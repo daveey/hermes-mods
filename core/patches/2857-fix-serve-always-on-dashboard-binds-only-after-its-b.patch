@@ -1,0 +1,323 @@
+From 4b069766eefe1bdd388878d18ee82dd3b25a780a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:39:56 +0000
+Subject: [PATCH] fix(serve): always-on dashboard binds only after its boot
+ prewarms finish (bounded) [daveey]
+
+Every hub core update retires the always-on `serve` and systemd starts a new
+one. The new process bound its port at once, with the kanban board, session
+annotation and project-tree prewarms still running on daemon threads. Desktop
+(polling the dead port, failing fast) attached on the first answer and fired
+its whole reconnect burst into cold caches: ~60 threadpool threads shared the
+GIL with the prewarms, the board prewarm took 39 s instead of ~0.5-4 s
+(`kanban board prewarm finished board=default elapsed_s=39.274`, 16:20:12Z
+2026-11-12), and /api/plugins/kanban/board plus session reads hit Desktop's
+6 s / 30 s deadlines on every core update (t_01a1d0971db77eb3).
+
+uvicorn runs lifespan startup before it binds, so the always-on backend now
+waits (asyncio.to_thread, 6 s budget) for the prewarm threads at the end of
+`standalone_lifespan`. Desktop's always-on attach treats the closed port as a
+supervisor restart and keeps failing fast for up to 20 s
+(ALWAYS_ON_RESTART_WAIT_MS), then attaches to a warm backend. Past the budget
+it binds anyway (today's behaviour). Desktop-owned `serve --isolated` backends
+do not wait (their 10 s ready probe, GH-73083).
+
+The two prewarm starters now remember their boot thread (`boot_thread()`).
+---
+ hermes_cli/boot_warmup_gate.py            |  77 +++++++++++++
+ hermes_cli/kanban_annotation_prewarm.py   |   8 ++
+ hermes_cli/web_server_app.py              |   6 +
+ plugins/kanban/dashboard/board_prewarm.py |   8 ++
+ tests/hermes_cli/test_boot_warmup_gate.py | 131 ++++++++++++++++++++++
+ 5 files changed, 230 insertions(+)
+ create mode 100644 hermes_cli/boot_warmup_gate.py
+ create mode 100644 tests/hermes_cli/test_boot_warmup_gate.py
+
+diff --git a/hermes_cli/boot_warmup_gate.py b/hermes_cli/boot_warmup_gate.py
+new file mode 100644
+index 0000000000..c83ea74e60
+--- /dev/null
++++ b/hermes_cli/boot_warmup_gate.py
+@@ -0,0 +1,77 @@
++"""Hold the always-on dashboard's socket until its boot prewarms finish (bounded). [daveey]
++
++Every hub core update retires the always-on ``serve`` (code skew) and its supervisor starts a new one. The new
++process starts the kanban board, session-list annotation and project-tree prewarms on daemon threads and binds its
++port at once. Desktop, which has been polling the dead port and failing fast, attaches on the first answer and fires
++its whole refresh burst (sessions lists, project trees, session tasks, the board, ...) into a process whose caches are
++all cold. Those requests wait on the prewarms' single-flight reads while ~60 threadpool threads share the GIL with
++them, so ~4 s of warm-up CPU took 39 s of wall time on 2026-11-12 (``kanban board prewarm finished ...
++elapsed_s=39.274``) and the Desktop's 6 s / 30 s request deadlines expired: a timeout burst on every core update.
++
++uvicorn runs the lifespan startup before it binds, so waiting here keeps the port closed while the prewarms run
++uncontended. Desktop's always-on attach treats a closed port as "waiting for its supervisor restart" and keeps
++failing fast for up to 20 s (``ALWAYS_ON_RESTART_WAIT_MS`` in ``apps/desktop/electron/remote-lifecycle.ts``), then
++attaches to a warm backend. The wait is bounded well inside that window so a slow warm-up degrades to today's
++behaviour (bind with prewarms still running) instead of pushing Desktop onto a second, colder owned backend.
++
++Only the always-on backend waits: a Desktop-owned ``serve --isolated`` is dialled with a 10 s ready probe and must
++bind at once (GH-73083).
++"""
++
++from __future__ import annotations
++
++import importlib
++import logging
++import threading
++import time
++from typing import Callable, Iterable, Optional
++
++log = logging.getLogger(__name__)
++
++# Boot to bind is ~10-12 s on hermes-hub; with Desktop's 20 s restart wait this leaves several seconds of slack.
++ALWAYS_ON_WARMUP_BUDGET_S = 6.0
++
++
++def join_within(threads: Iterable[Optional[threading.Thread]], budget_s: float, *,
++                clock: Callable[[], float] = time.monotonic) -> tuple[float, int]:
++    """Join each thread inside one shared ``budget_s``; return (elapsed seconds, threads still running)."""
++    started = clock()
++    pending = [t for t in threads if t is not None]
++    for thread in pending:
++        remaining = budget_s - (clock() - started)
++        if remaining <= 0:
++            break
++        thread.join(remaining)
++    return clock() - started, sum(1 for t in pending if t.is_alive())
++
++
++def boot_prewarm_threads() -> list[threading.Thread]:
++    """The boot prewarm threads this process started (annotation + project tree, kanban boards)."""
++    threads: list[threading.Thread] = []
++    for module, attr in (("hermes_cli.kanban_annotation_prewarm", "boot_thread"),
++                         ("plugins.kanban.dashboard.board_prewarm", "boot_thread")):
++        try:
++            thread = getattr(importlib.import_module(module), attr)()
++        except Exception:  # health: allow BLE001 -- a missing prewarm is simply not waited for
++            log.debug("boot prewarm %s unavailable", module, exc_info=True)
++            continue
++        if thread is not None:
++            threads.append(thread)
++    return threads
++
++
++def hold_bind_for_prewarm(budget_s: Optional[float] = None) -> Optional[tuple[float, int]]:
++    """In the always-on backend only: wait (bounded) for the boot prewarms before the socket binds. Never raises."""
++    try:
++        from hermes_cli.always_on_dashboard import always_on_enabled
++
++        if not always_on_enabled():
++            return None
++        threads = boot_prewarm_threads()
++        elapsed, running = join_within(threads, ALWAYS_ON_WARMUP_BUDGET_S if budget_s is None else budget_s)
++        log.info("always-on dashboard: boot prewarm %s after %.2fs (%d thread(s), %d still running); binding",
++                 "finished" if not running else "budget spent", elapsed, len(threads), running)
++        return elapsed, running
++    except Exception:  # health: allow BLE001 -- the gate is an optimisation; binding must never depend on it
++        log.warning("always-on dashboard: boot prewarm gate failed; binding now", exc_info=True)
++        return None
+diff --git a/hermes_cli/kanban_annotation_prewarm.py b/hermes_cli/kanban_annotation_prewarm.py
+index 3ef78b86a1..10890acc15 100644
+--- a/hermes_cli/kanban_annotation_prewarm.py
++++ b/hermes_cli/kanban_annotation_prewarm.py
+@@ -17,6 +17,13 @@ from typing import Optional
+ 
+ log = logging.getLogger(__name__)
+ 
++_boot_thread: list[Optional[threading.Thread]] = [None]
++
++
++def boot_thread() -> Optional[threading.Thread]:
++    """The boot prewarm thread this process started, if any (``boot_warmup_gate`` waits on it)."""
++    return _boot_thread[0]
++
+ 
+ def prewarm_annotation() -> bool:
+     """Build this process's annotation snapshot (and the remote-links projection under it). Never raises."""
+@@ -45,4 +52,5 @@ def start_annotation_prewarm() -> Optional[threading.Thread]:
+ 
+     thread = spawn_context_thread(_boot_prewarm, name="kanban-annotation-prewarm")
+     thread.start()
++    _boot_thread[0] = thread
+     return thread
+diff --git a/hermes_cli/web_server_app.py b/hermes_cli/web_server_app.py
+index 55508b0229..3aa65f3483 100644
+--- a/hermes_cli/web_server_app.py
++++ b/hermes_cli/web_server_app.py
+@@ -213,6 +213,12 @@ async def standalone_lifespan(app: "FastAPI"):
+ 
+     start_background_bootstrap()
+ 
++    # Always-on backend only: keep the port closed until the boot prewarms finish (bounded), so the Desktop's
++    # reconnect burst after a core-update restart meets warm caches (hermes_cli/boot_warmup_gate.py). [daveey]
++    from hermes_cli.boot_warmup_gate import hold_bind_for_prewarm
++
++    await asyncio.to_thread(hold_bind_for_prewarm)
++
+     try:
+         yield
+     finally:
+diff --git a/plugins/kanban/dashboard/board_prewarm.py b/plugins/kanban/dashboard/board_prewarm.py
+index 3a4a224a83..c0af0d7568 100644
+--- a/plugins/kanban/dashboard/board_prewarm.py
++++ b/plugins/kanban/dashboard/board_prewarm.py
+@@ -16,6 +16,13 @@ from hermes_cli import kanban_db
+ 
+ log = logging.getLogger(__name__)
+ 
++_boot_thread: list[Optional[threading.Thread]] = [None]
++
++
++def boot_thread() -> Optional[threading.Thread]:
++    """The boot prewarm thread this process started, if any (``hermes_cli.boot_warmup_gate`` waits on it)."""
++    return _boot_thread[0]
++
+ 
+ def _warm_names(api):
+     yield kanban_db.get_current_board()
+@@ -61,4 +68,5 @@ def start_board_prewarm(api) -> Optional[threading.Thread]:
+         return None
+     thread = spawn_context_thread(lambda: prewarm_boards(api), name="kanban-board-prewarm")
+     thread.start()
++    _boot_thread[0] = thread
+     return thread
+diff --git a/tests/hermes_cli/test_boot_warmup_gate.py b/tests/hermes_cli/test_boot_warmup_gate.py
+new file mode 100644
+index 0000000000..4602c9ed68
+--- /dev/null
++++ b/tests/hermes_cli/test_boot_warmup_gate.py
+@@ -0,0 +1,131 @@
++"""The always-on dashboard keeps its port closed until the boot prewarms finish (bounded).
++
++Every hub core update restarts the always-on ``serve``. The new process bound its port with the kanban board,
++annotation and project-tree prewarms still running, Desktop's reconnect burst landed on cold caches and ~4 s of warm-up
++took 39 s under GIL contention, so /kanban/board and session reads hit Desktop's 6 s / 30 s deadlines on every update
++(t_01a1d0971db77eb3). uvicorn runs lifespan startup before it binds, so a wait there keeps the port closed. [daveey]
++"""
++
++from __future__ import annotations
++
++import threading
++import time
++
++from fastapi.testclient import TestClient
++
++from hermes_cli import boot_warmup_gate as gate
++from hermes_cli import kanban_annotation_prewarm
++from hermes_cli import web_server
++from hermes_cli.always_on_dashboard import ENV_FLAG
++from plugins.kanban.dashboard import board_prewarm
++from tests.hermes_cli.test_serve_unloaded_sweeper import _quiet_boot
++
++
++def _gated_thread(release: threading.Event, done: threading.Event) -> threading.Thread:
++    def body():
++        release.wait(10)
++        done.set()
++
++    thread = threading.Thread(target=body, daemon=True, name="fake-prewarm")
++    thread.start()
++    return thread
++
++
++def test_join_within_shares_one_budget_across_threads():
++    release = threading.Event()
++    threads = [_gated_thread(release, threading.Event()) for _ in range(3)]
++    try:
++        started = time.monotonic()
++        elapsed, running = gate.join_within(threads + [None], 0.3)
++        assert running == 3
++        assert 0.25 <= elapsed < 1.5 and time.monotonic() - started < 1.5  # one budget, not 0.3 s per thread
++    finally:
++        release.set()
++    assert gate.join_within(threads, 5.0)[1] == 0
++
++
++def test_hold_is_a_no_op_outside_the_always_on_backend(monkeypatch):
++    monkeypatch.delenv(ENV_FLAG, raising=False)
++    monkeypatch.setattr(gate, "boot_prewarm_threads", lambda: (_ for _ in ()).throw(AssertionError("read threads")))
++    assert gate.hold_bind_for_prewarm() is None
++
++
++def test_hold_waits_for_the_prewarms_in_the_always_on_backend(monkeypatch):
++    monkeypatch.setenv(ENV_FLAG, "1")
++    release, done = threading.Event(), threading.Event()
++    thread = _gated_thread(release, done)
++    monkeypatch.setattr(gate, "boot_prewarm_threads", lambda: [thread])
++    threading.Timer(0.2, release.set).start()
++    elapsed, running = gate.hold_bind_for_prewarm(budget_s=5.0)
++    assert done.is_set() and running == 0 and elapsed >= 0.15
++
++
++def test_hold_gives_up_at_the_budget_and_never_raises(monkeypatch):
++    monkeypatch.setenv(ENV_FLAG, "1")
++    release = threading.Event()
++    thread = _gated_thread(release, threading.Event())
++    monkeypatch.setattr(gate, "boot_prewarm_threads", lambda: [thread])
++    try:
++        elapsed, running = gate.hold_bind_for_prewarm(budget_s=0.2)
++        assert running == 1 and elapsed < 2.0
++    finally:
++        release.set()
++    monkeypatch.setattr(gate, "boot_prewarm_threads", lambda: 1 / 0)
++    assert gate.hold_bind_for_prewarm(budget_s=0.2) is None
++
++
++def test_boot_prewarm_threads_are_the_ones_the_prewarms_started(monkeypatch):
++    first, second = threading.Thread(target=lambda: None), threading.Thread(target=lambda: None)
++    monkeypatch.setattr(kanban_annotation_prewarm, "_boot_thread", [first])
++    monkeypatch.setattr(board_prewarm, "_boot_thread", [second])
++    assert gate.boot_prewarm_threads() == [first, second]
++    monkeypatch.setattr(board_prewarm, "_boot_thread", [None])
++    assert gate.boot_prewarm_threads() == [first]
++
++
++def test_start_records_the_boot_threads(monkeypatch):
++    monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
++    monkeypatch.setattr(kanban_annotation_prewarm, "_boot_thread", [None])
++    monkeypatch.setattr(board_prewarm, "_boot_thread", [None])
++    monkeypatch.setattr(kanban_annotation_prewarm, "_boot_prewarm", lambda: None)
++    monkeypatch.setattr(board_prewarm, "prewarm_boards", lambda api: None)
++    annotation = kanban_annotation_prewarm.start_annotation_prewarm()
++    board = board_prewarm.start_board_prewarm(object())
++    assert kanban_annotation_prewarm.boot_thread() is annotation and board_prewarm.boot_thread() is board
++    annotation.join(5)
++    board.join(5)
++
++
++def _serve_startup(monkeypatch, *, always_on: bool) -> tuple[bool, list]:
++    """Run the serve lifespan startup with one fake prewarm thread that finishes ~0.3 s in.
++
++    Returns (prewarm finished by the time startup completed, the thread lists the gate joined)."""
++    _quiet_boot(monkeypatch)
++    monkeypatch.setattr(kanban_annotation_prewarm, "start_annotation_prewarm", lambda: None)
++    if always_on:
++        monkeypatch.setenv(ENV_FLAG, "1")
++    else:
++        monkeypatch.delenv(ENV_FLAG, raising=False)
++    release, done = threading.Event(), threading.Event()
++    thread = _gated_thread(release, done)
++    threading.Timer(0.3, release.set).start()
++    monkeypatch.setattr(gate, "boot_prewarm_threads", lambda: [thread])
++    joined, real_join = [], gate.join_within
++    monkeypatch.setattr(gate, "join_within", lambda threads, budget_s: joined.append(list(threads)) or
++                        real_join(threads, budget_s))
++    try:
++        with TestClient(web_server.app, raise_server_exceptions=False):
++            return done.is_set(), joined  # lifespan startup has completed here: uvicorn would bind now
++    finally:
++        release.set()
++
++
++def test_always_on_serve_lifespan_holds_startup_until_the_prewarms_finish(monkeypatch):
++    finished, joined = _serve_startup(monkeypatch, always_on=True)
++    assert len(joined) == 1 and len(joined[0]) == 1
++    assert finished
++
++
++def test_desktop_owned_serve_lifespan_does_not_wait(monkeypatch):
++    _finished, joined = _serve_startup(monkeypatch, always_on=False)
++    assert joined == []
+-- 
+2.43.0
+

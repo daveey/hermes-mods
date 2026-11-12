@@ -1,0 +1,588 @@
+From cbc541dd266bdb7e980eec874f6c8fb82a5b41c6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:32:44 +0000
+Subject: [PATCH] [daveey] perf(state): keep the clean deleted-WAL holder
+ verdict across unrelated directory churn
+
+The 30 s clean verdict for the /proc (and libproc) holder walk was keyed on the
+state.db directory's mtime. On hermes-hub ~/.hermes gets a new entry every ~2 s
+(atomic JSON renames, lock files), so the cache never hit and every SessionDB
+writer open walked every fd of every process: 3.7% of all py-spy samples of the
+hub Desktop backend (producer admission sweeps, session registry, notice
+delivery), t_01a1cb9d4cfc595b.
+
+While both sidecars exist with a known birth time, the key is now their
+(dev, ino, birth time) plus the directory's identity. A held retired inode is
+never freed, so retiring a generation leaves the path naming nothing or another
+inode. The verdict-time inodes are not held, though: once SQLite unlinks them on
+the last close, ext4/xfs hand their numbers out again, so (dev, ino) alone let a
+fresh pair repeat the cached key while a retired generation was still held
+(review of PR #1304, real /proc repro). The birth time (Darwin st_birthtime,
+Linux statx(STATX_BTIME) via ctypes) is set at allocation and untouched by WAL
+writes, so it tells a reused number apart. A missing sidecar or an unknown birth
+time keeps the directory mtime in the key, as before.
+
+Inode timestamps come from a coarse clock on many kernels (one jiffy; a second
+or two on some filesystems), and ext4 hands a freed number straight back, so a
+same-tick unlink + recreate repeats (dev, ino, birth) and a same-tick directory
+entry leaves the mtime unchanged (Blacksmith CI, second review of PR #1304). A
+clean verdict is therefore only stored once every timestamp in its key is older
+than 2 s; any later change then lands in a later tick and moves the key. A busy
+database's sidecars are old, so its cache still hits.
+---
+ hermes_state_dbfile.py                        | 127 +++++++--
+ tests/hermes_state/conftest.py                |  13 +
+ .../test_darwin_holder_snapshot.py            |   4 +-
+ .../test_deleted_wal_generation_guard.py      | 247 +++++++++++++++++-
+ .../test_state_db_darwin_fd_scan_hang.py      |   4 +-
+ 5 files changed, 374 insertions(+), 21 deletions(-)
+
+diff --git a/hermes_state_dbfile.py b/hermes_state_dbfile.py
+index 86fa579967..432141dbc2 100644
+--- a/hermes_state_dbfile.py
++++ b/hermes_state_dbfile.py
+@@ -352,20 +352,109 @@ def _iter_darwin_fd_targets():
+                 yield pid, fd, *current
+ 
+ 
+-def _darwin_clean_key(base: str) -> tuple:
+-    """What a clean verdict for *base* depends on: the directory's mtime and the sidecars' identity.
++_STATX_BTIME = 0x800
++_AT_FDCWD = -100
++_LINUX_STATX = None  # libc statx, False when unavailable; loaded once per process
++
++
++def _linux_statx():
++    global _LINUX_STATX
++    if _LINUX_STATX is None:
++        _LINUX_STATX = False
++        try:
++            import ctypes
++            fn = ctypes.CDLL(None, use_errno=True).statx
++            fn.restype = ctypes.c_int
++            fn.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p)
++            _LINUX_STATX = fn
++        except (ImportError, OSError, AttributeError):
++            pass
++    return _LINUX_STATX
++
++
++def _sidecar_birth_ns(path: str, st: os.stat_result):
++    """[daveey] The birth time of the inode *st* describes at *path*, or None when it is unknown.
++
++    A sidecar inode freed when the last connection unlinks it gets its number handed out again on
++    ext4/xfs, so ``(st_dev, st_ino)`` alone can name a different file than at verdict time. The birth
++    time is set at allocation and never touched by WAL writes, so a reused number allocated in a later
++    timestamp tick carries a new one (same tick: see :func:`_clean_key_settled`). Darwin reports it
++    in ``st_birthtime``; Linux needs ``statx(STATX_BTIME)``, absent from ``os``."""
++    if sys.platform == "darwin":
++        birth_ns = getattr(st, "st_birthtime_ns", None)  # Python >= 3.12: no float round-trip
++        if birth_ns is not None:
++            return birth_ns
++        birth = getattr(st, "st_birthtime", None)
++        return None if birth is None else int(birth * 1_000_000_000)
++    if not sys.platform.startswith("linux"):
++        return None
++    statx = _linux_statx()
++    if not statx:
++        return None
++    import ctypes
++    buf = ctypes.create_string_buffer(256)  # struct statx
++    if statx(_AT_FDCWD, os.fsencode(path), 0, _STATX_BTIME, buf) != 0:
++        return None
++    mask, = struct.unpack_from("=I", buf, 0)
++    ino, = struct.unpack_from("=Q", buf, 32)
++    sec, nsec = struct.unpack_from("=qI", buf, 80)  # stx_btime
++    if not mask & _STATX_BTIME or ino != st.st_ino:  # no btime on this fs, or the path moved meanwhile
++        return None
++    return sec * 1_000_000_000 + nsec
+ 
+-    A retired generation needs a sidecar path unlinked or replaced, and any create, unlink or
+-    rename in the directory moves its mtime, so an unchanged key means no generation can have been
+-    retired since the clean pass. WAL writes touch neither, so a busy database keeps its cache."""
++
++# [daveey] A clean verdict is only stored once every timestamp in its key is older than this.
++_CLEAN_KEY_SETTLE_NS = 2_000_000_000
++_wall_clock_ns = time.time_ns  # the clock inode timestamps are stamped from; tests age keys through it
++
++
++def _clean_key_settled(key: tuple, taken_ns: int) -> bool:
++    """[daveey] Whether every timestamp in a :func:`_darwin_clean_key` key predates the settle window.
++
++    Inode timestamps come from a coarse clock (one jiffy on many kernels, a second or two on some
++    filesystems). ext4 hands a freed inode number straight back to the next create in the directory,
++    so a sidecar unlinked and recreated within the tick of its verdict-time birth repeats
++    ``(st_dev, st_ino, birth)``, and an entry added within the tick of the directory's mtime leaves
++    it unchanged (Blacksmith CI kernel, review of PR #1304). Any change made after a verdict whose
++    timestamps are all older than the window lands in a later tick and moves the key. A busy
++    database's sidecars are old, so its cache still hits; a fresh pair is re-walked for ~2 s only.
++    A timestamp in the future (clock skew) counts as unsettled.
++
++    The window is measured back from *taken_ns*, the wall clock read just before the key was taken,
++    never from when the verdict is stored: a /proc or libproc walk longer than the window would
++    otherwise let a key stamped in its own key-take tick through (review of PR #1304)."""
++    horizon = taken_ns - _CLEAN_KEY_SETTLE_NS
++    return all(slot is None or not slot[2] or slot[2] <= horizon for slot in key)
++
++
++def _darwin_clean_key(base: str) -> tuple:
++    """What a clean verdict for *base* depends on: the identity of the directory and of each sidecar.
++
++    A retired generation needs a sidecar path unlinked, renamed away or replaced while some process
++    still holds the old inode; a held inode is never freed, so the path then names nothing or another
++    inode. The verdict-time inode itself is not held, though: SQLite unlinks it on the last close and
++    ext4/xfs hand its number out again, so a later fresh sidecar can repeat ``(st_dev, st_ino)`` while
++    a retired generation is still held. A sidecar's identity is therefore ``(st_dev, st_ino, birth
++    time)``. WAL writes touch none of these, so a busy database keeps its cache. [daveey] While both
++    sidecars exist with a known birth time the directory's mtime is not part of the key: it moves with
++    every unrelated entry (on hermes-hub ``~/.hermes`` gets one every ~2 s), so the clean verdict never
++    hit and every SessionDB writer open walked every fd of every process. A missing sidecar or an
++    unknown birth time keeps the mtime: a sidecar created after the verdict and retired again leaves
++    its slot ``None``, a reused number looks unchanged, and only the directory change shows either."""
+     key = []
+-    for path, with_mtime in ((os.path.dirname(base), True), (base + "-wal", False), (base + "-shm", False)):
++    for path in (base + "-wal", base + "-shm"):
+         try:
+             st = os.stat(path)
+         except OSError:
+             key.append(None)
+             continue
+-        key.append((st.st_dev, st.st_ino, st.st_mtime_ns if with_mtime else 0))
++        key.append((st.st_dev, st.st_ino, _sidecar_birth_ns(path, st)))
++    weak = any(slot is None or slot[2] is None for slot in key)
++    try:
++        st = os.stat(os.path.dirname(base))
++        key.append((st.st_dev, st.st_ino, st.st_mtime_ns if weak else 0))
++    except OSError:
++        key.append(None)
+     return tuple(key)
+ 
+ 
+@@ -389,8 +478,10 @@ class _DarwinFdScan:
+         self.expired = False
+         self.waiters = 0
+         # ``base -> (key, watched)`` of every caller that joined; a clean verdict for each is
+-        # recorded before this pass stops being in flight (see :meth:`run`).
++        # recorded before this pass stops being in flight (see :meth:`run`). ``taken`` is the
++        # wall clock each caller read just before taking its key (:func:`_clean_key_settled`).
+         self.watchers: dict[str, tuple[tuple, dict[str, str]]] = {}
++        self.taken: dict[str, int] = {}
+         self.verdicts: dict[str, list[tuple[int, str]]] = {}
+ 
+     def run(self) -> None:
+@@ -425,7 +516,7 @@ class _DarwinFdScan:
+                     # Publish caches and retire the flight atomically: every caller
+                     # that joined this pass has a verdict, including late joiners.
+                     for base, (key, _watched) in self.watchers.items():
+-                        if not self.verdicts[base]:
++                        if not self.verdicts[base] and _clean_key_settled(key, self.taken[base]):
+                             _darwin_clean_until[base] = (
+                                 time.monotonic() + _DARWIN_FD_CLEAN_TTL_SECONDS, key)
+                     if _DARWIN_SCAN_IN_FLIGHT is self:
+@@ -455,7 +546,8 @@ _DARWIN_SCAN_CACHED = _DarwinFdScan(0.0)  # sentinel, never run: a clean verdict
+ 
+ 
+ def _join_darwin_fd_scan(base: str | None = None, key: tuple | None = None,
+-                         watched: dict[str, str] | None = None) -> _DarwinFdScan | None:
++                         watched: dict[str, str] | None = None,
++                         taken_ns: int = 0) -> _DarwinFdScan | None:
+     """Wait for the in-flight pass, starting one only if none is alive; ``None`` on timeout.
+ 
+     With *base*/*key*/*watched*, returns ``_DARWIN_SCAN_CACHED`` when a pass that just finished
+@@ -479,7 +571,9 @@ def _join_darwin_fd_scan(base: str | None = None, key: tuple | None = None,
+                 raise
+         scan.waiters += 1
+         if base is not None and key is not None and watched is not None:
+-            scan.watchers.setdefault(base, (key, watched))
++            if base not in scan.watchers:
++                scan.watchers[base] = (key, watched)
++                scan.taken[base] = taken_ns  # 0 (none given): nothing settles, nothing is cached
+     try:
+         # ponytail: a kernel-blocked proc_pidfdinfo cannot be interrupted, so that one thread
+         # may outlive us; it is the only one, and it dies with the process.
+@@ -501,10 +595,11 @@ def _iter_darwin_sidecar_holders(db_path) -> list[tuple[int, str]]:
+     # APFS/HFS+ are case-insensitive by default and libproc reports the pathname as the opener
+     # spelled it; ``os.path.normcase`` is the identity on darwin, so fold case here.
+     watched = {path.casefold(): path for path in (base + "-wal", base + "-shm")}
++    taken_ns = _wall_clock_ns()  # before the key: the settle window counts back from here
+     key = _darwin_clean_key(base)  # taken before the pass, so a change during it invalidates
+     if _darwin_clean_cached(base, key):
+         return []
+-    scan = _join_darwin_fd_scan(base, key, watched)
++    scan = _join_darwin_fd_scan(base, key, watched, taken_ns)
+     if scan is _DARWIN_SCAN_CACHED:
+         return []
+     if scan is None:
+@@ -522,7 +617,7 @@ def _iter_darwin_sidecar_holders(db_path) -> list[tuple[int, str]]:
+ 
+ # Same contract as the Darwin clean-verdict cache, for the Linux /proc walk.
+ # Positive verdicts are never stored. ``_darwin_clean_key`` is the invalidation
+-# (directory mtime + sidecar identity): a WAL write touches neither.
++# (sidecar identity incl. birth time; directory mtime as the fallback): a WAL write touches neither.
+ _LINUX_FD_CLEAN_TTL_SECONDS = 30.0
+ _linux_clean_until: dict[str, tuple[float, tuple]] = {}
+ 
+@@ -558,6 +653,7 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> list[tuple[int, str]]:
+             holders = _iter_darwin_sidecar_holders(db_path)
+         elif sys.platform.startswith("linux"):
+             base = os.path.realpath(os.path.abspath(os.fspath(db_path)))
++            taken_ns = _wall_clock_ns()  # before the key: the settle window counts back from here
+             key = _darwin_clean_key(base)
+             if _linux_clean_cached(base, key):
+                 return []
+@@ -568,8 +664,9 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> list[tuple[int, str]]:
+                         and _fd_is_truly_unlinked(fd_path, watched[canonical])):
+                     holders.append((pid, target))
+             # Key taken before the walk: a sidecar retired during it must not be published
+-            # as clean under the new key. A positive verdict is never cached.
+-            if not holders and _darwin_clean_key(base) == key:
++            # as clean under the new key. A positive verdict is never cached, nor one whose key
++            # timestamps are too recent to tell a same-tick recreate apart.
++            if not holders and _darwin_clean_key(base) == key and _clean_key_settled(key, taken_ns):
+                 _linux_clean_until[base] = (
+                     time.monotonic() + _LINUX_FD_CLEAN_TTL_SECONDS, key)
+     except Exception as exc:
+diff --git a/tests/hermes_state/conftest.py b/tests/hermes_state/conftest.py
+index 3dbd56f407..a4aed4e93e 100644
+--- a/tests/hermes_state/conftest.py
++++ b/tests/hermes_state/conftest.py
+@@ -1,7 +1,20 @@
+ """Shared fixtures for tests/hermes_state."""
++import time
++
+ import pytest
+ 
+ 
++@pytest.fixture
++def settled_clean_keys(monkeypatch):
++    """[daveey] Judge deleted-WAL clean-verdict keys as if taken an hour after the test's files were made.
++
++    A clean verdict is only cached once every timestamp in its key is older than
++    ``_CLEAN_KEY_SETTLE_NS`` (a same-tick recreate is indistinguishable), and a test's sidecars are
++    seconds old. Tests about the cache itself age them through the module's wall clock."""
++    import hermes_state_dbfile
++    monkeypatch.setattr(hermes_state_dbfile, "_wall_clock_ns", lambda: time.time_ns() + 3600 * 10**9)
++
++
+ @pytest.fixture
+ def worker(tmp_path):
+     """A registered compute worker execution on session ``owned``: ``(db, RuntimeSessionStore)``."""
+diff --git a/tests/hermes_state/test_darwin_holder_snapshot.py b/tests/hermes_state/test_darwin_holder_snapshot.py
+index 4328314b41..85e279108a 100644
+--- a/tests/hermes_state/test_darwin_holder_snapshot.py
++++ b/tests/hermes_state/test_darwin_holder_snapshot.py
+@@ -48,7 +48,7 @@ def test_revalidation_is_bounded_and_does_not_cache_timeout(tmp_path, monkeypatc
+ 
+ 
+ @pytest.mark.platforms("macos")
+-def test_native_scan_does_not_refuse_after_normal_sidecar_close(tmp_path, monkeypatch):
++def test_native_scan_does_not_refuse_after_normal_sidecar_close(tmp_path, monkeypatch, settled_clean_keys):
+     wal = tmp_path / "state.db-wal"
+     wal.write_bytes(b"linked sidecar")
+     held = wal.open("rb")
+@@ -74,7 +74,7 @@ def test_native_scan_does_not_refuse_after_normal_sidecar_close(tmp_path, monkey
+         held.close()
+ 
+ 
+-def test_descriptor_closing_during_path_comparison_is_not_a_holder(tmp_path, monkeypatch):
++def test_descriptor_closing_during_path_comparison_is_not_a_holder(tmp_path, monkeypatch, settled_clean_keys):
+     wal = str(tmp_path / "state.db-wal")
+     closed = False
+ 
+diff --git a/tests/hermes_state/test_deleted_wal_generation_guard.py b/tests/hermes_state/test_deleted_wal_generation_guard.py
+index a96782f407..2a89315215 100644
+--- a/tests/hermes_state/test_deleted_wal_generation_guard.py
++++ b/tests/hermes_state/test_deleted_wal_generation_guard.py
+@@ -671,7 +671,7 @@ def test_darwin_scan_stops_itself_past_its_deadline(tmp_path, fake_darwin_scan,
+     assert fake_darwin_scan["calls"] == 2
+ 
+ 
+-def test_darwin_clean_verdict_is_dropped_once_a_sidecar_is_unlinked(tmp_path, fake_darwin_scan):
++def test_darwin_clean_verdict_is_dropped_once_a_sidecar_is_unlinked(tmp_path, fake_darwin_scan, settled_clean_keys):
+     """A cached clean verdict must not hide a generation retired after it: unlinking the WAL
+     (or any create/unlink in the directory) forces a fresh pass, while plain reuse does not."""
+     path = tmp_path / "state.db"
+@@ -690,7 +690,7 @@ def test_darwin_clean_verdict_is_dropped_once_a_sidecar_is_unlinked(tmp_path, fa
+     assert fake_darwin_scan["calls"] == 2, "an unlinked sidecar must force a fresh pass"
+ 
+ 
+-def test_linux_clean_holder_scan_is_reused_until_a_sidecar_changes(tmp_path, monkeypatch):
++def test_linux_clean_holder_scan_is_reused_until_a_sidecar_changes(tmp_path, monkeypatch, settled_clean_keys):
+     """A clean Linux /proc walk is not repeated on the next writer open.
+ 
+     Darwin already caches a clean verdict, invalidated by directory mtime or
+@@ -723,6 +723,249 @@ def test_linux_clean_holder_scan_is_reused_until_a_sidecar_changes(tmp_path, mon
+     assert calls["n"] == 2, "an unlinked sidecar must force a fresh pass"
+ 
+ 
++def test_linux_clean_holder_scan_survives_unrelated_directory_churn(tmp_path, monkeypatch, settled_clean_keys):
++    """[daveey] Only a sidecar's identity can retire a generation, so unrelated files do not drop the verdict.
++
++    On hermes-hub ``~/.hermes`` (state.db's directory) gets a new entry every ~2 s (atomic JSON renames,
++    lock files), which always moved the old key's directory mtime: the 30 s clean verdict never hit and
++    every SessionDB writer open walked every fd of every process (~4% of a core in the Desktop backend
++    alone, 2026-11-12). A sidecar that is unlinked, renamed away or replaced still forces a fresh pass:
++    a held retired inode cannot be reused, so the path then names nothing or another inode.
++    """
++    monkeypatch.setattr(hermes_state_dbfile.sys, "platform", "linux")
++    monkeypatch.setattr(hermes_state_dbfile, "_linux_clean_until", {}, raising=False)
++    path = tmp_path / "state.db"
++    path.write_bytes(b"")
++    wal = Path(str(path) + "-wal")
++    shm = Path(str(path) + "-shm")
++    wal.write_bytes(b"generation 1")
++    shm.write_bytes(b"shm 1")
++    calls = {"n": 0}
++
++    def scan():
++        calls["n"] += 1
++        yield from ()
++
++    monkeypatch.setattr(hermes_state_dbfile, "_iter_proc_fd_targets", scan)
++    if hermes_state_dbfile._sidecar_birth_ns(str(wal), os.stat(wal)) is None:
++        # No statx btime here (the Linux leg simulated on macOS, or a fs without it): stand in a
++        # per-inode birth so the test still covers the known-birth key.
++        monkeypatch.setattr(hermes_state_dbfile, "_sidecar_birth_ns", lambda p, st: st.st_ino * 7 + 1)
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    for i in range(3):
++        tmp = tmp_path / f"processes.json.tmp{i}"
++        tmp.write_text("{}")
++        tmp.replace(tmp_path / "processes.json")  # atomic-rename churn in the same directory
++        (tmp_path / f"lock{i}").touch()
++        assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 1, "unrelated directory entries must not drop the clean verdict"
++    other = tmp_path / "other-shm"
++    other.write_bytes(b"shm 2")
++    other.replace(shm)  # a replaced sidecar (new inode at the path)
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 2, "a replaced sidecar must force a fresh pass"
++    wal.rename(tmp_path / "moved-wal")  # renamed away: nothing at the path
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 3, "a sidecar renamed away must force a fresh pass"
++
++
++def test_linux_clean_holder_scan_rechecks_when_freed_sidecar_numbers_are_reused(tmp_path, monkeypatch, settled_clean_keys):
++    """[daveey] A verdict-time sidecar inode is not held: once freed, ext4/xfs hand its number out again.
++
++    Quiesce unlinks both sidecars, a new generation is held by another process and retired, then fresh
++    sidecars reuse the verdict-time ``(st_dev, st_ino)`` pair (reproduced on a hermes worker's ext4,
++    2 of 3 runs, review of PR #1304). The birth time differs, so the cached clean verdict must not
++    hide the held generation. Without a known birth time the directory mtime still invalidates.
++    """
++    monkeypatch.setattr(hermes_state_dbfile.sys, "platform", "linux")
++    monkeypatch.setattr(hermes_state_dbfile, "_linux_clean_until", {}, raising=False)
++    path = Path(os.path.realpath(tmp_path)) / "state.db"
++    path.write_bytes(b"")
++    wal, shm = str(path) + "-wal", str(path) + "-shm"
++    for p in (wal, shm):
++        Path(p).write_bytes(b"generation 1")
++    real_stat = os.stat
++    first = {p: real_stat(p) for p in (wal, shm)}
++    births = {p: 1_000 + i for i, p in enumerate((wal, shm))}
++    reuse = {"on": False}
++
++    class _ReusedNumbersOs:
++        """``os`` whose stat reports the verdict-time numbers for the fresh sidecars (forced reuse)."""
++
++        def __getattr__(self, name):
++            return getattr(os, name)
++
++        @staticmethod
++        def stat(p, *args, **kwargs):
++            st = real_stat(p, *args, **kwargs)
++            if reuse["on"] and os.fspath(p) in first:
++                fields = list(st)
++                fields[1], fields[2] = first[os.fspath(p)].st_ino, first[os.fspath(p)].st_dev
++                return os.stat_result(fields, {"st_mtime_ns": st.st_mtime_ns})
++            return st
++
++    monkeypatch.setattr(hermes_state_dbfile, "os", _ReusedNumbersOs())
++    monkeypatch.setattr(hermes_state_dbfile, "_sidecar_birth_ns", lambda p, st: births[p])
++    calls = {"n": 0}
++
++    def scan():
++        calls["n"] += 1
++        yield from ()
++
++    monkeypatch.setattr(hermes_state_dbfile, "_iter_proc_fd_targets", scan)
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    key = hermes_state_dbfile._darwin_clean_key(os.path.realpath(path))
++    for p in (wal, shm):  # quiesce, then a held generation retired, then fresh sidecars minted
++        os.unlink(p)
++        Path(p).write_bytes(b"generation 3")
++        births[p] += 100
++    reuse["on"] = True
++    fresh = hermes_state_dbfile._darwin_clean_key(os.path.realpath(path))
++    assert [slot[:2] for slot in fresh[:2]] == [slot[:2] for slot in key[:2]], "numbers reused"
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 2, "reused sidecar numbers with a new birth time must force a fresh pass"
++
++    monkeypatch.setattr(hermes_state_dbfile, "_sidecar_birth_ns", lambda p, st: None)
++    hermes_state_dbfile._linux_clean_until.clear()
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 3
++    st = os.stat(tmp_path)
++    # Bump the mtime explicitly: a touch within the tick of the last change keeps it on a coarse kernel.
++    os.utime(tmp_path, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 4, "without a birth time any directory change must force a fresh pass"
++
++
++def test_linux_clean_verdict_is_not_cached_while_key_timestamps_share_a_tick(tmp_path, monkeypatch):
++    """[daveey] On a coarse-timestamp kernel a same-tick unlink + recreate repeats ``(dev, ino, birth)``.
++
++    ext4 hands the freed number straight back, and the new inode is stamped with the same jiffy, so
++    nothing in the key tells the pairs apart (Blacksmith CI, review of PR #1304). A clean verdict is
++    therefore only stored once every key timestamp (sidecar birth, or the directory mtime when it is
++    in the key) is older than the settle window; then any later change lands in a later tick.
++    """
++    monkeypatch.setattr(hermes_state_dbfile.sys, "platform", "linux")
++    monkeypatch.setattr(hermes_state_dbfile, "_linux_clean_until", {}, raising=False)
++    path = Path(os.path.realpath(tmp_path)) / "state.db"
++    path.write_bytes(b"")
++    for suffix in ("-wal", "-shm"):
++        Path(str(path) + suffix).write_bytes(b"generation 1")
++    tick = time.time_ns()
++    now = {"ns": tick}
++    monkeypatch.setattr(hermes_state_dbfile, "_wall_clock_ns", lambda: now["ns"])
++    # Coarse clock: every inode created in this tick, a reused number included, carries this birth.
++    monkeypatch.setattr(hermes_state_dbfile, "_sidecar_birth_ns", lambda p, st: tick)
++    calls = {"n": 0}
++
++    def scan():
++        calls["n"] += 1
++        yield from ()
++
++    monkeypatch.setattr(hermes_state_dbfile, "_iter_proc_fd_targets", scan)
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 2, "a key stamped in the current tick must not be cached"
++    assert str(path) not in hermes_state_dbfile._linux_clean_until
++
++    now["ns"] = tick + hermes_state_dbfile._CLEAN_KEY_SETTLE_NS  # the births have settled
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 3, "a settled key reuses the clean verdict"
++
++    # Weak key (no birth time): the directory mtime is in the key and needs to settle too.
++    monkeypatch.setattr(hermes_state_dbfile, "_sidecar_birth_ns", lambda p, st: None)
++    hermes_state_dbfile._linux_clean_until.clear()
++    st = os.stat(tmp_path)
++    now["ns"] = st.st_mtime_ns + 1  # the directory changed within this tick
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 5, "a directory mtime from the current tick must not be cached"
++    now["ns"] = st.st_mtime_ns + hermes_state_dbfile._CLEAN_KEY_SETTLE_NS
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 6
++    now["ns"] = st.st_mtime_ns - 1  # a timestamp ahead of the clock (skew) is unsettled
++    hermes_state_dbfile._linux_clean_until.clear()
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 8
++
++
++def test_settle_window_counts_back_from_key_take_not_from_a_slow_walk(tmp_path, monkeypatch, fake_darwin_scan):
++    """[daveey] A walk that outlasts the settle window must not settle a key stamped in its key-take tick.
++
++    The horizon is read before the key is taken; reading it when the verdict is stored let a /proc
++    or libproc pass longer than the window cache a same-tick key (review of PR #1304). The clock
++    here jumps a full window ahead during each walk.
++    """
++    path = Path(os.path.realpath(tmp_path)) / "state.db"
++    path.write_bytes(b"")
++    for suffix in ("-wal", "-shm"):
++        Path(str(path) + suffix).write_bytes(b"generation 1")
++    tick = time.time_ns()
++    now = {"ns": tick}
++    monkeypatch.setattr(hermes_state_dbfile, "_wall_clock_ns", lambda: now["ns"])
++    monkeypatch.setattr(hermes_state_dbfile, "_sidecar_birth_ns", lambda p, st: tick)
++    settle = hermes_state_dbfile._CLEAN_KEY_SETTLE_NS
++
++    monkeypatch.setattr(hermes_state_dbfile.sys, "platform", "linux")
++    monkeypatch.setattr(hermes_state_dbfile, "_linux_clean_until", {}, raising=False)
++    calls = {"n": 0}
++
++    def slow_proc_walk():
++        calls["n"] += 1
++        now["ns"] += settle  # the walk takes a whole window
++        yield from ()
++
++    monkeypatch.setattr(hermes_state_dbfile, "_iter_proc_fd_targets", slow_proc_walk)
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert str(path) not in hermes_state_dbfile._linux_clean_until, "key from the key-take tick cached"
++    assert iter_deleted_sqlite_sidecar_holders(path) == []  # key taken a window later: settled now
++    assert calls["n"] == 2
++    assert iter_deleted_sqlite_sidecar_holders(path) == []
++    assert calls["n"] == 2, "a settled key reuses the clean verdict"
++
++    now["ns"] = tick
++    real_targets = hermes_state_dbfile._iter_darwin_fd_targets
++
++    def slow_libproc_walk():
++        now["ns"] += settle
++        yield from real_targets()
++
++    monkeypatch.setattr(hermes_state_dbfile, "_iter_darwin_fd_targets", slow_libproc_walk)
++    fake_darwin_scan["gate"].set()
++    base = os.path.realpath(path)
++    assert hermes_state_dbfile._iter_darwin_sidecar_holders(path) == []
++    assert base not in hermes_state_dbfile._darwin_clean_until, "key from the key-take tick cached"
++    assert hermes_state_dbfile._iter_darwin_sidecar_holders(path) == []
++    assert base in hermes_state_dbfile._darwin_clean_until
++    assert fake_darwin_scan["calls"] == 2
++
++
++@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="statx is Linux-only")
++def test_linux_sidecar_birth_time_is_read_and_survives_writes(tmp_path):
++    """[daveey] statx(STATX_BTIME) through ctypes: stable across WAL-style writes, new for a new inode."""
++    p = tmp_path / "state.db-wal"
++    p.write_bytes(b"a")
++    birth = hermes_state_dbfile._sidecar_birth_ns(str(p), os.stat(p))
++    if birth is None:
++        pytest.skip("this filesystem reports no birth time")
++    with open(p, "ab") as f:
++        f.write(b"more")
++    assert hermes_state_dbfile._sidecar_birth_ns(str(p), os.stat(p)) == birth
++    stale = os.stat(p)
++    # A coarse-timestamp kernel stamps a same-tick recreate with the same birth: let the tick pass.
++    from tests.waiting import wait_for_ctime_tick
++    wait_for_ctime_tick(tmp_path, stale.st_ctime_ns)  # ctime >= birth: the append moved it
++    p.unlink()
++    p.write_bytes(b"b")
++    now = os.stat(p)
++    fresh = hermes_state_dbfile._sidecar_birth_ns(str(p), now)
++    assert fresh is not None and fresh != birth
++    if now.st_ino != stale.st_ino:
++        assert hermes_state_dbfile._sidecar_birth_ns(str(p), stale) is None, "path moved: unknown"
++
++
+ def test_linux_positive_holder_scan_is_not_cached(tmp_path, monkeypatch):
+     """A process holding a deleted sidecar is re-checked on the next open."""
+     monkeypatch.setattr(hermes_state_dbfile.sys, "platform", "linux")
+diff --git a/tests/hermes_state/test_state_db_darwin_fd_scan_hang.py b/tests/hermes_state/test_state_db_darwin_fd_scan_hang.py
+index 05dd0a1549..63e1fcc113 100644
+--- a/tests/hermes_state/test_state_db_darwin_fd_scan_hang.py
++++ b/tests/hermes_state/test_state_db_darwin_fd_scan_hang.py
+@@ -133,7 +133,7 @@ def test_healthy_scan_still_reports_holder(monkeypatch, tmp_path, caplog):
+     ), "a successful scan must not log a timeout warning"
+ 
+ 
+-def test_clean_verdict_is_reused_and_scans_are_single_flight(monkeypatch, tmp_path):
++def test_clean_verdict_is_reused_and_scans_are_single_flight(monkeypatch, tmp_path, settled_clean_keys):
+     """Every SessionDB open used to walk all fds of all processes; a clean pass is now cached."""
+     calls = []
+ 
+@@ -157,7 +157,7 @@ def test_clean_verdict_is_reused_and_scans_are_single_flight(monkeypatch, tmp_pa
+     assert len(calls) == 2
+ 
+ 
+-def test_caller_arriving_after_pass_but_before_cache_write_reuses_it(monkeypatch, tmp_path):
++def test_caller_arriving_after_pass_but_before_cache_write_reuses_it(monkeypatch, tmp_path, settled_clean_keys):
+     """A caller that missed the cache and then found no pass in flight used to start another
+     pass, because the finished pass's clean verdict was only cached after its waiters woke. Here
+     the second caller arrives in exactly that gap, so the old code made two passes every time."""
+-- 
+2.43.0
+

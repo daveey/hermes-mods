@@ -1,0 +1,287 @@
+From bf886994e7b4aa7ee48827993cb6cb901773f512 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 11:14:27 +0000
+Subject: [PATCH] fix(kanban): deduplicate probe loss by portable event
+ identity [daveey]
+
+---
+ hermes_cli/kanban_ask_resolved_backfill.py    |   7 +-
+ hermes_cli/kanban_block_notice.py             |  17 ++-
+ hermes_cli/kanban_db.py                       |  20 +---
+ hermes_cli/kanban_db_event.py                 |  27 +++++
+ tests/hermes_cli/test_kanban_ask_backfill.py  |   3 +-
+ .../test_kanban_drop_backfill_sync.py         | 107 ++++++++++++++++++
+ .../test_kanban_resolved_check_drop_notice.py |   3 +-
+ 7 files changed, 158 insertions(+), 26 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_event.py
+ create mode 100644 tests/hermes_cli/test_kanban_drop_backfill_sync.py
+
+diff --git a/hermes_cli/kanban_ask_resolved_backfill.py b/hermes_cli/kanban_ask_resolved_backfill.py
+index 4900b290f5..6b433e5da7 100644
+--- a/hermes_cli/kanban_ask_resolved_backfill.py
++++ b/hermes_cli/kanban_ask_resolved_backfill.py
+@@ -74,6 +74,11 @@ def backfill(conn: sqlite3.Connection) -> list[str]:
+             if _latest_drop(conn, tid) != drop or not _eligible(conn, tid):
+                 continue
+             kar.mark_dropped(conn, tid, drop[2], drop[3])
+-            kb._append_event(conn, tid, drop[2], {"backfilled": True, "origin_event_id": drop[1]})
++            # Sync remaps integer IDs but preserves UIDs and payloads verbatim. Older unsynced
++            # schemas have no UID column; only those use the local reference.
++            origin = conn.execute("SELECT * FROM task_events WHERE id = ?", (drop[1],)).fetchone()
++            uid = origin["uid"] if "uid" in origin.keys() else None
++            reference = {"origin_event_uid": uid} if uid else {"origin_event_id": drop[1]}
++            kb._append_event(conn, tid, drop[2], {"backfilled": True, **reference})
+             marked.append(tid)
+     return marked
+diff --git a/hermes_cli/kanban_block_notice.py b/hermes_cli/kanban_block_notice.py
+index 0e3e2d687d..30f4e2240b 100644
+--- a/hermes_cli/kanban_block_notice.py
++++ b/hermes_cli/kanban_block_notice.py
+@@ -73,19 +73,28 @@ _DROP_CAUSE = {"resolved_check_broken": "its probe kept failing", "resolved_chec
+ def _drop_backfilled_origins(events):
+     """Remove a historical drop event when a backfill re-emission in the same batch names it as its origin.
+ 
+-    Only the exact ``origin_event_id`` of a ``backfilled`` drop event of the same kind goes; distinct drops stay.
++    Match stable UIDs across replicas. Integer references are safe only for UID-less,
++    unsynced events; a sender's local ID must never suppress a different receiver event.
+     """
+     origins = set()
++    local_origins = set()
+     for e in events:
+         payload = getattr(e, "payload", None)
+         if e.kind in DROP_EVENTS and isinstance(payload, dict) and payload.get("backfilled") is True:
++            uid = payload.get("origin_event_uid")
++            if isinstance(uid, str) and uid:
++                origins.add((uid, e.kind))
++                continue
++            if "origin_event_uid" in payload or getattr(e, "uid", None):
++                continue
+             try:
+-                origins.add((int(payload["origin_event_id"]), e.kind))
++                local_origins.add((int(payload["origin_event_id"]), e.kind))
+             except (KeyError, TypeError, ValueError):
+                 pass
+-    if not origins:
++    if not origins and not local_origins:
+         return events
+-    return [e for e in events if (int(e.id), e.kind) not in origins]
++    return [e for e in events if (getattr(e, "uid", None), e.kind) not in origins
++            and not (not getattr(e, "uid", None) and (int(e.id), e.kind) in local_origins)]
+ 
+ 
+ def coalesce_superseded_blocks(events):
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 96a1b3ea1f..f952d71179 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -34,6 +34,7 @@ from typing import Any, Callable, Iterable, Optional
+ 
+ from hermes_cli import kanban_db_sync as _sync, kanban_park_pin as _park_pin, kanban_priority
+ from hermes_cli.kanban_db_values import _first_line, _opt_int, _json_or_null
++from hermes_cli.kanban_db_event import Event  # public kb.Event; helpers import lazily: no cycle
+ from hermes_cli.kanban_worker_placement import resolved_db_placement, validate_creation
+ from hermes_cli import kanban_placement_forward as _placement_fwd  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+@@ -783,25 +784,6 @@ class Attachment:
+         )
+ 
+ 
+-@dataclass
+-class Event:
+-    id: int
+-    task_id: str
+-    kind: str
+-    payload: Optional[dict]
+-    created_at: int
+-    run_id: Optional[int] = None
+-
+-    @classmethod
+-    def from_row(cls, row: sqlite3.Row) -> Event:
+-        run_id = _row_get(row, "run_id")
+-        return cls(
+-            id=row["id"], task_id=row["task_id"], kind=_lossy_text(row["kind"]),
+-            payload=_json_or(_lossy_text(row["payload"])), created_at=_to_epoch(row["created_at"]) or 0,
+-            run_id=_opt_int(run_id),
+-        )
+-
+-
+ # --- Schema ---
+ 
+ SCHEMA_SQL = """
+diff --git a/hermes_cli/kanban_db_event.py b/hermes_cli/kanban_db_event.py
+new file mode 100644
+index 0000000000..0790d2886d
+--- /dev/null
++++ b/hermes_cli/kanban_db_event.py
+@@ -0,0 +1,27 @@
++"""The ``Event`` row dataclass; ``kanban_db`` re-exports it as ``kb.Event``."""
++from __future__ import annotations
++
++import sqlite3
++from dataclasses import dataclass
++from typing import Optional
++
++
++@dataclass
++class Event:
++    id: int
++    task_id: str
++    kind: str
++    payload: Optional[dict]
++    created_at: int
++    run_id: Optional[int] = None
++    uid: Optional[str] = None  # stable cross-replica ID; None on pre-UID schemas
++
++    @classmethod
++    def from_row(cls, row: sqlite3.Row) -> Event:
++        from hermes_cli.kanban_db import _json_or, _lossy_text, _opt_int, _row_get, _to_epoch
++
++        return cls(
++            id=row["id"], task_id=row["task_id"], kind=_lossy_text(row["kind"]),
++            payload=_json_or(_lossy_text(row["payload"])), created_at=_to_epoch(row["created_at"]) or 0,
++            run_id=_opt_int(_row_get(row, "run_id")), uid=_row_get(row, "uid"),
++        )
+diff --git a/tests/hermes_cli/test_kanban_ask_backfill.py b/tests/hermes_cli/test_kanban_ask_backfill.py
+index 8fb75b91d3..75019dd093 100644
+--- a/tests/hermes_cli/test_kanban_ask_backfill.py
++++ b/tests/hermes_cli/test_kanban_ask_backfill.py
+@@ -50,7 +50,8 @@ def test_old_drop_is_marked_once_with_one_reemitted_event(board, kind):
+         assert _count(conn) == events + 1 and kwc.get_state(conn, tid) is None
+         emitted = max(kb.list_events(conn, tid), key=lambda e: e.id)
+         assert emitted.kind == kind
+-        assert emitted.payload == {"backfilled": True, "origin_event_id": original.id}
++        reference = {"origin_event_uid": original.uid} if original.uid else {"origin_event_id": original.id}
++        assert emitted.payload == {"backfilled": True, **reference}
+         assert kb.get_task(conn, tid).status == "blocked"
+         before = _snapshot(conn)
+         assert not any(kar.reconcile(conn, now=199999).values())
+diff --git a/tests/hermes_cli/test_kanban_drop_backfill_sync.py b/tests/hermes_cli/test_kanban_drop_backfill_sync.py
+new file mode 100644
+index 0000000000..a8cf7b7e42
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_drop_backfill_sync.py
+@@ -0,0 +1,107 @@
++"""Backfill dedup follows event UIDs through the real Board transport, not local row IDs."""
++from contextlib import closing
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_ask_resolved as kar
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli.kanban_block_notice import coalesce_superseded_blocks
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_ask_backfill import _legacy
++from tests.hermes_cli.test_kanban_resolved_check_drop_notice import _assert_drop_wording, _drop
++from tui_gateway import server
++
++
++@pytest.mark.parametrize("kind", [kar.BROKEN_EVENT, kar.LOST_EVENT])
++def test_transport_remaps_drop_ids_but_origin_gets_exactly_one_notice(tmp_path, monkeypatch, kind):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    source_path, receiver_path = home / "source.db", home / "kanban.db"
++    svc = FakeService()
++    with closing(kbc.connect(source_path)) as source, closing(kbc.connect(receiver_path)) as receiver:
++        ksc.ensure_identity(source, "default", "source")
++        ksc.ensure_identity(receiver, "default", "receiver")
++        # Receiver-only history deliberately shifts every imported integer event ID.
++        padding = kb.create_task(receiver, title="receiver history")
++        with kb.write_txn(receiver):
++            for _ in range(20):
++                kb._append_event(receiver, padding, "commented", {})
++        tid = kb.create_task(source, title="DNS", assignee="worker")
++        _drop(source, tid, produce=False)
++        _legacy(source, tid, kind)
++        original = max(kb.list_events(source, tid), key=lambda e: e.id)
++        assert original.uid
++        kar.reconcile(source, now=9000)
++        replay = max(kb.list_events(source, tid), key=lambda e: e.id)
++        assert replay.payload == {"backfilled": True, "origin_event_uid": original.uid}
++        ksc.push(source, svc.hub("source"), "default", "source", primary=False)
++        ksc.pull(receiver, svc.hub("receiver"), "default", observers=True)
++        drops = sorted((e for e in kb.list_events(receiver, tid) if e.kind == kind), key=lambda e: e.id)
++        assert len(drops) == 2
++        assert drops[0].id != original.id and drops[0].uid == original.uid
++        assert drops[1].payload == replay.payload  # payload not rewritten by transport
++        kbn.add_notify_sub(receiver, task_id=tid, platform="tui", chat_id="sync-drop")
++        with kb.write_txn(receiver):
++            receiver.execute("UPDATE kanban_notify_subs SET last_event_id=? WHERE task_id=?",
++                             (drops[0].id - 1, tid))  # original drop is still unconsumed
++        claims = []
++        texts = server._collect_kanban_notifications({"session_key": "sync-drop"}, claims)
++        assert len(texts) == len(claims) == 1, texts
++        _assert_drop_wording(texts[0])
++        claim = claims[0]
++        assert kbn.ack_notify_claim(receiver, task_id=tid, platform="tui", chat_id="sync-drop", thread_id="",
++                                    upto=claim["new"], from_cursor=claim["old"])
++        assert server._collect_kanban_notifications({"session_key": "sync-drop"}) == []
++
++
++def test_numeric_fallback_never_suppresses_synced_events_or_overrides_uid():
++    old = SimpleNamespace(id=1, kind=kar.BROKEN_EVENT, uid="receiver-origin", payload={})
++    replay = SimpleNamespace(id=2, kind=old.kind, uid="receiver-replay",
++                             payload={"backfilled": True, "origin_event_id": 1})
++    assert coalesce_superseded_blocks([old, replay]) == [old, replay]
++    replay.payload["origin_event_uid"] = "different-origin"
++    assert coalesce_superseded_blocks([old, replay]) == [old, replay]
++    replay.payload["origin_event_uid"] = old.uid
++    assert coalesce_superseded_blocks([old, replay]) == [replay]
++    replay.kind = kar.LOST_EVENT
++    assert coalesce_superseded_blocks([old, replay]) == [old, replay]
++
++
++def _event_row(with_uid):
++    import sqlite3
++    c = sqlite3.connect(":memory:")
++    c.row_factory = sqlite3.Row
++    c.execute("CREATE TABLE e (id INTEGER, task_id TEXT, kind TEXT, payload TEXT, created_at INTEGER"
++              + (", uid TEXT)" if with_uid else ")"))
++    c.execute("INSERT INTO e VALUES (1, 't', 'k', '{\"a\": 1}', 5" + (", 'u-1')" if with_uid else ")"))
++    return c.execute("SELECT * FROM e").fetchone()
++
++
++@pytest.mark.parametrize("with_uid,uid", [(True, "u-1"), (False, None)])
++def test_event_from_row_uid_and_uidless(with_uid, uid):
++    from hermes_cli.kanban_db_event import Event
++    ev = kb.Event.from_row(_event_row(with_uid))
++    assert (ev.uid, ev.payload, ev.run_id, ev.created_at) == (uid, {"a": 1}, None, 5)
++    assert kb.Event is Event
++
++
++@pytest.mark.parametrize("payload,origin_uid,suppressed", [
++    ({"origin_event_uid": "u", "origin_event_id": 9}, "u", True),    # UID match suppresses
++    ({"origin_event_uid": "u"}, "other", False),                      # UID mismatch keeps
++    ({"origin_event_id": 1}, None, True),                             # UID-less local id suppresses
++    ({"origin_event_uid": "", "origin_event_id": 1}, None, False),    # empty uid: no id fallback
++    ({"origin_event_uid": 7, "origin_event_id": 1}, None, False),     # non-string uid: no id fallback
++    ({"origin_event_id": 1}, "z", False),                             # origin has uid: local id ignored
++    ({"origin_event_id": "bad"}, None, False),                        # malformed local id ignored
++])
++def test_origin_uid_guards(payload, origin_uid, suppressed):
++    from hermes_cli.kanban_block_notice import _drop_backfilled_origins
++    kind = kar.BROKEN_EVENT
++    origin = SimpleNamespace(id=1, kind=kind, payload=None, uid=origin_uid)
++    replay = SimpleNamespace(id=2, kind=kind, payload={"backfilled": True, **payload}, uid=None)
++    assert [e.id for e in _drop_backfilled_origins([origin, replay])] == ([2] if suppressed else [1, 2])
+diff --git a/tests/hermes_cli/test_kanban_resolved_check_drop_notice.py b/tests/hermes_cli/test_kanban_resolved_check_drop_notice.py
+index 538926d6c7..129c02521b 100644
+--- a/tests/hermes_cli/test_kanban_resolved_check_drop_notice.py
++++ b/tests/hermes_cli/test_kanban_resolved_check_drop_notice.py
+@@ -179,7 +179,8 @@ def test_legacy_drop_is_notified_once_after_backfill(tmp_path, monkeypatch, even
+         _assert_drop_wording(texts[0])
+         drops = sorted((e for e in kb.list_events(conn, tid) if e.kind == event), key=lambda e: e.id)
+         assert len(drops) == 2
+-        assert drops[-1].payload == {"backfilled": True, "origin_event_id": original.id}
++        reference = {"origin_event_uid": original.uid} if original.uid else {"origin_event_id": original.id}
++        assert drops[-1].payload == {"backfilled": True, **reference}
+         request = kar._request(kb.get_task(conn, tid).human_request)
+         assert request["resolved_check_dropped_at"] == DROPPED_AT
+         assert request["resolved_check_drop_reason"] == event
+-- 
+2.43.0
+

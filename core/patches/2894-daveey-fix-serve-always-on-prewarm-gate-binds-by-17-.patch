@@ -1,0 +1,254 @@
+From 7b7b115c3ef02ae5e3063e9645feadd0626f301c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:25:55 +0000
+Subject: [PATCH] [daveey] fix(serve): always-on prewarm gate binds by 17 s
+ after process start and names the prewarm still running
+
+Follow-up nits from review 5878436696 on PR #1580 (t_01a1d0aa320933ea):
+- Hub boot-to-bind measured 11.4-18.4 s (median ~14 s) over 30 restarts, not 10-12 s, so a fixed 6 s gate on a slow
+  boot could bind past Desktop's 20 s always-on attach window. The 6 s budget now also ends 17 s after process start
+  (psutil create_time; unknown or >300 s age falls back to the plain 6 s).
+- The budget-spent agent.log line names the prewarm(s) still running: board, session annotation or project tree (the
+  annotation thread records which step it is in), plus the budget used and the process age at the gate.
+---
+ hermes_cli/boot_warmup_gate.py            | 74 +++++++++++++++++++++--
+ hermes_cli/kanban_annotation_prewarm.py   |  9 +++
+ tests/hermes_cli/test_boot_warmup_gate.py | 71 ++++++++++++++++++++++
+ 3 files changed, 148 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/boot_warmup_gate.py b/hermes_cli/boot_warmup_gate.py
+index c83ea74e60..8804dce1f2 100644
+--- a/hermes_cli/boot_warmup_gate.py
++++ b/hermes_cli/boot_warmup_gate.py
+@@ -11,7 +11,8 @@ elapsed_s=39.274``) and the Desktop's 6 s / 30 s request deadlines expired: a ti
+ uvicorn runs the lifespan startup before it binds, so waiting here keeps the port closed while the prewarms run
+ uncontended. Desktop's always-on attach treats a closed port as "waiting for its supervisor restart" and keeps
+ failing fast for up to 20 s (``ALWAYS_ON_RESTART_WAIT_MS`` in ``apps/desktop/electron/remote-lifecycle.ts``), then
+-attaches to a warm backend. The wait is bounded well inside that window so a slow warm-up degrades to today's
++attaches to a warm backend. The wait is bounded inside that window (at most 6 s, and over by 17 s after process
++start, since boot alone takes 11-18 s on the hub) so a slow warm-up degrades to today's
+ behaviour (bind with prewarms still running) instead of pushing Desktop onto a second, colder owned backend.
+ 
+ Only the always-on backend waits: a Desktop-owned ``serve --isolated`` is dialled with a 10 s ready probe and must
+@@ -28,8 +29,19 @@ from typing import Callable, Iterable, Optional
+ 
+ log = logging.getLogger(__name__)
+ 
+-# Boot to bind is ~10-12 s on hermes-hub; with Desktop's 20 s restart wait this leaves several seconds of slack.
++# The wait is at most this long...
+ ALWAYS_ON_WARMUP_BUDGET_S = 6.0
++# ...and ends this many seconds after process start, whichever comes first. Boot to bind on hermes-hub measured
++# 11.4-18.4 s (median ~14 s) over 30 restarts on 2026-11-12, so a fixed 6 s on top of a slow boot would bind past
++# Desktop's 20 s always-on attach window (``ALWAYS_ON_RESTART_WAIT_MS``). That window opens when Desktop sees the old
++# process gone, before the supervisor has started this one, so the deadline keeps ~3 s of slack for the restart.
++ALWAYS_ON_BIND_DEADLINE_S = 17.0
++# A process older than this at the gate is not a fresh boot (or its start time is wrong): use the plain budget.
++_MAX_PLAUSIBLE_BOOT_S = 300.0
++
++# Thread names the budget-spent log line translates (the annotation thread reports its current step).
++_BOARD_THREAD = "kanban-board-prewarm"
++_ANNOTATION_THREAD = "kanban-annotation-prewarm"
+ 
+ 
+ def join_within(threads: Iterable[Optional[threading.Thread]], budget_s: float, *,
+@@ -60,17 +72,67 @@ def boot_prewarm_threads() -> list[threading.Thread]:
+     return threads
+ 
+ 
++def process_age_s() -> Optional[float]:
++    """Seconds since this process started, or None when unknown or implausible."""
++    try:
++        import psutil
++
++        age = time.time() - psutil.Process().create_time()
++    except Exception:  # health: allow BLE001 -- an unknown age falls back to the plain budget
++        return None
++    return age if 0 <= age <= _MAX_PLAUSIBLE_BOOT_S else None
++
++
++def warmup_budget_s(age_s: Optional[float], budget_s: float = ALWAYS_ON_WARMUP_BUDGET_S,
++                    deadline_s: float = ALWAYS_ON_BIND_DEADLINE_S) -> float:
++    """The wait left: ``budget_s``, cut so the bind lands by ``deadline_s`` after process start (never negative)."""
++    if age_s is None:
++        return budget_s
++    return max(0.0, min(budget_s, deadline_s - age_s))
++
++
++def running_prewarm_names(threads: Iterable[threading.Thread]) -> list[str]:
++    """Name each still-running prewarm (board / session annotation / project tree) for the budget-spent log."""
++    names = []
++    for thread in threads:
++        if not thread.is_alive():
++            continue
++        if thread.name == _BOARD_THREAD:
++            names.append("board")
++        elif thread.name == _ANNOTATION_THREAD:
++            try:
++                from hermes_cli.kanban_annotation_prewarm import boot_phase
++
++                names.append(boot_phase())
++            except Exception:  # health: allow BLE001 -- the label is diagnostics only
++                names.append("session annotation / project tree")
++        else:
++            names.append(thread.name)
++    return names
++
++
+ def hold_bind_for_prewarm(budget_s: Optional[float] = None) -> Optional[tuple[float, int]]:
+-    """In the always-on backend only: wait (bounded) for the boot prewarms before the socket binds. Never raises."""
++    """In the always-on backend only: wait (bounded) for the boot prewarms before the socket binds. Never raises.
++
++    Without an explicit ``budget_s`` the wait is ``ALWAYS_ON_WARMUP_BUDGET_S``, cut to end by
++    ``ALWAYS_ON_BIND_DEADLINE_S`` after process start."""
+     try:
+         from hermes_cli.always_on_dashboard import always_on_enabled
+ 
+         if not always_on_enabled():
+             return None
+         threads = boot_prewarm_threads()
+-        elapsed, running = join_within(threads, ALWAYS_ON_WARMUP_BUDGET_S if budget_s is None else budget_s)
+-        log.info("always-on dashboard: boot prewarm %s after %.2fs (%d thread(s), %d still running); binding",
+-                 "finished" if not running else "budget spent", elapsed, len(threads), running)
++        age = process_age_s()
++        budget = warmup_budget_s(age) if budget_s is None else budget_s
++        elapsed, running = join_within(threads, budget)
++        age_note = "?" if age is None else f"{age:.1f}s"
++        if running:
++            log.info("always-on dashboard: boot prewarm budget spent after %.2fs of %.2fs (process age %s at gate; "
++                     "%d thread(s), %d still running: %s); binding", elapsed, budget, age_note, len(threads),
++                     running, ", ".join(running_prewarm_names(threads)))
++        else:
++            log.info("always-on dashboard: boot prewarm finished after %.2fs of %.2fs (process age %s at gate; "
++                     "%d thread(s)); binding", elapsed, budget, age_note, len(threads))
+         return elapsed, running
+     except Exception:  # health: allow BLE001 -- the gate is an optimisation; binding must never depend on it
+         log.warning("always-on dashboard: boot prewarm gate failed; binding now", exc_info=True)
+diff --git a/hermes_cli/kanban_annotation_prewarm.py b/hermes_cli/kanban_annotation_prewarm.py
+index 10890acc15..ff5bb1d3be 100644
+--- a/hermes_cli/kanban_annotation_prewarm.py
++++ b/hermes_cli/kanban_annotation_prewarm.py
+@@ -18,6 +18,8 @@ from typing import Optional
+ log = logging.getLogger(__name__)
+ 
+ _boot_thread: list[Optional[threading.Thread]] = [None]
++# Which step the boot thread is in, so the bind gate's budget-spent line names the slow one.
++_boot_phase: list[str] = ["session annotation"]
+ 
+ 
+ def boot_thread() -> Optional[threading.Thread]:
+@@ -25,6 +27,11 @@ def boot_thread() -> Optional[threading.Thread]:
+     return _boot_thread[0]
+ 
+ 
++def boot_phase() -> str:
++    """The step the boot thread is in: ``session annotation``, then ``project tree``."""
++    return _boot_phase[0]
++
++
+ def prewarm_annotation() -> bool:
+     """Build this process's annotation snapshot (and the remote-links projection under it). Never raises."""
+     try:
+@@ -38,9 +45,11 @@ def prewarm_annotation() -> bool:
+ 
+ def _boot_prewarm() -> None:
+     """The annotation first (every session read waits on it), then the project tree, which reads that annotation."""
++    _boot_phase[0] = "session annotation"
+     prewarm_annotation()
+     from hermes_cli.projects_tree_prewarm import prewarm_project_tree
+ 
++    _boot_phase[0] = "project tree"
+     prewarm_project_tree()
+ 
+ 
+diff --git a/tests/hermes_cli/test_boot_warmup_gate.py b/tests/hermes_cli/test_boot_warmup_gate.py
+index 4602c9ed68..f9ac8b5c59 100644
+--- a/tests/hermes_cli/test_boot_warmup_gate.py
++++ b/tests/hermes_cli/test_boot_warmup_gate.py
+@@ -74,6 +74,75 @@ def test_hold_gives_up_at_the_budget_and_never_raises(monkeypatch):
+     assert gate.hold_bind_for_prewarm(budget_s=0.2) is None
+ 
+ 
++def test_budget_ends_at_the_bind_deadline_after_process_start():
++    # Hub boot-to-bind measured 11.4-18.4 s: a fixed 6 s on top of a slow boot overruns Desktop's 20 s attach window.
++    assert gate.warmup_budget_s(None) == gate.ALWAYS_ON_WARMUP_BUDGET_S == 6.0
++    assert gate.warmup_budget_s(5.0) == 6.0
++    assert gate.warmup_budget_s(13.0) == gate.ALWAYS_ON_BIND_DEADLINE_S - 13.0
++    assert gate.warmup_budget_s(18.4) == 0.0
++
++
++def test_process_age_is_none_when_unknown_or_implausible(monkeypatch):
++    import psutil
++
++    age = gate.process_age_s()
++    assert age is None or 0 <= age <= 300
++    monkeypatch.setattr(psutil.Process, "create_time", lambda self: time.time() - 3600)
++    assert gate.process_age_s() is None
++    monkeypatch.setattr(psutil.Process, "create_time", lambda self: 1 / 0)
++    assert gate.process_age_s() is None
++
++
++def test_hold_on_a_slow_boot_binds_by_the_deadline(monkeypatch):
++    monkeypatch.setenv(ENV_FLAG, "1")
++    release = threading.Event()
++    thread = _gated_thread(release, threading.Event())
++    monkeypatch.setattr(gate, "boot_prewarm_threads", lambda: [thread])
++    monkeypatch.setattr(gate, "process_age_s", lambda: 16.8, raising=False)  # 0.2 s before the 17 s deadline
++    try:
++        started = time.monotonic()
++        result = gate.hold_bind_for_prewarm()
++        assert result is not None
++        elapsed, running = result
++        assert running == 1 and elapsed < 1.5 and time.monotonic() - started < 1.5  # not the full 6 s
++    finally:
++        release.set()
++
++
++def test_budget_spent_line_names_the_prewarms_still_running(monkeypatch, caplog):
++    monkeypatch.setenv(ENV_FLAG, "1")
++    monkeypatch.setattr(kanban_annotation_prewarm, "_boot_phase", ["project tree"], raising=False)
++    release = threading.Event()
++    board = threading.Thread(target=release.wait, args=(10,), daemon=True, name="kanban-board-prewarm")
++    annotation = threading.Thread(target=release.wait, args=(10,), daemon=True, name="kanban-annotation-prewarm")
++    finished = threading.Thread(target=lambda: None, name="kanban-board-prewarm")
++    for thread in (board, annotation, finished):
++        thread.start()
++    finished.join(5)
++    monkeypatch.setattr(gate, "boot_prewarm_threads", lambda: [finished, board, annotation])
++    try:
++        with caplog.at_level("INFO", logger=gate.log.name):
++            result = gate.hold_bind_for_prewarm(budget_s=0.1)
++        assert result is not None and result[1] == 2
++    finally:
++        release.set()
++    line = next(r.getMessage() for r in caplog.records if "boot prewarm budget spent" in r.getMessage())
++    assert "2 still running: board, project tree); binding" in line, line
++
++
++def test_annotation_boot_thread_reports_its_current_step(monkeypatch):
++    from hermes_cli import projects_tree_prewarm
++
++    seen = []
++    monkeypatch.setattr(kanban_annotation_prewarm, "_boot_phase", ["project tree"])
++    monkeypatch.setattr(kanban_annotation_prewarm, "prewarm_annotation",
++                        lambda: seen.append(kanban_annotation_prewarm.boot_phase()))
++    monkeypatch.setattr(projects_tree_prewarm, "prewarm_project_tree",
++                        lambda: seen.append(kanban_annotation_prewarm.boot_phase()))
++    kanban_annotation_prewarm._boot_prewarm()
++    assert seen == ["session annotation", "project tree"]
++
++
+ def test_boot_prewarm_threads_are_the_ones_the_prewarms_started(monkeypatch):
+     first, second = threading.Thread(target=lambda: None), threading.Thread(target=lambda: None)
+     monkeypatch.setattr(kanban_annotation_prewarm, "_boot_thread", [first])
+@@ -110,6 +179,8 @@ def _serve_startup(monkeypatch, *, always_on: bool) -> tuple[bool, list]:
+     thread = _gated_thread(release, done)
+     threading.Timer(0.3, release.set).start()
+     monkeypatch.setattr(gate, "boot_prewarm_threads", lambda: [thread])
++    # A fresh boot (the test process itself is older than the bind deadline).
++    monkeypatch.setattr(gate, "process_age_s", lambda: 1.0, raising=False)
+     joined, real_join = [], gate.join_within
+     monkeypatch.setattr(gate, "join_within", lambda threads, budget_s: joined.append(list(threads)) or
+                         real_join(threads, budget_s))
+-- 
+2.43.0
+

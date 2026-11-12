@@ -1,0 +1,750 @@
+From 40d38696af49d203e52983238cc6f8a71573ed64 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 14:18:54 +0000
+Subject: [PATCH] fix(kanban-sync): hub CPU reports survive process stalls and
+ gateway restarts [daveey]
+
+hermes-hub 2026-11-12 (PR #1429 live probe, run 5 and runs 1-3):
+
+- 13:41:46-13:42:11, 13:42:12-13:42:46 and 13:42:58-13:43:26 the whole gateway
+  process stalled (control loop blocked 24.4 s; the advisory sampler's own
+  windows 25.3/34.2/27.8 s; worker.persist 25.2 s). The sender shares no lock
+  with the Board round that hung; it froze with everything else. Its late ticks
+  at 13:42:12 and 13:43:27 ran ~0.3 s before the sampler's restarted window
+  closed and sent the hub row CPU-less, erasing its triple, and the half-period
+  guard then skipped the next anchor (skipped=1/2).
+  * report_tick waits at most CPU_WAIT_S (1.5 s) for the sampler's next sample
+    (AdvisorySampler.wait_fresh); never on the loop thread.
+  * While the root gate is ON a CPU-less report is withheld unless nothing was
+    sent for KEEPALIVE_S (30 s, inside the Board's 90 s stale limit); the
+    sender logs `metrics_sender withheld ...` and counts withheld=N.
+  * A late send less than half a period before the next anchor delays that
+    tick until it is spaced instead of skipping it.
+  * The loop's takeover while ON (sender stalled or dead) sends through the
+    sender's bounded 2 s transport, not the kept-alive Hub's 30 s path.
+  * The stall WARNING no longer claims "the sync loop reports meanwhile"; it
+    says whether a tick is in flight (PR #1429 review nit).
+- Each of the 7 core-update restarts: the root gateway found a profile gateway
+  (askeve-reviewer/-builder) holding .sync.lock, posted its root claim, then
+  slept the full 30 s retry (contention 30-31 s every time). A root lease with
+  its claim posted now retries every ROOT_CLAIM_RETRY_SECONDS (2 s).
+
+Tests: bare skipif -> platforms("linux") marker (review nit). The
+`metrics_sender send` line keys are unchanged.
+---
+ gateway/kanban_singleton.py                   |  12 +-
+ gateway/kanban_watchers.py                    |   4 +-
+ hermes_cli/kanban_sync_client.py              |   1 +
+ hermes_cli/machine_cpu_sampler.py             |  18 +-
+ hermes_cli/machine_metrics.py                 |  38 ++-
+ hermes_cli/machine_metrics_sender.py          |  54 +++-
+ tests/gateway/test_kanban_singleton_lease.py  |  41 ++-
+ .../hermes_cli/test_machine_metrics_sender.py |  15 +-
+ .../test_machine_metrics_sender_stalls.py     | 241 ++++++++++++++++++
+ 9 files changed, 400 insertions(+), 24 deletions(-)
+ create mode 100644 tests/hermes_cli/test_machine_metrics_sender_stalls.py
+
+diff --git a/gateway/kanban_singleton.py b/gateway/kanban_singleton.py
+index 13e9082384..f1ee3b7c81 100644
+--- a/gateway/kanban_singleton.py
++++ b/gateway/kanban_singleton.py
+@@ -35,6 +35,9 @@ DEFAULT_RETRY_SECONDS = 30.0
+ DEFAULT_GRACE_SECONDS = 60.0
+ DEFAULT_WARN_AFTER_SECONDS = 300.0
+ _YIELD_CACHE_SECONDS = 5.0
++# A root gateway whose claim is posted retries this often: the profile holder yields within ~_YIELD_CACHE_SECONDS plus
++# its loop's next check, and every second the lock sits idle is a second without the hub's sync (and CPU reports).
++ROOT_CLAIM_RETRY_SECONDS = 2.0
+ 
+ 
+ def _resolve(path: Path) -> str:
+@@ -250,11 +253,18 @@ class SingletonLease:
+         if not self._logged_contended:
+             self._logged_contended = True
+             logger.info("kanban %s: another gateway holds %s (%s); retrying every %.0fs%s", self.name,
+-                        self.lock_path, describe_holder(holder_info(self.lock_path)), self.retry_seconds,
++                        self.lock_path, describe_holder(holder_info(self.lock_path)), self.retry_interval(),
+                         " and asking a profile holder to yield" if self.root else "")
+         self._maybe_warn(now)
+         return False
+ 
++    def retry_interval(self) -> float:
++        """Seconds until the next ``try_acquire``: short while this root gateway's claim asks a holder to yield
++        (hermes-hub 2026-11-12: the full 30 s retry made every core-update restart cost 30-31 s of contention)."""
++        if self.root and self.state == "contended":
++            return min(self.retry_seconds, ROOT_CLAIM_RETRY_SECONDS)
++        return self.retry_seconds
++
+     def _maybe_warn(self, now: float) -> None:
+         if self._contended_since is None or now - self._contended_since < self.warn_after_seconds:
+             return
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 2dccfde6e6..574d285f00 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -68,11 +68,11 @@ class GatewayKanbanWatchersMixin:
+                                   warn_after_seconds=_ks.DEFAULT_WARN_AFTER_SECONDS)
+ 
+     async def _acquire_kanban_lease(self, lease) -> bool:
+-        """Retry *lease* every ``lease.retry_seconds`` until held; False when the gateway stops first."""
++        """Retry *lease* every ``lease.retry_interval()`` until held; False when the gateway stops first."""
+         while self._running:
+             if lease.try_acquire():
+                 return True
+-            await self._sleep_between_ticks(lease.retry_seconds)
++            await self._sleep_between_ticks(lease.retry_interval())
+         return False
+ 
+     async def _sleep_between_ticks(self, interval: float) -> None:
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 3b7532d5bb..615c5d5572 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1484,6 +1484,7 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+     from hermes_cli.machine_cpu_sampler import AdvisorySampler
+     sampler = AdvisorySampler()
+     metrics.cpu_take_fn = sampler.take
++    metrics.cpu_wait_fn = getattr(sampler, "wait_fresh", None)  # the sender's bounded wait; never on this thread
+     sampler.start()
+     # While the CPU gate is on, reports go out on their own anchored thread, each send bounded to 2 s. [daveey]
+     from hermes_cli.machine_metrics_sender import MetricsSender, board_post
+diff --git a/hermes_cli/machine_cpu_sampler.py b/hermes_cli/machine_cpu_sampler.py
+index 2d1da25790..8105d3421d 100644
+--- a/hermes_cli/machine_cpu_sampler.py
++++ b/hermes_cli/machine_cpu_sampler.py
+@@ -22,7 +22,7 @@ stale (fail-closed).
+ from __future__ import annotations
+ 
+ import logging
+-from threading import Event, Lock, Thread, current_thread  # bound now: loop tests stub threading.Thread
++from threading import Condition, Event, Lock, Thread, current_thread  # bound now: loop tests stub threading.Thread
+ import time
+ from typing import Any, Callable, Optional
+ 
+@@ -72,6 +72,7 @@ class AdvisorySampler:
+         self.consecutive_drops = 0
+         self.records = 0
+         self._lock = Lock()
++        self._published = Condition(self._lock)  # notified when a new sample is published
+         self._prev: Optional[tuple[tuple[int, int], float, int]] = None  # (counters, monotonic, wall end ms)
+         self._latest: Optional[tuple[dict, Any]] = None  # (sample, limit it was measured under)
+         self._taken: Optional[tuple] = None
+@@ -114,6 +115,7 @@ class AdvisorySampler:
+         self.consecutive_drops = 0
+         with self._lock:
+             self._latest = (dict(measured), limit)
++            self._published.notify_all()
+         self.records += 1
+         _STATUS.update(records=self.records, consecutive_drops=0, last_end_ms=measured["cpu_busy_sample_end_ms"])
+         now = self.clock()
+@@ -125,6 +127,20 @@ class AdvisorySampler:
+                 _log.debug("hub CPU advisory sample not recorded: %s", exc)
+         return measured
+ 
++    def _takeable(self) -> bool:
++        latest = self._latest
++        if latest is None or latest is self._taken:
++            return False
++        return 0 <= int(self.wall() * 1000) - latest[0]["cpu_busy_sample_end_ms"] <= REPORT_MAX_AGE_MS
++
++    def wait_fresh(self, timeout: float) -> bool:
++        """Block at most *timeout* s until a sample is ready for :meth:`take` (not yet reported, fresh enough).
++
++        For the anchored metrics sender only (never the sync loop thread): after a process-wide stall the sampler drops
++        the over-long window and restarts it, so its next sample is ~1 s away when the sender's late tick runs."""
++        with self._published:
++            return self._published.wait_for(self._takeable, timeout)
++
+     def take(self, limit: Any) -> Optional[dict]:
+         """The newest sample for one metrics report: measured under *limit*, not yet reported, and ending at most
+         REPORT_MAX_AGE_MS before now (wall clock, like the Board's check). Otherwise None: no triple is sent."""
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 16b0995ea0..6788fdb597 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -31,6 +31,12 @@ _log = logging.getLogger(__name__)
+ REPORT_EVERY_S = 10.0
+ # A Board without the route (older deploy) answers 404/405: ask again rarely, not every 10 s.
+ UNSUPPORTED_RETRY_S = 600.0
++# The anchored sender waits at most this long for the advisory sampler's next sample when it has none fresh (a stalled
++# process restarts the sampler's window: its next sample is one ~1 s window away). Never on the loop thread.
++CPU_WAIT_S = 1.5
++# While the root CPU gate is on, a report without the CPU triple would erase the Board row's triple: it goes out only
++# as a keepalive, when no report was sent for this long (well inside the Board's 90 s stale-signal limit).
++KEEPALIVE_S = 30.0
+ _GB = 1024 ** 3
+ 
+ 
+@@ -202,6 +208,10 @@ class Reporter:
+         # loop's next_at is always a full period after the latest start; the sender checks started_at).
+         self._lock = threading.Lock()
+         self.started_at: Optional[float] = None
++        # The sender path's bounded wait for a fresh sample (the sync loop sets AdvisorySampler.wait_fresh).
++        self.cpu_wait_fn: Optional[Callable[[float], Any]] = None
++        self.sent_at: Optional[float] = None  # the latest report actually sent (either path)
++        self.suppressed = 0  # CPU-less reports withheld while the gate was on
+ 
+     def _sample(self, sample: dict, measured: Optional[dict]) -> dict:
+         from hermes_cli import kanban_sync_timing as timing
+@@ -214,7 +224,9 @@ class Reporter:
+     def _spaced(self, now: float) -> bool:
+         return self.started_at is None or now - self.started_at >= REPORT_EVERY_S / 2
+ 
+-    def report_due(self) -> bool:
++    def report_due(self, send: Optional[Callable[[dict], Any]] = None) -> bool:
++        """The sync loop's report (through *send*, default the Reporter's own): True sent; False not due, failed, or
++        withheld (a CPU-less report while the gate is on and a report was sent within KEEPALIVE_S)."""
+         if not self._lock.acquire(blocking=False):
+             return False  # the sender thread is reporting right now
+         try:
+@@ -222,7 +234,7 @@ class Reporter:
+             if now < self.next_at:
+                 return False
+             self.next_at = now + REPORT_EVERY_S
+-            return self._report(now, self.send)
++            return self._report(now, send or self.send) is True
+         finally:
+             self._lock.release()
+ 
+@@ -239,13 +251,17 @@ class Reporter:
+             now = self.clock()
+             if self.next_at - now > REPORT_EVERY_S or not self._spaced(now):
+                 return None
++            next_at = self.next_at
+             self.next_at = now + REPORT_EVERY_S
+-            return self._report(now, send)
++            result = self._report(now, send, wait=True)
++            if result is None:
++                self.next_at = next_at  # nothing was sent: the loop's own due time is unchanged
++            return result
+         finally:
+             self._lock.release()
+ 
+-    def _report(self, now: float, send: Callable[[dict], Any]) -> bool:
+-        self.started_at = now
++    def _report(self, now: float, send: Callable[[dict], Any], wait: bool = False) -> Optional[bool]:
++        """Collect, attach the CPU triple and send. None: withheld (CPU-less while the gate is on, see KEEPALIVE_S)."""
+         try:
+             from hermes_cli import kanban_sync_timing as timing
+             from hermes_cli import machine_cpu_metrics as cpu
+@@ -258,6 +274,16 @@ class Reporter:
+             if state == cpu.ON and self.cpu_take_fn is not None:
+                 with timing.span("cpu"):  # nonblocking: the sampler's newest unreported sample
+                     measured = self.cpu_take_fn(limit)
++                if measured is None and wait and self.cpu_wait_fn is not None:
++                    # [daveey] hermes-hub 2026-11-12 13:42:12 / 13:43:27: the tick ran ~0.3 s after a process-wide stall
++                    # ended, before the sampler's restarted window closed, and sent the row CPU-less. Wait (bounded).
++                    if self.cpu_wait_fn(CPU_WAIT_S):
++                        measured = self.cpu_take_fn(limit)
++            if state == cpu.ON and not (measured and all(k in measured for k in cpu.FIELDS)):
++                if self.sent_at is not None and self.clock() - self.sent_at < KEEPALIVE_S:
++                    self.suppressed += 1
++                    timing.note_cpu_sample(measured)
++                    return None  # withheld: it would erase the Board row's CPU triple
+             sample = self._sample(sample, measured)
+             if now < self.counters_off_until:  # this Board rejected them lately: the normal report only
+                 from hermes_cli.machine_throughput_metrics import FIELDS
+@@ -265,8 +291,10 @@ class Reporter:
+ 
+             def counters_rejected() -> None:
+                 self.counters_off_until = now + UNSUPPORTED_RETRY_S
++            self.started_at = now
+             with timing.span("send"):  # preserve the transport's existing hard 2 s budget
+                 send_compatible(send, sample, counters_rejected)
++            self.sent_at = self.clock()  # a failed send left the row as it was: it is no keepalive
+             return True
+         except Exception as exc:  # health: allow BLE001 -- load reporting must never stop kanban sync
+             status = getattr(exc, "status", None)
+diff --git a/hermes_cli/machine_metrics_sender.py b/hermes_cli/machine_metrics_sender.py
+index ccbbb52dc4..21f43b1768 100644
+--- a/hermes_cli/machine_metrics_sender.py
++++ b/hermes_cli/machine_metrics_sender.py
+@@ -11,7 +11,11 @@ entered, so every late call pushed the next one later and a tick that woke earli
+ starts beside the CPU advisory sampler and closes (bounded join) in the same ``finally``:
+ 
+ - Tick ``k`` is due at ``t0 + k * REPORT_EVERY_S`` on the monotonic clock. A tick that overruns one or more anchors
+-  skips them (no burst): the next tick is the next future anchor, so cadence never drifts with send time.
++  skips them (no burst): the next tick is the next future anchor, so cadence never drifts with send time. When a late
++  send came less than half a period before that anchor, the tick waits until it is spaced instead of skipping.
++- With no fresh CPU sample (the sampler restarts its window after a process-wide stall) a tick waits at most
++  ``machine_metrics.CPU_WAIT_S`` for the next one; still none, and a report went out within ``KEEPALIVE_S``, the
++  CPU-less report is withheld (it would erase the Board row's triple) and logged as ``metrics_sender withheld``.
+ - Each tick reads the root limit. ON: it runs the Reporter's unchanged body (collect, limit, take, send; a CPU sample
+   is never replayed) through :meth:`Reporter.report_tick`, whose due rule is the anchor itself plus one guard: no
+   report starts less than ``REPORT_EVERY_S / 2`` after the latest report start on either path (and the Board's
+@@ -24,10 +28,13 @@ starts beside the CPU advisory sampler and closes (bounded join) in the same ``f
+   the root limit ON at its latest tick and finished that tick within :data:`STALL_PERIODS` periods, ``loop_report``
+   returns False without collecting or sending (a component-free ``not_sent`` timing record). That check reads
+   in-memory state only: no config read, no Reporter lock. Otherwise (gate off, non-Linux, thread dead or stalled) it
+-  is exactly ``Reporter.report_due``, so worker and gate-off hosts are unchanged.
++  is exactly ``Reporter.report_due``, so worker and gate-off hosts are unchanged; with the gate ON (thread dead or
++  stalled) that report goes through this thread's bounded transport, never the kept-alive Hub. A stalled tick that
++  still holds the Reporter blocks the loop's report too: the stall WARNING says whether a tick is in flight.
+ - No exception ends the thread. INFO lines: one per attempted send (``metrics_sender send ...``: monotonic t0/t1 ns,
+   the triple's end_ms/win_ms, outcome, whether request bytes were written, and schedstat run/wait ns of this thread
+-  over the send and of the send's bounded-call worker), and ``metrics_sender ticks=N sent=N failed=N skipped=N`` at
++  over the send and of the send's bounded-call worker), ``metrics_sender withheld ...`` per withheld report, and
++  ``metrics_sender ticks=N sent=N failed=N skipped=N withheld=N`` at
+   most every :data:`LOG_EVERY_S` and at close. A WARNING when the loop takes reporting back from a stalled sender.
+ 
+ Thread safety of what a tick reads (checked in source): ``collect()`` opens its own read-only SQLite connection per
+@@ -95,8 +102,9 @@ class MetricsSender:
+         self.linux = sys.platform.startswith("linux") if linux is None else linux
+         self.sched_fn = sched_fn
+         self.on = False  # the root limit was ON at this thread's latest tick
+-        self.ticks = self.sent = self.failed = self.skipped = 0
++        self.ticks = self.sent = self.failed = self.skipped = self.withheld = 0
+         self.tick_done_at: Optional[float] = None
++        self.tick_started_at: Optional[float] = None
+         self._stall_warned = False
+         self._stop = Event()
+         self._wait = wait_fn or self._stop.wait
+@@ -140,6 +148,7 @@ class MetricsSender:
+         """One anchored tick: True sent, False the report failed, None nothing sent (off or skipped)."""
+         from hermes_cli import machine_cpu_metrics as cpu
+         self.ticks += 1
++        self.tick_started_at = self.clock()
+         try:
+             state = self._limit()[0]
+         except Exception:  # health: allow BLE001 -- an unreadable limit is "not ON" for this tick
+@@ -151,20 +160,34 @@ class MetricsSender:
+         if report_tick is None:  # a reporter without the tick seam (a stand-in): never delegate to it
+             self.on = False
+             return None
++        withheld_before = getattr(self.reporter, "suppressed", 0)
+         result = report_tick(self.send)
+         if result is True:
+             self.sent += 1
+         elif result is False:
+             self.failed += 1
++        elif getattr(self.reporter, "suppressed", 0) != withheld_before:
++            # No fresh CPU sample even after the bounded wait: a CPU-less send would erase the row's triple.
++            self.withheld += 1
++            _log.info("metrics_sender withheld t=%d reason=no_cpu_sample", time.monotonic_ns())
+         else:
+             self.skipped += 1
+         return result
+ 
++    def _due(self, anchor: float) -> float:
++        """The anchor, or later when a late send came less than half a period before it: the next report waits until
++        it is spaced instead of being skipped (hermes-hub 2026-11-12 13:42:48 / 13:43:28: a late tick right after a
++        stall made the next anchor's tick skip, ``skipped=1``/``2``, losing a CPU-bearing report)."""
++        started = getattr(self.reporter, "started_at", None)
++        if isinstance(started, (int, float)):
++            return max(anchor, started + _period() / 2)
++        return anchor
++
+     def run(self) -> None:
+         t0 = self.clock()
+         k = 1
+         while not self._stop.is_set():
+-            due = t0 + k * _period()
++            due = self._due(t0 + k * _period())
+             while not self._stop.is_set() and self.clock() < due:
+                 self._wait(due - self.clock())
+             if self._stop.is_set():
+@@ -186,8 +209,8 @@ class MetricsSender:
+                 self._log_counts()
+ 
+     def _log_counts(self) -> None:
+-        _log.info("metrics_sender ticks=%d sent=%d failed=%d skipped=%d", self.ticks, self.sent, self.failed,
+-                  self.skipped)
++        _log.info("metrics_sender ticks=%d sent=%d failed=%d skipped=%d withheld=%d", self.ticks, self.sent,
++                  self.failed, self.skipped, self.withheld)
+ 
+     def alive(self) -> bool:
+         thread = self._thread
+@@ -202,14 +225,27 @@ class MetricsSender:
+             return True
+         if not self._stall_warned:
+             self._stall_warned = True
+-            _log.warning("metrics_sender stalled: no tick finished for %.0f s; the sync loop reports meanwhile",
+-                         self.clock() - self.tick_done_at)
++            now, started = self.clock(), self.tick_started_at
++            in_flight = (f"tick in flight for {now - started:.0f} s" if started is not None
++                         and started > self.tick_done_at else "no tick in flight")
++            # Not "the loop reports meanwhile": while the stalled tick holds the Reporter the loop cannot report.
++            _log.warning("metrics_sender stalled: no tick finished for %.0f s (%s); the sync loop reports when the "
++                         "Reporter is free", now - self.tick_done_at, in_flight)
+         return False
+ 
+     def loop_report(self) -> Any:
+         """The sync loop's report callable (wrapped by ``sync_timing.report``)."""
+         if self.delegating():
+             return False
++        if self.on:
++            # Gate ON but the sender is stalled or dead: the loop reports through this thread's bounded transport
++            # (2 s, private connection), never the kept-alive Hub's 30 s path while holding the Reporter lock.
++            withheld_before = getattr(self.reporter, "suppressed", 0)
++            result = self.reporter.report_due(self.send)
++            if getattr(self.reporter, "suppressed", 0) != withheld_before:
++                self.withheld += 1
++                _log.info("metrics_sender withheld t=%d reason=no_cpu_sample path=loop", time.monotonic_ns())
++            return result
+         return self.reporter.report_due()
+ 
+     def start(self) -> Optional[Thread]:
+diff --git a/tests/gateway/test_kanban_singleton_lease.py b/tests/gateway/test_kanban_singleton_lease.py
+index 1f77f44376..244ebaf633 100644
+--- a/tests/gateway/test_kanban_singleton_lease.py
++++ b/tests/gateway/test_kanban_singleton_lease.py
+@@ -170,7 +170,7 @@ def test_dispatcher_watcher_retries_a_contended_lock_then_dispatches(root, monke
+         asyncio.run(runner._kanban_dispatcher_watcher())
+     finally:
+         _release_singleton_lock(other)
+-    assert sleeps[0] == ks.DEFAULT_RETRY_SECONDS
++    assert sleeps[0] == ks.ROOT_CLAIM_RETRY_SECONDS  # the root gateway asked the holder to yield: retry soon
+     assert ticks == [True]
+     assert runner._kanban_dispatcher_lock_handle is None  # released on stop
+ 
+@@ -353,3 +353,42 @@ def test_update_resume_root_lock_wait_is_bounded(root):
+         _release_singleton_lock(other)
+     lone = [_unit("hermes-gateway-x.service", root / "profiles" / "x", 1)]
+     assert pause._root_first(lone) == (lone, None)
++
++
++def test_root_gateway_retries_a_profile_held_lock_every_few_seconds_after_posting_its_claim(root, monkeypatch):
++    """hermes-hub 2026-11-12: on all 7 core-update restarts the root gateway found askeve-reviewer/-builder holding
++    .sync.lock, posted its claim and then slept the full 30 s retry, although the profile yields within a few seconds
++    (should_yield cache 5 s); each restart cost 30-31 s of contention without hub CPU reports. While the root's claim
++    is posted it retries every ROOT_CLAIM_RETRY_SECONDS; a profile gateway keeps the slow retry."""
++    clock = Clock()
++    profile = _lease(root, is_root=False, clock=clock, name="sync", grace=0.0)
++    rootl = _lease(root, is_root=True, clock=clock, name="sync")
++    assert profile.try_acquire()
++    assert rootl.retry_interval() == 30.0  # never tried: the configured interval
++    assert not rootl.try_acquire() and rootl.state == "contended"
++    assert rootl.retry_interval() == ks.ROOT_CLAIM_RETRY_SECONDS <= 2.0
++    other = _lease(root, is_root=False, clock=clock, name="sync")
++    assert not other.try_acquire()
++    assert other.retry_interval() == 30.0
++    profile.release()
++    assert rootl.try_acquire() and rootl.retry_interval() == 30.0
++    rootl.release()
++
++
++def test_lease_acquire_loop_sleeps_the_leases_retry_interval(root, monkeypatch):
++    runner = _runner()
++    attempts, sleeps = iter([False, False, True]), []
++
++    class Lease:
++        def try_acquire(self):
++            return next(attempts)
++
++        def retry_interval(self):
++            return 2.0
++    runner._running = True
++
++    async def between(interval):
++        sleeps.append(interval)
++    monkeypatch.setattr(runner, "_sleep_between_ticks", between)
++    assert asyncio.run(runner._acquire_kanban_lease(Lease())) is True
++    assert sleeps == [2.0, 2.0]
+diff --git a/tests/hermes_cli/test_machine_metrics_sender.py b/tests/hermes_cli/test_machine_metrics_sender.py
+index fe8dbd98a7..67e3d0e057 100644
+--- a/tests/hermes_cli/test_machine_metrics_sender.py
++++ b/tests/hermes_cli/test_machine_metrics_sender.py
+@@ -149,9 +149,10 @@ def _toggling_world(state_at, alive_at=lambda t: True, *, loop_from=0.0):
+     clock = FakeClock(0.0)
+     sends: list[tuple[float, str]] = []
+     state = [cpu.ON]
++    caller = ["sender"]  # which path is reporting (the loop's takeover while ON uses the sender's transport)
+     reporter = mm.Reporter(lambda s: sends.append((clock.now, "loop")), collect_fn=lambda: {"cpus": 2},
+                            clock=clock, cpu_limit_fn=_limit(state), cpu_take_fn=lambda _l: dict(SAMPLE))
+-    sender = ms.MetricsSender(reporter, lambda s, p: sends.append((clock.now, "sender")), limit_fn=_limit(state),
++    sender = ms.MetricsSender(reporter, lambda s, p: sends.append((clock.now, caller[0])), limit_fn=_limit(state),
+                               clock=clock, sched_fn=lambda: None)
+     sender.alive = lambda: alive_at(clock.now)
+     next_tick = P
+@@ -162,7 +163,9 @@ def _toggling_world(state_at, alive_at=lambda t: True, *, loop_from=0.0):
+             sender.tick_done_at = clock.now
+             next_tick += P
+         if clock.now >= loop_from:
++            caller[0] = "loop"
+             sender.loop_report()
++            caller[0] = "sender"
+         clock.now = round(clock.now + 0.5, 6)
+     return sends
+ 
+@@ -199,9 +202,11 @@ def test_the_first_anchor_skips_when_the_loop_reported_less_than_half_a_period_b
+ def test_a_stalled_sender_hands_reporting_back_to_the_loop_with_a_warning(caplog):
+     clock = FakeClock(0.0)
+     sends = []
+-    reporter = mm.Reporter(lambda s: sends.append(clock.now), collect_fn=lambda: {"cpus": 2}, clock=clock,
++    reporter = mm.Reporter(lambda s: sends.append(("hub", clock.now)), collect_fn=lambda: {"cpus": 2}, clock=clock,
+                            cpu_limit_fn=lambda: (cpu.ON, 50.0))
+-    sender = ms.MetricsSender(reporter, _nopost, limit_fn=lambda: (cpu.ON, 50.0), clock=clock)
++    # While ON the loop's takeover goes through the sender's bounded transport, never the kept-alive Hub.
++    sender = ms.MetricsSender(reporter, lambda s, p: sends.append(clock.now), limit_fn=lambda: (cpu.ON, 50.0),
++                              clock=clock, sched_fn=lambda: None)
+     sender.alive = lambda: True
+     sender.on = True  # mid-tick: ON is known, the tick's end not stamped yet
+     assert sender.loop_report() is True and sends == [0.0]
+@@ -404,7 +409,7 @@ class _SlowBoard(http.server.BaseHTTPRequestHandler):
+             pass
+ 
+ 
+-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="schedstat is Linux-only")
++@pytest.mark.platforms("linux")  # schedstat is Linux-only
+ def test_a_sample_without_a_cpu_triple_is_bounded_to_2_s_and_probed(caplog):
+     """S-3: the sender never uses the 30 s kept-alive path, even for a report without a CPU triple."""
+     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SlowBoard)
+@@ -464,7 +469,7 @@ def test_delegated_loop_report_is_a_component_free_not_sent_record(tmp_path, mon
+     assert reps[1]["res"] == "sent" and {"collect_t0", "limit_t0", "send_t0"} <= set(reps[1])
+ 
+ 
+-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the sender runs on Linux hosts only")
++@pytest.mark.platforms("linux")  # the sender runs on Linux hosts only
+ def test_a_long_blocked_round_still_yields_reports_from_the_sender(tmp_path, monkeypatch):
+     """A round blocked for 30 periods (the hub's 30 s round at a 0.1 s scale) still yields >= 3 reports."""
+     import hermes_constants
+diff --git a/tests/hermes_cli/test_machine_metrics_sender_stalls.py b/tests/hermes_cli/test_machine_metrics_sender_stalls.py
+new file mode 100644
+index 0000000000..6b90fde4f6
+--- /dev/null
++++ b/tests/hermes_cli/test_machine_metrics_sender_stalls.py
+@@ -0,0 +1,241 @@
++"""Hub metrics sender across process stalls and gateway restarts. [daveey]
++
++Regressions (hermes-hub, 2026-11-12, PR #1429 live probe):
++
++- 13:41:46-13:42:11 the whole gateway process stalled (control event loop blocked 24.4 s, the advisory sampler's
++  window 25.3 s, a 25.2 s ``worker.persist``); the sender's 13:41:48 tick finished at 13:42:12 and sent the hub row
++  WITHOUT the CPU triple (``end_ms=None``) because the sampler's next sample was still ~0.3 s away. The same
++  happened at 13:43:27. A CPU-less report erases the row's triple.
++- After that late tick (send at 13:42:47.9) the next anchor (13:42:48.4) was skipped by the half-period guard
++  (``skipped=1``), losing a report the guard only needed to delay.
++- Each hub gateway restart: the new root gateway's first ``.sync.lock`` attempt found a profile gateway holding it and
++  retried only every 30 s (contention 30-31 s on all 7 restarts; see tests/gateway/test_kanban_singleton_lease.py).
++"""
++from __future__ import annotations
++
++import itertools
++import logging
++import threading
++import time
++
++import pytest
++
++from hermes_cli import machine_cpu_metrics as cpu
++from hermes_cli import machine_cpu_sampler as cs
++from hermes_cli import machine_metrics as mm
++from hermes_cli import machine_metrics_sender as ms
++
++P = mm.REPORT_EVERY_S
++SAMPLE = {"cpu_busy_pct": 12.0, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": 1}
++ON = lambda: (cpu.ON, 50.0)
++
++
++class FakeClock:
++    def __init__(self, now: float = 0.0) -> None:
++        self.now = now
++
++    def __call__(self) -> float:
++        return self.now
++
++
++def _reporter(clock, sends, *, take, wait=None, collect=lambda: {"cpus": 2}):
++    reporter = mm.Reporter(lambda s: sends.append(("loop", clock.now, dict(s))), collect_fn=collect, clock=clock,
++                           cpu_limit_fn=ON, cpu_take_fn=take)
++    reporter.cpu_wait_fn = wait
++    return reporter
++
++
++def test_a_tick_that_finds_no_fresh_sample_waits_for_the_samplers_next_one():
++    """13:42:12: the tick ran as the stall ended, 0.3 s before the sampler's next valid window closed."""
++    clock, sends, pending = FakeClock(100.0), [], []
++    waits = []
++
++    def take(_limit):
++        return pending.pop() if pending else None
++
++    def wait(timeout):  # the sampler publishes its next sample 0.3 s into the wait
++        waits.append(timeout)
++        clock.now += 0.3
++        pending.append(dict(SAMPLE))
++        return True
++    reporter = _reporter(clock, sends, take=take, wait=wait)
++    assert reporter.report_tick(lambda s: sends.append(("sender", clock.now, dict(s)))) is True
++    (who, _at, body), = sends
++    assert who == "sender" and set(SAMPLE) <= set(body)  # CPU-bearing, not end_ms=None
++    assert waits and waits[0] <= mm.CPU_WAIT_S
++
++
++def test_the_wait_for_a_sample_is_bounded():
++    clock, sends = FakeClock(100.0), []
++
++    def wait(timeout):
++        clock.now += timeout  # nothing published
++        return False
++    reporter = _reporter(clock, sends, take=lambda _l: None, wait=wait)
++    reporter.sent_at = clock.now - 1.0  # a report just went out
++    t0 = clock.now
++    assert reporter.report_tick(lambda s: sends.append(s)) is None
++    assert clock.now - t0 <= mm.CPU_WAIT_S + 1e-9
++
++
++@pytest.mark.parametrize("path", ["sender", "loop"])
++def test_a_cpu_less_report_is_suppressed_while_the_gate_is_on_and_a_report_went_out_recently(path):
++    """13:42:12 / 13:43:27: a report without the triple overwrote the row's CPU fields. While the root gate is ON a
++    CPU-less report goes out only as a keepalive, when nothing was sent for KEEPALIVE_S."""
++    clock, sends = FakeClock(100.0), []
++    reporter = _reporter(clock, sends, take=lambda _l: None)
++
++    def report():
++        if path == "sender":
++            return reporter.report_tick(lambda s: sends.append(("sender", clock.now, dict(s))))
++        reporter.next_at = 0.0  # the loop's own period never holds this test
++        return reporter.report_due()
++    reporter.sent_at = clock.now - (mm.KEEPALIVE_S - 1.0)
++    assert not report() and sends == [] and reporter.suppressed == 1
++    clock.now += 1.0  # KEEPALIVE_S since the last report: the row's non-CPU fields must not age past the Board's 90 s
++    assert report() is True
++    (_who, at, body), = sends
++    assert at == clock.now and not set(SAMPLE) & set(body) and body["cpus"] == 2
++
++
++def test_suppression_applies_only_while_the_gate_is_on():
++    clock, sends = FakeClock(100.0), []
++    reporter = _reporter(clock, sends, take=lambda _l: None)
++    reporter.cpu_limit_fn = lambda: (cpu.OFF, None)
++    reporter.sent_at = clock.now - 1.0
++    assert reporter.report_tick(lambda s: sends.append(s)) is True and sends == [{"cpus": 2}]
++
++
++def test_a_suppressed_report_does_not_count_as_a_report_start():
++    """The half-period spacing guard measures sends; a suppressed attempt sent nothing."""
++    clock, sends = FakeClock(100.0), []
++    triple = []
++    reporter = _reporter(clock, sends, take=lambda _l: triple.pop() if triple else None)
++    reporter.sent_at = reporter.started_at = 95.0
++    clock.now = 106.0
++    assert reporter.report_tick(lambda s: sends.append(s)) is None
++    clock.now = 107.0  # 1 s after the suppressed attempt, 12 s after the last send
++    triple.append(dict(SAMPLE))
++    assert reporter.report_tick(lambda s: sends.append(s)) is True
++
++
++def _run(reporter, clock, *, stall_at, stall_s, until):
++    """MetricsSender.run on a fake clock; the wait that covers *stall_at* returns *stall_s* late (process stall)."""
++    sends, sender = [], None
++
++    def post(sample, _probe):
++        sends.append((round(clock.now, 6), set(SAMPLE) <= set(sample)))
++        return {}
++
++    def wait(seconds):
++        start = clock.now
++        clock.now += max(0.0, seconds)
++        if start < stall_at <= clock.now:
++            clock.now += stall_s
++        if clock.now >= until:
++            sender._stop.set()
++    sender = ms.MetricsSender(reporter, post, limit_fn=ON, clock=clock, wait_fn=wait, sched_fn=lambda: None)
++    sender.run()
++    return sender, sends
++
++
++def test_a_late_tick_delays_the_next_anchor_for_spacing_instead_of_skipping_it():
++    """13:42:47.9 late send, 13:42:48.4 anchor skipped (skipped=1). The next send waits until it is spaced."""
++    clock = FakeClock(0.0)
++    reporter = mm.Reporter(None, collect_fn=lambda: {"cpus": 2}, clock=clock, cpu_limit_fn=ON,
++                           cpu_take_fn=lambda _l: dict(SAMPLE))
++    # the wait for the 20 s anchor ends 25.5 s late (a stall covering the 20/30/40 anchors)
++    sender, sends = _run(reporter, clock, stall_at=20.0, stall_s=25.5, until=75.0)
++    assert [t for t, _ in sends] == [10.0, 45.5, 50.5, 60.0, 70.0]
++    assert sender.skipped == 0 and all(cpu_bearing for _, cpu_bearing in sends)
++    gaps = [b - a for (a, _), (b, _) in itertools.pairwise(sends)]
++    assert min(gaps) >= P / 2
++
++
++def test_the_loop_takeover_while_on_sends_through_the_senders_bounded_transport():
++    """A stalled sender hands reporting back to the loop; while the gate is ON the loop's report must not go through
++    the kept-alive Hub (30 s timeout) while holding the Reporter lock: it would block the recovered sender."""
++    clock, posted, hub = FakeClock(0.0), [], []
++    reporter = mm.Reporter(hub.append, collect_fn=lambda: {"cpus": 2}, clock=clock, cpu_limit_fn=ON,
++                           cpu_take_fn=lambda _l: dict(SAMPLE))
++    sender = ms.MetricsSender(reporter, lambda s, p: posted.append(dict(s)), limit_fn=ON, clock=clock,
++                              sched_fn=lambda: None)
++    sender.alive = lambda: True
++    sender.on, sender.tick_done_at = True, 0.0
++    clock.now = ms.STALL_PERIODS * P + 1.0
++    assert sender.loop_report() is True
++    assert hub == [] and len(posted) == 1 and set(SAMPLE) <= set(posted[0])
++
++
++def test_the_stall_warning_says_whether_a_tick_is_in_flight_not_that_the_loop_reports(caplog):
++    """PR #1429 review nit: "the sync loop reports meanwhile" is false while the stalled tick holds the Reporter."""
++    clock = FakeClock(0.0)
++    reporter = mm.Reporter(lambda s: None, collect_fn=lambda: {"cpus": 2}, clock=clock, cpu_limit_fn=ON)
++    sender = ms.MetricsSender(reporter, lambda s, p: None, limit_fn=ON, clock=clock, sched_fn=lambda: None)
++    sender.alive = lambda: True
++    sender.on, sender.tick_done_at, sender.tick_started_at = True, 0.0, 10.0
++    clock.now = 34.0
++    assert reporter._lock.acquire(blocking=False)  # the stalled tick holds the Reporter
++    try:
++        with caplog.at_level(logging.WARNING, logger=ms.__name__):
++            assert sender.loop_report() is False
++    finally:
++        reporter._lock.release()
++    (msg,) = [r.getMessage() for r in caplog.records if "metrics_sender stalled" in r.getMessage()]
++    assert "reports meanwhile" not in msg
++    assert "no tick finished for 34 s" in msg and "tick in flight for 24 s" in msg
++
++
++def test_sampler_wait_fresh_wakes_on_the_next_published_sample():
++    now = [100.0]
++    ticks = iter(range(0, 10_000_000, 400))
++
++    def read():
++        t = next(ticks)
++        return f"cpu {t // 4} 0 0 {t - t // 4} 0 0 0 0\n"
++    s = cs.AdvisorySampler(limit_fn=ON, read_fn=read, record_fn=lambda _m: None, clock=lambda: now[0],
++                           wall=lambda: time.time())
++    assert s.run_once() is None  # primes the window
++    assert s.wait_fresh(0.05) is False  # nothing new: bounded
++    result = []
++    waiter = threading.Thread(target=lambda: result.append(s.wait_fresh(10.0)))
++    waiter.start()
++    try:
++        now[0] += 1.0
++        assert s.run_once() is not None
++    finally:
++        waiter.join(10.0)
++    assert result == [True]
++    assert s.take(50.0) is not None
++
++
++def test_a_profile_gateways_sender_reads_the_installation_root_gate(tmp_path, monkeypatch):
++    """A profile gateway that holds the host sync lock (root gateway restarting) reports the hub row with the same
++    root-config CPU gate, so its reports carry the triple; it never reads the profile's own config."""
++    root = tmp_path / ".hermes"
++    profile = root / "profiles" / "askeve-reviewer"
++    profile.mkdir(parents=True)
++    (root / "config.yaml").write_text("kanban:\n  admission:\n    cpu_busy_below_pct: 50\n", encoding="utf-8")
++    (profile / "config.yaml").write_text("kanban: {}\n", encoding="utf-8")
++    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(profile))
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None, raising=False)
++    assert cpu.root_limit() == (cpu.ON, 50.0)
++
++
++def test_a_withheld_report_is_logged_and_counted_for_the_latency_analyzer(caplog):
++    """The rollout's analyzer counts withheld ticks from their own INFO line; the send line's keys stay unchanged."""
++    clock = FakeClock(100.0)
++    reporter = mm.Reporter(None, collect_fn=lambda: {"cpus": 2}, clock=clock, cpu_limit_fn=ON,
++                           cpu_take_fn=lambda _l: None)
++    reporter.sent_at = clock.now - 1.0
++    sender = ms.MetricsSender(reporter, lambda s, p: None, limit_fn=ON, clock=clock, sched_fn=lambda: None)
++    with caplog.at_level(logging.INFO, logger=ms.__name__):
++        assert sender.tick() is None
++        sender._log_counts()
++    msgs = [r.getMessage() for r in caplog.records]
++    assert any(m.startswith("metrics_sender withheld t=") and "reason=no_cpu_sample" in m for m in msgs)
++    assert not any(m.startswith("metrics_sender send ") for m in msgs)
++    assert sender.withheld == 1 and sender.skipped == 0
++    assert any(m.startswith("metrics_sender ticks=1 sent=0 failed=0 skipped=0 withheld=1") for m in msgs)
+-- 
+2.43.0
+

@@ -1,0 +1,209 @@
+From d10b699b6fd5f7acc0d29b0660dc9b7be30ead13 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:06:16 +0000
+Subject: [PATCH] [daveey] Worker pickup skips a card the local dispatcher
+ would hold on its quota wall
+
+worker-3 2026-11-12 11:30-11:56Z: four foreign cards walled until 11-17/18
+(subscription_quota_reset) were first in candidate order and filled every
+pickup batch. Each tick copied them, local dispatch held them, the next tick
+evicted and copied them again (126 pickups in 26 min), and two priority-0
+cards pinned to the machine waited budget_exhausted (t_01a1cf9f2b838cbb).
+
+_evaluate now asks, before spending budget on a candidate, whether the local
+dispatcher would hold it on its quota episode: the same read-only
+kanban_quota_episode.decision that check_respawn_guard returns for a card with
+an episode, judged on the card's runs/events in the replica (a copy carries
+exactly those) and this machine's provider walls. Such a card is not copied
+and takes no budget; when it is pinned here, its pickup skip records
+`hold: subscription_quota_reset until <deadline>` instead of budget_exhausted.
+An episode with a free alternate route, or a past deadline, is copied as
+before, and any failure of the check copies as before (the local guard still
+decides after the copy). active_pr holds are left to eba518b16a (a held copy
+is kept, not re-imported): predicting them needs PR state from gh per
+candidate per tick.
+
+Candidate order is unchanged (DISPATCH_ORDER, parity with the hub): only
+cards that would never spawn here leave the batch, so no reordering of
+machine-pinned cards is needed.
+
+Proof:
+- tests/hermes_cli/test_kanban_pickup_quota_held.py: 3 walled cards ahead of
+  a priority-0 pinned card, budget 2. Base: the first tick imports two walled
+  cards instead (RED). After: the first tick imports and starts the pinned
+  card, 3 more ticks import nothing, the pinned walled card records `hold`;
+  parity assertion that check_respawn_guard on a copy returns
+  subscription_quota_reset. A passed deadline and a failing check copy.
+- 76 test files importing kanban_worker_node / kanban_quota_episode: 1724 passed.
+---
+ hermes_cli/kanban_worker_node.py              |  29 +++++
+ .../test_kanban_pickup_quota_held.py          | 110 ++++++++++++++++++
+ 2 files changed, 139 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_quota_held.py
+
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 8b6813e776..bdb7aa62c6 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -550,6 +550,8 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+             continue
+         reason = _skip_reason(conn, card, own, reg["machines"], mode=mode, review_enabled=review_enabled,
+                               profile_exists=profile_exists)
++        if reason is None:
++            reason = _quota_held(replica, card)
+         if reason is None and full:
+             reason = ("budget_exhausted", full_detail)
+         if reason is None:
+@@ -559,6 +561,33 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+     return picked, skips
+ 
+ 
++def _quota_held(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tuple[str, Optional[str]]]:
++    """[daveey] ``("hold", detail)`` when the local dispatcher would hold ``card`` on its quota episode, judged
++    before the copy: the same read-only :func:`kanban_quota_episode.decision` ``check_respawn_guard`` returns for a
++    card with an episode, on the card's own runs/events in the replica (a copy carries exactly those) and this
++    machine's provider walls. Such a card would only be copied, held, evicted and copied again each tick, while
++    taking the pickup budget: worker-3 2026-11-12, 4 cards walled until 11-17/18 filled the batch and two
++    priority-0 cards pinned to it waited ``budget_exhausted`` (t_01a1cf9f2b838cbb). Not copied, it spends no
++    budget; an episode with a free alternate route (``decision`` -> None) is copied as before. Any failure copies
++    as before: the local guard still decides after the copy."""
++    from hermes_cli.kanban_quota_episode import decision, episode, hold_until
++    try:
++        if not episode(replica, card["id"]):
++            return None
++        from hermes_cli import kanban_db as kb
++        task = kb.get_task(replica, card["id"])
++        guard = decision(replica, task, lane=card["status"])[0] if task is not None else None
++        if guard is None:
++            return None
++        until = hold_until(replica, card["id"])
++    except Exception:  # health: allow BLE001 -- a hold prediction must never stop a pickup
++        _log.warning("kanban worker node: quota hold check for %s failed", card["id"], exc_info=True)
++        return None
++    from datetime import UTC, datetime
++    when = f" until {datetime.fromtimestamp(until, UTC):%Y-%m-%dT%H:%MZ}" if until else ""
++    return "hold", f"{guard}{when} (local dispatch would hold it)"
++
++
+ def note_capped(conn: sqlite3.Connection, profile_exists: Optional[Callable[[str], bool]] = None) -> None:
+     """A tick with no spawn budget runs no pickup: record why this machine's pinned cards wait (``budget_exhausted``
+     for the ones a slot would start). Evidence only (``kanban_pickup_stall``); copies nothing."""
+diff --git a/tests/hermes_cli/test_kanban_pickup_quota_held.py b/tests/hermes_cli/test_kanban_pickup_quota_held.py
+new file mode 100644
+index 0000000000..90e1ee8dc9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_quota_held.py
+@@ -0,0 +1,110 @@
++"""Pickup spends no budget on a card the local dispatcher would hold on its quota episode.
++
++worker-3 2026-11-12 (t_01a1cf9f2b838cbb): four foreign cards walled until 11-17/18 (``subscription_quota_reset``)
++filled every pickup batch. Each tick copied them, local dispatch held them, the next tick evicted and copied them
++again (126 pickups in 26 min), and two priority-0 cards pinned to the machine waited ``budget_exhausted``.
++"""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_pickup_stall as kps
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_worker_node as support
++
++svc = support.svc
++gws = support.gws
++PIN = [f"machine:{support.WORKER}"]
++WALL_S = 5 * 86400
++
++
++@pytest.fixture
++def imports(monkeypatch):
++    seen: list[str] = []
++    real = wn.import_cards
++
++    def counting(conn, replica, ids):
++        done = real(conn, replica, ids)
++        seen.extend(done)
++        return done
++    monkeypatch.setattr(wn, "import_cards", counting)
++    return seen
++
++
++def _walled(hub, *, title, priority, runs_on, providers=()):
++    """A hub card whose latest run hit a quota wall with a typed reset days away (a real episode, synced)."""
++    hub.enter()
++    tid = kb.create_task(hub.conn, title=title, assignee="default", priority=priority, runs_on=runs_on)
++    now = int(time.time())
++    with kb.write_txn(hub.conn):
++        run = hub.conn.execute(
++            "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
++            "VALUES (?, 'default', 'released', ?, ?, 'rate_limited')", (tid, now - 120, now - 60)).lastrowid
++        kb._append_event(hub.conn, tid, "quota_episode", {
++            "episode_id": run, "run_id": run, "count": 1, "until": now + WALL_S, "hinted": True,
++            "provider": providers[0] if providers else None, "providers": list(providers), "model": None},
++            run_id=run)
++    hub.round()
++    return tid
++
++
++def _status(conn, tid):
++    t = kb.get_task(conn, tid)
++    return t.status if t else None
++
++
++def test_quota_held_cards_do_not_starve_a_pinned_card(gws, imports):
++    hub, worker = gws
++    walled = [_walled(hub, title=f"walled {i}", priority=1000 - i, runs_on=["linux"] if i % 2 else PIN)
++              for i in range(3)]
++    pinned = support._hub_card(hub, title="pinned, eligible", priority=0, runs_on=PIN)
++    worker.round()
++    worker.enter()
++    # Parity: on a copy, the local dispatcher's own guard holds each walled card on that wall.
++    replica = wn.open_replica(worker.conn)
++    assert replica is not None
++    try:
++        assert wn.import_cards(worker.conn, replica, walled[:1]) == walled[:1]
++    finally:
++        replica.close()
++    assert kbd.check_respawn_guard(worker.conn, walled[0]) == "subscription_quota_reset"
++    assert wn.evict(worker.conn) == walled[:1]
++    imports.clear()
++    # Budget 2 < 3 walled cards ahead of the pinned one: the first tick copies and starts the pinned card.
++    worker.tick(max_spawn=2)
++    assert imports == [pinned]
++    assert _status(worker.conn, pinned) == "running"
++    for _ in range(3):  # and no later tick copies a walled card: no import/evict churn
++        worker.round()
++        worker.tick(max_spawn=3)
++    assert imports == [pinned]
++    assert all(_status(worker.conn, tid) is None for tid in walled)
++    # A walled card pinned here says why it waits, not budget_exhausted.
++    skip = kps.latest(worker.conn, walled[0])
++    assert skip is not None and skip["reason"] == "hold"
++    assert skip["detail"].startswith("subscription_quota_reset until ")
++
++
++def test_an_episode_whose_wall_has_passed_is_copied(gws, imports, monkeypatch):
++    hub, worker = gws
++    tid = _walled(hub, title="wall over", priority=10, runs_on=PIN)
++    worker.round()
++    worker.enter()
++    real = time.time
++    monkeypatch.setattr(time, "time", lambda: real() + WALL_S + 600)
++    assert wn.pickup(worker.conn, budget=1) == [tid]
++
++
++def test_a_failed_hold_check_copies_as_before(gws, imports, monkeypatch):
++    hub, worker = gws
++    tid = _walled(hub, title="walled", priority=10, runs_on=PIN)
++    worker.round()
++    worker.enter()
++    from hermes_cli import kanban_quota_episode as qe
++
++    def boom(*a, **kw):
++        raise RuntimeError("config unreadable")
++    monkeypatch.setattr(qe, "decision", boom)
++    assert wn.pickup(worker.conn, budget=1) == [tid]
+-- 
+2.43.0
+

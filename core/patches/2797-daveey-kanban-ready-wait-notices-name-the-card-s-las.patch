@@ -1,0 +1,320 @@
+From 83e888749b9db5d0593f80b177bfc96a871977ff Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:09:38 +0000
+Subject: [PATCH] [daveey] kanban: ready-wait notices name the card's last
+ checkpoint (kanban-3debc730ab)
+
+A ready card whose latest run parked (continued/blocked/scheduled) now carries that run's checkpoint
+(first line, 200 chars, plus its end time) in chat_wait_unclaimed and dependency_parent_unclaimed
+payloads, and the notice text and kanban_show ready hint say: Last checkpoint (HH:MMZ): "...". Read it
+before re-placing the card or creating a replacement; resume or finish what it records.
+
+t_01a1c59e0410b2fb recorded 'LANDED: PR1148 MERGED' only as a continued run's checkpoint; the 09:11Z
+ready-wait notice carried queue state only and the chat duplicated the landing card for a merged PR.
+---
+ hermes_cli/kanban_chat_wait.py                |  14 +-
+ hermes_cli/kanban_last_checkpoint.py          |  53 +++++++
+ hermes_cli/kanban_parent_unclaimed.py         |  13 +-
+ .../test_kanban_ready_wait_checkpoint.py      | 129 ++++++++++++++++++
+ 4 files changed, 199 insertions(+), 10 deletions(-)
+ create mode 100644 hermes_cli/kanban_last_checkpoint.py
+ create mode 100644 tests/hermes_cli/test_kanban_ready_wait_checkpoint.py
+
+diff --git a/hermes_cli/kanban_chat_wait.py b/hermes_cli/kanban_chat_wait.py
+index 8e977ad386..29bea22ffc 100644
+--- a/hermes_cli/kanban_chat_wait.py
++++ b/hermes_cli/kanban_chat_wait.py
+@@ -20,6 +20,7 @@ import logging
+ import time
+ from typing import Any, Optional
+ 
++from hermes_cli import kanban_last_checkpoint as last_checkpoint
+ from hermes_cli import kanban_parent_unclaimed as pu
+ 
+ _log = logging.getLogger(__name__)
+@@ -88,27 +89,28 @@ def notice_text(payload: Any) -> str:
+     tid = str(payload.get("parent") or "<card>")[:64]
+     title = str(payload.get("parent_title") or "").strip()[:120]
+     named = f"{tid} ({title})" if title else tid
++    checkpoint = last_checkpoint.sentence(payload)  # before the advice (kanban-3debc730ab) [daveey]
+     if payload.get("core_update_hold"):
+         return (f"{named}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min "
+                 "with no worker: claims are held for a pending Hermes update "
+-                f"(hold started {payload.get('core_update_started') or 'at an unknown time'}). "
+-                "The hold lasts until the update applies or the drain's hard max.")
++                f"(hold started {payload.get('core_update_started') or 'at an unknown time'}). " + checkpoint
++                + "The hold lasts until the update applies or the drain's hard max.")
+     if payload.get("missing_shared_board"):
+         return (f"{named}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min "
+                 f"with no worker because it isn't on the shared Board (claim_deferred: not_found). "
+                 f"Last sync rejection: {payload.get('sync_reject_reason') or 'no sync rejection recorded'}. "
+-                "Repair the Board sync rejection before retrying dispatch.")
++                + checkpoint + "Repair the Board sync rejection before retrying dispatch.")
+     if payload.get("respawn_guard"):
+         return (f"{named}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min "
+-                f"with no worker: last recorded respawn guard is {payload['respawn_guard']}. "
+-                "Check the current dispatcher verdict and resolve that guard; priority changes do not clear it.")
++                f"with no worker: last recorded respawn guard is {payload['respawn_guard']}. " + checkpoint
++                + "Check the current dispatcher verdict and resolve that guard; priority changes do not clear it.")
+     hold = ""
+     if payload.get("hold_reason") and payload.get("hold_until"):
+         stamp = time.strftime("%H:%M:%SZ", time.gmtime(int(payload["hold_until"])))
+         hold = f"; dispatcher hold {payload['hold_reason']} until {stamp}"
+     return (f"{named}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min with no "
+             f"worker ({payload.get('queue') or 'queue place unknown'}{hold}){pu._observation(payload)}. "
+-            + pu._options(tid, payload.get("priority_evidence"), payload) + ".")
++            + checkpoint + pu._options(tid, payload.get("priority_evidence"), payload) + ".")
+ 
+ 
+ def _floor_kinds() -> str:
+diff --git a/hermes_cli/kanban_last_checkpoint.py b/hermes_cli/kanban_last_checkpoint.py
+new file mode 100644
+index 0000000000..a08f399b6b
+--- /dev/null
++++ b/hermes_cli/kanban_last_checkpoint.py
+@@ -0,0 +1,53 @@
++"""The last checkpoint a ready card recorded, for the ready-wait notices that prompt a chat to act. [daveey]
++
++Defect kanban-3debc730ab (2026-11-12): t_01a1c59e0410b2fb merged PR #1148 at 08:15Z and recorded it only as the
++checkpoint summary of its continued run ("LANDED: PR1148 MERGED ... as main 6948d8bc"); its worker then went on
++hold and the card sat ready. The ``chat_wait_unclaimed`` notice at 09:11Z said only "ready 30 min with no worker
++... re-place on a capable gateway", so the chat re-read the card's older "NEXT: on approval rerun ship" comment and
++created a duplicate landing card for a merged PR. The notices (``kanban_parent_unclaimed``, ``kanban_chat_wait``)
++and the ``kanban_show`` ready hint now carry that checkpoint.
++
++:func:`fields` reads it (payload fields ``last_checkpoint`` / ``last_checkpoint_at``); :func:`sentence` renders
++it. An old payload without the fields renders nothing.
++"""
++from __future__ import annotations
++
++import logging
++import time
++from typing import Any
++
++_log = logging.getLogger(__name__)
++
++# A run that ended by parking: its summary is the checkpoint/reason the next run (or a chat) must read first.
++PARK_OUTCOMES = frozenset({"continued", "blocked", "scheduled"})
++LIMIT = 200
++
++
++def fields(conn, task_id: str) -> dict[str, Any]:
++    """``{"last_checkpoint", "last_checkpoint_at"}`` when ``task_id``'s latest run (core-update requeues and
++    unused Board grants skipped) ended by parking with a summary; ``{}`` otherwise. Advisory: a failed read
++    drops the fields, never the notice."""
++    try:
++        from hermes_cli import kanban_db as kb
++        from hermes_cli.kanban_core_update_requeue import latest_run_skipping_requeues
++        run = latest_run_skipping_requeues(conn, task_id)
++        if run is None or run["outcome"] not in PARK_OUTCOMES or run["ended_at"] is None:
++            return {}
++        text = kb._first_line(run["summary"], LIMIT)
++        return {"last_checkpoint": text, "last_checkpoint_at": int(kb._to_epoch(run["ended_at"]) or 0)} if text else {}
++    except Exception:  # health: allow BLE001 -- the checkpoint is advisory; the notice must still go out
++        _log.warning("last-checkpoint: lookup failed for %s", task_id, exc_info=True)
++        return {}
++
++
++def sentence(payload: Any) -> str:
++    """``Last checkpoint (HH:MMZ): "<text>". Read it before ...; resume or finish what it records. `` (trailing
++    space), or "" when ``payload`` has no ``last_checkpoint``."""
++    payload = payload if isinstance(payload, dict) else {}
++    text = str(payload.get("last_checkpoint") or "").strip()[:LIMIT]
++    if not text:
++        return ""
++    at = payload.get("last_checkpoint_at")
++    stamp = f" ({time.strftime('%H:%MZ', time.gmtime(int(at)))})" if isinstance(at, (int, float)) and at > 0 else ""
++    return (f"Last checkpoint{stamp}: \"{text}\". Read it before re-placing the card or creating a replacement; "
++            "resume or finish what it records. ")
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 3db903111a..5d85cac43a 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -17,6 +17,8 @@ import logging
+ import time
+ from typing import Any, Optional
+ 
++from hermes_cli import kanban_last_checkpoint as last_checkpoint
++
+ _log = logging.getLogger(__name__)
+ 
+ NOTICE_KIND = "dependency_parent_unclaimed"
+@@ -98,7 +100,7 @@ def notice_text(payload: Any) -> str:
+               if payload.get("respawn_guard") else _options(parent, payload.get("priority_evidence"), payload))
+     return (f"Waiting {payload.get('wait_minutes', '?')} min on parent {named}, which has been ready "
+             f"{payload.get('ready_minutes', '?')} min with no worker ({payload.get('queue') or 'queue place unknown'})"
+-            + _observation(payload) + ". " + advice + ".")
++            + _observation(payload) + ". " + last_checkpoint.sentence(payload) + advice + ".")
+ 
+ 
+ def ready_hint(conn, task, *, now: Optional[float] = None) -> Optional[str]:
+@@ -112,10 +114,11 @@ def ready_hint(conn, task, *, now: Optional[float] = None) -> Optional[str]:
+     from hermes_cli.kanban_priority import lane_evidence
+     from hermes_cli import kanban_queue_position as kqp
+     place = _place(conn, task.id)
++    checkpoint = last_checkpoint.sentence(last_checkpoint.fields(conn, task.id))  # kanban-3debc730ab [daveey]
+     if place.get("lane") == "respawn_guard":
+-        return f"Ready {_minutes(waited)} min, unclaimed; {kqp.describe(place)}."
++        return f"Ready {_minutes(waited)} min, unclaimed; {kqp.describe(place)}. {checkpoint}".rstrip()
+     from hermes_cli.kanban_dispatch_skip import notice_fields
+-    return (f"Ready {_minutes(waited)} min, unclaimed; {_queue_words(place)}. "
++    return (f"Ready {_minutes(waited)} min, unclaimed; {_queue_words(place)}. " + checkpoint
+             + _options(task.id, lane_evidence(conn, task.id), notice_fields(place, waited)) + ".")
+ 
+ 
+@@ -189,6 +192,7 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+                 "admission": ({"reason": "core_update_hold", "status": "held"} if (extra or {}).get("core_update_hold")
+                               else {"reason": None, "status": "unknown"})}
+     guard = place.get("reason") if place.get("lane") == "respawn_guard" else None
++    checkpoint = last_checkpoint.fields(conn, waiting_on)  # what the card already did (kanban-3debc730ab) [daveey]
+     with kb.write_txn(conn):
+         if _already_posted(conn, task_id, waiting_on, wait_key, kind):
+             return False
+@@ -200,7 +204,8 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+         kb._append_event(conn, task_id, kind, {
+             "parent": waiting_on, "parent_title": parent_title, "wait_event_id": wait_key,
+             "wait_minutes": _minutes(waited_seconds), "ready_minutes": _minutes(ready_seconds),
+-            "queue": kqp.describe(place) if guard else _queue_words(place), **observed, **(extra or {}),
++            "queue": kqp.describe(place) if guard else _queue_words(place), **observed, **checkpoint,
++            **(extra or {}),
+             "respawn_guard": guard,
+             "priority_evidence": lane_evidence(conn, waiting_on),
+             **({} if guard else notice_fields(place, ready_seconds)),
+diff --git a/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py b/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py
+new file mode 100644
+index 0000000000..d693c9493f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ready_wait_checkpoint.py
+@@ -0,0 +1,129 @@
++"""Ready-wait notices name the card's last checkpoint, so a chat doesn't re-place or duplicate finished work. [daveey]
++
++Defect kanban-3debc730ab (2026-11-12): t_01a1c59e0410b2fb merged PR #1148 at 08:15Z and recorded it only as the
++checkpoint of its continued run ("LANDED: PR1148 MERGED ... as main 6948d8bc"); it then sat ready with no worker.
++The ``chat_wait_unclaimed`` notice at 09:11Z carried queue state only, and the chat created a duplicate landing card
++for the merged PR. These tests pin: the checkpoint in both ready-wait notices and the ``kanban_show`` ready hint,
++no sentence for a card with no parked run, and unchanged text for an old payload without the field.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_chat_wait as cw
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kn
++from hermes_cli import kanban_parent_unclaimed as pu
++
++LANDED = "LANDED: PR1148 MERGED 08:15:20Z as main 6948d8bc; NEXT: wait for main CI then live-check"
++SENTENCE = "Read it before re-placing the card or creating a replacement; resume or finish what it records."
++
++
++@pytest.fixture
++def conn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK"):
++        monkeypatch.delenv(key, raising=False)
++    kb.init_db()
++    c = kbc.connect()
++    yield c
++    c.close()
++
++
++def _subscribe(conn, tid):
++    kn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="origin-chat", delivery_metadata={"reason": "create"})
++
++
++def _continued(conn, title="land PR #1148"):
++    """A ready card whose latest run parked with ``kanban_continue`` (a two-line checkpoint)."""
++    tid = kb.create_task(conn, title=title, assignee="default")
++    assert kb.claim_task(conn, tid)
++    assert kc.continue_task(conn, tid, checkpoint=LANDED + "\nState: main CI run pending")["ok"]
++    assert kb.get_task(conn, tid).status == "ready"
++    return tid
++
++
++def _age(conn, *tids, seconds=31 * 60):
++    then = int(time.time()) - seconds
++    for tid in tids:
++        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (then, tid))
++        conn.execute("UPDATE task_runs SET started_at=?, ended_at=? WHERE task_id=?", (then - 60, then, tid))
++        conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (then, tid))
++    conn.commit()
++    return then
++
++
++def _notices(conn, tid, kind):
++    return [json.loads(p) for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, kind))]
++
++
++def test_chat_wait_notice_names_the_continued_runs_checkpoint(conn):
++    tid = _continued(conn)
++    _subscribe(conn, tid)
++    then = _age(conn, tid)
++    assert cw.sweep(conn) == 1
++    [payload] = _notices(conn, tid, cw.NOTICE_KIND)
++    assert payload["last_checkpoint"] == LANDED  # first line only
++    assert payload["last_checkpoint_at"] == then
++    text = cw.notice_text(payload)
++    stamp = time.strftime("%H:%MZ", time.gmtime(then))
++    assert f'Last checkpoint ({stamp}): "{LANDED}". {SENTENCE}' in text
++    assert "State: main CI run pending" not in text
++    # It comes before the advice that points the chat at re-placement.
++    assert text.index("Last checkpoint") < text.index("can't start is no fix")
++
++
++def test_parent_unclaimed_notice_names_the_parents_checkpoint(conn):
++    parent = _continued(conn)
++    child = kb.create_task(conn, title="live-check #1148", assignee="default", parents=[parent])
++    _subscribe(conn, child)
++    _age(conn, parent, child)
++    assert pu.sweep(conn) == 1
++    [payload] = _notices(conn, child, pu.NOTICE_KIND)
++    text = pu.notice_text(payload)
++    assert "Last checkpoint" in text and LANDED in text and SENTENCE in text
++    assert text.index("Last checkpoint") < text.index("can't start is no fix")
++
++
++def test_kanban_show_ready_hint_names_the_checkpoint(conn, monkeypatch):
++    from tools import kanban_show
++    tid = _continued(conn)
++    _age(conn, tid)
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    hint = json.loads(kanban_show.show({"task_id": tid})).get("queue_hint") or ""
++    assert "Last checkpoint" in hint and LANDED in hint and SENTENCE in hint
++    assert "can't start is no fix" in hint
++
++
++def test_card_without_a_prior_run_gets_no_checkpoint(conn, monkeypatch):
++    from tools import kanban_show
++    tid = kb.create_task(conn, title="never ran", assignee="default")
++    _subscribe(conn, tid)
++    _age(conn, tid)
++    assert cw.sweep(conn) == 1
++    [payload] = _notices(conn, tid, cw.NOTICE_KIND)
++    assert "last_checkpoint" not in payload
++    assert "Last checkpoint" not in cw.notice_text(payload)
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    assert "Last checkpoint" not in (json.loads(kanban_show.show({"task_id": tid})).get("queue_hint") or "")
++
++
++@pytest.mark.parametrize("render", [cw.notice_text, pu.notice_text])
++def test_old_payload_without_the_field_renders_unchanged(render):
++    old = {"parent": "t_old", "parent_title": "old card", "wait_minutes": 40, "ready_minutes": 35,
++           "queue": "2 card(s) ahead of it"}
++    before = render(old)
++    assert "Last checkpoint" not in before
++    with_field = render({**old, "last_checkpoint": LANDED, "last_checkpoint_at": 1794470400})
++    sentence = f'Last checkpoint (08:00Z): "{LANDED}". {SENTENCE} '
++    assert sentence in with_field
++    assert with_field.replace(sentence, "") == before
+-- 
+2.43.0
+

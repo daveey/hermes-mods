@@ -1,0 +1,460 @@
+From 1ff68ab97becdb402be5e9ae3166c50e5a190212 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:55:58 +0000
+Subject: [PATCH] [daveey] fix(delegation): a terminal unit ends the child rows
+ it left open
+
+A backend restart killed async delegation deleg_5facc89f's owner at 10:06:01;
+the next process recorded the unit unknown 17 s later, but child session
+20261111_094134_4755e7 stayed ended_at NULL for 27 h+: recovery never touched
+session rows, and the startup orphan sweep deferred to any live backend whose
+heartbeat predated the row (hub backends restart many times a day).
+
+- dispatch persists task_session_ids; recover_abandoned_delegations ends the
+  unit's still-open subagent rows of that parent (delegation_unknown), and a
+  stall force-finalize does the same (delegation_stalled).
+- SessionDB.end_subagents_of_ended_parents: the startup sweep ends an idle
+  subagent row whose parent row has ended, with no heartbeat guess
+  (parent_ended_reap). Distinct reasons, so the reap's killed-subagent notice
+  is not re-sent to a chat that already got the delegation's result.
+---
+ hermes_state_maintenance.py                   |  34 +++
+ .../test_async_delegation_child_row_end.py    | 203 ++++++++++++++++++
+ tools/async_delegation.py                     |  74 ++++++-
+ tools/delegate_tool_dispatch.py               |   2 +
+ tui_gateway/session_reaper.py                 |  13 ++
+ 5 files changed, 323 insertions(+), 3 deletions(-)
+ create mode 100644 tests/tools/test_async_delegation_child_row_end.py
+
+diff --git a/hermes_state_maintenance.py b/hermes_state_maintenance.py
+index 5a8501cc7c..f6aaa19ac7 100644
+--- a/hermes_state_maintenance.py
++++ b/hermes_state_maintenance.py
+@@ -216,6 +216,40 @@ class SessionMaintenanceMixin:
+             return victims
+         return self._execute_write(_do) or []
+ 
++    def end_subagents_of_ended_parents(
++        self, *, max_idle_seconds: float, exclude_ids: tuple[str, ...] = (),
++        end_reason: str = "parent_ended_reap",
++    ) -> list[str]:
++        """[daveey] Close open ``subagent`` rows whose parent row is already ended and that have been idle (by
++        ``started_at`` AND canonical last activity) at least ``max_idle_seconds``. A delegate child's real owner is
++        the process that ran its parent's turn, so ``sweep_orphaned_sessions``' heartbeat guess (any live backend
++        started before the row could own it) kept such rows open for as long as some backend outlived them, which on
++        a host whose backends restart many times a day is indefinitely. A parent that has ended (reaped, closed or
++        rotated by compression) has no turn left to own the child. ``end_reason`` differs from
++        ``startup_orphan_reap`` so the reap's killed-subagent notice is not re-sent hours late to a chat that already
++        received the delegation's own result. Write guards and ``exclude_ids`` spare rows as in the orphan sweep."""
++        if max_idle_seconds <= 0:
++            return []
++        cutoff = time.time() - max_idle_seconds
++        scope_sql = (f" AND source = 'subagent' AND started_at < ? AND {_sql_session_last_active('sessions')} < ?"
++                     " AND parent_session_id IS NOT NULL AND EXISTS (SELECT 1 FROM sessions p WHERE"
++                     " p.id = sessions.parent_session_id AND p.ended_at IS NOT NULL)")
++        scope_params = (cutoff, cutoff)
++
++        def _do(conn):
++            rows = conn.execute(f"SELECT id FROM sessions WHERE ended_at IS NULL{scope_sql}", scope_params).fetchall()
++            excluded = {str(x) for x in exclude_ids if x}
++            victims = [sid for sid in (str(row["id"]) for row in rows)
++                       if sid not in excluded and not self._write_guards_reject(conn, sid)]
++            if not victims:
++                return []
++            conn.execute(
++                f"UPDATE sessions SET ended_at = ?, end_reason = ?"
++                f" WHERE id IN ({_placeholders(victims)}) AND ended_at IS NULL{scope_sql}",
++                (time.time(), end_reason, *victims, *scope_params))
++            return victims
++        return self._execute_write(_do) or []
++
+     @staticmethod
+     def _prune_filter_where(*, archived: Optional[bool] = None, include_pinned: bool = False,
+                             lineage_tips_only: bool = False, include_open: bool = False,
+diff --git a/tests/tools/test_async_delegation_child_row_end.py b/tests/tools/test_async_delegation_child_row_end.py
+new file mode 100644
+index 0000000000..f89784aa12
+--- /dev/null
++++ b/tests/tools/test_async_delegation_child_row_end.py
+@@ -0,0 +1,203 @@
++"""A delegate child row ends when its unit reaches a terminal state the child never closed itself.
++
++Hub incident (subagent 20261111_094134_4755e7): a backend restart killed the owner of async delegation
++``deleg_5facc89f`` at 10:06:01; the next process recorded the unit ``unknown`` 17 s later, but the child's
++session row stayed ``ended_at IS NULL`` for 27 h+. ``recover_abandoned_delegations`` never touched it, and the
++startup orphan sweep refused it because SOME live backend's heartbeat predated it. Three producers now end it:
++
++- recovery of a dead owner's unit ends the unit's open child rows (``delegation_unknown``);
++- a stall-monitor force-finalize ends them too (``delegation_stalled``);
++- the startup sweep ends a ``subagent`` row whose parent row has ended, with no heartbeat guess
++  (``parent_ended_reap``), which also closes rows left open before this fix.
++"""
++
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++from hermes_state import SessionDB
++from tools import async_delegation as ad
++
++IDLE_S = 6 * 3600
++
++
++@pytest.fixture(autouse=True)
++def _clean_state():
++    ad._reset_for_tests()
++    yield
++    ad._reset_for_tests()
++
++
++@pytest.fixture
++def home(tmp_path):
++    token = set_hermes_home_override(str(tmp_path))
++    try:
++        yield tmp_path
++    finally:
++        reset_hermes_home_override(token)
++
++
++def _session_row(home, sid):
++    db = SessionDB(home / "state.db")
++    try:
++        return db.get_session(sid)
++    finally:
++        db.close()
++
++
++def _seed_sessions(home, *, child_parent="parent-1", child_source="subagent"):
++    db = SessionDB(home / "state.db")
++    try:
++        db.create_session("parent-1", source="desktop")
++        db.create_session("other-parent", source="desktop")
++        db.create_session("child-1", source=child_source, parent_session_id=child_parent)
++        db.create_session("child-done", source="subagent", parent_session_id="parent-1")
++        db.end_session("child-done", "agent_close")
++    finally:
++        db.close()
++
++
++def _dead_owner_unit(task_session_ids):
++    """A running ledger row whose owner pid is gone."""
++    with ad._DB_LOCK, ad._transaction() as conn:
++        conn.execute(
++            "INSERT INTO async_delegations (delegation_id, origin_session, state, dispatched_at, updated_at, "
++            "delivery_state, delivery_attempts, owner_pid, owner_started_at, task_json, parent_session_id) "
++            "VALUES ('deleg-x', 'parent-1', 'running', 1, 1, 'pending', 0, 999999, 1, ?, 'parent-1')",
++            (json.dumps({"goal": "g", "is_batch": True, "goals": ["g"], "task_session_ids": task_session_ids}),))
++
++
++def test_recovered_unknown_unit_ends_its_open_child_row(home, monkeypatch):
++    _seed_sessions(home)
++    _dead_owner_unit({"0": "child-1", "1": "child-done"})
++    monkeypatch.setattr(ad, "_owner_liveness", lambda: (lambda pid, started: False))
++
++    assert ad.recover_abandoned_delegations() == 1
++
++    child = _session_row(home, "child-1")
++    assert child["ended_at"] is not None
++    assert child["end_reason"] == "delegation_unknown"
++    # A child that closed its own row keeps its first reason.
++    assert _session_row(home, "child-done")["end_reason"] == "agent_close"
++    assert _session_row(home, "parent-1")["ended_at"] is None
++
++
++@pytest.mark.parametrize("child_parent,child_source", [("other-parent", "subagent"), ("parent-1", "desktop")])
++def test_recovery_never_ends_a_row_that_is_not_this_parents_subagent(home, monkeypatch, child_parent, child_source):
++    _seed_sessions(home, child_parent=child_parent, child_source=child_source)
++    _dead_owner_unit({"0": "child-1"})
++    monkeypatch.setattr(ad, "_owner_liveness", lambda: (lambda pid, started: False))
++
++    assert ad.recover_abandoned_delegations() == 1
++    assert _session_row(home, "child-1")["ended_at"] is None
++
++
++def test_dispatch_persists_child_session_ids(home):
++    release = []
++    handle = ad.dispatch_async_delegation_batch(
++        goals=["g"], context=None, toolsets=None, role="leaf", model="m", session_key="k",
++        parent_session_id="parent-1", runner=lambda: (release.append(1), {"results": []})[1],
++        task_session_ids={"0": "child-1"})
++    assert handle["status"] == "dispatched"
++    with ad._DB_LOCK, ad._transaction() as conn:
++        task = json.loads(conn.execute("SELECT task_json FROM async_delegations WHERE delegation_id=?",
++                                       (handle["delegation_id"],)).fetchone()[0])
++    assert task["task_session_ids"] == {"0": "child-1"}
++
++
++def test_stall_force_finalize_ends_open_child_rows(home, monkeypatch):
++    _seed_sessions(home)
++    record = {"delegation_id": "deleg-s", "status": "stalling", "parent_session_id": "parent-1", "goal": "g",
++              "is_batch": True, "goals": ["g"], "task_session_ids": {"0": "child-1"}, "dispatched_at": time.time(),
++              "_interrupted_at": time.time(), "_stall_quiet_seconds": 500.0, "_stall_threshold_seconds": 450.0,
++              "_stall_in_tool": False}
++    ad._persist_dispatch(record)
++    with ad._records_lock:
++        ad._records["deleg-s"] = record
++
++    ad._finalize("deleg-s", lambda rec: ad._stalled_result("deleg-s", rec), "stalled")
++
++    child = _session_row(home, "child-1")
++    assert child["end_reason"] == "delegation_stalled"
++    assert child["ended_at"] is not None
++
++
++# ── startup sweep: a subagent whose parent has ended ─────────────────────────
++
++
++def _backdate(db, sid, ts):
++    db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (ts, sid))
++    db._conn.commit()
++
++
++@pytest.fixture
++def db(tmp_path):
++    d = SessionDB(tmp_path / "sweep.db")
++    yield d
++    d.close()
++
++
++def _hub_like(db, *, parent_ended: bool):
++    """Parent + idle subagent child, with a live backend heartbeat that predates the child (the hub's
++    many-restarts-a-day shape that kept the orphan sweep from ever closing the child)."""
++    now = time.time()
++    stale = now - 8 * 3600
++    db.create_session("parent", source="desktop")
++    db.create_session("child", source="subagent", parent_session_id="parent")
++    _backdate(db, "parent", stale - 3600)
++    _backdate(db, "child", stale)
++    if parent_ended:
++        db.end_session("parent", "startup_orphan_reap")
++    db.register_backend_heartbeat(backend_id="other-backend", pid=4242, started_at=stale - 60,
++                                  last_heartbeat=now, profile="default", host="hub")
++
++
++def test_heartbeat_guess_alone_keeps_the_child_open(db):
++    """The incident's producer: the orphan sweep defers to an unrelated live backend."""
++    _hub_like(db, parent_ended=True)
++    assert db.sweep_orphaned_sessions(max_idle_seconds=IDLE_S, sources=("subagent",)) == []
++    assert db.get_session("child")["ended_at"] is None
++
++
++def test_subagent_of_ended_parent_is_closed_without_heartbeat_guess(db):
++    _hub_like(db, parent_ended=True)
++    assert db.end_subagents_of_ended_parents(max_idle_seconds=IDLE_S) == ["child"]
++    row = db.get_session("child")
++    assert row["end_reason"] == "parent_ended_reap"
++    assert row["ended_at"] is not None
++
++
++def test_subagent_of_open_parent_is_left_alone(db):
++    _hub_like(db, parent_ended=False)
++    assert db.end_subagents_of_ended_parents(max_idle_seconds=IDLE_S) == []
++    assert db.get_session("child")["ended_at"] is None
++
++
++def test_recent_subagent_of_ended_parent_is_left_alone(db):
++    db.create_session("parent", source="desktop")
++    db.create_session("child", source="subagent", parent_session_id="parent")
++    db.end_session("parent", "agent_close")
++    assert db.end_subagents_of_ended_parents(max_idle_seconds=IDLE_S) == []
++    assert db.get_session("child")["ended_at"] is None
++
++
++def test_excluded_live_subagent_is_left_alone(db):
++    _hub_like(db, parent_ended=True)
++    assert db.end_subagents_of_ended_parents(max_idle_seconds=IDLE_S, exclude_ids=("child",)) == []
++
++
++def test_startup_sweep_closes_subagent_of_ended_parent_despite_live_heartbeat(db, monkeypatch):
++    """Gateway wiring: the startup sweep ends the child the heartbeat guess spared, with no killed-subagent
++    notice (that reason is reserved for ``startup_orphan_reap``)."""
++    from tui_gateway import server
++    _hub_like(db, parent_ended=True)
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(server, "_SESSION_TTL_S", float(IDLE_S))
++    monkeypatch.setattr(server, "_sessions", {})
++
++    assert server._sweep_orphaned_session_rows() == []  # nothing for the heartbeat-gated orphan sweep
++    assert db.get_session("child")["end_reason"] == "parent_ended_reap"
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index 5c70ac4237..f40b428fc8 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -184,7 +184,8 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
+         owner_started_at = None
+     task_payload = {
+         key: record.get(key)
+-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts", *_ROUTING_KEYS)
++        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts",
++                    "task_session_ids", *_ROUTING_KEYS)
+         if key in record}
+     try:  # where the children's terminals started; lets recovery add a git-state hint
+         task_payload["owner_cwd"] = os.getcwd()
+@@ -300,7 +301,7 @@ def recover_abandoned_delegations() -> int:
+     alive = _owner_liveness()
+     if alive is None:
+         return 0
+-    now, recovered = time.time(), 0
++    now, recovered, ended = time.time(), 0, []
+     with _DB_LOCK, _transaction() as conn:
+         rows = conn.execute("""SELECT delegation_id, origin_session, origin_ui_session_id,
+                       parent_session_id, dispatched_at, owner_pid,
+@@ -341,10 +342,71 @@ def recover_abandoned_delegations() -> int:
+             conn.execute("""UPDATE async_delegations SET state='unknown', completed_at=?,
+                    updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                    WHERE delegation_id=?""", (now, now, json.dumps(event), json.dumps(result), delegation_id))
++            ended.extend(_end_child_session_rows(conn, parent_id, task.get("task_session_ids"), "delegation_unknown", now))
+             recovered += 1
++    _refresh_ended_child_outcomes(ended)
+     return recovered
+ 
+ 
++# [daveey] End reasons for a delegate child row whose unit reached a terminal state without the child closing its own
++# row (``agent_close``): its owner process died (``unknown``) or the stall monitor force-finalized it (``stalled``).
++# Distinct from ``startup_orphan_reap`` so the reap's killed-subagent notice does not repeat the delegation's result.
++CHILD_END_REASONS = {"unknown": "delegation_unknown", "stalled": "delegation_stalled"}
++
++
++def _end_child_session_rows(conn, parent_session_id, task_session_ids, end_reason: str, now: float) -> list[str]:
++    """End the still-open session rows of a terminal unit's children inside the caller's transaction. Only rows that
++    really are this parent's ``subagent`` children are touched, so a stale or foreign id cannot end another chat.
++    Without this a child killed with its owner stayed open until a startup sweep proved no live backend could own it,
++    which on a host whose backends restart many times a day can be never. Never raises."""
++    ids = [str(v) for v in task_session_ids.values() if v] if isinstance(task_session_ids, dict) else []
++    if not ids or not parent_session_id:
++        return []
++    try:
++        open_ids = [r[0] for r in conn.execute(
++            f"SELECT id FROM sessions WHERE id IN ({','.join('?' * len(ids))}) AND parent_session_id=?"
++            " AND source='subagent' AND ended_at IS NULL", (*ids, parent_session_id)).fetchall()]
++        if open_ids:
++            conn.execute(
++                f"UPDATE sessions SET ended_at=?, end_reason=? WHERE id IN ({','.join('?' * len(open_ids))})"
++                " AND ended_at IS NULL", (now, end_reason, *open_ids))
++        return open_ids
++    except sqlite3.Error:
++        logger.debug("Could not end child session rows %s (%s)", ids, end_reason, exc_info=True)
++        return []
++
++
++def _refresh_ended_child_outcomes(ended: list[str]) -> None:
++    """Best-effort outcome refresh for child rows this module just ended (they ended mid-turn)."""
++    if not ended:
++        return
++    try:
++        from hermes_state_outcome import refresh_outcomes_quietly
++        refresh_outcomes_quietly(ended, "reap")
++    except Exception:
++        logger.debug("child outcome refresh failed for %s", ended, exc_info=True)
++
++
++def end_terminal_unit_children(record: dict[str, Any], status: str) -> list[str]:
++    """End the open child rows of a unit this process finalized as ``status`` without its runner returning
++    (``stalled``). A worker process has no ledger access; its owner's recovery covers it. Never raises."""
++    end_reason = CHILD_END_REASONS.get(status)
++    if not end_reason or not record.get("task_session_ids"):
++        return []
++    try:
++        from agent.runtime_session_store import is_worker_process
++        if is_worker_process() or not _db_path().exists():
++            return []
++        with _DB_LOCK, _transaction() as conn:
++            ended = _end_child_session_rows(conn, record.get("parent_session_id"), record.get("task_session_ids"),
++                                            end_reason, time.time())
++    except Exception:
++        logger.debug("Could not end child rows of %s", record.get("delegation_id"), exc_info=True)
++        return []
++    _refresh_ended_child_outcomes(ended)
++    return ended
++
++
+ def restore_undelivered_completions(target_queue) -> int:
+     """Enqueue durable pending completions as fresh turns after process start.
+     Restored events are stamped ``restored=True`` in memory only: they came from a PREVIOUS
+@@ -974,6 +1036,7 @@ def _dispatch_admitted(
+     progress_fn: Optional[Callable[[], tuple]], capacity_error: str, slot_key: Optional[str] = None,
+     task_indexes: Optional[list[int]] = None,
+     task_transcripts: Optional[dict[str, str]] = None,
++    task_session_ids: Optional[dict[str, str]] = None,
+ ) -> dict[str, Any]:
+     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
+     record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
+@@ -997,6 +1060,8 @@ def _dispatch_admitted(
+         "interrupt_fn": interrupt_fn, **({"is_batch": True} if is_batch else {}), "progress_fn": progress_fn,
+         "slot_key": slot_key or delegation_id,
+         **({"task_transcripts": dict(task_transcripts)} if task_transcripts else {}),
++        # Child session ids by task index: a terminal unit whose children never closed their rows ends them.
++        **({"task_session_ids": dict(task_session_ids)} if task_session_ids else {}),
+         # Which of the call's ``goals`` this unit runs (None = all of them).
+         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
+         # The one stale-monitor thread serves every profile and starts with an empty Context;
+@@ -1093,6 +1158,7 @@ def dispatch_async_delegation_batch(
+     progress_fn: Optional[Callable[[], tuple]] = None, slot_key: Optional[str] = None,
+     task_indexes: Optional[list[int]] = None,
+     task_transcripts: Optional[dict[str, str]] = None,
++    task_session_ids: Optional[dict[str, str]] = None,
+ ) -> dict[str, Any]:
+     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
+     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
+@@ -1110,7 +1176,7 @@ def dispatch_async_delegation_batch(
+         parent_session_id=parent_session_id, runner=runner,
+         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
+         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
+-        task_indexes=task_indexes, task_transcripts=task_transcripts,
++        task_indexes=task_indexes, task_transcripts=task_transcripts, task_session_ids=task_session_ids,
+         capacity_error=(
+             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
+             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
+@@ -1152,6 +1218,8 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
+         snapshot = dict(record)
+     final = result(snapshot) if callable(result) else result
+     _push_completion_event(snapshot, _keep_finished_children(snapshot, final, status), status)
++    if status == "stalled":  # its runner never returned, so its children never closed their rows
++        end_terminal_unit_children(snapshot, status)
+     with _records_lock:
+         if delegation_id in _records:
+             _records[delegation_id]["status"] = status
+diff --git a/tools/delegate_tool_dispatch.py b/tools/delegate_tool_dispatch.py
+index 1e79da1218..ec53700af7 100644
+--- a/tools/delegate_tool_dispatch.py
++++ b/tools/delegate_tool_dispatch.py
+@@ -448,6 +448,8 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
+         task_transcripts={str(i): str(unit.live_writers[i].path) for i, _, _ in unit.children
+                           if i < len(unit.live_writers) and unit.live_writers[i] is not None
+                           and unit.live_writers[i].path is not None},
++        # Child session rows by task index: a unit that ends unknown/stalled ends the rows its children left open.
++        task_session_ids={str(i): str(c.session_id) for i, _, c in unit.children if getattr(c, "session_id", None)},
+         progress_fn=lambda: _batch_progress_token(child_agents), **routing,
+     )
+ 
+diff --git a/tui_gateway/session_reaper.py b/tui_gateway/session_reaper.py
+index 8a2ac08362..67be564f55 100644
+--- a/tui_gateway/session_reaper.py
++++ b/tui_gateway/session_reaper.py
+@@ -463,6 +463,19 @@ def _sweep_orphaned_session_rows() -> list[str]:
+     swept = db.sweep_orphaned_sessions(
+         max_idle_seconds=_SESSION_TTL_S, sources=_ORPHAN_SWEEP_SOURCES,
+         exclude_ids=tuple(sorted(live_ids)), exclude_pinned=True)
++    # [daveey] A delegate child whose parent row has ended has no turn left to own it, whatever live backend's
++    # heartbeat predates it; end it without the heartbeat guess (and without the killed-subagent notice).
++    try:
++        children = db.end_subagents_of_ended_parents(
++            max_idle_seconds=_SESSION_TTL_S, exclude_ids=tuple(sorted(live_ids)))
++    except Exception:
++        logger.debug("ended-parent subagent sweep failed", exc_info=True)
++        children = []
++    if children:
++        logger.info("Closed %d subagent row(s) whose parent session had ended (parent_ended_reap): %s",
++                    len(children), ", ".join(children))
++        from hermes_state_outcome import refresh_outcomes_quietly
++        refresh_outcomes_quietly(children, "reap", db=db)
+     if swept:
+         logger.info(
+             "Closed %d orphaned session row(s) from a previous gateway process (startup_orphan_reap): %s",
+-- 
+2.43.0
+

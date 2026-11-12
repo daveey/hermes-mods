@@ -1,0 +1,538 @@
+From f552ab0a2cb27c7fe7a73bd3993a25b1dd1a15b3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 13:04:55 +0000
+Subject: [PATCH] [daveey] ci: require the macOS native-memory lane in the v2
+ aggregate when a PR touches the Darwin memory reader
+
+The no-subprocess tests for hermes_cli/machine_memory_darwin.py are
+platforms("macos") and skip on every Linux lane. Only native-memory-macos.yml
+ran them, from its own pull_request trigger, outside "All required checks pass
+(v2)": on PR #1055 the aggregate went green 29 minutes before the macOS job
+finished, and a mutant that put the sysctl/vm_stat subprocess pair back into
+_mem_used_pct passed all Linux CI.
+
+GitHub's needs cannot reach a job in another workflow, so the lane moves under
+CI the way hermes-state-macos did:
+
+- classify_changes.py gains a native_memory lane: exactly the workflow's six
+  paths (NATIVE_MEMORY_PATHS), plus an empty or capped diff (fail open). A
+  generic .github/ change does not start it, so other PRs are unaffected.
+- detect re-exports it and masks it on a non-release main push (the workflow's
+  own push trigger still runs main, as before).
+- ci.yaml calls native-memory-macos.yml (now workflow_call, no pull_request
+  trigger) for same-repo PRs, and all-checks-pass needs it.
+  required_results.py requires the job whenever detect selects the lane, so a
+  skipped (fork), failed, cancelled or unreported run keeps the gate red.
+
+tests/ci/test_native_memory_gate.py replays classifier -> detect action ->
+ci.yaml detect -> caller -> the aggregate's real evaluate step: a PR touching
+hermes_cli/machine_metrics.py fails the gate unless the native job succeeds,
+and a PR touching none of the six paths passes with the job skipped. It fails
+on the parent (24 failed) and passes here.
+---
+ .github/actions/detect-changes/action.yml |   3 +
+ .github/workflows/README.md               |   1 +
+ .github/workflows/ci.yaml                 |  27 +++-
+ .github/workflows/native-memory-macos.yml |  29 +++-
+ scripts/ci/classify_changes.py            |  21 +++
+ scripts/ci/required_results.py            |   2 +
+ tests/ci/test_classify_changes.py         |  23 ++-
+ tests/ci/test_native_memory_gate.py       | 184 ++++++++++++++++++++++
+ tests/ci/test_native_memory_workflow.py   |   8 +-
+ 9 files changed, 282 insertions(+), 16 deletions(-)
+ create mode 100644 tests/ci/test_native_memory_gate.py
+
+diff --git a/.github/actions/detect-changes/action.yml b/.github/actions/detect-changes/action.yml
+index 6770f416f3..b6cfd9acfd 100644
+--- a/.github/actions/detect-changes/action.yml
++++ b/.github/actions/detect-changes/action.yml
+@@ -75,6 +75,9 @@ outputs:
+   hermes_state:
+     description: Run tests/hermes_state/ on the macOS mini (state modules/tests, test harness, dependency manifests).
+     value: ${{ steps.classify.outputs.hermes_state }}
++  native_memory:
++    description: Run the Darwin memory reader's ABI and no-fork tests on the macOS mini (only its six exact paths).
++    value: ${{ steps.classify.outputs.native_memory }}
+ 
+ runs:
+   using: composite
+diff --git a/.github/workflows/README.md b/.github/workflows/README.md
+index 42be367f90..1a7493ab25 100644
+--- a/.github/workflows/README.md
++++ b/.github/workflows/README.md
+@@ -228,6 +228,7 @@ of every suite that reads it.
+ | Rust tests | `rust-tests.yml` | `rust` | no Rust change |
+ | Catalog tests | `catalog-tests.yml` | `catalog` | no catalog data change |
+ | Remote terminal backends | `remote-backends.yml` | `remote_backends` | no backend change |
++| Native memory (macOS) | `native-memory-macos.yml` (self-hosted mini) | `native_memory`: a same-repo PR touching one of the Darwin memory reader's six paths (`NATIVE_MEMORY_PATHS`), an empty diff, dispatch, release. The gate requires it when selected; a fork PR fails the gate on the skip | any other PR (incl. other `.github/` changes); a main push (the workflow's own push trigger runs main) |
+ | Bootstrap installer | `bootstrap-installer.yml` | `bootstrap` | no installer change |
+ | Desktop E2E | `e2e-desktop.yml` | **never** (`if: false`, deferred as flaky) | always |
+ | Desktop core E2E | `e2e-desktop-core.yml` | `e2e_desktop_core` (release or dispatch) | PRs and pushes |
+diff --git a/.github/workflows/ci.yaml b/.github/workflows/ci.yaml
+index b0837233ca..5b2d3d5533 100644
+--- a/.github/workflows/ci.yaml
++++ b/.github/workflows/ci.yaml
+@@ -111,6 +111,7 @@ jobs:
+       e2e_desktop_core: ${{ steps.gate-lanes.outputs.e2e_desktop_core }}
+       e2e_desktop_update: ${{ steps.gate-lanes.outputs.e2e_desktop_update }}
+       hermes_state: ${{ steps.gate-lanes.outputs.hermes_state }}
++      native_memory: ${{ steps.gate-lanes.outputs.native_memory }}
+       event_name: ${{ github.event_name }}
+       python_changed: ${{ steps.python-plan.outputs.changed }}
+       python_slices: ${{ steps.python-plan.outputs.slices }}
+@@ -129,9 +130,10 @@ jobs:
+         # Overwrite the classifier outputs with 'true' when inputs.release. The E2E
+         # lanes are forced off unless this is a release run or a manual dispatch
+         # (whose empty diff already turns every lane on): never on a pull request
+-        # or a push to main, whatever the diff or labels say. The macOS state lane
+-        # is off on a main push (hermes-state-macos.yml's own push trigger runs main, so
+-        # a main push never runs the suite twice on the one mini runner) and on for
++        # or a push to main, whatever the diff or labels say. The macOS state and
++        # native memory lanes are off on a main push (hermes-state-macos.yml and
++        # native-memory-macos.yml each run main from their own push trigger, so a
++        # main push never runs a suite twice on the one mini runner) and on for
+         # a dispatch or a release.
+         id: gate-lanes
+         env:
+@@ -149,7 +151,7 @@ jobs:
+               for lane, value in values.items():
+                   if lane.startswith('e2e') and not e2e_allowed:
+                       value = 'false'
+-                  elif (lane == 'hermes_state' and os.environ['EVENT_NAME'] == 'push'
++                  elif (lane in ('hermes_state', 'native_memory') and os.environ['EVENT_NAME'] == 'push'
+                         and os.environ['TEST_REF'] == 'refs/heads/main' and not release):
+                       value = 'false'
+                   elif release and value in ('true', 'false'):
+@@ -318,6 +320,22 @@ jobs:
+     with:
+       commit: ${{ inputs.commit }}
+ 
++  native-memory-macos:
++    name: Native memory (macOS)
++    needs: detect
++    # The Darwin memory reader's ABI and no-fork tests on the self-hosted macOS
++    # mini. They are platforms("macos") and skip on every Linux lane, so a PR
++    # that touches one of the reader's six paths (classify_changes.py
++    # NATIVE_MEMORY_PATHS) cannot land until they pass here: all-checks-pass
++    # requires this job whenever detect selects native_memory. A fork PR never
++    # runs on the mini: the job skips, and the gate then fails the selected
++    # lane. Main pushes skip here (detect turns the lane off); the workflow's
++    # own push trigger runs main.
++    if: needs.detect.outputs.native_memory == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
++    uses: ./.github/workflows/native-memory-macos.yml
++    with:
++      commit: ${{ inputs.commit }}
++
+   bootstrap-installer:
+     name: Bootstrap installer
+     needs: detect
+@@ -438,6 +456,7 @@ jobs:
+       - rust-tests
+       - remote-backends
+       - hermes-state-macos
++      - native-memory-macos
+       - catalog-tests
+       - bootstrap-installer
+       - e2e-desktop
+diff --git a/.github/workflows/native-memory-macos.yml b/.github/workflows/native-memory-macos.yml
+index b05f87bea5..12e649feb8 100644
+--- a/.github/workflows/native-memory-macos.yml
++++ b/.github/workflows/native-memory-macos.yml
+@@ -2,37 +2,52 @@ name: Native memory (macOS)
+ 
+ # The generic OS lane is disabled in this fork. These ABI and no-fork
+ # regressions must execute on Darwin before a memory-reader change lands.
++#
++# ci.yaml calls this (job native-memory-macos) for a same-repository PR whose
++# diff touches one of the paths below (classify_changes.py NATIVE_MEMORY_PATHS,
++# kept equal to this list by tests/ci/test_native_memory_gate.py) and for every
++# dispatch / release. "All required checks pass (v2)" then requires its success,
++# so the PR cannot land with this lane pending, skipped or red. There is no
++# pull_request trigger here: a second, unrequired copy of the job would only
++# hold the one mini runner. Main pushes run here directly; CI masks its
++# duplicate call only on main pushes.
+ on:
+-  pull_request:
+-    paths: &memory-paths
++  push:
++    branches: [main]
++    paths:
+       - 'hermes_cli/machine_memory_darwin.py'
+       - 'hermes_cli/machine_metrics.py'
+       - 'tests/hermes_cli/test_machine_memory_darwin.py'
+       - 'tests/hermes_cli/test_machine_memory_nofork.py'
+       - '.github/workflows/native-memory-macos.yml'
+       - 'tests/ci/test_native_memory_workflow.py'
+-  push:
+-    branches: [main]
+-    paths: *memory-paths
+   workflow_dispatch:
++  workflow_call:
++    inputs:
++      commit:
++        description: Commit to test. Empty keeps the triggering commit (the PR head on a pull request).
++        type: string
++        default: ''
+ 
+ permissions:
+   contents: read
+ 
+ concurrency:
+-  group: native-memory-${{ github.event.pull_request.number || github.ref }}
++  # Collapse queued standalone pushes, but never supersede a required caller.
++  group: ${{ github.workflow == 'Native memory (macOS)' && github.event_name == 'push' && format('native-memory-push-{0}', github.ref) || format('native-memory-{0}-{1}-{2}', github.run_id, github.run_attempt, inputs.commit || github.sha) }}
+   cancel-in-progress: false
+ 
+ jobs:
+   native-memory:
+     name: Native memory ABI and no-fork tests
++    # Defense in depth for other callers: fork PR code never reaches the mini.
+     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+     runs-on: [self-hosted, macOS, hermes-state]
+     timeout-minutes: 30
+     steps:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+         with:
+-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
++          ref: ${{ inputs.commit || github.event.pull_request.head.sha || github.sha }}
+       - name: Exercise native memory APIs
+         shell: bash
+         run: |
+diff --git a/scripts/ci/classify_changes.py b/scripts/ci/classify_changes.py
+index dbd2ff6cf6..74e532d92e 100644
+--- a/scripts/ci/classify_changes.py
++++ b/scripts/ci/classify_changes.py
+@@ -58,6 +58,13 @@ Lanes:
+   harness and the dependency manifests. An empty diff, a ``.github/`` change or
+   a list at the compare API's 300-file cap runs it. ci.yaml's ``detect`` turns
+   it off on a non-release main push: the standalone workflow already runs main.
++* ``native_memory`` — the Darwin memory reader's ABI and no-fork tests on the
++  real macOS mini (native-memory-macos.yml). Those tests are
++  ``platforms("macos")`` and skip on every Linux lane, so a PR that touches one
++  of :data:`NATIVE_MEMORY_PATHS` must run them before it can land. Only those
++  exact paths, an empty diff or a capped list start it: unlike the other lanes,
++  a generic ``.github/`` change does not. ci.yaml's ``detect`` turns it off on a
++  non-release main push: the standalone workflow already runs main.
+ 
+ ``docker``, ``nix`` and the E2E lanes take most of the larger-runner minutes.
+ An ordinary product change does not start them on a pull request. Every push
+@@ -274,6 +281,17 @@ _PY_TEST_HARNESS = (
+ # hermes_state.py and every hermes_state_* sibling, their tests, the shared pytest harness
+ # that runs them, and the dependency manifests they import through.
+ _HERMES_STATE_PATHS = ("hermes_state", "tests/hermes_state/", *_PY_TEST_HARNESS, *_DEP_MANIFESTS)
++# The native memory lane (native-memory-macos.yml): the Darwin memory reader, its one
++# caller, their macOS-only tests and the lane's own wiring. Exact files, kept equal to the
++# standalone workflow's ``push.paths`` by tests/ci/test_native_memory_gate.py.
++NATIVE_MEMORY_PATHS = (
++    "hermes_cli/machine_memory_darwin.py",
++    "hermes_cli/machine_metrics.py",
++    "tests/hermes_cli/test_machine_memory_darwin.py",
++    "tests/hermes_cli/test_machine_memory_nofork.py",
++    ".github/workflows/native-memory-macos.yml",
++    "tests/ci/test_native_memory_workflow.py",
++)
+ # The bootstrap lane's own inputs beyond the installer it guards: the scripts its
+ # steps run, its pytest suite and the helper that suite imports, and the shared
+ # pytest harness. That suite runs in a bare interpreter (four packages, none of
+@@ -725,6 +743,9 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
+         # A capped list may omit the state files, so it runs the lane.
+         "hermes_state": len(files) >= COMPARE_FILE_CAP
+         or any(f.startswith(_HERMES_STATE_PATHS) for f in files),
++        # Exact paths only: an empty diff or a capped list may hide them, so those run it.
++        "native_memory": not files or len(files) >= COMPARE_FILE_CAP
++        or any(f in NATIVE_MEMORY_PATHS for f in files),
+         **{lane: run_e2e or on for lane, on in _slow_lanes(files).items()},
+     }
+     consumers = [c for f in files for c in _SHARED_FIXTURE_CONSUMERS.get(f, ())]
+diff --git a/scripts/ci/required_results.py b/scripts/ci/required_results.py
+index f88f827dac..e6692667c9 100644
+--- a/scripts/ci/required_results.py
++++ b/scripts/ci/required_results.py
+@@ -60,6 +60,8 @@ _UPDATE_CONSUMER_LANES = {
+     "remote-backends": ("remote_backends",),
+     "catalog-tests": ("catalog",),
+     "hermes-state-macos": ("hermes_state",),
++    # The Darwin memory reader's macOS-only tests (skip on every Linux lane).
++    "native-memory-macos": ("native_memory",),
+ }
+ 
+ # ci.yaml's ``macOS state required (v1)`` consumer: the macOS state lane and its selector.
+diff --git a/tests/ci/test_classify_changes.py b/tests/ci/test_classify_changes.py
+index 6c1d1b5cf1..8cf0d3a251 100644
+--- a/tests/ci/test_classify_changes.py
++++ b/tests/ci/test_classify_changes.py
+@@ -50,12 +50,16 @@ DEFAULT = {
+     "remote_backends": True,
+     "catalog": True,
+     "hermes_state": True,
++    # Exact paths only: a generic CI-config change does not hold the mini for it.
++    "native_memory": False,
+ }
++# An empty (failed) diff may hide the native memory paths, so it runs that lane too.
++EMPTY_DIFF = {**DEFAULT, "native_memory": True}
+ 
+ SLOW_LANES = {"docker", "nix", "e2e", "e2e_upgrade", "e2e_desktop_core", "e2e_desktop_update"}
+ 
+ 
+-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, bootstrap=False, desktop_updater=False, rust=False, docker_meta=False, python_prod=None, nix=False, docker=None, e2e=False, e2e_upgrade=False, e2e_desktop_core=False, e2e_desktop_update=False, remote_backends=False, catalog=False, hermes_state=False) -> dict[str, bool]:
++def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, bootstrap=False, desktop_updater=False, rust=False, docker_meta=False, python_prod=None, nix=False, docker=None, e2e=False, e2e_upgrade=False, e2e_desktop_core=False, e2e_desktop_update=False, remote_backends=False, catalog=False, hermes_state=False, native_memory=False) -> dict[str, bool]:
+     # python_prod tracks python except for tests-only diffs; default it to
+     # python so the majority of cases don't need to spell it out.
+     #
+@@ -86,6 +90,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
+         "remote_backends": remote_backends,
+         "catalog": catalog,
+         "hermes_state": hermes_state,
++        "native_memory": native_memory,
+     }
+ 
+ 
+@@ -476,8 +481,18 @@ CASES = {
+     # Workflows call just recipes, so the recipes are CI config too.
+     "justfile change → all": (["justfile"], DEFAULT),
+     "recipe python wrapper → all": (["scripts/hermes-python"], DEFAULT),
+-    "empty diff → all": ([], DEFAULT),
+-    "blank lines → all": (["", "  "], DEFAULT),
++    "empty diff → all": ([], EMPTY_DIFF),
++    "blank lines → all": (["", "  "], EMPTY_DIFF),
++    # The Darwin reader's no-fork tests skip on Linux; only the mini lane runs them.
++    "darwin memory caller → native_memory": (
++        ["hermes_cli/machine_metrics.py"], _lanes(python=True, scan=True, native_memory=True),
++    ),
++    "native memory workflow → native_memory only of the mac lanes": (
++        [".github/workflows/native-memory-macos.yml"], DEFAULT | {"native_memory": True},
++    ),
++    "neighbouring memory module → no native_memory": (
++        ["hermes_cli/machine_memory.py"], _lanes(python=True, scan=True),
++    ),
+ }
+ 
+ 
+@@ -648,6 +663,8 @@ _REAL_UPDATE_LANES = (
+     ("ci.yaml", "remote-backends", "remote-backends.yml", "remote_backends"),
+     # Catalog-only PRs skip the suite, so their catalog tests must gate the merge.
+     ("ci.yaml", "catalog-tests", "catalog-tests.yml", "catalog"),
++    # The Darwin memory reader's macOS-only tests skip on every Linux lane.
++    ("ci.yaml", "native-memory-macos", "native-memory-macos.yml", "native_memory"),
+ )
+ 
+ 
+diff --git a/tests/ci/test_native_memory_gate.py b/tests/ci/test_native_memory_gate.py
+new file mode 100644
+index 0000000000..a901e7026d
+--- /dev/null
++++ b/tests/ci/test_native_memory_gate.py
+@@ -0,0 +1,184 @@
++"""The required aggregate gates a PR on the macOS native-memory lane exactly when it touches the reader.
++
++The Darwin memory reader's no-subprocess tests are ``platforms("macos")``: every
++Linux lane skips them, so a PR that put ``subprocess.run`` back into
++``_mem_used_pct`` passed all Linux CI. Only native-memory-macos.yml executes them.
++This replays the real wiring (classifier -> detect action -> ci.yaml detect ->
++caller job -> "All required checks pass (v2)" evaluate step, run as the real CLI)
++without a mini job, for a PR touching the reader and for one touching none of its
++paths.
++"""
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import hermes_yaml
++import pytest
++
++from scripts.ci import classify_changes
++from scripts.ci.classify_changes import classify
++from tests.ci import _gha_expr as gha, workflow_steps
++
++ROOT = Path(__file__).resolve().parents[2]
++CALLER = 'native-memory-macos'
++GATE = 'All required checks pass (v2)'
++# The lane's six paths (native-memory-macos.yml push.paths; classify_changes.py NATIVE_MEMORY_PATHS).
++MEMORY_PATHS = (
++    'hermes_cli/machine_memory_darwin.py',
++    'hermes_cli/machine_metrics.py',
++    'tests/hermes_cli/test_machine_memory_darwin.py',
++    'tests/hermes_cli/test_machine_memory_nofork.py',
++    '.github/workflows/native-memory-macos.yml',
++    'tests/ci/test_native_memory_workflow.py',
++)
++
++
++def workflow(name):
++    doc = hermes_yaml.safe_load((ROOT / '.github/workflows' / name).read_text())
++    doc['on'] = doc.get('on', doc.get(True, {}))
++    return doc
++
++
++def context(event='pull_request', ref='refs/pull/1/merge', release=False, fork=False):
++    return {'github': {'event_name': event, 'ref': ref, 'sha': 'trigger-sha',
++                       'run_id': '123', 'run_attempt': '1', 'repository': 'owner/repo',
++                       'event': {'pull_request': {'head': {'repo': {
++                           'full_name': 'fork/repo' if fork else 'owner/repo'}}}}},
++            'inputs': {'release': release, 'commit': ''},
++            '__status__': {'always': lambda: True, 'cancelled': lambda: False}}
++
++
++def detect(paths, ctx):
++    raw = {key: gha.to_string(value) for key, value in classify(paths).items()}
++    action = hermes_yaml.safe_load((ROOT / '.github/actions/detect-changes/action.yml').read_text())
++    outputs = {key: gha.render(value['value'], {'steps': {'classify': {'outputs': raw}}})
++               for key, value in action['outputs'].items()}
++    job = workflow('ci.yaml')['jobs']['detect']
++    ctx['steps'] = {'classify': {'outputs': outputs}}
++    step = next(step for step in job['steps'] if step.get('id') == 'gate-lanes')
++    ctx['steps']['gate-lanes'] = {'outputs': workflow_steps.outputs(step, ctx)}
++    return {key: gha.render(value, ctx) for key, value in job['outputs'].items()}
++
++
++def caller_job():
++    jobs = workflow('ci.yaml')['jobs']
++    callers = [name for name, job in jobs.items()
++               if job.get('uses') == './.github/workflows/native-memory-macos.yml']
++    assert callers == [CALLER], 'ci.yaml must call native-memory-macos.yml exactly once, as the required lane'
++    return jobs[CALLER]
++
++
++def gate_job():
++    gate = workflow('ci.yaml')['jobs']['all-checks-pass']
++    assert gate['name'] == GATE
++    return gate
++
++
++def run_gate(needs):
++    """Run the aggregate's real "Evaluate job results" step over ``needs``; True when it passes."""
++    ctx = context()
++    ctx['needs'] = needs
++    step = next(step for step in gate_job()['steps'] if step.get('id') == 'evaluate')
++    env = {**os.environ, 'PATH': str(Path(sys.executable).parent) + os.pathsep + os.environ['PATH'],
++           **{k: gha.to_string(gha.render(v, ctx)) for k, v in step['env'].items()}}
++    env.pop('GITHUB_OUTPUT', None)
++    proc = subprocess.run(['bash', '-eo', 'pipefail', '-c', gha.render(step['run'], ctx)],
++                          cwd=ROOT, text=True, capture_output=True, timeout=30, check=False, env=env)
++    assert proc.returncode in (0, 1), proc.stdout + proc.stderr
++    return proc.returncode == 0
++
++
++def pr_needs(paths, fork=False, lane_result=None):
++    """The aggregate's ``needs`` for a PR with this diff: every other job green or skipped."""
++    ctx = context(fork=fork)
++    outputs = detect(paths, ctx)
++    ctx['needs'] = {'detect': {'result': 'success', 'outputs': outputs}}
++    runs = gha.condition(caller_job()['if'], ctx)
++    needs = {name: {'result': 'success'} for name in gate_job()['needs']}
++    needs['detect'] = ctx['needs']['detect']
++    needs[CALLER] = {'result': lane_result or ('success' if runs else 'skipped')}
++    return outputs, runs, needs
++
++
++def test_aggregate_waits_for_the_native_memory_job():
++    assert CALLER in gate_job()['needs']
++    assert caller_job()['needs'] == 'detect'
++
++
++@pytest.mark.parametrize('lane_result', ['skipped', 'failure', 'cancelled', None])
++def test_pr_touching_machine_metrics_requires_the_native_memory_job(lane_result, monkeypatch):
++    # No duplicate run exists in this replay; never query the host's real CI run.
++    monkeypatch.delenv('GITHUB_REPOSITORY', raising=False)
++    outputs, runs, needs = pr_needs(['hermes_cli/machine_metrics.py'])
++    assert outputs['native_memory'] == 'true'
++    assert runs is True
++    assert run_gate(needs) is True
++    if lane_result is None:
++        del needs[CALLER]  # never reported, e.g. still pending when read
++    else:
++        needs[CALLER] = {'result': lane_result}
++    assert run_gate(needs) is False
++
++
++@pytest.mark.parametrize('path', MEMORY_PATHS)
++def test_every_memory_path_selects_the_lane(path, monkeypatch):
++    monkeypatch.delenv('GITHUB_REPOSITORY', raising=False)
++    outputs, runs, needs = pr_needs([path, 'README.md'])
++    assert outputs['native_memory'] == 'true' and runs is True
++    needs[CALLER] = {'result': 'skipped'}
++    assert run_gate(needs) is False
++
++
++@pytest.mark.parametrize('paths', [
++    ['README.md'], ['run_agent.py'], ['hermes_cli/main.py'], ['hermes_cli/machine_memory.py'],
++    ['tests/hermes_cli/test_machine_metrics.py'], ['.github/workflows/ci.yaml'],
++    ['scripts/ci/classify_changes.py', 'tests/ci/test_native_memory_gate.py'],
++])
++def test_pr_touching_no_memory_path_passes_without_the_macos_job(paths, monkeypatch):
++    monkeypatch.delenv('GITHUB_REPOSITORY', raising=False)
++    outputs, runs, needs = pr_needs(paths)
++    assert outputs['native_memory'] == 'false'
++    assert runs is False
++    assert needs[CALLER] == {'result': 'skipped'}
++    assert run_gate(needs) is True
++
++
++def test_fork_pr_touching_the_reader_cannot_land_on_a_skip(monkeypatch):
++    monkeypatch.delenv('GITHUB_REPOSITORY', raising=False)
++    outputs, runs, needs = pr_needs(['hermes_cli/machine_memory_darwin.py'], fork=True)
++    assert outputs['native_memory'] == 'true' and runs is False
++    assert run_gate(needs) is False
++
++
++@pytest.mark.parametrize('event,ref,release,selected', [
++    ('push', 'refs/heads/main', False, False),
++    ('push', 'refs/heads/main', True, True),
++    ('workflow_dispatch', 'refs/heads/main', False, True),
++    ('pull_request', 'refs/pull/1/merge', False, True),
++])
++def test_unknown_diff_fails_open_and_only_main_push_is_masked(event, ref, release, selected):
++    assert detect([], context(event, ref, release))['native_memory'] == gha.to_string(selected)
++    assert classify([f'docs/{i}.md' for i in range(300)])['native_memory'] is True
++
++
++def test_classifier_paths_match_the_standalone_workflow_and_it_has_no_unrequired_pr_trigger():
++    child = workflow('native-memory-macos.yml')
++    assert tuple(child['on']['push']['paths']) == MEMORY_PATHS
++    assert getattr(classify_changes, 'NATIVE_MEMORY_PATHS', None) == MEMORY_PATHS
++    assert 'pull_request' not in child['on']
++    assert child['on']['workflow_call']['inputs']['commit']['default'] == ''
++    job = child['jobs']['native-memory']
++    assert job['name'] == 'Native memory ABI and no-fork tests'
++    assert not job.get('continue-on-error')
++    ctx = context()
++    ctx['inputs'] = {key: gha.render(value, ctx) for key, value in caller_job()['with'].items()}
++    ctx['github']['event']['pull_request']['head']['sha'] = 'pr-head-sha'
++    checkout = next(step for step in job['steps'] if workflow_steps.is_checkout(step))
++    assert gha.render(checkout['with']['ref'], ctx) == 'pr-head-sha'
++    # A required call never queues behind (or supersedes) another run's call.
++    other = context()
++    other['github']['run_id'] = '124'
++    other['inputs'] = ctx['inputs']
++    assert gha.render(child['concurrency']['group'], ctx) != gha.render(child['concurrency']['group'], other)
++    assert child['concurrency']['cancel-in-progress'] is False
+diff --git a/tests/ci/test_native_memory_workflow.py b/tests/ci/test_native_memory_workflow.py
+index 597d5f6f9e..0bef91aa7a 100644
+--- a/tests/ci/test_native_memory_workflow.py
++++ b/tests/ci/test_native_memory_workflow.py
+@@ -9,7 +9,11 @@ ROOT = Path(__file__).resolve().parents[2]
+ def test_native_memory_lane_routes_and_executes_real_tests():
+     workflow = hermes_yaml.safe_load((ROOT / ".github/workflows/native-memory-macos.yml").read_text())
+     triggers = workflow.get("on", workflow.get(True))
+-    paths = triggers["pull_request"]["paths"]
++    # Pull requests reach this lane through ci.yaml's required call
++    # (tests/ci/test_native_memory_gate.py), never through an unrequired trigger.
++    assert "pull_request" not in triggers
++    assert "workflow_call" in triggers
++    paths = triggers["push"]["paths"]
+     for path in ("hermes_cli/machine_memory_darwin.py", "hermes_cli/machine_metrics.py",
+                  "tests/hermes_cli/test_machine_memory_darwin.py", "tests/hermes_cli/test_machine_memory_nofork.py"):
+         assert path in paths
+@@ -20,7 +24,7 @@ def test_native_memory_lane_routes_and_executes_real_tests():
+     assert "github.event.pull_request.head.repo.full_name == github.repository" in job["if"]
+     assert workflow["permissions"] == {"contents": "read"}
+     checkout, run = job["steps"]
+-    assert checkout["with"]["ref"] == "${{ github.event.pull_request.head.sha || github.sha }}"
++    assert checkout["with"]["ref"] == "${{ inputs.commit || github.event.pull_request.head.sha || github.sha }}"
+     command = run["run"]
+     assert "HERMES_HOME" in command and "mktemp -d" in command
+     assert "taskpolicy -c utility scripts/run_tests.sh" in command
+-- 
+2.43.0
+

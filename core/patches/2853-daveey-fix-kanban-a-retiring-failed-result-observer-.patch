@@ -1,0 +1,218 @@
+From e2346d9a09e5b146c613aeb77a8e0e9554df72ee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:18:50 +0000
+Subject: [PATCH] [daveey] fix(kanban): a retiring failed-result observer stops
+ its own unit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Transient units keep the properties they were submitted with. Observer units
+armed by a gateway older than 0edc432d7d (RestartPreventExitStatus=78 +
+StartLimitBurst) and f5ef9106e9 (PYTHONPATH pin) still carry only
+Restart=on-failure and no import-path pin, while their ExecStart runs today's
+observer: it retires with exit 78 on `No module named 'ruamel'` and the manager
+restarts it forever. On hermes-worker-4, 10 such units from dead gateway pid
+15887 had ~52k restarts each: ~13 starts/s x ~88 ms CPU ≈ 1.1 cores and ~48k of
+49k user-journal lines per 10 min.
+
+On retire (import failure or unusable context) the observer now queues
+`systemctl --user --no-block stop <observer_unit>`. A pending stop job cancels
+the auto-restart, so legacy units retire on their next start on every host once
+this is deployed. Only a `hermes-failed-result-*.service` named by the context
+and holding this process (/proc/self/cgroup) is stopped; best effort, the exit
+status stays 78.
+
+Live proof on worker-4: a legacy-shaped unit (Restart=on-failure, no
+RestartPreventExitStatus, bare tool python) logged the same ruamel retire, then
+Stopping/Stopped with NRestarts=0 and was collected.
+---
+ hermes_cli/kanban_failed_result_observer.py   | 42 ++++++--
+ .../test_kanban_failed_result_self_stop.py    | 97 +++++++++++++++++++
+ 2 files changed, 133 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_failed_result_self_stop.py
+
+diff --git a/hermes_cli/kanban_failed_result_observer.py b/hermes_cli/kanban_failed_result_observer.py
+index ece5b6c780..030683fa03 100644
+--- a/hermes_cli/kanban_failed_result_observer.py
++++ b/hermes_cli/kanban_failed_result_observer.py
+@@ -9,6 +9,7 @@ import contextlib
+ import json
+ import os
+ import select
++import shutil
+ import sqlite3
+ import subprocess
+ import sys
+@@ -221,6 +222,37 @@ def _release_ready(context):
+         pass
+ 
+ 
++def _stop_own_unit(context):
++    """[daveey] Queue a stop of this observer's own unit, so a retire is final on any unit.
++
++    Transient units keep the properties they were submitted with: one armed before
++    ``RestartPreventExitStatus`` existed restarts a deterministic retire forever.
++    A pending stop job cancels the manager's auto-restart. Only a
++    ``hermes-failed-result-*.service`` named by the context AND holding this process
++    (``/proc/self/cgroup``) is touched. Best effort: never changes the exit status.
++    """
++    try:
++        unit = context.get('observer_unit')
++        if not (isinstance(unit, str) and unit.startswith('hermes-failed-result-') and unit.endswith('.service')):
++            return
++        cgroup = Path('/proc/self/cgroup').read_text(encoding='utf-8')
++        if not any(line.rsplit('/', 1)[-1] == unit for line in cgroup.splitlines()):
++            return
++        systemctl = shutil.which('systemctl')
++        if systemctl:
++            subprocess.run([systemctl, '--user', '--no-block', 'stop', unit], stdin=subprocess.DEVNULL,
++                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=False)
++    except (AttributeError, OSError, ValueError, subprocess.SubprocessError):
++        pass
++
++
++def _retire(context):
++    if isinstance(context, dict):
++        _release_ready(context)
++        _stop_own_unit(context)
++    return STARTUP_FAILURE_EXIT
++
++
+ def main(argv):
+     """Run one observation; returns the process exit status.
+ 
+@@ -229,7 +261,8 @@ def main(argv):
+     forever. Exit ``STARTUP_FAILURE_EXIT``, which the service lists in
+     ``RestartPreventExitStatus``, so the manager retires the unit instead.
+     A missing or malformed context argument is equally deterministic.
+-    Retiring releases the readiness tempdir, as success does.
++    Retiring releases the readiness tempdir, as success does, and queues a stop of
++    its own unit (``_stop_own_unit``) for units armed without that exit status.
+     """
+     context = None
+     try:
+@@ -238,15 +271,12 @@ def main(argv):
+             raise ValueError(f'context lacks {CONTEXT_KEYS}')
+     except (IndexError, TypeError, ValueError) as exc:
+         print(f'failed-result observer has no usable context, retiring: {exc!r}', file=sys.stderr)
+-        if isinstance(context, dict):
+-            _release_ready(context)
+-        return STARTUP_FAILURE_EXIT
++        return _retire(context)
+     try:
+         observe(context)
+     except ImportError as exc:
+         print(f'failed-result observer cannot import its code, retiring: {exc!r}', file=sys.stderr)
+-        _release_ready(context)
+-        return STARTUP_FAILURE_EXIT
++        return _retire(context)
+     # Unexpected errors exit nonzero for manager restart; the unit's ExecStopPost
+     # releases the tempdir after each stop and the restart recreates it.
+     _release_ready(context)
+diff --git a/tests/hermes_cli/test_kanban_failed_result_self_stop.py b/tests/hermes_cli/test_kanban_failed_result_self_stop.py
+new file mode 100644
+index 0000000000..d695389dc3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_failed_result_self_stop.py
+@@ -0,0 +1,97 @@
++"""[daveey] A retiring observer stops its own unit, so units without RestartPreventExitStatus retire too.
++
++Transient units keep the properties they were submitted with. Units armed by a
++gateway older than the exit-78 fix carry ``Restart=on-failure`` and nothing else,
++so each retire was restarted forever (52k restarts, ~1 core, ~290k journal
++lines/h on worker-4). A queued stop job cancels the manager's auto-restart. No
++live service mutation: ``systemctl`` and ``/proc/self/cgroup`` are fixtures.
++"""
++import json
++import shutil
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_failed_result_observer as observer
++
++UNIT = 'hermes-failed-result-174699-3952684799857.service'
++CONTEXT = {'db': '/b/kanban.db', 'task_id': 't_x', 'run_id': 454, 'claim_lock': 'host:1',
++           'observer_unit': UNIT}
++
++
++def _import_failure(_):
++    raise ModuleNotFoundError("No module named 'ruamel'")
++
++
++@pytest.fixture
++def systemctl(monkeypatch):
++    calls = []
++    monkeypatch.setattr(shutil, 'which', lambda name: '/usr/bin/systemctl' if name == 'systemctl' else None)
++    def run(command, **kwargs):
++        calls.append(command)
++        return observer.subprocess.CompletedProcess(command, 0)
++    monkeypatch.setattr(observer.subprocess, 'run', run)
++    monkeypatch.setattr(observer, 'observe', _import_failure)
++    return calls
++
++
++def _cgroup(monkeypatch, path):
++    real = Path.read_text
++    def read_text(self, *args, **kwargs):
++        if str(self) == '/proc/self/cgroup':
++            return f'0::{path}\n'
++        return real(self, *args, **kwargs)
++    monkeypatch.setattr(Path, 'read_text', read_text)
++
++
++def test_import_failure_queues_stop_of_own_unit(systemctl, monkeypatch):
++    _cgroup(monkeypatch, f'/user.slice/user-1000.slice/user@1000.service/app.slice/{UNIT}')
++    assert observer.main(['observer', json.dumps(CONTEXT)]) == observer.STARTUP_FAILURE_EXIT
++    assert systemctl == [['/usr/bin/systemctl', '--user', '--no-block', 'stop', UNIT]]
++
++
++def test_unusable_context_queues_stop_of_own_unit(systemctl, monkeypatch):
++    _cgroup(monkeypatch, f'/user.slice/user-1000.slice/user@1000.service/app.slice/{UNIT}')
++    context = {'observer_unit': UNIT}  # lacks db/task_id/run_id/claim_lock
++    assert observer.main(['observer', json.dumps(context)]) == observer.STARTUP_FAILURE_EXIT
++    assert systemctl == [['/usr/bin/systemctl', '--user', '--no-block', 'stop', UNIT]]
++
++
++@pytest.mark.parametrize('cgroup', [
++    '/user.slice/user-1000.slice/user@1000.service/app.slice/hermes-failed-result-1-2.service',
++    '/user.slice/user-1000.slice/session-3.scope',
++])
++def test_never_stops_a_unit_it_does_not_run_in(systemctl, monkeypatch, cgroup):
++    _cgroup(monkeypatch, cgroup)
++    assert observer.main(['observer', json.dumps(CONTEXT)]) == observer.STARTUP_FAILURE_EXIT
++    assert systemctl == []
++
++
++@pytest.mark.parametrize('unit', ['gateway.service', 'hermes-failed-result-1-2.scope', 7, None])
++def test_only_failed_result_service_names_are_stopped(systemctl, monkeypatch, unit):
++    _cgroup(monkeypatch, f'/user.slice/user-1000.slice/user@1000.service/app.slice/{unit}')
++    assert observer.main(['observer', json.dumps({**CONTEXT, 'observer_unit': unit})]) == observer.STARTUP_FAILURE_EXIT
++    assert systemctl == []
++
++
++def test_stop_failure_never_masks_retire_exit(systemctl, monkeypatch):
++    _cgroup(monkeypatch, f'/user.slice/user-1000.slice/user@1000.service/app.slice/{UNIT}')
++    def refuse(command, **kwargs):
++        raise observer.subprocess.TimeoutExpired(command, 5)
++    monkeypatch.setattr(observer.subprocess, 'run', refuse)
++    assert observer.main(['observer', json.dumps(CONTEXT)]) == observer.STARTUP_FAILURE_EXIT
++
++
++def test_missing_systemctl_or_cgroup_is_a_no_op(systemctl, monkeypatch):
++    monkeypatch.setattr(shutil, 'which', lambda name: None)
++    _cgroup(monkeypatch, f'/user.slice/user-1000.slice/user@1000.service/app.slice/{UNIT}')
++    assert observer.main(['observer', json.dumps(CONTEXT)]) == observer.STARTUP_FAILURE_EXIT
++    real = Path.read_text
++    def no_proc(self, *args, **kwargs):
++        if str(self) == '/proc/self/cgroup':
++            raise FileNotFoundError(self)
++        return real(self, *args, **kwargs)
++    monkeypatch.setattr(Path, 'read_text', no_proc)
++    monkeypatch.setattr(shutil, 'which', lambda name: '/usr/bin/systemctl')
++    assert observer.main(['observer', json.dumps(CONTEXT)]) == observer.STARTUP_FAILURE_EXIT
++    assert systemctl == []
+-- 
+2.43.0
+

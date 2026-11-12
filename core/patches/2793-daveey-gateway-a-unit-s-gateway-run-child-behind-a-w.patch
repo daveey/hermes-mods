@@ -1,0 +1,315 @@
+From 30343a2ff9c00ee7a0e585cbdbd2f81b07ba9d58 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:05:04 +0000
+Subject: [PATCH] [daveey] gateway: a unit's `gateway run` child behind a
+ wrapper ExecStart is a service gateway
+
+hermes-worker-2 (2026-11-12): hermes-gateway.service runs hermes-gateway-broker
+(token-broker exec ... -- github_quota.py ... -- hermes gateway run), so the unit's
+MainPID is a wrapper and the gateway is its child. _get_service_pids returned only
+MainPIDs, so `hermes update`'s post-update manual sweep mapped the unit's own gateway
+(pidfile -> profile default) as a manual gateway: it armed a detached
+`gateway run --replace` watcher and drained the unit's gateway. The relaunch ran in
+hermes-core-update.service's cgroup and held the gateway lock, while the unit looped
+on exit 75 (already_running, ~every 7.5 s, NRestarts 117+) and could not own it.
+
+_get_service_pids now adds the `gateway run` descendants of each systemd unit's
+MainPID (gateway_service_members.gateway_descendant_pids; non-gateway descendants
+such as card workers are left out, so find_gateway_pids never reports them). Every
+caller only uses the set to protect PIDs, so the manual sweep, survivor sweep,
+stale-survivor restart, orphan reaper and inventory classifier all now treat the
+child as service-managed.
+
+_parse_ps_line and _iter_windows_list_processes move unchanged to
+gateway_process_listing.py to keep gateway.py under its line cap.
+
+Tests: tests/hermes_cli/test_gateway_service_child_pids.py (real wrapper process
+tree; RED on main: both fail, GREEN with the fix).
+---
+ hermes_cli/gateway.py                         |  31 +----
+ hermes_cli/gateway_process_listing.py         |  32 +++++
+ hermes_cli/gateway_service_members.py         |  41 ++++++
+ .../test_gateway_service_child_pids.py        | 128 ++++++++++++++++++
+ 4 files changed, 204 insertions(+), 28 deletions(-)
+ create mode 100644 hermes_cli/gateway_process_listing.py
+ create mode 100644 hermes_cli/gateway_service_members.py
+ create mode 100644 tests/hermes_cli/test_gateway_service_child_pids.py
+
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index b38a7fb223..fb118cdd2d 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -7,6 +7,8 @@ import asyncio
+ import contextlib
+ from hermes_cli.cli_output import line_input
+ from hermes_cli.gateway_host_record import _discard_dead_host_record, _forget_host_gateway_probe
++from hermes_cli.gateway_service_members import gateway_descendant_pids
++from hermes_cli.gateway_process_listing import _iter_windows_list_processes, _parse_ps_line
+ import json
+ import logging
+ import os
+@@ -171,6 +173,7 @@ def _get_service_pids(all_profiles: bool = False) -> set:
+                         pid = int(show.stdout.strip())
+                         if pid > 0:
+                             pids.add(pid)
++                            pids |= gateway_descendant_pids(pid)  # [daveey] its `gateway run` child behind a wrapper
+                     except (ValueError, subprocess.TimeoutExpired):
+                         pass
+             except (FileNotFoundError, subprocess.TimeoutExpired):
+@@ -685,34 +688,6 @@ def _scan_gateway_pids(
+     return pids
+ 
+ 
+-def _parse_ps_line(line: str) -> tuple[int, str] | None:
+-    """``(pid, command)`` from one ``ps -o pid=,command=`` line; also accepts ``ps aux`` rows."""
+-    stripped = line.strip()
+-    if not stripped or "grep" in stripped:
+-        return None
+-    parts = stripped.split(None, 1)
+-    if len(parts) == 2:
+-        with contextlib.suppress(ValueError):
+-            return int(parts[0]), parts[1]
+-    aux_parts = stripped.split()
+-    if len(aux_parts) > 10 and aux_parts[1].isdigit():
+-        return int(aux_parts[1]), " ".join(aux_parts[10:])
+-    return None
+-
+-
+-def _iter_windows_list_processes(listing: str):
+-    """Yield ``(pid, command_line)`` from wmic/CIM ``/FORMAT:LIST`` output."""
+-    current_cmd = ""
+-    for line in listing.split("\n"):
+-        line = line.strip()
+-        if line.startswith("CommandLine="):
+-            current_cmd = line[len("CommandLine=") :]
+-        elif line.startswith("ProcessId="):
+-            with contextlib.suppress(ValueError):
+-                yield int(line[len("ProcessId=") :]), current_cmd
+-            current_cmd = ""
+-
+-
+ def _windows_process_listing() -> str | None:
+     """``CommandLine=``/``ProcessId=`` LIST output for every Windows process (wmic, else Get-CimInstance), or None.
+     ``bounded_probe_run``, NOT ``subprocess.run(timeout=...)``: run()'s post-timeout cleanup joins pipe
+diff --git a/hermes_cli/gateway_process_listing.py b/hermes_cli/gateway_process_listing.py
+new file mode 100644
+index 0000000000..208aa75ee7
+--- /dev/null
++++ b/hermes_cli/gateway_process_listing.py
+@@ -0,0 +1,32 @@
++"""Parsers for the process listings ``hermes_cli.gateway``'s gateway scan reads (moved from gateway.py)."""
++from __future__ import annotations
++
++import contextlib
++
++
++def _parse_ps_line(line: str) -> tuple[int, str] | None:
++    """``(pid, command)`` from one ``ps -o pid=,command=`` line; also accepts ``ps aux`` rows."""
++    stripped = line.strip()
++    if not stripped or "grep" in stripped:
++        return None
++    parts = stripped.split(None, 1)
++    if len(parts) == 2:
++        with contextlib.suppress(ValueError):
++            return int(parts[0]), parts[1]
++    aux_parts = stripped.split()
++    if len(aux_parts) > 10 and aux_parts[1].isdigit():
++        return int(aux_parts[1]), " ".join(aux_parts[10:])
++    return None
++
++
++def _iter_windows_list_processes(listing: str):
++    """Yield ``(pid, command_line)`` from wmic/CIM ``/FORMAT:LIST`` output."""
++    current_cmd = ""
++    for line in listing.split("\n"):
++        line = line.strip()
++        if line.startswith("CommandLine="):
++            current_cmd = line[len("CommandLine=") :]
++        elif line.startswith("ProcessId="):
++            with contextlib.suppress(ValueError):
++                yield int(line[len("ProcessId=") :]), current_cmd
++            current_cmd = ""
+diff --git a/hermes_cli/gateway_service_members.py b/hermes_cli/gateway_service_members.py
+new file mode 100644
+index 0000000000..6939121f16
+--- /dev/null
++++ b/hermes_cli/gateway_service_members.py
+@@ -0,0 +1,41 @@
++"""[daveey] Gateway processes a service unit supervises below its ``MainPID``.
++
++A unit whose ``ExecStart`` is a non-exec wrapper (a worker node's ``hermes-gateway-broker`` runs
++``token-broker exec … -- github_quota.py … -- hermes gateway run``) reports the wrapper as its
++``MainPID``; the real ``gateway run`` process is a child of it, in the same cgroup. Callers of
++``_get_service_pids`` exclude service gateways from "manual gateway" sweeps, so a MainPID-only set
++let ``hermes update`` classify the unit's own gateway as manual: it armed a detached
++``gateway run --replace`` watcher inside the updater's cgroup (``hermes-core-update.service``),
++drained the unit's gateway, and the replacement then held the gateway lock outside the unit while
++the unit crash-looped on ``already_running`` (exit 75) (hermes-worker-2, 2026-11-12).
++
++Over-inclusion is safe for every caller (these PIDs are only ever protected, never targeted); a
++descendant that is not a ``gateway run`` command line is left out so wrappers and card workers
++never become "gateway PIDs" through ``find_gateway_pids``.
++"""
++from __future__ import annotations
++
++
++def gateway_descendant_pids(main_pid: int) -> set[int]:
++    """``gateway run`` processes below *main_pid* (recursive); empty when unreadable. Never raises."""
++    if main_pid <= 1:
++        return set()
++    try:
++        import psutil  # type: ignore
++
++        children = psutil.Process(main_pid).children(recursive=True)
++    except Exception:  # health: allow BLE001 -- no psutil / gone / denied: nothing provable to add
++        return set()
++    try:
++        from gateway.status import _read_process_cmdline, looks_like_gateway_command_line
++    except Exception:  # health: allow BLE001 -- identity matcher unavailable: add nothing
++        return set()
++    found: set[int] = set()
++    for child in children:
++        try:
++            pid = int(child.pid)
++            if looks_like_gateway_command_line(_read_process_cmdline(pid)):
++                found.add(pid)
++        except Exception:  # health: allow BLE001 -- a child that exits mid-scan is simply not added
++            continue
++    return found
+diff --git a/tests/hermes_cli/test_gateway_service_child_pids.py b/tests/hermes_cli/test_gateway_service_child_pids.py
+new file mode 100644
+index 0000000000..403abcf05c
+--- /dev/null
++++ b/tests/hermes_cli/test_gateway_service_child_pids.py
+@@ -0,0 +1,128 @@
++"""A systemd unit's ``gateway run`` child behind a non-exec wrapper is a service gateway, not a manual one.
++
++hermes-worker-2, 2026-11-12: ``hermes-gateway.service`` runs ``hermes-gateway-broker`` (``token-broker exec
++… -- github_quota.py … -- hermes gateway run``), so the unit's ``MainPID`` is the wrapper and the gateway is
++its child. ``_get_service_pids`` returned only the MainPID, so the post-update manual sweep mapped the unit's
++own gateway to profile ``default`` and armed a detached ``gateway run --replace`` watcher. That relaunch ran in
++``hermes-core-update.service``'s cgroup and held the gateway lock, while the unit looped on exit 75
++(``already_running``) every 7.5 s. These tests use a real process tree for the wrapper and its children.
++"""
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++from unittest.mock import MagicMock
++
++import pytest
++
++from tests.waiting import wait_until
++
++pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="systemd + /proc process tree")
++
++psutil = pytest.importorskip("psutil")
++
++
++@pytest.fixture()
++def wrapper_tree(tmp_path):
++    """``wrapper`` (the unit's MainPID) -> [a ``gateway run`` child, a non-gateway card worker child]."""
++    main_py = tmp_path / "hermes_cli" / "main.py"
++    main_py.parent.mkdir()
++    main_py.write_text("import time\ntime.sleep(60)\n")
++    worker_py = tmp_path / "card_worker.py"
++    worker_py.write_text("import time\ntime.sleep(60)\n")
++    wrapper_py = tmp_path / "broker_wrapper.py"
++    wrapper_py.write_text(textwrap.dedent(f"""
++        import subprocess, sys, time
++        subprocess.Popen([sys.executable, {str(main_py)!r}, "gateway", "run"])
++        subprocess.Popen([sys.executable, {str(worker_py)!r}])
++        time.sleep(60)
++    """))
++    wrapper = subprocess.Popen([sys.executable, str(wrapper_py)])
++    try:
++        def started():
++            children = psutil.Process(wrapper.pid).children()
++            names = {Path(c.cmdline()[1]).name: c.pid for c in children if len(c.cmdline()) >= 2}
++            return names if set(names) == {"main.py", "card_worker.py"} else None
++        by_script = wait_until(started, timeout=10, what="the wrapper's two children")
++        yield wrapper.pid, by_script["main.py"], by_script["card_worker.py"]
++    finally:
++        for child in psutil.Process(wrapper.pid).children(recursive=True):
++            child.kill()
++        wrapper.kill()
++        wrapper.wait(timeout=10)
++
++
++def _systemctl_for_main_pid(main_pid: int):
++    def run(args, **kwargs):
++        cmd = " ".join(str(a) for a in args)
++        if args[:2] == ["systemctl", "--user"] and "list-units" in cmd:
++            return MagicMock(returncode=0, stdout="hermes-gateway.service loaded active running Hermes\n", stderr="")
++        if args[:2] == ["systemctl", "--user"] and "show" in cmd and "MainPID" in cmd:
++            return MagicMock(returncode=0, stdout=f"{main_pid}\n", stderr="")
++        return MagicMock(returncode=0, stdout="", stderr="")
++    return run
++
++
++def _systemd_host(monkeypatch, main_pid: int):
++    from hermes_cli import gateway as gateway_mod
++    monkeypatch.setattr(gateway_mod, "is_macos", lambda: False)
++    monkeypatch.setattr(gateway_mod, "supports_systemd_services", lambda: True)
++    monkeypatch.setattr(gateway_mod.subprocess, "run", _systemctl_for_main_pid(main_pid))
++    return gateway_mod
++
++
++def test_service_pids_include_the_gateway_child_of_a_wrapper_main_pid(wrapper_tree, monkeypatch):
++    main_pid, gateway_pid, worker_pid = wrapper_tree
++    gateway_mod = _systemd_host(monkeypatch, main_pid)
++
++    pids = gateway_mod._get_service_pids(all_profiles=True)
++
++    assert main_pid in pids
++    assert gateway_pid in pids, "the unit's `gateway run` child must count as service-managed"
++    assert worker_pid not in pids, "a non-gateway descendant (card worker) is never a gateway PID"
++
++
++def test_update_manual_sweep_leaves_the_units_gateway_child_alone(monkeypatch, wrapper_tree, tmp_path):
++    """The exact worker-2 path: the pidfile maps the unit's gateway child to profile ``default``.
++
++    Before the fix the sweep armed a detached ``--replace`` relaunch for it and drained it."""
++    main_pid, gateway_pid, _worker_pid = wrapper_tree
++    gateway_mod = _systemd_host(monkeypatch, main_pid)
++    from hermes_cli import update_cmd_fleet as fleet
++    from hermes_cli import update_fleet_scope
++
++    live = [gateway_pid]  # what the host-wide scan sees (the real one also reports the wrapper)
++    monkeypatch.setattr(gateway_mod, "find_gateway_pids",
++                        lambda exclude_pids=None, all_profiles=False: [p for p in live if p not in (exclude_pids or set())])
++    monkeypatch.setattr(gateway_mod, "find_profile_gateway_processes", lambda exclude_pids=None, strict=False: [
++        gateway_mod.ProfileGatewayProcess(profile="default", path=tmp_path, pid=p)
++        for p in live if p not in (exclude_pids or set())])
++    armed, signalled, killed = [], [], []
++    monkeypatch.setattr(gateway_mod, "_prepare_profile_gateway_update_restart",
++                        lambda profile, pid: armed.append((profile, pid)) or "detached")
++    monkeypatch.setattr(gateway_mod, "_wait_for_gateway_exit", lambda **kwargs: None)
++    monkeypatch.setattr(update_fleet_scope, "drop_gateways_on_another_checkout", lambda pids, quiet=False: list(pids))
++    monkeypatch.setattr(fleet, "_scoped_manual_gateway_pids", lambda pids, keep=(), quiet=False: list(pids))
++    monkeypatch.setattr(fleet, "_drain_or_signal_gateway_for_update",
++                        lambda pid, budget, label, self_restart_pending=None: signalled.append(pid) or True)
++    class _OsWithoutKill:  # only this module's os.kill: the fixture's teardown still needs the real one
++        def __getattr__(self, name):
++            return getattr(os, name)
++
++        @staticmethod
++        def kill(pid, sig):
++            killed.append((pid, sig))
++
++    monkeypatch.setattr(fleet, "os", _OsWithoutKill())
++    out = fleet._GatewayRestartOutcome(
++        incomplete=False, phase_errors=[], pre_restart_gateway_pids=[], restarted_services=["hermes-gateway"],
++        failed_or_stale_units=[], relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set())
++
++    fleet._restart_manual_gateways(out, 45.0)
++
++    assert armed == [], "no detached --replace relaunch may be armed for the unit's own gateway"
++    assert signalled == [] and killed == []
++    assert out.killed_pids == set() and out.relaunched_profiles == []
+-- 
+2.43.0
+

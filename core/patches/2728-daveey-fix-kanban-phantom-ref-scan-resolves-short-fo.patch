@@ -1,0 +1,248 @@
+From c0a9078220714b0cb2214cec9a6a27fa6575c8d2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:39:07 +0000
+Subject: [PATCH] [daveey] fix(kanban): phantom-ref scan resolves short-form
+ ids by prefix and skips ids inside paths/branches
+
+The completion-summary advisory (`suspected_hallucinated_references`) extracted `t_<8+hex>` tokens and looked them
+up by exact id, so a card's own 8-hex prefix (worker-4: t_01a1cf03b74efb8d flagged `t_01a1cf03` from its branch
+`design/t_01a1cf03-land-lane`) counted as phantom.
+
+- `_TASK_ID_PROSE_RE` gains the `(?<![\w/])` lookbehind `kanban_block_policy._TASK_ID` uses: a token embedded in a
+  path, branch or identifier is not a reference.
+- A token shorter than a full id (`t_` + 16 hex) resolves when any task id starts with it: local board, Board
+  replicas (`replica_prefixes`) and the hub replica (`hub_replica_lookup`). Full ids keep the exact lookup.
+- The scan moves to `hermes_cli/kanban_prose_refs.py` (kanban_db re-exports it) to keep kanban_db.py under its cap.
+
+Tests: tests/hermes_cli/test_kanban_false_signals.py (branch-embedded prefix, prose prefix, ghost full id,
+orphan prefix, hub-replica prefix) and test_kanban_board_replica_refs.py (Board-replica prefix).
+---
+ hermes_cli/kanban_board_replica_refs.py       | 26 ++++++++-
+ hermes_cli/kanban_db.py                       | 14 +----
+ hermes_cli/kanban_prose_refs.py               | 55 +++++++++++++++++++
+ hermes_cli/kanban_session_activity.py         |  7 +--
+ .../test_kanban_board_replica_refs.py         |  9 +++
+ tests/hermes_cli/test_kanban_false_signals.py | 47 ++++++++++++++++
+ 6 files changed, 137 insertions(+), 21 deletions(-)
+ create mode 100644 hermes_cli/kanban_prose_refs.py
+
+diff --git a/hermes_cli/kanban_board_replica_refs.py b/hermes_cli/kanban_board_replica_refs.py
+index 713e35e0ea..b8cb132ce6 100644
+--- a/hermes_cli/kanban_board_replica_refs.py
++++ b/hermes_cli/kanban_board_replica_refs.py
+@@ -49,10 +49,30 @@ def replica_tasks(ids: Iterable[str], parent: Optional[str] = None) -> tuple[dic
+     return found, linked
+ 
+ 
++def replica_prefixes(refs: Iterable[str]) -> set[str]:
++    """The short-form ``refs`` (shorter than a full id) that prefix a card id in any Board replica."""
++    from hermes_cli.kanban_generation import open_ro
++    from hermes_cli.kanban_prose_refs import has_task_with_prefix, is_prefix_ref
++
++    want = [r for r in dict.fromkeys(refs) if is_prefix_ref(r)]
++    found: set[str] = set()
++    for path in _replica_paths() if want else ():
++        try:
++            conn = open_ro(path)
++            try:
++                found.update(r for r in want if r not in found and has_task_with_prefix(conn, r))
++            finally:
++                conn.close()
++        except sqlite3.Error:
++            continue
++    return found
++
++
+ def unresolved_after_replica(missing: list[str]) -> list[str]:
+-    """``missing`` (not on the local board) minus ids a Board replica or the hub replica knows; [] when the hub
+-    replica cannot say for the rest."""
+-    missing = [p for p in missing if p not in replica_tasks(missing)[0]]
++    """``missing`` (not on the local board) minus ids a Board replica or the hub replica knows (a short-form ref by
++    prefix); [] when the hub replica cannot say for the rest."""
++    known = set(replica_tasks(missing)[0]) | replica_prefixes(missing)
++    missing = [p for p in missing if p not in known]
+     try:
+         from hermes_cli.kanban_session_activity import replica_task_resolution
+         found, authoritative = replica_task_resolution(missing)
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 0313c715ea..8543302a27 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2438,19 +2438,7 @@ def _verify_created_cards(
+     return verified, phantom
+ 
+ 
+-# Matches ``kanban_create`` (12 hex) and ``_new_task_id`` (8 hex) ids; 8+ for forward compat.
+-_TASK_ID_PROSE_RE = re.compile(r"\bt_[a-f0-9]{8,}\b")
+-
+-
+-def _scan_prose_for_phantom_ids(conn: sqlite3.Connection, text: str) -> list[str]:
+-    """``t_<hex>`` references in ``text`` that resolve neither to a local task nor to a card in the hermes-hub
+-    replica of other gateways (deduped; advisory). An unreadable/stale replica leaves them unflagged."""
+-    if not text:
+-        return []
+-    missing = _missing_task_ids(conn, dict.fromkeys(_TASK_ID_PROSE_RE.findall(text)))
+-    return unresolved_after_replica(missing)
+-
+-
++from hermes_cli.kanban_prose_refs import _TASK_ID_PROSE_RE, _scan_prose_for_phantom_ids  # re-exported
+ from hermes_cli.kanban_board_replica_refs import replica_tasks as _replica_tasks, unresolved_after_replica
+ 
+ 
+diff --git a/hermes_cli/kanban_prose_refs.py b/hermes_cli/kanban_prose_refs.py
+new file mode 100644
+index 0000000000..e33136bd0a
+--- /dev/null
++++ b/hermes_cli/kanban_prose_refs.py
+@@ -0,0 +1,55 @@
++"""Task-id references in completion prose: the advisory ``suspected_hallucinated_references`` scan. [daveey]
++
++A prose token shorter than a full id (``t_`` + 16 hex) is a short form: it resolves when any card id (local board,
++Board replica or hub replica) starts with it, so a card's own ``t_01a1cf03`` prefix is not a phantom. A token inside a
++path, branch or identifier (``design/t_01a1cf03-land-lane``) is not a reference at all.
++"""
++
++from __future__ import annotations
++
++import re
++import sqlite3
++from typing import Iterable
++
++# 8+ hex: legacy ``_new_task_id`` (8), ``kanban_create`` (12) and current (16) ids, plus their prefixes. The
++# lookbehind matches ``kanban_block_policy._TASK_ID``.
++_TASK_ID_PROSE_RE = re.compile(r"(?<![\w/])t_[a-f0-9]{8,}\b")
++FULL_TASK_ID_LEN = len("t_") + 16
++
++
++def is_prefix_ref(ref: str) -> bool:
++    return len(ref) < FULL_TASK_ID_LEN
++
++
++def has_task_with_prefix(conn: sqlite3.Connection, prefix: str) -> bool:
++    """A ``tasks`` row whose id starts with ``prefix`` (GLOB: ``_`` is literal, unlike LIKE)."""
++    return conn.execute("SELECT 1 FROM tasks WHERE id GLOB ? LIMIT 1", (prefix + "*",)).fetchone() is not None
++
++
++def hub_replica_lookup(ref: str) -> tuple[str, tuple]:
++    """``(sql, params)`` finding ``ref`` among the hub replica's task keys (``[profile/]board/<id>``): the key's last
++    segment equals a full id, or starts with a short-form ref."""
++    if is_prefix_ref(ref):
++        return "SELECT 1 FROM replica WHERE coll = 'tasks' AND key GLOB ? LIMIT 1", (f"*/{ref}*",)
++    return ("SELECT 1 FROM replica WHERE coll = 'tasks' AND substr(key, -?) = ? LIMIT 1",
++            (len(ref) + 1, "/" + ref))
++
++
++def _missing_task_refs(conn: sqlite3.Connection, refs: Iterable[str]) -> list[str]:
++    """Refs (order kept) with no local task: full ids by exact id, short ones by prefix."""
++    from hermes_cli.kanban_db import _missing_task_ids
++
++    refs = list(refs)
++    missing = set(_missing_task_ids(conn, [r for r in refs if not is_prefix_ref(r)]))
++    missing.update(r for r in refs if is_prefix_ref(r) and not has_task_with_prefix(conn, r))
++    return [r for r in refs if r in missing]
++
++
++def _scan_prose_for_phantom_ids(conn: sqlite3.Connection, text: str) -> list[str]:
++    """``t_<hex>`` references in ``text`` that resolve neither to a local task nor to a card in the hermes-hub
++    replica of other gateways (deduped; advisory). An unreadable/stale replica leaves them unflagged."""
++    if not text:
++        return []
++    from hermes_cli.kanban_board_replica_refs import unresolved_after_replica
++
++    return unresolved_after_replica(_missing_task_refs(conn, dict.fromkeys(_TASK_ID_PROSE_RE.findall(text))))
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 9941c37687..911fc2f87e 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -420,11 +420,8 @@ def replica_task_resolution(ids: list[str], now: float | None = None) -> tuple[s
+         try:
+             offline = _meta_float(conn, "offline_since")
+             synced = max(filter(None, (_meta_float(conn, "last_ok"), _meta_float(conn, "last_digest"))), default=None)
+-            found = {
+-                tid for tid in ids
+-                if conn.execute("SELECT 1 FROM replica WHERE coll = 'tasks' AND substr(key, -?) = ? LIMIT 1",
+-                                (len(tid) + 1, "/" + tid)).fetchone()
+-            }
++            from hermes_cli.kanban_prose_refs import hub_replica_lookup
++            found = {tid for tid in ids if conn.execute(*hub_replica_lookup(tid)).fetchone()}
+         finally:
+             conn.close()
+     except sqlite3.Error:
+diff --git a/tests/hermes_cli/test_kanban_board_replica_refs.py b/tests/hermes_cli/test_kanban_board_replica_refs.py
+index e7218b603b..327ccaba25 100644
+--- a/tests/hermes_cli/test_kanban_board_replica_refs.py
++++ b/tests/hermes_cli/test_kanban_board_replica_refs.py
+@@ -100,6 +100,15 @@ def test_summary_naming_a_hub_card_only_the_board_replica_holds_is_not_flagged(w
+     assert _diag_refs(conn, tid) == []
+ 
+ 
++def test_short_prefix_of_a_board_replica_card_is_not_flagged_but_an_orphan_prefix_is(worker_node):
++    """A summary citing a replica-only card by its 8-hex prefix resolves through the Board replica."""
++    conn, tid = worker_node
++    assert kb.complete_task(conn, tid, summary=f"follow-up of {HUB_CARD[:10]}; also t_feedf00d")
++    (flag,) = _events(conn, tid, "suspected_hallucinated_references")
++    assert flag["phantom_refs"] == ["t_feedf00d"]
++    assert _diag_refs(conn, tid) == [["t_feedf00d"]]
++
++
+ def test_id_found_nowhere_is_still_flagged_and_still_refused(worker_node):
+     conn, tid = worker_node
+     with pytest.raises(kb.HallucinatedCardsError) as err:
+diff --git a/tests/hermes_cli/test_kanban_false_signals.py b/tests/hermes_cli/test_kanban_false_signals.py
+index 7d0afd1daa..a5cf9b75c1 100644
+--- a/tests/hermes_cli/test_kanban_false_signals.py
++++ b/tests/hermes_cli/test_kanban_false_signals.py
+@@ -147,3 +147,50 @@ def test_diagnostic_re_resolves_old_warning_at_read_time(board):
+     assert not [d for d in diags if d.kind == "prose_phantom_refs"]
+ 
+ 
++
++
++# Short-form refs: the 8-hex prefix of a real card (often in its own branch name) is not a phantom.
++REAL_FULL_ID = "t_01a1cf03b74efb8d"
++
++
++def _real_card(conn, monkeypatch):
++    monkeypatch.setattr(kb, "_new_task_id", lambda: REAL_FULL_ID)
++    assert kb.create_task(conn, title="land-lane design", assignee="worker") == REAL_FULL_ID
++    monkeypatch.undo()
++
++
++def test_card_prefix_inside_branch_name_is_not_flagged(board, monkeypatch):
++    conn, _ = board
++    _real_card(conn, monkeypatch)
++    tid = _complete_with_summary(conn, "pushed design/t_01a1cf03-land-lane for review")
++    assert _phantom_events(conn, tid) == []
++
++
++def test_prose_prefix_of_a_real_card_is_not_flagged(board, monkeypatch):
++    conn, _ = board
++    _real_card(conn, monkeypatch)
++    tid = _complete_with_summary(conn, "follow-up of t_01a1cf03 (land lane)")
++    assert _phantom_events(conn, tid) == []
++
++
++def test_nonexistent_full_length_id_is_still_flagged(board, monkeypatch):
++    conn, _ = board
++    _real_card(conn, monkeypatch)
++    ghost = "t_01a1cf03b74efb8e"  # shares the real card's prefix, but a full id resolves exactly
++    payloads = [r[0] for r in _phantom_events(conn, _complete_with_summary(conn, f"see {ghost}"))]
++    assert len(payloads) == 1 and ghost in payloads[0]
++
++
++def test_short_token_prefixing_no_card_is_flagged(board, monkeypatch):
++    conn, _ = board
++    _real_card(conn, monkeypatch)
++    payloads = [r[0] for r in _phantom_events(conn, _complete_with_summary(conn, "see t_feedf00d"))]
++    assert len(payloads) == 1 and "t_feedf00d" in payloads[0]
++
++
++def test_prefix_of_a_replica_only_card_is_not_flagged(board):
++    conn, hub = board
++    _make_hub_db(hub)
++    tid = _complete_with_summary(conn, f"hub card {REMOTE_ID[:10]} and t_feedf00d")
++    payloads = [r[0] for r in _phantom_events(conn, tid)]
++    assert len(payloads) == 1 and "t_feedf00d" in payloads[0] and REMOTE_ID[:10] not in payloads[0]
+-- 
+2.43.0
+

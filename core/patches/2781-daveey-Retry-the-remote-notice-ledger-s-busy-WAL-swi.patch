@@ -1,0 +1,85 @@
+From e2938b5f38aecd274d0e01d18f7c5000a5b13565 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 14:04:42 +0000
+Subject: [PATCH] [daveey] Retry the remote-notice ledger's busy WAL switch
+ instead of raising
+
+`PRAGMA journal_mode=WAL` answers SQLITE_BUSY without calling the busy
+handler while another opener holds a fresh ledger, so concurrent first
+notice polls raised `database is locked` despite the 5 s connect timeout.
+That made test_concurrent_polls_agree_on_every_first_seen flaky on CI
+(3 of 4 polls answered; run 43227376227).
+
+`_ledger` now retries the pragma on "locked" until the same 5 s budget,
+returning as soon as it succeeds.
+
+Repro: 8 parallel processes x 100 four-thread fresh-ledger polls:
+RED 37/800 failures, all at the WAL pragma; GREEN 0/1200.
+Regression test fakes three busy WAL answers (RED without the fix).
+
+Kanban: t_01a1d00d73d36109
+---
+ .../test_kanban_remote_observations_lock.py    | 18 ++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py           | 15 ++++++++++++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tui_gateway/test_kanban_remote_observations_lock.py b/tests/tui_gateway/test_kanban_remote_observations_lock.py
+index ab51fa9015..e336a84b19 100644
+--- a/tests/tui_gateway/test_kanban_remote_observations_lock.py
++++ b/tests/tui_gateway/test_kanban_remote_observations_lock.py
+@@ -125,3 +125,21 @@ def test_concurrent_polls_agree_on_every_first_seen(tmp_path):
+     for t in threads:
+         t.join()
+     assert len(results) == 4 and all(r == results[0] for r in results) and len(results[0]) == 200
++
++
++def test_a_busy_wal_switch_is_retried_not_raised(tmp_path, monkeypatch):
++    """SQLite answers ``journal_mode=WAL`` with SQLITE_BUSY, skipping the busy handler, while a concurrent first
++    opener holds the fresh ledger: one poller then raised ``database is locked`` (CI flake, 3 of 4 polls answered)."""
++    real = sqlite3.connect
++    busy = []
++
++    class Racing(sqlite3.Connection):
++        def execute(self, sql, *args):
++            if sql == "PRAGMA journal_mode=WAL" and len(busy) < 3:
++                busy.append(sql)
++                raise sqlite3.OperationalError("database is locked")
++            return super().execute(sql, *args)
++
++    monkeypatch.setattr(krn.sqlite3, "connect", lambda *a, **kw: real(*a, factory=Racing, **kw))
++    replica, ledger, _cards = _world(tmp_path)
++    assert len(obs.observe(replica, ledger, NOW)) == 20 and len(busy) == 3
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index b42af5247a..e20062bbe6 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -211,12 +211,25 @@ def _released(link: dict) -> bool:
+     return link_released(link)
+ 
+ 
++def _wal(conn: sqlite3.Connection, deadline: float) -> None:
++    """[daveey] ``journal_mode=WAL`` answers SQLITE_BUSY without calling the busy handler while another opener of a
++    fresh ledger holds it, so concurrent first polls raised ``database is locked``. Retry until the connect timeout."""
++    while True:
++        try:
++            conn.execute("PRAGMA journal_mode=WAL")
++            return
++        except sqlite3.OperationalError as exc:
++            if "locked" not in str(exc) or time.monotonic() >= deadline:
++                raise
++            time.sleep(0.005)
++
++
+ def _ledger(path: Optional[Path] = None) -> sqlite3.Connection:
+     path = path or ledger_path()
+     path.parent.mkdir(parents=True, exist_ok=True)
+     conn = sqlite3.connect(str(path), timeout=5.0)
+     conn.row_factory = sqlite3.Row
+-    conn.execute("PRAGMA journal_mode=WAL")
++    _wal(conn, deadline=time.monotonic() + 5.0)
+     conn.execute("CREATE TABLE IF NOT EXISTS notices (session TEXT NOT NULL, ref TEXT NOT NULL, state TEXT NOT NULL, "
+                  "at REAL NOT NULL, delivered INTEGER NOT NULL, PRIMARY KEY (session, ref, state))")
+     cols = {row[1] for row in conn.execute("PRAGMA table_info(notices)")}
+-- 
+2.43.0
+

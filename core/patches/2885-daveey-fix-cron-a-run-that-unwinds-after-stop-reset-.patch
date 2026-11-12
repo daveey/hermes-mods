@@ -1,0 +1,105 @@
+From b5f881cfa54b5161ed9237023a9fc7581996d116 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:04:49 +0000
+Subject: [PATCH] [daveey] fix(cron): a run that unwinds after stop() reset
+ _draining is still a restart cut
+
+Live on hermes-hub (job b5b0e485e75e, 17:53Z): the drain timed out and
+interrupted the owner's agent cron run, stop() finished and reset
+runner._draining, and the run thread (it outlives the executor quiesce)
+returned 2 s later. session_cron._restart_cut() gated on _draining first,
+so the result lost its _restart_cut flag; journal recovery in the new
+gateway booked it failed ("cron fire ownership was lost", streak +1) and
+never reran it. The owner's ShutdownAwareCancel had the same gate.
+
+Both now read the sticky _interrupting_remaining_work latch before
+_draining (an operator cancel still wins in the shutdown-reason check).
+
+Tests: tests/cron/test_restart_cut.py::test_owner_marks_only_its_own_restart_cut[returned_after_stop_finished]
+(RED on origin/main, GREEN here).
+---
+ gateway/session_cron.py        | 12 +++++++++---
+ tests/cron/test_restart_cut.py | 16 +++++++++++++---
+ 2 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/gateway/session_cron.py b/gateway/session_cron.py
+index defaa61690..678eb67017 100644
+--- a/gateway/session_cron.py
++++ b/gateway/session_cron.py
+@@ -265,10 +265,12 @@ def _restart_cut(authority, stop, execution_id):
+     fire claim, so the firer forwarded a "lost ownership" cancel)."""
+     from cron.cancellation import cancel_requested
+     runner = getattr(authority, 'runner', None)
+-    if not getattr(runner, '_draining', False):
+-        return False
++    # Sticky for this process, read first: a run interrupted by the stop can unwind after stop()
++    # finished and reset ``_draining`` (the run outlives the executor quiesce).
+     if getattr(runner, '_interrupting_remaining_work', False):
+         return True
++    if not getattr(runner, '_draining', False):
++        return False
+     return bool(stop is not None and stop.is_set() and not cancel_requested(execution_id))
+ 
+ 
+@@ -338,7 +340,11 @@ async def execute(authority, ref, row, policy):
+                 if fire_interrupted_by_shutdown(job_id):
+                     return True
+                 runner = getattr(authority, 'runner', None)
+-                return bool(getattr(runner, '_draining', False)) and not cancel_requested(execution_id)
++                if cancel_requested(execution_id):
++                    return False
++                # The interrupt latch outlives stop()'s ``_draining`` reset (see _restart_cut).
++                return bool(getattr(runner, '_interrupting_remaining_work', False)
++                            or getattr(runner, '_draining', False))
+ 
+             stop = _CombinedCancelEvent(
+                 CancelRequest(execution_id),
+diff --git a/tests/cron/test_restart_cut.py b/tests/cron/test_restart_cut.py
+index f4fae04dd3..f1d59dcf0e 100644
+--- a/tests/cron/test_restart_cut.py
++++ b/tests/cron/test_restart_cut.py
+@@ -127,9 +127,9 @@ def _owner(tmp_path, *, draining=False):
+ 
+ 
+ @pytest.mark.parametrize("case", ["interrupting", "claim_cleared", "operator_cancel", "not_draining",
+-                                  "finished_anyway"])
++                                  "finished_anyway", "returned_after_stop_finished"])
+ def test_owner_marks_only_its_own_restart_cut(home, monkeypatch, case):
+-    from cron.cancellation import request_cancel
++    from cron.cancellation import cancel_is_shutdown, request_cancel
+     from gateway import run, session_cron
+     from gateway.session_contract import SessionRef
+     from hermes_state_runtime import admit_session_input, claim_session_input
+@@ -138,10 +138,18 @@ def test_owner_marks_only_its_own_restart_cut(home, monkeypatch, case):
+     monkeypatch.setattr(run, "_profile_runtime_scope", lambda home: nullcontext())
+     execution = executions.create_execution("job", source="direct")
+     request_id = "cron:job:" + execution["id"]
++    captured = {}
+ 
+     def run_job(job, *, extra_prompt, execution_id, cancel_event):
+         if case == "interrupting":
+             authority.runner._interrupting_remaining_work = True
++        elif case == "returned_after_stop_finished":
++            # Live hub shape: the drain timed out and interrupted the run, then stop() finished and
++            # reset ``_draining`` before this thread unwound (it outlives the executor quiesce).
++            authority.runner._interrupting_remaining_work = True
++            authority._cron_cancellations[row["admission_id"]].set()
++            authority.runner._draining = False
++            captured["shutdown"] = cancel_is_shutdown(cancel_event)
+         elif case == "operator_cancel":
+             request_cancel(execution_id, reason="stop it")
+             authority._cron_cancellations[row["admission_id"]].set()
+@@ -173,7 +181,9 @@ def test_owner_marks_only_its_own_restart_cut(home, monkeypatch, case):
+     finally:
+         db.close()
+     cut = result["cron_job_flags"].get("_restart_cut", False)
+-    assert cut is (case in {"interrupting", "claim_cleared"})
++    assert cut is (case in {"interrupting", "claim_cleared", "returned_after_stop_finished"})
++    if case == "returned_after_stop_finished":
++        assert captured == {"shutdown": True}  # logged as this gateway's shutdown, not lost ownership
+     if cut:
+         assert result["cron_result"][0] is False
+ 
+-- 
+2.43.0
+

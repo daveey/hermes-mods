@@ -1,0 +1,86 @@
+From 3fa57193440a989d447a87e521381d5dcfe1cdae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:14:06 +0000
+Subject: [PATCH] test(build): stopped-owner shim waits on stdin, not a forking
+ poll
+
+The node-deps test "an owner stopped during its pnpm install cannot write
+into the next owner's trees" timed out at its stop-wait (line 612) in ~6%
+of CI jobs (2 of ~34 recent JS & TS checks runs: job 131235568203 on main,
+131298423130 on PR #1538), and 2 of 150 local runs under 2-core contention.
+
+Why: the owner's pnpm shim waited with `while [ ! -f owner.release ]; do
+sleep 0.05; done`. /bin/sh (dash) vforks `sleep`; a group SIGSTOP that
+lands between the vfork and the child's exec stops the child before exec,
+and the shell stays in its uninterruptible vfork wait (ps: `D
+kernel_clone`, captured in a local repro 24 s after the stop) instead of
+`T`. The job is stopped, but the test's `state(...) startsWith('T')` wait
+can never see it. The product is unaffected: the lock watcher ends the
+tree with SIGKILL, which a vfork wait honours.
+
+Fix: the shim blocks in the shell builtin `read` on its stdin (the job's
+stdin, passed through the run and the relay) and the test releases it with
+a line on the job's stdin. No fork while it waits, and a pipe read just
+restarts after the stop. No timeout changed.
+
+Proof: a mutated watcher that never kills still fails the test at the
+written-by-the-stopped-pnpm assertion (same as before the change).
+Mechanism demo (sh stopped 800x at random moments, 2 cores): forking poll
+5/800 stuck in `D kernel_clone`; stdin read 0/800.
+---
+ tests-js/node-deps.test.mjs | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/tests-js/node-deps.test.mjs b/tests-js/node-deps.test.mjs
+index 4c4efe0f53..8bdd911b5a 100644
+--- a/tests-js/node-deps.test.mjs
++++ b/tests-js/node-deps.test.mjs
+@@ -346,8 +346,12 @@ function background(source, env, ...args) {
+   child.stdout.on('data', data => { output += data })
+   child.stderr.on('data', data => { output += data })
+   const exit = new Promise(done => child.on('exit', (code, signal) => done({ code, signal, output })))
++  // The job's stdin may already be closed (the job is gone) when a line is written.
++  child.stdin.on('error', () => {})
+   return {
+     exit,
++    // A line on the job's stdin, which the run passes on to pnpm.
++    input: text => child.stdin.write(text),
+     kill: () => process.kill(-child.pid, 'SIGKILL'),
+     // As Ctrl-Z and `fg` do: the whole job.
+     stop: () => process.kill(-child.pid, 'SIGSTOP'),
+@@ -549,9 +553,13 @@ test.skipIf(process.platform === 'win32').each([[false, false], [true, false], [
+   const dir = dirname(source)
+   mkdirSync(join(dir, 'owner'))
+   // A's pnpm: stopped (with all of A) in the middle of its work, which goes on into the tree once resumed.
++  // It waits for a line on its stdin (the job's, which the run and relay pass on), in the shell itself:
++  // a polling loop forks `sleep`, and a stop that lands between that fork and the child's exec leaves
++  // the shell in its uninterruptible vfork wait (state D, never T) behind the stopped child, so the job
++  // is stopped but the shell never shows it. A read on a pipe just restarts after the stop.
+   writeFileSync(join(dir, 'owner/pnpm'), ['#!/bin/sh', 'if [ "$1" = install ]; then',
+     `  echo $$ > '${dir}/owner.started'`,
+-    `  while [ ! -f '${dir}/owner.release' ]; do sleep 0.05; done`,
++    '  read -r _ || :',
+     `  echo third > node_modules/.written-by-the-stopped-pnpm; touch '${dir}/relay.release'; '${pnpmCommand()}' "$@"; exit $?`,
+     'fi', `exec '${pnpmCommand()}' "$@"`, ''].join('\n'))
+   chmodSync(join(dir, 'owner/pnpm'), 0o755)
+@@ -619,7 +627,7 @@ test.skipIf(process.platform === 'win32').each([[false, false], [true, false], [
+     Object.assign(lockTiming, timing)
+   }
+   const built = readFileSync(join(webOnly(source), 'built'), 'utf8')
+-  writeFileSync(join(dir, 'owner.release'), '')
++  owner.input('\n')
+   owner.resume()
+   const { code, output } = await owner.exit
+   // Long enough for the stopped pnpm to have finished, had it survived.
+@@ -637,7 +645,7 @@ test.skipIf(process.platform === 'win32').each([[false, false], [true, false], [
+   } finally {
+     Object.assign(lockTiming, timing)
+     // No failed assertion can strand the gated installer or a stopped job.
+-    writeFileSync(join(dir, 'owner.release'), '')
++    owner.input('\n')
+     writeFileSync(join(dir, 'relay.release'), '')
+     try { owner.kill() } catch (error) { expect(error.code).toBe('ESRCH') }
+     const watcherPid = join(dir, 'watcher.pid')
+-- 
+2.43.0
+

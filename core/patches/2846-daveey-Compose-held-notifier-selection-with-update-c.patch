@@ -1,0 +1,164 @@
+From ee08173ae65876e7ba04f176fcb457c44178a042 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:28:48 +0000
+Subject: [PATCH] [daveey] Compose held notifier selection with update
+ checkpoints
+
+Rebase onto main 65e18f963a (Park native gateway turns at durable update
+boundaries). A started update checkpoint keeps precedence; only queued
+selection skips notifier wakes held by a core-update drain. The started
+checkpoint identity (attempted) and the validated queued selection stay
+distinct, so checkpoint refusal and admission-conflict refusal each keep
+their exact identity.
+
+Fix review finding (t_01a1ce25bf75fb4a): when the selected head conflicts
+and a cancel settles it during the async preclaim check, the drain now
+re-reads and runs the follower instead of pausing admission_conflict with
+the follower stranded queued.
+
+Tests: new test_conflict_cancel_successor (RED with the fix reverted:
+follower left queued; GREEN after), test_notifier_checkpoint_precedence,
+and test_update_pause_refusal stubs forward the selection argument (no
+assertion changes). Focused 36 files 271 passed; wider authority/claim/
+wake/checkpoint sweep 96 files 488 passed, 4 skipped.
+---
+ .../gateway/test_conflict_cancel_successor.py | 46 +++++++++++++++++
+ .../test_notifier_checkpoint_precedence.py    | 50 +++++++++++++++++++
+ tests/gateway/test_update_pause_refusal.py    |  4 +-
+ 3 files changed, 98 insertions(+), 2 deletions(-)
+ create mode 100644 tests/gateway/test_conflict_cancel_successor.py
+ create mode 100644 tests/gateway/test_notifier_checkpoint_precedence.py
+
+diff --git a/tests/gateway/test_conflict_cancel_successor.py b/tests/gateway/test_conflict_cancel_successor.py
+new file mode 100644
+index 0000000000..421f928994
+--- /dev/null
++++ b/tests/gateway/test_conflict_cancel_successor.py
+@@ -0,0 +1,46 @@
++"""A head cancelled while its preclaim check conflicts must not strand its queued successor.
++
++The notifier-drain selection resolves the attempted queued identity instead of the FIFO
++front. When that identity is no longer queued (a /stop cancel committed from a worker
++thread during the async check), the drain re-reads and runs the follower rather than
++pausing ``admission_conflict`` with the follower still queued.
++"""
++import asyncio
++
++import pytest
++
++from hermes_state_runtime import RuntimeStoreError, cancel_session_input, list_session_admissions
++from tests.gateway.test_session_authority_cancel_settlement import REF, _authority, _submit
++
++
++@pytest.mark.asyncio
++async def test_successor_runs_when_conflicted_head_is_cancelled_mid_check(tmp_path, monkeypatch):
++    from gateway import session_api_turn, session_finite
++    from gateway.config import Platform
++    db, authority = _authority(tmp_path, monkeypatch, platform=Platform.API_SERVER)
++    executed, ids = [], {}
++
++    def check_api_turn(authority_, ref, payload):
++        if payload['text'] == 'stale':
++            # A /stop cancel commits from a worker thread while the head's check runs.
++            cancel_session_input(db, epoch=authority.epoch, admission_id=ids['stale'])
++            authority._settle_cancelled(REF, ids['stale'])
++            raise RuntimeStoreError('admission_conflict')
++    monkeypatch.setattr(session_api_turn, 'check_api_turn', check_api_turn)
++
++    async def execute(authority, ref, row):
++        executed.append(row['payload']['text'])
++        return 'done'
++    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
++
++    with db:
++        authority._schedule = lambda ref: None
++        ids['stale'] = (await _submit(authority, 'stale')).admission_id
++        await _submit(authority, 'follower')
++        del authority._schedule
++        authority._schedule(REF)
++        await asyncio.wait_for(authority.sessions['s'].task, 5)
++        statuses = {r['request_id']: (r['status'], r['outcome'])
++                    for r in list_session_admissions(db, session_id='s', pending_only=False)}
++        assert executed == ['follower'], statuses
++        assert statuses['stale'][0] != 'queued' and statuses['follower'][0] != 'queued', statuses
+diff --git a/tests/gateway/test_notifier_checkpoint_precedence.py b/tests/gateway/test_notifier_checkpoint_precedence.py
+new file mode 100644
+index 0000000000..00b407c745
+--- /dev/null
++++ b/tests/gateway/test_notifier_checkpoint_precedence.py
+@@ -0,0 +1,50 @@
++"""A started update checkpoint keeps precedence over the notifier-drain queued selection."""
++import json
++
++import pytest
++
++from hermes_state_runtime import admit_session_input
++from tests.gateway.test_authority_update_pause import parked_fixture
++from tests.gateway.test_session_authority_cancel_settlement import REF
++from tests.hermes_state.test_notifier_claim_eligibility import wake_payload
++
++
++@pytest.mark.asyncio
++async def test_checkpoint_resumes_ahead_of_held_notifier_wake(tmp_path, monkeypatch):
++    from gateway import session_notifier_drain, session_update_pause
++    db, owner, head = parked_fixture(tmp_path, monkeypatch)
++    identity = json.dumps(['kanban-wake', 'route', 'one'])
++    admit_session_input(db, epoch=owner.epoch, session_id='s', principal_id='automation:route',
++                        request_id=identity, payload=wake_payload(identity))
++    monkeypatch.setattr(owner, '_schedule', lambda ref: None)
++    # Notifier wakes are held, the update-pause fence is not: the checkpoint must resume, and
++    # the held wake behind it must not turn the claim into a notifier wait.
++    monkeypatch.setattr(session_notifier_drain, 'held', lambda: True)
++    monkeypatch.setattr(session_update_pause, 'update_held', lambda authority: False)
++    resumed = []
++
++    async def resume(authority, ref, live, first):
++        resumed.append(first['admission_id'])
++        return first
++    monkeypatch.setattr(session_update_pause, 'resume_checkpoint', resume)
++    selected = []
++    with db:
++        row, _first = await owner._claim_next(REF, owner.sessions['s'], selected)
++    assert row != 'notifier_held'
++    assert resumed == [head['admission_id']]
++    assert [r['admission_id'] for r in selected] == [head['admission_id']]
++
++
++@pytest.mark.asyncio
++async def test_update_hold_parks_checkpoint_before_notifier_selection(tmp_path, monkeypatch):
++    from gateway import session_notifier_drain, session_update_pause
++    db, owner, _head = parked_fixture(tmp_path, monkeypatch)
++    identity = json.dumps(['kanban-wake', 'route', 'one'])
++    admit_session_input(db, epoch=owner.epoch, session_id='s', principal_id='automation:route',
++                        request_id=identity, payload=wake_payload(identity))
++    monkeypatch.setattr(owner, '_schedule', lambda ref: None)
++    monkeypatch.setattr(session_notifier_drain, 'held', lambda: True)
++    monkeypatch.setattr(session_update_pause, 'update_held', lambda authority: True)
++    with db:
++        row, first = await owner._claim_next(REF, owner.sessions['s'], [])
++    assert (row, first) == (session_update_pause.UPDATE_PAUSED, None)
+diff --git a/tests/gateway/test_update_pause_refusal.py b/tests/gateway/test_update_pause_refusal.py
+index 127dd53aa1..ebfd3b35f4 100644
+--- a/tests/gateway/test_update_pause_refusal.py
++++ b/tests/gateway/test_update_pause_refusal.py
+@@ -12,7 +12,7 @@ async def test_refused_checkpoint_fences_exact_head_not_follower(tmp_path, monke
+     follower = admit_session_input(db, epoch=owner.epoch, principal_id='human', session_id='s',
+                                    request_id='later', payload={'text': 'later'})
+     monkeypatch.setattr(owner, '_schedule', lambda ref: None)
+-    async def refuse(ref, live):
++    async def refuse(ref, live, attempted=None):
+         raise RuntimeStoreError(reason)
+     monkeypatch.setattr(owner, '_claim_next', refuse)
+     with db:
+@@ -31,7 +31,7 @@ async def test_refusal_cannot_fence_uncheckpointed_running_turn(tmp_path, monkey
+     db, owner, head = parked_fixture(tmp_path, monkeypatch)
+     with db:
+         db._execute_write(lambda conn: delete_session_checkpoint(conn, head['admission_id']))
+-        async def refuse(ref, live):
++        async def refuse(ref, live, attempted=None):
+             raise RuntimeStoreError('permission_denied')
+         monkeypatch.setattr(owner, '_claim_next', refuse)
+         await owner._claim_with_retry(REF, owner.sessions['s'])
+-- 
+2.43.0
+

@@ -1,0 +1,321 @@
+From 9b7fc3c67b01a54b079c03719f775a8fa990d3fd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:52:36 +0000
+Subject: [PATCH] [daveey] Park local Kanban/loop wakes for core updates;
+ active-work publishes update_pausable on every unit
+
+A Kanban notice (or /loop tick, plugin injection, heartbeat) on a local Desktop
+route is admitted as local_automation_v1, and session_update_pause_ingress.
+supported() refused every such admission, so the turn never bound an eligible
+pause scope (update_pausable stayed false) and a restart-safe drain waited on it
+for its whole claim lease (laptop-1 11-12 06:03 incident 13448, 07:16 incident
+14995: chat f07c32).
+
+supported() now admits a local-route producer wake: the claim re-checks its
+route (check_local_automation) and resume_event keeps only its mute/heartbeat
+traits, exactly as for a native notice. Still excluded: noted completions
+(async delegation, process completion/watch, cron), which note_if_unviewed would
+write as a note at an unviewed resume; detached-route wakes; API and malformed
+descriptors.
+
+The active-work verb now publishes update_pausable (e055b76f94's per-chat flag,
+read from the installed hook) on every unit, False for api/delegation/managed/
+cron, so a consumer can require `update_pausable is True` and never mistake a
+missing field for a parkable unit.
+
+Proof: RED on base 465e7d1fa1: kanban/loop/plugin eligibility rows, the
+ingress table row, the composed local Kanban wake (park at the step boundary,
+admission stays started, resumes as the same admission and completes), and the
+verb test. GREEN: 48/48 across the touched files plus the update_pausable and
+composed pause suites.
+---
+ gateway/run_active_work_verb.py               |   8 +
+ gateway/session_update_pause_ingress.py       |  22 ++-
+ .../test_active_work_verb_update_pausable.py  |  46 ++++++
+ tests/gateway/test_update_pause_ingress.py    |   4 +-
+ tests/gateway/test_update_pause_local_wake.py | 138 ++++++++++++++++++
+ 5 files changed, 212 insertions(+), 6 deletions(-)
+ create mode 100644 tests/gateway/test_active_work_verb_update_pausable.py
+ create mode 100644 tests/gateway/test_update_pause_local_wake.py
+
+diff --git a/gateway/run_active_work_verb.py b/gateway/run_active_work_verb.py
+index cd0c6dd4f0..ae0560e2ac 100644
+--- a/gateway/run_active_work_verb.py
++++ b/gateway/run_active_work_verb.py
+@@ -4,6 +4,11 @@
+ async delegations, so a CLI asking "may I stop this gateway?" could not see a background subagent
+ that ``stop()`` interrupts (``tools.async_delegation.interrupt_all``). The verb answers from the
+ running process instead: the same units the drain report publishes plus every live delegation.
++
++``active_work`` units carry ``update_pausable`` on every unit, not only chat: true only for a chat
++turn whose agent runs under the gateway's core-update pause hook
++(``session_update_pause_hook.update_pausable``), i.e. a pause request parks it at a step boundary with a
++durable checkpoint. Every other unit (api, managed, cron, delegation) only finishes or is cut.
+ """
+ 
+ from __future__ import annotations
+@@ -64,6 +69,9 @@ def active_work_verb(runner, loop) -> Callable[[], dict[str, Any]]:
+                 units = list(runner._describe_active_work()) + _delegation_units(time.time())
+                 if scoped:
+                     units = _profile_units(runner, profile, units)
++                # Only a chat turn under the update-pause hook parks; every other unit says so explicitly.
++                units = [{**unit, "update_pausable": unit.get("update_pausable") is True} for unit in units]
++                if scoped:
+                     box.append({"active_agents": len(units), "active_work": units, "profile": profile,
+                                 "parked_work": [u for u in runner._describe_parked_work()
+                                                 if u.get("profile") == profile]})
+diff --git a/gateway/session_update_pause_ingress.py b/gateway/session_update_pause_ingress.py
+index 89dc880faf..cc08fe83f5 100644
+--- a/gateway/session_update_pause_ingress.py
++++ b/gateway/session_update_pause_ingress.py
+@@ -4,8 +4,9 @@ from dataclasses import replace
+ 
+ 
+ def supported(authority, row, event, live, *, is_api):
+-    """Only a claimed native messaging or local chat turn can be checkpointed. API and
+-    producer-admitted automation have other result contracts and keep counting as active work.
++    """Only a claimed native messaging or local chat turn can be checkpointed, including a local
++    route's producer wake (below). API and noted-completion admissions have other result contracts
++    and keep counting as active work.
+     Native notices retain their presentation traits on resume, but must pass current ingress
+     authorization again; a formerly internal wake is never a license to bypass Stop or policy.
+ 
+@@ -16,10 +17,21 @@ def supported(authority, row, event, live, *, is_api):
+     """
+     payload = row['payload']
+     local = getattr(getattr(live.source, 'platform', None), 'value', None) == 'local'
+-    if is_api or (payload.get('finite') is True and not local):
+-        return False
+-    if any(key in payload for key in ('api_turn_v1', 'local_automation_v1')):
++    if is_api or (payload.get('finite') is True and not local) or 'api_turn_v1' in payload:
+         return False
++    if 'local_automation_v1' in payload:
++        # [daveey] A producer wake on a local route (Kanban notice, /loop tick, plugin injection,
++        # heartbeat) runs as a turn and resumes like a local chat turn: the claim re-checks its route
++        # (``check_local_automation``) and ``resume_event`` keeps its mute/heartbeat traits only.
++        # Unparkable, a notice turn held a restart-safe drain for its whole claim lease (laptop-1
++        # 2026-11-12 06:03/07:16 PST). Not a noted completion: at an unviewed resume
++        # ``note_if_unviewed`` would write it as a note instead of continuing. Not a detached
++        # route's wake: its resume is not covered here.
++        descriptor = payload['local_automation_v1']
++        if not (isinstance(descriptor, dict) and isinstance(descriptor.get('identity'), str)):
++            return False  # malformed: the claim refuses it anyway, never park it
++        from gateway.session_completion_notes import noted_completion
++        return local and not noted_completion(row)
+     return 'native_text_v1' in payload or local
+ 
+ 
+diff --git a/tests/gateway/test_active_work_verb_update_pausable.py b/tests/gateway/test_active_work_verb_update_pausable.py
+new file mode 100644
+index 0000000000..6e9f74b608
+--- /dev/null
++++ b/tests/gateway/test_active_work_verb_update_pausable.py
+@@ -0,0 +1,46 @@
++"""The ``active-work`` verb says, on every unit, whether a core-update pause request parks it.
++
++``update_pausable`` comes from the gateway update-pause hook itself (``_describe_active_work``): true
++only while that hook is installed on a chat turn's agent, which happens only for an eligible bound
++scope. Units with no such notion (api, delegation, managed, cron) are published ``False`` explicitly,
++so a consumer never mistakes a missing field on an older core for a parkable unit.
++"""
++import os
++from types import SimpleNamespace
++
++from gateway.run import GatewayRunner
++from gateway.session_update_pause_hook import bind_scope, installed
++
++
++def _runner(agents):
++    runner = object.__new__(GatewayRunner)
++    runner._running_agents = {}
++    runner.adapters = {}
++    runner.session_authorities = []
++    sessions = {key: SimpleNamespace(turn=SimpleNamespace(agent=agent, started_ts=None))
++                for key, agent in agents.items()}
++    runner._sessions_map = lambda: sessions
++    runner._active_api_run_count = lambda: 1
++    runner._active_deferred_agent_worker_count = lambda: 0
++    return runner
++
++
++def test_active_work_verb_reports_update_pausable_on_every_unit(tmp_path, monkeypatch):
++    from gateway.run_active_work_verb import active_work_verb
++    from tools import async_delegation
++    monkeypatch.setattr("gateway.session_update_pause_hook.start_mid_tool_cancel", lambda agent, root: lambda: None)
++    monkeypatch.setattr(async_delegation, 'list_async_delegations', lambda: [
++        {'status': 'running', 'delegation_id': 'd1', 'goal': 'g', 'dispatched_at': 0}])
++    pausable, plain = SimpleNamespace(), SimpleNamespace()
++    runner = _runner({'k:pausable': pausable, 'k:plain': plain})
++    runner._describe_parked_work = list
++    runner._active_work_count = lambda: 4
++    loop = SimpleNamespace(call_soon_threadsafe=lambda fn: fn())
++    with bind_scope(tmp_path, eligible=True), installed(pausable):
++        answer = active_work_verb(runner, loop)({})
++    assert answer['pid'] == os.getpid()
++    got = {(u['kind'], u.get('session') or u.get('delegation_id') or ''): u['update_pausable']
++           for u in answer['active_work']}
++    assert got == {('chat', 'k:pausable'): True, ('chat', 'k:plain'): False,
++                   ('api', ''): False, ('delegation', 'd1'): False}
++    assert all(type(u['update_pausable']) is bool for u in answer['active_work'])
+diff --git a/tests/gateway/test_update_pause_ingress.py b/tests/gateway/test_update_pause_ingress.py
+index 8c181bd8e3..21bd4cb8d8 100644
+--- a/tests/gateway/test_update_pause_ingress.py
++++ b/tests/gateway/test_update_pause_ingress.py
+@@ -198,7 +198,9 @@ async def test_native_admission_without_pause_is_unaffected_and_delivers_once(mo
+     ({'text': 'x', 'finite': True, 'unattended': True}, 'local', True),
+     ({'native_text_v1': {}, 'finite': True}, 'telegram', False),
+     ({'api_turn_v1': {}}, 'local', False),
+-    ({'local_automation_v1': {}}, 'local', False),
++    ({'local_automation_v1': {}}, 'local', False),  # malformed descriptor: fails closed
++    ({'local_automation_v1': {'identity': '["kanban-wake","route","x"]'}}, 'local', True),
++    ({'local_automation_v1': {'identity': '["async_delegation","d","x"]'}}, 'local', False),
+ ])
+ def test_only_native_or_local_chat_admissions_are_pause_eligible(payload, platform, expected):
+     from types import SimpleNamespace
+diff --git a/tests/gateway/test_update_pause_local_wake.py b/tests/gateway/test_update_pause_local_wake.py
+new file mode 100644
+index 0000000000..91ecb19049
+--- /dev/null
++++ b/tests/gateway/test_update_pause_local_wake.py
+@@ -0,0 +1,138 @@
++"""A producer wake on a local route (a Kanban notice, a /loop tick) parks for a core update.
++
++The wake rides ``local_automation_v1`` (``admit_route_wake``). Before it bound an eligible pause scope,
++such a turn never parked: a restart-safe drain waited on it for the whole claim lease. It parks at a
++completed-tool step boundary with a durable checkpoint and resumes as the same admission once the
++update hold lifts, re-authorized against its route. A noted completion (an async delegation or
++process result) stays ineligible: with no viewer at resume it would be written as a note, not resumed.
++"""
++import asyncio
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.session_results import execution_result
++
++
++def _row(payload, request_id='r'):
++    return {'payload': payload, 'request_id': request_id}
++
++
++def _live(platform):
++    return SimpleNamespace(source=SimpleNamespace(platform=SimpleNamespace(value=platform)))
++
++
++def _wake(producer):
++    return {'text': 'wake', 'local_automation_v1': {
++        'identity': json.dumps([producer, 'route', 'x'], separators=(',', ':')), 'owner': 's'}}
++
++
++@pytest.mark.parametrize('payload,platform,eligible', [
++    (_wake('kanban-wake'), 'local', True),
++    (_wake('loop-tick'), 'local', True),
++    (_wake('plugin'), 'local', True),
++    (_wake('async_delegation'), 'local', False),  # noted completion: a note at an unviewed resume
++    (_wake('completion'), 'local', False),
++    (_wake('watch_match'), 'local', False),
++    (_wake('cron'), 'local', False),
++    (_wake('kanban-wake'), 'telegram', False),  # a detached route's wake: not checkpointed here
++    ({**_wake('kanban-wake'), 'finite': True}, 'telegram', False),
++    ({'text': 'hi', 'api_turn_v1': {}}, 'local', False),
++    ({'text': 'hi'}, 'local', True),
++    ({'text': 'hi', 'native_text_v1': {'automation': {'identity': 'x'}}}, 'telegram', True),
++    ({'text': 'hi'}, 'telegram', False),
++], ids=['kanban', 'loop', 'plugin', 'delegation', 'completion', 'watch', 'cron', 'detached', 'finite',
++        'api', 'local-chat', 'native-notice', 'unenveloped'])
++def test_pause_eligibility_by_admission_kind(payload, platform, eligible):
++    from gateway.session_update_pause_ingress import supported
++    assert supported(None, _row(payload), None, _live(platform), is_api=False) is eligible
++
++
++def test_api_turn_is_never_eligible():
++    from gateway.session_update_pause_ingress import supported
++    assert supported(None, _row(_wake('kanban-wake')), None, _live('local'), is_api=True) is False
++
++
++@pytest.mark.asyncio
++async def test_local_kanban_wake_parks_at_boundary_then_resumes_same_admission(tmp_path, monkeypatch):
++    from agent.turn_iteration_prep import _step_boundary_pause
++    from gateway import session_update_pause
++    from gateway.config import GatewayConfig
++    from gateway.run import GatewayRunner
++    from gateway.response_filters import display_kind_for_event
++    from gateway.session_authority import initialize_session_authority
++    from gateway.session_automation import admit_route_wake
++    from gateway.session_contract import SessionActor
++    from gateway.session_local import create_local_session
++    from gateway.session_update_pause_hook import installed, update_pausable
++    from hermes_cli import admission_fence
++    from hermes_state import SessionDB
++    from hermes_state_runtime import get_session_admission
++    from tests.waiting import async_wait_until
++    from tui_gateway.update_pause import PAUSE_REASON, pause_note
++
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
++    db = SessionDB(tmp_path / 'state.db')
++    runner.session_store._db = runner._session_db = db
++    authority = await initialize_session_authority(runner, profile_id='default', instance_id='wake-pause', db=db)
++    held = [True]
++    monkeypatch.setattr(session_update_pause, 'update_held', lambda authority: held[0])
++    monkeypatch.setattr(admission_fence, 'pause_requested', lambda root: held[0])
++    seen, verdicts = [], []
++
++    async def turn(event, source, quick_key, run_generation):
++        seen.append(event)
++        if len(seen) == 1:
++            sid = event.metadata['gateway_session_id']
++            history = [
++                {'role': 'user', 'content': event.text},
++                {'role': 'assistant', 'content': '', 'tool_calls': [
++                    {'id': 'k1', 'type': 'function', 'function': {'name': 'kanban_show', 'arguments': '{}'}}]},
++                {'role': 'tool', 'content': 'card', 'tool_call_id': 'k1', 'tool_name': 'kanban_show'}]
++            authority.db.append_messages_batch(sid, history)
++            agent = SimpleNamespace()
++            # TurnRunner's exact install call: the hook exists only for an eligible bound scope.
++            with installed(agent, message_id=event.message_id) as hooked:
++                verdicts.append((hooked, update_pausable(agent), _step_boundary_pause(agent, history, 1)))
++            assert not update_pausable(agent)  # restored after the run
++            execution_result.get()['result'] = {'paused_for_update': True, 'interrupted': True,
++                                                'final_response': '', 'messages': history}
++            return None
++        assert event.internal is False and not event.allow_gateway_control
++        assert event.text == pause_note('kanban: task t_1 blocked')
++        assert display_kind_for_event(event) == 'auto_continue'
++        assert event.message_id.startswith('update-resume:')
++        execution_result.get()['result'] = {'final_response': 'continued', 'messages': []}
++        return 'continued'
++
++    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
++    try:
++        viewer = SessionActor('test-owner', 'default', frozenset(
++            {'session:create', 'session:submit', 'session:read'}), 'viewer')
++        ref = create_local_session(authority, viewer, dict(request_id='cli', source='tui', model='fixture',
++                                                          cwd=str(tmp_path), toolsets=[]))
++        await authority.attach(viewer, ref, history=False)
++        live = authority.sessions[ref.session_id]
++        adapter = runner._adapter_for_source(live.source)
++        assert await admit_route_wake(runner, adapter, live.source, 'kanban: task t_1 blocked', 'kanban-wake') is True
++        await async_wait_until(lambda: bool(authority.update_parked), timeout=10, what='the wake parked')
++        assert verdicts == [(True, True, PAUSE_REASON)]
++        assert len(seen) == 1
++        parked = authority.update_parked[ref.session_id]
++        assert get_session_admission(db, admission_id=parked['admission_id'])['status'] == 'started'
++        held[0] = False
++        authority._schedule(ref)
++        await async_wait_until(lambda: len(seen) == 2, timeout=10, what='the wake resumed')
++        await asyncio.wait_for(authority.sessions[ref.session_id].task, 10)
++        row = get_session_admission(db, admission_id=parked['admission_id'])
++        assert (row['status'], row['outcome']) == ('terminal', 'completed')
++    finally:
++        held[0] = False
++        tasks = [live.task for live in authority.sessions.values() if live.task]
++        for task in tasks:
++            if not task.done():
++                task.cancel()
++        await asyncio.gather(*tasks, return_exceptions=True)
++        db.close()
+-- 
+2.43.0
+

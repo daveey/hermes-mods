@@ -1,0 +1,229 @@
+From f728c555186dcc37e3420b23b8c0af6b5d310167 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 14:29:36 +0000
+Subject: [PATCH] [daveey] fix(kanban): a pickup-stall alarm may re-place a
+ listed card onto the pool queue
+
+t_01a1d0214f3e63e8: the alarm scope (kanban_pickup_stall_repin.scope_refusal) accepted only runs_on=[machine:<X>], and kanban_move_pool refuses machine:<pool worker> without a host_reason, which no alarm path can pass (operator op fields are {runs_on, reason}; the local move passes none). With every eligible machine a pool worker, an alarm could re-place nothing.
+
+scope_refusal now also accepts runs_on == [POOL_LABEL] while a pool machine other than the stalled one passes eligible_now (same capability/profile/slot/freshness rules); the machine:<X> form is unchanged. howto() (the alarm body), the refusal texts and the kanban_move tool description recommend ["pool:worker"] first. host_reason stays off the alarm path.
+
+Proof: RED on b38b8d78cd: 10 new tests fail with 'runs_on must be exactly one machine:<X> label' (unit through refusal, operator_refusal via ksr.submit dry-run, and end-to-end kanban_move). GREEN: 11 files / 352 tests (pickup_stall*, pickup_alarm_placement, operator_call, operator_labels, hub_admission_pickup, quota_held, kanban_move, pool_queue, tools/test_kanban_tools). scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban_operator_call.py            |  2 +-
+ hermes_cli/kanban_pickup_stall_repin.py       | 53 +++++++++++++---
+ .../test_kanban_pickup_stall_repin.py         | 62 +++++++++++++++++++
+ tools/kanban_tools_schemas.py                 |  3 +-
+ 4 files changed, 109 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index 3dbaac0526..f22d1e5afe 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -336,7 +336,7 @@ def preflight_op(conn: sqlite3.Connection, requester: str, op: dict) -> dict:
+         return refuse("running", f"{target} is running; only its own run may move it (kanban_move)")
+     if alarm_scope is not None:
+         return refuse("pickup_stall_scope", f"a pickup-stall alarm moves only a card it lists, off the stalled "
+-                                            f"machine, to one eligible now: {alarm_scope}")
++                                            f"machine, to the pool or one machine eligible now: {alarm_scope}")
+     if op["action"] == "unblock":
+         if status != "blocked":
+             return refuse("not_blocked", f"{target} is {status}, not blocked")
+diff --git a/hermes_cli/kanban_pickup_stall_repin.py b/hermes_cli/kanban_pickup_stall_repin.py
+index 4f3ed245bf..259acedf98 100644
+--- a/hermes_cli/kanban_pickup_stall_repin.py
++++ b/hermes_cli/kanban_pickup_stall_repin.py
+@@ -7,7 +7,8 @@ task or its ``repin-owner`` supervisor, and the stalled cards were created by ot
+ re-placed them by hand.
+ 
+ The grant (:func:`refusal`) is the alarm's own run moving one target with ``kanban_move(task_id=<target>,
+-runs_on=["machine:<X>"], reason=...)``. Every condition must hold, each read on the board the move would write:
++runs_on=["pool:worker"], reason=...)`` (or ``["machine:<X>"]``). Every condition must hold, each read on the board the
++move would write:
+ 
+ * the caller is an open alarm the detector filed: ``created_by`` the detector, ``created_on`` M, idempotency key
+   ``pickup-stall:<M>:...`` (M is read from the key, never from the arguments);
+@@ -16,7 +17,10 @@ runs_on=["machine:<X>"], reason=...)``. Every condition must hold, each read on
+ * the target is still ready and unclaimed, with no current run, and still pinned ``machine:<M>`` (only off M);
+ * ``runs_on`` is exactly ``["machine:<X>"]``, X is not M, and X is eligible now by the alarm placement rules
+   (active, unheld, copies cards, carries the target's ``capability:<requires>`` and ``profile:<assignee>``, not
+-  draining, seen recently, a free card slot).
++  draining, seen recently, a free card slot); or exactly the pool queue ``[POOL_LABEL]``
++  (:data:`hermes_cli.kanban_placement.POOL_LABEL`) while some pool machine other than M is eligible now by the same
++  rules (t_01a1d0214f3e63e8: ``machine:<pool worker>`` needs a ``host_reason`` (:mod:`hermes_cli.kanban_move_pool`)
++  that no alarm path passes, so with every eligible machine a pool worker the alarm could re-place nothing).
+ 
+ The move itself is the ordinary queued move (``kanban_move.move_queued``) with its own guards. Nothing here reads
+ or writes a registry hold, so a hold is never lifted or shortened. A target another gateway created is moved through
+@@ -35,14 +39,17 @@ CLOSED = ("done", "archived")
+ 
+ def howto(own: str) -> str:
+     """The supported re-place command, as alarm prose (``_tail`` and the hold text name it)."""
++    pool = pool_label()
+     return (f"To re-place a listed card off {own}, call the kanban_move TOOL from this alarm's run (not the shell: "
+             f"`hermes kanban move` is fenced in worker shells): kanban_move(task_id=\"<listed card>\", "
+-            "runs_on=[\"machine:<X>\"], reason=\"...\"), where X is another machine eligible now (active, unheld, "
+-            "free slot, the card's profile and capabilities). When the card was created on another gateway, "
+-            "kanban_move answers foreign_card: send the same move as kanban_supervisor_request(ops=[{\"op\": "
+-            "\"operator\", \"action\": \"move\", \"task_id\": \"<listed card>\", \"runs_on\": [\"machine:<X>\"], "
+-            f"\"reason\": \"...\"}}]). Only the cards this alarm lists, only while they are ready and pinned to {own}, "
+-            f"and never back to {own}.")
++            f"runs_on=[\"{pool}\"], reason=\"...\") queues it for any pool worker other than {own} with a free "
++            "slot (granted while one is eligible now). Never pin one pool worker: that needs a host_reason, and "
++            "capacity is none. Only when no pool worker is eligible, use runs_on=[\"machine:<X>\"] for another "
++            "machine eligible now that is not a pool worker (active, unheld, free slot, the card's profile and "
++            "capabilities). When the card was created on another gateway, kanban_move answers foreign_card: send "
++            "the same move as kanban_supervisor_request(ops=[{\"op\": \"operator\", \"action\": \"move\", "
++            f"\"task_id\": \"<listed card>\", \"runs_on\": [\"{pool}\"], \"reason\": \"...\"}}]). Only the cards "
++            f"this alarm lists, only while they are ready and pinned to {own}, and never back to {own}.")
+ 
+ 
+ def _cols(row: Any) -> set:
+@@ -126,14 +133,42 @@ def scope_refusal(conn: sqlite3.Connection, alarm: Any, target: Any, runs_on: An
+         labels = list(wn.normalize_runs_on(runs_on) or [])
+     except ValueError as exc:
+         return str(exc)
++    if labels == [pool_label()]:
++        return pool_refusal(own, machines, _need(target), now_ms)
+     if len(labels) != 1 or not labels[0].startswith("machine:"):
+-        return "runs_on must be exactly one machine:<X> label"
++        return f"runs_on must be exactly [\"{pool_label()}\"] or exactly one machine:<X> label"
+     name = labels[0].split(":", 1)[1]
+     if name == own:
+         return f"the card must leave {own}"
+     return eligible_now(name, own, machines, _need(target), now_ms)
+ 
+ 
++def pool_label() -> str:
++    from hermes_cli.kanban_placement import POOL_LABEL
++    return POOL_LABEL
++
++
++def pool_refusal(own: str, machines: Optional[Mapping[str, Mapping[str, Any]]], need: set,
++                 now_ms: int) -> Optional[str]:
++    """None when a pool machine other than ``own`` may take the card now (:func:`eligible_now`), else why not.
++
++    The pool queue is how an alarm re-places a card onto a pool worker: ``machine:<pool worker>`` needs a
++    ``host_reason`` (:mod:`hermes_cli.kanban_move_pool`), which capacity never is, so no alarm path passes one."""
++    label = pool_label()
++    if machines is None:
++        return "the machine registry is unreadable"
++    pooled = sorted(n for n, e in machines.items() if n != own and label in ((e or {}).get("labels") or []))
++    whys = []
++    for name in pooled:
++        why = eligible_now(name, own, machines, need, now_ms)
++        if why is None:
++            return None
++        whys.append(why)
++    return (f"no {label} machine other than {own} is eligible now"
++            + (f": {'; '.join(whys)}" if whys else " (none carries the label)")
++            + "; a machine outside the pool that is eligible now takes runs_on=[\"machine:<X>\"]")
++
++
+ def _registry_machines() -> Optional[Mapping[str, Mapping[str, Any]]]:
+     from hermes_cli import kanban_worker_node as wn
+     reg = wn.registry()
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_repin.py b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+index b52b0ca5af..4ab8b0750d 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_repin.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+@@ -177,6 +177,46 @@ def test_the_new_machine_must_be_eligible_now(board, change):
+     assert board.why(machines=_machines(**{X: change})) is not None
+ 
+ 
++# t_01a1d0214f3e63e8 (2026-11-12): every eligible machine was a pool worker, and a move to ``machine:<pool worker>``
++# needs a host_reason no alarm path can pass (kanban_move_pool), so the alarm could re-place nothing. The pool queue
++# is the alarm's way off M whenever another pool worker is eligible now.
++POOL = "pool:worker"
++
++
++def _pooled(**over):
++    return _machines(**{X: {"labels": [*_worker(X)["labels"], POOL]}}, **over)
++
++
++def test_the_pool_queue_is_a_valid_target_when_another_pool_worker_is_eligible(board):
++    assert board.why(runs_on=[POOL], machines=_pooled()) is None
++
++
++@pytest.mark.parametrize("machines", [
++    lambda: _machines(),                                               # no machine carries the pool label
++    lambda: _pooled(worker_2={"hold": True}),                          # the only other pool worker is held
++    lambda: _pooled(worker_2={"metrics": {"active_card_runs": 10}}),  # ... or has no free slot
++    lambda: _pooled(worker_2={"last_seen": NOW - 301_000}),           # ... or was not seen recently
++    lambda: _machines(worker_1={"hold": False, "labels": [*_worker(M)["labels"], POOL]}),  # only M is pooled
++    lambda: None,                                                      # the registry is unreadable
++])
++def test_the_pool_queue_is_refused_when_no_other_pool_worker_is_eligible_now(board, machines):
++    why = rp.refusal(board.conn, board.target, board.alarm, [POOL], machines=machines(), now_ms=NOW)
++    assert why is not None and (POOL in why or "unreadable" in why), why
++
++
++@pytest.mark.parametrize("runs_on", [[POOL, "linux"], [POOL, f"machine:{X}"], ["pool:gpu"]])
++def test_the_pool_queue_is_exactly_the_pool_label(board, runs_on):
++    assert board.why(runs_on=runs_on, machines=_pooled(worker_2={
++        "labels": [*_worker(X)["labels"], POOL, "pool:gpu"]})) is not None
++
++
++def test_the_pool_queue_still_needs_the_cards_capabilities(board):
++    board.set(board.target, requires=json.dumps(["gpu"]))
++    assert "capability:gpu" in board.why(runs_on=[POOL], machines=_pooled())
++    assert board.why(runs_on=[POOL], machines=_pooled(
++        worker_2={"labels": [*_worker(X)["labels"], POOL, "capability:gpu"]})) is None
++
++
+ def test_the_new_machine_needs_the_cards_required_capabilities(board):
+     board.set(board.target, requires=json.dumps(["gpu"]))
+     assert "capability:gpu" in board.why()
+@@ -267,6 +307,22 @@ def test_the_alarms_run_re_places_each_listed_card_and_keeps_running(held):
+     assert support.MACHINES[M]["hold"] is True  # the hold is the operator's: never lifted or shortened
+ 
+ 
++def test_the_alarms_run_re_places_a_listed_card_onto_the_pool_queue(held, monkeypatch):
++    hub, _worker_gw, alarm, (a, b), _unlisted = held
++    body = kb.get_task(hub.conn, alarm).body
++    assert f'runs_on=["{POOL}"]' in body  # the alarm recommends the pool queue first
++    out = _move(a, [POOL])  # worker-2 carries no pool label yet: nowhere on the pool can take it now
++    assert out.get("ok") is not True and POOL in out["error"], out
++    monkeypatch.setitem(support.MACHINES, X, {**support.MACHINES[X],
++                                              "labels": [*support.MACHINES[X]["labels"], POOL]})
++    hub.enter()  # re-read the registry
++    for tid in (a, b):
++        out = _move(tid, [POOL])
++        assert out.get("ok") is True, out
++        assert place._pin(hub.conn, tid) == [POOL]
++    assert kb.get_task(hub.conn, alarm).status == "running"
++
++
+ def test_the_alarms_run_may_not_move_an_unlisted_card_or_back_onto_the_stalled_machine(held):
+     hub, _worker_gw, _alarm, (a, _b), unlisted = held
+     out = _move(unlisted, [f"machine:{X}"])
+@@ -313,6 +369,12 @@ def test_an_alarm_caller_gets_the_same_scope_on_an_operator_call_move(fleet, mon
+         f.h.execute("UPDATE tasks SET runs_on = ? WHERE id = ?", (json.dumps([f"machine:{M}"]), other))
+     f.board()
+     assert ask([f"machine:{X}"], target=other).get("code") == "pickup_stall_scope"
++    # The pool queue: granted while another pool worker is eligible now, refused when none is.
++    assert ask([POOL]).get("code") == "pickup_stall_scope"
++    monkeypatch.setattr(rp, "_registry_machines", lambda: _pooled())
++    assert ask([POOL])["verdict"] == "supervisor"
++    monkeypatch.setattr(rp, "_registry_machines", lambda: _pooled(worker_2={"hold": True}))
++    assert ask([POOL]).get("code") == "pickup_stall_scope"
+     # A caller that is no alarm keeps the plain operator-call rules.
+     with kb.write_txn(f.w):
+         f.w.execute("UPDATE tasks SET created_by = 'default' WHERE id = ?", (f.caller,))
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 2e0da64789..6024d3bd63 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -465,7 +465,8 @@ KANBAN_MOVE_SCHEMA = _schema(
+         "gateway whose runs_on no enrolled machine carries (stranded: e.g. ['hermes-hub']) may be re-routed by any "
+         "worker to labels a machine does carry (e.g. ['machine:hub']); the old labels are kept in a comment. "
+         "Third: a pickup-stall alarm's run may move a ready card its alarm lists off the stalled machine to "
+-        "runs_on = [\"machine:<X>\"] for one other machine eligible now. "
++        "runs_on = [\"pool:worker\"] while another pool worker is eligible now (or [\"machine:<X>\"] for one other "
++        "eligible machine outside the pool). "
+         "Every other card is refused."
+     ),
+     {
+-- 
+2.43.0
+

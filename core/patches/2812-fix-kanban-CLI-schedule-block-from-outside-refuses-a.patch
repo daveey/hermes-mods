@@ -1,0 +1,370 @@
+From 45a36af491818028406e516372a2c185e91c94f7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:39:29 +0000
+Subject: [PATCH] fix(kanban): CLI schedule/block from outside refuses a card a
+ live worker owns; pin live_claim own-holder and primary gates [daveey]
+
+PR #1517 fenced the agent tools kanban_schedule/kanban_block, but the sibling
+CLI path (hermes kanban schedule|block <id>, used over ssh) still passed
+expected_run_id=None for an outside caller and ended the live worker's open run
+underneath it (repro on aabc3f0c2d). _guarded_park now asks the same
+tools.kanban_tools_live_park.live_claim() per id when the caller does not own
+the run, and refuses that id with the tool's text (holder, run, Nothing changed,
+steer with hermes kanban comment, stop with reclaim/archive). Bulk --ids refuses
+only the live ids, parks the rest and exits 1. kb.schedule_task/block_task are
+unchanged, so internal parkers keep their behaviour.
+
+Tests: CLI schedule, block, bulk (live + ready), own-run CLI park, dead-worker
+claim, ready card, the Board-claim incident shape via the CLI; plus pins for two
+live_claim() guards no test exercised (holder == own; non-primary board).
+
+Card: t_01a1d0622df6ea87
+---
+ hermes_cli/kanban_cli_park.py                 |  17 +-
+ ...test_kanban_cli_outside_park_live_claim.py | 159 ++++++++++++++++++
+ .../test_kanban_outside_park_board_claim.py   |  61 +++++++
+ tools/kanban_tools_live_park.py               |  37 +++-
+ 4 files changed, 266 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_cli_outside_park_live_claim.py
+
+diff --git a/hermes_cli/kanban_cli_park.py b/hermes_cli/kanban_cli_park.py
+index 1ea9551946..e5803114b2 100644
+--- a/hermes_cli/kanban_cli_park.py
++++ b/hermes_cli/kanban_cli_park.py
+@@ -81,11 +81,26 @@ def _cli_awaiting(args: argparse.Namespace, wake):
+ def _guarded_park(conn, op: str, wake, refused: dict, park, awaiting=None, **plan):
+     """Per-task op: refuse a park > 2 h out with no probe (``kanban_wake_check.guard_error``)
+     or one nothing would produce (``kanban_awaiting``) before ``park`` runs; ``park`` itself writes
+-    its reason comment only when it lands (``_commented``). [daveey]"""
++    its reason comment only when it lands (``_commented``).
++
++    First, a caller that does not own ``tid``'s run (``_worker_run_id_for`` is None) is refused on a card a
++    live worker owns (``kanban_tools_live_park.cli_refusal``, the agent tools' check): the park would end that
++    run underneath the worker (t_01a1d0622df6ea87). [daveey]"""
+     from hermes_cli import kanban_awaiting as kaw
+     from hermes_cli import kanban_wake_check as kwc
++    from hermes_cli.kanban import _worker_run_id_for
++    from tools.kanban_tools_live_park import cli_refusal
+ 
+     def run(tid):
++        try:
++            outside = _worker_run_id_for(tid) is None
++        except ValueError as exc:   # a worker scoped to another card
++            refused[tid] = f"cannot {op} {tid}: {exc}"
++            return False
++        live = cli_refusal(conn, op, tid) if outside else None
++        if live:
++            refused[tid] = live
++            return False
+         wake_at = kwc.planned_wake(conn, tid, op=op, **plan)
+         err = kwc.guard_error(wake_at=wake_at, wake_check=wake[0], clock_only=wake[2])
+         if err:
+diff --git a/tests/hermes_cli/test_kanban_cli_outside_park_live_claim.py b/tests/hermes_cli/test_kanban_cli_outside_park_live_claim.py
+new file mode 100644
+index 0000000000..9873987a7f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_cli_outside_park_live_claim.py
+@@ -0,0 +1,159 @@
++"""`hermes kanban schedule|block <id>` from outside refuses a card a live worker owns (t_01a1d0622df6ea87). [daveey]
++
++PR #1517 fenced the agent tools (``kanban_schedule``/``kanban_block``) against parking a card under a live worker,
++but the CLI is a sibling entry path: ``_cmd_schedule``/``_cmd_block`` passed ``expected_run_id=None`` for an
++outside caller, so ``hermes kanban schedule <id>`` over ssh still ended the worker's open run underneath it (the
++2026-11-12 incident shape). The CLI now consults the same ``live_claim()`` per id: a live one is refused with
++nothing changed, the rest of a bulk ``--ids`` still parks, and the exit is non-zero.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++
++SOAK = "SCHEDULED_UNTIL=2099-01-01T00:00:00Z short soak"
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_BOARD",
++                "HERMES_KANBAN_DB", "HERMES_SESSION_ID"):
++        monkeypatch.delenv(var, raising=False)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return h
++
++
++def _conn():
++    from hermes_cli import kanban_db_connect as kbc
++    return kbc.connect()
++
++
++def _cli():
++    from hermes_cli import kanban as kcli
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kcli.build_parser(parser.add_subparsers(dest="command"))
++    return lambda *argv: kcli.kanban_command(parser.parse_args(["kanban", *argv]))
++
++
++def _claimed(live: bool = True) -> tuple[str, int]:
++    """A card the dispatcher claimed; with ``live`` this test process stands in for its spawned worker."""
++    from hermes_cli import kanban_db_dispatch as kbd
++    with _conn() as conn:
++        tid = kb.create_task(conn, title="verify after owner lands", assignee="default")
++        assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
++        if live:
++            kbd._set_worker_pid(conn, tid, os.getpid())
++        return tid, kb._current_run_id(conn, tid)
++
++
++def _ready() -> str:
++    with _conn() as conn:
++        tid = kb.create_task(conn, title="not started", assignee="default")
++        assert kb.get_task(conn, tid).status == "ready"
++        return tid
++
++
++def _run(run_id: int):
++    with _conn() as conn:
++        return conn.execute("SELECT ended_at, outcome FROM task_runs WHERE id = ?", (run_id,)).fetchone()
++
++
++def _status(tid: str) -> str:
++    with _conn() as conn:
++        return kb.get_task(conn, tid).status
++
++
++def _assert_untouched(tid: str, run_id: int) -> None:
++    assert _status(tid) == "running"
++    assert _run(run_id)["ended_at"] is None  # the worker's run was not ended underneath it
++    with _conn() as conn:
++        assert not kb.list_comments(conn, tid)  # no SCHEDULED:/BLOCKED: comment claiming a park
++        assert not [e for e in kb.list_events(conn, tid) if e.kind in ("scheduled", "blocked")]
++
++
++def _assert_refusal(err: str, tid: str, run_id: int) -> None:
++    assert "live worker claim" in err and tid in err and f"run {run_id}" in err, err
++    assert kb._claimer_id() in err, err  # names the holder
++    assert "Nothing changed" in err, err
++    assert f"hermes kanban comment {tid}" in err, err
++    assert "hermes kanban reclaim" in err and "hermes kanban archive" in err, err
++
++
++def test_cli_schedule_of_a_live_claimed_card_is_refused_and_the_run_stays_open(home, capsys):
++    tid, run_id = _claimed()
++    assert _cli()("schedule", tid, SOAK, "--clock-only") != 0
++    _assert_refusal(capsys.readouterr().err, tid, run_id)
++    _assert_untouched(tid, run_id)
++
++
++def test_cli_block_of_a_live_claimed_card_is_refused_and_the_run_stays_open(home, capsys):
++    tid, run_id = _claimed()
++    assert _cli()("block", tid, SOAK, "--kind", "time", "--clock-only") != 0
++    _assert_refusal(capsys.readouterr().err, tid, run_id)
++    _assert_untouched(tid, run_id)
++
++
++@pytest.mark.parametrize("verb,extra", [("schedule", ()), ("block", ("--kind", "time"))])
++def test_cli_bulk_ids_refuses_only_the_live_card_and_parks_the_rest(home, capsys, verb, extra):
++    live, run_id = _claimed()
++    idle = _ready()
++    assert _cli()(verb, live, SOAK, *extra, "--clock-only", "--ids", idle) == 1
++    out = capsys.readouterr()
++    _assert_refusal(out.err, live, run_id)
++    assert idle not in out.err and idle in out.out, out
++    _assert_untouched(live, run_id)
++    assert _status(idle) == "scheduled"
++
++
++def test_the_worker_still_parks_its_own_live_card_via_the_cli(home, monkeypatch, capsys):
++    tid, run_id = _claimed()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    assert _cli()("schedule", tid, SOAK, "--clock-only") == 0, capsys.readouterr().err
++    assert _status(tid) == "scheduled" and _run(run_id)["outcome"] == "scheduled"
++
++
++def test_the_worker_still_blocks_its_own_live_card_via_the_cli(home, monkeypatch, capsys):
++    tid, run_id = _claimed()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    assert _cli()("block", tid, SOAK, "--kind", "time", "--clock-only") == 0, capsys.readouterr().err
++    assert _status(tid) == "scheduled" and _run(run_id)["ended_at"] is not None
++
++
++@pytest.mark.parametrize("verb,extra", [("schedule", ()), ("block", ("--kind", "time"))])
++def test_a_claim_whose_worker_is_gone_is_still_parked_via_the_cli(home, capsys, verb, extra):
++    """A claim with no live worker protects no run (the same rule the tool path applies)."""
++    tid, run_id = _claimed(live=False)
++    assert _cli()(verb, tid, SOAK, *extra, "--clock-only") == 0, capsys.readouterr().err
++    assert _status(tid) == "scheduled" and _run(run_id)["ended_at"] is not None
++
++
++@pytest.mark.parametrize("verb,extra", [("schedule", ()), ("block", ("--kind", "time"))])
++def test_a_ready_card_is_still_parked_via_the_cli(home, capsys, verb, extra):
++    tid = _ready()
++    assert _cli()(verb, tid, SOAK, *extra, "--clock-only") == 0, capsys.readouterr().err
++    assert _status(tid) == "scheduled"
++
++
++def test_tool_and_cli_refusals_carry_the_same_facts(home, capsys):
++    """One helper decides both paths: the tool's typed error and the CLI line name the same holder and run."""
++    tid, run_id = _claimed()
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_schedule({"task_id": tid, "reason": SOAK, "clock_only": True}))
++    assert out.get("code") == "live_claim_park" and out.get("run_id") == run_id, out
++    assert _cli()("schedule", tid, SOAK, "--clock-only") != 0
++    err = capsys.readouterr().err
++    assert out["holder"] in err and f"run {run_id}" in err, err
++    _assert_untouched(tid, run_id)
+diff --git a/tests/hermes_cli/test_kanban_outside_park_board_claim.py b/tests/hermes_cli/test_kanban_outside_park_board_claim.py
+index d16fcdacfe..768398ff75 100644
+--- a/tests/hermes_cli/test_kanban_outside_park_board_claim.py
++++ b/tests/hermes_cli/test_kanban_outside_park_board_claim.py
+@@ -10,6 +10,8 @@ from __future__ import annotations
+ 
+ import json
+ 
++import pytest
++
+ from hermes_cli import kanban_db as kb
+ from tests.hermes_cli.test_kanban_remote_archive import _running_on_worker, _tool
+ from tests.hermes_cli.test_kanban_worker_node import WORKER
+@@ -56,3 +58,62 @@ def test_an_expired_board_claim_does_not_hold_off_an_outside_park(gws, svc, kill
+         "AND json_extract(payload, '$.holder') IS NOT NULL ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0])
+     assert live_claim(hub.conn, tid, now=payload["expires"] / 1000 + 1) is None
+     assert live_claim(hub.conn, tid)["holder"] == WORKER
++
++
++def _claim_event(conn, tid):
++    return conn.execute("SELECT id, payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
++                        "AND json_extract(payload, '$.holder') IS NOT NULL ORDER BY id DESC LIMIT 1",
++                        (tid, kb._current_run_id(conn, tid))).fetchone()
++
++
++def test_a_board_claim_naming_this_gateway_does_not_refuse(gws, svc, kills):
++    """``holder == own``: the Board ``claimed`` event names this gateway while ``claim_lock`` is NULL (e.g. a local
++    reclaim raced the feed). Our own claim with no live local worker protects no run, so the park is not refused."""
++    from hermes_cli import kanban_db_sync as sync
++    from tools.kanban_tools_live_park import live_claim
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    _drop_lease_mirror(hub.conn, tid)
++    assert live_claim(hub.conn, tid)["via"] == "board_claim"  # the foreign claim is seen, so the gate is reached
++    own = str(sync._state(hub.conn)["gateway_id"])
++    event_id, payload = _claim_event(hub.conn, tid)
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE task_events SET payload = ? WHERE id = ?",
++                         (json.dumps({**json.loads(payload), "holder": own}), event_id))
++    assert kb.get_task(hub.conn, tid).status == "running"
++    assert live_claim(hub.conn, tid) is None
++
++
++@pytest.mark.parametrize("mode", ["off", "shadow"])
++def test_a_non_primary_board_does_not_consult_claim_events(gws, svc, kills, monkeypatch, mode):
++    """Only a primary board's feed carries authoritative ``claimed`` events; any other mode never refuses on them."""
++    from hermes_cli import kanban_db_sync as sync
++    from tools.kanban_tools_live_park import live_claim
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    _drop_lease_mirror(hub.conn, tid)
++    assert live_claim(hub.conn, tid)["via"] == "board_claim"
++    monkeypatch.setattr(sync, "board_mode", lambda conn: mode)
++    assert live_claim(hub.conn, tid) is None
++
++
++def test_cli_creator_park_before_the_lease_mirror_arrives_is_refused(gws, svc, kills, capsys):
++    """The CLI path of the incident shape: ``hermes kanban schedule <id>`` on the creator's replica."""
++    import argparse
++
++    from hermes_cli import kanban as kcli
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    _drop_lease_mirror(hub.conn, tid)
++    run_id = kb._current_run_id(hub.conn, tid)
++    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
++    kcli.build_parser(parser.add_subparsers(dest="command"))
++    rc = kcli.kanban_command(parser.parse_args(["kanban", "schedule", tid,
++                                                "SCHEDULED_UNTIL=2099-01-01T00:00:00Z soak", "--clock-only"]))
++    assert rc != 0
++    assert WORKER in capsys.readouterr().err
++    assert kb.get_task(hub.conn, tid).status == "running"
++    assert hub.conn.execute("SELECT ended_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0] is None
+diff --git a/tools/kanban_tools_live_park.py b/tools/kanban_tools_live_park.py
+index 6ecec0d492..1d1d487978 100644
+--- a/tools/kanban_tools_live_park.py
++++ b/tools/kanban_tools_live_park.py
+@@ -21,6 +21,10 @@ A card counts as live-claimed when it is ``running`` and one of these holds:
+ 
+ Applies only to a caller that does not own the run (no ``HERMES_KANBAN_TASK``/``HERMES_KANBAN_RUN_ID`` for the
+ card): a worker parking its own card is unaffected, and so is a ready, todo or blocked card.
++
++The CLI (``hermes kanban schedule|block <id>``) is a sibling entry path; it refuses through ``cli_refusal``, called
++from ``hermes_cli.kanban_cli_park._guarded_park`` (t_01a1d0622df6ea87). The check stays out of
++``kanban_db.schedule_task``/``block_task``, so internal parkers (owner-down, placement forwarding) are unchanged.
+ """
+ from __future__ import annotations
+ 
+@@ -66,23 +70,42 @@ def live_claim(conn, task_id: str, now: Optional[float] = None) -> Optional[dict
+     return {"holder": str(holder), "run_id": run_id, "via": "board_claim"}
+ 
+ 
++def _message(name: str, task_id: str, claim: dict, steer: str, stop: str) -> str:
++    """The refusal text both entry paths print: holder, run, nothing changed, how to steer or stop the worker."""
++    return (f"{name} refused: {task_id} is running under a live worker claim ({claim['holder']}, run "
++            f"{claim['run_id']}). Parking it from here would end that run underneath the worker, whose clean exit "
++            f"is then booked as a failure. Nothing changed. Steer the worker instead: {steer} reaches it at its next "
++            f"model call, and it parks its own card. {stop}")
++
++
+ def refusal(conn, tool_name: str, task_id: str) -> Optional[str]:
+     """A typed ``live_claim_park`` tool error when ``task_id`` holds a live claim, else None. Nothing changes."""
+     claim = live_claim(conn, task_id)
+     if claim is None:
+         return None
+     from tools.registry import tool_error
+-    holder = claim["holder"]
+     return tool_error(
+-        f"{tool_name} refused: {task_id} is running under a live worker claim ({holder}, run {claim['run_id']}). "
+-        "Parking it from here would end that run underneath the worker, whose clean exit is then booked as a "
+-        f"failure. Nothing changed. Steer the worker instead: kanban_comment(task_id='{task_id}', body='<what to "
+-        "do, e.g. park with kanban_schedule(awaiting=...) and end the run>') reaches it at its next model call, "
+-        "and it parks its own card. To stop the run outright use kanban_archive.",
+-        code=CODE, rejection="live_claim", task_id=task_id, holder=holder, run_id=claim["run_id"],
++        _message(tool_name, task_id, claim,
++                 f"kanban_comment(task_id='{task_id}', body='<what to do, e.g. park with "
++                 "kanban_schedule(awaiting=...) and end the run>')",
++                 "To stop the run outright use kanban_archive."),
++        code=CODE, rejection="live_claim", task_id=task_id, holder=claim["holder"], run_id=claim["run_id"],
+         claim_via=claim["via"], handoff_complete=False)
+ 
+ 
++def cli_refusal(conn, op: str, task_id: str) -> Optional[str]:
++    """The same refusal for ``hermes kanban schedule|block <id>`` from a caller that does not own the run
++    (t_01a1d0622df6ea87): one stderr line for ``_bulk_apply``, else None. Nothing changes."""
++    claim = live_claim(conn, task_id)
++    if claim is None:
++        return None
++    return _message(
++        f"kanban {op}", task_id, claim,
++        f"hermes kanban comment {task_id} \"<what to do, e.g. park with kanban schedule and end the run>\"",
++        f"To stop the run outright use hermes kanban reclaim {task_id} or hermes kanban archive {task_id}. "
++        f"[{CODE}, via {claim['via']}]")
++
++
+ def guard_refusal(board, args: dict, tool_name: str, task_id: str) -> Optional[str]:
+     """``refusal`` for an outside caller of a fenced tool (``_worker_guard``); None for anything else."""
+     if tool_name not in FENCED_TOOLS:
+-- 
+2.43.0
+

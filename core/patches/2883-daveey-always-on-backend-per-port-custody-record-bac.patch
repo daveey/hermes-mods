@@ -1,0 +1,166 @@
+From d39bf81c3915fabbd14d85cdab342d7e2dbd9d06 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:45:06 +0000
+Subject: [PATCH] [daveey] always-on backend: per-port custody record
+ (backends/<port>.json) written before exec, verify_backend_custody
+
+A systemd-owned always-on backend never had a Desktop backend.lock.json (only
+a Desktop owned spawn writes one) and, with blue/green rolls, several backends
+share the always-on slot, so one slot lock cannot name them all. Ask Eve's
+operator custody check (t_01a1cbfae450bef1) needs an authoritative per-backend
+proof: cmd_backend now writes desktop-ssh/always-on/backends/<port>.json (0600:
+pid, linux:<starttime>, port, unit, ownershipId, spawnNonce, hermesHome) just
+before execve (exec keeps pid and start time). verify_backend_custody(pid)
+accepts only when the pid's cgroup unit port, the record's pid + current start
+time, the persisted always-on nonce and the argv --ssh-owner-nonce all agree.
+---
+ hermes_cli/always_on_rollover.py            | 73 ++++++++++++++++++++-
+ tests/hermes_cli/test_always_on_rollover.py | 34 ++++++++++
+ 2 files changed, 105 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/always_on_rollover.py b/hermes_cli/always_on_rollover.py
+index 7f40d34a9b..0f1e5fc14e 100644
+--- a/hermes_cli/always_on_rollover.py
++++ b/hermes_cli/always_on_rollover.py
+@@ -321,9 +321,77 @@ def cmd_proxy(args) -> int:
+ 
+ # ── a backend unit ───────────────────────────────────────────────────────────────────────────────────
+ 
++CUSTODY_DIR = "backends"
++CUSTODY_SCHEMA = 1
++
++
++def _proc_starttime(pid: int, proc: Path = Path("/proc")) -> Optional[str]:
++    """``linux:<field 22 of /proc/<pid>/stat>`` (start time in clock ticks since boot), else None. exec keeps
++    the pid and this value, so a record written just before ``execve`` names the serve that follows."""
++    with contextlib.suppress(OSError, ValueError, IndexError):
++        stat = (proc / str(int(pid)) / "stat").read_text(encoding="utf-8-sig", errors="replace")
++        return f"linux:{int(stat.rsplit(')', 1)[1].split()[19])}"
++    return None
++
++
++def custody_path(port: int, home: Optional[Path] = None) -> Path:
++    return aod.state_dir(home) / CUSTODY_DIR / f"{int(port)}.json"
++
++
++def write_backend_custody(*, port: int, nonce: str, hermes: str, home: Optional[Path] = None,
++                          pid: Optional[int] = None) -> dict:
++    """[daveey] Per-backend custody record ``desktop-ssh/always-on/backends/<port>.json`` (0600), written by
++    ``cmd_backend`` immediately before it execs the serve. A systemd-owned always-on backend has no Desktop
++    ``backend.lock.json`` (only a Desktop owned spawn writes one, and several backends share the always-on
++    slot during a roll, so one slot lock cannot name them all). This record is that backend's proof of
++    custody instead; ``verify_backend_custody`` checks it against the live process."""
++    pid = os.getpid() if pid is None else int(pid)
++    record = {"schemaVersion": CUSTODY_SCHEMA, "kind": "always-on-backend", "pid": pid,
++              "creationTime": _proc_starttime(pid) or "", "port": int(port), "unit": backend_unit(port),
++              "ownershipId": aod.OWNERSHIP_ID, "spawnNonce": nonce, "hermesHome": str(aod._root_hermes_home()),
++              "hermesPath": hermes, "writtenAt": time.time()}
++    path = custody_path(port, home)
++    aod._private_dir(path.parent)
++    aod._write_private(path, json.dumps(record))
++    return record
++
++
++def verify_backend_custody(pid: int, *, home: Optional[Path] = None, proc: Path = Path("/proc"),
++                           nonce: Optional[str] = None) -> Optional[dict]:
++    """The custody record of always-on backend *pid* when every fact agrees, else None: the pid runs in the
++    cgroup of ``hermes-always-on-backend@<port>.service``; ``backends/<port>.json`` names this pid and its
++    current kernel start time (so a recycled pid never matches); the record's nonce is the persisted
++    always-on nonce (``always-on/nonce``) and appears in the process argv as ``--ssh-owner-nonce``."""
++    port = backend_port_for_pid(pid, proc)
++    if port is None:
++        return None
++    try:
++        record = json.loads(custody_path(port, home).read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return None
++    if not isinstance(record, dict) or record.get("schemaVersion") != CUSTODY_SCHEMA:
++        return None
++    started = _proc_starttime(pid, proc)
++    if record.get("pid") != int(pid) or record.get("port") != port or not started \
++            or record.get("creationTime") != started or record.get("ownershipId") != aod.OWNERSHIP_ID:
++        return None
++    if nonce is None:
++        with contextlib.suppress(OSError):
++            nonce = (aod.state_dir(home) / "nonce").read_text(encoding="utf-8-sig").strip()
++    if not nonce or record.get("spawnNonce") != nonce:
++        return None
++    try:
++        argv = (proc / str(int(pid)) / "cmdline").read_bytes().split(b"\0")
++    except OSError:
++        return None
++    if b"--ssh-owner-nonce" not in argv or argv.index(b"--ssh-owner-nonce") + 1 >= len(argv) \
++            or argv[argv.index(b"--ssh-owner-nonce") + 1] != nonce.encode():
++        return None
++    return record
++
+ 
+ def cmd_backend(args) -> int:
+-    """``hermes-always-on-backend@<port>``: stage the persisted token and exec the isolated SSH serve."""
++    """``hermes-always-on-backend@<port>``: stage the persisted token, record custody, exec the isolated SSH serve."""
+     hermes = os.path.abspath(args.hermes)
+     token, nonce = aod.ensure_credentials()
+     token_path = aod.stage_token_file(token, nonce)
+@@ -333,6 +401,7 @@ def cmd_backend(args) -> int:
+     env[ENV_BACKEND] = str(int(args.port))
+     env.pop("HERMES_DASHBOARD_SESSION_TOKEN", None)
+     argv = aod.build_serve_argv(hermes, args.port, token_path, nonce)
++    write_backend_custody(port=args.port, nonce=nonce, hermes=hermes)
+     log(f"backend :{args.port}: exec {' '.join(argv[:7])} ...")
+     os.execve(hermes, argv, env)
+     return 0  # unreachable
+@@ -764,5 +833,5 @@ __all__ = [
+     "BACKEND_PORTS", "ENV_BACKEND", "PROXY_UNIT", "Proxy", "Roller", "backend_port_for_pid", "bind_listener",
+     "cmd_backend", "cmd_proxy", "cmd_roll", "install_units", "is_superseded", "pop_backend_port",
+     "read_active", "render_units", "request_roll", "route_always_on_backends", "stop_all", "successor_pending",
+-    "write_active",
++    "verify_backend_custody", "write_active", "write_backend_custody",
+ ]
+diff --git a/tests/hermes_cli/test_always_on_rollover.py b/tests/hermes_cli/test_always_on_rollover.py
+index 071838c9a8..3145b44517 100644
+--- a/tests/hermes_cli/test_always_on_rollover.py
++++ b/tests/hermes_cli/test_always_on_rollover.py
+@@ -455,6 +455,40 @@ def test_backend_unit_execs_the_isolated_serve_with_its_port(home, monkeypatch):
+     ro.cmd_backend(argparse.Namespace(port=9149, hermes="/h/hermes"))
+     assert captured["argv"][:7] == ["/h/hermes", "serve", "--isolated", "--host", "127.0.0.1", "--port", "9149"]
+     assert captured["env"][ro.ENV_BACKEND] == "9149" and captured["env"][ao.ENV_FLAG] == "1"
++    record = json.loads(ro.custody_path(9149).read_text())  # written before the exec, same pid
++    assert record["pid"] == os.getpid() and record["port"] == 9149 and record["unit"] == ro.backend_unit(9149)
++    assert record["ownershipId"] == ao.OWNERSHIP_ID and record["creationTime"].startswith("linux:")
++    assert oct(ro.custody_path(9149).stat().st_mode & 0o777) == "0o600"
++
++
++def _fake_proc(root, pid, *, port, nonce, starttime=4242):
++    d = root / str(pid)
++    d.mkdir(parents=True)
++    (d / "cgroup").write_text(f"0::/user.slice/app.slice/hermes-always-on-backend@{port}.service\n")
++    fields = ["S"] + ["0"] * 18 + [str(starttime)] + ["0"] * 10
++    (d / "stat").write_text(f"{pid} (hermes serve) " + " ".join(fields) + "\n")
++    (d / "cmdline").write_bytes(b"\0".join([b"/h/hermes", b"serve", b"--ssh-owner-nonce", nonce.encode(), b""]))
++    return root
++
++
++def test_backend_custody_record_proves_the_live_backend_and_nothing_else(home, tmp_path):
++    # t_01a1cbfae450bef1: an always-on backend has no Desktop backend.lock.json (a systemd unit, and several
++    # backends share the always-on slot during a roll); its per-port custody record is the proof instead.
++    proc, nonce = _fake_proc(tmp_path / "proc", 777, port=9148, nonce="ab" * 8), "ab" * 8
++    ao._private_dir(ao.state_dir())
++    (ao.state_dir() / "nonce").write_text(nonce)
++    assert ro.verify_backend_custody(777, proc=proc) is None  # no record yet
++    ro.write_backend_custody(port=9148, nonce=nonce, hermes="/h/hermes", pid=777)
++    record = json.loads(ro.custody_path(9148).read_text())
++    record["creationTime"] = "linux:4242"  # the fake process's start time (written from the real /proc)
++    ro.custody_path(9148).write_text(json.dumps(record))
++    assert ro.verify_backend_custody(777, proc=proc)["port"] == 9148
++    # a recycled pid (other start time), another unit's port, another nonce: no custody
++    (proc / "777" / "stat").write_text("777 (x) " + " ".join(["S"] + ["0"] * 18 + ["9999"] + ["0"] * 10))
++    assert ro.verify_backend_custody(777, proc=proc) is None
++    _fake_proc(proc, 778, port=9149, nonce=nonce)
++    assert ro.verify_backend_custody(778, proc=proc) is None  # 9149's record names no such pid
++    assert ro.verify_backend_custody(777, proc=proc, nonce="cd" * 8) is None
+ 
+ 
+ # ── the superseded watchdog (in the backend) ─────────────────────────────────────────────────────────
+-- 
+2.43.0
+

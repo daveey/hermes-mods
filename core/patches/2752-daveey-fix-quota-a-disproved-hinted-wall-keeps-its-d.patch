@@ -1,0 +1,197 @@
+From 7eaf64bd63ac86c1187ae73f7bd8cf4efba814c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:10:52 +0000
+Subject: [PATCH] [daveey] fix(quota): a disproved hinted wall keeps its
+ doubling backoff
+
+Review of 9620b5c892: dropping a hinted episode wall the live pool disproves also
+dropped the episode's doubling backoff, so a card hitting 'retry after 5s' 429s
+respawned at once once the short pool cooldown lapsed (4-run episode: held to
+NOW+2400 on the base, released at the head).
+
+- episode() records backoff_until; _outstanding clamps a disproved wall to it
+  (recomputed from the run's end and count for episodes stored without it) and
+  marks it unhinted, so the guard reads rate_limit_cooldown, not quota reset.
+- Pool reads are memoized per _outstanding call.
+---
+ hermes_cli/kanban_quota_episode.py            | 52 +++++++++++++----
+ .../test_kanban_quota_episode_false_wall.py   | 57 ++++++++++++++++++-
+ 2 files changed, 94 insertions(+), 15 deletions(-)
+
+diff --git a/hermes_cli/kanban_quota_episode.py b/hermes_cli/kanban_quota_episode.py
+index 79e607d1e5..7ed67ee0b5 100644
+--- a/hermes_cli/kanban_quota_episode.py
++++ b/hermes_cli/kanban_quota_episode.py
+@@ -21,9 +21,20 @@ MAX_BACKOFF_SECONDS = 7200
+ LOCAL_WALL_TRUST_SECONDS = 30 * 60
+ 
+ 
++def _backoff(ended_at, count):
++    """The doubling-backoff deadline after the *count*-th consecutive rate_limited run ending at *ended_at*."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_quota_receipt import valid_deadline
++    cooldown = max(0, kb._resolve_rate_limit_cooldown_seconds())
++    delay = min(MAX_BACKOFF_SECONDS, cooldown * 2 ** min(max(count, 1) - 1, 20))
++    ended = kb._to_epoch(ended_at)
++    # An unreadable end stamp anchors backoff at now; an unrepresentable sum holds one full cap.
++    return valid_deadline((ended if ended is not None else time.time()) + delay)
++
++
+ def episode(conn, task_id, *, run_id=None):
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_quota_receipt import receipt_deadline, receipt_route, valid_deadline
++    from hermes_cli.kanban_quota_receipt import receipt_deadline, receipt_route
+     runs = []
+     bound = conn.execute("SELECT ended_at,id FROM task_runs WHERE task_id=? AND id=? AND ended_at IS NOT NULL",
+                          (task_id, run_id)).fetchone() if run_id is not None else None
+@@ -45,11 +56,7 @@ def episode(conn, task_id, *, run_id=None):
+     if stored:
+         return kb._json_dict(stored[0])
+     reset = receipt_deadline(conn, task_id, latest['id'])
+-    cooldown = max(0, kb._resolve_rate_limit_cooldown_seconds())
+-    delay = min(MAX_BACKOFF_SECONDS, cooldown * 2 ** min(len(runs) - 1, 20))
+-    ended = kb._to_epoch(latest['ended_at'])
+-    # An unreadable end stamp anchors backoff at now; an unrepresentable sum holds one full cap.
+-    backoff = valid_deadline((ended if ended is not None else time.time()) + delay)
++    backoff = _backoff(latest['ended_at'], len(runs))
+     # A hint extends the wait, never shortens it below the doubling backoff ('retry after 5s' x N).
+     found = [t for t in (reset, backoff) if t is not None]
+     until = max(found) if found else None
+@@ -63,7 +70,8 @@ def episode(conn, task_id, *, run_id=None):
+     providers = sorted({p for p in (actual, admitted) if p})
+     return {'episode_id': runs[-1]['id'], 'run_id': latest['id'], 'count': len(runs),
+             'until': until if until is not None else time.time() + MAX_BACKOFF_SECONDS,
+-            'hinted': reset is not None, 'provider': actual or admitted, 'providers': providers,
++            'backoff_until': backoff, 'hinted': reset is not None,
++            'provider': actual or admitted, 'providers': providers,
+             'model': route.get('model')}
+ 
+ 
+@@ -74,10 +82,11 @@ def _providers(state):
+     return [state['provider']] if state.get('provider') else []
+ 
+ 
+-def _disproved(wall, now):
++def _disproved(wall, now, memo):
+     """True for a hinted wall the live OAuth pool now contradicts: every provider it names serves its
+     model (any model for a class route) and no provider-wide wall stands. A transient auth bench once
+-    made ``quota_unavailable`` report a days-long false wall; the stored deadline must not outlive it."""
++    made ``quota_unavailable`` report a days-long false wall; the stored deadline must not outlive it.
++    *memo* caches the pool reads for one ``_outstanding`` call (walls of an episode share providers)."""
+     from agent.model_routing import is_class_selector
+     from hermes_cli import kanban_provider_walls as pw
+     names = _providers(wall)
+@@ -86,8 +95,25 @@ def _disproved(wall, now):
+     model = wall.get('model')
+     if not isinstance(model, str) or not model or is_class_selector(model) or len(names) > 1:
+         model = None
+-    known = pw.active_walls(now=now)
+-    return all(known.get(name) is None and pw.live_pool_serving(name, model) for name in names)
++    if 'walls' not in memo:
++        memo['walls'] = pw.active_walls(now=now)
++    for name in names:
++        if (name, model) not in memo:
++            memo[name, model] = memo['walls'].get(name) is None and pw.live_pool_serving(name, model)
++    return all(memo[name, model] for name in names)
++
++
++def _unhinted(conn, task_id, wall):
++    """*wall* with its disproved hint rejected: it keeps only the doubling backoff ('retry after 5s' x N
++    must stay paced). Episodes stored before ``backoff_until`` recompute it from their latest run."""
++    backoff = wall.get('backoff_until')
++    if not isinstance(backoff, (int, float)):
++        row = conn.execute('SELECT ended_at FROM task_runs WHERE task_id=? AND id=?',
++                           (task_id, wall.get('run_id'))).fetchone()
++        count = wall.get('count') if isinstance(wall.get('count'), int) else 1
++        backoff = _backoff(row['ended_at'] if row else None, count)
++    until = min(wall['until'], backoff) if backoff is not None else wall['until']
++    return {**wall, 'until': until, 'hinted': False}
+ 
+ 
+ def _outstanding(conn, task_id, state, now):
+@@ -100,7 +126,9 @@ def _outstanding(conn, task_id, state, now):
+         prior = kb._json_dict(row[0])
+         if isinstance(prior.get('until'), (int, float)) and prior['until'] > now:
+             out.append(prior)
+-    return [wall for wall in out if not _disproved(wall, now)]
++    memo = {}
++    out = [_unhinted(conn, task_id, wall) if _disproved(wall, now, memo) else wall for wall in out]
++    return [wall for wall in out if wall['until'] > now]
+ 
+ 
+ def _base_route(task, base):
+diff --git a/tests/hermes_cli/test_kanban_quota_episode_false_wall.py b/tests/hermes_cli/test_kanban_quota_episode_false_wall.py
+index 06ac09990e..5a8a813c47 100644
+--- a/tests/hermes_cli/test_kanban_quota_episode_false_wall.py
++++ b/tests/hermes_cli/test_kanban_quota_episode_false_wall.py
+@@ -69,6 +69,7 @@ def test_hinted_episode_wall_holds_only_while_the_live_pool_confirms_it(
+     from hermes_cli import kanban_provider_walls as pw
+ 
+     monkeypatch.setattr(kb.time, 'time', lambda: NOW)
++    monkeypatch.setenv('HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS', '300')
+     _pool(tmp_path, monkeypatch, kind)
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title='false wall', assignee='a')
+@@ -82,6 +83,56 @@ def test_hinted_episode_wall_holds_only_while_the_live_pool_confirms_it(
+             assert quota.hold_until(conn, tid) == reset
+             assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
+         else:
+-            assert quota.hold_until(conn, tid) is None
+-            assert not quota.active(conn, tid)
+-            assert dispatch.check_respawn_guard(conn, tid) is None
++            # The disproved hint is rejected; the run's doubling backoff (first run: 300 s) still paces it.
++            assert quota.hold_until(conn, tid) == NOW + 300
++            assert dispatch.check_respawn_guard(conn, tid) == 'rate_limit_cooldown'
++            assert quota.hold_until(conn, tid, NOW + 301) is None
++            assert not quota.active(conn, tid, NOW + 301)
++
++
++def _short_hint_run(conn, tid, pid, reset):
++    task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++    assert task is not None
++    conn.execute('UPDATE tasks SET worker_pid=? WHERE id=?', (pid, tid))
++    kb._append_event(conn, tid, 'run_route', {'model': MODEL, 'provider': 'anthropic', 'source': 'pin',
++                     'tier_reason': 'default', 'lane': 'ready'}, run_id=task.current_run_id)
++    kb._append_event(conn, tid, 'worker_result', {
++        'pid': pid, 'claim_lock': task.claim_lock, 'exit_code': 75,
++        'last_output': 'rate limited; retry after 5s', 'failure_reason': 'rate_limit',
++        'failure_retryable': True, 'failure_resets_at': float(reset),
++        'route_provider': 'anthropic', 'route_model': MODEL}, run_id=task.current_run_id)
++    conn.commit()
++    dispatch._record_worker_exit(pid, 75 << 8)
++    dispatch.detect_crashed_workers(conn)
++
++
++@pytest.mark.parametrize('legacy', [False, True])
++def test_a_disproved_short_hint_keeps_the_doubling_backoff(board, tmp_path, monkeypatch, legacy):
++    """Rejecting a hint the pool disproves must not drop the backoff, or a 'retry after 5s' x N storm
++    respawns at once. Episodes stored before ``backoff_until`` existed recompute it from the run."""
++    from hermes_cli import kanban_provider_walls as pw
++
++    monkeypatch.setattr(kb.time, 'time', lambda: NOW)
++    monkeypatch.setenv('HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS', '300')
++    _pool(tmp_path, monkeypatch, 'serving')
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='short hints', assignee='a')
++        for i in range(4):
++            _short_hint_run(conn, tid, 72000 + i, NOW + 5)
++        if legacy:
++            rows = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='quota_episode'",
++                                (tid,)).fetchall()
++            assert rows
++            for row in rows:
++                payload = json.loads(row['payload'])
++                payload.pop('backoff_until', None)
++                conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(payload), row['id']))
++            conn.commit()
++        state = quota.episode(conn, tid)
++        assert state is not None and state['hinted'] and state['count'] == 4
++        pw.walls_path().write_text(json.dumps({}))
++        # 4th rate_limited run: backoff 300 * 2**3 = 2400 s; the 5 s hint has long elapsed.
++        assert quota.hold_until(conn, tid, NOW + 60) == NOW + 2400
++        # Held on the backoff, not on the rejected hint.
++        assert dispatch.check_respawn_guard(conn, tid) == 'rate_limit_cooldown'
++        assert quota.hold_until(conn, tid, NOW + 2401) is None
+-- 
+2.43.0
+

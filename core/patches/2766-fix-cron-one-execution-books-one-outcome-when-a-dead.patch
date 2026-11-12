@@ -1,0 +1,198 @@
+From c3ee344638ea03597752ba35883bb8dace80093d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 13:41:52 +0000
+Subject: [PATCH] fix(cron): one execution books one outcome when a dead worker
+ and its run both report it [daveey]
+
+Hub incident 2026-11-12 (job kanban-hub-pin-sweep, execution 367fcebc): a drain made the
+restart-safe worker exit after adopting the 12:44Z fire. The gateway waiter booked the unknown
+outcome via record_unknown_worker_outcome (12:47:47), then the run's own bookkeeping booked
+"cron fire ownership was lost" for the same execution (12:49:06). The single fire left
+failure_streak 2 (previous run succeeded) and spent two repeat slots.
+
+Why: mark_job_run dedupes per execution through canonical_completions, but only when the caller
+passes execution_id. record_unknown_worker_outcome did not, so the later booking (which did)
+could not see the earlier one. The dispatch-failure, ownership-lost-interrupted, crash-tail and
+operator-cancel bookings had the same gap.
+
+Fix: every terminal booking that knows its execution id passes it, so whichever path books first
+wins and the rest are no-ops.
+
+Regression: tests/cron/test_execution_books_once.py drives both orders (worker death then
+ownership-lost, and the reverse); before the fix the first order leaves failure_streak == 2.
+---
+ cron/cancellation.py                    |  3 +-
+ cron/scheduler.py                       |  5 ++-
+ cron/scheduler_worker_failure.py        |  3 ++
+ tests/cron/test_execution_books_once.py | 58 +++++++++++++++++++++++++
+ tests/cron/test_run_one_job.py          | 10 +++--
+ 5 files changed, 73 insertions(+), 6 deletions(-)
+ create mode 100644 tests/cron/test_execution_books_once.py
+
+diff --git a/cron/cancellation.py b/cron/cancellation.py
+index 59b12171d7..81565e3424 100644
+--- a/cron/cancellation.py
++++ b/cron/cancellation.py
+@@ -238,7 +238,8 @@ def finish_cancelled_run(job: dict[str, Any], execution_id: str, fire_owner: Opt
+         # A stopped ladder re-run re-ran an occurrence that already counted: no second repeat slot.
+         rung = {"ladder_rung": True} if is_retry_run(job) else {}
+         scheduler.mark_job_run(
+-            job["id"], False, f"Cancelled: {reason}", status="cancelled", **owner, **rung)
++            job["id"], False, f"Cancelled: {reason}", status="cancelled",
++            execution_id=execution_id, **owner, **rung)
+     scheduler.finish_execution(execution_id, success=False, error=reason, cancelled=True)
+ 
+ 
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index eaf1b4df25..581234e93c 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -3117,6 +3117,7 @@ def run_one_job(
+                     False,
+                     error,
+                     delivery_error=delivery_error,
++                    execution_id=execution_id,
+                     **({"expected_fire_owner": owner} if owner else {}),
+                     # A ladder re-run's occurrence already counted toward repeat.
+                     **({"ladder_rung": True} if is_retry_run(job) else {}),
+@@ -3184,6 +3185,7 @@ def _record_fire_ownership_lost(
+     if fire_owner is not None and heartbeat_fire_claim(job_id, expected_owner=fire_owner):
+         mark_job_run(
+             job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner,
++            execution_id=execution_id,
+             **({"ladder_rung": True} if is_retry_run(job) else {}),
+         )
+         finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)
+@@ -3721,7 +3723,8 @@ def _run_one_job_body(
+                 not _consume_interrupted_flag(job["id"], execution_token)
+                 and not self_removal_delivery_allowed(job["id"])  # no record left to mark
+             ):
+-                mark_kwargs = {}
++                # One execution books one outcome, whichever terminal path sees it first.
++                mark_kwargs = {"execution_id": execution_id}
+                 if fire_owner is not None:
+                     mark_kwargs["expected_fire_owner"] = fire_owner
+                 if contained:
+diff --git a/cron/scheduler_worker_failure.py b/cron/scheduler_worker_failure.py
+index 87b0292072..8f1d8a1697 100644
+--- a/cron/scheduler_worker_failure.py
++++ b/cron/scheduler_worker_failure.py
+@@ -39,6 +39,9 @@ def record_unknown_worker_outcome(
+                 error,
+                 delivery_error=delivery_error,
+                 expected_fire_owner=owner,
++                # The run's own bookkeeping may book this execution too (e.g. "fire ownership
++                # was lost" once it notices): the id makes the second booking a no-op.
++                execution_id=str(job["execution_id"]),
+                 # A ladder re-run's occurrence already counted toward repeat.
+                 **({"ladder_rung": True} if is_retry_run(job) else {}),
+             )
+diff --git a/tests/cron/test_execution_books_once.py b/tests/cron/test_execution_books_once.py
+new file mode 100644
+index 0000000000..e864104094
+--- /dev/null
++++ b/tests/cron/test_execution_books_once.py
+@@ -0,0 +1,58 @@
++"""One cron execution books one outcome, whichever terminal paths observe it.
++
++Hub incident (2026-11-12, job kanban-hub-pin-sweep): a drain made the restart-safe worker exit
++after adopting execution 367fcebc; the gateway waiter booked the unknown outcome through
++``record_unknown_worker_outcome`` and, 41 s later, the run's own bookkeeping booked "cron fire
++ownership was lost" for the SAME execution. The first booking carried no ``execution_id``, so
++``mark_job_run``'s per-execution dedupe (``canonical_completions``) could not see it and the
++single fire left ``failure_streak == 2`` and spent two repeat slots.
++"""
++
++from datetime import datetime, timedelta, UTC
++
++import pytest
++
++import cron.scheduler as sched
++from cron.jobs import claim_job_for_fire, create_job, get_job, mark_job_run, update_job
++from cron.scheduler_worker_failure import record_unknown_worker_outcome
++
++LOST = "RuntimeError: Cron job 'x' was stopped: cron fire ownership was lost"
++
++
++@pytest.fixture
++def fired(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(sched, "_deliver_crash_failure", lambda *_a, **_kw: (None, "suppressed"))
++    monkeypatch.setattr(
++        sched, "get_execution",
++        lambda *_a, **_kw: {"status": "unknown", "error": "Restart-safe cron worker exited with status 1"})
++    job = create_job("sweep", "every 60m")
++    # A prior success, so the streak starts at 0 like the incident's 11:44Z run.
++    assert mark_job_run(job["id"], True)
++    update_job(job["id"], {"next_run_at": (datetime.now(UTC) - timedelta(seconds=5)).isoformat()})
++    claimed = claim_job_for_fire(job["id"], return_job=True)
++    assert claimed
++    claimed["execution_id"] = "367fcebc0a04427c93bc4b5340a633e1"
++    return claimed, get_job(job["id"])["repeat"]["completed"]
++
++
++def test_worker_death_then_ownership_lost_books_one_failure(fired):
++    claimed, completed = fired
++    assert record_unknown_worker_outcome(claimed)
++    # The gateway-side run_job finishes later and books the same execution without a claim owner.
++    assert mark_job_run(claimed["id"], False, LOST, execution_id=claimed["execution_id"])
++    job = get_job(claimed["id"])
++    assert job["failure_streak"] == 1, job
++    assert job["repeat"]["completed"] == completed + 1, job
++    assert job["canonical_completions"][-1] == claimed["execution_id"]
++
++
++def test_ownership_lost_then_worker_death_books_one_failure(fired):
++    claimed, completed = fired
++    assert mark_job_run(claimed["id"], False, LOST, execution_id=claimed["execution_id"])
++    record_unknown_worker_outcome(claimed)
++    job = get_job(claimed["id"])
++    assert job["failure_streak"] == 1, job
++    assert job["repeat"]["completed"] == completed + 1, job
+diff --git a/tests/cron/test_run_one_job.py b/tests/cron/test_run_one_job.py
+index b514e447dd..426c57fbbc 100644
+--- a/tests/cron/test_run_one_job.py
++++ b/tests/cron/test_run_one_job.py
+@@ -157,7 +157,8 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
+     assert not delivered[0][1].lstrip("⚠️ ").startswith("Gemini HTTP 503")
+     assert "hermes cron run j3" in delivered[0][1]
+     assert marked == [
+-        (("j3", False, "Gemini HTTP 503 (UNAVAILABLE)"), {"delivery_error": None})
++        (("j3", False, "Gemini HTTP 503 (UNAVAILABLE)"),
++         {"execution_id": "exec-j3", "delivery_error": None})
+     ]
+     assert finished == [
+         (
+@@ -195,7 +196,8 @@ def test_run_one_job_exception_records_failure_alert_delivery_error(monkeypatch)
+ 
+     assert s.run_one_job({"id": "j4", "deliver": "telegram"}) is False
+     assert marked == [
+-        (("j4", False, "provider failed"), {"delivery_error": "send failed: 502"})
++        (("j4", False, "provider failed"),
++         {"execution_id": "exec-j4", "delivery_error": "send failed: 502"})
+     ]
+ 
+ 
+@@ -317,7 +319,7 @@ def test_run_one_job_exception_after_delivery_does_not_redeliver(monkeypatch):
+         "delivery_error": None, "execution_id": "exec-j5", "status": "delivery_queued"})
+     assert mark_calls[1] == (
+         ("j5", False, "bookkeeping boom"),
+-        {"delivery_error": None},
++        {"execution_id": "exec-j5", "delivery_error": None},
+     )
+ 
+ 
+@@ -357,7 +359,7 @@ def test_run_one_job_keyboard_interrupt_skips_delivery_and_reraises(monkeypatch)
+         s.run_one_job({"id": "j6", "name": "interrupt", "deliver": "telegram"})
+ 
+     assert delivered == []
+-    assert marked == [(("j6", False, "KeyboardInterrupt"), {})]
++    assert marked == [(("j6", False, "KeyboardInterrupt"), {"execution_id": "exec-j6"})]
+     assert finished == [
+         (
+             ("exec-j6",),
+-- 
+2.43.0
+

@@ -1,0 +1,82 @@
+From 7065c77462c9db7cd9359cdfee1de58c1d659bbb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:10:52 -0800
+Subject: [PATCH] [daveey] fix(tui): a notice held for a refused turn keeps its
+ session from the reapers
+
+A completion whose notice turn admission refused (core-update admission hold,
+a paused turn's continuation due) waits in the session's _notif_held list: off
+completion_queue and out of the in-flight hold, so awaits_notification could
+not see it. The headless session was then reaped (detached-turn cleanup), the
+shutdown drain requeued the notice, no live owner existed, it was parked and
+dropped 10 min later at DEBUG. Hub chat 20261111_005201_05663e ended on 'tests
+still running, I'll report back'; its job exited 10:36:18 UTC during a hold and
+the chat never woke (session outcome unresolved{no_summary}).
+
+_session_owns_pending_process_notification now counts a non-empty held list
+(still released by the user's Stop latch).
+---
+ .../test_detached_process_notify_keepalive.py | 30 +++++++++++++++++++
+ tui_gateway/session_notifications.py          |  5 ++++
+ 2 files changed, 35 insertions(+)
+
+diff --git a/tests/tui_gateway/test_detached_process_notify_keepalive.py b/tests/tui_gateway/test_detached_process_notify_keepalive.py
+index 502ecfb900..dd99a165a3 100644
+--- a/tests/tui_gateway/test_detached_process_notify_keepalive.py
++++ b/tests/tui_gateway/test_detached_process_notify_keepalive.py
+@@ -233,6 +233,36 @@ def test_queued_notice_survives_registry_pruning(server, registry, detached):
+     assert not server._session_is_reapable(sid, session)
+ 
+ 
++def test_notice_held_for_refused_turn_keeps_session(server, registry, detached, monkeypatch):
++    """A completion whose turn could not start (update admission hold, a paused turn's continuation due) waits in
++    the session's own held list, off the queue and out of the in-flight hold. The reapers must still see it as
++    pending: hub chat 20261111_005201_05663e ended on "the tests are still running, I'll report back", its job
++    exited at 10:36:18 during a core-update admission hold, the notice went to ``_notif_held``, the headless session
++    was reaped, and the completion was parked, then dropped. The chat never woke and ended without a summary."""
++    from tools.process_registry_awaiting import release, take_ready
++
++    sid, session, _ = detached
++    session["_notif_held"] = []
++    proc = _spawn(registry, session["session_key"], notify_on_complete=True)
++    proc.mark_exited(0)
++    registry._move_to_finished(proc)
++    monkeypatch.setattr(server, "_notif_claim_turn", lambda s: False)  # admission refused the notice turn
++    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
++
++    ready = take_ready(registry.completion_queue, 0)
++    try:
++        server._notif_handle_ready(sid, session, ready, set(), registry,
++                                   lambda evt: "process finished", None)
++    finally:
++        release(ready)
++
++    assert registry.completion_queue.empty() and len(session["_notif_held"]) == 1, "held for this session's poller"
++    assert not server._session_is_reapable(sid, session), "a held notice is still owed: reaping drops it"
++
++    session["_turn_cancel_requested"] = True  # after Stop the held notice waits for the next prompt: never pins
++    assert server._session_is_reapable(sid, session)
++
++
+ def test_notice_held_after_stop_does_not_pin_session(server, registry, detached):
+     """After the user's Stop the poller requeues notices until their next prompt; that wait must not be forever."""
+     sid, session, _ = detached
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 1c78e9ecff..a1f0eb40dd 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -521,6 +521,11 @@ def _session_owns_pending_process_notification(session: dict) -> bool:
+         # After Stop no notification turn can start until the user's next prompt (``_notif_claim_turn``), so a
+         # pending notice is no reason to keep the session: the user's prompt resumes it like any other.
+         return False
++    if session.get("_notif_held"):
++        # [daveey] A notice whose turn admission refused (update hold, a paused turn's continuation due) waits in
++        # this session's held list: off the queue, out of the in-flight hold, so awaits_notification cannot see
++        # it. Reaping now parks it unowned and drops it 10 min later (hub chat 20261111_005201_05663e).
++        return True
+     from tools.process_registry import process_registry
+     from tools.process_registry_awaiting import awaits_notification
+     return awaits_notification(process_registry, _session_process_owners(session))
+-- 
+2.43.0
+

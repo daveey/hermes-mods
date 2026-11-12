@@ -1,0 +1,89 @@
+From 0aa9a05f011e528c1e85815f8e7d9fe066ff24fe Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:12:01 +0000
+Subject: [PATCH] test(kanban): compose dispatch recovery with authoritative
+ feed [daveey]
+
+---
+ tests/hermes_cli/test_kanban_recovery_feed.py | 69 +++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_recovery_feed.py
+
+diff --git a/tests/hermes_cli/test_kanban_recovery_feed.py b/tests/hermes_cli/test_kanban_recovery_feed.py
+new file mode 100644
+index 0000000000..b6d9994cb4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_recovery_feed.py
+@@ -0,0 +1,69 @@
++"""Client recovery through real push/pull and dispatcher entry; Board selection is a fixture."""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_placement as placement
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_node as node
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_worker_node as fixtures
++
++gws = fixtures.gws
++svc = fixtures.svc
++
++
++@pytest.mark.parametrize("mode", ["promote", "stale_pin"])
++def test_dispatch_recovers_only_from_authoritative_feed(gws, monkeypatch, mode):
++    origin, _ = gws
++    conn = origin.enter()
++    monkeypatch.setattr(placement, "config", dict)
++    monkeypatch.setitem(fixtures.MACHINES, "retired", {"name": "retired", "state": "active", "labels": ["linux"]})
++    fields = {"runs_on": ["machine:retired", "linux"]} if mode == "stale_pin" else {}
++    tid = kb.create_task(conn, title="Analyze public data", assignee="default", **fields)
++    origin.round()  # push initial rows
++    origin.round()  # consume creator identity from authoritative feed before dispatch selection
++    hub = origin.svc.hub("hub")
++    calls = []
++    before = conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++
++    def recover(board, **args):
++        calls.append(args)
++        assert args["mode"] == mode
++        b = origin.svc.board(board)
++        row = b["rows"]["tasks"][tid]
++        assert row["version"] == args["expected_revision"]
++        labels = ["machine:worker-1"] + (["linux"] if mode == "stale_pin" else [])
++        patch = {"runs_on": json.dumps(labels), "placement_policy": wp.POLICY if mode == "promote" else None}
++        updated = origin.svc._put(b, "tasks", tid, patch, "hub", None, row["hlc"])
++        origin.svc._put(b, "task_events", "recovery-event", {
++            "task_id": tid, "kind": "moved", "created_at": int(time.time()),
++            "payload": json.dumps({"repinned": True, "runs_on": labels, "reason": "recovery:" + mode}),
++        }, "hub", None, row["hlc"])
++        # Fixture reply deliberately lies: only the feed is authoritative.
++        assert conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0] == before
++        return {"state": "assigned", "machine": "wrong-reply", "task_version": updated["version"]}
++
++    monkeypatch.setattr(hub, "recover", recover, raising=False)
++    monkeypatch.setattr(hub, "reserve", lambda *a, **kw: {"state": "assigned", "machine": "worker-1"}, raising=False)
++    monkeypatch.setattr(client, "load_identity", lambda: hub.ident)
++    monkeypatch.setattr(client, "Hub", lambda *a, **kw: hub)
++    monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": ["worker-1"]}})
++    monkeypatch.setattr(node, "registry", lambda **kw: {"machines": {
++        "retired": {"state": "revoked"}, "worker-1": {"state": "active", "hold": False}}})
++    wp.dispatch_tick(conn)
++    assert len(calls) == 1, (dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()),
++                             [dict(r) for r in conn.execute("SELECT * FROM kanban_sync_state")],
++                             [dict(r) for r in conn.execute("SELECT * FROM kanban_sync_outbox")])
++    labels = json.loads(conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0])
++    assert labels == ["machine:worker-1"] + (["linux"] if mode == "stale_pin" else [])
++    events = [e for e in kb.list_events(conn, tid) if e.kind == "moved"]
++    assert len(events) == 1 and events[0].payload["reason"] == "recovery:" + mode
++    assert wp.requested_move(conn, tid) is None
++    wp.dispatch_tick(conn)
++    assert len(calls) == 1, (dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()),
++                             [dict(r) for r in conn.execute("SELECT * FROM kanban_sync_state")],
++                             [dict(r) for r in conn.execute("SELECT * FROM kanban_sync_outbox")])
++    assert len([e for e in kb.list_events(conn, tid) if e.kind == "moved"]) == 1
+-- 
+2.43.0
+

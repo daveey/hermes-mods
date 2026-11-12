@@ -1,0 +1,131 @@
+From b333168ef8ec62971b514d9da1a0c1c0592abe1d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:19:24 -0800
+Subject: [PATCH] [daveey] fix(notices): a row stamped final busy by the older
+ core is offered again; comment states the real 4.25 h busy span
+
+---
+ tests/tui_gateway/test_notice_guarantee.py | 37 ++++++++++++++++++++++
+ tui_gateway/notice_guarantee.py            | 22 ++++++++++---
+ 2 files changed, 54 insertions(+), 5 deletions(-)
+
+diff --git a/tests/tui_gateway/test_notice_guarantee.py b/tests/tui_gateway/test_notice_guarantee.py
+index 298346a20a..6c92d1a76e 100644
+--- a/tests/tui_gateway/test_notice_guarantee.py
++++ b/tests/tui_gateway/test_notice_guarantee.py
+@@ -220,6 +220,43 @@ def test_busy_wakes_do_not_spend_the_failed_wake_budget(db, monkeypatch):
+     assert (state, attempts, _busy_attempts(db, row)) == ("deferred", 4, 3)  # 1 of MAX_ATTEMPTS errors used
+ 
+ 
++def _stamp_legacy_busy(db, row):
++    # What the core before busy deferral wrote: busy after one wake, final, no busy_attempts.
++    db._write_rowcount("UPDATE messages SET display_metadata = json_set(display_metadata, '$.closeout', "
++                       "json('{\"state\": \"busy\", \"at\": 1, \"pid\": 1, \"attempts\": 1}')) WHERE id = ?",
++                       (row,))
++
++
++def test_a_row_stamped_busy_by_the_old_core_is_offered_again(db):
++    # The two hub chats of 2026-11-12 were stamped final busy before the fix landed; they resolve after it.
++    row = _notice(db, "✔ Kanban t_aaa done — deploy card")
++    _stamp_legacy_busy(db, row)
++
++    _out, calls = _run(db, verdict="started")
++
++    assert calls == [(CHAT, row)] and _closeout(db, row) == "started"
++    assert _run(db, now=time.time() + 99999) == ([], [])
++
++
++def test_a_legacy_busy_row_counts_its_old_busy_wake(db):
++    row = _notice(db, "✔ Kanban t_aaa done — deploy card")
++    _stamp_legacy_busy(db, row)
++
++    _run(db, verdict="busy")
++
++    state, retry_at, _attempts = _closeout_meta(db, row)
++    assert (state, _busy_attempts(db, row)) == ("deferred", 2)
++    assert retry_at >= time.time() + 2 * ng.BUSY_RETRY_S - 60
++
++
++def test_a_legacy_busy_row_past_the_lookback_is_left_alone(db):
++    row = _notice(db, "✔ Kanban t_aaa done — deploy card")
++    _stamp_legacy_busy(db, row)
++
++    assert _run(db, now=time.time() + ng.LOOKBACK_S + 3600) == ([], [])
++    assert _closeout(db, row) == "busy"
++
++
+ def test_retry_at_follows_the_build_failures_quota_reset(monkeypatch):
+     from tui_gateway import automation_replay, server
+     now = 1_000_000.0
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index db792cb9e1..000607c3e1 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -27,7 +27,8 @@ unloaded sweeper's loop therefore looks, in every profile store, for chats whose
+   ``BUSY_RETRY_S`` doubling up to ``BUSY_RETRY_MAX_S``, at most ``MAX_BUSY_ATTEMPTS`` busy wakes per row (counted in
+   ``busy_attempts``, apart from the failed-wake budget); the last one stamps ``busy``. Before this ``busy`` was
+   final: a notice that landed while a hub core update held admission for 30 min stayed ``unresolved{notice_tail}``
+-  after the hold lifted (two hub chats, 2026-11-12). [daveey]
++  after the hold lifted (two hub chats, 2026-11-12). A ``busy`` stamp without ``busy_attempts`` (that older core's)
++  within ``LOOKBACK_S`` is offered again as busy wake 2, so those rows resolve once this ships. [daveey]
+ 
+ Ownership follows the unloaded sweeper's: a chat another live backend holds is that backend's (its own pass
+ handles it); a chat with a live turn is skipped. The close-out prompt row is itself a notice, stamped as claimed,
+@@ -62,7 +63,7 @@ WAKES_PER_HOUR = 2
+ # no sooner than the failure's quota/route reset (or the automation replay's floor) plus this slack.
+ MAX_ATTEMPTS = 3
+ DEFER_SLACK_S = 600.0
+-# A busy wake is offered again after BUSY_RETRY_S, doubling to BUSY_RETRY_MAX_S: ~4.6 h of busy wakes per row.
++# A busy wake is offered again after BUSY_RETRY_S, doubling to BUSY_RETRY_MAX_S: 8 wakes over ~4.25 h per row.
+ BUSY_RETRY_S = 300.0
+ BUSY_RETRY_MAX_S = 3600.0
+ MAX_BUSY_ATTEMPTS = 8
+@@ -118,7 +119,7 @@ def candidates(db: Any, now: float) -> list[dict]:
+             continue
+         if row["timestamp"] > now - GRACE_S:
+             continue
+-        if "closeout" not in meta or deferred_due:
++        if "closeout" not in meta or deferred_due or _legacy_busy(meta):
+             out.append({"sid": str(row["sid"]), "msg_id": int(row["msg_id"]), "content": str(row["content"] or ""),
+                         "meta": meta, "raw_meta": row["display_metadata"]})
+     return out
+@@ -133,6 +134,13 @@ def _deferred_due(meta: dict, now: float) -> bool:
+     return isinstance(retry_at, (int, float)) and not isinstance(retry_at, bool) and retry_at <= now
+ 
+ 
++def _legacy_busy(meta: dict) -> bool:
++    """A row stamped final ``busy`` by a core from before busy wakes were deferred (no ``busy_attempts``): that core
++    gave up after one busy wake, so the row is offered again as its first deferred busy wake (within LOOKBACK_S)."""
++    closeout = meta.get("closeout")
++    return isinstance(closeout, dict) and closeout.get("state") == "busy" and "busy_attempts" not in closeout
++
++
+ def _attempts(meta: Any, field: str = "attempts") -> int:
+     closeout = meta.get("closeout") if isinstance(meta, dict) else None
+     n = closeout.get(field) if isinstance(closeout, dict) else None
+@@ -144,8 +152,12 @@ def started_last_hour(db: Any, sid: str, now: float) -> int:
+     return int(db._read_one(_LINEAGE_CTE_SQL + _STARTED_SQL, (sid, sid, now - 3600.0))[0])
+ 
+ 
++def _busy_attempts(meta: Any) -> int:
++    return max(_attempts(meta, "busy_attempts"), 1 if isinstance(meta, dict) and _legacy_busy(meta) else 0)
++
++
+ def _claim(db: Any, cand: dict, now: float) -> bool:
+-    busy = _attempts(cand["meta"], "busy_attempts")
++    busy = _busy_attempts(cand["meta"])
+     meta = {**cand["meta"], "closeout": {"state": "claimed", "at": now, "pid": os.getpid(),
+                                          "attempts": _attempts(cand["meta"]) + 1,
+                                          **({"busy_attempts": busy} if busy else {})}}
+@@ -369,7 +381,7 @@ def _handle(db, cand: dict, now: float, *, holders, session_db, wake, spawn, see
+         return "skipped:claimed"
+     try:
+         attempts = _attempts(cand["meta"]) + 1
+-        busy = _attempts(cand["meta"], "busy_attempts")
++        busy = _busy_attempts(cand["meta"])
+         spawn(lambda: _closeout_job(session_db, wake, sid, cand["msg_id"], attempts=attempts, busy_attempts=busy))
+     except Exception:
+         _wake_slots.release()
+-- 
+2.43.0
+

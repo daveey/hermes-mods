@@ -1,0 +1,196 @@
+From f23c28b751138a11c9d04decc82e822d29c1a8a1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 23:55:04 +0000
+Subject: [PATCH] fix(kanban): back off unsupported recovery endpoints without
+ stopping reserves [daveey]
+
+---
+ hermes_cli/kanban_placement_recovery.py       | 27 ++++++++
+ hermes_cli/kanban_queue_reason.py             |  2 +-
+ hermes_cli/kanban_worker_placement.py         | 25 +++++---
+ .../test_kanban_recovery_backoff.py           | 64 +++++++++++++++++++
+ 4 files changed, 108 insertions(+), 10 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_recovery_backoff.py
+
+diff --git a/hermes_cli/kanban_placement_recovery.py b/hermes_cli/kanban_placement_recovery.py
+index 7d659f1bfd..0ddf574480 100644
+--- a/hermes_cli/kanban_placement_recovery.py
++++ b/hermes_cli/kanban_placement_recovery.py
+@@ -5,6 +5,33 @@ import json
+ import math
+ import time
+ 
++RECOVERY_RETRY_S = 600.0
++_unsupported: dict[tuple, float] = {}
++
++
++def endpoint_key(hub, board, gateway):
++    ident = getattr(hub, "ident", None)
++    return (ident.url if ident is not None else hub, board, gateway)
++
++
++def endpoint_available(hub, board, gateway):
++    return time.monotonic() >= _unsupported.get(endpoint_key(hub, board, gateway), 0)
++
++
++def unavailable_endpoint(hub, board, gateway, error, mode):
++    """Bound old-server probes across cards without disabling ordinary reserves."""
++    if not mode or error.status not in (404, 405, 501):
++        return False
++    _unsupported[endpoint_key(hub, board, gateway)] = time.monotonic() + RECOVERY_RETRY_S
++    if len(_unsupported) > 1024:
++        del _unsupported[next(iter(_unsupported))]
++    return True
++
++
++def available_mode(conn, row, cfg, hub, board, gateway):
++    # Existing policy cards still renew through reserve while recovery is unavailable.
++    return recovery_mode(conn, row, cfg) if endpoint_available(hub, board, gateway) else None
++
+ 
+ def request_assignment(hub, board, row, mode, candidates):
+     """Keep recovery opt-in; ordinary reservations retain their existing wire contract."""
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index eb7d175c59..1f96bca990 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -257,7 +257,7 @@ def try_record(writer, *args, **kwargs):
+         return False
+ 
+ 
+-STAGES = frozenset({"pull", "reserve", "repin"})
++STAGES = frozenset({"pull", "reserve", "repin", "recover"})
+ TIMING_KEYS = ("budget_ms", "elapsed_ms")
+ TIMING_CAP_MS = 86_400_000
+ 
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 4c59980e25..bbbfd1baff 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -25,6 +25,15 @@ RESERVE_KEEPALIVE_S = 60.0
+ _queued: dict[tuple[str, str], tuple[int, str | None, float]] = {}
+ 
+ 
++def _remember_queued(reply, key, revision, identity):
++    if reply.get("state") == "queued":
++        # Never adopt an arbitrary post-pull revision: it may be somebody else's edit.
++        version = reply.get("task_version", revision)
++        _queued[key] = (version, identity, time.monotonic() + RESERVE_KEEPALIVE_S)
++        if len(_queued) > 1024:
++            del _queued[next(iter(_queued))]
++
++
+ def _local_identity(conn, task_id):
+     from hermes_cli import kanban_repin_notice as repin
+ 
+@@ -289,10 +298,10 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+     try:
+         for row in rows:
+             last = row["id"]
+-            from hermes_cli.kanban_placement_recovery import recovery_mode, unchanged_ready
+-            if not unchanged_ready(conn, row):
++            from hermes_cli import kanban_placement_recovery as recovery
++            if not recovery.unchanged_ready(conn, row):
+                 continue
+-            mode = recovery_mode(conn, dict(row), cfg)
++            mode = recovery.available_mode(conn, dict(row), cfg, hub, board, gateway)
+             if row["placement_policy"] is None and mode is None:
+                 continue
+             key = (board, row["id"])
+@@ -327,12 +336,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                 else:
+                     from hermes_cli.kanban_placement_recovery import request_assignment
+                     reply = request_assignment(hub, board, row, mode, candidates)
+-                    if reply.get("state") == "queued":
+-                        # Never adopt an arbitrary post-pull revision: it may be somebody else's edit.
+-                        version = reply.get("task_version", row["sync_version"])
+-                        _queued[key] = (version, identity, time.monotonic() + RESERVE_KEEPALIVE_S)
+-                        if len(_queued) > 1024:
+-                            del _queued[next(iter(_queued))]
++                    _remember_queued(reply, key, row["sync_version"], identity)
+                     queue.try_record(queue.record_reply, conn, row["id"], gateway, reply, candidates)
+                 attempted += 1
+             except OSError as exc:
+@@ -342,6 +346,9 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                 return attempted
+             except client.HubError as exc:
+                 timing = queue.call_timing(budget, started, time.monotonic())
++                if recovery.unavailable_endpoint(hub, board, gateway, exc, mode):
++                    logger.info("Board recovery endpoint unavailable; backing off for %ss", recovery.RECOVERY_RETRY_S)
++                    continue
+                 fence = None
+                 if rejection_code(exc) == "not_claimable":
+                     # The Board already has it leased or not ready: our copy is behind. Back off at this revision.
+diff --git a/tests/hermes_cli/test_kanban_recovery_backoff.py b/tests/hermes_cli/test_kanban_recovery_backoff.py
+new file mode 100644
+index 0000000000..ec00828fef
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_recovery_backoff.py
+@@ -0,0 +1,64 @@
++"""Older Boards do not support recovery; retain normal reservation service."""
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_placement_recovery as fixtures
++
++conn = fixtures.conn
++setup = fixtures.setup
++
++
++@pytest.mark.parametrize("status", [404, 405, 501])
++def test_absent_recovery_endpoint_backs_off_across_cards(setup, monkeypatch, status):
++    db, hub = setup
++    fixtures.make(db)
++    fixtures.make(db)
++    clock = [100.0]
++    monkeypatch.setattr(wp.time, "monotonic", lambda: clock[0])
++    calls = []
++
++    def unsupported(board, **body):
++        calls.append(body)
++        raise client.HubError(status, "not found")
++
++    hub.recover = unsupported
++    wp.reevaluate(db, hub, "default", "hub")
++    wp.reevaluate(db, hub, "default", "hub")
++    assert len(calls) == 1
++    clock[0] += 601
++    wp.reevaluate(db, hub, "default", "hub")
++    assert len(calls) == 2
++
++
++def test_unavailable_recovery_keeps_policy_reservations(setup, monkeypatch):
++    from hermes_cli import kanban_worker_node as node
++    from tests.hermes_cli import test_kanban_worker_reserve_client as reserve
++    db, hub = setup
++    tid = reserve.acknowledged(db, runs_on='["machine:worker-1"]')
++    monkeypatch.setattr(node, "registry", lambda **kw: {"machines": {"worker-1": {"state": "revoked"}}})
++    calls = []
++
++    def unsupported(board, **body):
++        raise client.HubError(404, "not found")
++
++    hub.recover = unsupported
++    hub.reserve = lambda board, **body: calls.append(body) or {"state": "assigned", "machine": "worker-2"}
++    wp.reevaluate(db, hub, "default", "hub")
++    wp.reevaluate(db, hub, "default", "hub")
++    assert calls == [{"task_id": tid, "expected_revision": 4, "candidates": ["worker-2"]}]
++
++
++def test_other_recovery_errors_remain_observable(setup):
++    db, hub = setup
++    fixtures.make(db)
++    calls = []
++
++    def conflict(board, **body):
++        calls.append(body)
++        raise client.HubError(409, '{"error":"revision_conflict"}')
++
++    hub.recover = conflict
++    wp.reevaluate(db, hub, "default", "hub")
++    wp.reevaluate(db, hub, "default", "hub")
++    assert len(calls) == 2
+-- 
+2.43.0
+

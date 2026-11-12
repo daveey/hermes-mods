@@ -1,0 +1,520 @@
+From ee2af7d54b79935964f9e613fa61a315a37990d4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 14:03:26 +0000
+Subject: [PATCH] [daveey] ci(review-comment): answer PR #1382's review points
+ (footer, writer race, Docker trigger)
+
+PR #1382 (3dbd5428ff) made the ci-review-bot comment refresh when CI
+completes on a wt/ head. Its exact-head review (card t_01a1cf7772b1ff84)
+approved with three non-blocking points that merged unanswered:
+
+1. Footer: the comment still said "refreshed hourly, not live" although
+   it is now also refreshed on CI completion. It now reads "refreshed
+   when CI or Docker completes on this head, and hourly; not live". The
+   "<sub>ran on [sha](.../commits/<40hex>)" prefix that ship's BOT_HEAD
+   parser reads is unchanged.
+
+2. Writer race: the hourly sweep (one run, many PRs, one shared
+   concurrency group) and a targeted workflow_run refresh (a per-head
+   group) can both hold a snapshot of the same PR. A sweep that started
+   at :17 but reached the PR after a targeted run overwrote the newer
+   snapshot with its older one until the next sweep. Each write now puts
+   a hidden state line right after the marker:
+     <!-- hermes-ci-review-bot:state head=<40hex> started=<UTC us> run=<id> -->
+   Right before writing (after the existing head/open re-read), the run
+   reads the bot comment; if it holds a snapshot of the same head from a
+   run that started at or after this one, it skips and logs why. Another
+   head, or a comment without a state line (written before this change),
+   is replaced as before. A per-head concurrency group can't do this,
+   because one sweep run covers every PR.
+
+3. Docker trigger: the comment reports "Docker Build, Test, and Publish"
+   (WATCH_WORKFLOWS), but only CI triggered a refresh. When Docker
+   finishes after CI (a rerun, a slow build), the comment showed it
+   pending until the next sweep. Docker now triggers too, by its exact
+   name: and with the same wt/** filter. TRIGGER_WORKFLOW (the
+   workflow_run's name, compared for equality only) lets a Docker
+   completion while that head's CI is still running write nothing and
+   spend no collection calls, since CI's own completion refreshes.
+
+Proof: tests/ci/test_batch_review_comments.py goes from 34 to 48
+collected cases (none removed). 17 fail with the 3dbd5428ff script and
+workflow (footer, same-head ordering incl. the equal-start tie, state
+written after the marker with the compared comment id, Docker in the
+trigger list by exact name, sibling-before-CI skip, env wiring) and all
+pass here. 17 source mutants (each new condition flipped or dropped)
+are all killed. 93 tests in the batch/live-comment/runner-routing files
+pass; actionlint 1.7.12 (the pinned version) clean on every workflow.
+---
+ .github/workflows/README.md             |   6 +-
+ .github/workflows/ci-review-comment.yml |  29 +++--
+ scripts/ci/batch_review_comments.py     |  99 +++++++++++++++--
+ tests/ci/test_batch_review_comments.py  | 141 +++++++++++++++++++++++-
+ 4 files changed, 248 insertions(+), 27 deletions(-)
+
+diff --git a/.github/workflows/README.md b/.github/workflows/README.md
+index 665db154f0..42be367f90 100644
+--- a/.github/workflows/README.md
++++ b/.github/workflows/README.md
+@@ -41,7 +41,7 @@ pull_request / push main
+  └─ path-filtered: pm-bundle, termux-verify, plugin-catalog-ci, sandbox-image, windows-bundle-sdk
+ 
+ hourly / manual dispatch → ci-review-comment.yml (batched PR snapshots)
+-CI completed on a wt/** PR → ci-review-comment.yml (that PR's head only)
++CI or Docker completed on a wt/** PR → ci-review-comment.yml (that PR's head only)
+ PR labeled run-e2e       → label-rerun.yml (reruns CI, Docker, Nix)
+ 
+ schedule daily 06:41 UTC → canary-release.yml → (release.py dispatches) desktop-bundled-release.yml
+@@ -340,7 +340,7 @@ branch protection.
+ 
+ | Workflow | Trigger | What it does / skip conditions |
+ |---|---|---|
+-| `ci-review-comment.yml`, **CI review comment** | Hourly (`17 * * * *`), manual dispatch, and `workflow_run` when **CI** completes on a `wt/**` branch | One batch snapshots every open same-repository PR using its newest exact-head CI pull-request run and sibling Docker results. On `workflow_run` (same-repo `pull_request` CI that ended success/failure) it refreshes only the PR at that exact head (`TARGET_HEAD_SHA`), so `hermes-core-wt ship` sees "ran on <head>" minutes after a rebased head's CI instead of at the next hourly sweep. Always runs trusted default-branch scripts; no polling or PR code execution. Forks, closed/moved heads, and heads with no CI run are skipped. Comments identify their SHA. Non-cancelling concurrency (one group for the batch, one per head for targeted runs), 15-minute job timeout; 168 scheduled runs/week plus one per completed `wt/**` PR CI run. |
++| `ci-review-comment.yml`, **CI review comment** | Hourly (`17 * * * *`), manual dispatch, and `workflow_run` when **CI** or **Docker Build, Test, and Publish** completes on a `wt/**` branch | One batch snapshots every open same-repository PR using its newest exact-head CI pull-request run and sibling Docker results. On `workflow_run` (same-repo `pull_request` run that ended success/failure) it refreshes only the PR at that exact head (`TARGET_HEAD_SHA`), so `hermes-core-wt ship` sees "ran on <head>" minutes after a rebased head's CI instead of at the next hourly sweep; a Docker completion while that head's CI is still running writes nothing (CI's completion refreshes). Each write records its head and run start in a hidden `hermes-ci-review-bot:state` line; a run never overwrites a snapshot of the same head written by a run that started later. Always runs trusted default-branch scripts; no polling or PR code execution. Forks, closed/moved heads, and heads with no CI run are skipped. Comments identify their SHA. Non-cancelling concurrency (one group for the batch, one per head for targeted runs), 15-minute job timeout; 168 scheduled runs/week plus one per completed `wt/**` PR CI or Docker run. |
+ | `label-rerun.yml`, **Label rerun** | `pull_request: labeled` | Only for the `run-e2e` label. Cancels the head commit's `ci.yaml`, `docker.yml` and `nix.yml` runs if they are still going, then reruns them. Their `detect` reads the live labels, so Docker and Nix build. Exits if the PR head moved. The E2E suites stay off. |
+ 
+ ---
+@@ -555,7 +555,7 @@ gh workflow run windows-install-update-e2e.yml --ref <branch> -f strict_acceptan
+ | `bootstrap-installer.yml` | Bootstrap installer | R | ci |
+ | `canary-release.yml` | Canary Release | cron daily 06:41, dispatch | none |
+ | `catalog-tests.yml` | Catalog tests | R | ci |
+-| `ci-review-comment.yml` | CI review comment | cron hourly :17, dispatch, workflow_run(CI completed, wt/**) | none |
++| `ci-review-comment.yml` | CI review comment | cron hourly :17, dispatch, workflow_run(CI or Docker completed, wt/**) | none |
+ | `ci.yaml` | CI | PR, main, dispatch, call | stable |
+ | `deploy-site.yml` | Deploy Site | main (paths), release published, dispatch | skills-index (dispatch) |
+ | `desktop-bundled-release.yml` | Desktop Bundled Release | dispatch, call | stable; canary/release.py (dispatch) |
+diff --git a/.github/workflows/ci-review-comment.yml b/.github/workflows/ci-review-comment.yml
+index 7a47a250f7..0af3fb6550 100644
+--- a/.github/workflows/ci-review-comment.yml
++++ b/.github/workflows/ci-review-comment.yml
+@@ -1,7 +1,7 @@
+ name: CI review comment
+ 
+ # Batched PR review summaries: an hourly sweep, plus one targeted refresh
+-# whenever CI completes on a ship branch's PR head.
++# whenever CI or a watched sibling (Docker) completes on a ship branch's PR head.
+ #
+ # The scheduled run snapshots every open same-repo PR: the newest CI
+ # ``pull_request`` run on the PR's exact head, one comment per PR. It replaces
+@@ -12,15 +12,22 @@ name: CI review comment
+ # this comment says "ran on <its head>", and every ship rebase makes a new
+ # head; on the hourly sweep alone an approved, CI-green PR waited up to an hour
+ # (or for a hand dispatch) after each rebase (PR1104, 2026-11-12). CI on PR
+-# heads finishes after the sibling Docker run (60 of 60 wt/ heads sampled
+-# 2026-11-12: Docker done 5-36 min earlier), so this one run posts the final
+-# "ran on" comment. Only ``wt/**`` branches (what ship pushes), and only CI
+-# runs that ended success/failure: main pushes and other branches start no run
+-# here, and other PRs' comments are not rewritten.
++# heads usually finishes after the sibling Docker run (60 of 60 wt/ heads
++# sampled 2026-11-12: Docker done 5-36 min earlier), so the CI-triggered run
++# usually posts the final "ran on" comment. Docker is a trigger too, by its
++# exact ``name:`` (every WATCH_WORKFLOWS entry must be listed): when Docker
++# finishes after CI (a rerun, a slow build) the comment would otherwise show
++# it pending until the next sweep. A Docker completion while CI is still
++# running writes nothing (CI's completion refreshes). Only ``wt/**`` branches
++# (what ship pushes), and only runs that ended success/failure: main pushes
++# and other branches start no run here, and other PRs' comments are not
++# rewritten. Each write records its head and run start in the comment, and an
++# older run never overwrites a newer run's snapshot of the same head.
+ #
+ # It runs from the default branch only and never checks out or executes PR
+ # code, which makes a write token safe here (workflow_run included: only the
+-# head sha, a 40-hex string the script validates, crosses from the event).
++# head sha, a 40-hex string the script validates, and the triggering
++# workflow's name, compared for equality only, cross from the event).
+ # Fork PRs are skipped.
+ 
+ on:
+@@ -28,7 +35,7 @@ on:
+     - cron: "17 * * * *"
+   workflow_dispatch:
+   workflow_run:
+-    workflows: [CI]
++    workflows: [CI, "Docker Build, Test, and Publish"]
+     types: [completed]
+     branches: ["wt/**"]
+ 
+@@ -65,10 +72,14 @@ jobs:
+       - name: Post batched review summaries
+         env:
+           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-          # Empty on schedule/dispatch (every open PR); the completed CI run's
++          # Empty on schedule/dispatch (every open PR); the completed run's
+           # head on workflow_run (only that PR).
+           TARGET_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
++          # Which workflow completed (CI or a watched sibling); empty on
++          # schedule/dispatch. A sibling completing before CI writes nothing.
++          TRIGGER_WORKFLOW: ${{ github.event.workflow_run.name }}
+           # Sibling workflows whose jobs join each comment, one name per line.
++          # Each must also be listed under on.workflow_run.workflows.
+           WATCH_WORKFLOWS: |
+             Docker Build, Test, and Publish
+         run: python3 -u scripts/ci/batch_review_comments.py
+diff --git a/scripts/ci/batch_review_comments.py b/scripts/ci/batch_review_comments.py
+index 8391f174ee..58c0d2b082 100644
+--- a/scripts/ci/batch_review_comments.py
++++ b/scripts/ci/batch_review_comments.py
+@@ -22,8 +22,18 @@ Safety / behaviour:
+   - Each PR is isolated: an error on one PR is recorded and the rest still
+     run. Any error (listing, collection, write) makes the exit code 1.
+   - The comment keeps the ``<!-- hermes-ci-review-bot -->`` marker, so it
+-    replaces earlier comments from the live poller. The footer says the
+-    snapshot is refreshed hourly, so it is not mistaken for a live view.
++    replaces earlier comments from the live poller. The footer names both
++    refresh triggers (a CI or Docker completion on the head, and the hourly
++    sweep), so the snapshot is not mistaken for a live view.
++  - Ordering: the hourly sweep and a targeted run can both hold a snapshot of
++    the same PR. Each write records the head and the writing run's start in a
++    hidden state line (``<!-- hermes-ci-review-bot:state ... -->``). A run
++    writes only if no snapshot of that same head from a run that started
++    later is already there; otherwise it skips and logs why, so an older run
++    cannot overwrite a newer run's result until the next sweep.
++  - Targeted runs triggered by a watched sibling (Docker) completing while CI
++    on that head is still running write nothing: CI's own completion
++    refreshes the PR with both results.
+ """
+ 
+ from __future__ import annotations
+@@ -93,10 +103,63 @@ def snapshot_commit_info(pr: dict, run: dict, repo: str, now: datetime, *, compl
+     phase = "ran on" if completed else "running on"
+     return (
+         f"<sub>{phase} [{sha[:7]}]({url}){tail} · snapshot of CI taken {stamp}; "
+-        f"refreshed hourly, not live</sub>"
++        f"{REFRESH_NOTE}</sub>"
+     )
+ 
+ 
++# Both triggers in ci-review-comment.yml: workflow_run (CI or a watched sibling completed on this head) and cron.
++REFRESH_NOTE = "refreshed when CI or Docker completes on this head, and hourly; not live"
++
++STATE_PREFIX = "<!-- hermes-ci-review-bot:state "
++BOT_MARKER = "<!-- hermes-ci-review-bot -->"
++_STAMP = "%Y-%m-%dT%H:%M:%S.%fZ"  # fixed width, so stamps order as strings
++_STATE_RE = re.compile(
++    r"<!-- hermes-ci-review-bot:state head=([0-9a-f]{40}) "
++    r"started=(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z) run=(\S*) -->"
++)
++
++
++def _stamp(started: datetime) -> str:
++    return started.astimezone(UTC).strftime(_STAMP)
++
++
++def state_line(head_sha: str, started: datetime, run_id: str = "") -> str:
++    """The hidden line recording which head this snapshot is of and when the writing run started."""
++    return f"{STATE_PREFIX}head={head_sha} started={_stamp(started)} run={run_id} -->"
++
++
++def with_state(body: str, head_sha: str, started: datetime, run_id: str = "") -> str:
++    """``body`` with the state line right after the marker line (the marker must stay first: find_comment_id)."""
++    first, _, rest = body.partition("\n")
++    return f"{first}\n{state_line(head_sha, started, run_id)}\n{rest}"
++
++
++def stale_write_reason(existing_body: str, head_sha: str, started: datetime) -> str:
++    """Why this run must not overwrite ``existing_body``, or "" when it may write.
++
++    A snapshot of another head (or a comment with no state line, e.g. from before this marker) is always
++    replaced. A snapshot of the same head is replaced only by a run that started later.
++    """
++    m = _STATE_RE.search(existing_body or "")
++    if not m or m.group(1) != head_sha:
++        return ""
++    if _stamp(started) > m.group(2):
++        return ""
++    return (f"a run that started {m.group(2)} (run {m.group(3) or '?'}) already wrote head "
++            f"{head_sha[:12]}; this run started {_stamp(started)}")
++
++
++def find_bot_comment(token: str, repo: str, number: int) -> tuple[int | None, str]:
++    """(id, body) of the PR's ci-review-bot comment, or (None, "")."""
++    owner, name = repo.split("/")
++    comments = lc._api_get_paginated(f"{lc.API_BASE}/repos/{owner}/{name}/issues/{number}/comments", token)
++    for c in comments:
++        body = c.get("body", "") if isinstance(c, dict) else ""
++        if body.startswith(BOT_MARKER):
++            return c.get("id"), body
++    return None, ""
++
++
+ def build_snapshot(token: str, repo: str, pr: dict, run: dict, now: datetime) -> str:
+     watch = lc.parse_watch_workflows(os.environ.get("WATCH_WORKFLOWS", "")) or DEFAULT_WATCH_WORKFLOWS
+     jobs, runs_completed = lc.collect_run_jobs(token, repo, str(run["id"]), watch, strict=True)
+@@ -115,8 +178,11 @@ def build_snapshot(token: str, repo: str, pr: dict, run: dict, now: datetime) ->
+     )
+ 
+ 
+-def process_pr(token: str, repo: str, pr: dict, now: datetime) -> str:
+-    """Returns 'posted' or 'skipped:<why>'. Raises on API/write failure."""
++def process_pr(token: str, repo: str, pr: dict, now: datetime, *, trigger_workflow: str = "") -> str:
++    """Returns 'posted' or 'skipped:<why>'. Raises on API/write failure.
++
++    ``now`` is this run's start; it is recorded in the comment's state line and orders competing writers.
++    """
+     owner, name = repo.split("/")
+     number = pr["number"]
+     sha = pr["head"]["sha"]
+@@ -130,6 +196,9 @@ def process_pr(token: str, repo: str, pr: dict, now: datetime) -> str:
+         return "skipped:no CI run on head"
+     if run.get("status") == "completed" and run.get("conclusion") not in {"success", "failure"}:
+         return "skipped:CI cancelled or incomplete"
++    if trigger_workflow and trigger_workflow != CI_WORKFLOW_NAME and run.get("status") != "completed":
++        # A watched sibling (Docker) finished first; CI's own completion on this head refreshes the PR.
++        return f"skipped:{trigger_workflow} completed but CI is still {run.get('status') or 'unknown'}"
+     body = build_snapshot(token, repo, pr, run, now)
+ 
+     # Head race: re-read the PR right before writing.
+@@ -139,17 +208,25 @@ def process_pr(token: str, repo: str, pr: dict, now: datetime) -> str:
+     if (fresh.get("head") or {}).get("sha") != sha:
+         return "skipped:head changed"
+ 
+-    if not lc.upsert_comment(token, repo, str(number), body):
++    # Writer race: the hourly sweep and a targeted run can hold snapshots of the same head; the later-started wins.
++    comment_id, existing = find_bot_comment(token, repo, number)
++    why = stale_write_reason(existing, sha, now)
++    if why:
++        return f"skipped:newer snapshot present ({why})"
++    body = with_state(body, sha, now, os.environ.get("GITHUB_RUN_ID", ""))
++    if not lc.upsert_comment(token, repo, str(number), body, comment_id):
+         raise RuntimeError("comment write failed")
+     return "posted"
+ 
+ 
+-def run_batch(token: str, repo: str, now: datetime | None = None, *, head_sha: str = "") -> int:
++def run_batch(token: str, repo: str, now: datetime | None = None, *, head_sha: str = "",
++              trigger_workflow: str = "") -> int:
+     """Snapshot every eligible open PR, or only those whose head is exactly ``head_sha``.
+ 
+     ``head_sha`` is the targeted mode the workflow uses on ``workflow_run``: the
+     CI run on that head just completed, so only its PR's comment is refreshed
+-    (no other PR's comment is rewritten).
++    (no other PR's comment is rewritten). ``trigger_workflow`` names the
++    workflow whose completion started this run (empty on schedule/dispatch).
+     """
+     now = now or datetime.now(UTC)
+     owner, name = repo.split("/")
+@@ -169,7 +246,7 @@ def run_batch(token: str, repo: str, now: datetime | None = None, *, head_sha: s
+     failures = 0
+     for pr in targets:
+         try:
+-            result = process_pr(token, repo, pr, now)
++            result = process_pr(token, repo, pr, now, trigger_workflow=trigger_workflow)
+             print(f"  PR #{pr['number']}: {result}")
+         except (OSError, ValueError, RuntimeError) as e:
+             failures += 1
+@@ -195,7 +272,9 @@ def main() -> int:
+     if head_sha and not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+         print(f"--head-sha must be a full 40-hex commit sha, got {a.head_sha!r}", file=sys.stderr)
+         return 1
+-    return run_batch(token, repo, head_sha=head_sha)
++    # The workflow_run trigger's workflow name (CI or a watched sibling); empty on schedule/dispatch.
++    trigger_workflow = os.environ.get("TRIGGER_WORKFLOW", "").strip()
++    return run_batch(token, repo, head_sha=head_sha, trigger_workflow=trigger_workflow)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/ci/test_batch_review_comments.py b/tests/ci/test_batch_review_comments.py
+index 7e64d2bc37..a1f54530b2 100644
+--- a/tests/ci/test_batch_review_comments.py
++++ b/tests/ci/test_batch_review_comments.py
+@@ -33,12 +33,14 @@ def _run(rid, sha, created, name="CI", event="pull_request"):
+ class Fake:
+     """Patches the live_comment API surface used by the batch script."""
+ 
+-    def __init__(self, monkeypatch, prs, runs_by_sha, fresh=None, write_ok=None, fail_collect=()):
++    def __init__(self, monkeypatch, prs, runs_by_sha, fresh=None, write_ok=None, fail_collect=(), comments=None):
+         self.prs, self.runs_by_sha = prs, runs_by_sha
+         self.fresh = fresh or {}
+         self.write_ok = write_ok or {}
+         self.fail_collect = set(fail_collect)
++        self.comments = comments or {}  # PR number -> that PR's issue comments
+         self.posted: dict[str, str] = {}
++        self.comment_ids: dict[str, int | None] = {}
+         self.collected: list[str] = []
+         lc = b.lc
+ 
+@@ -51,6 +53,8 @@ class Fake:
+                 sha = url.split("head_sha=")[1].split("&")[0]
+                 assert "event=pull_request" in url
+                 return self.runs_by_sha.get(sha, [])
++            if url.endswith("/comments") and "/issues/" in url:
++                return self.comments.get(int(url.split("/issues/")[1].split("/")[0]), [])
+             raise AssertionError(url)
+ 
+         def request(url, token):
+@@ -68,6 +72,7 @@ class Fake:
+             if not self.write_ok.get(pr, True):
+                 return None
+             self.posted[pr] = body
++            self.comment_ids[pr] = comment_id
+             return 1
+ 
+         monkeypatch.setattr(lc, "_api_get_paginated", paginated)
+@@ -95,7 +100,7 @@ def test_two_prs_one_invocation_exact_head_newest_run(monkeypatch):
+     assert f.collected == ["11", "20"]
+     assert set(f.posted) == {"1", "2"}
+     body = f.posted["1"]
+-    assert "snapshot of" in body and "refreshed hourly, not live" in body
++    assert "snapshot of" in body and b.REFRESH_NOTE in body
+     assert "running on" not in body
+     assert "<!-- hermes-ci-review-bot -->" in body
+ 
+@@ -246,7 +251,8 @@ def test_ci_completion_on_a_ship_head_triggers_a_targeted_refresh():
+     """
+     doc = _workflow()
+     on = doc.get("on", doc.get(True))
+-    assert on["workflow_run"] == {"workflows": ["CI"], "types": ["completed"], "branches": ["wt/**"]}
++    assert on["workflow_run"] == {"workflows": ["CI", "Docker Build, Test, and Publish"], "types": ["completed"],
++                                  "branches": ["wt/**"]}
+     job = doc["jobs"]["comment"]
+     cond = " ".join(job["if"].split())
+     # schedule/dispatch keep the full sweep; workflow_run only for same-repo PR runs that finished green or red.
+@@ -293,14 +299,15 @@ def test_main_targets_the_completed_runs_head_from_the_workflow_env(monkeypatch)
+     monkeypatch.setenv("GITHUB_TOKEN", "t")
+     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+     monkeypatch.setenv("TARGET_HEAD_SHA", head.upper())
++    monkeypatch.delenv("TRIGGER_WORKFLOW", raising=False)
+     monkeypatch.setattr(sys, "argv", ["x"])
+     monkeypatch.setattr(b, "run_batch", lambda token, repo, **kw: seen.update(kw) or 0)
+     assert b.main() == 0
+-    assert seen == {"head_sha": head}
++    assert seen == {"head_sha": head, "trigger_workflow": ""}
+     # schedule/dispatch: the workflow expression renders empty, so every PR is swept
+     monkeypatch.setenv("TARGET_HEAD_SHA", "")
+     assert b.main() == 0
+-    assert seen == {"head_sha": ""}
++    assert seen == {"head_sha": "", "trigger_workflow": ""}
+ 
+ 
+ @pytest.mark.parametrize("bad", ["abc123", "g" * 40, "1" * 39, "1" * 41, "$(id)"])
+@@ -311,3 +318,127 @@ def test_main_refuses_a_target_that_is_not_a_full_sha(monkeypatch, bad):
+     monkeypatch.setattr(sys, "argv", ["x"])
+     monkeypatch.setattr(b, "run_batch", lambda *a, **k: pytest.fail("ran with an invalid target"))
+     assert b.main() == 1
++
++
++# --- PR #1382 review follow-ups (card t_01a1cfff03a1f1ea) --------------------------------------------------------
++DOCKER = "Docker Build, Test, and Publish"
++
++
++def _done(rid, sha, **kw):
++    return _run(rid, sha, "t", **kw) | {"status": "completed", "conclusion": "success"}
++
++
++def _bot_comment(cid, head, started, run_id="900"):
++    # The state line's format is spelt out here (not built with b.state_line) so this pins the on-comment contract.
++    state = f"<!-- hermes-ci-review-bot:state head={head} started={started:%Y-%m-%dT%H:%M:%S.%fZ} run={run_id} -->"
++    body = f"<!-- hermes-ci-review-bot -->\n{state}\n# old snapshot\n"
++    return {"id": cid, "body": body}
++
++
++def test_footer_names_both_refresh_triggers(monkeypatch):
++    """Point 1: the comment is also refreshed when CI (or Docker) completes on the head, not only hourly."""
++    sha = "a" * 40
++    prs = [_pr(1, sha)]
++    f = Fake(monkeypatch, prs, {sha: [_done(1, sha)]}, fresh=_fresh(prs))
++    assert b.run_batch("t", REPO, NOW) == 0
++    footer = re.search(r"<sub>ran on [^\n]*</sub>", f.posted["1"]).group(0)
++    assert "refreshed hourly" not in footer
++    assert "when CI or Docker completes on this head" in footer and "hourly" in footer
++
++
++@pytest.mark.parametrize(("recorded_offset_s", "writes"), [(300, False), (0, False), (-3600, True)])
++def test_an_older_run_never_overwrites_a_newer_snapshot_of_the_same_head(monkeypatch, recorded_offset_s, writes):
++    """Point 2: the hourly sweep and a targeted run race on one comment; the run that started later wins.
++
++    Before: a sweep that started at :17 but reached the PR after a targeted run (started later, after CI
++    completed) overwrote the final snapshot with its older one until the next sweep.
++    """
++    from datetime import timedelta
++    sha = "a" * 40
++    prs = [_pr(1, sha)]
++    existing = _bot_comment(55, sha, NOW + timedelta(seconds=recorded_offset_s))
++    f = Fake(monkeypatch, prs, {sha: [_done(1, sha)]}, fresh=_fresh(prs), comments={1: [existing]})
++    assert b.run_batch("t", REPO, NOW) == 0
++    assert ("1" in f.posted) is writes
++    if writes:
++        assert f.comment_ids["1"] == 55  # updates the comment it compared against
++
++
++def test_a_snapshot_of_another_head_or_without_state_is_replaced_and_the_write_records_its_state(monkeypatch):
++    from datetime import timedelta
++    old, new = "1" * 40, "2" * 40
++    prs = [_pr(1, new), _pr(2, new)]
++    later = NOW + timedelta(hours=1)
++    comments = {1: [{"id": 7, "body": "unrelated"}, _bot_comment(8, old, later)],
++                2: [{"id": 9, "body": "<!-- hermes-ci-review-bot -->\n# from before the state line\n"}]}
++    monkeypatch.setenv("GITHUB_RUN_ID", "4242")
++    f = Fake(monkeypatch, prs, {new: [_done(1, new)]}, fresh=_fresh(prs), comments=comments)
++    assert b.run_batch("t", REPO, NOW) == 0
++    assert f.comment_ids == {"1": 8, "2": 9}
++    for body in f.posted.values():
++        assert body.startswith("<!-- hermes-ci-review-bot -->\n" + b.state_line(new, NOW, "4242") + "\n")
++        # The ship parser still reads the head from the footer.
++        assert re.search(r"<sub>(running|ran) on [^\n]*?/commits/([0-9a-f]{40})", body).group(2) == new
++
++
++def test_recorded_state_round_trips_and_orders_runs(monkeypatch):
++    from datetime import timedelta
++    sha = "a" * 40
++    prs = [_pr(1, sha)]
++    f = Fake(monkeypatch, prs, {sha: [_done(1, sha)]}, fresh=_fresh(prs))
++    assert b.run_batch("t", REPO, NOW) == 0
++    written = f.posted.pop("1")
++    f.comments = {1: [{"id": 3, "body": written}]}
++    assert b.run_batch("t", REPO, NOW - timedelta(microseconds=1)) == 0  # started earlier: skipped
++    assert f.posted == {}
++    assert b.run_batch("t", REPO, NOW + timedelta(microseconds=1)) == 0  # started later: writes
++    assert f.comment_ids == {"1": 3}
++    assert b.stale_write_reason(written, "b" * 40, NOW - timedelta(days=1)) == ""  # another head: write
++    assert b.stale_write_reason(written, sha, NOW).startswith("a run that started ")
++
++
++def test_every_watched_sibling_workflow_also_triggers_a_targeted_refresh():
++    """Point 3: a Docker run finishing after CI refreshed the comment only at the next hourly sweep."""
++    doc = _workflow()
++    on = doc.get("on", doc.get(True))
++    step = next(s for s in doc["jobs"]["comment"]["steps"] if "batch_review_comments.py" in (s.get("run") or ""))
++    watched = b.lc.parse_watch_workflows(step["env"]["WATCH_WORKFLOWS"])
++    assert watched == [DOCKER]
++    assert on["workflow_run"]["workflows"] == ["CI", *watched]
++    assert on["workflow_run"]["branches"] == ["wt/**"]
++    assert step["env"]["TRIGGER_WORKFLOW"] == "${{ github.event.workflow_run.name }}"
++    # Trigger names must be the workflows' exact `name:`; a misspelt one never fires.
++    yaml = pytest.importorskip("hermes_yaml")
++    names = {yaml.safe_load(p.read_text()).get("name")
++             for p in (Path(__file__).resolve().parents[2] / ".github/workflows").glob("*.y*ml")}
++    assert set(on["workflow_run"]["workflows"]) <= names
++
++
++@pytest.mark.parametrize(("trigger", "ci_status", "writes"), [
++    (DOCKER, "in_progress", False),   # Docker first: CI's completion refreshes
++    (DOCKER, "queued", False),
++    (DOCKER, "completed", True),      # Docker after CI: this run posts Docker's result
++    ("CI", "completed", True),
++    ("CI", "in_progress", True),      # a rerun of CI on this head (label-rerun) is newest: show it running
++    ("", "in_progress", True),        # the hourly sweep still shows a running CI
++])
++def test_sibling_completion_refreshes_only_once_ci_is_done(monkeypatch, trigger, ci_status, writes):
++    sha = "a" * 40
++    prs = [_pr(1, sha)]
++    run = _run(1, sha, "t") | {"status": ci_status, "conclusion": "success" if ci_status == "completed" else None}
++    f = Fake(monkeypatch, prs, {sha: [run]}, fresh=_fresh(prs))
++    assert b.run_batch("t", REPO, NOW, head_sha=sha if trigger else "", trigger_workflow=trigger) == 0
++    assert ("1" in f.posted) is writes
++    assert (f.collected == ["1"]) is writes  # a skipped sibling trigger spends no collection calls
++
++
++def test_main_passes_the_triggering_workflow(monkeypatch):
++    seen = {}
++    monkeypatch.setenv("GITHUB_TOKEN", "t")
++    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
++    monkeypatch.setenv("TARGET_HEAD_SHA", "c" * 40)
++    monkeypatch.setenv("TRIGGER_WORKFLOW", f" {DOCKER}\n")
++    monkeypatch.setattr(sys, "argv", ["x"])
++    monkeypatch.setattr(b, "run_batch", lambda token, repo, **kw: seen.update(kw) or 0)
++    assert b.main() == 0
++    assert seen == {"head_sha": "c" * 40, "trigger_workflow": DOCKER}
+-- 
+2.43.0
+

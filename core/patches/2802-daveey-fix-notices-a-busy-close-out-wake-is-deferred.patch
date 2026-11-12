@@ -1,0 +1,190 @@
+From 8569969db90fbf4d26ec52f2f4ad1b800e8064a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:45:37 -0800
+Subject: [PATCH] [daveey] fix(notices): a busy close-out wake is deferred and
+ offered again, not stamped final
+
+The notice guarantee stamped a close-out wake that returned "busy" as final. busy here never
+means a live turn (_handle skips those): it means admission refused the turn, e.g. a hub core
+update holding admission. On 2026-11-12 two hub chats got kanban notices during a 30+ min
+update hold; both close-outs returned busy at 14:20 UTC, were stamped final, and stayed
+unresolved{notice_tail} after the hold lifted.
+
+A busy wake is now deferred like a failed one: retry after 5 min, doubling to 1 h, at most
+8 busy wakes per row (busy_attempts, separate from the failed-wake budget); the last stamps busy.
+---
+ tests/tui_gateway/test_notice_guarantee.py | 61 +++++++++++++++++++++-
+ tui_gateway/notice_guarantee.py            | 34 +++++++++---
+ 2 files changed, 86 insertions(+), 9 deletions(-)
+
+diff --git a/tests/tui_gateway/test_notice_guarantee.py b/tests/tui_gateway/test_notice_guarantee.py
+index d0a76c63d7..298346a20a 100644
+--- a/tests/tui_gateway/test_notice_guarantee.py
++++ b/tests/tui_gateway/test_notice_guarantee.py
+@@ -155,14 +155,71 @@ def test_failed_wakes_stop_after_max_attempts(db, monkeypatch):
+     assert (state, attempts) == ("error", ng.MAX_ATTEMPTS)
+ 
+ 
+-@pytest.mark.parametrize("verdict", ["refused", "busy", "missing"])
+-def test_only_a_failed_wake_is_deferred(db, verdict):
++@pytest.mark.parametrize("verdict", ["refused", "missing"])
++def test_a_refused_or_missing_wake_is_final(db, verdict):
+     row = _notice(db, "✔ Kanban t_aaa done — deploy card")
+     _run(db, verdict=verdict)
+     assert _closeout(db, row) == verdict
+     assert _run(db, now=time.time() + 99999) == ([], [])
+ 
+ 
++def _busy_attempts(db, row):
++    return db._read_one("SELECT json_extract(display_metadata, '$.closeout.busy_attempts') FROM messages "
++                        "WHERE id = ?", (row,))[0]
++
++
++def test_a_busy_wake_is_deferred_and_offered_again_once_admission_reopens(db):
++    # Two hub chats (2026-11-12): their notices landed while a core update held turn admission for 30 min; the
++    # close-out wake returned "busy", the row was stamped final, and the chats stayed unresolved{notice_tail}.
++    now = time.time()
++    row = _notice(db, "✔ Kanban t_aaa done — deploy card")
++
++    out, calls = _run(db, verdict="busy", now=now)
++
++    assert calls == [(CHAT, row)] and [o["result"] for o in out] == ["dispatched"]
++    state, retry_at, attempts = _closeout_meta(db, row)
++    assert state == "deferred" and attempts == 1 and _busy_attempts(db, row) == 1
++    assert retry_at >= now + ng.BUSY_RETRY_S
++    stored = so.get_outcome(CHAT, db=db)
++    assert (stored["kind"], stored["reason"]) == ("unresolved", "notice_tail")
++    assert _run(db, now=now + ng.BUSY_RETRY_S - 60) == ([], [])  # not before retry_at
++
++    out, calls = _run(db, verdict="started", now=retry_at + 1)
++
++    assert calls == [(CHAT, row)] and _closeout_meta(db, row)[0] == "started"
++    assert _run(db, now=retry_at + 99999) == ([], [])  # started: never woken again
++
++
++def test_busy_wakes_back_off_and_stop_after_max_busy_attempts(db):
++    row = _notice(db, "✔ Kanban t_aaa done — deploy card")
++    now, wakes, delays = time.time(), 0, []
++    for _ in range(ng.MAX_BUSY_ATTEMPTS + 2):
++        _out, calls = _run(db, verdict="busy", now=now)
++        wakes += len(calls)
++        state, retry_at, _attempts = _closeout_meta(db, row)
++        if state == "deferred":
++            delays.append(round((retry_at - time.time()) / 60))
++            now = retry_at + 1
++        else:
++            now += 99999
++
++    assert wakes == ng.MAX_BUSY_ATTEMPTS
++    assert delays == sorted(delays) and delays[0] == 5 and delays[-1] == 60  # doubling, capped at an hour
++    assert (_closeout(db, row), _busy_attempts(db, row)) == ("busy", ng.MAX_BUSY_ATTEMPTS)
++
++
++def test_busy_wakes_do_not_spend_the_failed_wake_budget(db, monkeypatch):
++    monkeypatch.setattr(ng, "_retry_at", lambda sid, t: t + 60, raising=False)
++    row = _notice(db, "✔ Kanban t_aaa done — deploy card")
++    now = time.time()
++    for verdict in ["busy"] * 3 + ["error"]:
++        _run(db, verdict=verdict, now=now)
++        now = max(now, _closeout_meta(db, row)[1] or now) + 1
++
++    state, _retry, attempts = _closeout_meta(db, row)
++    assert (state, attempts, _busy_attempts(db, row)) == ("deferred", 4, 3)  # 1 of MAX_ATTEMPTS errors used
++
++
+ def test_retry_at_follows_the_build_failures_quota_reset(monkeypatch):
+     from tui_gateway import automation_replay, server
+     now = 1_000_000.0
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index 8187aa5d57..db792cb9e1 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -22,6 +22,12 @@ unloaded sweeper's loop therefore looks, in every profile store, for chats whose
+   dies with its backend and its own failure gives up, so before this a close-out refused by a quota window that a
+   restart (or a still-broken store) outlived was never offered again (two hub chats, 2026-11-10). A deferred row
+   is durable: any backend's pass picks it up. [daveey]
++- a wake that found the chat ``"busy"`` (no live turn, yet admission refused it: a core update's admission hold or
++  drain, a paused turn owed to its restarting backend, an exiting backend's fence) is deferred the same way,
++  ``BUSY_RETRY_S`` doubling up to ``BUSY_RETRY_MAX_S``, at most ``MAX_BUSY_ATTEMPTS`` busy wakes per row (counted in
++  ``busy_attempts``, apart from the failed-wake budget); the last one stamps ``busy``. Before this ``busy`` was
++  final: a notice that landed while a hub core update held admission for 30 min stayed ``unresolved{notice_tail}``
++  after the hold lifted (two hub chats, 2026-11-12). [daveey]
+ 
+ Ownership follows the unloaded sweeper's: a chat another live backend holds is that backend's (its own pass
+ handles it); a chat with a live turn is skipped. The close-out prompt row is itself a notice, stamped as claimed,
+@@ -56,6 +62,10 @@ WAKES_PER_HOUR = 2
+ # no sooner than the failure's quota/route reset (or the automation replay's floor) plus this slack.
+ MAX_ATTEMPTS = 3
+ DEFER_SLACK_S = 600.0
++# A busy wake is offered again after BUSY_RETRY_S, doubling to BUSY_RETRY_MAX_S: ~4.6 h of busy wakes per row.
++BUSY_RETRY_S = 300.0
++BUSY_RETRY_MAX_S = 3600.0
++MAX_BUSY_ATTEMPTS = 8
+ LOOKBACK_S = 3 * 86400.0
+ MAX_PARALLEL_WAKES = 2
+ CLOSEOUT_TEXT = (
+@@ -123,9 +133,9 @@ def _deferred_due(meta: dict, now: float) -> bool:
+     return isinstance(retry_at, (int, float)) and not isinstance(retry_at, bool) and retry_at <= now
+ 
+ 
+-def _attempts(meta: Any) -> int:
++def _attempts(meta: Any, field: str = "attempts") -> int:
+     closeout = meta.get("closeout") if isinstance(meta, dict) else None
+-    n = closeout.get("attempts") if isinstance(closeout, dict) else None
++    n = closeout.get(field) if isinstance(closeout, dict) else None
+     return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else 0
+ 
+ 
+@@ -135,8 +145,10 @@ def started_last_hour(db: Any, sid: str, now: float) -> int:
+ 
+ 
+ def _claim(db: Any, cand: dict, now: float) -> bool:
++    busy = _attempts(cand["meta"], "busy_attempts")
+     meta = {**cand["meta"], "closeout": {"state": "claimed", "at": now, "pid": os.getpid(),
+-                                         "attempts": _attempts(cand["meta"]) + 1}}
++                                         "attempts": _attempts(cand["meta"]) + 1,
++                                         **({"busy_attempts": busy} if busy else {})}}
+     return db._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
+                               (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"])) == 1
+ 
+@@ -265,9 +277,9 @@ def _retry_at(sid: str, now: float) -> float:
+ 
+ 
+ def _closeout_job(session_db, wake, sid: str, msg_id: int, attempts: int = 1,
+-                  retry_at: Optional[Callable[[str, float], float]] = None) -> str:
++                  retry_at: Optional[Callable[[str, float], float]] = None, busy_attempts: int = 0) -> str:
+     """Worker: the wake, then the verdict on the claimed row; a wake that did not start refreshes the outcome.
+-    A failed wake (``"error"``) with attempts left is stamped ``deferred`` for a later pass (module doc)."""
++    A failed (``"error"``) or busy wake with attempts left is stamped ``deferred`` for a later pass (module doc)."""
+     try:
+         try:
+             verdict = str(wake(sid, msg_id) or "error")
+@@ -275,7 +287,14 @@ def _closeout_job(session_db, wake, sid: str, msg_id: int, attempts: int = 1,
+             logger.warning("notice close-out wake of %s failed", sid, exc_info=True)
+             verdict = "error"
+         extra: dict = {}
+-        if verdict == "error" and attempts < MAX_ATTEMPTS:
++        if verdict == "busy":
++            busy_attempts += 1
++            extra = {"busy_attempts": busy_attempts}
++            if busy_attempts < MAX_BUSY_ATTEMPTS:
++                delay = min(BUSY_RETRY_S * 2 ** (busy_attempts - 1), BUSY_RETRY_MAX_S)
++                extra["retry_at"] = time.time() + delay
++                verdict = "deferred"
++        elif verdict == "error" and attempts - busy_attempts < MAX_ATTEMPTS:
+             now = time.time()
+             try:
+                 extra = {"retry_at": float((retry_at or _retry_at)(sid, now)), "attempts": attempts}
+@@ -350,7 +369,8 @@ def _handle(db, cand: dict, now: float, *, holders, session_db, wake, spawn, see
+         return "skipped:claimed"
+     try:
+         attempts = _attempts(cand["meta"]) + 1
+-        spawn(lambda: _closeout_job(session_db, wake, sid, cand["msg_id"], attempts=attempts))
++        busy = _attempts(cand["meta"], "busy_attempts")
++        spawn(lambda: _closeout_job(session_db, wake, sid, cand["msg_id"], attempts=attempts, busy_attempts=busy))
+     except Exception:
+         _wake_slots.release()
+         _stamp(db, cand["msg_id"], "error")
+-- 
+2.43.0
+

@@ -1,0 +1,153 @@
+From c90b995da6d890c35044b0bfd6c2fac653c292f4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:00:10 +0000
+Subject: [PATCH] [daveey] test: api_daemon re-boots only on
+ api_server_port_in_use; listener timeout carries restart.log
+
+A non-port api_server fatal (e.g. api_server_key_invalid) used to boot five
+times and then report 'never owned a free port'. api_listener_state now
+returns the settled record, api_daemon retries only the free-port race and
+fails at once with the real error code and the daemon's restart.log, and the
+listener-settle timeout carries restart.log like daemon()'s ready assert.
+
+Follow-up to review 5879571299 on #1656.
+---
+ .../gateway/fixtures/local_recovery_probe.py  | 32 +++++++---
+ tests/gateway/test_api_daemon_fixture.py      | 63 +++++++++++++++++++
+ 2 files changed, 87 insertions(+), 8 deletions(-)
+ create mode 100644 tests/gateway/test_api_daemon_fixture.py
+
+diff --git a/tests/gateway/fixtures/local_recovery_probe.py b/tests/gateway/fixtures/local_recovery_probe.py
+index 3b8510e949..344ea03f9f 100644
+--- a/tests/gateway/fixtures/local_recovery_probe.py
++++ b/tests/gateway/fixtures/local_recovery_probe.py
+@@ -151,18 +151,30 @@ def free_port():
+         return sock.getsockname()[1]
+ 
+ 
+-def api_listener_state(home, desc):
+-    """This daemon's settled ``api_server`` state from its ``gateway_state.json``: ``connected``, or
+-    ``fatal`` when the port was already taken. Keyed on identify's pid, so a killed predecessor's
+-    retained record never answers for its successor."""
++def _log_text(path):
++    try:
++        return Path(path).read_text(encoding='utf-8', errors='replace')
++    except FileNotFoundError:
++        return ''
++
++
++def api_listener_state(home, desc, log=None):
++    """This daemon's settled ``api_server`` record from its ``gateway_state.json``: ``state`` is
++    ``connected``, or ``fatal`` with its ``error_code`` (``api_server_port_in_use`` when the port was
++    already taken). Keyed on identify's pid, so a killed predecessor's retained record never answers
++    for its successor. A timeout carries the daemon's log (``log``, default ``restart.log``), as
++    ``daemon()``'s ready assert does."""
+     def settled():
+         try:
+             record = json.loads((Path(home) / 'gateway_state.json').read_text())
+         except (OSError, ValueError):
+             return None
+         api = ((record.get('platforms') or {}).get('api_server') or {}) if record.get('pid') == desc['pid'] else {}
+-        return api.get('state') if api.get('state') in ('connected', 'fatal') else None
+-    return wait_until(settled, timeout=RPC_DEADLINE, what='api_server listener settled')
++        return api if api.get('state') in ('connected', 'fatal') else None
++    try:
++        return wait_until(settled, timeout=RPC_DEADLINE, what='api_server listener settled')
++    except AssertionError as exc:
++        raise AssertionError(f'{exc}\n{_log_text(log or Path(home) / "restart.log")}') from None
+ 
+ 
+ @contextmanager
+@@ -171,14 +183,18 @@ def api_daemon(root, home, env, write_config, attempts=5):
+     be bound by a concurrent test's daemon before this one starts; the loser parks api_server
+     (``api_server_port_in_use``) yet still reports ready, and the winner, built from the same
+     fixtures (API key, model stub), answers every request, so the turns land in its state.db, not
+-    this home's. ``write_config(port)`` writes the boot's config.yaml; yields ``(proc, desc, port)``."""
++    this home's. Only that race re-boots on a fresh port; any other fatal fails at once with its
++    own error code. ``write_config(port)`` writes the boot's config.yaml; yields ``(proc, desc, port)``."""
+     for _ in range(attempts):
+         port = free_port()
+         write_config(port)
+         with daemon(root, home, {**env, 'API_SERVER_PORT': str(port)}, barrier=False) as (proc, desc):
+-            if api_listener_state(home, desc) == 'connected':
++            api = api_listener_state(home, desc)
++            if api['state'] == 'connected':
+                 yield proc, desc, port
+                 return
++            if api.get('error_code') != 'api_server_port_in_use':
++                raise AssertionError(f'api_server fatal on port {port}: {api}\n{_log_text(Path(home) / "restart.log")}')
+     raise AssertionError(f'api_server never owned a free port in {attempts} boots')
+ 
+ 
+diff --git a/tests/gateway/test_api_daemon_fixture.py b/tests/gateway/test_api_daemon_fixture.py
+new file mode 100644
+index 0000000000..b0cdf72f23
+--- /dev/null
++++ b/tests/gateway/test_api_daemon_fixture.py
+@@ -0,0 +1,63 @@
++"""``api_daemon`` re-boots only for the free-port race; other api_server fatals fail at once."""
++from contextlib import contextmanager
++import json
++
++import pytest
++
++from tests.gateway.fixtures import local_recovery_probe as probe
++
++
++def fake_boots(monkeypatch, home, records):
++    """Stand in for ``daemon``: boot N publishes ``records[N]`` as its api_server record in
++    ``gateway_state.json`` and writes a restart.log naming the boot."""
++    boots = []
++
++    @contextmanager
++    def daemon(root, home_arg, env, *, barrier):
++        assert not barrier
++        pid = 1000 + len(boots)
++        boots.append(env['API_SERVER_PORT'])
++        (home / 'restart.log').write_text(f'BOOT_LOG_{len(boots)}\n')
++        record = records[len(boots) - 1]
++        (home / 'gateway_state.json').write_text(json.dumps({'pid': pid, 'platforms': {'api_server': record}}))
++        yield object(), {'pid': pid}
++
++    ports = iter(range(41000, 41100))
++    monkeypatch.setattr(probe, 'daemon', daemon)
++    monkeypatch.setattr(probe, 'free_port', lambda: next(ports))
++    return boots
++
++
++def test_non_port_fatal_fails_after_one_boot_with_its_code(tmp_path, monkeypatch):
++    boots = fake_boots(monkeypatch, tmp_path, [{'state': 'fatal', 'error_code': 'api_server_key_invalid'}] * 5)
++    with pytest.raises(AssertionError) as raised:
++        with probe.api_daemon(tmp_path, tmp_path, {}, lambda port: None):
++            pytest.fail('a fatal api_server must not yield')
++    assert len(boots) == 1
++    assert 'api_server_key_invalid' in str(raised.value) and 'BOOT_LOG_1' in str(raised.value)
++    assert 'never owned a free port' not in str(raised.value)
++
++
++def test_port_in_use_reboots_on_a_fresh_port(tmp_path, monkeypatch):
++    lost = {'state': 'fatal', 'error_code': 'api_server_port_in_use'}
++    boots = fake_boots(monkeypatch, tmp_path, [lost, lost, {'state': 'connected'}])
++    written = []
++    with probe.api_daemon(tmp_path, tmp_path, {}, written.append) as (_, desc, port):
++        assert desc == {'pid': 1002} and port == 41002
++    assert boots == ['41000', '41001', '41002'] and written == [41000, 41001, 41002]
++
++
++def test_port_in_use_every_boot_reports_the_race(tmp_path, monkeypatch):
++    boots = fake_boots(monkeypatch, tmp_path, [{'state': 'fatal', 'error_code': 'api_server_port_in_use'}] * 3)
++    with pytest.raises(AssertionError, match='never owned a free port in 3 boots'):
++        with probe.api_daemon(tmp_path, tmp_path, {}, lambda port: None, attempts=3):
++            pass
++    assert len(boots) == 3
++
++
++def test_listener_state_timeout_carries_restart_log(tmp_path, monkeypatch):
++    monkeypatch.setattr(probe, 'RPC_DEADLINE', 0.1)
++    (tmp_path / 'restart.log').write_text('DAEMON_SAID_WHY\n')
++    (tmp_path / 'gateway_state.json').write_text(json.dumps({'pid': 7, 'platforms': {'api_server': {'state': 'connecting'}}}))
++    with pytest.raises(AssertionError, match='DAEMON_SAID_WHY'):
++        probe.api_listener_state(tmp_path, {'pid': 7})
+-- 
+2.43.0
+

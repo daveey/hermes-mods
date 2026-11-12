@@ -1,0 +1,550 @@
+From bc3b626bc2b55390f888184cf368bd2aab8dbe81 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:47:41 +0000
+Subject: [PATCH] [daveey] Defer notifier batches and queued wakes during core
+ drain
+
+---
+ gateway/kanban_watchers_notifier.py           |  9 ++
+ gateway/session_authority.py                  | 40 ++++++--
+ gateway/session_automation.py                 |  2 +-
+ gateway/session_notifier_drain.py             | 35 +++++++
+ gateway/wake.py                               |  9 +-
+ hermes_state_runtime.py                       |  5 +-
+ tests/gateway/test_notifier_core_drain.py     | 91 +++++++++++++++++++
+ tests/gateway/test_notifier_fallback_drain.py | 67 ++++++++++++++
+ .../test_notifier_claim_eligibility.py        | 90 ++++++++++++++++++
+ 9 files changed, 337 insertions(+), 11 deletions(-)
+ create mode 100644 gateway/session_notifier_drain.py
+ create mode 100644 tests/gateway/test_notifier_core_drain.py
+ create mode 100644 tests/gateway/test_notifier_fallback_drain.py
+ create mode 100644 tests/hermes_state/test_notifier_claim_eligibility.py
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index 9853408c81..80503d3520 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -750,6 +750,7 @@ class _KanbanNotification:
+             # unprefixed self-post would resume the session in the DEFAULT profile's store.
+             async with self._owner_scope():
+                 await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key,
++                                   core_update_notifier=True,
+                                    profile=self._served_wake_profile(),
+                                    notification_category="diagnostic" if self.wake_diagnostic else "result")
+             self._log_woke()
+@@ -780,6 +781,7 @@ class _KanbanNotification:
+                 raise RuntimeError(f"Kanban wake profile {self.sub_profile!r} no longer exists")
+         async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
+             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source,
++                               core_update_notifier=True,
+                                notification_category="diagnostic" if self.wake_diagnostic else "result",
+                                kanban_card=self.wake_card)
+         self._log_woke()
+@@ -898,6 +900,13 @@ class _KanbanNotification:
+         # Pings, artifact uploads (media policy) and the wake text (display.language) all read the
+         # SUBSCRIBER profile's config; the notifier thread itself runs in the launch profile's scope.
+         async with self._owner_scope():
++            from gateway.session_notifier_drain import held
++            if self.wake_agent and held():
++                # Decide once before any delivery. Refusing a later chunk on a new
++                # hold would rewind and replay earlier accepted chunks. An admitted
++                # batch settles; the next tick waits with its cursor retained.
++                await self.rewind()
++                return
+             if not await self._send_pings():
+                 return
+             # All text pings delivered (or skipped for non-push / wake-only).
+diff --git a/gateway/session_authority.py b/gateway/session_authority.py
+index 8de757f29d..0e8a8995f7 100644
+--- a/gateway/session_authority.py
++++ b/gateway/session_authority.py
+@@ -63,6 +63,7 @@ class LiveSession:
+     # Set by ``_schedule`` while a drain is alive. The claim commits off-loop, so input admitted
+     # after its transaction read the FIFO would otherwise be stranded by a drain that exits idle.
+     rescan: bool = False
++    claim_changed: asyncio.Event = field(default_factory=asyncio.Event)
+     # admission id -> its started claim, from the moment the settlement worker starts the terminal
+     # write until the completion frame is published. The write runs outside ``event_stream.lock``
+     # (a contended SQLite writer must not stall loop-side lock takers); readers holding that lock
+@@ -490,6 +491,7 @@ class SessionAuthority:
+         restore_retired(self, ref.session_id)
+         live = self.sessions[ref.session_id]
+         live.rescan = True
++        live.claim_changed.set()
+         if live.task is None or live.task.done():
+             live.task = asyncio.create_task(self._drain(ref))
+             live.task.add_done_callback(_log_drain_failure)
+@@ -1085,18 +1087,26 @@ class SessionAuthority:
+                 raise RuntimeStoreError("invalid_params")
+             return live.controls.respond(ref.session_id, generation, prompt_id, response, kind=kind)
+ 
+-    async def _claim_next(self, ref, live):
++    async def _claim_next(self, ref, live, attempted=None):
+         # False asks the pump to re-read after a queued head changed during preflight.
+         async with live.claim_gate, live.mutation_lock:
+             pending = list_session_admissions(self.db, session_id=ref.session_id)
++            live.claim_changed.clear()
+             if any(row['status'] == 'unknown' for row in pending):
+                 raise RuntimeStoreError('unknown_execution')
+             from gateway.session_update_pause import checkpoint_head, update_held, UPDATE_PAUSED
++            from gateway.session_notifier_drain import eligible, queued_head
++            # A started update checkpoint precedes every queued row; only queued selection skips
++            # notifier wakes held by a core-update drain.
+             checkpoint = checkpoint_head(self, ref)
+             if checkpoint is not None and update_held(self):
+                 return UPDATE_PAUSED, None
+             first = (get_session_admission(self.db, admission_id=checkpoint['admission_id']) if checkpoint
+-                     else next((row for row in pending if row['status'] == 'queued'), None))
++                     else queued_head(pending))
++            if attempted is not None:
++                attempted[:] = [first]
++            if checkpoint is None and first is None and any(row['status'] == 'queued' for row in pending):
++                return 'notifier_held', None
+             expected_status = 'started' if checkpoint else 'queued'
+             from gateway.config import Platform
+             if live.source.platform == Platform.LOCAL:
+@@ -1174,7 +1184,7 @@ class SessionAuthority:
+                 from gateway.session_update_pause import resume_checkpoint
+                 return await resume_checkpoint(self, ref, live, first), first
+             row = await tracked_write(self, partial(claim_session_input, self.db, epoch=self.epoch,
+-                                                    session_id=ref.session_id, _guard=self._admission_gate(),
++                                                    session_id=ref.session_id, _guard=self._admission_gate(), _eligible=eligible,
+                                                     head=first['admission_id'] if first is not None else None),
+                                       then=partial(self._stamp_claim, ref, live))
+             # Input scheduled while this claim's transaction ran may postdate its read: re-read
+@@ -1247,8 +1257,11 @@ class SessionAuthority:
+                 # Remember the attempted FIFO identity, including a started checkpoint. A
+                 # refusal must never select a queued follower behind unfinished work.
+                 attempted = next(iter(list_session_admissions(self.db, session_id=ref.session_id)), None)
++                # The row the claim actually validated: a held notifier wake is skipped, so the
++                # queued FIFO front is not necessarily the attempted queued identity.
++                selected = []
+                 try:
+-                    row, first = await self._claim_next(ref, live)
++                    row, first = await self._claim_next(ref, live, selected)
+                 except RuntimeStoreError as exc:
+                     if (attempted is not None and attempted['status'] == 'started'
+                             and exc.reason in {'admission_conflict', 'permission_denied', 'not_found',
+@@ -1270,8 +1283,15 @@ class SessionAuthority:
+                         # A verdict on the head alone (its route or binding moved under it) that every drain
+                         # repeats: pausing behind it strands the FIFO for good. Refused only once the same
+                         # head conflicted twice, read after each: never a successor a cancel advanced to.
+-                        head = next((row['admission_id'] for row in list_session_admissions(
+-                            self.db, session_id=ref.session_id) if row['status'] == 'queued'), None)
++                        candidate = selected[0] if selected else None
++                        current = (get_session_admission(self.db, admission_id=candidate['admission_id'])
++                                   if candidate is not None else None)
++                        if candidate is not None and (current is None or current['status'] != 'queued'):
++                            # A cancel settled the conflicted row while its check ran: re-read and
++                            # run whichever row is now eligible, never pause its successor.
++                            conflicted = None
++                            continue
++                        head = current['admission_id'] if current is not None else None
+                         if head is not None and head != conflicted:
+                             conflicted = head
+                             continue
+@@ -1306,6 +1326,14 @@ class SessionAuthority:
+                     return None
+                 await asyncio.sleep(_CLAIM_RETRY_MIN_S)
+                 continue
++            if row == 'notifier_held':
++                if self.runner._draining or self.retiring or self.sessions.get(ref.session_id) is not live:
++                    return None
++                try:
++                    await asyncio.wait_for(live.claim_changed.wait(), _CLAIM_RETRY_MIN_S)
++                except TimeoutError:
++                    pass  # the drain hold can expire without a new admission
++                continue
+             if row != 'classic_busy':
+                 return row, first
+             if self._drain_stopping(ref, live):
+diff --git a/gateway/session_automation.py b/gateway/session_automation.py
+index d6e67a2634..c02a7a3aee 100644
+--- a/gateway/session_automation.py
++++ b/gateway/session_automation.py
+@@ -648,7 +648,7 @@ async def admit_automation(authority, adapter, event, identity, replaces=None, f
+         then=admitted, ordered=True, after=partial(authority._schedule_admitted, ref))
+ 
+ 
+-_ROUTE_WAKE_PRODUCERS = frozenset({'kanban-wake', 'loop-tick'})
++_ROUTE_WAKE_PRODUCERS = frozenset({'kanban-wake', 'background-wake', 'loop-tick'})
+ 
+ 
+ def route_owner_lock(runner, session_id):
+diff --git a/gateway/session_notifier_drain.py b/gateway/session_notifier_drain.py
+new file mode 100644
+index 0000000000..66bcf225c2
+--- /dev/null
++++ b/gateway/session_notifier_drain.py
+@@ -0,0 +1,35 @@
++"""Selective queued notifier admission during a core-update claim hold.
++
++Receipts stay queued; only their execution waits. Human inputs and other producers
++retain their normal admission semantics. Selection is repeated inside the store's
++claim transaction so async route validation cannot authorize a different input.
++"""
++import json
++
++
++def notifier_wake(row):
++    payload = row['payload']
++    descriptor = payload.get('local_automation_v1') or (payload.get('native_text_v1') or {}).get('automation') or {}
++    identity = descriptor.get('identity')
++    if identity != row['request_id'] or not row['principal_id'].startswith('automation:'):
++        return False
++    try:
++        parts = json.loads(identity)
++    except (TypeError, ValueError):
++        return False
++    return (isinstance(parts, list) and len(parts) == 3 and parts[0] == 'kanban-wake'
++            and row['principal_id'] == 'automation:' + str(parts[1]))
++
++
++def held():
++    from agent.core_update_drain import active_hold, hold_paths
++    from hermes_cli.admission_fence import is_held
++    return active_hold() is not None or any(is_held(path.parent) for path in hold_paths())
++
++
++def eligible(row):
++    return not notifier_wake(row) or not held()
++
++
++def queued_head(pending):
++    return next((row for row in pending if row['status'] == 'queued' and eligible(row)), None)
+diff --git a/gateway/wake.py b/gateway/wake.py
+index d700844d07..03fdee33b0 100644
+--- a/gateway/wake.py
++++ b/gateway/wake.py
+@@ -126,7 +126,8 @@ def _runner_draining(adapter: Any) -> bool:
+ 
+ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
+                        notification_category: str = "result", profile: Optional[str] = None,
+-                       kanban_card: Optional[dict] = None) -> None:
++                       kanban_card: Optional[dict] = None,
++                       core_update_notifier: bool = False) -> None:
+     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
+     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
+     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
+@@ -147,10 +148,12 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
+             if kanban_card:
+                 category["kanban_cards"] = [{**kanban_card, "text": str(kanban_card.get("text") or "")[:32000]}]
+             try:
+-                if await admit_route_wake(runner, adapter, source, text, "kanban-wake", category):
++                producer = "kanban-wake" if core_update_notifier else "background-wake"
++                if await admit_route_wake(runner, adapter, source, text, producer, category):
+                     return  # committed to the session FIFO: never interrupts the admitted turn
+             except RuntimeStoreError as exc:
+                 raise WakeNotAccepted(str(exc), reason=exc.reason) from exc
++
+         synth_event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True,
+                                    metadata={"notification_category": notification_category})
+         await admit_internal_event(adapter, synth_event)
+@@ -158,6 +161,7 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
+     if not session_id:
+         raise ValueError("deliver_wake: non-push adapter (supports_async_delivery=False) "
+                          "requires the raw session id to self-post the wake turn")
++
+     extra: dict = {}
+     if profile:
+         extra["profile"] = profile
+@@ -166,6 +170,7 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
+     await _self_post_chat_completion(adapter, text=text, session_id=session_id, **extra)
+ 
+ 
++
+ def _delegation_display_metadata(evt: dict) -> dict:
+     """Display-only metadata for a persisted delegation delivery row. Mirrors
+     ``tui_gateway.server._async_delegation_display_metadata`` (same ``display_kind`` consumer
+diff --git a/hermes_state_runtime.py b/hermes_state_runtime.py
+index 3e80c2f7a2..3e02f4875d 100644
+--- a/hermes_state_runtime.py
++++ b/hermes_state_runtime.py
+@@ -231,7 +231,7 @@ def list_session_admissions(db, *, session_id: str, pending_only: bool = True) -
+ _ANY_HEAD = object()
+ 
+ 
+-def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_ANY_HEAD) -> dict | bool | None:
++def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_ANY_HEAD, _eligible=None) -> dict | bool | None:
+     """Claim the FIFO head. ``_guard(conn)`` (owner admission gate) raises to refuse inside the
+     write transaction, so a drain that began while this waited on the writer still wins.
+     ``head`` is the admission id the caller's preclaim checks validated (None: it saw nothing
+@@ -251,7 +251,8 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
+             raise RuntimeStoreError('unknown_execution')
+         if blocked or workers:
+             return None
+-        row = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='queued' ORDER BY seq LIMIT 1", (session_id,)).fetchone()
++        candidates = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='queued' ORDER BY seq", (session_id,))
++        row = next((candidate for candidate in candidates if _eligible is None or _eligible(_row(candidate))), None)
+         if head is not _ANY_HEAD and (row['admission_id'] if row is not None else None) != head:
+             return False
+         if row is None:
+diff --git a/tests/gateway/test_notifier_core_drain.py b/tests/gateway/test_notifier_core_drain.py
+new file mode 100644
+index 0000000000..f99fa00983
+--- /dev/null
++++ b/tests/gateway/test_notifier_core_drain.py
+@@ -0,0 +1,91 @@
++"""Core drain must leave receipted notifier wakes queued, without holding humans."""
++import asyncio
++import json
++import os
++import time
++
++import pytest
++
++from tests.gateway.test_wake_admitted_before_drain_authority import (
++    Hold, admissions, authority_route,
++)
++from tests.waiting import async_wait_until
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('release', ['apply', 'give-up'])
++async def test_receipted_wakes_wait_for_core_drain_but_human_bypasses(monkeypatch, tmp_path, release):
++    from agent import core_update_drain
++    from gateway.platforms.event import MessageEvent
++    from gateway.run_runtime import settle_gateway_runtime
++    from gateway.wake import deliver_wake
++
++    marker = tmp_path / "drain-hold"
++    monkeypatch.setattr(core_update_drain, "hold_paths", lambda: [marker])
++    executed, hold = [], Hold()
++    runner, adapter, authority, source = await authority_route(monkeypatch, "owner", executed, hold)
++    try:
++        await adapter.handle_message(MessageEvent(text="A", source=source, message_id="A"))
++        await asyncio.wait_for(hold.running.wait(), 10)
++        for text in ("wake-1", "wake-2"):
++            await deliver_wake(adapter, text=text, source=source, core_update_notifier=True)
++        marker.write_text(json.dumps({"pid": os.getpid(), "reason": "fixture core drain"}))
++        assert core_update_drain.active_hold() is not None
++        hold.finish.set()
++        await adapter.handle_message(MessageEvent(text="human", source=source, message_id="human"))
++        await async_wait_until(
++            lambda: admissions(runner, authority, source)[-1] == ("messaging", "terminal", "completed"),
++            what="human bypasses deferred notifier wakes",
++        )
++        assert executed == [("owner", "A"), ("owner", "human")], (
++            "core drain starved: receipted notifier wakes started new turns during hold", executed)
++        assert admissions(runner, authority, source)[1:3] == [
++            ("automation", "queued", None), ("automation", "queued", None)]
++        await async_wait_until(lambda: runner._active_work_count() == 0,
++                               what="settlement unwinds to an idle core-update census")
++        if release == 'apply':
++            marker.unlink()
++        else:
++            marker.write_text(json.dumps({'pid': os.getpid(), 'started_at': time.time() - 10, 'max_s': 1}))
++        await async_wait_until(
++            lambda: all(status == "terminal" for _, status, _ in admissions(runner, authority, source)),
++            what="deferred wakes released after core drain",
++        )
++        assert executed == [("owner", text) for text in ("A", "human", "wake-1", "wake-2")]
++    finally:
++        hold.finish.set()
++        marker.unlink(missing_ok=True)
++        await settle_gateway_runtime(runner)
++
++
++@pytest.mark.asyncio
++async def test_new_human_wakes_held_pump_without_waiting_for_poll(monkeypatch, tmp_path):
++    from agent import core_update_drain
++    from gateway import session_authority
++    from gateway.platforms.event import MessageEvent
++    from gateway.run_runtime import settle_gateway_runtime
++    from gateway.wake import deliver_wake
++
++    marker = tmp_path / 'drain-hold'
++    monkeypatch.setattr(core_update_drain, 'hold_paths', lambda: [marker])
++    monkeypatch.setattr(session_authority, '_CLAIM_RETRY_MIN_S', 60)
++    executed, hold = [], Hold()
++    runner, adapter, authority, source = await authority_route(monkeypatch, 'owner', executed, hold)
++    try:
++        await adapter.handle_message(MessageEvent(text='A', source=source, message_id='A'))
++        await asyncio.wait_for(hold.running.wait(), 10)
++        await deliver_wake(adapter, text='wake', source=source, core_update_notifier=True)
++        marker.write_text(json.dumps({'pid': os.getpid()}))
++        hold.finish.set()
++        await async_wait_until(lambda: runner._active_work_count() == 0, what='held pump idle')
++        # The 60-second hold poll cannot be what admits this human.
++        await adapter.handle_message(MessageEvent(text='human', source=source, message_id='human'))
++        await async_wait_until(lambda: ('owner', 'human') in executed, timeout=5,
++                               what='human admission signals the held pump')
++        assert executed == [('owner', 'A'), ('owner', 'human')]
++    finally:
++        hold.finish.set()
++        marker.unlink(missing_ok=True)
++        for live in authority.sessions.values():
++            live.claim_changed.set()
++        await settle_gateway_runtime(runner)
+diff --git a/tests/gateway/test_notifier_fallback_drain.py b/tests/gateway/test_notifier_fallback_drain.py
+new file mode 100644
+index 0000000000..a4e00b2eb6
+--- /dev/null
++++ b/tests/gateway/test_notifier_fallback_drain.py
+@@ -0,0 +1,67 @@
++"""Batch-level holds never rewind a partially accepted notifier batch."""
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++
++from gateway.config import Platform
++from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
++from tests.gateway import test_kanban_wake_acceptance as helpers
++
++
++@pytest.mark.asyncio
++async def test_notifier_batch_hold_and_mid_batch_release(tmp_path, monkeypatch):
++    from gateway import session_notifier_drain
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_notify as kbn
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
++    (tmp_path / 'config.yaml').write_text('display: {suppress_warning_notifications: true}')
++    runner, _adapter, _source, key = helpers.setup_route()
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title='batch', assignee='worker', session_id=key)
++        kbn.add_notify_sub(conn, task_id=tid, platform='telegram', chat_id='42',
++                           user_id='42', chat_type='dm', delivery_mode='wake')
++        kb.block_task(conn, tid, reason='failure', kind='transient')
++        kb.complete_task(conn, tid, summary='result')
++    finally:
++        conn.close()
++    held = [True]
++    monkeypatch.setattr(session_notifier_drain, 'held', lambda: held[0])
++    delivered = []
++
++    async def wake(self):
++        delivered.append((self.synth, self.wake_diagnostic))
++        held[0] = True  # hold begins after first accepted chunk
++
++    monkeypatch.setattr(_KanbanNotification, 'wake', wake)
++
++    async def tick():
++        deliveries = await asyncio.to_thread(_notifier_collect, runner, kb,
++            notifier_profile=None, gc_due=False, gc_retention_days=30)
++        for delivery in deliveries:
++            await _KanbanNotification(runner, delivery, platform_cls=Platform,
++                                      sub_fail_counts={}).deliver()
++
++    await tick()
++    await tick()
++    assert delivered == []
++    held[0] = False
++    await tick()
++    assert [item[1] for item in delivered] == [True, False]
++    held[0] = False
++    await tick()
++    assert len(delivered) == 2
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('notifier', [False, True])
++async def test_native_wake_producer_is_explicit(monkeypatch, notifier):
++    from gateway import wake, session_automation
++    admit = AsyncMock(return_value=True)
++    monkeypatch.setattr(session_automation, 'admit_route_wake', admit)
++    adapter = SimpleNamespace(gateway_runner=object(), supports_async_delivery=True)
++    await wake.deliver_wake(adapter, text='wake', source=object(), core_update_notifier=notifier)
++    assert admit.await_args is not None
++    assert admit.await_args.args[4] == ('kanban-wake' if notifier else 'background-wake')
+diff --git a/tests/hermes_state/test_notifier_claim_eligibility.py b/tests/hermes_state/test_notifier_claim_eligibility.py
+new file mode 100644
+index 0000000000..8611d13c38
+--- /dev/null
++++ b/tests/hermes_state/test_notifier_claim_eligibility.py
+@@ -0,0 +1,90 @@
++"""Selective FIFO eligibility is transactional and never bypasses execution fences."""
++import json
++
++import pytest
++
++from gateway.session_notifier_drain import eligible, notifier_wake
++from hermes_state import SessionDB
++import hermes_state_runtime as rt
++
++
++def wake_payload(identity, local=False):
++    descriptor = {'identity': identity}
++    return {'local_automation_v1': descriptor} if local else {'native_text_v1': {'automation': descriptor}}
++
++
++@pytest.mark.parametrize('local', [False, True])
++def test_exact_head_hold_flip_and_restart(monkeypatch, tmp_path, local):
++    from agent import core_update_drain
++    held = [True]
++    monkeypatch.setattr(core_update_drain, 'active_hold', lambda: {} if held[0] else None)
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    try:
++        db.create_session('s', source='test')
++        epoch = rt.begin_runtime_epoch(db, instance_id='first')
++        identity = json.dumps(['kanban-wake', 'route', 'one'])
++        wake = rt.admit_session_input(db, epoch=epoch, session_id='s', principal_id='automation:route',
++                                     request_id=identity, payload=wake_payload(identity, local))
++        human = rt.admit_session_input(db, epoch=epoch, session_id='s', principal_id='human',
++                                      request_id='human', payload={'text': identity})
++        args = dict(epoch=epoch, session_id='s', _eligible=eligible)
++        # A wake preflight completed before the hold: it cannot authorize the human behind it.
++        assert rt.claim_session_input(db, **args, head=wake['admission_id']) is False
++        # A human preflight completed while held, then the hold cleared: FIFO is restored.
++        held[0] = False
++        assert rt.claim_session_input(db, **args, head=human['admission_id']) is False
++        held[0] = True
++        claimed = rt.claim_session_input(db, **args, head=human['admission_id'])
++        assert claimed['admission_id'] == human['admission_id']
++        assert rt.claim_session_input(db, **args) is None  # started input always fences
++        rt.settle_session_input(db, epoch=epoch, admission_id=claimed['admission_id'],
++                                generation=claimed['generation'], outcome='completed')
++        db.close()
++        db = SessionDB(db_path=tmp_path / 'state.db')
++        epoch = rt.begin_runtime_epoch(db, instance_id='replacement')
++        assert rt.recover_session_inputs(db, epoch=epoch) == 0
++        args['epoch'] = epoch
++        assert rt.claim_session_input(db, **args) is None
++        assert rt.get_session_admission(db, admission_id=wake['admission_id'])['status'] == 'queued'
++        held[0] = False
++        claimed = rt.claim_session_input(db, **args)
++        assert claimed['admission_id'] == wake['admission_id']
++        rt.settle_session_input(db, epoch=epoch, admission_id=claimed['admission_id'],
++                                generation=claimed['generation'], outcome='completed')
++        assert rt.claim_session_input(db, **args) is None
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize('kind', ['human', 'other-route', 'other-producer', 'mismatch', 'malformed', 'shape'])
++def test_non_notifier_inputs_never_filtered(kind, monkeypatch):
++    from agent import core_update_drain
++    monkeypatch.setattr(core_update_drain, 'active_hold', lambda: {'pid': 1})
++    identity = json.dumps(['kanban-wake', 'route', 'one'])
++    row = {'principal_id': 'automation:route', 'request_id': identity, 'payload': wake_payload(identity)}
++    identities = {'other-producer': json.dumps(['loop-tick', 'route', 'one']),
++                  'malformed': 'not json', 'shape': json.dumps({'kanban-wake': True})}
++    mutations: dict[str, dict] = {'human': {'principal_id': 'human'},
++                 'other-route': {'principal_id': 'automation:other'},
++                 'mismatch': {'request_id': 'other'}}
++    mutations.update({key: {'request_id': value, 'payload': wake_payload(value)}
++                      for key, value in identities.items()})
++    row.update(mutations[kind])
++    assert not notifier_wake(row)
++    assert eligible(row)
++
++
++@pytest.mark.parametrize('root_index', [0, 1])
++def test_window_fence_without_drain_marker(tmp_path, monkeypatch, root_index):
++    from agent import core_update_drain
++    from gateway.session_notifier_drain import held
++    roots = [tmp_path / 'installation' / 'core-update', tmp_path / 'profile' / 'core-update']
++    monkeypatch.setattr(core_update_drain, 'hold_paths', lambda: [root / 'drain-hold' for root in roots])
++    assert not held()
++    marker = roots[root_index] / 'holds' / 'hermes-sync'
++    marker.parent.mkdir(parents=True)
++    marker.touch()
++    assert core_update_drain.active_hold() is None
++    assert held()
++    marker.unlink()
++    assert not held()
+-- 
+2.43.0
+

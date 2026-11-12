@@ -1,0 +1,1035 @@
+From 2122713602aa20867ab079bf86cb4a1ab7939966 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 09:59:43 +0000
+Subject: [PATCH] fix(kanban): tolerate transient ask probe failures and report
+ lost detection [daveey]
+
+---
+ gateway/kanban_watchers_notifier.py           |  16 +-
+ hermes_cli/kanban_ask_resolved.py             |  31 ++-
+ hermes_cli/kanban_block_notice.py             |  42 ++-
+ hermes_cli/kanban_db.py                       |   2 +-
+ hermes_cli/kanban_db_connect.py               |   1 +
+ locales/af.yaml                               |   2 +
+ locales/ar.yaml                               |   2 +
+ locales/de.yaml                               |   2 +
+ locales/en.yaml                               |   2 +
+ locales/es.yaml                               |   2 +
+ locales/fr.yaml                               |   2 +
+ locales/ga.yaml                               |   2 +
+ locales/hu.yaml                               |   2 +
+ locales/it.yaml                               |   2 +
+ locales/ja.yaml                               |   2 +
+ locales/ko.yaml                               |   2 +
+ locales/pt.yaml                               |   2 +
+ locales/ru.yaml                               |   2 +
+ locales/tr.yaml                               |   2 +
+ locales/uk.yaml                               |   2 +
+ locales/zh-hant.yaml                          |   2 +
+ locales/zh.yaml                               |   2 +
+ .../test_kanban_ask_failure_grace.py          |  94 +++++++
+ .../test_kanban_ask_grace_migration.py        |  34 +++
+ .../test_kanban_ask_resolved_check.py         |   4 +-
+ .../test_kanban_ask_resolved_sync.py          |   4 +-
+ .../test_kanban_resolved_check_drop_notice.py | 251 ++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          |  20 ++
+ tui_gateway/kanban_remote_observations.py     |   4 +
+ tui_gateway/session_notifications.py          |  17 +-
+ 30 files changed, 534 insertions(+), 20 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_ask_failure_grace.py
+ create mode 100644 tests/hermes_cli/test_kanban_ask_grace_migration.py
+ create mode 100644 tests/hermes_cli/test_kanban_resolved_check_drop_notice.py
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index adbd2be1db..9853408c81 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -19,6 +19,7 @@ from agent.i18n import t
+ 
+ from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
+ from gateway.wake import session_owned_by_profile
++from hermes_cli.kanban_block_notice import coalesce_superseded_blocks
+ 
+ 
+ def _kbc():
+@@ -50,10 +51,10 @@ def _pin_first():
+ # ``dependency_parent_unclaimed`` (hermes_cli.kanban_parent_unclaimed) wakes the waiting chat: it must act on the
+ # parent that cannot start (bump, re-place, do it here), not answer "ready but not started" when asked. [daveey]
+ # ``chat_wait_unclaimed`` (hermes_cli.kanban_chat_wait) does the same for a card the chat waits on directly.
+-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed", "chat_wait_unclaimed", "request_withdrawn")
++TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed", "chat_wait_unclaimed", "request_withdrawn", "resolved_check_broken", "resolved_check_lost")
+ # Kinds that hand a decision back to the origin, which must take a turn.
+ # status/archived/unblocked are bookkeeping.
+-_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "dependency_parent_unclaimed", "chat_wait_unclaimed", "request_withdrawn", "failure_finalized")
++_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "dependency_parent_unclaimed", "chat_wait_unclaimed", "request_withdrawn", "failure_finalized", "resolved_check_broken", "resolved_check_lost")
+ TERMINAL_KINDS = (*TERMINAL_KINDS, "failure_finalized")
+ 
+ 
+@@ -332,6 +333,7 @@ class _Collector:
+         )
+         if not events:
+             return None
++        events = coalesce_superseded_blocks(events)  # cursor range stays whole; only the render is coalesced
+         task = self.kb.get_task(conn, sub["task_id"])
+         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
+                      len(events), sub["task_id"], slug, old_cursor, cursor)
+@@ -534,6 +536,14 @@ def _fmt_timed_out(ev, n) -> tuple:
+     return t("gateway.kanban.ping.timed_out", head=n.head, span=span), None, None
+ 
+ 
++def _fmt_resolved_check_drop(ev, n) -> tuple:
++    """The ask's probe was dropped (resolved_check_broken/_lost): the block notice plus the loss of automatic
++    detection, delivered once per drop event through the subscription cursor. [daveey]"""
++    from hermes_cli.kanban_block_notice import block_notice
++    body = block_notice(n.task, n.task_id, n.board_slug, reason=str(_payload(ev, "reason") or ""), drop_event=ev.kind)
++    return f"⏸ {n.head} {body}", body, None
++
++
+ def _fmt_request_withdrawn(ev, n):
+     detail = ("the card was archived. No answer is needed for this request; "
+               "this is not approval and not proof of completion.")
+@@ -545,6 +555,8 @@ def _fmt_request_withdrawn(ev, n):
+ # never wake the creator.
+ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+     "request_withdrawn": _fmt_request_withdrawn,
++    "resolved_check_broken": _fmt_resolved_check_drop,
++    "resolved_check_lost": _fmt_resolved_check_drop,
+     "completed": _fmt_completed,
+     "blocked": _fmt_blocked,
+     "failure_finalized": _fmt_failure("failure_finalized"),
+diff --git a/hermes_cli/kanban_ask_resolved.py b/hermes_cli/kanban_ask_resolved.py
+index 60658fccb0..63011836f2 100644
+--- a/hermes_cli/kanban_ask_resolved.py
++++ b/hermes_cli/kanban_ask_resolved.py
+@@ -24,8 +24,9 @@ pair button, flipped the Settings toggle), so the card does not sit blocked unti
+   needs its own card id is filed with ``kanban block`` after the create. An idempotent create that returns an
+   existing card runs no probe.
+ * One exit 0 appends an ``ask_resolved`` event, comments, and unblocks through the normal unblock path
+-  (``ready``, or ``todo`` behind an open parent). ``BROKEN_AFTER`` failures in a row comment once, drop the probe
+-  and leave the card blocked: a broken probe never answers for David and is never restored.
++  (``ready``, or ``todo`` behind an open parent). ``BROKEN_AFTER`` consecutive failures spanning at least
++  ``BROKEN_MIN_SECONDS`` drop the probe, mark the ask and notify its origins once. Exit 1 resets the streak.
++  The card stays blocked: a broken probe never answers for David and is never restored until re-filed.
+ """
+ from __future__ import annotations
+ 
+@@ -47,6 +48,7 @@ RESTORED_EVENT = "resolved_check_restored"
+ LOST_EVENT = "resolved_check_lost"
+ ALIVE_EVENT = "resolved_check_alive"
+ SILENT_EVENT = "resolved_check_host_silent"
++BROKEN_MIN_SECONDS = 6 * 60 * 60
+ 
+ 
+ def _request(value: Any) -> Optional[dict]:
+@@ -231,6 +233,10 @@ def filing_fields(conn: sqlite3.Connection, human_request: Any) -> dict:
+ 
+ def store_request(conn: sqlite3.Connection, task_id: str, human_request: Optional[dict]) -> None:
+     """Write the card's human_request and (re)register its resolved_check probe. Caller holds the write txn."""
++    if human_request:
++        human_request = dict(human_request)
++        human_request.pop("resolved_check_dropped_at", None)
++        human_request.pop("resolved_check_drop_reason", None)
+     conn.execute("UPDATE tasks SET human_request = ? WHERE id = ?",
+                  (json.dumps(human_request) if human_request else None, task_id))
+     sync_row(conn, task_id)
+@@ -263,6 +269,14 @@ def satisfied_note(cmd: str, tail: str) -> str:
+             "Verify the state and continue; don't redo the asked action.")
+ 
+ 
++def mark_dropped(conn: sqlite3.Connection, task_id: str, kind: str, now: int) -> None:
++    """Persist probe custody loss alongside its event; keep the filed action intact."""
++    row = conn.execute("SELECT human_request FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    request = _request(row[0]) or {}
++    request.update(resolved_check_dropped_at=now, resolved_check_drop_reason=kind)
++    conn.execute("UPDATE tasks SET human_request = ? WHERE id = ?", (json.dumps(request), task_id))
++
++
+ def broken_note(cmd: str, rc: Any, fails: int, tail: str) -> str:
+     return (f"This ask's resolved_check `{cmd}` failed {fails} times in a row (last rc {rc}): `{tail}`. It is no "
+             "longer probed and the card stays blocked on David's ask; re-file the ask with a fixed resolved_check "
+@@ -313,18 +327,22 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             return None
+         nxt = now + int(state["every"])
+         if rc == 1:
+-            conn.execute("UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, next_at = ? "
++            conn.execute("UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, first_failure_at = NULL, next_at = ? "
+                          "WHERE task_id = ?", (now, tail, nxt, task_id))
+             note_alive(conn, task_id, cmd, now)
+             return None
+         fails = int(state["fails"] or 0) + 1
++        first = conn.execute("SELECT first_failure_at FROM task_wake_checks WHERE task_id = ?", (task_id,)).fetchone()[0]
++        # Legacy rows have a count but no start time: grant a fresh grace period.
++        first = now if first is None else int(first)
+         rc_col = rc if isinstance(rc, int) else -1
+-        if fails < kwc.BROKEN_AFTER:
+-            conn.execute("UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, fails = ?, next_at = ? "
+-                         "WHERE task_id = ?", (now, rc_col, tail, fails, nxt, task_id))
++        if fails < kwc.BROKEN_AFTER or now - first < BROKEN_MIN_SECONDS:
++            conn.execute("UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, fails = ?, next_at = ?, first_failure_at = ? "
++                         "WHERE task_id = ?", (now, rc_col, tail, fails, nxt, first, task_id))
+             note_alive(conn, task_id, cmd, now)
+             return None
+         conn.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (task_id,))
++        mark_dropped(conn, task_id, BROKEN_EVENT, now)
+         kb._append_event(conn, task_id, BROKEN_EVENT, {"cmd": cmd, "rc": rc, "fails": fails, "output": tail})
+         kb.add_comment(conn, task_id, AUTHOR, broken_note(cmd, rc, fails, tail))
+         return BROKEN_EVENT
+@@ -446,6 +464,7 @@ def reconcile(conn: sqlite3.Connection, *, now: Optional[int] = None) -> dict:
+                                                               **({"probe_host": host} if host else {})})
+                 out["restored"].append(tid)
+             else:
++                mark_dropped(conn, tid, LOST_EVENT, now)
+                 kb._append_event(conn, tid, LOST_EVENT, {"cmd": cmd, "filed_event_id": filed_id})
+                 kb.add_comment(conn, tid, AUTHOR, lost_note(cmd))
+                 out["lost"].append(tid)
+diff --git a/hermes_cli/kanban_block_notice.py b/hermes_cli/kanban_block_notice.py
+index 99854e27bc..fb407c1433 100644
+--- a/hermes_cli/kanban_block_notice.py
++++ b/hermes_cli/kanban_block_notice.py
+@@ -66,7 +66,39 @@ def ask_update_notice(task, task_id: str, board: str, payload, *, chat_id: str |
+     return f"ask updated (card still blocked): {text} — open task: {link}"
+ 
+ 
+-def block_notice(task, task_id: str, board: str, *, gateway: str = "", reason: str = "", actor: str = "") -> str:
++DROP_EVENTS = ("resolved_check_broken", "resolved_check_lost")
++_DROP_CAUSE = {"resolved_check_broken": "its probe kept failing", "resolved_check_lost": "its probe went missing"}
++
++
++def coalesce_superseded_blocks(events):
++    """Drop ``blocked`` events that a later drop event in the same unseen batch supersedes. [daveey]
++
++    The drop notice renders the current card (block text plus the lost-detection warning), so the earlier
++    ``blocked`` of the same batch would print the same marked card twice. Only blocks older than a drop event
++    in this batch go; an ordinary block, or one re-filed after the drop, is kept. Callers keep the full claimed
++    cursor range, so ack/rewind semantics are unchanged.
++    """
++    events = list(events)
++    last_drop = max((int(e.id) for e in events if e.kind in DROP_EVENTS), default=None)
++    if last_drop is None:
++        return events
++    return [e for e in events if not (e.kind == "blocked" and int(e.id) < last_drop)]
++
++
++def drop_warning(request: dict, drop_event: str = "") -> str:
++    """Notice head for an ask whose resolved_check was dropped. [daveey]
++
++    The filed ask text may promise "I'll notice automatically"; that was true when it was filed and is not now,
++    so the caller renders it under a label that makes it historical (persisted text is never edited).
++    """
++    cause = _DROP_CAUSE.get(str(request.get("resolved_check_drop_reason") or drop_event))
++    return ("Automatic detection stopped" + (f" ({cause})" if cause else "") + ": this ask's resolved_check is no "
++            "longer probed, so the card will NOT resume by itself when your step is done. It resumes only if you "
++            "unblock it or the ask is re-filed with a working resolved_check.")
++
++
++def block_notice(task, task_id: str, board: str, *, gateway: str = "", reason: str = "",
++                 actor: str = "", drop_event: str = "") -> str:
+     """Use current card evidence, never event prose, to assign a human action.
+ 
+     Links open the existing task flow; this function grants no authority and
+@@ -89,6 +121,14 @@ def block_notice(task, task_id: str, board: str, *, gateway: str = "", reason: s
+         lines = [f"blocked — actor: {actor or 'user'}", f"Next action for the user: {request['action']}",
+                  f"Why only the user: {request['why_human']}", f"Scope: {request['scope']}",
+                  f"Open task: {link}"]
++        if request.get("resolved_check_dropped_at"):
++            lines[1:2] = [drop_warning(request, drop_event),
++                          "Your step is still needed. Filed ask, historical wording (any promise below to detect "
++                          "it automatically no longer applies):", lines[1]]
++            lines.insert(1, f"Work: {get('title') or task_id}")
++        elif drop_event in DROP_EVENTS:  # re-filed since the drop: never report "stopped" as the current state
++            lines.insert(1, "Automatic detection had stopped for an earlier version of this ask; it was re-filed "
++                            "since, so this is the current ask.")
+         if request["interaction"] == "user_terminal":
+             lines.append("Use the owner Desktop session's user-terminal flow; opening this task or unblocking it does not execute a command or grant terminal authority.")
+         return "\n".join(lines)
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 8543302a27..96a1b3ea1f 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1019,7 +1019,7 @@ CREATE TABLE IF NOT EXISTS task_wake_checks (
+     last_at   INTEGER,
+     last_rc   INTEGER,
+     last_out  TEXT,
+-    fails     INTEGER NOT NULL DEFAULT 0,
++    fails     INTEGER NOT NULL DEFAULT 0, first_failure_at INTEGER,
+     generation TEXT, purpose TEXT NOT NULL DEFAULT 'wake'  -- 'wake' (park) | 'ask_resolved' (kanban_ask_resolved)
+ );
+ 
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 48d691dcde..83e1c02256 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1128,6 +1128,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+     if _table_exists(conn, "task_wake_checks"):
+         _add_column_if_missing(conn, "task_wake_checks", "generation", "generation TEXT")
+         _add_column_if_missing(conn, "task_wake_checks", "purpose", "purpose TEXT NOT NULL DEFAULT 'wake'")
++        _add_column_if_missing(conn, "task_wake_checks", "first_failure_at", "first_failure_at INTEGER")
+     cols = _column_names(conn, "tasks")
+     for name, ddl in _BASE_TASK_COLUMNS + _EARLY_TASK_COLUMNS:
+         if name not in cols:
+diff --git a/locales/af.yaml b/locales/af.yaml
+index f22dcf3012..8099da8c7a 100644
+--- a/locales/af.yaml
++++ b/locales/af.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "(geen uitvoer)"
+     wake:
+       request_withdrawn: "versoek teruggetrek (nie goedkeuring of bewys van voltooiing nie)"
++      resolved_check_broken: "outomatiese opsporing van jou stap het gestop (die toets het aanhou misluk); die versoek moet weer ingedien word om self te hervat"
++      resolved_check_lost: "outomatiese opsporing van jou stap het gestop (die toets het verdwyn); die versoek moet weer ingedien word om self te hervat"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/ar.yaml b/locales/ar.yaml
+index f1b20c12ab..a32213f16c 100644
+--- a/locales/ar.yaml
++++ b/locales/ar.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "(لا يوجد خرج)"
+     wake:
+       request_withdrawn: "تم سحب الطلب (ليس موافقة أو دليلاً على الإكمال)"
++      resolved_check_broken: "توقف الاكتشاف التلقائي لخطوتك (استمر فشل الفحص)؛ يجب إعادة تقديم الطلب ليستأنف تلقائياً"
++      resolved_check_lost: "توقف الاكتشاف التلقائي لخطوتك (فُقد الفحص)؛ يجب إعادة تقديم الطلب ليستأنف تلقائياً"
+       completed: "اكتملت"
+       gave_up: "استسلم (نفدت المحاولات)"
+       crashed: "تعطّل (خرج العامل)؛ سيعيد المُوزّع المحاولة"
+diff --git a/locales/de.yaml b/locales/de.yaml
+index 59735d2f7a..789663d8dd 100644
+--- a/locales/de.yaml
++++ b/locales/de.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "(keine Ausgabe)"
+     wake:
+       request_withdrawn: "Anfrage zurückgezogen (keine Genehmigung oder Bestätigung des Abschlusses)"
++      resolved_check_broken: "automatische Erkennung deines Schritts wurde eingestellt (die Prüfung schlug wiederholt fehl); die Anfrage muss neu gestellt werden, damit sie von selbst fortgesetzt wird"
++      resolved_check_lost: "automatische Erkennung deines Schritts wurde eingestellt (die Prüfung ging verloren); die Anfrage muss neu gestellt werden, damit sie von selbst fortgesetzt wird"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/en.yaml b/locales/en.yaml
+index 43ecb2d458..d4edabc323 100644
+--- a/locales/en.yaml
++++ b/locales/en.yaml
+@@ -229,6 +229,8 @@ gateway:
+     no_output: "(no output)"
+     wake:
+       request_withdrawn: "request withdrawn (not approval or proof of completion)"
++      resolved_check_broken: "automatic detection of your step stopped (its probe kept failing); the ask must be re-filed to resume on its own"
++      resolved_check_lost: "automatic detection of your step stopped (its probe went missing); the ask must be re-filed to resume on its own"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/es.yaml b/locales/es.yaml
+index b2d4816807..7583ab5df5 100644
+--- a/locales/es.yaml
++++ b/locales/es.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "(sin salida)"
+     wake:
+       request_withdrawn: "solicitud retirada (no es aprobación ni prueba de finalización)"
++      resolved_check_broken: "la detección automática de tu paso se detuvo (su comprobación siguió fallando); hay que volver a presentar la solicitud para que se reanude sola"
++      resolved_check_lost: "la detección automática de tu paso se detuvo (su comprobación se perdió); hay que volver a presentar la solicitud para que se reanude sola"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/fr.yaml b/locales/fr.yaml
+index a3bcbffed1..efaa57eef0 100644
+--- a/locales/fr.yaml
++++ b/locales/fr.yaml
+@@ -252,6 +252,8 @@ gateway:
+     no_output: "(aucune sortie)"
+     wake:
+       request_withdrawn: "demande retirée (ni approbation ni preuve d’achèvement)"
++      resolved_check_broken: "la détection automatique de votre étape s’est arrêtée (sa vérification n’a cessé d’échouer) ; la demande doit être redéposée pour reprendre d’elle-même"
++      resolved_check_lost: "la détection automatique de votre étape s’est arrêtée (sa vérification a disparu) ; la demande doit être redéposée pour reprendre d’elle-même"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/ga.yaml b/locales/ga.yaml
+index 61c55b81e9..24c907a57d 100644
+--- a/locales/ga.yaml
++++ b/locales/ga.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "(gan aschur)"
+     wake:
+       request_withdrawn: "iarratas tarraingthe siar (ní ceadú ná cruthúnas ar chríochnú é)"
++      resolved_check_broken: "stop an bhrath uathoibríoch ar do chéim (lean an tástáil ag teipeadh); caithfear an t-iarratas a athsholáthar le go bhfeidhmeoidh sé arís leis féin"
++      resolved_check_lost: "stop an bhrath uathoibríoch ar do chéim (chaill an tástáil); caithfear an t-iarratas a athsholáthar le go bhfeidhmeoidh sé arís leis féin"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/hu.yaml b/locales/hu.yaml
+index 8efbc00409..4fe06ae215 100644
+--- a/locales/hu.yaml
++++ b/locales/hu.yaml
+@@ -229,6 +229,8 @@ gateway:
+     no_output: "(nincs kimenet)"
+     wake:
+       request_withdrawn: "kérés visszavonva (nem jóváhagyás és nem bizonyítja a befejezést)"
++      resolved_check_broken: "a lépésed automatikus észlelése leállt (az ellenőrzés újra és újra meghiúsult); a kérést újra be kell nyújtani, hogy magától folytatódjon"
++      resolved_check_lost: "a lépésed automatikus észlelése leállt (az ellenőrzés elveszett); a kérést újra be kell nyújtani, hogy magától folytatódjon"
+       completed: "befejeződött"
+       gave_up: "feladva (az újrapróbálkozások elfogytak)"
+       crashed: "összeomlott (a worker kilépett); a diszpécser újrapróbálja"
+diff --git a/locales/it.yaml b/locales/it.yaml
+index c63240b8f1..b63623be0d 100644
+--- a/locales/it.yaml
++++ b/locales/it.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "(nessun output)"
+     wake:
+       request_withdrawn: "richiesta ritirata (non è approvazione né prova di completamento)"
++      resolved_check_broken: "il rilevamento automatico del tuo passaggio si è interrotto (il controllo continuava a fallire); la richiesta va ripresentata per riprendere da sola"
++      resolved_check_lost: "il rilevamento automatico del tuo passaggio si è interrotto (il controllo è andato perso); la richiesta va ripresentata per riprendere da sola"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/ja.yaml b/locales/ja.yaml
+index 556e803a98..92d06e58e4 100644
+--- a/locales/ja.yaml
++++ b/locales/ja.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "(出力なし)"
+     wake:
+       request_withdrawn: "依頼は取り下げられました（承認や完了の証明ではありません）"
++      resolved_check_broken: "あなたの手順の自動検出が停止しました（確認処理が失敗し続けました）。自動で再開するには依頼を出し直す必要があります"
++      resolved_check_lost: "あなたの手順の自動検出が停止しました（確認処理が失われました）。自動で再開するには依頼を出し直す必要があります"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/ko.yaml b/locales/ko.yaml
+index f8387da7bd..406abad7db 100644
+--- a/locales/ko.yaml
++++ b/locales/ko.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "(출력 없음)"
+     wake:
+       request_withdrawn: "요청 철회됨 (승인 또는 완료 증명이 아님)"
++      resolved_check_broken: "사용자 단계의 자동 감지가 중단되었습니다 (확인 검사가 계속 실패함). 자동으로 재개되려면 요청을 다시 제출해야 합니다"
++      resolved_check_lost: "사용자 단계의 자동 감지가 중단되었습니다 (확인 검사가 사라짐). 자동으로 재개되려면 요청을 다시 제출해야 합니다"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/pt.yaml b/locales/pt.yaml
+index dcd6a01d2b..c5c63707a5 100644
+--- a/locales/pt.yaml
++++ b/locales/pt.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "(sem saída)"
+     wake:
+       request_withdrawn: "pedido retirado (não é aprovação nem prova de conclusão)"
++      resolved_check_broken: "a deteção automática do seu passo parou (a verificação continuou a falhar); o pedido tem de ser reenviado para retomar sozinho"
++      resolved_check_lost: "a deteção automática do seu passo parou (a verificação perdeu-se); o pedido tem de ser reenviado para retomar sozinho"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/ru.yaml b/locales/ru.yaml
+index e8451ca6ba..601c0912bf 100644
+--- a/locales/ru.yaml
++++ b/locales/ru.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "(нет вывода)"
+     wake:
+       request_withdrawn: "запрос отозван (не является одобрением или подтверждением завершения)"
++      resolved_check_broken: "автоматическое обнаружение вашего шага остановлено (проверка постоянно завершалась ошибкой); чтобы продолжить самостоятельно, запрос нужно подать заново"
++      resolved_check_lost: "автоматическое обнаружение вашего шага остановлено (проверка пропала); чтобы продолжить самостоятельно, запрос нужно подать заново"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/tr.yaml b/locales/tr.yaml
+index f97a8c6b99..5f56172717 100644
+--- a/locales/tr.yaml
++++ b/locales/tr.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "(çıktı yok)"
+     wake:
+       request_withdrawn: "istek geri çekildi (onay veya tamamlanma kanıtı değildir)"
++      resolved_check_broken: "adımınızın otomatik algılanması durdu (denetimi sürekli başarısız oldu); kendiliğinden devam etmesi için isteğin yeniden verilmesi gerekir"
++      resolved_check_lost: "adımınızın otomatik algılanması durdu (denetimi kayboldu); kendiliğinden devam etmesi için isteğin yeniden verilmesi gerekir"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/uk.yaml b/locales/uk.yaml
+index 6fc8532bbb..f7d357c805 100644
+--- a/locales/uk.yaml
++++ b/locales/uk.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "(немає виводу)"
+     wake:
+       request_withdrawn: "запит відкликано (не є схваленням або підтвердженням завершення)"
++      resolved_check_broken: "автоматичне виявлення вашого кроку зупинено (перевірка постійно завершувалася помилкою); щоб продовжити самостійно, запит треба подати знову"
++      resolved_check_lost: "автоматичне виявлення вашого кроку зупинено (перевірка зникла); щоб продовжити самостійно, запит треба подати знову"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/zh-hant.yaml b/locales/zh-hant.yaml
+index 5ddac29ccc..60c828f16f 100644
+--- a/locales/zh-hant.yaml
++++ b/locales/zh-hant.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "（無輸出）"
+     wake:
+       request_withdrawn: "請求已撤回（不代表批准或完成證明）"
++      resolved_check_broken: "你的步驟自動偵測已停止（其檢查持續失敗）；必須重新提交請求才能自行恢復"
++      resolved_check_lost: "你的步驟自動偵測已停止（其檢查已遺失）；必須重新提交請求才能自行恢復"
+       completed: "completed"
+       gave_up: "gave up (retries exhausted)"
+       crashed: "crashed (worker exited); dispatcher will retry"
+diff --git a/locales/zh.yaml b/locales/zh.yaml
+index 9e5ecf4fc7..7973fe71a5 100644
+--- a/locales/zh.yaml
++++ b/locales/zh.yaml
+@@ -226,6 +226,8 @@ gateway:
+     no_output: "（无输出）"
+     wake:
+       request_withdrawn: "请求已撤回（不代表批准或完成证明）"
++      resolved_check_broken: "你的步骤自动检测已停止（其检查持续失败）；必须重新提交请求才能自行恢复"
++      resolved_check_lost: "你的步骤自动检测已停止（其检查已丢失）；必须重新提交请求才能自行恢复"
+       completed: "已完成"
+       gave_up: "已放弃（重试次数耗尽）"
+       crashed: "崩溃（worker 异常退出），dispatcher 将重试"
+diff --git a/tests/hermes_cli/test_kanban_ask_failure_grace.py b/tests/hermes_cli/test_kanban_ask_failure_grace.py
+new file mode 100644
+index 0000000000..0950370e97
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ask_failure_grace.py
+@@ -0,0 +1,94 @@
++"""Elapsed-time grace for human-ask probes; transient outages are not permanent."""
++import json
++
++from hermes_cli import kanban_ask_resolved as kar
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import test_kanban_ask_resolved_check as helpers
++
++board = helpers.board
++
++
++def result(conn, tid, at, rc=255):
++    state = kwc.get_state(conn, tid)
++    return kar.apply_result(conn, tid, state['cmd'], rc, 'connection closed',
++                            generation=state['generation'], now=at)
++
++
++def test_three_failures_within_hour_keep_probe(board):
++    with kbc.connect_closing() as conn:
++        tid = helpers._blocked_ask(conn, 'exit 255')
++        for at in (1000, 1900, 2800):
++            assert result(conn, tid, at) is None
++        assert kwc.get_state(conn, tid)['fails'] == 3
++        assert not helpers._events(conn, tid, kar.BROKEN_EVENT)
++        assert conn.execute('SELECT first_failure_at FROM task_wake_checks WHERE task_id=?', (tid,)).fetchone()[0] == 1000
++
++
++def test_three_failures_spanning_six_hours_drop_once_and_mark(board):
++    with kbc.connect_closing() as conn:
++        tid = helpers._blocked_ask(conn, 'exit 255')
++        state = kwc.get_state(conn, tid)
++        assert result(conn, tid, 1000) is None
++        assert result(conn, tid, 22599) is None
++        assert result(conn, tid, 22600) == kar.BROKEN_EVENT
++        assert kwc.get_state(conn, tid) is None
++        request = kb.get_task(conn, tid).human_request
++        if isinstance(request, str):
++            request = json.loads(request)
++        assert request['resolved_check_dropped_at'] == 22600
++        assert request['resolved_check_drop_reason'] == kar.BROKEN_EVENT
++        assert kar.apply_result(conn, tid, state['cmd'], 255, '', generation=state['generation'], now=23000) is None
++        assert len(helpers._events(conn, tid, kar.BROKEN_EVENT)) == 1
++        assert not kar.reconcile(conn, now=24000)['restored']
++
++
++def test_not_yet_resets_failure_time_and_counter(board):
++    with kbc.connect_closing() as conn:
++        tid = helpers._blocked_ask(conn, 'exit 255')
++        for at, rc in ((1000,255), (2000,255), (21000,1), (22000,255), (23000,255), (24000,255)):
++            assert result(conn, tid, at, rc) is None
++        assert kwc.get_state(conn, tid)['fails'] == 3
++        assert conn.execute('SELECT first_failure_at FROM task_wake_checks WHERE task_id=?', (tid,)).fetchone()[0] == 22000
++        assert not helpers._events(conn, tid, kar.BROKEN_EVENT)
++
++
++def test_elapsed_time_alone_is_not_broken(board):
++    with kbc.connect_closing() as conn:
++        tid = helpers._blocked_ask(conn, 'exit 255')
++        assert result(conn, tid, 0) is None
++        assert result(conn, tid, 21600) is None
++        assert kwc.get_state(conn, tid)['fails'] == 2
++        assert result(conn, tid, 21601) == kar.BROKEN_EVENT
++
++
++def test_lost_probe_marks_and_refiling_clears_mark(board):
++    with kbc.connect_closing() as conn:
++        tid = helpers._blocked_ask(conn, 'exit 1')
++        for at in (1000, 2000):
++            with kb.write_txn(conn):
++                conn.execute('DELETE FROM task_wake_checks WHERE task_id=?', (tid,))
++            kar.reconcile(conn, now=at)
++        request = kb.get_task(conn, tid).human_request
++        if isinstance(request, str):
++            request = json.loads(request)
++        assert request['resolved_check_dropped_at'] == 2000
++        assert request['resolved_check_drop_reason'] == kar.LOST_EVENT
++        assert kar.reconcile(conn, now=3000)['lost'] == []
++        with kb.write_txn(conn):
++            kar.store_request(conn, tid, request)
++        request = kb.get_task(conn, tid).human_request
++        if isinstance(request, str):
++            request = json.loads(request)
++        assert 'resolved_check_dropped_at' not in request
++        assert kwc.get_state(conn, tid)['fails'] == 0
++
++
++def test_legacy_failure_count_starts_new_grace(board):
++    with kbc.connect_closing() as conn:
++        tid = helpers._blocked_ask(conn, 'exit 255')
++        with kb.write_txn(conn):
++            conn.execute('UPDATE task_wake_checks SET fails=5, last_at=1 WHERE task_id=?', (tid,))
++        assert result(conn, tid, 100000) is None
++        assert kwc.get_state(conn, tid)['fails'] == 6
+diff --git a/tests/hermes_cli/test_kanban_ask_grace_migration.py b/tests/hermes_cli/test_kanban_ask_grace_migration.py
+new file mode 100644
+index 0000000000..1cbbf9e77b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ask_grace_migration.py
+@@ -0,0 +1,34 @@
++"""Legacy boards gain failure timing without inventing outage age."""
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_ask_resolved as kar
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import test_kanban_ask_resolved_check as helpers
++
++board = helpers.board
++
++
++def test_legacy_column_migration_preserves_armed_probe(board):
++    with kbc.connect_closing() as conn:
++        tid = helpers._blocked_ask(conn, 'exit 255')
++        with kb.write_txn(conn):
++            conn.execute('ALTER TABLE task_wake_checks DROP COLUMN first_failure_at')
++            conn.execute('UPDATE task_wake_checks SET fails=2 WHERE task_id=?', (tid,))
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        row = conn.execute('SELECT first_failure_at, fails FROM task_wake_checks WHERE task_id=?', (tid,)).fetchone()
++        assert tuple(row) == (None, 2)
++        state = kwc.get_state(conn, tid)
++        assert kar.apply_result(conn, tid, state['cmd'], 255, '', generation=state['generation'], now=100000) is None
++        assert kwc.get_state(conn, tid)['fails'] == 3
++
++
++def test_satisfied_clears_streak_and_refile_starts_fresh(board):
++    with kbc.connect_closing() as conn:
++        tid = helpers._blocked_ask(conn, 'exit 255')
++        state = kwc.get_state(conn, tid)
++        assert kar.apply_result(conn, tid, state['cmd'], 255, '', generation=state['generation'], now=1000) is None
++        assert kar.apply_result(conn, tid, state['cmd'], 0, '', generation=state['generation'], now=2000) == kar.EVENT
++        assert kwc.get_state(conn, tid) is None
++        assert kb.get_task(conn, tid).status == 'ready'
+diff --git a/tests/hermes_cli/test_kanban_ask_resolved_check.py b/tests/hermes_cli/test_kanban_ask_resolved_check.py
+index c0257beba6..909184cc74 100644
+--- a/tests/hermes_cli/test_kanban_ask_resolved_check.py
++++ b/tests/hermes_cli/test_kanban_ask_resolved_check.py
+@@ -292,8 +292,8 @@ def test_broken_resolved_check_comments_once_and_never_unblocks(board):
+         for i in range(kwc.BROKEN_AFTER - 1):
+             kwc.run_due_wake_checks(conn, now=now + 200 * (i + 1), wait=True)
+             assert kwc.get_state(conn, tid)["fails"] == i + 1
+-        kwc.run_due_wake_checks(conn, now=now + 200 * kwc.BROKEN_AFTER, wait=True)
+-        kwc.run_due_wake_checks(conn, now=now + 200 * (kwc.BROKEN_AFTER + 2), wait=True)
++        kwc.run_due_wake_checks(conn, now=now + 200 + kar.BROKEN_MIN_SECONDS, wait=True)
++        kwc.run_due_wake_checks(conn, now=now + 400 + kar.BROKEN_MIN_SECONDS, wait=True)
+         assert kb.get_task(conn, tid).status == "blocked"
+         broken = _events(conn, tid, kar.BROKEN_EVENT)
+         assert len(broken) == 1 and "kaput" in broken[0].payload["output"]
+diff --git a/tests/hermes_cli/test_kanban_ask_resolved_sync.py b/tests/hermes_cli/test_kanban_ask_resolved_sync.py
+index 4ea0cf7b92..c47e1b606e 100644
+--- a/tests/hermes_cli/test_kanban_ask_resolved_sync.py
++++ b/tests/hermes_cli/test_kanban_ask_resolved_sync.py
+@@ -218,7 +218,7 @@ def test_an_exhausted_probe_is_never_restored_until_the_ask_is_refiled(board, tm
+     tid = _blocked(board, f"sh {script}")
+     now = int(time.time())
+     for i in range(kwc.BROKEN_AFTER):
+-        kwc.run_due_wake_checks(board, now=now + 200 * (i + 1), wait=True)
++        kwc.run_due_wake_checks(board, now=now + 200 + kar.BROKEN_MIN_SECONDS * i, wait=True)
+     assert len(_events(board, tid, kar.BROKEN_EVENT)) == 1 and kwc.get_state(board, tid) is None
+     for i in range(3):
+         kwc.run_due_wake_checks(board, now=now + 5000 + 200 * i, wait=True)
+@@ -260,7 +260,7 @@ def test_a_permanently_stopped_probe_takes_no_write_txn(board, tmp_path, monkeyp
+     broken = _blocked(board, f"sh {script}")
+     now = int(time.time())
+     for i in range(kwc.BROKEN_AFTER):
+-        kwc.run_due_wake_checks(board, now=now + 200 * (i + 1), wait=True)
++        kwc.run_due_wake_checks(board, now=now + 200 + kar.BROKEN_MIN_SECONDS * i, wait=True)
+     lost = _blocked(board, "exit 1")
+     for _ in range(2):
+         _lose(board, lost)
+diff --git a/tests/hermes_cli/test_kanban_resolved_check_drop_notice.py b/tests/hermes_cli/test_kanban_resolved_check_drop_notice.py
+new file mode 100644
+index 0000000000..b2c6c1ef50
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_resolved_check_drop_notice.py
+@@ -0,0 +1,251 @@
++"""A dropped resolved_check (resolved_check_broken / _lost) notifies each card origin exactly once.
++
++The notice must say automatic detection stopped until the ask is re-filed, and must not repeat the filed ask's
++own "I'll notice automatically" promise as if it were still true.
++"""
++import asyncio
++import json
++import sqlite3
++from contextlib import closing
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_cli.kanban_block_notice import block_notice
++from tests.gateway import test_kanban_changes_requested_notifier as helpers
++from tests.tui_gateway.test_kanban_remote_notices import CHAT, _card, _hub as _base_hub
++from tui_gateway import kanban_remote_notices as krn
++from tui_gateway import server
++
++PROMISE = "I will detect this automatically once the DNS record exists and resume the card on my own."
++DROPPED_AT = 1_800_000_100
++
++
++def _request(dropped=True, **extra):
++    req = {"action": f"Create the DNS record. {PROMISE}", "why_human": "Only you hold the registrar login",
++           "interaction": "external", "scope": "example.com TXT record", "evidence": "dig exited 1",
++           "resolved_check": "dig +short TXT x.example.com | grep -q ok", "resolved_check_every": 900}
++    if dropped:
++        req.update(resolved_check_dropped_at=DROPPED_AT, resolved_check_drop_reason="resolved_check_broken")
++    req.update(extra)
++    return req
++
++
++def _drop(conn, tid, event="resolved_check_broken", request=None, seen=True, produce=True):
++    """Exercise the real atomic drop producer before collecting its origin notices."""
++    from hermes_cli import kanban_ask_resolved as kar
++    from hermes_cli import kanban_wake_check as kwc
++    request = request or _request(dropped=False)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?", (tid,))
++        kar.store_request(conn, tid, request)
++        kb._append_event(conn, tid, 'blocked', {})
++        if seen:  # original block delivered before the probe failed; seen=False models an offline origin
++            conn.execute('UPDATE kanban_notify_subs SET last_event_id=(SELECT MAX(id) FROM task_events WHERE task_id=?) WHERE task_id=?', (tid, tid))
++    if not produce:
++        return
++    if event == kar.BROKEN_EVENT:
++        state = kwc.get_state(conn, tid)
++        for at in (DROPPED_AT - 21600, DROPPED_AT - 100, DROPPED_AT):
++            kar.apply_result(conn, tid, state['cmd'], 255, 'connection closed',
++                             generation=state['generation'], now=at)
++    else:
++        for at in (DROPPED_AT - 100, DROPPED_AT):
++            with kb.write_txn(conn):
++                conn.execute('DELETE FROM task_wake_checks WHERE task_id=?', (tid,))
++            kar.reconcile(conn, now=at)
++
++
++def _assert_drop_wording(text):
++    low = text.lower()
++    assert "automatic detection stopped" in low
++    assert "re-filed" in low
++    assert "historical" in low  # the filed prose is labelled, not left as a live promise
++    # The stale promise only survives inside the explicitly labelled historical quote.
++    assert low.index("historical") < low.index("detect this automatically")
++    assert "Create the DNS record" in text  # the human step itself is not altered or dropped
++
++
++# -- shared formatter ----------------------------------------------------------------------------
++
++@pytest.mark.parametrize("event", ["resolved_check_broken", "resolved_check_lost"])
++def test_block_notice_marks_stale_promise_historical(event):
++    task = {"status": "blocked", "block_kind": "needs_input",
++            "human_request": json.dumps(_request(resolved_check_drop_reason=event))}
++    body = block_notice(task, "t_1", "default", drop_event=event)
++    _assert_drop_wording(body)
++    assert "blocked — actor: user" in body and "Open task: @task:default/t_1" in body
++
++
++def test_block_notice_for_dropped_card_without_event_name_still_warns():
++    body = block_notice({"status": "blocked", "human_request": _request()}, "t_1", "default")
++    _assert_drop_wording(body)
++
++
++def test_undropped_ask_renders_unchanged_and_refiled_ask_is_not_called_stopped():
++    plain = block_notice({"status": "blocked", "human_request": _request(dropped=False)}, "t_1", "default")
++    assert "stopped" not in plain.lower() and "historical" not in plain.lower()
++    refiled = block_notice({"status": "blocked", "human_request": _request(dropped=False)}, "t_1", "default",
++                           drop_event="resolved_check_lost")
++    assert "re-filed since" in refiled.lower() and "stopped" in refiled.lower()
++    assert "historical" not in refiled.lower()
++    resolved = block_notice({"status": "ready", "human_request": _request()}, "t_1", "default",
++                            drop_event="resolved_check_lost")
++    assert resolved.startswith("Earlier block resolved")
++
++
++# -- gateway (telegram etc.) path ------------------------------------------------------------------
++
++@pytest.mark.parametrize("event", ["resolved_check_broken", "resolved_check_lost"])
++def test_gateway_notifier_sends_and_wakes_origin_exactly_once(tmp_path, monkeypatch, event):
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "drop.db"))
++    kb.init_db()
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="DNS", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1", delivery_mode="notify+wake")
++        _drop(conn, tid, event)
++    adapter = helpers.RecordingAdapter()
++    runner = helpers._runner(adapter)
++    for _ in range(3):
++        runner._running = True
++        asyncio.run(helpers._run_one_tick(monkeypatch, runner))
++    texts = [s["text"] for s in adapter.sent if "automatic detection stopped" in s["text"].lower()]
++    assert len(texts) == 1, adapter.sent
++    _assert_drop_wording(texts[0])
++    assert len(adapter.handled) == 1
++    _assert_drop_wording(adapter.handled[0].text)
++
++
++# -- local TUI path ----------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("event", ["resolved_check_broken", "resolved_check_lost"])
++def test_tui_origin_gets_one_notice_per_drop_event(event):
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="DNS", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="drop-chat")
++        _drop(conn, tid, event)
++        claims = []
++        texts = server._collect_kanban_notifications({"session_key": "drop-chat"}, claims)
++        assert len(texts) == 1 and len(claims) == 1
++        _assert_drop_wording(texts[0])
++        claim = claims[0]
++        assert kbn.ack_notify_claim(conn, task_id=tid, platform="tui", chat_id="drop-chat", thread_id="",
++                                    upto=claim["new"], from_cursor=claim["old"])
++        assert server._collect_kanban_notifications({"session_key": "drop-chat"}) == []
++
++
++# -- remote (hub replica) path -----------------------------------------------------------------------
++
++# -- offline origin: unseen original block followed by a drop ------------------------------------------
++
++def _stops(texts):
++    return [x for x in texts if "automatic detection stopped" in str(x).lower()]
++
++
++def _plain_block(conn, tid):
++    _drop(conn, tid, seen=False, request=_request(dropped=False), produce=False)  # an ordinary unseen block
++
++
++@pytest.mark.parametrize("event", ["resolved_check_broken", "resolved_check_lost"])
++def test_tui_offline_origin_unseen_block_plus_drop_warns_once(event):
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="DNS", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="off-chat")
++        _drop(conn, tid, event, seen=False)
++        claims = []
++        texts = server._collect_kanban_notifications({"session_key": "off-chat"}, claims)
++        assert len(texts) == 1 and len(_stops(texts)) == 1, texts
++        _assert_drop_wording(texts[0])
++        claim = claims[0]  # the whole range (block + drop) is acked; nothing replays
++        assert kbn.ack_notify_claim(conn, task_id=tid, platform="tui", chat_id="off-chat", thread_id="",
++                                    upto=claim["new"], from_cursor=claim["old"])
++        assert server._collect_kanban_notifications({"session_key": "off-chat"}) == []
++
++
++def test_tui_ordinary_block_alone_still_notifies():
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="DNS", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="plain-chat")
++        _plain_block(conn, tid)
++        texts = server._collect_kanban_notifications({"session_key": "plain-chat"})
++        assert len(texts) == 1 and not _stops(texts), texts
++
++
++def test_tui_drop_alone_still_notifies():
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="DNS", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="dalone-chat")
++        _drop(conn, tid, seen=True)
++        texts = server._collect_kanban_notifications({"session_key": "dalone-chat"})
++        assert len(texts) == 1 and len(_stops(texts)) == 1
++
++
++@pytest.mark.parametrize("event", ["resolved_check_broken", "resolved_check_lost"])
++def test_gateway_offline_origin_unseen_block_plus_drop_sends_one_stop_warning(tmp_path, monkeypatch, event):
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "off.db"))
++    kb.init_db()
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="DNS", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1", delivery_mode="notify+wake")
++        _drop(conn, tid, event, seen=False)
++    adapter = helpers.RecordingAdapter()
++    runner = helpers._runner(adapter)
++    for _ in range(3):
++        runner._running = True
++        asyncio.run(helpers._run_one_tick(monkeypatch, runner))
++    assert len(_stops([s["text"] for s in adapter.sent])) == 1, adapter.sent
++    assert len(adapter.handled) == 1 and len(_stops([adapter.handled[0].text])) == 1
++
++
++def test_gateway_ordinary_block_alone_still_sends(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "plain.db"))
++    kb.init_db()
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="DNS", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1", delivery_mode="notify+wake")
++        _plain_block(conn, tid)
++    adapter = helpers.RecordingAdapter()
++    runner = helpers._runner(adapter)
++    runner._running = True
++    asyncio.run(helpers._run_one_tick(monkeypatch, runner))
++    assert len(adapter.sent) == 1 and not _stops([s["text"] for s in adapter.sent])
++
++
++def test_remote_origin_gets_one_extra_notice_when_the_replica_shows_the_drop(tmp_path):
++    t0 = 1_800_000_000.0
++    replica = _base_hub(tmp_path, [])
++    with sqlite3.connect(replica) as conn:
++        conn.executemany("INSERT INTO meta VALUES (?,?)", [("cursor", "100"), ("head", "100")])
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++
++    def put(card, seq):
++        with sqlite3.connect(replica) as conn:
++            conn.execute("DELETE FROM replica WHERE key=?", (card["key"],))
++            conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,?)", (card["key"], json.dumps(card["task"]), seq))
++        krn._reset_for_tests()
++
++    def poll(now):
++        got = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now)
++        for claim in got:
++            assert krn.ack(claim, ledger=ledger)
++        return got
++
++    assert poll(t0 - 60) == []
++    card = _card("t_drop", CHAT, status="blocked", at=t0)
++    card["task"]["human_request"] = _request(dropped=False)
++    put(card, 1)
++    first = poll(t0 + 5)
++    assert len(first) == 1 and "automatic detection stopped" not in first[0]["text"].lower()
++    assert poll(t0 + 6) == []
++    card["task"]["human_request"] = _request(resolved_check_dropped_at=t0 + 60)
++    put(card, 2)
++    second = poll(t0 + 65)
++    assert len(second) == 1, second
++    _assert_drop_wording(second[0]["text"])
++    assert second[0]["state"] != first[0]["state"]
++    assert poll(t0 + 66) == []
++    krn._reset_for_tests()
++    assert poll(t0 + 67) == []
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 92f4742aaf..b42af5247a 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -73,7 +73,27 @@ def _ro(path: Path) -> sqlite3.Connection:
+         return conn
+ 
+ 
++def drop_mark(task: dict) -> Optional[float]:
++    """``human_request.resolved_check_dropped_at`` of a blocked remote card (the owner's dropped-probe mark).
++
++    A drop is a new state of the block, so it is the state's time: the dropped card gets its own ledger identity
++    (``blocked@<dropped_at>``) and notifies each origin once more, even after the earlier block was delivered."""
++    request = task.get("human_request")
++    if isinstance(request, str):
++        try:
++            request = json.loads(request)
++        except ValueError:
++            return None
++    if task.get("status") != "blocked" or not isinstance(request, dict):
++        return None
++    with contextlib.suppress(TypeError, ValueError):
++        return float(request.get("resolved_check_dropped_at")) or None
++    return None
++
++
+ def _terminal_at(task: dict) -> Optional[float]:
++    if (dropped := drop_mark(task)) is not None:
++        return dropped
+     run = task.get("run") if isinstance(task.get("run"), dict) else {}
+     for value in (task.get("completed_at") if task.get("status") == "done" else None, run.get("ended_at")):
+         with contextlib.suppress(TypeError, ValueError):
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index b324d4cd91..28cdd2e342 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -61,6 +61,8 @@ _decoded_files: dict[str, tuple | None] = {}  # replica -> file identity its _de
+ 
+ 
+ def _summary(task) -> dict | None:
++    from tui_gateway.kanban_remote_notices import drop_mark
++
+     if not isinstance(task, dict):
+         return None
+     withdrawal = _withdrawal(task)
+@@ -74,6 +76,8 @@ def _summary(task) -> dict | None:
+     notice = notice if isinstance(notice, dict) else {}
+     return {"status": task.get("status"), "completed_at": task.get("completed_at"),
+             "run": {"ended_at": run.get("ended_at")},
++            "human_request": ({"resolved_check_dropped_at": drop_mark(task)}
++                              if drop_mark(task) is not None else None),
+             "completion_notice": {"created_at": notice.get("created_at")}}
+ 
+ 
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 9dfb084c52..29f269873f 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -169,7 +169,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
+ # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
+ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked",
+                         "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed",
+-                        "chat_wait_unclaimed", "request_withdrawn", "failure_finalized")
++                        "chat_wait_unclaimed", "request_withdrawn", "failure_finalized", "resolved_check_broken",
++                        "resolved_check_lost")
+ # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
+ # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
+ _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
+@@ -615,6 +616,8 @@ def _kb_parent_unclaimed(payload: dict) -> str:
+ _KANBAN_EVENT_FORMATTERS = {
+     "request_withdrawn": ("ℹ", lambda t, p, title: " request withdrawn: the card was archived. "
+                          "No answer is needed for this request; this is not approval and not proof of completion."),
++    "resolved_check_broken": ("⏸", lambda t, p, title: " blocked"),  # body rendered by block_notice in the formatter
++    "resolved_check_lost": ("⏸", lambda t, p, title: " blocked"),
+     "completed": ("✔", _kb_completed),
+     "blocked": ("⏸", lambda t, p, title: " blocked" + (f": {str(p.get('reason'))[:160]}" if p.get("reason") else "")),
+     "failure_finalized": ("✖", lambda t, p, title: _kb_failure("failure_finalized", p, title)),
+@@ -643,12 +646,14 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
+     who = getattr(task, "assignee", None) or ""
+     prefix = f"{glyph} " + (f"[{board_slug}] " if board_slug else "") + (f"@{who} " if who else "")
+     payload = getattr(ev, "payload", None) or {}
+-    if getattr(ev, "kind", "") == "blocked":
++    if getattr(ev, "kind", "") in ("blocked", "resolved_check_broken", "resolved_check_lost"):
+         from hermes_cli.kanban_block_notice import ask_update_notice, block_notice, is_metadata_only
+-        if is_metadata_only(payload):  # an ask amendment, not a new block; silent for the editing chat [daveey]
++        if ev.kind == "blocked" and is_metadata_only(payload):  # an ask amendment, not a new block [daveey]
+             body = ask_update_notice(task, task_id, board_slug, payload, chat_id=sub.get("chat_id"))
+             return f"{prefix}Kanban {task_id} {body}" if body is not None else None
+-        return f"{prefix}Kanban {task_id} " + block_notice(task, task_id, board_slug, reason=str(payload.get("reason") or ""), actor=str(payload.get("actor") or ""))
++        return f"{prefix}Kanban {task_id} " + block_notice(task, task_id, board_slug, reason=str(payload.get("reason") or ""),
++                                                         actor=str(payload.get("actor") or ""),
++                                                         drop_event=ev.kind if ev.kind != "blocked" else "")
+     if getattr(ev, "kind", "") == "completed":
+         # A worker refused a send into this chat put its message in the summary as a FINAL SEND line. [daveey]
+         from hermes_cli.kanban_final_send import final_send_for_chat
+@@ -790,10 +795,10 @@ def _kb_poll_board_now(_kb, _kbc, _kbn, slug: str, session_key: str, claims: lis
+                          "claimed_mono": time.monotonic()}
+                 claims.append(claim)
+             task = _kb.get_task(conn, sub["task_id"])
+-            from gateway.kanban_watchers_notifier import diagnostic_event
++            from gateway.kanban_watchers_notifier import coalesce_superseded_blocks, diagnostic_event
+             from gateway.warning_notifications import DiagnosticText
+             sub_texts = []
+-            for ev in events:
++            for ev in coalesce_superseded_blocks(events):  # a block superseded by a drop in this batch renders once
+                 text = _format_kanban_event_text(sub, task, ev, slug)
+                 if text:
+                     text = DiagnosticText(text) if diagnostic_event(ev) else _KanbanText(text)
+-- 
+2.43.0
+

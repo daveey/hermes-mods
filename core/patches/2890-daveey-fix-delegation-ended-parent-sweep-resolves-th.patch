@@ -1,0 +1,304 @@
+From 76236e116bcce7ff6b16cabde3eca2c84024c39f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:48:20 +0000
+Subject: [PATCH] [daveey] fix(delegation): ended-parent sweep resolves the
+ delegator past compression; spares pinned rows; recovery ends a compressed
+ child's open tip
+
+Follow-up to review 5878780845 of #1600 (non-blocking points S1-S3).
+
+- S1: end_subagents_of_ended_parents judged a subagent row by its immediate
+  parent. A compressed child's continuation has its own compressed segment as
+  parent (end_reason='compression', always ended), so it was reaped while the
+  delegating parent was still open. The sweep now walks up the row's own
+  subagent compression segments (_delegating_parent_on) and requires that
+  delegator to be ended.
+- S2: exclude_pinned, as in sweep_orphaned_sessions (pinned rows and the
+  unpinned continuations a pinned segment covers); the startup reaper passes
+  exclude_pinned=True like its orphan sweep.
+- S3: recovery / stall force-finalize ended only the ids persisted at dispatch;
+  after a child compressed, its open row is a continuation of that id. They now
+  end the open rows of each verified child's compression lineage (a delegate
+  child of a segment is not a continuation and stays open).
+- end_terminal_unit_children docstring: a worker process's units are not
+  covered by owner recovery; say what actually closes them.
+---
+ hermes_state_maintenance.py                   |  56 +++++++--
+ .../test_async_delegation_child_row_end.py    | 109 ++++++++++++++++++
+ tools/async_delegation.py                     |  30 ++++-
+ tui_gateway/session_reaper.py                 |   2 +-
+ 4 files changed, 179 insertions(+), 18 deletions(-)
+
+diff --git a/hermes_state_maintenance.py b/hermes_state_maintenance.py
+index f6aaa19ac7..457f48b605 100644
+--- a/hermes_state_maintenance.py
++++ b/hermes_state_maintenance.py
+@@ -107,6 +107,33 @@ def _not_pinned_sql(alias: str = "s") -> str:
+     return f"COALESCE({alias}.pinned, 0) = 0 AND {alias}.id NOT IN ({_PINNED_TAIL_SQL})"
+ 
+ 
++# One hop up a ``subagent`` row's own compression lineage: its parent is a compressed ``subagent`` segment it
++# continues (not a delegate child of that segment, whose ``_delegate_from`` names it).
++_SUBAGENT_SEGMENT_PARENT_SQL = ("SELECT p.id FROM sessions c JOIN sessions p ON p.id = c.parent_session_id"
++                                f" WHERE c.id = ? AND p.source = 'subagent' AND {_CONTINUATION_EDGE_SQL}")
++_LINEAGE_WALK_CAP = 1000
++
++
++def _delegating_parent_on(conn, session_id: str) -> Optional[str]:
++    """The row that delegated *session_id*: the ``parent_session_id`` of the first segment of its compression
++    lineage. A compressed child's continuation names its previous segment as parent, not the delegator."""
++    current, seen = session_id, {session_id}
++    for _ in range(_LINEAGE_WALK_CAP):
++        row = conn.execute(_SUBAGENT_SEGMENT_PARENT_SQL, (current,)).fetchone()
++        if row is None or row[0] in seen:
++            break
++        current = row[0]
++        seen.add(current)
++    row = conn.execute("SELECT parent_session_id FROM sessions WHERE id = ?", (current,)).fetchone()
++    return row[0] if row is not None else None
++
++
++def _delegator_ended_on(conn, session_id: str) -> bool:
++    delegator = _delegating_parent_on(conn, session_id)
++    return bool(delegator) and conn.execute(
++        "SELECT 1 FROM sessions WHERE id = ? AND ended_at IS NOT NULL", (delegator,)).fetchone() is not None
++
++
+ class SessionMaintenanceMixin:
+     """Retention pruning, stale-session archiving and VACUUM policy for SessionDB."""
+ 
+@@ -218,20 +245,26 @@ class SessionMaintenanceMixin:
+ 
+     def end_subagents_of_ended_parents(
+         self, *, max_idle_seconds: float, exclude_ids: tuple[str, ...] = (),
+-        end_reason: str = "parent_ended_reap",
++        end_reason: str = "parent_ended_reap", exclude_pinned: bool = False,
+     ) -> list[str]:
+-        """[daveey] Close open ``subagent`` rows whose parent row is already ended and that have been idle (by
+-        ``started_at`` AND canonical last activity) at least ``max_idle_seconds``. A delegate child's real owner is
+-        the process that ran its parent's turn, so ``sweep_orphaned_sessions``' heartbeat guess (any live backend
+-        started before the row could own it) kept such rows open for as long as some backend outlived them, which on
+-        a host whose backends restart many times a day is indefinitely. A parent that has ended (reaped, closed or
+-        rotated by compression) has no turn left to own the child. ``end_reason`` differs from
+-        ``startup_orphan_reap`` so the reap's killed-subagent notice is not re-sent hours late to a chat that already
+-        received the delegation's own result. Write guards and ``exclude_ids`` spare rows as in the orphan sweep."""
++        """[daveey] Close open ``subagent`` rows whose delegating parent row is already ended and that have been
++        idle (by ``started_at`` AND canonical last activity) at least ``max_idle_seconds``. A delegate child's real
++        owner is the process that ran its parent's turn, so ``sweep_orphaned_sessions``' heartbeat guess (any live
++        backend started before the row could own it) kept such rows open for as long as some backend outlived them,
++        which on a host whose backends restart many times a day is indefinitely. A parent that has ended (reaped,
++        closed or rotated by compression) has no turn left to own the child. A compressed child's continuation has
++        its own compressed segment as ``parent_session_id``, so the delegating parent is found by walking past those
++        segments (``_delegating_parent_on``): an open delegator keeps its child's continuation. ``end_reason``
++        differs from ``startup_orphan_reap`` so the reap's killed-subagent notice is not re-sent hours late to a chat
++        that already received the delegation's own result. Write guards, ``exclude_ids`` and ``exclude_pinned``
++        spare rows as in the orphan sweep."""
+         if max_idle_seconds <= 0:
+             return []
+         cutoff = time.time() - max_idle_seconds
+-        scope_sql = (f" AND source = 'subagent' AND started_at < ? AND {_sql_session_last_active('sessions')} < ?"
++        pin_scope = f" AND {_not_pinned_sql('sessions')}" if exclude_pinned else ""
++        # Prefilter: the immediate parent is ended (the delegator, or a compressed segment of the child itself).
++        scope_sql = (f" AND source = 'subagent'{pin_scope} AND started_at < ?"
++                     f" AND {_sql_session_last_active('sessions')} < ?"
+                      " AND parent_session_id IS NOT NULL AND EXISTS (SELECT 1 FROM sessions p WHERE"
+                      " p.id = sessions.parent_session_id AND p.ended_at IS NOT NULL)")
+         scope_params = (cutoff, cutoff)
+@@ -240,7 +273,8 @@ class SessionMaintenanceMixin:
+             rows = conn.execute(f"SELECT id FROM sessions WHERE ended_at IS NULL{scope_sql}", scope_params).fetchall()
+             excluded = {str(x) for x in exclude_ids if x}
+             victims = [sid for sid in (str(row["id"]) for row in rows)
+-                       if sid not in excluded and not self._write_guards_reject(conn, sid)]
++                       if sid not in excluded and _delegator_ended_on(conn, sid)
++                       and not self._write_guards_reject(conn, sid)]
+             if not victims:
+                 return []
+             conn.execute(
+diff --git a/tests/tools/test_async_delegation_child_row_end.py b/tests/tools/test_async_delegation_child_row_end.py
+index f89784aa12..e646c38b1d 100644
+--- a/tests/tools/test_async_delegation_child_row_end.py
++++ b/tests/tools/test_async_delegation_child_row_end.py
+@@ -201,3 +201,112 @@ def test_startup_sweep_closes_subagent_of_ended_parent_despite_live_heartbeat(db
+ 
+     assert server._sweep_orphaned_session_rows() == []  # nothing for the heartbeat-gated orphan sweep
+     assert db.get_session("child")["end_reason"] == "parent_ended_reap"
++
++
++# ── compression continuations, pinned rows, stale task_session_ids (review 5878780845) ──
++
++
++def _compressed_child(db, *, delegator_ended: bool, pinned: bool = False):
++    """A delegate child that compressed once: segment ``child`` (ended ``compression``) and its open, idle
++    continuation ``child-2``. The continuation inherits the root's ``_delegate_from``; its parent row is the
++    compressed segment, not the delegator."""
++    stale = time.time() - 8 * 3600
++    cfg = {"_delegate_from": "parent"}
++    db.create_session("parent", source="desktop")
++    db.create_session("child", source="subagent", parent_session_id="parent", model_config=cfg)
++    db.end_session("child", "compression")
++    db.create_session("child-2", source="subagent", parent_session_id="child", model_config=cfg)
++    for sid in ("parent", "child", "child-2"):
++        _backdate(db, sid, stale)
++    if delegator_ended:
++        db.end_session("parent", "agent_close")
++    if pinned:
++        db.set_session_pinned("child", True)
++
++
++def test_compressed_continuation_of_an_open_delegator_is_left_alone(db):
++    """S1: the continuation's parent row is its own compressed segment; the owner is the delegator."""
++    _compressed_child(db, delegator_ended=False)
++    assert db.end_subagents_of_ended_parents(max_idle_seconds=IDLE_S) == []
++    assert db.get_session("child-2")["ended_at"] is None
++
++
++def test_compressed_continuation_of_an_ended_delegator_is_closed(db):
++    _compressed_child(db, delegator_ended=True)
++    assert db.end_subagents_of_ended_parents(max_idle_seconds=IDLE_S) == ["child-2"]
++    assert db.get_session("child-2")["end_reason"] == "parent_ended_reap"
++
++
++def test_pinned_subagent_is_spared_when_asked(db):
++    """S2: like ``sweep_orphaned_sessions(exclude_pinned=True)``, a pin covers the row and its continuations."""
++    _hub_like(db, parent_ended=True)
++    db.set_session_pinned("child", True)
++    assert db.end_subagents_of_ended_parents(max_idle_seconds=IDLE_S, exclude_pinned=True) == []
++    assert db.get_session("child")["ended_at"] is None
++    assert db.end_subagents_of_ended_parents(max_idle_seconds=IDLE_S) == ["child"]
++
++
++def test_pinned_segment_spares_its_unpinned_continuation(db):
++    _compressed_child(db, delegator_ended=True, pinned=True)
++    assert db.end_subagents_of_ended_parents(max_idle_seconds=IDLE_S, exclude_pinned=True) == []
++    assert db.get_session("child-2")["ended_at"] is None
++
++
++def test_startup_sweep_spares_pinned_subagent(db, monkeypatch):
++    from tui_gateway import server
++    _hub_like(db, parent_ended=True)
++    db.set_session_pinned("child", True)
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(server, "_SESSION_TTL_S", float(IDLE_S))
++    monkeypatch.setattr(server, "_sessions", {})
++
++    server._sweep_orphaned_session_rows()
++    assert db.get_session("child")["ended_at"] is None
++
++
++def _seed_compressed_unit_child(home):
++    """``child-1`` (the id dispatch persisted) compressed into ``child-1b``, which compressed into the open tip
++    ``child-1c``. ``grandchild`` is a delegate child of a segment, not a continuation, so it is not the unit's."""
++    db = SessionDB(home / "state.db")
++    try:
++        cfg = {"_delegate_from": "parent-1"}
++        db.create_session("parent-1", source="desktop")
++        db.create_session("child-1", source="subagent", parent_session_id="parent-1", model_config=cfg)
++        db.end_session("child-1", "compression")
++        db.create_session("child-1b", source="subagent", parent_session_id="child-1", model_config=cfg)
++        db.end_session("child-1b", "compression")
++        db.create_session("child-1c", source="subagent", parent_session_id="child-1b", model_config=cfg)
++        db.create_session("grandchild", source="subagent", parent_session_id="child-1b",
++                          model_config={"_delegate_from": "child-1b"})
++    finally:
++        db.close()
++
++
++def test_recovery_ends_the_open_tip_of_a_compressed_child(home, monkeypatch):
++    """S3: ``task_session_ids`` names the row at dispatch; after compression the open row is its tip."""
++    _seed_compressed_unit_child(home)
++    _dead_owner_unit({"0": "child-1"})
++    monkeypatch.setattr(ad, "_owner_liveness", lambda: (lambda pid, started: False))
++
++    assert ad.recover_abandoned_delegations() == 1
++
++    assert _session_row(home, "child-1c")["end_reason"] == "delegation_unknown"
++    assert _session_row(home, "child-1")["end_reason"] == "compression"
++    assert _session_row(home, "child-1b")["end_reason"] == "compression"
++    assert _session_row(home, "grandchild")["ended_at"] is None
++
++
++def test_stall_force_finalize_ends_the_open_tip_of_a_compressed_child(home):
++    _seed_compressed_unit_child(home)
++    record = {"delegation_id": "deleg-s", "status": "stalling", "parent_session_id": "parent-1", "goal": "g",
++              "is_batch": True, "goals": ["g"], "task_session_ids": {"0": "child-1"}, "dispatched_at": time.time(),
++              "_interrupted_at": time.time(), "_stall_quiet_seconds": 500.0, "_stall_threshold_seconds": 450.0,
++              "_stall_in_tool": False}
++    ad._persist_dispatch(record)
++    with ad._records_lock:
++        ad._records["deleg-s"] = record
++
++    ad._finalize("deleg-s", lambda rec: ad._stalled_result("deleg-s", rec), "stalled")
++
++    assert _session_row(home, "child-1c")["end_reason"] == "delegation_stalled"
++    assert _session_row(home, "grandchild")["ended_at"] is None
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index f40b428fc8..f1b971d64e 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -354,18 +354,32 @@ def recover_abandoned_delegations() -> int:
+ CHILD_END_REASONS = {"unknown": "delegation_unknown", "stalled": "delegation_stalled"}
+ 
+ 
++def _child_lineage_open_rows_sql(n_ids: int) -> str:
++    """Open rows of the unit's children: each persisted id that really is the parent's ``subagent`` child, plus every
++    compression continuation of it (a compressed child keeps working in a new row whose parent is its previous
++    segment, so the id persisted at dispatch is stale). A delegate child of a segment is not a continuation."""
++    from hermes_state_common import _non_continuation_child_sql
++    return ("WITH RECURSIVE lineage(id) AS ("
++            f" SELECT id FROM sessions WHERE id IN ({','.join('?' * n_ids)}) AND parent_session_id=?"
++            " AND source='subagent'"
++            " UNION SELECT c.id FROM lineage l JOIN sessions p ON p.id = l.id"
++            " JOIN sessions c ON c.parent_session_id = p.id"
++            " WHERE c.source='subagent' AND p.end_reason = 'compression'\n"
++            + _non_continuation_child_sql("c.", "p.id") +
++            ") SELECT s.id FROM sessions s JOIN lineage l ON l.id = s.id WHERE s.ended_at IS NULL")
++
++
+ def _end_child_session_rows(conn, parent_session_id, task_session_ids, end_reason: str, now: float) -> list[str]:
+-    """End the still-open session rows of a terminal unit's children inside the caller's transaction. Only rows that
+-    really are this parent's ``subagent`` children are touched, so a stale or foreign id cannot end another chat.
++    """End the still-open session rows of a terminal unit's children inside the caller's transaction, including the
++    open tip of a child that compressed after dispatch. Only rows that really are this parent's ``subagent``
++    children (or their continuations) are touched, so a stale or foreign id cannot end another chat.
+     Without this a child killed with its owner stayed open until a startup sweep proved no live backend could own it,
+     which on a host whose backends restart many times a day can be never. Never raises."""
+     ids = [str(v) for v in task_session_ids.values() if v] if isinstance(task_session_ids, dict) else []
+     if not ids or not parent_session_id:
+         return []
+     try:
+-        open_ids = [r[0] for r in conn.execute(
+-            f"SELECT id FROM sessions WHERE id IN ({','.join('?' * len(ids))}) AND parent_session_id=?"
+-            " AND source='subagent' AND ended_at IS NULL", (*ids, parent_session_id)).fetchall()]
++        open_ids = [r[0] for r in conn.execute(_child_lineage_open_rows_sql(len(ids)), (*ids, parent_session_id))]
+         if open_ids:
+             conn.execute(
+                 f"UPDATE sessions SET ended_at=?, end_reason=? WHERE id IN ({','.join('?' * len(open_ids))})"
+@@ -389,7 +403,11 @@ def _refresh_ended_child_outcomes(ended: list[str]) -> None:
+ 
+ def end_terminal_unit_children(record: dict[str, Any], status: str) -> list[str]:
+     """End the open child rows of a unit this process finalized as ``status`` without its runner returning
+-    (``stalled``). A worker process has no ledger access; its owner's recovery covers it. Never raises."""
++    (``stalled``). Never raises. A worker process (no state.db access) ends nothing here, and nothing ends its
++    units' rows on its behalf: its dispatch does not forward ``task_session_ids`` and the owner's
++    ``recover_abandoned_delegations`` only visits units still ``running`` under a dead owner pid. Such rows close
++    only once their parent row ends (``SessionDB.end_subagents_of_ended_parents``) or the heartbeat-gated orphan
++    sweep proves no backend owns them."""
+     end_reason = CHILD_END_REASONS.get(status)
+     if not end_reason or not record.get("task_session_ids"):
+         return []
+diff --git a/tui_gateway/session_reaper.py b/tui_gateway/session_reaper.py
+index 67be564f55..76b760089d 100644
+--- a/tui_gateway/session_reaper.py
++++ b/tui_gateway/session_reaper.py
+@@ -467,7 +467,7 @@ def _sweep_orphaned_session_rows() -> list[str]:
+     # heartbeat predates it; end it without the heartbeat guess (and without the killed-subagent notice).
+     try:
+         children = db.end_subagents_of_ended_parents(
+-            max_idle_seconds=_SESSION_TTL_S, exclude_ids=tuple(sorted(live_ids)))
++            max_idle_seconds=_SESSION_TTL_S, exclude_ids=tuple(sorted(live_ids)), exclude_pinned=True)
+     except Exception:
+         logger.debug("ended-parent subagent sweep failed", exc_info=True)
+         children = []
+-- 
+2.43.0
+

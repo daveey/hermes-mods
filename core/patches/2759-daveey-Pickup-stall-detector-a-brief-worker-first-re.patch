@@ -1,0 +1,239 @@
+From 5043debceb7d4cd9d05356ddec7c7ed263770b4f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 13:18:03 +0000
+Subject: [PATCH] [daveey] Pickup-stall detector: a brief worker-first
+ reservation is not a pinned-card stall, and one card gets one host-wide
+ repair
+
+t_01a1cfdfb6f3f7ea: MacBook card t_01a1cfa91548dad7 (worker-first-v1, ready since 12:09Z) was
+reserved to worker-2 by the Board for seconds at a time. A reservation writes no placement event
+(only the origin's worker_queue_reason observations), so the pinned-here clock (#1370) fell back
+to ready_since and worker-2 filed "Pickup evidence missing ... waiting 40 min" at 12:50:44Z, then
+"Pickup queue full ... waiting 40 min" for the same card on the next tick.
+
+* stalled(): the clock also starts no earlier than the origin's newest worker_queue_reason
+  observation of the card NOT pinned machine:<own> (lifecycle.runs_on).
+* file_repairs(): a card an open host-wide repair about this machine already lists is not
+  added to another host-wide repair. Card-specific refusals still get their own card.
+---
+ hermes_cli/kanban_pickup_stall.py             |  58 ++++++++-
+ .../test_kanban_pickup_stall_reservation.py   | 111 ++++++++++++++++++
+ 2 files changed, 165 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_stall_reservation.py
+
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index a17db190e0..ebd3bef0b1 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -170,17 +170,39 @@ def _pinned_here_since_ms(replica, task_id: str, own: str) -> Optional[int]:
+     return None if row is None or row[0] is None else int(row[0]) * 1000
+ 
+ 
++# The origin's worker-first placement observation (``kanban_queue_reason.EVENT``); ``lifecycle.runs_on`` is the
++# card's ``runs_on`` (JSON text, or null) on the origin when the Board answered.
++_QUEUE_EVENT = "worker_queue_reason"
++
++
++def _seen_unpinned_here_ms(replica, task_id: str, own: str) -> Optional[int]:
++    """When the origin's newest worker-placement observation saw the card NOT pinned ``machine:<own>`` (ms), or None.
++
++    t_01a1cfdfb6f3f7ea (2026-11-12): a worker-first card's Board reservation pins it to a worker for seconds and
++    lapses (``runs_on`` null again), with no placement event. t_01a1cfa91548dad7 was reserved to worker-2 at
++    12:49:27Z, unpinned by 12:50:35Z and reserved again; worker-2 counted from ``ready_since`` (12:09Z) and filed
++    "waiting 40 min" at 12:50:44Z. A pin lasts at most since the last time it was seen absent."""
++    row = replica.execute(
++        "SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind = ? AND json_valid(payload) "
++        "AND NOT EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(json_extract(task_events.payload, "
++        "'$.lifecycle.runs_on')) THEN json_extract(task_events.payload, '$.lifecycle.runs_on') ELSE '[]' END) "
++        "WHERE value = ?)", (task_id, _QUEUE_EVENT, f"machine:{own}")).fetchone()
++    return None if row is None or row[0] is None else int(row[0]) * 1000
++
++
+ def stalled(conn, replica, own: str, *, now: Optional[float] = None) -> list[dict[str, Any]]:
+     """Cards ready in ``replica``, pinned ``machine:<own>``, created elsewhere, unleased, not in the live file,
+-    ready AND pinned here longer than :func:`stall_seconds`; oldest first. The clock starts at the later of
+-    ``ready_since`` (else creation) and the newest placement event naming this machine."""
++    ready AND pinned here longer than :func:`stall_seconds`; oldest first. The clock starts at the latest of
++    ``ready_since`` (else creation), the newest placement event naming this machine and the newest worker-placement
++    observation of the card not pinned here (:func:`_seen_unpinned_here_ms`)."""
+     from hermes_cli import kanban_worker_node as wn
+     now_ms = _now_ms(now)
+     limit_ms = stall_seconds() * 1000
+     out = []
+     for row in wn.pinned_rows(replica, own, now_ms=now_ms, statuses=("ready",)):
+         since = row["ready_since"] if row["ready_since"] is not None else int(row["created_at"] or 0) * 1000
+-        since = max(int(since), _pinned_here_since_ms(replica, row["id"], own) or 0)
++        since = max(int(since), _pinned_here_since_ms(replica, row["id"], own) or 0,
++                    _seen_unpinned_here_ms(replica, row["id"], own) or 0)
+         if now_ms - int(since) <= limit_ms:
+             continue
+         if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (row["id"],)).fetchone():
+@@ -489,12 +511,38 @@ def _refresh_targets(conn, task_id: str, members: list[dict[str, Any]], now_ms:
+             _log.info("pickup-stall refreshed card=%s added_targets=%d", task_id, len(added))
+ 
+ 
++def _open_coverage(conn, own: str) -> dict[str, str]:
++    """``{target card id: slug}`` for every card an OPEN host-wide repair about ``own`` (:data:`_HOST_GROUPS`) lists
++    in its body or the detector's target comments: a card whose host-wide cause changed (evidence missing, then
++    queue full) is not handed a second open host-wide repair. A card-specific refusal still gets its own card.
++
++    t_01a1cfdfb6f3f7ea (2026-11-12): worker-2 filed "Pickup evidence missing" for t_01a1cfa91548dad7 at 12:50:44Z;
++    pickup recorded budget_exhausted 0.3 s later, and the next tick filed "Pickup queue full" for the same card."""
++    prefix = f"{KEY_PREFIX}{own}:"
++    slugs = {spec[0] for spec in _HOST_GROUPS.values()}
++    out: dict[str, str] = {}
++    for row in conn.execute("SELECT id, body, idempotency_key FROM tasks WHERE idempotency_key >= ? "
++                            "AND idempotency_key < ? AND status NOT IN ('done', 'archived')",
++                            (prefix, prefix + "\U0010ffff")).fetchall():
++        slug = row["idempotency_key"][len(prefix):].split(":", 1)[0]
++        if slug not in slugs:
++            continue
++        text = (row["body"] or "") + "\n" + "\n".join(
++            r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id = ? AND author = ?",
++                                       (row["id"], DETECTOR)))
++        for tid in re.findall(r"^- (\S+) \(", text, re.MULTILINE):
++            out.setdefault(tid, slug)
++    return out
++
++
+ def file_repairs(conn, own: str, cards: list[dict[str, Any]], *, now: Optional[float] = None) -> list[str]:
+     """One repair per stalled card with a card-specific last reason; one per host per host-wide cause
+-    (:data:`_HOST_GROUPS`), naming the oldest card. Returns the covering repair ids."""
++    (:data:`_HOST_GROUPS`), naming the oldest card. A card an open repair about this host already lists under
++    another key gets no second one (:func:`_open_coverage`). Returns the covering repair ids."""
+     now_ms = _now_ms(now)
+     ids: list[str] = []
+     groups: dict[str, list[dict[str, Any]]] = {}
++    covered = _open_coverage(conn, own)
+     for card in cards:
+         # The sweep precedes pickup/note_capped. A first post-drain tick may
+         # have old ready rows but no observation yet: missing evidence is not
+@@ -510,6 +558,8 @@ def file_repairs(conn, own: str, cards: list[dict[str, Any]], *, now: Optional[f
+             continue
+         group = _group(card)
+         if group is not None:
++            if covered.get(card["id"], _HOST_GROUPS[group][0]) != _HOST_GROUPS[group][0]:
++                continue  # an open host-wide repair about this machine already lists it
+             groups.setdefault(group, []).append(card)
+             continue
+         reason = (card["skip"] or {}).get("reason") or "none recorded"
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_reservation.py b/tests/hermes_cli/test_kanban_pickup_stall_reservation.py
+new file mode 100644
+index 0000000000..011502d261
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_stall_reservation.py
+@@ -0,0 +1,111 @@
++"""A worker-first card the Board reserves to this machine only briefly is not a pinned-card stall here, and one card
++on one machine gets at most one open host-wide repair.
++
++t_01a1cfdfb6f3f7ea (2026-11-12): MacBook card t_01a1cfa91548dad7 (``worker-first-v1``, ready since 12:09Z) was
++reserved to worker-2 for seconds at a time (12:40:32-12:40:43Z, 12:49:27-12:50:46Z; ``runs_on`` null in between,
++recorded only as the origin's ``worker_queue_reason`` observations, never as a placement event). worker-2 counted
++from ``ready_since`` and filed "Pickup evidence missing ... waiting 40 min" at 12:50:44Z; pickup recorded
++budget_exhausted 0.3 s later, and the next tick filed "Pickup queue full ... waiting 40 min" for the same card.
++Same fake-Board harness as ``test_kanban_pickup_stall``.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_pickup_stall as kps
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_pickup_stall as base
++
++WORKER = base.WORKER
++gws = base.gws
++svc = base.svc
++
++
++def _observed(worker, tid, ago, runs_on):
++    """The origin's worker-placement observation ``ago`` seconds back, synced into the worker's replica:
++    ``lifecycle.runs_on`` is the origin's ``runs_on`` JSON text (None: unpinned)."""
++    payload = {"version": 1, "code": "reserved", "state": "assigned", "machine": WORKER,
++               "lifecycle": {"runs_on": None if runs_on is None else json.dumps(runs_on), "run_count": 0}}
++    with sqlite3.connect(wn._replica_path(worker.conn)) as rw:
++        rw.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'worker_queue_reason', ?, "
++                   "CAST(strftime('%s','now') AS INTEGER) - ?)", (tid, json.dumps(payload), ago))
++
++
++def _reserved_card(hub, worker):
++    tid = base._pinned(hub, title="reserved by the Board")  # the Board row says machine:<worker> right now
++    worker.round()
++    base._age(worker, tid, 2400)  # ready 40 min, like t_01a1cfa91548dad7
++    return tid
++
++
++def test_a_brief_reservation_of_a_long_ready_card_raises_no_alarm(gws):
++    hub, worker = gws
++    tid = _reserved_card(hub, worker)
++    _observed(worker, tid, 1800, None)
++    _observed(worker, tid, 600, [f"machine:{WORKER}"])  # an earlier reservation...
++    _observed(worker, tid, 590, None)                   # ...that lapsed
++    _observed(worker, tid, 9, None)                     # reserved again 9 s ago (the Board answered 'assigned')
++    _observed(worker, tid, 7, [f"machine:{WORKER}"])
++    assert not base._queue_full_repairs(worker)
++
++
++def test_a_reservation_held_past_the_interval_still_raises_its_alarm_from_the_reservation(gws):
++    hub, worker = gws
++    tid = _reserved_card(hub, worker)
++    _observed(worker, tid, 700, None)                   # last seen unpinned 11 min ago, pinned here since
++    _observed(worker, tid, 690, [f"machine:{WORKER}"])
++    _observed(worker, tid, 30, [f"machine:{WORKER}"])
++    [card] = base._queue_full_repairs(worker)
++    assert tid in card["title"] and "waiting 11 min" in card["title"]
++
++
++def test_observations_naming_this_machine_or_bad_payloads_do_not_restart_the_clock(gws):
++    hub, worker = gws
++    tid = _reserved_card(hub, worker)
++    _observed(worker, tid, 30, [f"machine:{WORKER}"])
++    with sqlite3.connect(wn._replica_path(worker.conn)) as rw:
++        rw.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'worker_queue_reason', "
++                   "'not json', CAST(strftime('%s','now') AS INTEGER))", (tid,))
++    replica = wn.open_replica(worker.conn)
++    try:
++        [card] = kps.stalled(worker.conn, replica, WORKER)
++    finally:
++        replica.close()
++    assert card["id"] == tid and kps._now_ms() - card["since_ms"] >= 2390_000
++
++
++def test_a_card_whose_host_wide_cause_changes_keeps_one_open_repair(gws, monkeypatch):
++    hub, worker = gws
++    tid = base._pinned(hub, title="evidence then queue full")
++    worker.round()
++    base._age(worker, tid, 2400)
++    clock = [kps._now_ms() - 601_000]
++    monkeypatch.setattr(kps, "_now_ms", lambda now=None: clock[0])
++    # The detector's own row from an earlier tick, one stall interval ago.
++    kps.record(worker.conn, {tid: ("evidence_missing", "detector observation; no pickup skip recorded")})
++    clock[0] += 601_000
++    worker.tick(max_spawn=0)  # sweep files "Pickup evidence missing"; the capped path then records budget_exhausted
++    [first] = base._repairs(worker.conn)
++    assert "evidence" in first["title"].lower()
++    assert kps.latest(worker.conn, tid)["reason"] == "budget_exhausted"
++    worker.tick(max_spawn=0)  # same card, now budget_exhausted: no "Pickup queue full" beside it
++    worker.tick(max_spawn=0)
++    assert [r["id"] for r in base._repairs(worker.conn)] == [first["id"]]
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++def test_a_closed_host_wide_repair_does_not_cover_another_cause(gws, status):
++    from hermes_cli import kanban_db as kb
++    _, worker = gws
++    worker.enter()
++    card = {"id": "t_0000target", "title": "waiting", "tenant": None, "since_ms": 1,
++            "skip": {"reason": "evidence_missing", "first_at": 1, "last_at": 1, "passes": 1, "detail": None}}
++    [evidence] = kps.file_repairs(worker.conn, WORKER, [card])
++    with kb.write_txn(worker.conn):
++        worker.conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, evidence))
++    full = {**card, "skip": {**card["skip"], "reason": "budget_exhausted"}}
++    [queue] = kps.file_repairs(worker.conn, WORKER, [full])
++    assert queue != evidence and "queue" in kb.get_task(worker.conn, queue).title.lower()
+-- 
+2.43.0
+

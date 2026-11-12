@@ -1,0 +1,463 @@
+From d13461aaa1229e047dba350f21c84d0c31a29929 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:40:41 +0000
+Subject: [PATCH] fix(ci): upstream sync gate reads jobs once per actionable
+ head, on the canonical slug [daveey]
+
+Each gate call read runs/{id}/jobs for every green run in the 50-run list
+(oldest first, later runs overwriting), and origin's daveey/hermes slug
+answers every REST call with a 301 to example-org/hermes. One
+call cost ~100-200 requests of the shared user token and tripped the fleet
+GitHub quota brake (worker-6 ledger: 103x jobs 301 + 103x 200 in 3 min).
+
+- candidates() walks runs newest first and reads jobs only for each head's
+  newest verdict-bearing run, and only for heads the gate can act on (the
+  requested head, recent runs inside the red backoff, heads main lacks).
+- Completed run-attempt verdicts are cached on disk ($HERMES_HOME/cache/
+  upstream-sync-gate.json), keyed by run id + attempt.
+- main() resolves GitHub's name for origin's slug once (known rename map,
+  else repos/{slug}.full_name, cached) and calls every endpoint on it.
+- The run list reads one page (page=1: the newest 50 runs, as documented);
+  github_pages no longer --paginates an endpoint that names its page, which
+  walked the whole run history (63 runs = 2 pages, growing).
+
+Live read-only probe on worker-3 against example-org/hermes:
+candidates() made 2 requests (run list + 1 jobs read) for 49 heads.
+---
+ scripts/ci/upstream_sync.py                  | 136 +++++++++++--
+ tests/hermes_cli/upstream_gate_fake.py       |   3 +-
+ tests/scripts/ci/test_upstream_sync_quota.py | 200 +++++++++++++++++++
+ 3 files changed, 321 insertions(+), 18 deletions(-)
+ create mode 100644 tests/scripts/ci/test_upstream_sync_quota.py
+
+diff --git a/scripts/ci/upstream_sync.py b/scripts/ci/upstream_sync.py
+index e516645465..418a526653 100644
+--- a/scripts/ci/upstream_sync.py
++++ b/scripts/ci/upstream_sync.py
+@@ -57,6 +57,8 @@ STALE_PENDING_S = 6 * 3600  # a run queued this long never got runners: it no lo
+ # Set on the gate's own pushes; the pre-push guard lets exactly those through.
+ GATE_ENV = "HERMES_UPSTREAM_SYNC_GATE"
+ UPSTREAM_REF = "refs/remotes/upstream/main"
++# Renamed/transferred repos (lowercase configured slug -> GitHub's name): origin URLs still name the old slug.
++CANONICAL_SLUGS = {"daveey/hermes": "example-org/hermes"}
+ 
+ LANDED, REFUSED, NOT_YET = 0, 1, 2
+ # The check daveey/hermes main's branch protection requires on a PR head (ci.yaml's aggregate job),
+@@ -122,11 +124,16 @@ def gh_cli(*args, reason="upstream sync gate: read fork CI evidence") -> subproc
+ 
+ 
+ def github_pages(endpoint):
+-    """Every page of a GitHub API GET: the logged-in gh, else the broker's ``user/github`` scope."""
+-    proc = gh_cli("api", "--paginate", "--slurp", endpoint)
++    """Every page of a GitHub API GET: the logged-in gh, else the broker's ``user/github`` scope.
++
++    An endpoint that names its ``page=`` reads that one page only: ``--paginate`` would walk the whole
++    history, one request of the shared token per page."""
++    paged = re.search(r"[?&]page=\d+(?:&|$)", endpoint)
++    proc = gh_cli("api", endpoint) if paged else gh_cli("api", "--paginate", "--slurp", endpoint)
+     if proc.returncode:
+         raise GateError(f"GitHub API read failed: {(proc.stderr or proc.stdout).strip()[-300:]}")
+-    return json.loads(proc.stdout)
++    data = json.loads(proc.stdout)
++    return [data] if paged else data
+ 
+ 
+ @dataclass
+@@ -152,25 +159,85 @@ def _jobs_green(gh_repo, run_id, request) -> bool:
+                for name in REQUIRED_JOBS)
+ 
+ 
+-def candidates(gh_repo, request) -> dict[str, Candidate]:
+-    """Each staged candidate's newest verdict, keyed by head sha."""
+-    pages = request(f"repos/{gh_repo}/actions/workflows/{WORKFLOW_FILE}/runs?event=push&per_page=50")
+-    runs = sorted((r for page in pages for r in page["workflow_runs"]), key=lambda r: (r.get("run_number", 0), r["id"]))
++class VerdictCache:
++    """Jobs verdicts of completed run attempts and canonical repo slugs, kept on disk between gate calls.
++
++    A completed run attempt's jobs never change (a re-run is a new ``run_attempt``), so its verdict is read
++    from GitHub once. Unreadable or unwritable: the gate just reads GitHub again.
++    """
++
++    def __init__(self, path: Path | None):
++        self.path, self.data = path, {}
++        try:
++            self.data = json.loads(path.read_text(encoding="utf-8-sig")) if path and path.exists() else {}
++        except (OSError, ValueError):
++            self.data = {}
++        if not isinstance(self.data, dict):
++            self.data = {}
++
++    def get(self, key):
++        return self.data.get(key)
++
++    def put(self, key, value) -> None:
++        self.data[key] = value
++        if self.path is None:
++            return
++        try:
++            self.path.parent.mkdir(parents=True, exist_ok=True)
++            tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
++            tmp.write_text(json.dumps(self.data, sort_keys=True), encoding="utf-8")
++            os.replace(tmp, self.path)
++        except OSError:
++            pass  # a cache that cannot be written only costs requests
++
++
++def default_cache_path() -> Path:
++    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
++    return Path(home) / "cache" / "upstream-sync-gate.json"
++
++
++def _run_verdict(gh_repo, run, request, cache) -> bool:
++    key = f"jobs:{gh_repo.lower()}:{run['id']}:{run.get('run_attempt', 1)}"
++    cached = cache.get(key) if cache is not None else None
++    if isinstance(cached, bool):
++        return cached
++    green = bool(_jobs_green(gh_repo, run["id"], request))
++    if cache is not None:
++        cache.put(key, green)
++    return green
++
++
++def candidates(gh_repo, request, *, wanted=None, cache=None) -> dict[str, Candidate]:
++    """Each staged candidate's newest verdict, keyed by head sha.
++
++    Only a head's newest verdict-bearing run counts, so jobs are read for that run alone, and only when
++    ``wanted(head, updated_at)`` says the gate can act on that head (None: every head). Re-reading jobs for
++    every green run in the list cost ~100-200 requests of the shared user token per call. A completed-success
++    run that is not wanted is reported ``unread``: no landing, staging or backoff decision reads that status.
++    """
++    pages = request(f"repos/{gh_repo}/actions/workflows/{WORKFLOW_FILE}/runs?event=push&per_page=50&page=1")
++    runs = sorted((r for page in pages for r in page["workflow_runs"]), key=lambda r: (r.get("run_number", 0), r["id"]),
++                  reverse=True)
+     found: dict[str, Candidate] = {}
+-    for run in runs:  # oldest first: a later run on the same head replaces the earlier verdict
++    for run in runs:  # newest first: a head's first verdict-bearing run is its verdict
+         head = run["head_sha"]
++        if head in found:
++            continue
+         if run["head_branch"] != BRANCH_PREFIX + head or run["path"] != WORKFLOW_PATH or run["event"] != "push":
+             continue  # evidence counts only from the candidate's own branch and this workflow
++        updated = _ts(run.get("updated_at") or run.get("created_at"))
+         if run["status"] != "completed":
+             status = "pending"
+         elif run["conclusion"] == "success":
+-            status = "green" if _jobs_green(gh_repo, run["id"], request) else "red"
++            if wanted is not None and not wanted(head, updated):
++                status = "unread"
++            else:
++                status = "green" if _run_verdict(gh_repo, run, request, cache) else "red"
+         elif run["conclusion"] in ("cancelled", "skipped", "stale"):
+             continue  # never reached a verdict: neither evidence nor a failure
+         else:
+             status = "red"
+-        found[head] = Candidate(head, status, run["html_url"], _ts(run.get("updated_at") or run.get("created_at")),
+-                                run["id"])
++        found[head] = Candidate(head, status, run["html_url"], updated, run["id"])
+     return found
+ 
+ 
+@@ -376,24 +443,34 @@ def _close_superseded(repo, gh_repo, request, gh, protected=()) -> None:
+         print(f"  superseded sync PRs: cleanup failed: {exc!r}")
+ 
+ 
+-def advance(repo: Path, head: str | None, *, gh_repo: str, request=github_pages, gh=gh_cli, now=None) -> int:
++def advance(repo: Path, head: str | None, *, gh_repo: str, request=github_pages, gh=gh_cli, now=None,
++            cache: VerdictCache | None = None) -> int:
+     """Land green candidates, then report ``head``'s state or stage it (module doc, exit codes).
+ 
+     Every call then closes open sync PRs whose parents main already holds, including any this call's landing
+     made redundant."""
+     protected = set()
+-    verdict = _advance(repo, head, gh_repo=gh_repo, request=request, gh=gh, now=now, protected=protected)
++    verdict = _advance(repo, head, gh_repo=gh_repo, request=request, gh=gh, now=now, protected=protected,
++                       cache=cache)
+     _close_superseded(repo, gh_repo, request, gh, protected)
+     return verdict
+ 
+ 
+-def _advance(repo: Path, head: str | None, *, gh_repo: str, request, gh, now, protected) -> int:
++def _advance(repo: Path, head: str | None, *, gh_repo: str, request, gh, now, protected, cache=None) -> int:
+     now = time.time() if now is None else now
+     try:
+         if head is not None:
+             head = git(repo, "rev-parse", "--verify", f"{head}^{{commit}}")
+-        found = candidates(gh_repo, request)
+-        landed_other = _land_other_greens(repo, found, head, _fetch_main(repo), gh_repo=gh_repo, request=request,
++        main = _fetch_main(repo)
++
++        def wanted(sha, updated_at):
++            """A green run's jobs matter only for a head this call may land, or back off on (recent)."""
++            if sha == head or now - updated_at < RED_BACKOFF_S:
++                return True
++            return not (_is_ancestor(repo, sha, main) or _parents_on_main(repo, sha, main))
++
++        found = candidates(gh_repo, request, wanted=wanted, cache=cache)
++        landed_other = _land_other_greens(repo, found, head, main, gh_repo=gh_repo, request=request,
+                                          gh=gh, protected=protected)
+         if head is None:
+             return LANDED if landed_other else NOT_YET
+@@ -465,6 +542,30 @@ def origin_slug(repo) -> str:
+     return match[1]
+ 
+ 
++def canonical_slug(slug: str, request=github_pages, cache: VerdictCache | None = None) -> str:
++    """GitHub's current name for ``slug``. A renamed or transferred repo answers every old-name REST call with
++    a 301 first, which doubles each request on the shared token, so the gate resolves the name once.
++    Unreadable: the configured slug (GitHub still redirects it)."""
++    known = CANONICAL_SLUGS.get(slug.lower())
++    if known:
++        return known
++    key = f"slug:{slug.lower()}"
++    cached = cache.get(key) if cache is not None else None
++    if isinstance(cached, str) and cached:
++        return cached
++    try:
++        pages = request(f"repos/{slug}")
++        name = next((p.get("full_name") for p in pages if isinstance(p, dict) and p.get("full_name")), None)
++    except (GateError, OSError, subprocess.SubprocessError, ValueError, TypeError) as exc:
++        print(f"  could not resolve GitHub's name for {slug} ({exc}); using it as configured")
++        return slug
++    if not isinstance(name, str) or not re.fullmatch(r"[^/\s]+/[^/\s]+", name):
++        return slug
++    if cache is not None:
++        cache.put(key, name)
++    return name
++
++
+ def main(argv=None) -> int:
+     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     parser.add_argument("--repo", type=Path, default=Path.cwd())
+@@ -478,7 +579,8 @@ def main(argv=None) -> int:
+     except GateError as exc:
+         print(f"REFUSED: {exc}")
+         return REFUSED
+-    return advance(args.repo, args.head, gh_repo=slug)
++    cache = VerdictCache(default_cache_path())
++    return advance(args.repo, args.head, gh_repo=canonical_slug(slug, cache=cache), cache=cache)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/hermes_cli/upstream_gate_fake.py b/tests/hermes_cli/upstream_gate_fake.py
+index e310a211e2..bca4a43ea6 100644
+--- a/tests/hermes_cli/upstream_gate_fake.py
++++ b/tests/hermes_cli/upstream_gate_fake.py
+@@ -73,7 +73,8 @@ elif "/check-runs?" in endpoint:
+                                        "status": verdict[0], "conclusion": verdict[1],
+                                        "app": {{"id": 15368}}}}] if verdict else []}}]))
+ else:
+-    print(json.dumps([{{"workflow_runs": runs}}]))
++    page = {{"workflow_runs": runs}}
++    print(json.dumps([page] if "--paginate" in args else page))  # a named page= is one page, not a list
+ '''
+ 
+ 
+diff --git a/tests/scripts/ci/test_upstream_sync_quota.py b/tests/scripts/ci/test_upstream_sync_quota.py
+new file mode 100644
+index 0000000000..4e222cb596
+--- /dev/null
++++ b/tests/scripts/ci/test_upstream_sync_quota.py
+@@ -0,0 +1,200 @@
++"""The gate's GitHub request budget: it shares the fleet's user token, so each call stays a handful of reads.
++
++Each gate call used to read ``runs/{id}/jobs`` for every green run in the 50-run list, and the configured
++``daveey/hermes`` slug answers every REST call with a 301 to ``example-org/hermes``, so one
++call cost ~100-200 requests and tripped the shared quota brake.
++"""
++import json
++import subprocess
++
++import pytest
++
++from scripts.ci import upstream_sync as sync
++from tests.scripts.ci.test_upstream_sync import (
++    FakeActions, gate, git, landed_by_merge, main_of, make_world, merge_upstream, upstream_commit,
++)
++
++SLUG = "example/fork"
++
++
++@pytest.fixture
++def world(tmp_path):
++    return make_world(tmp_path)
++
++
++def run(run_id, head, *, conclusion="success", status="completed", attempt=1):
++    return {"id": run_id, "run_number": run_id, "run_attempt": attempt, "head_sha": head,
++            "head_branch": sync.BRANCH_PREFIX + head, "event": "push", "path": sync.WORKFLOW_PATH,
++            "status": status, "conclusion": conclusion if status == "completed" else None,
++            "html_url": f"https://ci.example/run/{run_id}", "updated_at": "2026-11-01T00:00:00Z"}
++
++
++class CountingAPI:
++    """GitHub's REST reads, counted per endpoint; each run's jobs are green unless listed in ``red_runs``."""
++
++    def __init__(self, runs, red_runs=()):
++        self.runs, self.red_runs, self.calls = runs, set(red_runs), []
++
++    def request(self, endpoint):
++        self.calls.append(endpoint)
++        if "/jobs?" in endpoint:
++            run_id = int(endpoint.split("/runs/", 1)[1].split("/", 1)[0])
++            conclusion = "failure" if run_id in self.red_runs else "success"
++            return [{"jobs": [{"name": f"Full suite / {n}", "status": "completed", "conclusion": conclusion,
++                               "labels": ["self-hosted"], "runner_name": "hub-1"} for n in sync.REQUIRED_JOBS]}]
++        assert f"workflows/{sync.WORKFLOW_FILE}/runs" in endpoint, endpoint
++        return [{"workflow_runs": list(reversed(self.runs))}]
++
++    def jobs_reads(self):
++        return [c for c in self.calls if "/jobs?" in c]
++
++
++def fifty_runs(heads):
++    """50 completed-green runs over ``heads``, round robin: every head has several reruns."""
++    return [run(i + 1, heads[i % len(heads)]) for i in range(50)]
++
++
++@pytest.mark.parametrize("n_heads", [1, 5, 50])
++def test_fifty_runs_read_jobs_once_per_head_at_most(n_heads):
++    heads = [f"{i:040x}" for i in range(1, n_heads + 1)]
++    api = CountingAPI(fifty_runs(heads))
++    found = sync.candidates(SLUG, api.request)
++    assert set(found) == set(heads) and {c.status for c in found.values()} == {"green"}
++    assert len(api.jobs_reads()) <= n_heads
++    newest = {h: max(r["id"] for r in api.runs if r["head_sha"] == h) for h in heads}
++    assert {h: c.run_id for h, c in found.items()} == newest  # the newest run is each head's verdict
++
++
++def test_only_wanted_heads_cost_a_jobs_read():
++    heads = [f"{i:040x}" for i in range(1, 11)]
++    api = CountingAPI(fifty_runs(heads))
++    found = sync.candidates(SLUG, api.request, wanted=lambda head, _updated: head == heads[3])
++    assert len(api.jobs_reads()) == 1 and found[heads[3]].status == "green"
++    assert {c.status for h, c in found.items() if h != heads[3]} == {"unread"}
++
++
++def test_newest_verdict_wins_and_a_newer_cancelled_run_does_not_count():
++    head = "a" * 40
++    api = CountingAPI([run(1, head), run(2, head, conclusion="failure"), run(3, head, conclusion="cancelled")])
++    assert sync.candidates(SLUG, api.request)[head].status == "red"  # run 2, not the older green run 1
++    assert api.jobs_reads() == []  # a failed run needs no jobs read
++    api = CountingAPI([run(1, head, conclusion="failure"), run(2, head)], red_runs={2})
++    assert sync.candidates(SLUG, api.request)[head].status == "red"  # newest green run's jobs decide
++    assert len(api.jobs_reads()) == 1
++
++
++def test_completed_run_verdicts_are_cached_by_attempt(tmp_path):
++    head = "b" * 40
++    path = tmp_path / "cache" / "gate.json"
++    api = CountingAPI([run(7, head)])
++    assert sync.candidates(SLUG, api.request, cache=sync.VerdictCache(path))[head].status == "green"
++    assert len(api.jobs_reads()) == 1
++    assert sync.candidates(SLUG, api.request, cache=sync.VerdictCache(path))[head].status == "green"
++    assert len(api.jobs_reads()) == 1  # a fresh process reads the stored verdict
++    api.runs = [run(7, head, attempt=2)]  # a re-run is a new attempt: its jobs are read again
++    api.red_runs = {7}
++    assert sync.candidates(SLUG, api.request, cache=sync.VerdictCache(path))[head].status == "red"
++    assert len(api.jobs_reads()) == 2
++    path.write_text("not json")
++    assert sync.candidates(SLUG, api.request, cache=sync.VerdictCache(path))[head].status == "red"  # unreadable: refetch
++
++
++def test_a_gate_call_reads_jobs_only_for_the_head_it_can_act_on(world):
++    """Landed history (many reruns on heads main already holds) costs no jobs reads."""
++    root, checkout = world
++    upstream_commit(root, {"u.txt": "u\n"}, "upstream")
++    landed = merge_upstream(checkout)
++    actions = FakeActions(root / "origin.git", root)
++    before = main_of(root)
++    gate(checkout, landed, actions)
++    actions.ci()
++    assert gate(checkout, landed, actions) == sync.LANDED and landed_by_merge(root, landed, before)
++    for _ in range(40):  # GitHub keeps the landed head's (re)runs in the list for weeks
++        rerun = dict(actions.runs[0], id=len(actions.runs) + 1, run_number=len(actions.runs) + 1,
++                     updated_at="2026-10-01T00:00:00Z")
++        actions.runs.append(rerun)
++
++    upstream_commit(root, {"v.txt": "v\n"}, "more upstream")
++    head = merge_upstream(checkout)
++    calls = []
++    request = actions.request
++
++    def counting(endpoint):
++        calls.append(endpoint)
++        return request(endpoint)
++    actions.request = counting
++    assert gate(checkout, head, actions) == sync.NOT_YET  # staged
++    actions.ci()
++    calls.clear()
++    actions.aggregate = ("in_progress", None)
++    assert gate(checkout, head, actions) == sync.NOT_YET  # landing PR waits for its required check
++    jobs = [c for c in calls if "/jobs?" in c]
++    head_run = next(r["id"] for r in actions.runs if r["head_sha"] == head)
++    assert jobs == [f"repos/{SLUG}/actions/runs/{head_run}/jobs?per_page=100&filter=latest"], calls
++    assert len(calls) <= 10, calls
++
++
++def test_known_renamed_slug_resolves_without_a_request():
++    def fail(endpoint):
++        raise AssertionError(f"no request expected: {endpoint}")
++    assert sync.canonical_slug("daveey/hermes", fail) == "example-org/hermes"
++    assert sync.canonical_slug("Daveey/Hermes", fail) == "example-org/hermes"
++
++
++def test_unknown_slug_is_resolved_once_then_cached(tmp_path):
++    calls = []
++
++    def request(endpoint):
++        calls.append(endpoint)
++        return [{"full_name": "new-owner/fork"}]
++    path = tmp_path / "gate.json"
++    assert sync.canonical_slug(SLUG, request, sync.VerdictCache(path)) == "new-owner/fork"
++    assert sync.canonical_slug(SLUG, request, sync.VerdictCache(path)) == "new-owner/fork"
++    assert calls == [f"repos/{SLUG}"]
++
++    def broken(endpoint):
++        raise sync.GateError("API down")
++    assert sync.canonical_slug("other/repo", broken, sync.VerdictCache(None)) == "other/repo"
++    assert sync.canonical_slug("other/repo", lambda e: [{"workflow_runs": []}], None) == "other/repo"
++
++
++def test_main_calls_every_endpoint_on_the_canonical_slug(world, monkeypatch, tmp_path):
++    """origin still says daveey/hermes: no REST call may use it (each would cost a 301 plus the redirect)."""
++    root, checkout = world
++    git(checkout, "config", "remote.origin.url", "git@github.com:daveey/hermes.git")
++    git(checkout, "config", f"url.{root / 'origin.git'}.insteadOf", "git@github.com:daveey/hermes.git")
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
++    head = "c" * 40
++    api = CountingAPI([run(i, head) for i in range(1, 30)])
++    seen = []
++
++    def gh(*args, reason=None):
++        seen.append(args)
++        if args[:1] == ("api",):
++            pages = api.request(args[-1]) if "/pulls?" not in args[-1] else [[]]
++            if "--paginate" not in args:  # one named page: GitHub returns that page, not a list of pages
++                assert len(pages) == 1
++                pages = pages[0]
++            return subprocess.CompletedProcess(args, 0, json.dumps(pages), "")
++        raise AssertionError(args)
++    monkeypatch.setattr(sync, "gh_cli", gh)
++    assert sync.main(["--repo", str(checkout)]) == sync.NOT_YET
++    endpoints = [a[-1] for a in seen]
++    assert endpoints and all(e.startswith("repos/example-org/hermes/") for e in endpoints), endpoints
++    assert len([e for e in endpoints if "/jobs?" in e]) <= 1
++    [runs_list] = [a for a in seen if "/workflows/" in a[-1]]
++    assert "--paginate" not in runs_list  # the newest 50 runs: one request, not the whole run history
++
++
++def test_a_named_page_is_read_without_paginating(monkeypatch):
++    seen = []
++
++    def gh(*args, reason=None):
++        seen.append(args)
++        return subprocess.CompletedProcess(args, 0, json.dumps({"workflow_runs": []} if "--paginate" not in args
++                                                               else [{"jobs": []}, {"jobs": []}]), "")
++    monkeypatch.setattr(sync, "gh_cli", gh)
++    assert sync.github_pages("repos/a/b/actions/workflows/x/runs?per_page=50&page=1") == [{"workflow_runs": []}]
++    assert sync.github_pages("repos/a/b/actions/runs/1/jobs?per_page=100") == [{"jobs": []}, {"jobs": []}]
++    assert seen == [("api", "repos/a/b/actions/workflows/x/runs?per_page=50&page=1"),
++                    ("api", "--paginate", "--slurp", "repos/a/b/actions/runs/1/jobs?per_page=100")]
+-- 
+2.43.0
+

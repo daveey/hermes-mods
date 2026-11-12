@@ -1,0 +1,452 @@
+From c4bf691bf01880493c25ebed3c96ce61477a951b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 14:00:26 +0000
+Subject: [PATCH] [daveey] perf(gateway): dispatcher tick reads profile names
+ only and each other board once
+
+hermes-hub gateway, 600 s at 118% of a core with 12 boards (2026-11-12 13:34Z):
+- _receipt_scope ran list_profiles() twice per board per tick: config and gateway
+  liveness for every profile, only to take the names (7.6% of samples). It now
+  uses list_profile_names().
+- count_running_tasks_other_boards opened every other board from every board's
+  tick: 132 connections per tick (6.4%). Inside kanban_board_share.tick_counts()
+  (one dispatcher tick) a board's count is kept until that board's own tick
+  asks, so later boards still see the workers it started; 22 connections.
+  Outside a tick every call reads every board, as before.
+
+Review notes from #1406:
+- gateway_names does not memoise the answer of a failed hub.db read.
+- repair_divergence skips a row that left the replica mid-pass instead of
+  aborting the pass with KeyError.
+
+Tests: tests/hermes_cli/test_dispatcher_tick_read_budget.py (5 of 7 fail on the
+old code: 20 opens vs budget 8, profile probes, remembered failure, KeyError).
+---
+ gateway/kanban_watchers_dispatcher.py         |  23 +-
+ hermes_cli/kanban_board_share.py              |  33 ++-
+ hermes_cli/kanban_origin.py                   |  14 +-
+ hermes_cli/kanban_sync_divergence.py          |   4 +-
+ .../gateway/test_kanban_dispatcher_health.py  |   2 +-
+ .../test_kanban_external_drain_hold.py        |   2 +-
+ .../test_dispatcher_tick_read_budget.py       | 217 ++++++++++++++++++
+ 7 files changed, 276 insertions(+), 19 deletions(-)
+ create mode 100644 tests/hermes_cli/test_dispatcher_tick_read_budget.py
+
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index a2198d7f19..d6d5a1f93a 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -305,23 +305,26 @@ class _KanbanDispatcher:
+         cross-board ranking (``hermes_cli.kanban_board_share``: priority order plus a starvation guard). [daveey]
+         """
+         self.successful_scopes = []
+-        if not suppress_spawn:
+-            order = self._fair_board_order()
+-            from hermes_cli import kanban_board_share as share
+-            quotas = share.shares(order, self.live_max_in_progress())
+-            if quotas is not None:
+-                return share.run(order, quotas, self.tick_once_for_board)
+-            return [(slug, self.tick_once_for_board(slug)) for slug in order]
+-        return [(slug, self.tick_once_for_board(slug, suppress_spawn=True)) for slug in self._board_slugs()]
++        from hermes_cli import kanban_board_share as share
++        with share.tick_counts():
++            if not suppress_spawn:
++                order = self._fair_board_order()
++                quotas = share.shares(order, self.live_max_in_progress())
++                if quotas is not None:
++                    return share.run(order, quotas, self.tick_once_for_board)
++                return [(slug, self.tick_once_for_board(slug)) for slug in order]
++            return [(slug, self.tick_once_for_board(slug, suppress_spawn=True)) for slug in self._board_slugs()]
+ 
+     @staticmethod
+     def _receipt_scope() -> tuple[set, set]:
+         """Only existing profiles admitted by native dispatch policy."""
+-        from hermes_cli.profiles import list_profiles
++        from hermes_cli.profiles import list_profile_names
+         predicate = _kbd()._profile_exists_fn()
+         if predicate is None:
+             return set(), set()
+-        profiles = {p.name for p in list_profiles(lazy_skill_count=True) if predicate(p.name)}
++        # Names only: ``list_profiles`` also probes each profile's gateway liveness and config, twice per board
++        # per tick (7.6% of hub gateway CPU at 12 boards, 2026-11-12). [daveey]
++        profiles = {name for name in list_profile_names() if predicate(name)}
+         lanes = {"ready"}
+         if _kbd().review_dispatch_enabled():
+             lanes.add("review")
+diff --git a/hermes_cli/kanban_board_share.py b/hermes_cli/kanban_board_share.py
+index 66f4b5e77c..f2bb05d65b 100644
+--- a/hermes_cli/kanban_board_share.py
++++ b/hermes_cli/kanban_board_share.py
+@@ -26,6 +26,7 @@ from __future__ import annotations
+ import contextlib
+ import heapq
+ import logging
++import threading
+ import time
+ from pathlib import Path
+ from typing import Any, Callable, NamedTuple, Optional
+@@ -146,6 +147,26 @@ def shares(slugs: list[str], cap: Optional[int], *, now: Optional[float] = None)
+     return plan(heads, cap - running, now=time.time() if now is None else now)
+ 
+ 
++_tick = threading.local()
++
++
++@contextlib.contextmanager
++def tick_counts():
++    """One dispatcher tick over every board: :func:`count_running_tasks_other_boards` reads each board once.
++
++    Every board's tick asked every other board for its running count: 12 boards meant 132 connections per tick
++    (5% of hub gateway CPU, 2026-11-12). Inside this scope a board's count is kept until that board's own tick
++    asks (its tick is what starts workers there), so the next board reads it again and still sees those starts.
++    A worker that ends on another board mid-tick is counted until the next tick, which only delays a start.
++    Outside the scope (daemon, CLI, notices) every call reads every board, as before. [daveey]"""
++    previous = getattr(_tick, "counts", None)
++    _tick.counts = {}
++    try:
++        yield
++    finally:
++        _tick.counts = previous
++
++
+ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
+     """Total ``running`` tasks across every board EXCEPT ``board`` (re-exported by ``kanban_db_dispatch``).
+ 
+@@ -161,6 +182,10 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
+         current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
+     except Exception:
+         current_path = None
++    # Without the asking board's path nothing says whose count goes stale: read every board.
++    counts: Optional[dict[str, int]] = getattr(_tick, "counts", None) if current_path is not None else None
++    if counts is not None:
++        counts.pop(current_path, None)  # this board's tick is about to change its own count
+     try:
+         boards = _kb.list_boards(include_archived=False)
+     except Exception:
+@@ -173,14 +198,20 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
+             resolved = str(path.resolve())
+             if current_path is not None and resolved == current_path:
+                 continue
++            if counts is not None and resolved in counts:
++                total += counts[resolved]
++                continue
+             if not path.exists():
+                 continue
+             other = _kbc.connect(board=slug)
+             try:
+-                total += count_running_tasks(other)
++                running = count_running_tasks(other)
+             finally:
+                 with contextlib.suppress(Exception):
+                     other.close()
++            total += running
++            if counts is not None:
++                counts[resolved] = running
+         except Exception:
+             continue
+     return total
+diff --git a/hermes_cli/kanban_origin.py b/hermes_cli/kanban_origin.py
+index a06e4ee1e7..75bdcb4bdb 100644
+--- a/hermes_cli/kanban_origin.py
++++ b/hermes_cli/kanban_origin.py
+@@ -127,15 +127,18 @@ def gateway_names() -> tuple[str, set[str]]:
+     memo, now = _names_memo, time.monotonic()
+     if memo is not None and memo[0] == key and now - memo[1] < _NAMES_MAX_AGE_S:
+         return memo[2], set(memo[3])
+-    me, known = _read_gateway_names(path, cfg)
++    failed: list[sqlite3.Error] = []
++    me, known = _read_gateway_names(path, cfg, failed)
+     # A file written within the timestamp granularity could change again under the same signature: not kept.
++    # Nor is an answer from a hub.db read that failed (locked, mid-replace): the next caller reads again.
+     racy = time.time_ns() - _NAMES_RACY_NS
+-    _names_memo = None if any(isinstance(sig, tuple) and sig[1] >= racy for sig in key) else (
++    _names_memo = None if failed or any(isinstance(sig, tuple) and sig[1] >= racy for sig in key) else (
+         key, now, me, frozenset(known))
+     return me, known
+ 
+ 
+-def _read_gateway_names(path: Optional[Path], cfg: Path) -> tuple[str, set[str]]:
++def _read_gateway_names(path: Optional[Path], cfg: Path,
++                        failed: Optional[list[sqlite3.Error]] = None) -> tuple[str, set[str]]:
+     me, known = "", set()
+     if path is not None:
+         try:
+@@ -146,8 +149,9 @@ def _read_gateway_names(path: Optional[Path], cfg: Path) -> tuple[str, set[str]]
+                 known = {str(r[0]) for r in conn.execute("SELECT DISTINCT gw FROM replica") if r[0]}
+             finally:
+                 conn.close()
+-        except sqlite3.Error:
+-            pass
++        except sqlite3.Error as exc:
++            if failed is not None:
++                failed.append(exc)
+     if not me:
+         try:
+             me = str(json.loads(cfg.read_text(encoding="utf-8-sig")).get("gateway") or "")
+diff --git a/hermes_cli/kanban_sync_divergence.py b/hermes_cli/kanban_sync_divergence.py
+index bca58e9a40..7c8a4195dd 100644
+--- a/hermes_cli/kanban_sync_divergence.py
++++ b/hermes_cli/kanban_sync_divergence.py
+@@ -44,7 +44,9 @@ def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gate
+             replica = {r["id"]: r for r in shadow.execute(
+                 f"SELECT * FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)}
+         tid = row["id"]
+-        theirs = replica[tid]
++        theirs = replica.get(tid)
++        if theirs is None:  # left the replica since ``seen`` was read: nothing to compare this pass
++            continue
+         mine, remote = _row_fields(live, "tasks", row), _row_fields(shadow, "tasks", theirs)
+         omitted = omissions.get(tid, ())
+         fields = {k: v for k, v in mine.items() if k in remote and remote[k] != v and k not in omitted}
+diff --git a/tests/gateway/test_kanban_dispatcher_health.py b/tests/gateway/test_kanban_dispatcher_health.py
+index c554e0671d..87afca96b5 100644
+--- a/tests/gateway/test_kanban_dispatcher_health.py
++++ b/tests/gateway/test_kanban_dispatcher_health.py
+@@ -88,7 +88,7 @@ def test_native_loop_publishes_only_actual_board_success(tmp_path, monkeypatch,
+     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+-    monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda **kw: [SimpleNamespace(name="default")])
++    monkeypatch.setattr("hermes_cli.profiles.list_profile_names", lambda: ["default"])
+     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: name == "default")
+     monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: False)
+     monkeypatch.setattr(_KanbanDispatcher, "_board_slugs", lambda self: ["default", "broken"])
+diff --git a/tests/gateway/test_kanban_external_drain_hold.py b/tests/gateway/test_kanban_external_drain_hold.py
+index 56519e38a8..3dc56c8ae3 100644
+--- a/tests/gateway/test_kanban_external_drain_hold.py
++++ b/tests/gateway/test_kanban_external_drain_hold.py
+@@ -41,7 +41,7 @@ def _board(monkeypatch):
+     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+     from hermes_cli import kanban_db_dispatch as kbd
+ 
+-    monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda **kw: [SimpleNamespace(name="default")])
++    monkeypatch.setattr("hermes_cli.profiles.list_profile_names", lambda: ["default"])
+     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: name == "default")
+     monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: False)
+     monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "unknown")
+diff --git a/tests/hermes_cli/test_dispatcher_tick_read_budget.py b/tests/hermes_cli/test_dispatcher_tick_read_budget.py
+new file mode 100644
+index 0000000000..bbfc36cd31
+--- /dev/null
++++ b/tests/hermes_cli/test_dispatcher_tick_read_budget.py
+@@ -0,0 +1,217 @@
++"""Read budgets for the gateway's dispatcher tick, and two repair-pass edge cases. [daveey]
++
++hermes-hub 2026-11-12 (12 boards, 600 s at 118% of a core): every board's tick listed every profile with its
++gateway liveness twice (7.6% of samples) and opened every other board to count its running cards (6.4%).
++"""
++from __future__ import annotations
++
++import os
++import sqlite3
++import time
++from pathlib import Path
++
++import pytest
++
++from gateway.kanban_watchers_dispatcher import _KanbanDispatcher, _resolve_dispatcher_settings
++from hermes_cli import kanban_board_share as share
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_origin
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import profiles
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++BOARDS = ("default", "b1", "b2", "b3", "b4")
++
++
++def _scope_open() -> bool:
++    return getattr(getattr(share, "_tick", None), "counts", None) is not None
++
++
++def _tick_scope():
++    return share.tick_counts()
++
++
++@pytest.fixture
++def boards(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME"):
++        monkeypatch.delenv(key, raising=False)
++    kb.init_db()
++    for slug in BOARDS[1:]:
++        kb.create_board(slug)
++    for slug in BOARDS:
++        _start(slug)
++    return home
++
++
++def _start(slug: str) -> None:
++    with kbc.connect(board=slug) as conn:
++        tid = kb.create_task(conn, title="busy", assignee="alice")
++        assert kb.claim_task(conn, tid) is not None
++
++
++def _count_connects(monkeypatch) -> list:
++    real, opened = kbc.connect, []
++
++    def counted(*args, **kwargs):
++        opened.append(kwargs.get("board"))
++        return real(*args, **kwargs)
++
++    monkeypatch.setattr(kbc, "connect", counted)
++    return opened
++
++
++# --- _receipt_scope -------------------------------------------------------------------------------------------------
++
++
++def test_receipt_scope_lists_names_without_probing_any_profile(tmp_path, monkeypatch):
++    monkeypatch.setattr(profiles, "_iter_named_profile_dirs", lambda **kw: [tmp_path / "alice", tmp_path / "bob"])
++    probed = []
++    monkeypatch.setattr(profiles, "_check_gateway_running", lambda path: probed.append(path) or False)
++    monkeypatch.setattr(profiles, "_read_config_model", lambda path: probed.append(path) or (None, None))
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda name: name != "bob")
++    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
++    assert _KanbanDispatcher._receipt_scope() == ({"default", "alice"}, {"ready", "review"})
++    assert probed == [], f"profile config/liveness read for a name-only scope: {probed}"
++
++
++# --- other boards' running count ------------------------------------------------------------------------------------
++
++
++def test_a_tick_reads_each_other_board_about_once_not_once_per_board(boards, monkeypatch):
++    opened = _count_connects(monkeypatch)
++    with _tick_scope():
++        totals = [share.count_running_tasks_other_boards(slug) for slug in BOARDS]
++    assert totals == [len(BOARDS) - 1] * len(BOARDS)
++    budget = 2 * (len(BOARDS) - 1)
++    assert len(opened) <= budget, f"{len(opened)} board opens in one tick over {len(BOARDS)} boards (budget {budget})"
++
++
++def test_a_tick_counts_the_workers_earlier_boards_started_in_it(boards):
++    with _tick_scope():
++        assert share.count_running_tasks_other_boards("default") == 4
++        _start("default")  # the default board's tick starts a worker
++        assert share.count_running_tasks_other_boards("b1") == 5
++        _start("b1")
++        _start("b1")
++        assert share.count_running_tasks_other_boards("b2") == 7
++        assert share.count_running_tasks_other_boards("default") == 6
++
++
++def test_outside_a_tick_every_call_reads_every_board(boards, monkeypatch):
++    opened = _count_connects(monkeypatch)
++    assert share.count_running_tasks_other_boards("default") == 4
++    first = len(opened)
++    assert first == len(BOARDS) - 1
++    assert share.count_running_tasks_other_boards("default") == 4
++    assert len(opened) == 2 * first
++    with _tick_scope():
++        share.count_running_tasks_other_boards("default")
++    assert not _scope_open()
++    before = len(opened)
++    share.count_running_tasks_other_boards("default")
++    assert len(opened) == before + first, "a count outlived its tick"
++
++
++def test_the_gateway_tick_runs_every_board_inside_one_count_scope(boards, monkeypatch):
++    dispatcher = _KanbanDispatcher(kb, _resolve_dispatcher_settings({}, kb))
++    monkeypatch.setattr(dispatcher, "_board_slugs", lambda: list(BOARDS))
++    scoped = []
++    monkeypatch.setattr(dispatcher, "tick_once_for_board", lambda slug, **kw: scoped.append(_scope_open()))
++    dispatcher.tick_once()
++    dispatcher.tick_once(suppress_spawn=True)
++    assert scoped == [True] * (2 * len(BOARDS))
++    assert not _scope_open()
++
++
++# --- gateway_names ---------------------------------------------------------------------------------------------------
++
++
++def test_gateway_names_does_not_keep_the_answer_of_a_failed_hub_db_read(tmp_path, monkeypatch):
++    state = tmp_path / "hub-state"
++    state.mkdir()
++    monkeypatch.setenv("HERMES_HUB_STATE", str(state))
++    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(tmp_path / "absent.json"))
++    monkeypatch.setattr(kanban_origin, "_names_memo", None, raising=False)
++    db = sqlite3.connect(state / "hub.db")
++    db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
++    db.execute("CREATE TABLE replica (gw TEXT)")
++    db.execute("INSERT INTO meta VALUES ('gateway', 'hub')")
++    db.execute("INSERT INTO replica VALUES ('macbook')")
++    db.commit()
++    db.close()
++    old = time.time() - 60
++    os.utime(state / "hub.db", (old, old))
++    real, calls = kanban_origin._ro, []
++
++    def flaky(path):
++        calls.append(str(path))
++        if len(calls) == 1:
++            raise sqlite3.OperationalError("database is locked")
++        return real(path)
++
++    monkeypatch.setattr(kanban_origin, "_ro", flaky)
++    assert kanban_origin.gateway_names() == ("", set())
++    assert kanban_origin.gateway_names() == ("hub", {"hub", "macbook"}), "a failed read was remembered"
++    assert kanban_origin.gateway_names() == ("hub", {"hub", "macbook"})
++    assert len(calls) == 2
++
++
++# --- divergence repair ----------------------------------------------------------------------------------------------
++
++
++class _VanishingReplica:
++    """The replica connection, losing one task row right after the pass's first read."""
++
++    def __init__(self, conn, task_id):
++        self._conn, self._task_id, self._reads = conn, task_id, 0
++
++    def __getattr__(self, name):
++        return getattr(self._conn, name)
++
++    def execute(self, sql, *params):
++        if self._reads == 0:
++            self._reads = 1
++            rows = self._conn.execute(sql, *params).fetchall()
++            self._conn.execute("DELETE FROM tasks WHERE id = ?", (self._task_id,))
++            return iter(rows)
++        return self._conn.execute(sql, *params)
++
++
++def test_divergence_repair_skips_a_row_that_left_the_replica_mid_pass(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    live = kbc.connect(home / "kanban.db")
++    me, board = "macbook", "default"
++    try:
++        ksc.ensure_identity(live, board, me)
++        svc = FakeService()
++        ids = [kb.create_task(live, title=f"card {i}", assignee="default") for i in range(4)]
++        ksc.sync_board(board, home / "kanban.db", svc.hub(me), me)
++        real, passes = ksc.repair_divergence, []
++
++        def vanishing(live_conn, shadow, gateway):
++            passes.append(1)
++            if len(passes) == 1:
++                return real(live_conn, _VanishingReplica(shadow, ids[0]), gateway)
++            return real(live_conn, shadow, gateway)
++
++        monkeypatch.setattr(ksc, "repair_divergence", vanishing)
++        with kbc.write_txn(live):
++            sync.drop_triggers(live)
++            live.execute("UPDATE tasks SET title = 'gap edit' WHERE id = ?", (ids[-1],))
++        sync.install_triggers(live)
++        ksc.sync_board(board, home / "kanban.db", svc.hub(me), me)
++        assert passes, "the repair scan did not run"
++        ksc.sync_board(board, home / "kanban.db", svc.hub(me), me)
++        assert svc.board(board)["rows"]["tasks"][ids[-1]]["title"] == "gap edit", \
++            "one vanished replica row stopped the pass before the uncaptured edit was healed"
++    finally:
++        live.close()
+-- 
+2.43.0
+

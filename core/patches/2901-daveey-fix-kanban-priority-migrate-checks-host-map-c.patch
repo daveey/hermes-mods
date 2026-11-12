@@ -1,0 +1,481 @@
+From 348c8db7855e18afcbcfd585dae497be91178dcf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:39:24 +0000
+Subject: [PATCH] [daveey] fix(kanban): priority migrate checks host-map
+ coverage before staging; add read-only origins check
+
+Run 1 of the f953 migrate (op bdc414c0) refused 'host map must exactly cover
+manifest origins' only after the local writer had written its backup and
+attachment, so every retry needed new paths, and the live origin set could be
+read only by running migrate.
+
+- migrate now captures the canonical manifest first, compares the explicit host
+  map with the captured origins (missing/extra in the report) and refuses before
+  stage() writes any backup or attachment; it then stages that same manifest.
+- --priority-operation origins: read-only check printing {origins, missing,
+  extra, errors}; exit 1 on a missing origin or unmapped/rowless writer. Same
+  operator fence; refuses backup/task/manifest/attachment/digest/rollback flags.
+- Superset maps: entries for origins owning no captured row are reported as
+  skipped and never contacted. Missing entries still refuse. Hosts are never
+  inferred.
+- Runbook: a coverage mismatch consumes no backup path or attachment.
+---
+ docs/kanban-priority-rollout.md               |  34 +++-
+ hermes_cli/kanban_parser.py                   |   2 +-
+ hermes_cli/kanban_priority_cli.py             |  35 ++--
+ hermes_cli/kanban_priority_runner.py          |  62 +++++--
+ .../hermes_cli/test_kanban_priority_runner.py | 163 +++++++++++++++++-
+ 5 files changed, 263 insertions(+), 33 deletions(-)
+
+diff --git a/docs/kanban-priority-rollout.md b/docs/kanban-priority-rollout.md
+index 2e42b02cbf..173b47a341 100644
+--- a/docs/kanban-priority-rollout.md
++++ b/docs/kanban-priority-rollout.md
+@@ -55,7 +55,10 @@ fences. The coordinator checks lineage before reading configuration or starting
+ SSH; remote staging checks it before reading stdin. SSH is transport for an
+ already authorized operator, never a worker authorization mechanism.
+ 
+-Create an explicit JSON mapping for **every origin in the captured manifest**:
++Create an explicit JSON mapping for **every origin in the captured manifest**.
++Entries for other enrolled origins that own no captured row are allowed; the
++coordinator reports them as `skipped` and never contacts them, so a map listing
++every enrolled gateway keeps working when one drains:
+ 
+ ```json
+ {
+@@ -91,12 +94,33 @@ flag). `--allow-legacy-rollback` explicitly permits automatic guarded recovery
+ of above-cap originals; omit it only if refusing that policy rollback is intended.
+ Do not pass separate task, backup, manifest, attachment or digest flags to migrate.
+ 
+-The coordinator captures one global raw manifest, secures its local original and
+-attachment, sends the **exact UTF-8 bytes** over SSH stdin with `stage --manifest -`,
+-and validates every origin's attachment, writer, inventory and identical SHA256
++Before a run, check the map against the live origins with the read-only
++`origins` operation (same operator fence, same map flags, no `--allow-legacy-rollback`):
++
++```sh
++hermes kanban --board default supervisor-requests --priority-operation origins \
++  --writer origin-a --host-map-file /absolute/operator-host-map.json
++```
++
++It captures the canonical inventory and prints
++`{"origins": {name: open-row count}, "missing": [...], "extra": [...], "errors": [...]}`.
++It exits 1 when an origin has no map entry or the writer is unmapped or owns no
++rows; `extra` entries alone pass. It writes no backup, attachment or priority,
++and does not use the backup paths, so they stay fresh for the real run. Hosts are
++still never inferred: fix a `missing` origin by adding its entry by hand.
++
++The coordinator captures one global raw manifest and checks host-map coverage on
++it **before writing anything**. A coverage mismatch (an origin missing from the
++map, or a local writer that is unmapped or owns no rows) exits 1 with `missing`,
++`extra` and `errors` in the report and consumes **no backup path and no
++attachment**: fix the map and rerun with the same paths. Only then does it stage
++that same captured manifest locally (backup plus attachment, so the staged digest
++is that of the checked capture), send the **exact UTF-8 bytes** over SSH stdin with
++`stage --manifest -` to every covered origin,
++and validate every origin's attachment, writer, inventory and identical SHA256
+ receipt **before any apply**. Staging failure or digest mismatch writes no
+ priorities, but local preparation and any completed staging consume their fresh
+-backup paths even if host-map coverage validation or later staging fails. Retain
++backup paths if later staging fails. Retain
+ those backups and choose new paths before retrying. It then applies each origin,
+ publishes each normal outbox via the
+ supported `kanban_sync_client.push` API (no snapshot pull), rejects pending or
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index f3e30e7870..9efd0c06a7 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -408,7 +408,7 @@ _SPECS = [
+     _cmd("link", [_arg("parent_id"), _arg("child_id")], help="Add a parent->child dependency"),
+     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
+     _cmd("supervisor-requests", [
+-        _arg("--priority-operation", choices=["prepare", "stage", "apply", "restore", "verify", "verify-restore", "migrate", "publish"],
++        _arg("--priority-operation", choices=["prepare", "stage", "apply", "restore", "verify", "verify-restore", "migrate", "origins", "publish"],
+              help="Operator-only attached priority migration; never executable by workers"),
+         _arg("--host-map", help="Explicit origin-to-SSH transport/task/backup JSON for migrate"),
+         _arg("--host-map-file", help="File containing the explicit migrate host-map JSON"),
+diff --git a/hermes_cli/kanban_priority_cli.py b/hermes_cli/kanban_priority_cli.py
+index 3d89c0a8b4..2269dc5820 100644
+--- a/hermes_cli/kanban_priority_cli.py
++++ b/hermes_cli/kanban_priority_cli.py
+@@ -23,9 +23,9 @@ def run(conn, args) -> int:
+         if not args.writer:
+             raise ValueError('explicit --writer required')
+         action = args.priority_operation
+-        if action == 'migrate':
++        if action in ('migrate', 'origins'):
+             from hermes_cli import kanban_priority_runner as runner
+-            code, result = runner.run(conn, args)
++            code, result = (runner.run if action == 'migrate' else runner.check_host_map)(conn, args)
+             print(json.dumps(result, sort_keys=True))
+             return code
+         handlers = {
+@@ -63,7 +63,24 @@ def _manifest_bytes(path: str) -> bytes:
+     return Path(path).read_bytes()
+ 
+ 
+-def _prepare_stage(conn, args) -> dict:
++def _capture(conn, args) -> dict:
++    """Read-only canonical capture for this enrolled primary writer; writes nothing."""
++    refusal = _non_worker_refusal()
++    if refusal:
++        raise PermissionError(refusal)
++    from hermes_cli import kanban_sync_client as sync
++    identity = sync.load_identity()
++    state = sync_state(conn) or {}
++    if identity.gateway != args.writer or state.get('gateway_id') != args.writer:
++        raise ValueError('configured gateway differs from explicit writer')
++    if state.get('mode') != 'primary' or not state.get('board_id'):
++        raise ValueError('prepare requires an enrolled primary board')
++    return prepare.capture(sync.Hub(identity), board_id=state['board_id'], exceptions=args.exception)
++
++
++def _prepare_stage(conn, args, *, manifest: dict | None = None) -> dict:
++    """Stage a --manifest input, or prepare from ``manifest`` already captured by the
++    caller (migrate checks host-map coverage on it first), else a fresh capture."""
+     refusal = _non_worker_refusal()
+     if refusal:
+         raise PermissionError(refusal)
+@@ -71,6 +88,8 @@ def _prepare_stage(conn, args) -> dict:
+         raise ValueError('--task and a fresh --backup path required')
+     data = None
+     if args.priority_operation == 'stage':
++        if manifest is not None:
++            raise ValueError('stage reads only its --manifest input')
+         if not args.manifest or args.exception:
+             raise ValueError('stage requires --manifest and no --exception overrides')
+         data = _manifest_bytes(args.manifest)
+@@ -78,14 +97,8 @@ def _prepare_stage(conn, args) -> dict:
+     else:
+         if args.manifest:
+             raise ValueError('prepare reads canonical Board, not --manifest')
+-        from hermes_cli import kanban_sync_client as sync
+-        identity = sync.load_identity()
+-        state = sync_state(conn) or {}
+-        if identity.gateway != args.writer or state.get('gateway_id') != args.writer:
+-            raise ValueError('configured gateway differs from explicit writer')
+-        if state.get('mode') != 'primary' or not state.get('board_id'):
+-            raise ValueError('prepare requires an enrolled primary board')
+-        manifest = prepare.capture(sync.Hub(identity), board_id=state['board_id'], exceptions=args.exception)
++        if manifest is None:
++            manifest = _capture(conn, args)
+     return prepare.stage(conn, manifest, path=Path(args.backup), task_id=args.task,
+                          writer=args.writer, original_bytes=data)
+ 
+diff --git a/hermes_cli/kanban_priority_runner.py b/hermes_cli/kanban_priority_runner.py
+index c2c88cd494..cf5275b099 100644
+--- a/hermes_cli/kanban_priority_runner.py
++++ b/hermes_cli/kanban_priority_runner.py
+@@ -1,6 +1,7 @@
+ """Operator-only all-origin coordinator; never grants authority or edits lineage."""
+ from __future__ import annotations
+ 
++from collections import Counter
+ import hashlib
+ import json
+ import logging
+@@ -61,27 +62,68 @@ def ssh(entry, words, data=None):
+     return receipt
+ 
+ 
++def coverage(hosts, manifest, writer):
++    """Compare an explicit host map with the origins owning captured rows.
++
++    Hosts are never derived from this: a missing origin refuses. An extra entry
++    (an enrolled origin owning no captured row) is reported and skipped.
++    """
++    origins = dict(sorted(Counter(row['origin'] for row in manifest['rows']).items()))
++    report = {'origins': origins, 'missing': sorted(set(origins) - set(hosts)),
++              'extra': sorted(set(hosts) - set(origins))}
++    errors = []
++    if report['missing']:
++        errors.append(f"host map missing manifest origins: {', '.join(report['missing'])}")
++    if writer not in hosts:
++        errors.append('local writer missing from host map')
++    elif writer not in origins:
++        errors.append('local writer owns no manifest rows; choose a writer that does')
++    return report, errors
++
++
++def _capture_coverage(conn, args, operation):
++    require_operator()
++    from hermes_cli import kanban_priority_cli as cli
++
++    hosts = load_hosts(args)
++    if args.manifest or args.backup or args.task or args.attachment_id or args.digest:
++        raise ValueError(f'{operation} takes attachment task/backup paths only from host map')
++    manifest = cli._capture(conn, args)  # Read-only: no backup, attachment or priority.
++    cover, errors = coverage(hosts, manifest, args.writer)
++    return hosts, manifest, cover, errors
++
++
++def check_host_map(conn, args):
++    """Read-only preflight: (0, report) iff ``migrate`` would accept this host map."""
++    require_operator()
++    if args.allow_legacy_rollback:
++        raise ValueError('origins is read-only; it takes no rollback policy')
++    _hosts, _manifest, cover, errors = _capture_coverage(conn, args, 'origins')
++    return (1 if errors else 0), {**cover, 'writer': args.writer, 'errors': errors}
++
++
+ def run(conn, args):
+     """Return (exit status, full receipts), including guarded rollback failures."""
+     require_operator()
+     from hermes_cli import kanban_priority_cli as cli
+     from hermes_cli import kanban_priority_executor as executor
+ 
+-    hosts = load_hosts(args)
+-    if args.writer not in hosts:
+-        raise ValueError('local writer missing from host map')
+-    if args.manifest or args.backup or args.task or args.attachment_id or args.digest:
+-        raise ValueError('migrate takes attachment task/backup paths only from host map')
++    hosts, manifest, cover, errors = _capture_coverage(conn, args, 'migrate')
++    # Coverage refuses before stage() writes any backup or attachment.
++    base = {**cover, 'skipped': cover['extra'], 'staged': {}, 'attempted': [],
++            'applied': {}, 'restored': {}, 'published': {}, 'errors': errors}
++    if errors:
++        return 1, base
+     local = hosts[args.writer]
+     prepared_args = SimpleNamespace(**vars(args))
+     prepared_args.task, prepared_args.backup = local['task'], local['backup']
+     prepared_args.priority_operation = 'prepare'
+-    prepared = cli._prepare_stage(conn, prepared_args)
++    # Stage exactly the manifest whose coverage was checked; no second capture.
++    prepared = cli._prepare_stage(conn, prepared_args, manifest=manifest)
+     data = Path(local['backup']).read_bytes()
+     digest = hashlib.sha256(data).hexdigest()
+     origins = prepared['origins']
+-    report = {'manifest_sha256': digest, 'staged': {args.writer: prepared},
+-              'attempted': [], 'applied': {}, 'restored': {}, 'published': {}, 'errors': []}
++    report = {**base, 'manifest_sha256': digest, 'staged': {args.writer: prepared}}
+ 
+     def invoke(origin, action):
+         require_operator()
+@@ -102,8 +144,8 @@ def run(conn, args):
+         return receipt
+ 
+     try:
+-        if set(hosts) != set(origins):
+-            raise ValueError('host map must exactly cover manifest origins')
++        if origins != cover['origins']:
++            raise ValueError('staged origins differ from the coverage-checked capture')
+         checked(prepared, args.writer)
+         for origin in sorted(origins):
+             if origin == args.writer:
+diff --git a/tests/hermes_cli/test_kanban_priority_runner.py b/tests/hermes_cli/test_kanban_priority_runner.py
+index 166f05f056..c5d7579019 100644
+--- a/tests/hermes_cli/test_kanban_priority_runner.py
++++ b/tests/hermes_cli/test_kanban_priority_runner.py
+@@ -6,6 +6,7 @@ import shlex
+ import sqlite3
+ import subprocess
+ import sys
++from pathlib import Path
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -35,15 +36,21 @@ def rig(monkeypatch, tmp_path):
+     data = '{ "note": "caf\u00e9", "rows": [] }\r\n'.encode('utf-8')
+     digest = hashlib.sha256(data).hexdigest()
+     events = []
++    rig_ns = SimpleNamespace(staged_origins=origins, manifest={
++        'board_id': 'board', 'rows': [{'id': f't-{o}', 'origin': o, 'old': 1, 'new': 2} for o in origins]})
+     def receipt(o):
+         return {'writer': o, 'manifest_sha256': digest, 'attachment_id': 1,
+                 'origins': origins, 'backup': hosts[o]['backup']}
+-    def prepare(_conn, _args):
++    def capture(_conn, _args):
++        events.append(('capture', _args.writer))
++        return rig_ns.manifest
++    def prepare(_conn, _args, *, manifest=None):
+         events.append(('prepare', 'a'))
+         assert _args.priority_operation == 'prepare'
+         assert _args.task == 'task-a'
++        assert manifest is rig_ns.manifest  # stages the coverage-checked capture, no re-capture
+         (tmp_path / 'a.json').write_bytes(data)
+-        return receipt('a')
++        return {**receipt('a'), 'origins': dict(rig_ns.staged_origins)}
+     def apply(_conn, attachment, dg, *, writer, undo, allow_legacy_rollback):
+         assert attachment == 1 and dg == digest
+         assert allow_legacy_rollback
+@@ -81,12 +88,23 @@ def rig(monkeypatch, tmp_path):
+         output = {'writer': origin, 'pending': 0, 'rejected': 0} if action == 'publish' else receipt(origin)
+         return SimpleNamespace(returncode=0, stdout=json.dumps(output), stderr='')
+     monkeypatch.setenv('RUNNER_TEST_SENTINEL', 'retained')
++    monkeypatch.setattr(cli, '_capture', capture)
+     monkeypatch.setattr(cli, '_prepare_stage', prepare)
+     monkeypatch.setattr(cli, '_publish', publish)
+     monkeypatch.setattr(cli, '_verify', verify)
+     monkeypatch.setattr(executor, 'apply_attached', apply)
+     monkeypatch.setattr(runner.subprocess, 'run', transport)
+-    return SimpleNamespace(args=args, hosts=hosts, data=data, events=events, transport=transport)
++    rig_ns.__dict__.update(args=args, hosts=hosts, data=data, events=events, transport=transport, tmp_path=tmp_path)
++    return rig_ns
++
++
++def _set_host_map(rig, hosts):
++    rig.args.host_map = json.dumps(hosts)
++
++
++def _consumed_nothing(rig):
++    assert not any(e[0] in ('prepare', 'stage', 'apply', 'restore', 'publish') for e in rig.events)
++    assert not any(Path(entry['backup']).exists() for entry in rig.hosts.values())
+ 
+ 
+ def test_all_stages_before_apply_and_actual_command_wiring(rig, capsys):
+@@ -96,7 +114,7 @@ def test_all_stages_before_apply_and_actual_command_wiring(rig, capsys):
+     assert report['attempted'] == ['a', 'b', 'c']
+     assert set(report['applied']) == {'a', 'b', 'c'}
+     assert report['canonical'] == {'verified': 3}
+-    assert rig.events == [('prepare', 'a'), ('stage', 'b'), ('stage', 'c'),
++    assert rig.events == [('capture', 'a'), ('prepare', 'a'), ('stage', 'b'), ('stage', 'c'),
+                           ('apply', 'a'), ('apply', 'b'), ('apply', 'c'),
+                           ('publish', 'a'), ('publish', 'b'), ('publish', 'c'), ('verify', 'a')]
+ 
+@@ -217,8 +235,141 @@ def test_host_map_file_and_coverage(rig, tmp_path):
+     del hosts['c']
+     path.write_text(json.dumps(hosts), encoding='utf-8')
+     code, report = runner.run(None, rig.args)
+-    assert code != 0 and 'exactly cover' in report['errors'][0]
+-    assert not report['applied']
++    assert code != 0 and report['errors'] == ['host map missing manifest origins: c']
++    assert report['missing'] == ['c'] and report['extra'] == []
++    assert not report['applied'] and not report['staged']
++
++
++@pytest.mark.parametrize('drop, add', [(['c'], []), (['b', 'c'], ['z'])])
++def test_coverage_mismatch_refuses_before_any_backup_or_attachment(rig, drop, add):
++    """Run 1 (op bdc414c0) staged the local backup and attachment, then refused on
++    coverage. Missing origins must refuse after the read-only capture only."""
++    hosts = {o: e for o, e in rig.hosts.items() if o not in drop}
++    for origin in add:
++        hosts[origin] = {**rig.hosts['a'], 'host': f'{origin}.example.com',
++                         'backup': str(rig.tmp_path / f'{origin}.json')}
++    _set_host_map(rig, hosts)
++    rig.manifest['rows'].append({'id': 't-a2', 'origin': 'a', 'old': 3, 'new': 4})
++    code, report = runner.run(None, rig.args)
++    assert code == 1
++    assert report['origins'] == {'a': 2, 'b': 1, 'c': 1}
++    assert report['missing'] == sorted(drop) and report['extra'] == add
++    assert report['staged'] == {} and report['attempted'] == []
++    assert rig.events == [('capture', 'a')]
++    _consumed_nothing(rig)
++
++
++def test_superset_map_skips_origins_without_rows(rig):
++    hosts = dict(rig.hosts, drained={**rig.hosts['b'], 'host': 'drained.example.com',
++                                     'backup': str(rig.tmp_path / 'drained.json')})
++    _set_host_map(rig, hosts)
++    code, report = runner.run(None, rig.args)
++    assert code == 0, report['errors']
++    assert report['skipped'] == ['drained'] and report['extra'] == ['drained']
++    assert report['missing'] == []
++    assert set(report['staged']) == set(report['applied']) == {'a', 'b', 'c'}
++    assert not any(origin == 'drained' for _action, origin in rig.events)
++    assert not Path(hosts['drained']['backup']).exists()
++
++
++def test_writer_without_rows_refuses_before_staging(rig):
++    hosts = dict(rig.hosts, w={**rig.hosts['a'], 'backup': str(rig.tmp_path / 'w.json')})
++    _set_host_map(rig, hosts)
++    rig.args.writer = 'w'
++    code, report = runner.run(None, rig.args)
++    assert code == 1 and report['extra'] == ['w']
++    assert any('local writer owns no manifest rows' in e for e in report['errors'])
++    assert rig.events == [('capture', 'w')]
++    _consumed_nothing(rig)
++
++
++def test_writer_missing_from_map_refuses_before_staging(rig):
++    _set_host_map(rig, {o: e for o, e in rig.hosts.items() if o != 'a'})
++    code, report = runner.run(None, rig.args)
++    assert code == 1 and report['missing'] == ['a']
++    assert 'local writer missing from host map' in report['errors']
++    _consumed_nothing(rig)
++
++
++def test_staged_origins_must_equal_checked_capture(rig):
++    rig.staged_origins = {'a': 1, 'b': 1}
++    code, report = runner.run(None, rig.args)
++    assert code == 1 and 'coverage-checked capture' in report['errors'][0]
++    assert not any(e[0] in ('stage', 'apply') for e in rig.events)
++
++
++def _origins_args(rig, *extra):
++    return cli_helpers.args('--priority-operation', 'origins', '--writer', 'a',
++                            '--host-map', rig.args.host_map, *extra)
++
++
++@pytest.mark.parametrize('drop, add, code', [([], [], 0), (['c'], [], 1), ([], ['z'], 0), (['b'], ['z'], 1)])
++def test_origins_check_is_read_only_and_reports_coverage(rig, capsys, drop, add, code):
++    hosts = {o: e for o, e in rig.hosts.items() if o not in drop}
++    for origin in add:
++        hosts[origin] = {**rig.hosts['a'], 'backup': str(rig.tmp_path / f'{origin}.json')}
++    _set_host_map(rig, hosts)
++    assert cli.run(None, _origins_args(rig)) == code
++    report = json.loads(capsys.readouterr().out)
++    assert report['origins'] == {'a': 1, 'b': 1, 'c': 1}
++    assert report['missing'] == drop and report['extra'] == add
++    assert bool(report['errors']) == bool(code)
++    assert rig.events == [('capture', 'a')]
++    _consumed_nothing(rig)
++
++
++@pytest.mark.parametrize('flag', [['--backup', '/x.json'], ['--task', 't'], ['--manifest', '-'],
++                                  ['--digest', 'd'], ['--attachment-id', '1'], ['--allow-legacy-rollback']])
++def test_origins_check_refuses_write_flags_before_capture(rig, flag):
++    assert cli.run(None, _origins_args(rig, *flag)) != 0
++    assert rig.events == []
++
++
++@pytest.mark.parametrize('delegated', [False, True])
++def test_origins_check_keeps_operator_fence(rig, monkeypatch, delegated):
++    from agent import delegation_context
++    monkeypatch.setattr(delegation_context, 'is_delegated_child_process_context', lambda: delegated)
++    if not delegated:
++        monkeypatch.setenv('HERMES_KANBAN_TASK', 'worker')
++    assert cli.run(None, _origins_args(rig)) != 0
++    with pytest.raises(PermissionError):
++        runner.check_host_map(None, _origins_args(rig))
++    assert rig.events == []
++
++
++@pytest.mark.parametrize('operation', ['origins', 'migrate'])
++def test_real_capture_path_writes_nothing_on_coverage_refusal(conn, monkeypatch, tmp_path, operation):
++    """Un-faked _capture/_prepare_stage: an uncovered origin refuses with no backup file,
++    no attachment and no priority change, for both the check and migrate itself."""
++    ids, _, _ = helpers.setup_plan(conn)
++    before = [tuple(r) for r in conn.execute('SELECT id, priority FROM tasks ORDER BY id')]
++    from hermes_cli.kanban_priority_migration import plan_global
++    inventory = [dict(r) for r in conn.execute('SELECT id,priority,created_on,status FROM tasks')]
++    inventory.append({'id': 'remote', 'priority': 5, 'created_on': 'worker-9', 'status': 'ready'})
++    calls = []
++    def capture(hub, *, board_id, exceptions):
++        calls.append((hub, board_id, exceptions))
++        return plan_global(inventory, board_id=board_id, exceptions=exceptions)
++    from hermes_cli import kanban_priority_prepare as prepare
++    from hermes_cli import kanban_sync_client as sync
++    monkeypatch.setattr(prepare, 'capture', capture)
++    monkeypatch.setattr(sync, 'load_identity', lambda: SimpleNamespace(gateway=sync_helpers.ME))
++    monkeypatch.setattr(sync, 'Hub', lambda identity: 'fake-hub')
++    def forbidden(*_a, **_kw):
++        pytest.fail('coverage refusal reached SSH')
++    monkeypatch.setattr(runner.subprocess, 'run', forbidden)
++    hosts = {sync_helpers.ME: {'host': 'me.example.com', 'argv': ['hermes'], 'task': ids[0],
++                               'backup': str(tmp_path / 'never.json')}}
++    args = cli_helpers.args('--priority-operation', operation, '--writer', sync_helpers.ME,
++                            '--host-map', json.dumps(hosts))
++    attachments_before = conn.execute('SELECT COUNT(*) FROM task_attachments').fetchone()[0]
++    code, report = (runner.check_host_map if operation == 'origins' else runner.run)(conn, args)
++    assert not (tmp_path / 'never.json').exists()  # run 1 consumed this path before refusing
++    assert conn.execute('SELECT COUNT(*) FROM task_attachments').fetchone()[0] == attachments_before
++    assert code == 1 and 'worker-9' in report['missing'] and sync_helpers.ME not in report['missing']
++    assert report['origins']['worker-9'] == 1 and report['origins'][sync_helpers.ME] >= 1
++    assert calls == [('fake-hub', sync_helpers.BOARD, [])]
++    assert [tuple(r) for r in conn.execute('SELECT id, priority FROM tasks ORDER BY id')] == before
+ 
+ 
+ def test_publish_uses_supported_push_without_pull(conn, monkeypatch):
+-- 
+2.43.0
+

@@ -1,0 +1,215 @@
+From 9b534e07cfb3834ccddff0d34dd70d2637b683a1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 23:52:14 +0000
+Subject: [PATCH] fix(kanban): require fresh recovery evidence and preserve
+ courier custody [daveey]
+
+---
+ hermes_cli/kanban_placement_recovery.py       |  5 +-
+ hermes_cli/kanban_worker_node.py              |  6 +-
+ hermes_cli/kanban_worker_placement.py         |  7 +-
+ .../test_kanban_recovery_observation.py       | 64 +++++++++++++++++++
+ .../hermes_cli/test_kanban_recovery_safety.py |  2 +-
+ .../test_kanban_stale_pin_recovery.py         |  8 +--
+ 6 files changed, 83 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_recovery_observation.py
+
+diff --git a/hermes_cli/kanban_placement_recovery.py b/hermes_cli/kanban_placement_recovery.py
+index 46ef5efeca..7d659f1bfd 100644
+--- a/hermes_cli/kanban_placement_recovery.py
++++ b/hermes_cli/kanban_placement_recovery.py
+@@ -38,7 +38,7 @@ def recovery_mode(conn, row, cfg):
+     names = [label.removeprefix("machine:") for label in labels or [] if label.startswith("machine:")]
+     if len(names) != 1:
+         return None
+-    entry = ((node.registry() or {}).get("machines") or {}).get(names[0])
++    entry = ((node.registry(require_fresh=True) or {}).get("machines") or {}).get(names[0])
+     if not isinstance(entry, dict):
+         return None
+     seen = entry.get("last_seen")
+@@ -52,6 +52,9 @@ def recovery_mode(conn, row, cfg):
+ def current_portable(conn, row, cfg):
+     from hermes_cli.kanban_placement import portable_reason
+ 
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='origin_creation_intents'").fetchone():
++        if conn.execute("SELECT 1 FROM origin_creation_intents WHERE task_id=? LIMIT 1", (row["id"],)).fetchone():
++            return False  # courier binding owns the destination, including historical creates
+     # Even scratch work can contain unpublished outputs from an earlier run.
+     if row.get("workspace_path") or conn.execute(
+             "SELECT 1 FROM task_runs WHERE task_id=? LIMIT 1", (row["id"],)).fetchone():
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 8aad77872a..08f91b3d5b 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -214,13 +214,15 @@ def set_registry_fetch(fn: Optional[Callable[[], Mapping[str, Any]]]) -> None:
+         _REGISTRY.update(at=None, value=None, retry=False, ok_at=None)
+ 
+ 
+-def registry() -> Optional[Mapping[str, Any]]:
++def registry(*, require_fresh: bool = False) -> Optional[Mapping[str, Any]]:
+     """``{me, machines: {name: entry}}``, cached for :data:`REGISTRY_TTL_S`; None when unreachable."""
+     # Several board/executor ticks can reach the same expired entry concurrently.
+     # Failed attempts also consume the TTL: an outage must not turn every tick
+     # into another HTTP request. The Board still authorizes every actual lease.
+     with _REGISTRY_LOCK:
+-        return _registry_locked()
++        value = _registry_locked()
++        # Last-good discovery is useful offline, but is not evidence for moving a stale pin.
++        return None if require_fresh and _REGISTRY.get("retry") else value
+ 
+ 
+ def registry_fresh(max_age_s: float) -> Optional[Mapping[str, Any]]:
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 8612e53cd0..4c59980e25 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -487,10 +487,15 @@ def dispatch_tick(conn):
+     """Retry placement before local capacity checks, without creating an extra daemon."""
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_sync_client as client
++    from hermes_cli import kanban_placement as placement
+ 
+     if sync.board_mode(conn) != "primary":
+         return
+     state = sync.sync_state(conn) or {}
++    cfg = placement.config()
++    pools = cfg.get("worker_pools")
++    if not isinstance(pools, dict) or not pools.get(state.get("gateway_id")):
++        return
+     if not conn.execute("SELECT 1 FROM tasks WHERE status='ready' AND created_on=? LIMIT 1",
+                         (state.get("gateway_id"),)).fetchone():
+         return
+@@ -507,7 +512,7 @@ def dispatch_tick(conn):
+             queue.try_record(queue.record_pull_error, conn, ident.gateway, error=exc)
+             return
+         queue.clear_pull_streaks(ident.gateway)  # a feed-pull failure streak is no longer consecutive
+-        reevaluate(conn, hub, state["board_id"], ident.gateway)
++        reevaluate(conn, hub, state["board_id"], ident.gateway, cfg=cfg)
+     except (client.HubError, client.SyncUnavailable, client.Resync, OSError):
+         # Offline origin cannot remove the queue fence or manufacture an assignment.
+         return
+diff --git a/tests/hermes_cli/test_kanban_recovery_observation.py b/tests/hermes_cli/test_kanban_recovery_observation.py
+new file mode 100644
+index 0000000000..017117ff37
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_recovery_observation.py
+@@ -0,0 +1,64 @@
++"""Recovery cannot infer machine failure from an unavailable registry."""
++import pytest
++
++from hermes_cli import kanban_placement as placement
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_node as node
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_placement_recovery as fixtures
++
++conn = fixtures.conn
++setup = fixtures.setup
++
++
++def test_failed_registry_refresh_does_not_turn_cached_seen_into_stale(setup, monkeypatch):
++    db, hub = setup
++    fixtures.make(db, runs_on='["machine:worker-1"]')
++    clock = [100.0]
++    monkeypatch.setattr(node.time, "monotonic", lambda: clock[0])
++    monkeypatch.setattr(node.time, "time", lambda: clock[0])
++
++    def fetch():
++        if 100 < clock[0] < 3000:
++            raise OSError("registry offline")
++        return {"machines": [{"name": "worker-1", "state": "active", "last_seen": 100000}]}
++
++    node.set_registry_fetch(fetch)
++    try:
++        assert node.registry()["machines"]["worker-1"]["last_seen"] == 100000
++        clock[0] = 2000
++        assert wp.reevaluate(db, hub, "default", "hub") == 0
++        assert not hub.calls
++        # Ordinary discovery retains its historical last-good cache contract.
++        assert node.registry()["machines"]["worker-1"]["last_seen"] == 100000
++        assert wp.reevaluate(db, hub, "default", "hub") == 0  # retry TTL is not freshness
++        clock[0] = 3000
++        assert wp.reevaluate(db, hub, "default", "hub") == 1  # affirmative refresh restores recovery
++    finally:
++        node.set_registry_fetch(None)
++
++
++def test_dispatch_without_pool_does_not_pull(setup, monkeypatch):
++    db, _ = setup
++    fixtures.make(db)
++    monkeypatch.setattr(placement, "config", dict)
++    monkeypatch.setattr(client, "load_identity", lambda: client.Identity("http://localhost", "synthetic", "hub"))
++    calls = []
++    monkeypatch.setattr(client, "pull", lambda *a, **kw: calls.append(True))
++    wp.dispatch_tick(db)
++    assert not calls
++
++
++@pytest.mark.parametrize("labels", [None, '["machine:worker-1"]'])
++def test_courier_custody_blocks_recovery(setup, monkeypatch, labels):
++    db, hub = setup
++    tid = fixtures.make(db, runs_on=labels)
++    db.execute("CREATE TABLE origin_creation_intents (task_id TEXT)")
++    db.execute("INSERT INTO origin_creation_intents VALUES (?)", (tid,))
++    db.commit()
++    monkeypatch.setattr(node, "registry", lambda **kw: {"machines": {"worker-1": {"state": "revoked"}}})
++    assert wp.reevaluate(db, hub, "default", "hub") == 0
++    assert not hub.calls
++    db.execute("DELETE FROM origin_creation_intents WHERE task_id=?", (tid,))
++    db.commit()
++    assert wp.reevaluate(db, hub, "default", "hub") == 1  # an unrelated/empty ledger is not a pin
+diff --git a/tests/hermes_cli/test_kanban_recovery_safety.py b/tests/hermes_cli/test_kanban_recovery_safety.py
+index 14966a16a1..8f694de81b 100644
+--- a/tests/hermes_cli/test_kanban_recovery_safety.py
++++ b/tests/hermes_cli/test_kanban_recovery_safety.py
+@@ -76,7 +76,7 @@ def test_prior_run_preserves_unpublished_custody(setup, monkeypatch, labels):
+     tid = fixtures.make(db, runs_on=labels)
+     db.execute("INSERT INTO task_runs (task_id,profile,status,started_at) VALUES (?,'default','completed',1)", (tid,))
+     db.commit()
+-    monkeypatch.setattr(node, "registry", lambda: {"machines": {"worker-1": {"state": "revoked"}}})
++    monkeypatch.setattr(node, "registry", lambda **kw: {"machines": {"worker-1": {"state": "revoked"}}})
+     assert wp.reevaluate(db, hub, "default", "hub") == 0
+     assert not hub.calls
+ 
+diff --git a/tests/hermes_cli/test_kanban_stale_pin_recovery.py b/tests/hermes_cli/test_kanban_stale_pin_recovery.py
+index 95d3bf4785..98a671d7b0 100644
+--- a/tests/hermes_cli/test_kanban_stale_pin_recovery.py
++++ b/tests/hermes_cli/test_kanban_stale_pin_recovery.py
+@@ -18,7 +18,7 @@ setup = fixtures.setup
+ def test_stale_pin_recovery_requests_board_recheck(setup, monkeypatch, entry):
+     conn, hub = setup
+     tid = fixtures.make(conn, runs_on='["machine:worker-1", "linux"]')
+-    monkeypatch.setattr(node, "registry", lambda: {"machines": {"worker-1": entry}})
++    monkeypatch.setattr(node, "registry", lambda **kw: {"machines": {"worker-1": entry}})
+     assert wp.reevaluate(conn, hub, "default", "hub") == 1
+     assert hub.calls[0][1] == {"task_id": tid, "expected_revision": 4,
+                                 "mode": "stale_pin", "candidates": ["worker-2"]}
+@@ -34,7 +34,7 @@ def test_stale_pin_recovery_requests_board_recheck(setup, monkeypatch, entry):
+ def test_unknown_registry_does_not_authorize_stale_recovery(setup, monkeypatch, registry):
+     conn, hub = setup
+     fixtures.make(conn, runs_on='["machine:worker-1"]')
+-    monkeypatch.setattr(node, "registry", lambda: registry)
++    monkeypatch.setattr(node, "registry", lambda **kw: registry)
+     assert wp.reevaluate(conn, hub, "default", "hub") == 0
+     assert not hub.calls
+ 
+@@ -48,7 +48,7 @@ def test_unknown_registry_does_not_authorize_stale_recovery(setup, monkeypatch,
+ def test_stale_machine_never_overrides_independent_constraints(setup, monkeypatch, fields):
+     conn, hub = setup
+     fixtures.make(conn, runs_on='["machine:worker-1"]', **fields)
+-    monkeypatch.setattr(node, "registry", lambda: {"machines": {"worker-1": {"state": "revoked"}}})
++    monkeypatch.setattr(node, "registry", lambda **kw: {"machines": {"worker-1": {"state": "revoked"}}})
+     assert wp.reevaluate(conn, hub, "default", "hub") == 0
+     assert not hub.calls
+ 
+@@ -59,6 +59,6 @@ def test_stale_threshold_uses_milliseconds(setup, monkeypatch, age, expected):
+     conn, hub = setup
+     fixtures.make(conn, runs_on='["machine:worker-1"]')
+     monkeypatch.setattr(recovery.time, "time", lambda: 2000)
+-    monkeypatch.setattr(node, "registry", lambda: {"machines": {
++    monkeypatch.setattr(node, "registry", lambda **kw: {"machines": {
+         "worker-1": {"state": "active", "last_seen": (2000 - age) * 1000}}})
+     assert wp.reevaluate(conn, hub, "default", "hub") == expected
+-- 
+2.43.0
+

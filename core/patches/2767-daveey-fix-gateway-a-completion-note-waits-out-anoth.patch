@@ -1,0 +1,591 @@
+From fb8ce3569543261caa99ddb0d806eba071f0e951 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:39:43 +0000
+Subject: [PATCH] [daveey] fix(gateway): a completion note waits out another
+ turn's lease; recover failed completion admissions
+
+An async delegation's ledger row is acknowledged `delivered` when its admission commits. On the
+MacBook (deleg_e757744d, admission ca1d8f79) the admitted note then met a turn lease another turn
+held on the parent conversation; SessionTurnLeaseLostError settled the admission `failed` and the
+result never reached the parent. A request id is admitted once, so a re-offer resolved to that
+failed admission and was "acknowledged" again without delivering anything.
+
+- session_completion_notes: the FIFO head's note write retries (backoff 0.25-2 s, a warning per
+  minute) while another turn holds the lease, re-reading the physical tip each try. The note is
+  keyed by its admission, so a refused try leaves nothing to repeat. Cancellation still stops it.
+- completion_admission_recovery (new): once per gateway start the async-delegation watcher scans
+  the newest 200 `failed` local completion admissions; for each with no note (by
+  completion_admission) and no copy of its text in the target session, it reopens every carried
+  delegation via requeue_admitted_completion. The claimed offer (claim_completion_delivery stays the
+  gate) reaches `deliver_admitted`, which writes the failed admission's note keyed by that admission
+  (exactly once); a refused write releases the claim, spending an attempt, so the row converges to
+  `dropped` with a logged reason. Any other existing admission is the lost ACK it always was.
+- requeue_admitted_completion: a row past _MAX_COMPLETION_REPLAY_AGE_S is dropped with a WARNING
+  naming the delegation instead of being reopened and then skipped silently by _replay_pending.
+
+Tests: test_completion_note_turn_lease (RED on 2cfdbeedc2: admission settles while the lease is
+held), test_completion_admission_reconcile (RED without the recovery: no note / row stays pending;
+negative controls: a completed admission or an existing note is never reopened).
+---
+ gateway/completion_admission_recovery.py      | 138 ++++++++++++++++
+ gateway/run_notifications.py                  |   9 +-
+ gateway/session_completion_notes.py           |  55 ++++++-
+ .../test_completion_admission_reconcile.py    | 149 ++++++++++++++++++
+ .../test_completion_note_turn_lease.py        | 113 +++++++++++++
+ tools/async_delegation.py                     |  10 ++
+ 6 files changed, 465 insertions(+), 9 deletions(-)
+ create mode 100644 gateway/completion_admission_recovery.py
+ create mode 100644 tests/gateway/test_completion_admission_reconcile.py
+ create mode 100644 tests/gateway/test_completion_note_turn_lease.py
+
+diff --git a/gateway/completion_admission_recovery.py b/gateway/completion_admission_recovery.py
+new file mode 100644
+index 0000000000..f5cdeddee9
+--- /dev/null
++++ b/gateway/completion_admission_recovery.py
+@@ -0,0 +1,138 @@
++"""An async completion whose admission failed is delivered again, once (deleg_e757744d).
++
++A completion's ledger row is acknowledged ``delivered`` when its admission commits, before the
++admission runs. An admission that then settles ``failed`` (its note met another turn's lease, before
++``session_completion_notes._write_note`` waited for it) left the row ``delivered`` with nothing in the
++parent. Its request id is admitted once, so a later offer of the same result resolves to that failed
++admission and cannot run it again.
++
++Two halves close it:
++
++- ``reconcile_failed_completion_admissions`` (once per gateway start, bounded) finds local completion
++  admissions that settled ``failed`` with no note and no copy of their text in the parent, and reopens
++  each async delegation they carried through ``requeue_admitted_completion``. The ledger stays the
++  gate: the reopened row is claimed (``claim_completion_delivery``, one attempt each) like any pending
++  result, and a row past its attempts or its replay age is dropped there with a logged reason.
++- ``deliver_admitted`` is the claimed offer's step when the result already has an admission: a
++  failed local admission without a note gets its note now (keyed by that admission, so exactly once);
++  any other admission is the lost acknowledgement it always was.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++
++logger = logging.getLogger(__name__)
++
++# Newest failed admissions one start examines: a bounded pass over history, not a crawl of it.
++RECONCILE_SCAN_LIMIT = 200
++
++_FAILED_SQL = ("SELECT * FROM session_admissions WHERE status = 'terminal' AND outcome = 'failed' "
++               "ORDER BY seq DESC LIMIT ?")
++_NOTED_SQL = ("SELECT 1 FROM messages WHERE session_id IN (?, ?) AND "
++              "(json_extract(display_metadata, '$.completion_admission') = ? OR content = ?) LIMIT 1")
++
++
++def _local_descriptor(row):
++    return (row.get('payload') or {}).get('local_automation_v1')
++
++
++def _delegation_ids(descriptor) -> list[str]:
++    """The async delegations a completion admission carries (a coalesced batch carries several)."""
++    ids = []
++    for identity in [descriptor.get('identity'), *(descriptor.get('identities') or ())]:
++        try:
++            kind, producer, _rest = json.loads(identity)
++        except (TypeError, ValueError):
++            continue
++        if kind == 'async_delegation' and producer and producer not in ids:
++            ids.append(producer)
++    return ids
++
++
++def _target(authority, row) -> str:
++    from gateway.session_viewer_close import _physical_target
++    return _physical_target(authority, row['target_session_id'])
++
++
++def _noted(authority, row, target) -> bool:
++    """The admission's result already reached its session: its note, or its text from a turn that ran."""
++    with authority.db._read_ctx() as conn:
++        return conn.execute(_NOTED_SQL, (row['target_session_id'], target, row['admission_id'],
++                                         str(row['payload'].get('text') or ''))).fetchone() is not None
++
++
++def unnoted_failed_completions(authority, limit: int = RECONCILE_SCAN_LIMIT) -> list[tuple[str, dict]]:
++    """``(delegation_id, admission)`` for each async delegation carried by a local completion admission
++    that settled ``failed`` and left nothing in its session."""
++    from hermes_state_runtime import _row
++    with authority.db._read_ctx() as conn:
++        rows = [_row(r) for r in conn.execute(_FAILED_SQL, (limit,)).fetchall()]
++    found = []
++    for row in rows:
++        descriptor = _local_descriptor(row)
++        ids = _delegation_ids(descriptor) if descriptor else []
++        if ids and not _noted(authority, row, _target(authority, row)):
++            found.extend((delegation_id, row) for delegation_id in ids)
++    return found
++
++
++def reconcile_failed_completion_admissions(authority, target_queue) -> int:
++    """Reopen each acknowledged delegation whose admission failed unnoted; the count reopened."""
++    from tools.async_delegation import requeue_admitted_completion
++    reopened = 0
++    for delegation_id, row in unnoted_failed_completions(authority):
++        if requeue_admitted_completion(delegation_id, target_queue):
++            reopened += 1
++            logger.warning('Async delegation %s: its admission %s on %s failed before delivery; offered again',
++                           delegation_id, row['admission_id'], row['target_session_id'])
++    return reopened
++
++
++async def reconcile_at_start(runner) -> None:
++    """The gateway start's one pass over the launch profile's ledger (the watcher's first step).
++    Best-effort: a failed pass leaves every row as it was for the next start."""
++    from gateway.session_authorities import active_authority
++    from tools.process_registry import process_registry
++    authority = active_authority(runner)
++    if authority is None:
++        return
++    try:
++        count = await asyncio.to_thread(reconcile_failed_completion_admissions, authority,
++                                        process_registry.completion_queue)
++    except Exception:  # health: allow BLE001 -- a recovery pass must never stop the completion watcher
++        logger.warning('Failed-admission completion reconciliation did not run', exc_info=True)
++        return
++    if count:
++        logger.info('Offered %d async completion(s) whose admission failed again', count)
++
++
++async def deliver_admitted(runner, admission) -> bool:
++    """The claimed offer of a result that already has *admission*: True when it is delivered (a lost
++    acknowledgement, or the failed admission's note written now), False to release the claim."""
++    if (admission.get('status'), admission.get('outcome')) != ('terminal', 'failed'):
++        return True
++    descriptor = _local_descriptor(admission)
++    if descriptor is None:
++        return True  # a platform turn's failure is its own; only a local note can be written here
++    from gateway.session_authorities import active_authority
++    from gateway.session_completion_notes import note_metadata
++    authority = active_authority(runner)
++    if authority is None:
++        return False
++    target = await asyncio.to_thread(_target, authority, admission)
++    if await asyncio.to_thread(_noted, authority, admission, target):
++        return True
++    metadata = {**note_metadata(descriptor), 'recovered_admission': True}
++    try:
++        await asyncio.to_thread(
++            authority.db.append_completion_note, target, admission['admission_id'],
++            admission['payload']['text'], descriptor.get('display_kind', 'internal_notification'), metadata)
++    except Exception as exc:  # health: allow BLE001 -- any refusal (a held lease) spends this attempt; the ledger retries or drops
++        logger.warning('Note for failed admission %s on %s not written yet: %s',
++                       admission['admission_id'], target, exc)
++        return False
++    logger.info('Async completion of failed admission %s recovered as a note on %s',
++                admission['admission_id'], target)
++    return True
+diff --git a/gateway/run_notifications.py b/gateway/run_notifications.py
+index c757365e12..ff2180c29f 100644
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -1343,9 +1343,10 @@ class GatewayNotificationsMixin(
+                 return claim.early_result
+             if getattr(self, 'session_authority', None) is not None:
+                 from gateway.session_automation import completion_admission
+-                if completion_admission(self, evt) is not None:
+-                    accepted = True  # Lost ACK: finish durable claims, never infer again.
+-                    return True
++                if (admitted := completion_admission(self, evt)) is not None:
++                    from gateway.completion_admission_recovery import deliver_admitted
++                    accepted = await deliver_admitted(self, admitted)  # Lost ACK, or a failed admission's note
++                    return accepted
+             if identity is not None:
+                 if self._completion_identity_seen(identity, claim=True):
+                     return None
+@@ -1693,6 +1694,8 @@ class GatewayNotificationsMixin(
+         consumer; both must progress without a later foreground turn.
+         """
+         await asyncio.sleep(3)  # let platforms finish connecting
++        from gateway.completion_admission_recovery import reconcile_at_start
++        await reconcile_at_start(self)  # acknowledged results whose admission failed (deleg_e757744d)
+         from tools.async_delegation import ORPHAN_SWEEP_INTERVAL_S
+         from tools.process_registry import process_registry as _pr
+         last_orphan_sweep = None
+diff --git a/gateway/session_completion_notes.py b/gateway/session_completion_notes.py
+index 71df7eb93a..b671a0bfa6 100644
+--- a/gateway/session_completion_notes.py
++++ b/gateway/session_completion_notes.py
+@@ -27,6 +27,11 @@ _ALWAYS_NOTED = frozenset({'cron'})
+ # re-dispatches into the same failure (billing, a usage limit) would otherwise wake itself forever; past
+ # the limit the failure is a note again until a viewer attaches or the user sends something.
+ UNATTENDED_WAKE_LIMIT = 3
++# Backoff while another turn holds the conversation's lease (``_write_note``); the warning repeats
++# at most this often, so a long turn ahead of the note is visible without flooding the log.
++_LEASE_RETRY_MIN_S = 0.25
++_LEASE_RETRY_MAX_S = 2.0
++_LEASE_NOTICE_EVERY_S = 60.0
+ 
+ 
+ def _producer(identity):
+@@ -86,14 +91,11 @@ async def note_if_unviewed(authority, ref, row):
+         # The claim left a closed row closed for a note; the turn reopens it as any first turn does.
+         await reopen_for_turn(authority, ref)
+         return None
+-    from gateway.session_viewer_close import _physical_target
+-    metadata = {'completion_note': sorted(set(descriptor.get('identities') or ()) | {descriptor['identity']})}
+-    metadata.update({key: descriptor[key] for key in ('display_text', 'notification_category') if key in descriptor})
+-    target = _physical_target(authority, ref.session_id)
++    metadata = note_metadata(descriptor)
+     # Keyed by its admission: a claim is never replayed, and this keeps a write retry exact.
+-    await tracked_write(authority, partial(
++    target = await _write_note(authority, ref, lambda target: tracked_write(authority, partial(
+         authority.db.append_completion_note, target, row['admission_id'], row['payload']['text'],
+-        descriptor.get('display_kind', 'internal_notification'), metadata))
++        descriptor.get('display_kind', 'internal_notification'), metadata)))
+     refresh = getattr(authority.runner, '_refresh_agent_cache_message_count', None)
+     if refresh is not None:  # the owner's own row: a cached agent stays, as after a turn's writes
+         await refresh(live.route, target)
+@@ -102,6 +104,47 @@ async def note_if_unviewed(authority, ref, row):
+     return ''
+ 
+ 
++def note_metadata(descriptor):
++    """A completion note's display metadata: every identity it covers and the producer's card fields."""
++    metadata = {'completion_note': sorted(set(descriptor.get('identities') or ()) | {descriptor['identity']})}
++    metadata.update({key: descriptor[key] for key in ('display_text', 'notification_category') if key in descriptor})
++    return metadata
++
++
++async def _write_note(authority, ref, write):
++    """Run ``write(target)`` against the session's physical tip; return that target.
++
++    The note refuses a transcript another turn on the same conversation holds the turn lease of
++    (``SessionTurnLeaseLostError``): another process's turn, or a sibling session's. That refusal is
++    transient (the lease ends with its turn, or goes stale and the guard reclaims it), while failing
++    the admission loses the completion for good: its producer was acknowledged at admission and its
++    request id is admitted once, so a re-offer resolves to the failed row (deleg_e757744d). The FIFO
++    head waits for the lease instead, as a turn of this session waits for it, and writes then; the
++    note is keyed by its admission, so a refused try leaves nothing to repeat. A drain that stops
++    meanwhile cancels the wait, as it does a running turn. The tip is re-read each try: a
++    compression may rotate it while we wait."""
++    import asyncio
++    import logging
++
++    from gateway.session_viewer_close import _physical_target
++    from hermes_state_errors import SessionTurnLeaseLostError
++    delay, waited, notice_at = 0.0, 0.0, 0.0
++    while True:
++        target = _physical_target(authority, ref.session_id)
++        try:
++            await write(target)
++            return target
++        except SessionTurnLeaseLostError:
++            if waited >= notice_at:
++                logging.getLogger(__name__).warning(
++                    'Completion note for %s waits for another turn\'s lease on %s (%.0fs so far)',
++                    ref.session_id, target, waited)
++                notice_at = waited + _LEASE_NOTICE_EVERY_S
++        delay = min(max(delay * 2, _LEASE_RETRY_MIN_S), _LEASE_RETRY_MAX_S)
++        await asyncio.sleep(delay)
++        waited += delay
++
++
+ def _refresh_outcome_after_note(db, target):
+     """[daveey] A note runs no turn, so no turn-end refresh restores the chat's stored outcome: refresh it here, off
+     the admission loop (the judge may call a model), as ``gateway/turn_outcome.py`` does for a turn. Best-effort."""
+diff --git a/tests/gateway/test_completion_admission_reconcile.py b/tests/gateway/test_completion_admission_reconcile.py
+new file mode 100644
+index 0000000000..badbfb96bb
+--- /dev/null
++++ b/tests/gateway/test_completion_admission_reconcile.py
+@@ -0,0 +1,149 @@
++"""An acknowledged completion whose admission failed is offered again and delivered once (deleg_e757744d).
++
++Before the lease wait (``test_completion_note_turn_lease``), a note refused by another turn's lease
++settled its admission ``failed`` while the ledger row already said ``delivered``. The start-up
++reconciliation reopens such rows through ``requeue_admitted_completion``; the claimed offer then
++writes the failed admission's note, keyed by that admission. Negative controls: an admission that
++completed, or a failed one whose note exists, is never reopened.
++"""
++import logging
++import queue
++
++import pytest
++
++from tests.gateway.test_completion_admission import pending
++from tests.gateway.test_session_end_delegations import _admissions, _local
++from tools import async_delegation as delegation
++
++
++@pytest.fixture(autouse=True)
++def _no_delegations():
++    delegation._reset_for_tests()
++    yield
++    delegation._reset_for_tests()
++
++
++def _target(runner, authority, ref):
++    return runner.session_store.lookup_by_session_key(authority.sessions[ref.session_id].route).session_id
++
++
++def _notes(authority, target, name):
++    return [m for m in authority.db.get_messages(target) if name in str(m.get('content'))]
++
++
++def _ledger(delegation_id):
++    with delegation._DB_LOCK, delegation._transaction() as conn:
++        return conn.execute('SELECT delivery_state, delivery_attempts FROM async_delegations '
++                            'WHERE delegation_id=?', (delegation_id,)).fetchone()
++
++
++async def _admit(runner, authority, ref, name):
++    route = authority.sessions[ref.session_id].route
++    evt = dict(pending(route, name), parent_session_id=_target(runner, authority, ref))
++    assert await runner._deliver_async_delegation_group([evt]) is True
++    assert _ledger(name)[0] == 'delivered', 'acknowledged at admission'
++    return evt
++
++
++async def _fail_next_note(authority, ref, monkeypatch):
++    """Drain the queued completion the way the old code did when the note met another turn's lease."""
++    from gateway import session_completion_notes as notes
++    from hermes_state_errors import SessionTurnLeaseLostError
++
++    async def refused(*_args):
++        raise SessionTurnLeaseLostError('Session has an active turn lease; refusing transcript mutation')
++    with monkeypatch.context() as patch:
++        patch.setattr(notes, '_write_note', refused)
++        await authority._drain(ref)
++
++
++def _offered(q):
++    events = []
++    while not q.empty():
++        events.append(q.get_nowait())
++    return events
++
++
++@pytest.mark.asyncio
++async def test_failed_admission_is_reopened_and_noted_exactly_once(tmp_path, monkeypatch):
++    from gateway.completion_admission_recovery import reconcile_failed_completion_admissions
++    runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
++    try:
++        target = _target(runner, authority, ref)
++        await _admit(runner, authority, ref, 'deleg_lost')
++        await _fail_next_note(authority, ref, monkeypatch)
++        assert [r['outcome'] for r in _admissions(authority, ref)] == ['failed']
++        assert _notes(authority, target, 'deleg_lost') == [] and _ledger('deleg_lost')[0] == 'delivered'
++
++        # Negative control: a completion whose admission ran its note is never reopened.
++        await _admit(runner, authority, ref, 'deleg_fine')
++        await authority._drain(ref)
++        assert len(_notes(authority, target, 'deleg_fine')) == 1
++
++        offers = queue.Queue()
++        assert reconcile_failed_completion_admissions(authority, offers) == 1
++        events = _offered(offers)
++        assert [e['delegation_id'] for e in events] == ['deleg_lost']
++        assert _ledger('deleg_lost')[0] == 'pending' and _ledger('deleg_fine')[0] == 'delivered'
++
++        # The claimed offer writes the failed admission's note; the ledger is acknowledged again.
++        assert await runner._deliver_async_delegation_group(events) is True
++        assert len(_notes(authority, target, 'deleg_lost')) == 1
++        state, attempts = _ledger('deleg_lost')
++        assert state == 'delivered' and attempts == 2
++        assert [r['outcome'] for r in _admissions(authority, ref)] == ['failed', 'completed']
++
++        # Negative control: once noted, a later start reopens nothing, and a stray copy writes nothing.
++        assert reconcile_failed_completion_admissions(authority, offers) == 0
++        assert _offered(offers) == []
++        assert await runner._deliver_async_delegation_group([dict(events[0])]) in (True, None)
++        assert len(_notes(authority, target, 'deleg_lost')) == 1
++        assert len(_notes(authority, target, 'deleg_fine')) == 1
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_refused_recovery_note_spends_attempts_until_dropped(tmp_path, monkeypatch):
++    """A recovery note still refused (a lease that never clears) releases its claim: the row converges to
++    ``dropped`` within the delivery budget, never back to a silent ``delivered``."""
++    from gateway.completion_admission_recovery import reconcile_failed_completion_admissions
++    runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
++    try:
++        target = _target(runner, authority, ref)
++        await _admit(runner, authority, ref, 'deleg_held')
++        await _fail_next_note(authority, ref, monkeypatch)
++        offers = queue.Queue()
++        assert reconcile_failed_completion_admissions(authority, offers) == 1
++        assert authority.db.try_acquire_session_turn_lease(target, 'other-turn', ttl_seconds=300.0)
++        monkeypatch.setattr(delegation, '_CLAIM_LEASE_S', -1.0)
++        events = _offered(offers)
++        for _ in range(delegation._MAX_DELIVERY_ATTEMPTS):
++            assert await runner._deliver_async_delegation_group([dict(events[0])]) is not True
++            if _ledger('deleg_held')[0] != 'pending':
++                break
++        state, attempts = _ledger('deleg_held')
++        assert state == 'dropped' and attempts >= 1
++        assert _notes(authority, target, 'deleg_held') == []
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_reopen_past_the_replay_age_drops_it_with_a_logged_reason(tmp_path, monkeypatch, caplog):
++    from gateway.completion_admission_recovery import reconcile_failed_completion_admissions
++    runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
++    try:
++        await _admit(runner, authority, ref, 'deleg_old')
++        await _fail_next_note(authority, ref, monkeypatch)
++        with delegation._DB_LOCK, delegation._transaction() as conn:
++            conn.execute('UPDATE async_delegations SET completed_at=?, dispatched_at=? WHERE delegation_id=?',
++                         (1.0, 1.0, 'deleg_old'))
++        offers = queue.Queue()
++        with caplog.at_level(logging.WARNING, logger='tools.async_delegation'):
++            assert reconcile_failed_completion_admissions(authority, offers) == 0
++        assert _offered(offers) == []
++        assert _ledger('deleg_old')[0] == 'dropped'
++        assert any('deleg_old' in r.getMessage() and 'replay age' in r.getMessage() for r in caplog.records)
++    finally:
++        authority.db.close()
+diff --git a/tests/gateway/test_completion_note_turn_lease.py b/tests/gateway/test_completion_note_turn_lease.py
+new file mode 100644
+index 0000000000..f9ec285445
+--- /dev/null
++++ b/tests/gateway/test_completion_note_turn_lease.py
+@@ -0,0 +1,113 @@
++"""A completion note refused by another turn's lease waits for it; the result is never lost.
++
++Regression (live, deleg_e757744d): an async delegation's completion was admitted and its ledger row
++acknowledged ``delivered`` at admission. When the admission came up with no viewer attached, its
++note write met a turn lease another turn held on the same conversation
++(``SessionTurnLeaseLostError``); the admission settled ``failed`` and the result never reached the
++parent. A request id is admitted once, so a re-offer resolves to that failed admission and cannot
++deliver again: the note must land from the admission itself once the lease is gone.
++"""
++import asyncio
++
++import pytest
++
++from tests.gateway.test_completion_admission import pending
++from tests.gateway.test_session_end_delegations import _admissions, _local
++from tools import async_delegation as delegation
++
++
++@pytest.fixture(autouse=True)
++def _no_delegations():
++    delegation._reset_for_tests()
++    yield
++    delegation._reset_for_tests()
++
++
++def _target(runner, authority, ref):
++    return runner.session_store.lookup_by_session_key(authority.sessions[ref.session_id].route).session_id
++
++
++def _delegation_notes(authority, target, name):
++    return [m for m in authority.db.get_messages(target) if name in str(m.get('content'))]
++
++
++def _ledger_state(delegation_id):
++    with delegation._DB_LOCK, delegation._transaction() as conn:
++        return conn.execute('SELECT delivery_state FROM async_delegations WHERE delegation_id=?',
++                            (delegation_id,)).fetchone()[0]
++
++
++async def _until(predicate, timeout=10.0):
++    loop = asyncio.get_running_loop()
++    deadline = loop.time() + timeout
++    while not predicate():
++        assert loop.time() < deadline, 'condition not reached'
++        await asyncio.sleep(0.01)
++
++
++@pytest.mark.asyncio
++async def test_note_held_off_by_another_turns_lease_lands_once_it_releases(tmp_path, monkeypatch):
++    from gateway import session_completion_notes as notes
++    monkeypatch.setattr(notes, '_LEASE_RETRY_MIN_S', 0.01, raising=False)
++    monkeypatch.setattr(notes, '_LEASE_RETRY_MAX_S', 0.02, raising=False)
++    runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
++    try:
++        route = authority.sessions[ref.session_id].route
++        target = _target(runner, authority, ref)
++        evt = dict(pending(route, 'deleg_leased'), parent_session_id=target)
++        assert await runner._deliver_async_delegation_group([evt]) is True
++        assert _ledger_state('deleg_leased') == 'delivered'
++
++        # Another turn (another process's, e.g. a Kanban notice) holds the conversation's turn lease.
++        assert authority.db.try_acquire_session_turn_lease(target, 'other-turn', ttl_seconds=300.0)
++        refused = []
++        write = authority.db.append_completion_note
++
++        def counted(*args, **kwargs):
++            try:
++                return write(*args, **kwargs)
++            except Exception as exc:
++                refused.append(type(exc).__name__)
++                raise
++        monkeypatch.setattr(authority.db, 'append_completion_note', counted)
++
++        drain = asyncio.ensure_future(authority._drain(ref))
++        await _until(lambda: len(refused) >= 2 or drain.done())
++        assert not drain.done(), 'the admission settled while the lease was still held'
++        assert set(refused) == {'SessionTurnLeaseLostError'}
++        assert _delegation_notes(authority, target, 'deleg_leased') == []
++
++        authority.db.release_session_turn_lease(target, 'other-turn')
++        await asyncio.wait_for(drain, 10.0)
++        assert len(_delegation_notes(authority, target, 'deleg_leased')) == 1
++        assert [r['outcome'] for r in _admissions(authority, ref)] == ['completed']
++        assert _ledger_state('deleg_leased') == 'delivered'
++
++        # Exactly once: a re-offer resolves to the settled admission and writes nothing more.
++        assert await runner._deliver_async_delegation_group([dict(evt)]) in (True, None)
++        await authority._drain(ref)
++        assert len(_delegation_notes(authority, target, 'deleg_leased')) == 1
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_note_reclaims_a_dead_holders_lease(tmp_path, monkeypatch):
++    """An expired lease (its holder died) is no wait: the guard reclaims it and the note lands at once."""
++    from gateway import session_completion_notes as notes
++    monkeypatch.setattr(notes, '_LEASE_RETRY_MIN_S', 0.01, raising=False)
++    monkeypatch.setattr(notes, '_LEASE_RETRY_MAX_S', 0.02, raising=False)
++    runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
++    try:
++        route = authority.sessions[ref.session_id].route
++        target = _target(runner, authority, ref)
++        evt = dict(pending(route, 'deleg_stale'), parent_session_id=target)
++        assert await runner._deliver_async_delegation_group([evt]) is True
++        assert authority.db.try_acquire_session_turn_lease(target, 'dead-turn', ttl_seconds=300.0)
++        authority.db._execute_write(lambda conn: conn.execute(
++            "UPDATE session_turn_leases SET expires_at = 0 WHERE holder = 'dead-turn'"))
++        await asyncio.wait_for(authority._drain(ref), 10.0)
++        assert len(_delegation_notes(authority, target, 'deleg_stale')) == 1
++        assert [r['outcome'] for r in _admissions(authority, ref)] == ['completed']
++    finally:
++        authority.db.close()
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index 8c3846ad81..5c70ac4237 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -738,6 +738,16 @@ def requeue_admitted_completion(delegation_id: str, target_queue) -> bool:
+                            "marking terminally dropped (result remains queryable).",
+                            delegation_id, _MAX_DELIVERY_ATTEMPTS)
+             return False
++        aged = conn.execute("""UPDATE async_delegations SET delivery_state='dropped', updated_at=?
++               WHERE delegation_id=? AND delivery_state='delivered'
++                 AND COALESCE(NULLIF(completed_at, 0), dispatched_at) > 0
++                 AND COALESCE(NULLIF(completed_at, 0), dispatched_at) < ?""",
++            (now, delegation_id, now - _MAX_COMPLETION_REPLAY_AGE_S))
++        if aged.rowcount == 1:
++            # Never offered past the replay cap (``_replay_pending`` would skip it silently): say so.
++            logger.warning("Async delegation %s: replay age expired before it could be offered again; "
++                           "terminally dropped (result remains queryable).", delegation_id)
++            return False
+         reopened = conn.execute("""UPDATE async_delegations SET delivery_state='pending',
+                       delivered_at=NULL, updated_at=?
+                WHERE delegation_id=? AND delivery_state='delivered' AND event_json IS NOT NULL""",
+-- 
+2.43.0
+

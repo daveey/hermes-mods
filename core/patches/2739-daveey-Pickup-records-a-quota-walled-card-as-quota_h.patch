@@ -1,0 +1,147 @@
+From aff2d21f8c50ff171a143547dfac53e11c60985e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:19:56 +0000
+Subject: [PATCH] [daveey] Pickup records a quota-walled card as quota_hold,
+ expected until its deadline
+
+Review 5874270282 on PR 1413: the skip reason "hold" grouped a walled
+pinned card with the machine-wide registry hold, so after 600 s the stall
+sweep filed "Pickup held on <host> ... do not lift it" for a machine that
+was not held (reproduced at 6c192acaa6, not on base).
+
+_quota_held now records "quota_hold" (new in REASONS, deadline to the
+second). file_repairs treats it as expected until its stated deadline plus
+the stall threshold; past that, or with no readable deadline, the card gets
+its own card-specific repair, never the host hold group.
+
+Proof:
+- test_a_quota_held_pinned_card_files_no_repair_until_its_deadline_passes:
+  FAILS at 6c192acaa6 (sweep files a repair at t0), passes now; past the
+  deadline+threshold it files one card-specific repair naming quota_hold.
+- 76 test files importing kanban_pickup_stall / kanban_worker_node /
+  kanban_quota_episode: 1725 passed.
+---
+ hermes_cli/kanban_pickup_stall.py             | 22 ++++++++++++++++--
+ hermes_cli/kanban_worker_node.py              |  7 +++---
+ .../test_kanban_pickup_quota_held.py          | 23 ++++++++++++++++++-
+ 3 files changed, 46 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index 777c599afa..a17db190e0 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -20,7 +20,8 @@ read back: pickup kept no record of why a pass skipped a candidate.
+   entry, replica path). Host-wide causes share
+   ONE card per host naming the oldest card: ``budget_exhausted`` (the queue is simply full), ``hold`` and an
+   unreadable machine registry. A ``hold`` that states ``release by HH:MMZ`` (or is the core rollout's own,
+-  :func:`expected_hold`) files nothing until that release plus the stall threshold has passed. Missing evidence gets
++  :func:`expected_hold`) files nothing until that release plus the stall threshold has passed; nor does a card's own
++  ``quota_hold`` (local dispatch would hold it on its quota wall) before its stated deadline. Missing evidence gets
+   one additional stall interval of durable grace, then one
+   host alert (not a fabricated refusal); a failed pickup must not silence the detector forever.
+   ``budget_exhausted`` is recorded only for a card a slot would have started, so a
+@@ -38,7 +39,7 @@ _log = logging.getLogger(__name__)
+ 
+ TABLE = "kanban_pickup_skips"
+ REASONS = ("budget_exhausted", "profile_ineligible", "capability_missing", "parents_incomplete", "hold", "other",
+-           "evidence_missing")
++           "evidence_missing", "quota_hold")
+ DEFAULT_STALL_SECONDS = 600
+ REFRESH_SECONDS = 60
+ RETENTION_SECONDS = 7 * 86400
+@@ -448,6 +449,21 @@ def _hold_expected(own: str, now_ms: int) -> bool:
+     return True
+ 
+ 
++_QUOTA_UNTIL = re.compile(r" until (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)Z")
++
++
++def _quota_hold_expected(skip: Mapping[str, Any], now_ms: int) -> bool:
++    """A ``quota_hold`` skip (the card's own quota wall: local dispatch would hold a copy) whose stated deadline plus
++    the stall threshold is still ahead: the wait is expected, file nothing. Past it, or with no readable deadline,
++    the card alerts on its own like any card-specific reason, never as the machine-wide registry ``hold``."""
++    found = _QUOTA_UNTIL.search(str(skip.get("detail") or "")) if skip.get("reason") == "quota_hold" else None
++    if found is None:
++        return False
++    from datetime import UTC, datetime
++    until = datetime.strptime(found.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC).timestamp()
++    return now_ms < (until + stall_seconds()) * 1000
++
++
+ def _group(card: Mapping[str, Any]) -> Optional[str]:
+     skip = card["skip"] or {}
+     if skip.get("reason") == "other" and skip.get("detail") == "machine registry unavailable":
+@@ -490,6 +506,8 @@ def file_repairs(conn, own: str, cards: list[dict[str, Any]], *, now: Optional[f
+         if (card["skip"]["reason"] == "evidence_missing"
+                 and now_ms - card["skip"]["first_at"] < stall_seconds() * 1000):
+             continue
++        if _quota_hold_expected(card["skip"], now_ms):
++            continue
+         group = _group(card)
+         if group is not None:
+             groups.setdefault(group, []).append(card)
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index bdb7aa62c6..f57274f234 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -562,7 +562,7 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+ 
+ 
+ def _quota_held(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tuple[str, Optional[str]]]:
+-    """[daveey] ``("hold", detail)`` when the local dispatcher would hold ``card`` on its quota episode, judged
++    """[daveey] ``("quota_hold", detail)`` when the local dispatcher would hold ``card`` on its quota episode, judged
+     before the copy: the same read-only :func:`kanban_quota_episode.decision` ``check_respawn_guard`` returns for a
+     card with an episode, on the card's own runs/events in the replica (a copy carries exactly those) and this
+     machine's provider walls. Such a card would only be copied, held, evicted and copied again each tick, while
+@@ -584,8 +584,9 @@ def _quota_held(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tupl
+         _log.warning("kanban worker node: quota hold check for %s failed", card["id"], exc_info=True)
+         return None
+     from datetime import UTC, datetime
+-    when = f" until {datetime.fromtimestamp(until, UTC):%Y-%m-%dT%H:%MZ}" if until else ""
+-    return "hold", f"{guard}{when} (local dispatch would hold it)"
++    when = f" until {datetime.fromtimestamp(until, UTC):%Y-%m-%dT%H:%M:%SZ}" if until else ""
++    # Not "hold": that groups with a registry hold of the whole machine (kanban_pickup_stall._HOST_GROUPS).
++    return "quota_hold", f"{guard}{when} (local dispatch would hold it)"
+ 
+ 
+ def note_capped(conn: sqlite3.Connection, profile_exists: Optional[Callable[[str], bool]] = None) -> None:
+diff --git a/tests/hermes_cli/test_kanban_pickup_quota_held.py b/tests/hermes_cli/test_kanban_pickup_quota_held.py
+index 90e1ee8dc9..9f62974340 100644
+--- a/tests/hermes_cli/test_kanban_pickup_quota_held.py
++++ b/tests/hermes_cli/test_kanban_pickup_quota_held.py
+@@ -83,10 +83,31 @@ def test_quota_held_cards_do_not_starve_a_pinned_card(gws, imports):
+     assert all(_status(worker.conn, tid) is None for tid in walled)
+     # A walled card pinned here says why it waits, not budget_exhausted.
+     skip = kps.latest(worker.conn, walled[0])
+-    assert skip is not None and skip["reason"] == "hold"
++    assert skip is not None and skip["reason"] == "quota_hold"
+     assert skip["detail"].startswith("subscription_quota_reset until ")
+ 
+ 
++def test_a_quota_held_pinned_card_files_no_repair_until_its_deadline_passes(gws):
++    """Review 5874270282: recorded as the machine-wide ``hold``, a walled pinned card filed "Pickup held on <host>
++    ... do not lift it" after 600 s while the machine was not held. Its own wall is expected until its deadline."""
++    from tests.hermes_cli.test_kanban_pickup_stall import _age, _repairs
++    hub, worker = gws
++    tid = _walled(hub, title="walled, pinned", priority=10, runs_on=PIN)
++    worker.round()
++    worker.tick(max_spawn=1)
++    assert _status(worker.conn, tid) is None
++    _age(worker, tid, 3600)
++    t0 = time.time()
++    assert kps.sweep(worker.conn, now=t0) == []
++    assert kps.sweep(worker.conn, now=t0 + WALL_S + kps.stall_seconds() - 120) == []
++    assert not _repairs(worker.conn)
++    # The wall outlived its deadline and the card is still not here: a card-specific repair, never the host hold.
++    kps.sweep(worker.conn, now=t0 + WALL_S + kps.stall_seconds() + 120)
++    [repair] = _repairs(worker.conn)
++    assert tid in repair["title"] and "quota_hold" in repair["title"]
++    assert "held on" not in repair["title"].lower()
++
++
+ def test_an_episode_whose_wall_has_passed_is_copied(gws, imports, monkeypatch):
+     hub, worker = gws
+     tid = _walled(hub, title="wall over", priority=10, runs_on=PIN)
+-- 
+2.43.0
+

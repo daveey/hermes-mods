@@ -1,0 +1,222 @@
+From c728e732a18968f9d9c55b53980874892b1df2dc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:59:45 +0000
+Subject: [PATCH] [daveey] Buffered tui Kanban block notices re-read a stale
+ ask at delivery
+
+The legacy tui_gateway poller renders a notice when it claims it and holds it in
+_kanban_pending behind a busy turn. PR #1260 refreshed a stale "Next action for the
+user" ask only on the gateway admission path, so a buffered notice for a card that
+finished meanwhile still asked the user to decide (review N3, t_01a1ce7ed2addb09).
+
+kanban_claim_custody.batch_text joins the batch with each text passed through
+refresh_stale_ask; the persisted kanban_notice row and the submitted turn use the same
+text. The _KanbanText objects are not replaced, so claim identity and _kb_* attributes
+stay intact. Still-blocked, remote and unreadable cards stay byte-identical.
+---
+ .../test_kanban_notice_stale_ask_buffered.py  | 112 ++++++++++++++++++
+ tui_gateway/kanban_claim_custody.py           |  20 ++++
+ tui_gateway/session_notifications.py          |  12 +-
+ 3 files changed, 138 insertions(+), 6 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_notice_stale_ask_buffered.py
+
+diff --git a/tests/tui_gateway/test_kanban_notice_stale_ask_buffered.py b/tests/tui_gateway/test_kanban_notice_stale_ask_buffered.py
+new file mode 100644
+index 0000000000..7c6c5f16be
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_notice_stale_ask_buffered.py
+@@ -0,0 +1,112 @@
++"""A block notice buffered in the tui poller's ``_kanban_pending`` re-reads its card when the batch is delivered.
++
++The legacy tui_gateway path renders a notice when it is claimed, then holds it in ``_kanban_pending`` until the
++chat's running turn ends. PR #1260 refreshed a stale "Next action for the user" ask only on the gateway admission
++path (``refresh_payload``), so a notice buffered here behind a busy turn still asked the user to decide a card
++that had since finished (review N3 of t_01a1ce7ed2addb09). [daveey]
++"""
++
++import contextlib
++import threading
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_state import SessionDB
++from tui_gateway import server
++
++KEY = "20261112_101500_ab12cd"
++ASK = "Next action for the user"
++REQUEST = dict(action="Reply 'accept offline coverage' or 'require Docker proof'. Unblock = apply it; "
++                      "archive = drop the remaining acceptance work.",
++               why_human="Accepting offline coverage changes the acceptance criterion.", interaction="reply",
++               scope="Only the standalone Docker integration acceptance.", evidence="No Docker endpoint on either host.")
++
++
++def _session(running: bool) -> dict:
++    return {"session_key": KEY, "history_lock": threading.RLock(), "running": running}
++
++
++@pytest.fixture
++def gate(monkeypatch):
++    state = {"submitted": []}
++
++    def _submit(rid, sid, session, text, **kwargs):
++        state["submitted"].append(text)
++        with session["history_lock"]:
++            session["running"] = False
++        return True
++
++    monkeypatch.setattr(server, "_run_prompt_submit", _submit)
++    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
++    return state
++
++
++@pytest.fixture
++def sdb(tmp_path, monkeypatch):
++    d = SessionDB(tmp_path / "state.db")
++    d.create_session(KEY, "desktop")
++    d.append_message(KEY, "user", "run the drill")
++
++    @contextlib.contextmanager
++    def _opener(session):
++        yield d
++
++    monkeypatch.setattr(server, "_session_db", _opener)
++    return d
++
++
++def _blocked_card() -> str:
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="state CI fixture", assignee="default")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=KEY)
++        assert kb.block_task(conn, tid, kind="needs_input", reason="Choose coverage", human_request=dict(REQUEST))
++        return tid
++
++
++def _finish(tid: str) -> None:
++    with contextlib.closing(kbc.connect()) as conn:
++        assert kb.unblock_task(conn, tid)
++        assert kb.complete_task(conn, tid, result="fixed")
++
++
++def _buffer_then_deliver(gate, sdb, then):
++    """Claim the block notice while a turn runs, run ``then``, end the turn; return (buffered, row, submitted)."""
++    tid = _blocked_card()
++    busy = _session(running=True)
++    server._notif_poll_kanban_scoped("ui", busy)
++    assert gate["submitted"] == [], "the chat is busy: the notice waits in the buffer"
++    pending = list(busy["_kanban_pending"])
++    buffered = next(t for t in pending if ASK in t)
++    assert f"Open task: @task:default/{tid}" in buffered
++    attrs = {k: getattr(buffered, k, None) for k in ("_kb_keys", "_kb_blocked", "_kb_remote")}
++    then(tid)
++    # Only the already-buffered notice is delivered here: later events are not claimed while backing off.
++    busy["_kanban_refused_until"] = float("inf")
++    with busy["history_lock"]:
++        busy["running"] = False
++    server._notif_poll_kanban_scoped("ui", busy)
++    assert len(gate["submitted"]) == 1, "the buffered batch runs as one turn once the chat is idle"
++    assert {k: getattr(buffered, k, None) for k in attrs} == attrs, "the buffered text keeps its identity"
++    rows = [m for m in sdb.get_messages(KEY) if m.get("display_kind") == "kanban_notice"]
++    assert len(rows) == 1
++    return "\n".join(pending), rows[0]["content"], gate["submitted"][0]
++
++
++def test_buffered_block_notice_for_a_finished_card_drops_the_ask(gate, sdb):
++    original, row, submitted = _buffer_then_deliver(gate, sdb, _finish)
++    assert ASK not in submitted, "the card finished while the notice waited: no decision is left to ask for"
++    assert "Why only the user" not in submitted
++    assert "Since then: unblocked" in submitted and "completed" in submitted and "No action needed." in submitted
++    assert "Scope: Only the standalone Docker integration acceptance." in submitted
++    assert row == submitted, "the transcript row and the turn carry the same refreshed text"
++    assert original.split(ASK)[0] in submitted, "the notice itself stays"
++
++
++def test_buffered_block_notice_for_a_still_blocked_card_is_byte_identical(gate, sdb):
++    original, row, submitted = _buffer_then_deliver(gate, sdb, lambda tid: None)
++    assert submitted == original
++    assert row == original
++    assert f"{ASK}: {REQUEST['action']}" in submitted
+diff --git a/tui_gateway/kanban_claim_custody.py b/tui_gateway/kanban_claim_custody.py
+index c17f183f55..b913676574 100644
+--- a/tui_gateway/kanban_claim_custody.py
++++ b/tui_gateway/kanban_claim_custody.py
+@@ -62,6 +62,26 @@ def fresh_texts(batch, delivered):
+     return fresh
+ 
+ 
++def batch_text(texts) -> str:
++    """The turn text for a buffered batch, each block notice's ask re-read against its card NOW (delivery).
++
++    A notice is rendered when it is claimed, then may wait in ``_kanban_pending`` behind a busy turn while its
++    card is unblocked or finished; ``refresh_stale_ask`` swaps such a stale "Next action for the user" ask for a
++    ``Since then:`` line (still-blocked, remote and unreadable cards stay byte-identical). The texts themselves
++    are not replaced: claims track them by identity and keep their ``_kb_*`` attributes. Never raises. [daveey]"""
++    import logging
++
++    from hermes_cli.kanban_stale_ask import ASK_MARK, refresh_stale_ask
++    out = []
++    for text in texts:
++        try:
++            out.append(refresh_stale_ask(str(text)) if ASK_MARK in text else str(text))
++        except Exception:  # health: allow BLE001 -- a refresh must never cost the notice itself
++            logging.getLogger(__name__).warning("stale block-ask refresh failed; delivering unchanged", exc_info=True)
++            out.append(str(text))
++    return "\n".join(out)
++
++
+ def release_claims(session: dict, log_failure, logger) -> None:
+     """The poller is stopping with notices still buffered: hand their claimed ranges back (newest first, CAS) so
+     the chat's next consumer delivers them now instead of after this process exits. Never raises; takes no
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 7b2c546a06..9dfb084c52 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -1156,12 +1156,12 @@ def _kb_persist_batch(session: dict, batch: list, diagnostic: bool) -> tuple:
+             if not target or db.get_session(target) is None:
+                 return "unkeyed", batch, {}
+             done = db.kanban_notice_keys_delivered(target, keys)
+-            from tui_gateway.kanban_claim_custody import fresh_texts
++            from tui_gateway.kanban_claim_custody import batch_text, fresh_texts
+             from tui_gateway.kanban_remote_late import missing_texts
+             fresh = fresh_texts(missing_texts(batch, done), done)
+             if not fresh:
+                 return "delivered", [], {}
+-            text = "\n".join(fresh)
++            text = batch_text(fresh)  # [daveey] stale block asks re-read at delivery
+             fresh_keys = _kb_text_keys(fresh)
+             import hashlib
+             metadata = {"notice_id": "live:" + hashlib.sha1(",".join(sorted(fresh_keys)).encode()).hexdigest()[:20],
+@@ -1248,7 +1248,7 @@ def _notif_poll_kanban_scoped(sid: str, session: dict, prepared=None) -> None:
+         if session.get("_kanban_claims") or session.get("_kanban_pending"):
+             _kb_release_claims(session)
+         return
+-    from tui_gateway.kanban_claim_custody import release_expired
++    from tui_gateway.kanban_claim_custody import batch_text, release_expired
+     if release_expired(session, time.monotonic()):
+         return
+     texts, claims = prepared if prepared is not None else _notif_collect_kanban(session)
+@@ -1274,8 +1274,7 @@ def _notif_poll_kanban_scoped(sid: str, session: dict, prepared=None) -> None:
+         _notif_release_turn(session)
+         _kb_rewind_refused(session, batch, not_owned=True)
+         return
+-    # At-least-once (t_01a1835174955959): the notices land in the transcript and the board claim is acked
+-    # BEFORE the turn runs; until then the claim is in flight and a process that dies first hands it back.
++    # At-least-once (t_01a1835174955959): row written and claim acked BEFORE the turn; a dying process hands it back.
+     verdict, fresh, submit_kwargs = _kb_persist_batch(session, batch, diagnostic)
+     if verdict == "busy":
+         with session["history_lock"]:
+@@ -1291,7 +1290,8 @@ def _notif_poll_kanban_scoped(sid: str, session: dict, prepared=None) -> None:
+     if verdict == "unkeyed" and diagnostic:
+         submit_kwargs = {"display_metadata": {"notification_category": "diagnostic"}}
+     try:
+-        accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(fresh),
++        text = (submit_kwargs.get("display_metadata") or {}).get("display_text") or batch_text(fresh)  # = the row
++        accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
+                                  "kanban notification dispatch failed", **submit_kwargs)
+     except Exception:
+         accepted = False
+-- 
+2.43.0
+

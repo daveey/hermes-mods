@@ -1,0 +1,585 @@
+From 83d5119428f3d7e10d303280ea2927b0653598a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:51:15 +0000
+Subject: [PATCH] perf(state): recency pages probe messages only for rows that
+ can reach the page
+
+list_sessions_rich(order_by_last_active=True) ran the per-session MAX(messages.timestamp)
+probe for every admitted row on each sidebar poll miss (~100-140 ms CPU per read on the
+hub's 22.5k-session store). hermes_state_recency keeps a per-store cache of each session's
+in-window message max, folds in messages past the AUTOINCREMENT watermark inside the read's
+own snapshot, and derives the page threshold T from idx_sessions_effective_activity. Only
+sessions whose upper bound reaches T (plus their ancestors) enter the exact ranking, so the
+page is identical to the unrestricted query; anything unprovable falls back to it.
+
+Hub (read-only, one snapshot): limit=100 page 101.7ms -> 14.3ms CPU, identical rows on 4 shapes.
+---
+ hermes_state_recency.py                       | 252 ++++++++++++++++++
+ hermes_state_sessions.py                      |  72 +----
+ .../hermes_state/test_recency_page_probes.py  | 205 ++++++++++++++
+ 3 files changed, 465 insertions(+), 64 deletions(-)
+ create mode 100644 hermes_state_recency.py
+ create mode 100644 tests/hermes_state/test_recency_page_probes.py
+
+diff --git a/hermes_state_recency.py b/hermes_state_recency.py
+new file mode 100644
+index 0000000000..9b73145718
+--- /dev/null
++++ b/hermes_state_recency.py
+@@ -0,0 +1,252 @@
++"""``list_sessions_rich(order_by_last_active=True)`` pages without a messages probe per session.
++
++The exact ranking (``ranked_query``) orders every admitted row by its chain's freshest
++``_sql_session_last_active``, whose ``MAX(messages.timestamp)`` probe costs one index seek per
++session: ~100 ms of CPU per read on a 22k-session store, and a sidebar poll misses its caches about
++once a second because some session row changes that often. ``ranked_rows`` returns the same rows
++while running that probe only on a small candidate set that provably contains the page:
++
++* A per-store cache keeps each session's in-window ``MAX(messages.timestamp)``, built once with
++  the same probe. Every read folds in the sessions of messages past the watermark, inside the
++  read's own snapshot (``messages.id`` is AUTOINCREMENT, so a new message always lands past it).
++  A delete or rewind can only lower the true max, so a cached value is an UPPER bound.
++* A row's exact recency is the MAX of its in-window ``last_activity_at`` and message max, else its
++  in-window ``started_at``; a chain root's is the MAX over its compression chain. So
++  ``max(last_activity_at, cached max, started_at)`` of some chain member bounds it from above, and
++  the row's own in-window ``last_activity_at`` bounds it from below.
++* ``T`` = the (offset+limit)-th largest in-window ``last_activity_at`` among admitted rows (read
++  off ``idx_sessions_effective_activity``). That many rows rank at ``>= T``, so every row of the
++  page ranks ``>= T`` and has a chain member whose upper bound is ``>= T``. The candidates are every
++  session with ``last_activity_at``/``started_at`` ``>= T`` (index ranges) or a cached max ``>= T``,
++  plus all their ancestors. A row outside them ranks strictly below ``T``: it cannot reach or tie
++  into the page, and the exact query restricted to the candidates returns exactly the unrestricted
++  query's page, in SQLite's own ordering.
++
++Fewer than offset+limit in-window ``last_activity_at`` rows, a search, a store without
++AUTOINCREMENT ids, a watermark that moved backwards (another file) or any SQLite error falls back
++to the unrestricted query. Assumption: a message's ``timestamp`` and ``session_id`` are not raised or
++moved in place and no message is inserted with an explicit old id on a live store (no writer does;
++the salvage repair rewrites timestamps only on a new file, which starts a new cache).
++"""
++import json
++import os
++import sqlite3
++import threading
++from collections import OrderedDict
++from typing import Any, Optional
++
++from hermes_state_common import _SQL_IN_WINDOW, _sql_in_window, _sql_json_extract, _RESET_CHILD_SQL
++from hermes_state_common import _sql_session_last_active, _sql_session_last_active_by_id
++from hermes_cli.timefmt import EPOCH_MAX
++
++ENABLED = True  # tests flip it to compare against the unrestricted query
++_MAX_STORES = 8
++_STORES: "OrderedDict[tuple, _StoreRecency]" = OrderedDict()
++_STORES_LOCK = threading.Lock()
++
++
++def _msg_max_sql(session_id_expr: str) -> str:
++    # The same probe _sql_freshest_of embeds, so a cached value is the value the exact query reads.
++    return (f"(SELECT MAX(_rc_m.timestamp) FROM messages _rc_m INDEXED BY idx_messages_session"
++            f" WHERE _rc_m.session_id = {session_id_expr} AND _rc_m.timestamp {_SQL_IN_WINDOW})")
++
++
++def chain_cte(seed_from: str, where_sql: str) -> str:
++    return f"""chain(root_id, cur_id) AS (
++                    SELECT s.id, s.id FROM {seed_from} {where_sql}
++                    UNION ALL
++                    SELECT c.root_id, child.id
++                    FROM chain c
++                    JOIN sessions parent ON parent.id = c.cur_id
++                    JOIN sessions child ON child.parent_session_id = c.cur_id
++                    WHERE parent.end_reason = 'compression'
++                      AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
++                      AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL
++                      AND NOT ({_RESET_CHILD_SQL.format(a='child')})
++                      AND COALESCE(child.source, '') != 'tool'
++                )"""
++
++
++def ranked_query(where_sql: str, outer_where: str, seed_from: str, select_head: str, prompt_join: str) -> str:
++    """The exact chain-tip ranking: the CTE walks compression-continuation edges forward from the
++    admitted rows; MAX over the chain gives effective_last_active in SQL. Do NOT require
++    child.started_at >= parent.ended_at: races insert the continuation before ended_at is written.
++
++    The page is ranked and cut on ids alone (``page``); only its rows then pay for the projection.
++    Projecting in the ranked query made SQLite build every admitted row's full result (s.*, the
++    resolved system prompt, the preview subquery over message content) before LIMIT: 4-11s per
++    page at 25k rows, for LIMIT 1 as much as LIMIT 200. Binds: where (seed), outer, LIMIT, OFFSET."""
++    return f"""
++                WITH RECURSIVE {chain_cte(seed_from, where_sql)},
++                chain_max AS (
++                    SELECT
++                        root_id,
++                        MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
++                    FROM chain
++                    GROUP BY root_id
++                ),
++                page AS (
++                    SELECT s.id AS page_id,
++                        COALESCE(cm.effective_last_active, {_sql_session_last_active("s")},
++                                 {_sql_in_window("s.started_at")}) AS effective_last_active
++                    FROM sessions s
++                    LEFT JOIN chain_max cm ON cm.root_id = s.id
++                    {outer_where}
++                    ORDER BY effective_last_active DESC, s.started_at DESC, s.id DESC
++                    LIMIT ? OFFSET ?
++                )
++                {select_head}{_sql_session_last_active("s")} AS last_active,
++                    page.effective_last_active AS _effective_last_active
++                FROM page
++                JOIN sessions s ON s.id = page.page_id
++                {prompt_join}
++                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
++            """
++
++
++# Every session with a bound >= ? (three binds of the threshold, then the JSON list of sessions whose
++# cached message max reaches it), plus all their ancestors: a chain root ranks by its members.
++# UNION ALL keeps each arm on its own index (a UNION merge scanned the PK instead); ``up`` dedupes.
++_CANDIDATES_SQL = f"""
++    WITH RECURSIVE
++    seed(id) AS (
++        SELECT id FROM sessions WHERE COALESCE(last_activity_at, started_at) >= ?
++        UNION ALL SELECT id FROM sessions WHERE started_at BETWEEN ? AND {EPOCH_MAX!r}
++        UNION ALL SELECT value FROM json_each(?)
++    ),
++    up(id) AS (
++        SELECT id FROM seed
++        UNION SELECT s.parent_session_id FROM up JOIN sessions s ON s.id = up.id
++        WHERE s.parent_session_id IS NOT NULL
++    )
++    SELECT id FROM up"""
++
++
++class _StoreRecency:
++    """One store's ``{session_id: cached in-window MAX(messages.timestamp)}`` and its watermark."""
++
++    def __init__(self):
++        self.lock = threading.Lock()
++        self.watermark: Optional[int] = None  # None: never built
++        self.msg_max: dict[str, Any] = {}
++        self.stale = False
++
++    def probe(self, conn, ids) -> None:
++        ids = list(ids)
++        if not ids:
++            return
++        for sid, value in conn.execute(f"SELECT j.value, {_msg_max_sql('j.value')} FROM json_each(?) j",
++                                       (json.dumps(ids),)).fetchall():
++            if value is None:
++                self.msg_max.pop(sid, None)
++            else:
++                self.msg_max[sid] = value
++
++    def refresh(self, conn) -> bool:
++        """Fold this snapshot's new messages in; False when ids cannot carry a watermark."""
++        seq_row = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'messages'").fetchone()
++        max_id = conn.execute("SELECT MAX(id) FROM messages").fetchone()[0]
++        if seq_row is None and max_id is not None:
++            return False  # ids may be reused (no AUTOINCREMENT): a watermark proves nothing
++        high = max(int(seq_row[0]) if seq_row else 0, int(max_id or 0))
++        if self.watermark is None or self.stale or high < self.watermark:
++            self.msg_max, self.stale = {}, False
++            for sid, value in conn.execute(f"SELECT s.id, {_msg_max_sql('s.id')} FROM sessions s").fetchall():
++                if value is not None:
++                    self.msg_max[sid] = value
++        elif high > self.watermark:
++            # NOT INDEXED: walk the rowid range, never the whole (session_id, timestamp) index.
++            self.probe(conn, {sid for (sid,) in conn.execute(
++                "SELECT session_id FROM messages NOT INDEXED WHERE id > ?", (self.watermark,)).fetchall()})
++        self.watermark = high
++        return True
++
++
++def _store_for(path: str) -> Optional[_StoreRecency]:
++    try:
++        st = os.stat(path)
++    except OSError:
++        return None
++    key = (os.path.realpath(path), st.st_dev, st.st_ino)  # a replaced file starts over
++    with _STORES_LOCK:
++        store = _STORES.get(key)
++        if store is None:
++            store = _STORES[key] = _StoreRecency()
++        _STORES.move_to_end(key)
++        while len(_STORES) > _MAX_STORES:
++            _STORES.popitem(last=False)
++        return store
++
++
++def clear() -> None:
++    with _STORES_LOCK:
++        _STORES.clear()
++
++
++def _candidates(conn, store, where_clauses, params, need) -> Optional[list[str]]:
++    """Session ids that contain the page (module doc), or None to read unrestricted."""
++    if not store.refresh(conn):
++        return None
++    # Among rows with an in-window last_activity_at the index key IS last_activity_at. CASE keeps the
++    # admission filter (JSON markers) off every row that has none.
++    in_window = f"s.last_activity_at {_SQL_IN_WINDOW}"
++    admitted = " AND ".join(f"({clause})" for clause in where_clauses) or "1"
++    row = conn.execute(
++        f"SELECT s.last_activity_at FROM sessions s WHERE CASE WHEN {in_window} THEN {admitted} ELSE 0 END"
++        " ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC LIMIT 1 OFFSET ?",
++        [*params, need - 1]).fetchone()
++    if row is None:
++        return None
++    threshold = row[0]
++    high = [sid for sid, value in store.msg_max.items() if value >= threshold]
++    if len(high) > 2 * need + 64:
++        # Cached maxima a delete lowered stay high until probed again: re-probe them once.
++        store.probe(conn, high)
++        high = [sid for sid in high if store.msg_max.get(sid, threshold - 1) >= threshold]
++    return [sid for (sid,) in conn.execute(
++        _CANDIDATES_SQL, (threshold, threshold, json.dumps(high))).fetchall()]
++
++
++def ranked_rows(db, where_clauses: list[str], params: list, select_head: str, prompt_join: str,
++                id_needle: str, search_needle: str, limit: int, offset: int) -> list:
++    """The ``order_by_last_active`` page of list_sessions_rich (see module doc).
++
++    Unless a search needs every row's chain (it matches a row's own id and title through it), only
++    rows that HAVE a child seed the walk: a childless row's chain is itself alone, so its MAX is just
++    its own last_active, which the outer COALESCE reads directly. Drive from distinct parent ids via
++    idx_sessions_parent, then look up each seed by PK (a correlated EXISTS still parsed every
++    childless row's JSON before rejecting it)."""
++    from hermes_state_sessions import _where_sql
++    where_sql = _where_sql(where_clauses)
++    seed_from = "sessions s" if (id_needle or search_needle) else (
++        "(SELECT DISTINCT parent_session_id FROM sessions WHERE parent_session_id IS NOT NULL) roots "
++        "CROSS JOIN sessions s ON s.id = roots.parent_session_id")
++    outer_where, id_params = db._chain_search_where(where_sql, id_needle, search_needle)
++    query = ranked_query(where_sql, outer_where, seed_from, select_head, prompt_join)
++    query_params = params + params + id_params + [limit, offset]
++    need = (offset or 0) + (limit or 0)
++    path = str(getattr(db, "db_path", "") or "")
++    store = _store_for(path) if ENABLED and path and not (id_needle or search_needle) else None
++    if store is None or limit is None or limit <= 0 or (offset or 0) < 0:
++        return db._read_all(query, query_params)
++    try:
++        with db._read_ctx() as conn:
++            began = not conn.in_transaction
++            if began:
++                conn.execute("BEGIN")  # one snapshot for the bounds and the restricted exact query
++            try:
++                with store.lock:
++                    picked = _candidates(conn, store, where_clauses, params, need)
++                if picked is None:
++                    return conn.execute(query, query_params).fetchall()
++                narrowed = _where_sql([*where_clauses, "s.id IN (SELECT value FROM json_each(?))"])
++                narrowed_params = [*params, json.dumps(picked)]
++                return conn.execute(ranked_query(narrowed, narrowed, seed_from, select_head, prompt_join),
++                                    narrowed_params + narrowed_params + [limit, offset]).fetchall()
++            finally:
++                if began and conn.in_transaction:
++                    conn.execute("ROLLBACK")
++    except sqlite3.Error:
++        with store.lock:
++            store.stale = True
++        return db._read_all(query, query_params)  # reports a real storage fault through its own path
+diff --git a/hermes_state_sessions.py b/hermes_state_sessions.py
+index dccbc0deed..b8c552f33a 100644
+--- a/hermes_state_sessions.py
++++ b/hermes_state_sessions.py
+@@ -1357,68 +1357,12 @@ class SessionSessionsMixin:
+         )
+         from_sessions = f"FROM sessions s\n                {prompt_join}"
+         if order_by_last_active:
+-            # The CTE walks compression-continuation edges forward from the admitted
+-            # rows; MAX over the chain gives effective_last_active in SQL. Do NOT
+-            # require child.started_at >= parent.ended_at: races insert the
+-            # continuation before ended_at is written.
+-            #
+-            # The page is ranked and cut on ids alone (``page``); only its rows then
+-            # pay for the projection. Projecting in the ranked query made SQLite
+-            # build every admitted row's full result — s.*, the resolved system
+-            # prompt, the preview subquery over message content — before LIMIT:
+-            # 4-11s per page at 25k rows, for LIMIT 1 as much as LIMIT 200.
+-            #
+-            # Unless a search needs every row's chain (it matches a row's own id and
+-            # title through it), only rows that HAVE a child seed the walk. A
+-            # childless row's chain is itself alone, so its MAX is just its own
+-            # last_active, which the outer COALESCE reads directly.
+-            # Drive from distinct parent ids via idx_sessions_parent, then look up each seed by PK.
+-            # A correlated EXISTS still parsed every childless row's JSON before rejecting it.
+-            id_needle = (id_query or "").strip().lower()
+-            search_needle = (search_query or "").strip().lower()
+-            seed_from = "sessions s" if (id_needle or search_needle) else (
+-                "(SELECT DISTINCT parent_session_id FROM sessions WHERE parent_session_id IS NOT NULL) roots "
+-                "CROSS JOIN sessions s ON s.id = roots.parent_session_id")
+-            outer_where, id_params = self._chain_search_where(where_sql, id_needle, search_needle)
+-            query = f"""
+-                WITH RECURSIVE chain(root_id, cur_id) AS (
+-                    SELECT s.id, s.id FROM {seed_from} {where_sql}
+-                    UNION ALL
+-                    SELECT c.root_id, child.id
+-                    FROM chain c
+-                    JOIN sessions parent ON parent.id = c.cur_id
+-                    JOIN sessions child ON child.parent_session_id = c.cur_id
+-                    WHERE parent.end_reason = 'compression'
+-                      AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
+-                      AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL
+-                      AND NOT ({_RESET_CHILD_SQL.format(a='child')})
+-                      AND COALESCE(child.source, '') != 'tool'
+-                ),
+-                chain_max AS (
+-                    SELECT
+-                        root_id,
+-                        MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
+-                    FROM chain
+-                    GROUP BY root_id
+-                ),
+-                page AS (
+-                    SELECT s.id AS page_id,
+-                        COALESCE(cm.effective_last_active, {_sql_session_last_active("s")},
+-                                 {_sql_in_window("s.started_at")}) AS effective_last_active
+-                    FROM sessions s
+-                    LEFT JOIN chain_max cm ON cm.root_id = s.id
+-                    {outer_where}
+-                    ORDER BY effective_last_active DESC, s.started_at DESC, s.id DESC
+-                    LIMIT ? OFFSET ?
+-                )
+-                {select_head}{_sql_session_last_active("s")} AS last_active,
+-                    page.effective_last_active AS _effective_last_active
+-                FROM page
+-                JOIN sessions s ON s.id = page.page_id
+-                {prompt_join}
+-                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+-            """
+-            params = params + params + id_params + [limit, offset]  # WHERE binds twice (seed + outer)
++            # Exact chain-tip ranking (hermes_state_recency): messages are probed only for rows that
++            # can reach the page, not for every admitted session on every read.
++            from hermes_state_recency import ranked_rows
++            raw_rows = ranked_rows(
++                self, where_clauses, params, select_head, prompt_join, (id_query or "").strip().lower(),
++                (search_query or "").strip().lower(), limit, offset)
+         else:
+             query = f"""
+                 {select_head}{_sql_session_last_active("s")} AS last_active
+@@ -1427,8 +1371,8 @@ class SessionSessionsMixin:
+                 ORDER BY s.started_at DESC
+                 LIMIT ? OFFSET ?
+             """
+-            params.extend([limit, offset])
+-        sessions = [self._list_row(row) for row in self._read_all(query, params)]
++            raw_rows = self._read_all(query, [*params, limit, offset])
++        sessions = [self._list_row(row) for row in raw_rows]
+         # Pinned back-fill runs BEFORE compression projection so a back-filled root
+         # projects to its tip like any other row. Do not inherit the archived
+         # constraint: the sidebar lists with include_archived=False, and a pin
+diff --git a/tests/hermes_state/test_recency_page_probes.py b/tests/hermes_state/test_recency_page_probes.py
+new file mode 100644
+index 0000000000..2a65bc047b
+--- /dev/null
++++ b/tests/hermes_state/test_recency_page_probes.py
+@@ -0,0 +1,205 @@
++"""Recency pages probe messages only for rows that can reach the page (hermes_state_recency).
++
++The sidebar polls ``list_sessions_rich(order_by_last_active=True)`` about once a second on a
++store whose session rows change that often, so every poll is a miss. The exact ranking used to
++probe ``MAX(messages.timestamp)`` for every admitted session on each of them (~100 ms CPU at 22k
++sessions). These tests pin both halves: polls after a write probe only the delta and the
++candidates, and the page stays identical to the unrestricted query through inserts, deletes,
++garbage timestamps (#91536) and compression chains.
++"""
++
++import random
++from contextlib import contextmanager
++
++import pytest
++
++import hermes_state_recency
++from hermes_state import SessionDB
++
++_BASE = 1_700_000_000.0
++
++
++@pytest.fixture
++def db(tmp_path):
++    hermes_state_recency.clear()
++    database = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        yield database
++    finally:
++        database.close()
++        hermes_state_recency.clear()
++
++
++def _write(db, sql, params=()):
++    db._execute_write(lambda conn: conn.execute(sql, params))
++
++
++def _seed(db, count):
++    def seed(conn):
++        conn.executemany(
++            "INSERT INTO sessions (id, source, started_at, last_activity_at, message_count) VALUES (?, 'cli', ?, ?, 1)",
++            [(f"s{i:04d}", _BASE + i, _BASE + i + 0.5) for i in range(count)])
++        conn.executemany("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'x', ?)",
++                         [(f"s{i:04d}", _BASE + i + 0.25) for i in range(count)])
++    db._execute_write(seed)
++
++
++@contextmanager
++def _traced(db):
++    statements = []
++    borrow = db._read_ctx
++
++    @contextmanager
++    def traced_read(*args, **kwargs):
++        with borrow(*args, **kwargs) as conn:
++            if conn is None:
++                yield conn
++                return
++            conn.set_trace_callback(statements.append)
++            try:
++                yield conn
++            finally:
++                conn.set_trace_callback(None)
++
++    db._read_ctx = traced_read  # type: ignore[method-assign]
++    try:
++        yield statements
++    finally:
++        del db._read_ctx
++
++
++def _unrestricted_rankings(statements):
++    """Ranking statements that probe the messages of EVERY admitted session (the trace callback
++    sees the SQL with its bound values expanded)."""
++    return [sql for sql in statements if "chain_max AS" in sql and "s.id IN (SELECT value FROM json_each(" not in sql]
++
++
++def _page(db, **kwargs):
++    return db.list_sessions_rich(order_by_last_active=True, compact_rows=True, min_message_count=1, **kwargs)
++
++
++def test_polls_after_one_insert_do_not_probe_every_session(db, monkeypatch):
++    _seed(db, 400)
++    probed = []
++    real_probe = hermes_state_recency._StoreRecency.probe
++    monkeypatch.setattr(hermes_state_recency._StoreRecency, "probe",
++                        lambda self, conn, ids: (probed.append(list(ids)), real_probe(self, conn, ids))[1])
++    _page(db, limit=20)  # first read builds the store's recency once
++    probed.clear()
++    db.append_message(session_id="s0007", role="user", content="new")
++    with _traced(db) as statements:
++        first = _page(db, limit=20)
++        second = _page(db, limit=20)
++    assert _unrestricted_rankings(statements) == []
++    assert sum(len(ids) for ids in probed) <= 2  # the one session the insert touched
++    assert [s["id"] for s in first][:1] == ["s0007"] and first == second
++    monkeypatch.setattr(hermes_state_recency, "ENABLED", False)
++    assert _page(db, limit=20) == first
++
++
++def _random_store(db, rng, count):
++    ids = [f"r{i:03d}" for i in range(count)]
++
++    def pick_ts():
++        roll = rng.random()
++        if roll < 0.05:
++            return 5.4905047707024164e+246  # salvaged garbage double (#91536)
++        if roll < 0.08:
++            return "not-a-timestamp"
++        if roll < 0.25:
++            return None
++        return _BASE + rng.randrange(0, 5000) + rng.choice((0, 0.5))
++
++    def seed(conn):
++        for i, sid in enumerate(ids):
++            parent = None
++            if i and rng.random() < 0.25:
++                parent = ids[rng.randrange(0, i)]
++                conn.execute("UPDATE sessions SET end_reason = 'compression', ended_at = ? WHERE id = ?",
++                             (_BASE + 1, parent))
++            started = pick_ts() or _BASE + rng.randrange(0, 5000)
++            conn.execute("INSERT INTO sessions (id, source, started_at, last_activity_at, message_count,"
++                         " parent_session_id, model_config) VALUES (?, ?, ?, ?, ?, ?, ?)",
++                         (sid, rng.choice(("cli", "cli", "cron", "telegram")), started, pick_ts(),
++                          rng.randrange(0, 4), parent,
++                          '{"_branched_from": "x"}' if parent and rng.random() < 0.2 else None))
++            for _ in range(rng.randrange(0, 4)):
++                conn.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'x', ?)",
++                             (sid, pick_ts() or _BASE + rng.randrange(0, 5000)))
++    db._execute_write(seed)
++    return ids, pick_ts
++
++
++def _mutate(db, rng, ids, pick_ts):
++    sid = rng.choice(ids)
++    roll = rng.random()
++    if roll < 0.4:
++        _write(db, "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'y', ?)",
++               (sid, pick_ts() or _BASE + rng.randrange(0, 6000)))
++        if rng.random() < 0.5:
++            _write(db, "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?", (sid,))
++    elif roll < 0.6:  # a rewind/delete that may lower the true max without touching message_count
++        _write(db, "DELETE FROM messages WHERE id = (SELECT MAX(id) FROM messages WHERE session_id = ?)", (sid,))
++    elif roll < 0.8:
++        _write(db, "UPDATE sessions SET last_activity_at = ? WHERE id = ?", (pick_ts(), sid))
++    elif roll < 0.9:
++        _write(db, "UPDATE sessions SET message_count = ? WHERE id = ?", (rng.randrange(0, 4), sid))
++    else:  # the newest messages go, AUTOINCREMENT still never reuses their ids
++        _write(db, "DELETE FROM messages WHERE id > (SELECT MAX(id) - 3 FROM messages)")
++
++
++@pytest.mark.parametrize("seed", range(4))
++def test_pages_match_the_unrestricted_ranking_through_writes(db, monkeypatch, seed):
++    rng = random.Random(seed)
++    ids, pick_ts = _random_store(db, rng, 120)
++    shapes = [dict(limit=5), dict(limit=20, offset=7), dict(limit=60), dict(limit=200),
++              dict(limit=10, exclude_sources=["cron"]), dict(limit=15, include_children=True),
++              dict(limit=8, min_message_count=0)]
++    for _ in range(15):
++        for shape in shapes:
++            kwargs = {"min_message_count": 1, **shape}
++            monkeypatch.setattr(hermes_state_recency, "ENABLED", True)
++            fast = db.list_sessions_rich(order_by_last_active=True, compact_rows=True, include_pinned=True,
++                                         **kwargs)
++            monkeypatch.setattr(hermes_state_recency, "ENABLED", False)
++            exact = db.list_sessions_rich(order_by_last_active=True, compact_rows=True, include_pinned=True,
++                                          **kwargs)
++            assert fast == exact, (seed, shape)
++        for _ in range(rng.randrange(1, 4)):
++            _mutate(db, rng, ids, pick_ts)
++
++
++def test_deleted_messages_leave_no_stale_rank(db, monkeypatch):
++    """A delete lowers the true max under a cached one; the page must still be the exact one, and the
++    stale cached maxima get probed again instead of widening every later read."""
++    _seed(db, 200)
++    # Old heartbeats, fresh messages: the cache, not last_activity_at, ranks these rows first.
++    _write(db, "UPDATE messages SET timestamp = timestamp + 100000 WHERE session_id < 's0100'")
++    hermes_state_recency.clear()
++    assert [s["id"] for s in _page(db, limit=3)] == ["s0099", "s0098", "s0097"]
++    _write(db, "DELETE FROM messages WHERE session_id < 's0100'")
++    monkeypatch.setattr(hermes_state_recency, "ENABLED", False)
++    exact = _page(db, limit=3)
++    monkeypatch.setattr(hermes_state_recency, "ENABLED", True)
++    assert _page(db, limit=3) == exact
++    assert [s["id"] for s in exact] == ["s0199", "s0198", "s0197"]
++    assert not [sid for sid in next(iter(hermes_state_recency._STORES.values())).msg_max if sid < "s0100"]
++
++
++def test_replaced_store_starts_over(tmp_path):
++    hermes_state_recency.clear()
++    path = tmp_path / "state.db"
++    first = SessionDB(db_path=path)
++    _seed(first, 30)
++    assert _page(first, limit=5)[0]["id"] == "s0029"
++    first.close()
++    path.unlink()
++    for suffix in ("-wal", "-shm"):
++        (tmp_path / f"state.db{suffix}").unlink(missing_ok=True)
++    second = SessionDB(db_path=path)
++    try:
++        _seed(second, 10)
++        assert [s["id"] for s in _page(second, limit=3)] == ["s0009", "s0008", "s0007"]
++    finally:
++        second.close()
++        hermes_state_recency.clear()
+-- 
+2.43.0
+

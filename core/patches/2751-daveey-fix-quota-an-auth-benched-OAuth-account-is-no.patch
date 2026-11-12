@@ -1,0 +1,305 @@
+From 18877042c619f9532053e7443b082c81c90adb4e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:56:24 +0000
+Subject: [PATCH] [daveey] fix(quota): an auth-benched OAuth account is not
+ quota evidence; release false episode walls
+
+quota_unavailable() skipped every auth/refresh-benched entry and judged the pool
+from the rest, so three healthy anthropic accounts 401-benched for minutes made the
+four walled accounts look like the whole pool: workers exited with
+SubscriptionQuotaUnavailable resetting days away (worker-3, 2026-11-12 11:32) and
+their quota episodes held the cards until then.
+
+- quota_unavailable: a live entry on a non-quota bench without its own model
+  cooldown means the pool is not proven exhausted (None); an auth-benched entry
+  with a model cooldown still counts by that cooldown. Dead entries and entitlement
+  benches stay excluded. live_quota_wall and cron's pool_serving get this for free.
+- kanban_quota_episode._outstanding drops a hinted episode wall the live OAuth pool
+  now disproves (serves the model, any model for a class route) while no
+  provider-wide wall stands, so episodes recorded from the false wall release.
+---
+ agent/model_routing_unavailable.py            | 18 ++--
+ hermes_cli/kanban_provider_walls.py           | 16 ++++
+ hermes_cli/kanban_quota_episode.py            | 18 +++-
+ .../test_quota_unavailable_auth_bench.py      | 66 ++++++++++++++
+ .../test_kanban_quota_episode_false_wall.py   | 87 +++++++++++++++++++
+ 5 files changed, 199 insertions(+), 6 deletions(-)
+ create mode 100644 tests/agent/test_quota_unavailable_auth_bench.py
+ create mode 100644 tests/hermes_cli/test_kanban_quota_episode_false_wall.py
+
+diff --git a/agent/model_routing_unavailable.py b/agent/model_routing_unavailable.py
+index 8f267689a2..63688ca4d3 100644
+--- a/agent/model_routing_unavailable.py
++++ b/agent/model_routing_unavailable.py
+@@ -15,7 +15,10 @@ class SubscriptionQuotaUnavailable(ModelRoutingError):
+ 
+ 
+ def _quota_scan(pool, model):
+-    """``(room, waits)`` for *model*: room when a live OAuth entry can serve it now, else its quota resets."""
++    """``(room, waits)`` for *model*: room when a live OAuth entry can serve it now, else its quota resets.
++
++    Every live OAuth entry must carry quota evidence: one on an auth/refresh/billing bench without its
++    own model cooldown means "not proven a quota wall" (no waits), though it is not room either."""
+     from agent.credential_pool import STATUS_DEAD, _exhausted_until
+     from agent.credential_pool_model_cooldowns import MODEL_ENTITLEMENT_BENCH_SECONDS, model_cooldown_until
+     import time
+@@ -24,19 +27,24 @@ def _quota_scan(pool, model):
+         return False, []
+     now = time.time()
+     entries = [entry for entry in pool.entries() if entry.auth_type == "oauth" and entry.last_status != STATUS_DEAD]
+-    waits = []
++    waits, unproven = [], False
+     for entry in entries:
+         account = _exhausted_until(entry, sole_credential=len(entries) <= 1)
+-        if account and account > now and entry.last_error_code != 429:
+-            continue  # an auth/refresh/billing bench is not evidence of quota
+         model_reset = model_cooldown_until(entry, model)
+         if model_reset and model_reset - now >= MODEL_ENTITLEMENT_BENCH_SECONDS / 2:
+             continue  # entitlement benches do not reopen on a quota reset
++        if account and account > now and entry.last_error_code != 429:
++            # An auth/refresh/billing bench is not evidence of quota: unless this account
++            # also has its own cooldown for the model, the pool is not proven exhausted.
++            if not model_reset:
++                unproven = True
++                continue
++            account = None
+         reset = max(account or 0, model_reset or 0)
+         if reset <= now:
+             return True, []  # not an exhausted pool
+         waits.append(reset)
+-    return False, waits
++    return False, [] if unproven else waits
+ 
+ 
+ def quota_unavailable(pool, model):
+diff --git a/hermes_cli/kanban_provider_walls.py b/hermes_cli/kanban_provider_walls.py
+index a1291e3157..08945fe13d 100644
+--- a/hermes_cli/kanban_provider_walls.py
++++ b/hermes_cli/kanban_provider_walls.py
+@@ -209,6 +209,22 @@ def live_quota_room(provider: str, model: str) -> bool:
+         return False
+ 
+ 
++def live_pool_serving(provider: str, model: Optional[str] = None) -> bool:
++    """True when ``provider``'s OAuth pool can serve ``model`` right now (``None``: any model, judged
++    conservatively): no quota wall and an entry out of cooldown. Any read fault is False."""
++    provider = _norm(provider)
++    if not provider or provider == "auto":
++        return False
++    try:
++        from agent.credential_pool import load_pool
++        from agent.model_routing_unavailable import quota_unavailable
++        pool = load_pool(provider, allowed_auth_types={"oauth"})
++        return quota_unavailable(pool, model) is None and bool(pool.has_available(model=model))
++    except Exception as exc:  # health: allow BLE001 -- a pool read fault keeps every hold
++        logger.debug("kanban walls: live serving check failed for %s/%s (%s)", provider, model, exc, exc_info=True)
++        return False
++
++
+ def rate_limit_storm(conn: sqlite3.Connection, *, now: Optional[float] = None, prefix: Optional[str] = None) -> int:
+     """``rate_limited`` runs in the last hour claimed by this host (claim ``prefix``, default this host's).
+ 
+diff --git a/hermes_cli/kanban_quota_episode.py b/hermes_cli/kanban_quota_episode.py
+index 62c395f0b9..79e607d1e5 100644
+--- a/hermes_cli/kanban_quota_episode.py
++++ b/hermes_cli/kanban_quota_episode.py
+@@ -74,6 +74,22 @@ def _providers(state):
+     return [state['provider']] if state.get('provider') else []
+ 
+ 
++def _disproved(wall, now):
++    """True for a hinted wall the live OAuth pool now contradicts: every provider it names serves its
++    model (any model for a class route) and no provider-wide wall stands. A transient auth bench once
++    made ``quota_unavailable`` report a days-long false wall; the stored deadline must not outlive it."""
++    from agent.model_routing import is_class_selector
++    from hermes_cli import kanban_provider_walls as pw
++    names = _providers(wall)
++    if not wall.get('hinted') or not names:
++        return False
++    model = wall.get('model')
++    if not isinstance(model, str) or not model or is_class_selector(model) or len(names) > 1:
++        model = None
++    known = pw.active_walls(now=now)
++    return all(known.get(name) is None and pw.live_pool_serving(name, model) for name in names)
++
++
+ def _outstanding(conn, task_id, state, now):
+     """Every wall of this episode still before its deadline (earlier providers included)."""
+     from hermes_cli import kanban_db as kb
+@@ -84,7 +100,7 @@ def _outstanding(conn, task_id, state, now):
+         prior = kb._json_dict(row[0])
+         if isinstance(prior.get('until'), (int, float)) and prior['until'] > now:
+             out.append(prior)
+-    return out
++    return [wall for wall in out if not _disproved(wall, now)]
+ 
+ 
+ def _base_route(task, base):
+diff --git a/tests/agent/test_quota_unavailable_auth_bench.py b/tests/agent/test_quota_unavailable_auth_bench.py
+new file mode 100644
+index 0000000000..7696bff157
+--- /dev/null
++++ b/tests/agent/test_quota_unavailable_auth_bench.py
+@@ -0,0 +1,66 @@
++"""A transient auth/refresh bench on an OAuth account is not quota evidence for the pool."""
++import time
++
++import pytest
++
++from agent.credential_pool import CredentialPool, PooledCredential
++from agent.model_routing_unavailable import quota_unavailable
++
++MODEL = "claude-opus-5-5"
++
++
++def _entry(i, **status):
++    row = dict(id=f"acct{i}", label=f"account{i}", source="manual:device_code", auth_type="oauth",
++               access_token=f"fixture-access-{i}", refresh_token=f"fixture-refresh-{i}", priority=i)
++    row.update(status)
++    return PooledCredential.from_dict("anthropic", row)
++
++
++def _auth_benched(i, now):
++    return _entry(i, last_status="exhausted", last_status_at=now, last_error_code=401,
++                  last_error_reset_at=now + 300)
++
++
++def _walled(i, now, days):
++    return _entry(i, model_cooldowns={MODEL: now + days * 86400})
++
++
++def test_auth_benched_accounts_with_quota_do_not_make_a_wall():
++    """3 accounts 401-benched for 5 min + 4 with multi-day model cooldowns: the pool is not
++    proven quota-exhausted (worker-3, 2026-11-12 11:32)."""
++    now = time.time()
++    entries = [_auth_benched(i, now) for i in range(3)]
++    entries += [_walled(3 + i, now, days) for i, days in enumerate((1, 4, 5, 5.5))]
++    assert quota_unavailable(CredentialPool("anthropic", entries), MODEL) is None
++
++
++def test_auth_bench_on_an_account_with_its_own_quota_cooldown_still_counts_as_walled():
++    """An account that is both auth-benched and model-cooled for this model is quota evidence."""
++    now = time.time()
++    benched = _entry(0, last_status="exhausted", last_status_at=now, last_error_code=401,
++                     last_error_reset_at=now + 300, model_cooldowns={MODEL: now + 7200})
++    wall = quota_unavailable(CredentialPool("anthropic", [benched, _walled(1, now, 2)]), MODEL)
++    assert wall is not None
++    assert wall.resets_at == pytest.approx(now + 7200, abs=1)
++
++
++def test_all_429_walled_pool_still_reports_the_earliest_reset():
++    now = time.time()
++    entries = [_entry(0, last_status="exhausted", last_status_at=now, last_error_code=429,
++                      last_error_reset_at=now + 3600), _walled(1, now, 2)]
++    wall = quota_unavailable(CredentialPool("anthropic", entries), MODEL)
++    assert wall is not None
++    assert wall.resets_at == pytest.approx(now + 3600, abs=1)
++
++
++def test_dead_and_entitlement_benched_entries_stay_excluded():
++    from agent.credential_pool import STATUS_DEAD
++    from agent.credential_pool_model_cooldowns import MODEL_ENTITLEMENT_BENCH_SECONDS
++
++    now = time.time()
++    entries = [_entry(0, last_status=STATUS_DEAD, last_status_at=now, last_error_code=401),
++               _entry(1, model_cooldowns={MODEL: now + MODEL_ENTITLEMENT_BENCH_SECONDS}),
++               _walled(2, now, 3)]
++    wall = quota_unavailable(CredentialPool("anthropic", entries), MODEL)
++    assert wall is not None
++    assert wall.resets_at == pytest.approx(now + 3 * 86400, abs=1)
+diff --git a/tests/hermes_cli/test_kanban_quota_episode_false_wall.py b/tests/hermes_cli/test_kanban_quota_episode_false_wall.py
+new file mode 100644
+index 0000000000..06ac09990e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_quota_episode_false_wall.py
+@@ -0,0 +1,87 @@
++"""A hinted episode wall the live OAuth pool now disproves stops holding the card.
++
++worker-3, 2026-11-12 11:32: three healthy anthropic accounts were 401-benched for minutes, so
++``quota_unavailable`` judged the pool from four walled accounts only and the workers exited with
++``SubscriptionQuotaUnavailable ... resets at <5 days away>``. Each card stored that deadline in its
++``quota_episode`` and kept being held (``subscription_quota_reset``) although anthropic was serving.
++"""
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_quota_episode as quota
++from tests.hermes_cli.test_kanban_quota_episode import board as board  # noqa: PLC0414 -- the self-alias suppresses F811 for the pytest fixture parameter
++
++NOW = 1_800_000_000
++MODEL = 'claude-opus-5-5'
++
++
++def _pool(tmp_path, monkeypatch, kind):
++    from agent.credential_pool import PooledCredential
++    from hermes_cli.auth import write_credential_pool
++
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    monkeypatch.setenv('HERMES_SHARED_AUTH_DIR', str(tmp_path / 'shared'))
++    rows = []
++    for i in range(3):
++        row: dict[str, object] = dict(id=f'acct{i}', label=f'account{i}', source='manual:device_code', auth_type='oauth',
++                   access_token=f'sk-ant-oat01-fixture-{i}', refresh_token=f'fixture-refresh-{i}', priority=i)
++        if kind == 'walled' or (kind == 'serving' and i):
++            row['model_cooldowns'] = {MODEL: NOW + (i + 1) * 86400}
++        rows.append(PooledCredential.from_dict('anthropic', row).to_dict())
++    write_credential_pool('anthropic', rows if kind != 'empty' else [])
++
++
++def _false_wall(conn, tid, model):
++    task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++    assert task is not None
++    conn.execute('UPDATE tasks SET worker_pid=? WHERE id=?', (71001, tid))
++    concrete = not model.startswith('class:')
++    kb._append_event(conn, tid, 'run_route', {'model': model, 'provider': 'anthropic' if concrete else None,
++                     'source': 'pin' if concrete else 'class', 'tier_reason': 'default', 'lane': 'ready'},
++                     run_id=task.current_run_id)
++    reset = NOW + 5 * 86400
++    kb._append_event(conn, tid, 'worker_result', {
++        'pid': 71001, 'claim_lock': task.claim_lock, 'exit_code': 75,
++        'last_output': f'SubscriptionQuotaUnavailable: anthropic/{MODEL}; resets at {reset}',
++        'failure_reason': 'rate_limit', 'failure_retryable': True, 'failure_resets_at': float(reset),
++        'route_provider': 'anthropic', 'route_model': MODEL}, run_id=task.current_run_id)
++    conn.commit()
++    dispatch._record_worker_exit(71001, 75 << 8)
++    dispatch.detect_crashed_workers(conn)
++    assert kb.get_task(conn, tid).status == 'ready'
++    return reset
++
++
++@pytest.mark.parametrize('model', [MODEL, 'class:deep'])
++@pytest.mark.parametrize('kind,provider_wall,held', [
++    ('serving', False, False),  # worker-3: the provider-wide file held only openai-codex
++    ('serving', True, True),    # a standing provider-wide wall is independent evidence
++    ('walled', False, True),
++    ('empty', False, True),     # an empty or unreadable pool proves nothing
++])
++def test_hinted_episode_wall_holds_only_while_the_live_pool_confirms_it(
++        board, tmp_path, monkeypatch, model, kind, provider_wall, held):
++    from hermes_cli import kanban_provider_walls as pw
++
++    monkeypatch.setattr(kb.time, 'time', lambda: NOW)
++    _pool(tmp_path, monkeypatch, kind)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='false wall', assignee='a')
++        reset = _false_wall(conn, tid, model)
++        state = quota.episode(conn, tid)
++        assert state is not None
++        assert state['hinted'] and state['providers'] == ['anthropic'] and state['until'] == reset
++        pw.walls_path().write_text(json.dumps({'openai-codex': NOW + 6 * 86400,
++                                               **({'anthropic': reset} if provider_wall else {})}))
++        if held:
++            assert quota.hold_until(conn, tid) == reset
++            assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        else:
++            assert quota.hold_until(conn, tid) is None
++            assert not quota.active(conn, tid)
++            assert dispatch.check_respawn_guard(conn, tid) is None
+-- 
+2.43.0
+

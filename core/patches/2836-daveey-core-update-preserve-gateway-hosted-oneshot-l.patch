@@ -1,0 +1,709 @@
+From e055b76f94e6db73c6c17fb60f6df370f2823c7d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:00:18 +0000
+Subject: [PATCH] [daveey] core update: preserve gateway-hosted oneshot/lane
+ chat turns (park finite local turns, mid-tool cancel, one-shot redial,
+ update_pausable)
+
+---
+ gateway/run_shutdown_restart_wait.py          |   6 +-
+ gateway/session_update_pause.py               |   3 +
+ gateway/session_update_pause_hook.py          |  76 ++++++++-
+ gateway/session_update_pause_ingress.py       |  12 +-
+ hermes_cli/gateway_chat.py                    |   6 +-
+ hermes_cli/gateway_chat_view.py               |  59 ++++++-
+ .../test_update_pausable_active_work.py       |  51 ++++++
+ tests/gateway/test_update_pause_composed.py   | 158 +++++++++++++++++-
+ tests/gateway/test_update_pause_ingress.py    |   4 +-
+ .../test_gateway_chat_view_redial.py          | 103 ++++++++++++
+ 10 files changed, 467 insertions(+), 11 deletions(-)
+ create mode 100644 tests/gateway/test_update_pausable_active_work.py
+ create mode 100644 tests/hermes_cli/test_gateway_chat_view_redial.py
+
+diff --git a/gateway/run_shutdown_restart_wait.py b/gateway/run_shutdown_restart_wait.py
+index 431d7557ca..a9d824ac7a 100644
+--- a/gateway/run_shutdown_restart_wait.py
++++ b/gateway/run_shutdown_restart_wait.py
+@@ -142,11 +142,15 @@ class GatewayRestartWaitMixin:
+             agent = state.turn.agent
+             if agent is None:
+                 continue
+-            unit: dict = {"kind": "chat", "session": key, "pid": os.getpid()}
++            unit: dict = {"kind": "chat", "session": key, "pid": os.getpid(), "update_pausable": False}
+             if state.turn.started_ts:
+                 unit["elapsed_s"] = round(now - state.turn.started_ts, 1)
+             if agent is not _AGENT_PENDING_SENTINEL:
+                 unit["model"] = getattr(agent, "model", None)
++                # [daveey] A turn under the core-update pause hook parks on a durable checkpoint when an update
++                # requests a pause, then auto-continues: the updater pauses it instead of waiting for a gap.
++                from gateway.session_update_pause_hook import update_pausable
++                unit["update_pausable"] = update_pausable(agent)
+                 summary_fn = getattr(agent, "get_activity_summary", None)
+                 if callable(summary_fn):
+                     with suppress(Exception):
+diff --git a/gateway/session_update_pause.py b/gateway/session_update_pause.py
+index 901401e370..79579868a3 100644
+--- a/gateway/session_update_pause.py
++++ b/gateway/session_update_pause.py
+@@ -104,6 +104,9 @@ async def resume_checkpoint(authority, ref, live, first):
+         authority._stamp_claim(ref, live, row)
+         from gateway.session_runtime_workers import persist_work_count
+         persist_work_count(authority)
++        # [daveey] The gateway twin of the Desktop sweep's line: hub checks grep it per session.
++        logging.getLogger(__name__).info('Update pause: auto-continue scheduled for gateway session=%s '
++                                         'admission=%s', ref.session_id, row.get('admission_id'))
+         return row
+ 
+     try:
+diff --git a/gateway/session_update_pause_hook.py b/gateway/session_update_pause_hook.py
+index 856698fc49..a6188fd39c 100644
+--- a/gateway/session_update_pause_hook.py
++++ b/gateway/session_update_pause_hook.py
+@@ -6,17 +6,30 @@ scope, so they are never parked and keep counting as active work. The hook share
+ rules (``hermes_cli.admission_fence``) and reason (``PAUSE_REASON``) and only fires at the agent's existing
+ completed-tool step boundary (``agent.turn_iteration_prep._step_boundary_pause``). A user Stop/new message
+ or a pending steer always wins.
++
++[daveey] A turn inside one long tool call (a reviewer chat waiting on a test run) never reaches that
++boundary, so its pause could not land before the instant update's cap. As Desktop turns do
++(``tui_gateway.update_pause.start_mid_tool_cancel``), an installed hook also runs a watcher that, once a
++requested pause has waited ``MID_TOOL_GRACE_S`` on a running call, cancels it through the agent's
++mid-tool cancel (``agent.update_pause_cancel``): the call's result becomes the stamped
++``[interrupted by Hermes update ...]`` text and the turn parks at the boundary right after it.
+ """
+ from __future__ import annotations
+ 
++import _thread
+ import contextvars
++import logging
++import threading
++import time
+ from contextlib import contextmanager
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Callable, Iterator
+ 
+ _HOOK_ATTR = "step_boundary_pause"
++_PAUSABLE_ATTR = "_update_pause_installed"
+ _MISSING = object()
++logger = logging.getLogger(__name__)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -77,6 +90,52 @@ def boundary_hook(agent: Any, root: Path) -> Callable[[], str | None]:
+     return hook
+ 
+ 
++def mid_tool_cancel_step(agent: Any, root: Path, state: dict) -> list[str] | None:
++    """One poll of ``start_mid_tool_cancel``: the cancelled call ids once a requested pause has waited
++    ``MID_TOOL_GRACE_S`` on a running call (from the later of the request's first sighting and the
++    call's start), else None. Never while a Stop or steer is pending: the boundary would not pause then,
++    and the cut call's stamped result would only mislead the turn that goes on."""
++    from agent import update_pause_cancel
++    from hermes_cli import admission_fence
++    from tui_gateway.update_pause import MID_TOOL_GRACE_S, interrupted_tool_result
++    if not admission_fence.pause_requested(root):
++        state.clear()  # a later request starts its own grace (and may cancel again)
++        return None
++    if state.get("cancelled") or stop_or_steer_pending(agent):
++        return None  # one cancel per request: the turn pauses at the next boundary
++    now = time.monotonic()
++    seen = state.setdefault("seen", now)
++    running = update_pause_cancel.in_flight(agent)
++    if not running or now - max(seen, max(running.values())) < MID_TOOL_GRACE_S:
++        return None
++    cancelled = update_pause_cancel.cancel(agent, interrupted_tool_result())
++    if cancelled:
++        state["cancelled"] = True
++        logger.info("core-update pause: gateway session %s cancelled %d running tool call(s) after %.0fs for a "
++                    "Hermes update: %s", getattr(agent, "session_id", "?"), len(cancelled), MID_TOOL_GRACE_S,
++                    ", ".join(cancelled))
++    return cancelled
++
++
++def start_mid_tool_cancel(agent: Any, root: Path) -> Callable[[], None]:
++    """Per-turn daemon (one fence stat per ``MID_TOOL_POLL_S``); returns its stop."""
++    from tui_gateway.update_pause import MID_TOOL_POLL_S
++    stop = threading.Event()
++
++    def run() -> None:
++        state: dict = {}
++        while not stop.wait(MID_TOOL_POLL_S):
++            try:
++                mid_tool_cancel_step(agent, root, state)
++            except Exception:  # health: allow BLE001 -- a failed poll never ends the turn; the next one retries
++                logger.debug("core-update mid-tool cancel poll failed", exc_info=True)
++
++    # The low-level primitive, as the Desktop watcher: a harness that runs turn threads inline patches
++    # threading.Thread, and an inline watcher would block the turn forever.
++    _thread.start_new_thread(run, ())
++    return stop.set
++
++
+ @contextmanager
+ def installed(agent: Any, scope: UpdatePauseScope | None = None, *,
+               message_id: Any = _MISSING) -> Iterator[bool]:
+@@ -90,16 +149,31 @@ def installed(agent: Any, scope: UpdatePauseScope | None = None, *,
+         yield False
+         return
+     prior = vars(agent).get(_HOOK_ATTR, _MISSING)
+-    setattr(agent, _HOOK_ATTR, boundary_hook(agent, fence_root(scope.home)))
++    root = fence_root(scope.home)
++    setattr(agent, _HOOK_ATTR, boundary_hook(agent, root))
++    vars(agent)[_PAUSABLE_ATTR] = True
++    stop_watcher = start_mid_tool_cancel(agent, root)
+     try:
+         yield True
+     finally:
++        stop_watcher()
++        vars(agent).pop(_PAUSABLE_ATTR, None)
+         if prior is _MISSING:
+             vars(agent).pop(_HOOK_ATTR, None)
+         else:
+             setattr(agent, _HOOK_ATTR, prior)
+ 
+ 
++def update_pausable(agent: Any) -> bool:
++    """[daveey] Whether ``agent`` runs a turn under an installed pause hook, i.e. a core-update pause request
++    parks it on a durable checkpoint (``active_work`` publishes it as ``update_pausable`` so the updater asks
++    it to pause instead of waiting for a gap). Unknown objects are not pausable (fail closed)."""
++    try:
++        return vars(agent).get(_PAUSABLE_ATTR) is True
++    except TypeError:
++        return False
++
++
+ def is_paused(result: Any) -> bool:
+     # The agent stamps the hook's reason (``PAUSE_REASON``); any other value is not our pause.
+     from tui_gateway.update_pause import PAUSE_REASON
+diff --git a/gateway/session_update_pause_ingress.py b/gateway/session_update_pause_ingress.py
+index 6f7db01aa8..89dc880faf 100644
+--- a/gateway/session_update_pause_ingress.py
++++ b/gateway/session_update_pause_ingress.py
+@@ -4,17 +4,23 @@ from dataclasses import replace
+ 
+ 
+ def supported(authority, row, event, live, *, is_api):
+-    """Only a claimed native messaging or local chat turn can be checkpointed. API, finite and
++    """Only a claimed native messaging or local chat turn can be checkpointed. API and
+     producer-admitted automation have other result contracts and keep counting as active work.
+     Native notices retain their presentation traits on resume, but must pass current ingress
+     authorization again; a formerly internal wake is never a license to bypass Stop or policy.
++
++    [daveey] A finite local turn (``chat -q`` / ``-z``: the hub's ``oneshot`` reviewer chats) parks too:
++    its admission keeps the finite flags, so the resumed run is finite again, and its viewer redials
++    the restarted owner for the same admission's settlement (``gateway_chat_view``). Unparkable, it
++    refused every instant checkpoint for as long as it ran (hermes-hub 2026-11-12 15:09-15:40Z).
+     """
+     payload = row['payload']
+-    if is_api or payload.get('finite') is True:
++    local = getattr(getattr(live.source, 'platform', None), 'value', None) == 'local'
++    if is_api or (payload.get('finite') is True and not local):
+         return False
+     if any(key in payload for key in ('api_turn_v1', 'local_automation_v1')):
+         return False
+-    return 'native_text_v1' in payload or getattr(live.source.platform, 'value', None) == 'local'
++    return 'native_text_v1' in payload or local
+ 
+ 
+ @contextmanager
+diff --git a/hermes_cli/gateway_chat.py b/hermes_cli/gateway_chat.py
+index 964d40ded1..8cff3ca838 100644
+--- a/hermes_cli/gateway_chat.py
++++ b/hermes_cli/gateway_chat.py
+@@ -169,7 +169,8 @@ async def run_gateway_chat(args, emitter=None):
+     # Finite: answer one prompt and exit (-z, --oneshot, -Q, stream-json, or -q off a TTY).
+     oneshot = bool(oneshot_prompt or getattr(args, "oneshot_exit", False) or quiet or
+                    (query and not (sys.stdin.isatty() and sys.stdout.isatty())))
+-    async with connect_gateway() as client:
++    async with contextlib.AsyncExitStack() as connections:
++        client = await connections.enter_async_context(connect_gateway())
+         description = await client.rpc("runtime.describe")
+         title = continue_title(args)
+         create_if_missing = bool(title and getattr(args, "create_if_missing", False))
+@@ -235,6 +236,9 @@ async def run_gateway_chat(args, emitter=None):
+         view.launch_api_key = getattr(args, "api_key", None)  # /new keeps this launch's key
+         view.unattended = isinstance(oneshot_prompt, str)
+         view.resume_footer = oneshot and not quiet
++        # [daveey] A core update restarting the owner parks a finite turn and continues it on the next owner:
++        # the one-shot wait redials it (``GatewayChatView._redial``). Each dial is closed on exit.
++        view.reconnect = lambda: connections.enter_async_context(connect_gateway())
+         if (getattr(args, "resume", None) or title or latest) and not quiet:
+             from agent.context_compressor import MODEL_ONLY_DISPLAY_METADATA_KEY
+             for row in snapshot.get("messages", []):
+diff --git a/hermes_cli/gateway_chat_view.py b/hermes_cli/gateway_chat_view.py
+index e9ea49802b..89d1f95a1f 100644
+--- a/hermes_cli/gateway_chat_view.py
++++ b/hermes_cli/gateway_chat_view.py
+@@ -3,6 +3,7 @@ import asyncio
+ from contextlib import suppress
+ import logging
+ import sys
++from typing import Any, Awaitable, Callable
+ import uuid
+ 
+ from hermes_cli.gateway_client import GatewayClientError
+@@ -11,6 +12,11 @@ logger = logging.getLogger(__name__)
+ 
+ 
+ _PREVIEW_CHARS = 80
++# [daveey] ``_redial``: a core update restarts the hub gateway in ~90-110 s; a finite run waits this long
++# per hang-up for the replacement owner, polling every REDIAL_RETRY_S, at most REDIAL_LIMIT hang-ups.
++REDIAL_WINDOW_S = 600.0
++REDIAL_RETRY_S = 2.0
++REDIAL_LIMIT = 5
+ 
+ 
+ def _pending_preview(text):
+@@ -123,6 +129,11 @@ class GatewayChatView:
+         self._composer = None
+         # `/undo` puts the removed message back in the composer for the next prompt.
+         self.prefill = ""
++        # A finite run's redial after its owner hung up (``_redial``): ``reconnect()`` opens a fresh
++        # connection (set by ``run_gateway_chat``); None never redials.
++        self.reconnect: Callable[[], Awaitable[Any]] | None = None
++        self.redials = 0
++        self._renderer: asyncio.Task | None = None
+ 
+     def unknown_admissions(self):
+         return [row["admission_id"] for row in self.pending if row["status"] == "unknown"]
+@@ -201,6 +212,48 @@ class GatewayChatView:
+                 await self._recover(admission, sid)
+             self.changed.set()  # after its own turn settled: a control it lists may end a one-shot's wait
+ 
++    async def _redial(self):
++        """[daveey] A finite run whose owner hung up dials the replacement and re-attaches as after a replay
++        gap. A core update restarts the gateway under a running ``chat -q`` / ``-z``: the owner parks its turn
++        on a durable checkpoint and the next owner continues the same admission, so the view waits for that
++        admission's live completion, its settled receipt, or (an owner that could not park it) its unknown
++        outcome, instead of exiting on a turn that is still running. Only a hang-up (``DISCONNECTED``) of
++        a view that can dial (``reconnect``) redials, at most ``REDIAL_LIMIT`` times, each within
++        ``REDIAL_WINDOW_S`` of the hang-up; anything else keeps the old exit."""
++        from hermes_cli.gateway_client import DISCONNECTED
++        if (self.reconnect is None or self.redials >= REDIAL_LIMIT
++                or not isinstance(self.failure, GatewayClientError) or str(self.failure) != DISCONNECTED):
++            return False
++        self.redials += 1
++        loop = asyncio.get_running_loop()
++        deadline = loop.time() + REDIAL_WINDOW_S
++        while True:
++            try:
++                client = await self.reconnect()
++                break
++            except (GatewayClientError, OSError, TimeoutError) as exc:  # restarting: not ready yet
++                if loop.time() >= deadline:
++                    logger.debug("gateway redial gave up: %s", exc)
++                    return False
++                await asyncio.sleep(REDIAL_RETRY_S)
++        renderer = self._renderer
++        if renderer is not None:
++            renderer.cancel()
++            with suppress(asyncio.CancelledError):
++                await renderer
++        self.client, self.failure = client, None
++        self.failed.clear()
++        self._renderer = asyncio.create_task(self.render())
++        await self._reattach()
++        return self.failure is None
++
++    async def _redial_or_raise(self):
++        """The one-shot wait's failure: redialled (``_redial``), or raised as before."""
++        failure = self.failure
++        assert failure is not None  # called only once the wait saw a failure
++        if not await self._redial():
++            raise self.failure or failure
++
+     async def _recover(self, admission, sid):
+         """Queued: it lost nothing. Running: cut until its live completion. Unknown: its completion was the
+         one lost, so an own turn settles as unknown now. Unlisted: it ended in the hole."""
+@@ -544,7 +597,7 @@ class GatewayChatView:
+             return self._detach(f"Your message was not sent. To continue, run `hermes sessions discard "
+                                 f"{self.session_id} --yes`, or resume this session in an interactive chat "
+                                 "and /discard the paused turn there; then send it again.")
+-        renderer = asyncio.create_task(self.render())
++        renderer = self._renderer = asyncio.create_task(self.render())
+         try:
+             receipt = await self.submit(query) if query else None
+             if oneshot:
+@@ -560,7 +613,8 @@ class GatewayChatView:
+                 while admission not in self.completions:
+                     self.changed.clear()
+                     if self.failure:
+-                        raise self.failure
++                        await self._redial_or_raise()
++                        continue
+                     blocked = self._finite_block(admission)
+                     if blocked:
+                         return self._detach(blocked)
+@@ -627,6 +681,7 @@ class GatewayChatView:
+                         print(f"Error: {exc}", file=sys.stderr)
+                 raise self.failure
+         finally:
++            renderer = self._renderer
+             renderer.cancel()
+             with suppress(asyncio.CancelledError):
+                 await renderer
+diff --git a/tests/gateway/test_update_pausable_active_work.py b/tests/gateway/test_update_pausable_active_work.py
+new file mode 100644
+index 0000000000..5181e97ef3
+--- /dev/null
++++ b/tests/gateway/test_update_pausable_active_work.py
+@@ -0,0 +1,51 @@
++"""[daveey] ``active_work`` names which gateway chat turns a core-update pause request parks.
++
++A turn running under the gateway's update-pause hook (an eligible local/native admission: lanes and `oneshot`
++reviewer chats included) parks on a durable checkpoint and auto-continues after the restart, so the updater can
++pause it instead of waiting for a gap (hermes-sync ``instant_checkpoint_blockers``). Everything else stays
++``update_pausable: False`` (fail closed): a pending agent, an API/automation turn, an unknown object.
++"""
++import types
++
++from gateway.run import GatewayRunner
++from gateway.session_update_pause_hook import bind_scope, installed, update_pausable
++
++
++class _Agent:
++    model = "m"
++
++    def get_activity_summary(self):
++        return {"current_tool": "terminal", "seconds_since_activity": 1.0}
++
++
++def _runner(sessions):
++    runner = object.__new__(GatewayRunner)
++    runner._sessions_map = lambda: sessions
++    runner._running_agents = {}
++    runner.session_authorities = []
++    runner.adapters = {}
++    runner._active_api_run_count = lambda: 0
++    runner._active_deferred_agent_worker_count = lambda: 0
++    return runner
++
++
++def _state(agent):
++    return types.SimpleNamespace(turn=types.SimpleNamespace(agent=agent, started_ts=None))
++
++
++def test_only_a_turn_under_the_installed_hook_is_published_pausable(tmp_path, monkeypatch):
++    from gateway.run import _AGENT_PENDING_SENTINEL
++    monkeypatch.setattr("gateway.session_update_pause_hook.start_mid_tool_cancel", lambda agent, root: lambda: None)
++    pausable, plain = _Agent(), _Agent()
++    runner = _runner({"agent:main:local:dm:a": _state(pausable), "agent:main:local:dm:b": _state(plain),
++                      "agent:main:local:dm:c": _state(_AGENT_PENDING_SENTINEL)})
++    with bind_scope(tmp_path, eligible=True), installed(pausable) as on:
++        assert on and update_pausable(pausable) and not update_pausable(plain)
++        units = {u["session"]: u for u in runner._describe_active_work() if u["kind"] == "chat"}
++        assert units["agent:main:local:dm:a"]["update_pausable"] is True
++        assert units["agent:main:local:dm:b"]["update_pausable"] is False
++        assert units["agent:main:local:dm:c"]["update_pausable"] is False
++    assert not update_pausable(pausable)  # the turn ended: no longer parkable
++    with bind_scope(tmp_path, eligible=False), installed(plain) as on:
++        assert not on and not update_pausable(plain)
++    assert update_pausable(object()) is False and update_pausable(None) is False
+diff --git a/tests/gateway/test_update_pause_composed.py b/tests/gateway/test_update_pause_composed.py
+index ee09962021..b62cd536ba 100644
+--- a/tests/gateway/test_update_pause_composed.py
++++ b/tests/gateway/test_update_pause_composed.py
+@@ -15,7 +15,13 @@ from tests.agent.test_step_boundary_pause import _final_response, _make_agent, _
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_local_admission_real_agent_parks_and_resumes_without_tool_replay(tmp_path, monkeypatch):
++@pytest.mark.parametrize('extra', [
++    {},
++    # [daveey] A `chat -q` / `-z` turn (the hub's `oneshot` reviewer chats): parked like any local turn, and
++    # its continuation stays finite (unattended) on the same admission its redialling viewer awaits.
++    {'finite': True, 'unattended': True},
++], ids=['interactive', 'finite'])
++async def test_local_admission_real_agent_parks_and_resumes_without_tool_replay(tmp_path, monkeypatch, extra):
+     from gateway.config import GatewayConfig
+     from gateway.run import GatewayRunner
+     from gateway.run_turn_runner import TurnRunner
+@@ -71,7 +77,7 @@ async def test_local_admission_real_agent_parks_and_resumes_without_tool_replay(
+     monkeypatch.setattr('model_tools.handle_function_call', tool)
+     try:
+         receipt = await authority.submit(connection.actor, Submission(
+-            'composed-original', ref, {'text': 'do some tool work'}, 'queue'))
++            'composed-original', ref, {'text': 'do some tool work', **extra}, 'queue'))
+         await async_wait_until(started.is_set, timeout=15)
+         admission_fence.set_hold(home)
+         admission_fence.request_pause(home, expires_at=time.time() + 60)
+@@ -250,3 +256,151 @@ async def test_native_automation_real_agent_retains_quiet_traits_across_pause(tm
+                 task.cancel()
+         await asyncio.gather(*tasks, return_exceptions=True)
+         authority.db.close()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('restart', [False, True], ids=['same-owner', 'restarted-owner'])
++async def test_finite_local_turn_inside_a_long_tool_call_is_cancelled_parked_and_continued(tmp_path, monkeypatch,
++                                                                                           restart):
++    """[daveey] A `oneshot` reviewer chat waits minutes inside one tool call (a test run): it never reaches the
++    completed-tool boundary on its own, so its pause could not land within the instant update's cap. After
++    ``MID_TOOL_GRACE_S`` the gateway hook cancels the call (the Desktop rule), the result is the stamped
++    interrupted-by-update text, the turn parks and then continues on the same admission."""
++    import re
++    from gateway.config import GatewayConfig
++    from gateway.run import GatewayRunner
++    from gateway.run_turn_runner import TurnRunner
++    from gateway.session_authority import initialize_session_authority
++    from gateway.session_controls import AuthorityConnection
++    from gateway.session_contract import Submission
++    from gateway.session_local import create_local_session
++    from hermes_cli import admission_fence
++    from hermes_constants import get_process_hermes_home
++    from hermes_state_runtime import get_session_admission
++    from hermes_state_update_pause import get_session_checkpoint
++    from tests.waiting import async_wait_until
++    from tools.interrupt import is_interrupted
++    from tui_gateway import update_pause as up
++
++    monkeypatch.setattr(up, 'MID_TOOL_GRACE_S', 0.3)
++    monkeypatch.setattr(up, 'MID_TOOL_POLL_S', 0.05)
++    home = get_process_hermes_home()
++    runner = GatewayRunner(GatewayConfig())
++    authority = await initialize_session_authority(runner, profile_id='default', instance_id='composed-mid-tool')
++    owners = [authority]
++    connection = AuthorityConnection(authority, object(), {'user_id': 'owner'})
++    ref = create_local_session(authority, connection.actor, {
++        'request_id': 'composed-mid-tool', 'source': 'tui', 'cwd': str(tmp_path),
++        'model': 'test/model', 'toolsets': []})
++    await authority.attach(connection.actor, ref, history=False)
++    physical = authority.physical_target(ref)
++    started = threading.Event()
++    calls, provider_inputs, turns = [], [], []
++    agent = _make_agent([])
++    del agent._execute_tool_calls
++    agent.session_id, agent._session_db = physical, authority.db
++    agent._save_trajectory = lambda *a, **k: None
++    agent._cleanup_task_resources = lambda *a, **k: None
++
++    def provider(**kwargs):
++        provider_inputs.append(copy.deepcopy(kwargs['messages']))
++        return _tool_response(1) if len(provider_inputs) == 1 else _final_response()
++
++    agent.client.chat.completions.create.side_effect = provider
++
++    def tool(name, args, *a, **k):  # like a foreground test run: only an interrupt ends it early
++        calls.append(name)
++        started.set()
++        deadline = time.monotonic() + 20
++        while time.monotonic() < deadline:
++            if is_interrupted():
++                return 'partial'
++            time.sleep(0.02)
++        return 'finished on its own'
++
++    def allocate(turn, *a, **k):
++        turns.append(turn._ctx.persist_user_display_kind)
++        turn._ctx.agent_holder[0] = agent
++        return agent, len(turns) > 1
++
++    monkeypatch.setattr(TurnRunner, '_resolve_turn_agent', allocate)
++    monkeypatch.setattr(runner, '_resolve_session_agent_runtime', lambda **k: ('test/model', {}))
++    monkeypatch.setattr('model_tools.handle_function_call', tool)
++    try:
++        receipt = await authority.submit(connection.actor, Submission(
++            'composed-mid-tool', ref, {'text': 'run the tests', 'finite': True, 'unattended': True}, 'queue'))
++        await async_wait_until(started.is_set, timeout=15)
++        admission_fence.set_hold(home)
++        # The real checkpoint handler refuses while the turn runs and ACKs once it parked.
++        import json
++        import os
++        from types import SimpleNamespace
++        from unittest.mock import Mock
++        from gateway import update_checkpoint
++        (home / 'core-update').mkdir(parents=True, exist_ok=True)
++        (home / 'core-update/intent').write_text(json.dumps({
++            'pid': os.getpid(), 'kind': 'unfenced', 'checkpoint': True, 'created_at': time.time(),
++            'expires_at': time.time() + 120, 'nonce': 'episode-chat'}))
++        runner.request_restart = Mock(return_value=True)
++        monkeypatch.setattr(update_checkpoint, 'preserve_cron_slots', Mock())
++
++        def checkpoint():
++            return update_checkpoint.checkpoint_for_update(
++                runner, SimpleNamespace(call_soon_threadsafe=lambda callback: callback()), {'nonce': 'episode-chat'})
++
++        assert runner._active_work_count() >= 1
++        assert (await asyncio.to_thread(checkpoint))['pausing'] is False  # live, not yet parked
++        runner.request_restart.assert_not_called()
++        admission_fence.request_pause(home, expires_at=time.time() + 60)
++        await async_wait_until(lambda: bool(authority.update_parked), timeout=10)
++        assert runner._active_work_count() == 0
++        ack = await asyncio.to_thread(checkpoint)
++        assert ack['pausing'] is True and ack['checkpoint'] is True
++        runner.request_restart.assert_called_once()
++        assert get_session_checkpoint(authority.db, session_id=ref.session_id)['admission_id'] == receipt.admission_id
++        assert get_session_admission(authority.db, admission_id=receipt.admission_id)['status'] == 'started'
++        tool_rows = [m for m in authority.db.get_messages(physical) if m['role'] == 'tool']
++        assert len(tool_rows) == 1 and re.search(
++            r'\[interrupted by Hermes update at [0-9T:Z-]+: re-run if still needed\]', tool_rows[0]['content'])
++        assert 'partial' not in tool_rows[0]['content']
++        assert len(provider_inputs) == 1 and calls == ['web_search']
++
++        owner = authority
++        if restart:
++            # The update stops this owner (its parked waiter dies with it) and boots the new code on the same
++            # store: boot recovery must find the started checkpoint and continue the same admission.
++            old_tasks = [live.task for live in authority.sessions.values() if live.task]
++            for task in old_tasks:
++                task.cancel()
++            await asyncio.gather(*old_tasks, return_exceptions=True)
++            admission_fence.clear_hold(home)
++            admission_fence.clear_pause_request(home)
++            runner = GatewayRunner(GatewayConfig())  # the restarted process: a new runner on the same store
++            monkeypatch.setattr(runner, '_resolve_session_agent_runtime', lambda **k: ('test/model', {}))
++            owners.append(owner := await initialize_session_authority(
++                runner, profile_id='default', instance_id='composed-mid-tool-next'))
++            from gateway.session_authorities import owner_scope
++            from gateway.session_local_recovery import recover_local_sessions
++            with owner_scope(owner):  # the boot's recovery (``recover_gateway_native_sessions``)
++                recover_local_sessions(owner, schedule=True)
++            await async_wait_until(lambda: get_session_admission(
++                owner.db, admission_id=receipt.admission_id)['status'] == 'terminal', timeout=15)
++        else:
++            admission_fence.clear_hold(home)
++            admission_fence.clear_pause_request(home)
++            await asyncio.wait_for(owner.sessions[ref.session_id].task, 15)
++        after = get_session_admission(owner.db, admission_id=receipt.admission_id)
++        assert after['status'] == 'terminal' and after['outcome'] == 'completed'
++        assert turns == [None, 'auto_continue'] and calls == ['web_search'] and len(provider_inputs) == 2
++        assert get_session_checkpoint(owner.db, session_id=ref.session_id) is None
++    finally:
++        admission_fence.clear_hold(home)
++        admission_fence.clear_pause_request(home)
++        tasks = [live.task for each in owners for live in each.sessions.values() if live.task]
++        for task in tasks:
++            if not task.done():
++                task.cancel()
++        await asyncio.gather(*tasks, return_exceptions=True)
++        await connection.close()
++        for each in owners:
++            each.db.close()
+diff --git a/tests/gateway/test_update_pause_ingress.py b/tests/gateway/test_update_pause_ingress.py
+index f5c6d9e716..8c181bd8e3 100644
+--- a/tests/gateway/test_update_pause_ingress.py
++++ b/tests/gateway/test_update_pause_ingress.py
+@@ -194,7 +194,9 @@ async def test_native_admission_without_pause_is_unaffected_and_delivers_once(mo
+     ({'text': 'x'}, 'local', True),
+     ({'text': 'x'}, 'telegram', False),
+     ({'text': 'x'}, None, False),
+-    ({'native_text_v1': {}, 'finite': True}, 'local', False),
++    ({'text': 'x', 'finite': True}, 'local', True),  # `chat -q` / `-z` (oneshot): its viewer redials
++    ({'text': 'x', 'finite': True, 'unattended': True}, 'local', True),
++    ({'native_text_v1': {}, 'finite': True}, 'telegram', False),
+     ({'api_turn_v1': {}}, 'local', False),
+     ({'local_automation_v1': {}}, 'local', False),
+ ])
+diff --git a/tests/hermes_cli/test_gateway_chat_view_redial.py b/tests/hermes_cli/test_gateway_chat_view_redial.py
+new file mode 100644
+index 0000000000..d077b4713d
+--- /dev/null
++++ b/tests/hermes_cli/test_gateway_chat_view_redial.py
+@@ -0,0 +1,103 @@
++"""[daveey] A finite run (`chat -q` / `-z`, the hub's `oneshot` reviewer chats) outlives a core update.
++
++The update parks the turn on a durable checkpoint and restarts the gateway; the next owner continues the same
++admission. The view used to exit on the hang-up ("turn outcome is unknown") while its turn went on; it now
++dials the replacement and waits for that admission's live completion or settled receipt. Anything other than
++a hang-up, a view without a dialer, or a replacement that never comes keeps the old exit.
++"""
++import asyncio
++
++import pytest
++
++from hermes_cli import gateway_chat_view as gcv
++from hermes_cli.gateway_client import DISCONNECTED, GatewayClientError
++
++
++def _event(kind, payload, admission="a"):
++    return {"method": "event", "params": {"type": kind, "session_id": "s", "admission_id": admission,
++                                          "payload": payload}}
++
++
++class Life:
++    """One gateway process as the view sees it."""
++
++    def __init__(self, answer):
++        self.events, self.answer, self.calls = asyncio.Queue(), answer, []
++
++    async def rpc(self, method, **params):
++        self.calls.append(method)
++        return await self.answer(self, method, params)
++
++
++async def _first(life, method, params):
++    if method == "prompt.submit":
++        life.events.put_nowait(_event("message.delta", {"text": "Work"}))
++        life.events.put_nowait(GatewayClientError(DISCONNECTED))  # the update restarts the owner
++        return {"admission_id": "a", "status": "queued"}
++    raise AssertionError(method)
++
++
++def _view(first, dials):
++    view = gcv.GatewayChatView(Life(first), {"stored_session_id": "s"}, quiet=True)
++
++    async def reconnect():
++        nxt = dials.pop(0)
++        if isinstance(nxt, Exception):
++            raise nxt
++        return nxt
++    view.reconnect = reconnect
++    return view
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("live", [True, False], ids=["completes-live", "settled-before-redial"])
++async def test_oneshot_redials_the_restarted_owner_and_prints_the_continued_answer(capsys, monkeypatch, live):
++    monkeypatch.setattr(gcv, "REDIAL_RETRY_S", 0.01)
++
++    async def second(life, method, params):
++        if method == "session.resume":
++            if live:  # parked, continued by the new owner: its completion follows on this socket
++                life.events.put_nowait(_event("message.complete", {"text": "Work done", "outcome": "completed"}))
++                return {"pending": [{"admission_id": "a", "status": "started"}], "prompts": []}
++            return {"pending": [], "prompts": []}  # ended before this dial: its receipt settles it
++        if method == "prompt.receipt":
++            return {"admission_id": "a", "status": "terminal", "outcome": "completed",
++                    "result": {"final_response": "Work done", "completed": True}}
++        raise AssertionError(method)
++
++    replacement = Life(second)
++    view = _view(_first, [ConnectionRefusedError("starting"), replacement])
++    assert await asyncio.wait_for(view.run("review the PR", oneshot=True), 10) == 0
++    assert view.redials == 1 and "session.resume" in replacement.calls
++    assert "Work done" in capsys.readouterr().out
++
++
++@pytest.mark.asyncio
++async def test_oneshot_without_a_dialer_or_past_the_window_keeps_the_unknown_exit(monkeypatch):
++    monkeypatch.setattr(gcv, "REDIAL_RETRY_S", 0.01)
++    monkeypatch.setattr(gcv, "REDIAL_WINDOW_S", 0.05)
++    view = _view(_first, [])
++    view.reconnect = None
++    with pytest.raises(GatewayClientError, match="outcome is unknown"):
++        await asyncio.wait_for(view.run("q", oneshot=True), 5)
++    assert view.redials == 0
++
++    never = _view(_first, [ConnectionRefusedError("down")] * 1000)
++    with pytest.raises(GatewayClientError, match="outcome is unknown"):
++        await asyncio.wait_for(never.run("q", oneshot=True), 5)
++    assert never.redials == 1
++
++
++@pytest.mark.asyncio
++async def test_a_refusal_that_is_not_a_hang_up_never_redials():
++    async def refused(life, method, params):
++        if method == "prompt.submit":
++            life.events.put_nowait(GatewayClientError("session_replay_gap"))
++            return {"admission_id": "a", "status": "queued"}
++        raise AssertionError(method)
++
++    dials = []
++    view = _view(refused, dials)
++    with pytest.raises(GatewayClientError, match="session_replay_gap"):
++        await asyncio.wait_for(view.run("q", oneshot=True), 5)
++    assert view.redials == 0
+-- 
+2.43.0
+

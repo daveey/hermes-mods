@@ -1,0 +1,57 @@
+From ca144ace464993dfa9bcfeb7a8b118b6b56b1b74 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:57:32 +0000
+Subject: [PATCH] [daveey] test(admission): hold the lock on an event in the
+ reserve/extend timeout test
+
+The test held admission.lock for a fixed 1.5 s and required each default (50 ms) reserve/extend
+to return within 0.5 s. A CPU-throttled runner stalled the caller 0.79 s (run 43203457679), and a
+longer stall could also let the 1.5 s hold lapse before the short tries ran. The holder now keeps
+the lock until an Event is set, the short-try bound is 5 s (the regression it guards is
+admission_lock's 10 s wait; the holder keeps the lock up to 20 s), and a timer releases the lock
+while the longer-timeout caller waits.
+
+Repro: SIGSTOP/SIGCONT duty cycle (50 ms on / 800 ms off) on the pytest process failed 3/6 on
+base with the CI signature; 0/10 with this change. Mutations (default timeout 10 s; reserve
+ignoring timeout) both still fail the test.
+---
+ tests/hermes_cli/test_admission_fence.py | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/tests/hermes_cli/test_admission_fence.py b/tests/hermes_cli/test_admission_fence.py
+index 003f779605..ae07026371 100644
+--- a/tests/hermes_cli/test_admission_fence.py
++++ b/tests/hermes_cli/test_admission_fence.py
+@@ -400,14 +400,25 @@ def test_reserve_and_extend_default_to_one_short_try_and_accept_a_longer_timeout
+     """[daveey] N3: callers holding the session-map lock keep the 50 ms default; lock-free callers (cron) may wait."""
+     import time
+ 
+-    child = _spawn_lock_holder(tmp_path, 1.5)
++    # Held until ``finish`` is set, not for a fixed time: a CPU-starved runner must not see the lock
++    # drop before the short tries run, nor have the short tries measured against a sub-second bound.
++    ctx = multiprocessing.get_context("spawn")
++    ready, finish = ctx.Event(), ctx.Event()
++    child = ctx.Process(target=_lock_child, args=(tmp_path, ready, finish))
++    child.start()
++    release = threading.Timer(0.3, finish.set)
+     try:
++        assert ready.wait(20)
+         for fn in (af.reserve, af.extend):
+             started = time.monotonic()
+             with pytest.raises(af.AdmissionBusy):
+                 fn(tmp_path)
+-            assert time.monotonic() - started < 0.5
+-        af.reserve(tmp_path, timeout=10).close()
+-        af.extend(tmp_path, timeout=10).close()
++            # One short try, not admission_lock's 10 s wait (the holder keeps the lock up to 20 s).
++            assert time.monotonic() - started < 5
++        release.start()  # the holder lets go while the longer-timeout caller waits
++        af.reserve(tmp_path, timeout=60).close()
++        af.extend(tmp_path, timeout=60).close()
+     finally:
++        release.cancel()
++        finish.set()
+         _reap(child)
+-- 
+2.43.0
+

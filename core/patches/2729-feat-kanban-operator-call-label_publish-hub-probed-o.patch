@@ -1,0 +1,1235 @@
+From 0fbc311e320b175986edbfd5c4e937e635cc1c3d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:03:58 +0000
+Subject: [PATCH] =?UTF-8?q?feat(kanban):=20operator=20call=20label=5Fpubli?=
+ =?UTF-8?q?sh=20=E2=80=94=20hub-probed,=20one=20atomic=20Board=20labels=5F?=
+ =?UTF-8?q?add=20[t=5F01a1cefefcad176a]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+kanban_supervisor_request(ops=[{op:'operator', action:'label_publish', machine, labels, proof:{kind:'hub_probe'}}])
+asks the hub to ADD skill:/capability: labels to one machine's Board registry entry.
+
+- Executor: the hub (the gateway holding ~/.config/hermes-mail/admin.key). Workers never read the key or run an
+  admin command; a non-hub gateway never takes a label_publish call, and a hub without the key refuses
+  no_admin_key.
+- Proof: the hub takes no claimed result. It re-runs its own probe of the machine
+  (~/.local/share/hermes-worker-skills/bin/label-probe <machine>, the instance-role SSM read) and publishes a
+  label only if that probe proves it (skill in the complete inventory, capability proof ok=true). One unproven
+  label refuses the whole call bad_proof; an absent/failed probe fails it proof_unavailable.
+- Labels: add-only delta, skill:/capability: only; machine:* and every other namespace refused (label_refused),
+  re-validated on the hub.
+- Write: ONE `hermes-mail admin machine <m> --add-labels` (Board labels_add, hermes-hub 3ddfe728a8 / client
+  1.3.12). The Board applies the delta to the stored set inside its Durable Object transaction, so a concurrent
+  writer's labels are never dropped and there is no client-side compare-and-set loop (three exact-head reviews
+  found lost-write races in the earlier client CAS/repair loop; that loop is gone). A pre-read skips the write
+  when every label is present (already_applied) and refuses unknown_machine / too_many_labels; the call is
+  applied only when the Board's answer holds the whole delta, else failed.
+- Result channel: operator_call_result on the requester's own card through the Board, accepted only when the
+  Board vouches origin_gateway == hub (a self-written result is ignored).
+- Probe + admin calls run in one background job thread (operator_label_jobs row; stale/dying jobs bounded,
+  JOB_STALE_S 900 > worst 330 s; delivery backs off to ~12 h inside the 24 h deadline); every call logged in
+  operator_calls (new target_machine column).
+---
+ hermes_cli/kanban_operator_call.py            |  62 ++-
+ hermes_cli/kanban_operator_labels.py          | 456 ++++++++++++++++
+ tests/hermes_cli/test_kanban_operator_call.py |   4 +-
+ .../hermes_cli/test_kanban_operator_labels.py | 489 ++++++++++++++++++
+ tools/kanban_tools_schemas.py                 |  15 +-
+ 5 files changed, 1006 insertions(+), 20 deletions(-)
+ create mode 100644 hermes_cli/kanban_operator_labels.py
+ create mode 100644 tests/hermes_cli/test_kanban_operator_labels.py
+
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index 52904d954a..3dbaac0526 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -13,8 +13,10 @@ on a card another gateway created refuse ``foreign_card``. This module is the su
+    ordinary functions on its live file and appends ``operator_call_result`` on the target card.
+ 3. Request side again (:func:`poll`): finds that result in the replica, finishes the request and wakes the caller.
+ 
+-Only comment, move and unblock exist. complete / archive / link / unlink / block / edit of a foreign card stay with
+-its owner and are refused; so is any second op or a card the op does not name. No Board admin key is read here.
++Only comment, move and unblock of a card exist, plus ``label_publish`` of a machine (``kanban_operator_labels``: the
++hub executes it with its Board admin key, after re-running its own probe of that machine, and answers on the
++requester's card). complete / archive / link / unlink / block / edit of a foreign card stay with its owner and are
++refused; so is any second op or a card the op does not name. No Board admin key is read here.
+ Every call, accepted or refused, is logged in ``operator_calls`` on the gateway that saw it.
+ """
+ from __future__ import annotations
+@@ -33,9 +35,10 @@ from typing import Any, Iterator, Optional
+ _log = logging.getLogger(__name__)
+ 
+ OP = "operator"
+-ACTIONS = ("comment", "move", "unblock")
++CARD_ACTIONS = ("comment", "move", "unblock")
++LABEL_PUBLISH = "label_publish"  # names a machine, not a card (kanban_operator_labels)
++ACTIONS = (*CARD_ACTIONS, LABEL_PUBLISH)
+ OWNER_ONLY = ("complete", "archive", "link", "unlink", "block", "edit", "assign", "delete", "reclaim")
+-DEFERRED = ("label_publish",)
+ REQUEST_KIND = "operator_call_requested"
+ RESULT_KIND = "operator_call_result"
+ REFUSED_KIND = "operator_call_refused"
+@@ -91,8 +94,11 @@ def _err(code: str, message: str):
+ 
+ 
+ def ensure_schema(conn: sqlite3.Connection) -> None:
+-    for stmt in _SCHEMA:
++    from hermes_cli import kanban_operator_labels as kol
++    for stmt in (*_SCHEMA, *kol.SCHEMA):
+         conn.execute(stmt)
++    if "target_machine" not in {r[1] for r in conn.execute("PRAGMA table_info(operator_calls)")}:
++        conn.execute("ALTER TABLE operator_calls ADD COLUMN target_machine TEXT")
+ 
+ 
+ def _has_log(conn: sqlite3.Connection) -> bool:
+@@ -111,8 +117,9 @@ def normalize_op(i: int, op: dict) -> dict:
+     if action in OWNER_ONLY:
+         raise _err("operator_action_refused", f"op {i}: {action} of another gateway's card stays with its owner; "
+                    f"the operator call only does {', '.join(ACTIONS)}")
+-    if action in DEFERRED:
+-        raise _err("operator_action_refused", f"op {i}: {action} is not available through the operator call yet")
++    if action == LABEL_PUBLISH:
++        from hermes_cli import kanban_operator_labels as kol
++        return kol.normalize(i, op)
+     if action not in ACTIONS:
+         raise _err("operator_action_refused", f"op {i}: action must be one of {', '.join(ACTIONS)}")
+     task_id = str(op.get("task_id") or "").strip()
+@@ -146,6 +153,8 @@ def normalize_op(i: int, op: dict) -> dict:
+ 
+ 
+ def label(op: dict) -> str:
++    if op.get("action") == LABEL_PUBLISH:
++        return f"operator {LABEL_PUBLISH} {op.get('machine')} {','.join(op.get('labels') or [])}"
+     return f"operator {op.get('action')} {op.get('task_id')}"
+ 
+ 
+@@ -212,15 +221,16 @@ def log(conn: sqlite3.Connection, *, request_uid: str, side: str, outcome: str,
+     conn.execute(
+         "INSERT INTO operator_calls (request_uid, side, board, action, target_task_id, caller_gateway, "
+         "caller_task_id, caller_run_id, caller_run_uid, caller_profile, caller_host, executor_gateway, args_digest, "
+-        "request_event_uid, outcome, detail, supervisor_request_id, created_at, finished_at) "
+-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(request_uid, side) DO UPDATE SET "
++        "request_event_uid, outcome, detail, supervisor_request_id, created_at, finished_at, target_machine) "
++        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(request_uid, side) DO UPDATE SET "
+         "outcome=excluded.outcome, detail=COALESCE(excluded.detail, detail), "
+         "request_event_uid=COALESCE(excluded.request_event_uid, request_event_uid), "
+         "executor_gateway=COALESCE(excluded.executor_gateway, executor_gateway), finished_at=excluded.finished_at",
+         (request_uid, side, board, op.get("action"), op.get("task_id"), caller.get("gateway"),
+          caller.get("task_id"), caller.get("run_id"), caller.get("run_uid"), caller.get("profile"),
+          caller.get("host"), executor_gateway, _digest(op) if op else None, request_event_uid, outcome,
+-         (detail or None) and str(detail)[:500], supervisor_request_id, now, now if finished else None))
++         (detail or None) and str(detail)[:500], supervisor_request_id, now, now if finished else None,
++         op.get("machine")))
+ 
+ 
+ def _caller_here(conn: sqlite3.Connection, task: Optional[str], run: Optional[int]) -> dict:
+@@ -244,7 +254,8 @@ def log_submit_refusal(conn: sqlite3.Connection, *, env_task: Optional[str], env
+     except ValueError:
+         run = None
+     op = next((o for o in raw_ops if isinstance(o, dict) and o.get("op") == OP), {}) if isinstance(raw_ops, list) else {}
+-    op = {"action": str(op.get("action") or "")[:40], "task_id": str(op.get("task_id") or "")[:64]}
++    op = {"action": str(op.get("action") or "")[:40], "task_id": str(op.get("task_id") or "")[:64],
++          "machine": str(op.get("machine") or "")[:64] or None}
+     try:
+         with kb.write_txn(conn):
+             caller = _caller_here(conn, env_task, run)
+@@ -285,6 +296,12 @@ def _rate_refusal(conn: sqlite3.Connection, requester: str) -> Optional[str]:
+ def preflight_op(conn: sqlite3.Connection, requester: str, op: dict) -> dict:
+     from hermes_cli import kanban_capability_routing as kcr
+     from hermes_cli import kanban_db as kb
++    if op.get("action") == LABEL_PUBLISH:
++        from hermes_cli import kanban_operator_labels as kol
++        synced = _synced(conn)
++        own = _own_gateway(conn) if synced else None
++        return kol.preflight(conn, requester, op, own=own, synced=synced,
++                             rate=_rate_refusal(conn, requester) if own else None)
+     target = op["task_id"]
+     verdict = {**op}
+ 
+@@ -359,7 +376,7 @@ def start(conn: sqlite3.Connection, req: dict, executor: str) -> str:
+                                                            "detail": verdict.get("reason")}],
+                 error=verdict.get("reason"))
+         return "rejected"
+-    payload = {"request_uid": uid, "board": board, "action": op["action"], "target_task_id": op["task_id"],
++    payload = {"request_uid": uid, "board": board, "action": op["action"], "target_task_id": op.get("task_id"),
+                "args": {k: v for k, v in op.items() if k not in ("op", "action", "task_id")},
+                "caller": caller, "requested_at": int(time.time()), "supervisor_request_id": req["id"],
+                "home": verdict.get("home")}
+@@ -464,7 +481,9 @@ def poll(conn: sqlite3.Connection, executor: str, *, now: Optional[int] = None)
+         if req is None:
+             continue
+         state, op = req["result"], req["ops"][0]
+-        res = _result_for(conn, op["task_id"], state["request_uid"], state.get("home"), _board_slug(conn))
++        # A card action is answered on its target card; label_publish (a machine) on the requester's own card.
++        answered_on = op.get("task_id") or req["requester_task_id"]
++        res = _result_for(conn, answered_on, state["request_uid"], state.get("home"), _board_slug(conn))
+         if res is _RETRY:
+             res = None
+         if res is None and now < int(state.get("deadline") or 0):
+@@ -668,6 +687,7 @@ def _scan_start(conn: sqlite3.Connection, board: str, rep: sqlite3.Connection) -
+ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+     """Home side, each dispatcher tick: execute calls naming this gateway's own cards. Returns (uid, outcome)."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_operator_labels as kol
+     own = _own_gateway(conn)
+     if not own:
+         return []
+@@ -677,7 +697,9 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+         if rep is None:
+             return []
+         if not _has_log(conn) or not conn.execute(
+-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_call_scan'").fetchone():
++                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_call_scan'").fetchone() \
++                or not conn.execute(
++                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_label_jobs'").fetchone():
+             with kb.write_txn(conn):
+                 ensure_schema(conn)
+         last = _scan_start(conn, board, rep)
+@@ -692,7 +714,12 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+             except ValueError:
+                 continue
+             uid, target = payload.get("request_uid"), payload.get("target_task_id")
+-            if not uid or not target or not _is_home(conn, own, target):
++            labels = payload.get("action") == LABEL_PUBLISH
++            if labels:
++                # A machine has no home card: the call names its executor, and only that gateway takes it.
++                if not uid or own != kol.HOME or payload.get("home") != own:
++                    continue
++            elif not uid or not target or not _is_home(conn, own, target):
+                 continue
+             if conn.execute("SELECT 1 FROM operator_calls WHERE request_uid = ? AND side = 'execute'",
+                             (uid,)).fetchone():
+@@ -706,6 +733,9 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+             if retry:
+                 hi = eid - 1
+                 break
++            if labels:
++                done.append((uid, kol.handle(conn, own, event, payload, refusal)))
++                continue
+             outcome, _detail = _execute_one(conn, payload, own, refusal)
+             done.append((uid, outcome))
+         stored = conn.execute("SELECT last_id, last_uid FROM operator_call_scan WHERE board = ?",
+@@ -722,6 +752,8 @@ def apply_incoming(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+                              "ON CONFLICT(board) DO UPDATE SET last_id = excluded.last_id, "
+                              "last_uid = excluded.last_uid", (board, new, anchor))
+             _PERSISTED[key] = time.time()
++    if own == kol.HOME:
++        kol.tick(conn, own, board)  # start queued label jobs, answer finished ones on the requesters' cards
+     return done
+ 
+ 
+diff --git a/hermes_cli/kanban_operator_labels.py b/hermes_cli/kanban_operator_labels.py
+new file mode 100644
+index 0000000000..0253ce74dc
+--- /dev/null
++++ b/hermes_cli/kanban_operator_labels.py
+@@ -0,0 +1,456 @@
++"""Operator call ``label_publish``: a worker asks the hub to ADD skill:/capability: labels to one machine. [daveey]
++
++``kanban_supervisor_request(ops=[{"op": "operator", "action": "label_publish", "machine": "worker-3",
++"labels": ["capability:hub-read"], "proof": {"kind": "hub_probe"}}])``. It rides the operator call's request event
++(``kanban_operator_call``), with three differences:
++
++* **Executor.** The target is a machine, not a card, so the call's home is :data:`HOME`, the gateway that holds the
++  Board admin key (``~/.config/hermes-mail/admin.key``). The requester never reads that key or runs an admin command;
++  a home without the key refuses ``no_admin_key``.
++* **Proof.** The requester names the proof kind; the hub does not trust any claim in it. For ``hub_probe`` the hub
++  re-runs its own probe against that machine (:data:`PROBE_COMMAND <machine>`, the instance-role SSM read the
++  skill-refresh timer uses) and publishes a label only when the probe proves it: ``skill:X`` must be in the
++  machine's complete skill inventory, ``capability:X`` must have ``{"ok": true}`` in the probe's proofs. Anything
++  unproven refuses the whole call ``bad_proof``. The probe prints one JSON object ``{"machine": <name>,
++  "complete": true, "skills": ["skill:..."], "proofs": {"capability:...": {"ok": bool, "detail": str}}}``; a
++  missing probe, a non-zero exit or unparseable output fails the call ``proof_unavailable`` and publishes nothing.
++* **Result channel.** The hub writes ``operator_call_result`` on the REQUESTER's card through the Board (a single
++  row op), so the requester's poll finds it there, vouched by the Board's ``origin_gateway``, and finishes the request
++  as for the card actions.
++
++The registry write is one atomic DELTA, never a whole-set replace: ``labels_add`` (hermes-hub 3ddfe728a8, client
++1.3.12) makes the Board add the labels to the stored set inside its Durable Object, in the transaction that reads it,
++so a concurrent writer's labels are never dropped and the client runs no compare-and-set loop. The delta only adds;
++``machine:*`` and every other namespace are refused.
++
++The probe and the admin calls take seconds to minutes, so they run in one background thread per process
++(:func:`tick` starts it, a row in ``operator_label_jobs`` is its state, a stale row is retried); the dispatcher tick
++only queues, starts and delivers. Every call is logged in ``operator_calls`` like the card actions.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import re
++import sqlite3
++import subprocess
++import sys
++import threading
++import time
++import uuid
++from contextlib import contextmanager
++from pathlib import Path
++from typing import Any, Callable, Iterator, Optional
++
++_log = logging.getLogger(__name__)
++
++ACTION = "label_publish"
++HOME = "hub"  # the Board gateway name of the hub (cards it creates carry created_on = "hub")
++PROOF_KINDS = ("hub_probe",)
++FIELDS = {"machine", "labels", "proof"}
++NAMESPACES = ("skill:", "capability:")
++LABEL_RE = re.compile(r"(skill|capability):[a-z0-9][a-z0-9._-]*")
++LABEL_MAX_CHARS = 64  # the Board's LABEL_RE length
++MACHINE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
++MAX_LABELS_PER_CALL = 16
++BOARD_MAX_LABELS = 32  # the Board's MAX_LABELS (worker/src/mailbox.ts), machine:<name> not counted
++PROBE_TIMEOUT_S = 240
++ADMIN_TIMEOUT_S = 45
++ADMIN_CALLS_PER_JOB = 2  # one registry read, one labels_add
++# Well above the worst job: the probe plus its admin calls (240 + 2 * 45 = 330 s).
++JOB_STALE_S = 900
++MAX_JOB_ATTEMPTS = 3
++MAX_DELIVERY_ATTEMPTS = 20
++DELIVERY_FREE_RETRIES = 3  # then back off 60 s doubling to 1 h: 20 attempts span ~13 h, inside the 24 h deadline
++DELIVERY_BACKOFF_CAP_S = 3600
++MAX_DELIVERIES_PER_TICK = 10
++PROBE_COMMAND = "~/.local/share/hermes-worker-skills/bin/label-probe"  # hermes-state; absent = proof_unavailable
++MAIL = "~/.local/share/hermes-mail/hermes_mail.py"
++ADMIN_KEY = "~/.config/hermes-mail/admin.key"
++LOCK_NAME = "operator-label-publish.lock"
++
++SCHEMA = (
++    """CREATE TABLE IF NOT EXISTS operator_label_jobs (
++        request_uid TEXT PRIMARY KEY,
++        board TEXT,
++        machine TEXT NOT NULL,
++        labels TEXT NOT NULL,
++        caller TEXT,
++        result_task_id TEXT NOT NULL,
++        state TEXT NOT NULL,
++        attempts INTEGER NOT NULL DEFAULT 0,
++        started_at INTEGER,
++        outcome TEXT,
++        detail TEXT,
++        labels_after TEXT,
++        event_uid TEXT,
++        delivered_at INTEGER,
++        delivery_attempts INTEGER NOT NULL DEFAULT 0,
++        last_delivery_at INTEGER,
++        last_error TEXT,
++        supervisor_request_id INTEGER,
++        created_at INTEGER NOT NULL)""",
++)
++
++_THREAD: dict = {}  # "t" -> the running job thread of this process
++
++
++def _err(code: str, message: str):
++    from hermes_cli.kanban_supervisor_requests import SupervisorRequestError
++    return SupervisorRequestError(code, message)
++
++
++# --- validation (both sides) ---------------------------------------------------------------------
++
++def check_labels(raw: Any) -> list[str]:
++    """The add-only delta, sorted and unique; ``ValueError`` names the first label it refuses."""
++    if not isinstance(raw, list) or not raw:
++        raise ValueError("labels must be a non-empty list")
++    if len(raw) > MAX_LABELS_PER_CALL:
++        raise ValueError(f"at most {MAX_LABELS_PER_CALL} labels per call")
++    out = set()
++    for lab in raw:
++        lab = str(lab or "").strip() if isinstance(lab, str) else ""
++        if lab.startswith("machine:"):
++            raise ValueError(f"{lab}: machine:* labels are never published (the Board sets a machine's own)")
++        if not lab.startswith(NAMESPACES):
++            raise ValueError(f"{lab or '<empty>'}: only skill:* and capability:* labels can be published")
++        if len(lab) > LABEL_MAX_CHARS or not LABEL_RE.fullmatch(lab):
++            raise ValueError(f"{lab}: not a valid label")
++        out.add(lab)
++    return sorted(out)
++
++
++def check_machine(raw: Any) -> str:
++    machine = str(raw or "").strip() if isinstance(raw, str) else ""
++    if not MACHINE_RE.fullmatch(machine):
++        raise ValueError("machine must be a Board gateway name")
++    return machine
++
++
++def check_proof(raw: Any) -> dict:
++    if not isinstance(raw, dict) or raw.get("kind") not in PROOF_KINDS or set(raw) - {"kind"}:
++        raise ValueError(f"proof must be {{'kind': {' | '.join(repr(k) for k in PROOF_KINDS)}}}: the hub re-runs "
++                         "its own probe against the machine; it takes no claimed result")
++    return {"kind": raw["kind"]}
++
++
++def normalize(i: int, op: dict) -> dict:
++    extra = set(op) - {"op", "action"} - FIELDS
++    if extra:
++        raise _err("invalid_ops", f"op {i}: label_publish takes only machine, labels and proof (it names a machine, "
++                   f"not a card); unexpected {', '.join(sorted(extra))}")
++    try:
++        machine = check_machine(op.get("machine"))
++    except ValueError as exc:
++        raise _err("invalid_ops", f"op {i}: {exc}") from None
++    try:
++        labels = check_labels(op.get("labels"))
++    except ValueError as exc:
++        raise _err("label_refused", f"op {i}: {exc}") from None
++    try:
++        proof = check_proof(op.get("proof"))
++    except ValueError as exc:
++        raise _err("bad_proof", f"op {i}: {exc}") from None
++    return {"op": "operator", "action": ACTION, "machine": machine, "labels": labels, "proof": proof}
++
++
++def preflight(conn: sqlite3.Connection, requester: str, op: dict, *, own: Optional[str], synced: bool,
++              rate: Optional[str]) -> dict:
++    verdict = {**op}
++    if not synced or not own:
++        return {**verdict, "verdict": "refused", "code": "not_synced",
++                "reason": "this board does not sync to the Board, so the hub cannot be asked"}
++    if rate:
++        return {**verdict, "verdict": "refused", "code": "rate_limited", "reason": rate}
++    return {**verdict, "verdict": "supervisor", "home": HOME}
++
++
++# --- seams (tests replace these) -----------------------------------------------------------------
++
++def _admin_key_present() -> bool:
++    return Path(ADMIN_KEY).expanduser().is_file()
++
++
++def _run(argv: list[str], timeout: float) -> str:
++    from tools.environments.local import build_subprocess_env
++    out = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", timeout=timeout, check=False,
++                         stdin=subprocess.DEVNULL, env=build_subprocess_env())
++    if out.returncode != 0:
++        raise RuntimeError(f"{Path(argv[1] if len(argv) > 1 else argv[0]).name} exited {out.returncode}: "
++                           f"{(out.stderr or out.stdout).strip()[-300:]}")
++    return out.stdout
++
++
++def _admin(*args: str) -> dict:
++    """``hermes_mail.py admin <args>`` (the Board admin key; hub only)."""
++    return json.loads(_run([sys.executable, str(Path(MAIL).expanduser()), "admin", *args], ADMIN_TIMEOUT_S))
++
++
++def _probe(machine: str) -> dict:
++    """The hub's own probe of ``machine``: ``{machine, complete, skills: [...], proofs: {label: {ok, detail}}}``."""
++    cmd = Path(PROBE_COMMAND).expanduser()
++    if not cmd.is_file():
++        raise FileNotFoundError(f"no probe at {PROBE_COMMAND}")
++    return json.loads(_run([sys.executable, str(cmd), machine], PROBE_TIMEOUT_S))
++
++
++def _push_event(conn: sqlite3.Connection, board: str, own: str, task_id: str, event_uid: str,
++                payload: dict) -> tuple[str, str]:
++    """Write one ``operator_call_result`` event on ``task_id`` (another gateway's card) through the Board.
++
++    Returns ``(status, detail)``; status is the Board's per-op answer (``applied``/``merged``/``rejected``)."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_operator_call as kox
++    from hermes_cli import kanban_sync_client as ksc
++    with kb.write_txn(conn):
++        hlc = ksc._next_hlc(conn, own)
++    op = {"client_op_id": uuid.uuid4().hex, "op": "upsert", "table": "task_events", "uid": event_uid, "hlc": hlc,
++          "fields": {"task_id": task_id, "kind": kox.RESULT_KIND, "payload": json.dumps(payload, sort_keys=True),
++                     "created_at": int(time.time())}}
++    res = (ksc.Hub(ksc.load_identity()).ops(board, [op]).get("results") or [{}])[0]
++    return str(res.get("status") or ""), f"{res.get('reason') or ''}: {res.get('detail') or ''}".strip(": ")
++
++
++def _start(fn: Callable[[], None]) -> Optional[threading.Thread]:
++    from agent.memory_provider import spawn_context_thread
++    t = spawn_context_thread(fn, name="kanban-label-publish")
++    t.start()
++    return t
++
++
++@contextmanager
++def _lock(conn: sqlite3.Connection) -> Iterator[None]:
++    """Host-wide: one label job at a time across the gateway and CLI drains (the hub is Linux)."""
++    import fcntl
++    from hermes_cli import kanban_operator_call as kox
++    path = Path(kox._db_path(conn) or ".").parent / LOCK_NAME
++    with open(path, "ab") as fh:
++        fcntl.flock(fh, fcntl.LOCK_EX)
++        try:
++            yield
++        finally:
++            fcntl.flock(fh, fcntl.LOCK_UN)
++
++
++# --- proof ---------------------------------------------------------------------------------------
++
++def verify(machine: str, labels: list[str], probe: Any) -> Optional[str]:
++    """None when the hub's probe proves every label, else why not."""
++    if not isinstance(probe, dict) or probe.get("machine") != machine:
++        return f"the probe did not answer for {machine}"
++    skills = probe.get("skills") if probe.get("complete") is True else None
++    skills = set(skills) if isinstance(skills, list) else None
++    proofs = probe.get("proofs") if isinstance(probe.get("proofs"), dict) else {}
++    unproven = []
++    for lab in labels:
++        if lab.startswith("skill:"):
++            if skills is None or lab not in skills:
++                unproven.append(f"{lab} (not in {machine}'s {'complete ' if skills is None else ''}skill inventory)")
++        else:
++            res = proofs.get(lab)
++            res = res if isinstance(res, dict) else {}
++            if res.get("ok") is not True:
++                why = res.get("detail")
++                unproven.append(f"{lab} ({'probe failed: ' + str(why)[:120] if why else 'no probe proves it'})")
++    return "; ".join(unproven) if unproven else None
++
++
++# --- atomic delta --------------------------------------------------------------------------------
++
++def _own(row: Any, machine: str) -> Optional[set]:
++    """A registry row's labels without the implicit ``machine:<name>``; None when the row is not this machine."""
++    if not isinstance(row, dict) or row.get("name") != machine or not isinstance(row.get("labels"), list):
++        return None
++    return {x for x in row["labels"] if isinstance(x, str) and x != f"machine:{machine}"}
++
++
++def _current(machine: str) -> Optional[set]:
++    rows = [g for g in (_admin("machines").get("gateways") or []) if isinstance(g, dict)
++            and g.get("name") == machine and g.get("state") == "active"]
++    return _own(rows[0], machine) if rows else None
++
++
++def publish(machine: str, delta: list[str]) -> tuple[str, str, Optional[list[str]]]:
++    """Add ``delta`` to ``machine``'s registry labels: ``(outcome, detail, labels_after)``.
++
++    One ``labels_add`` write (``hermes-mail admin machine <name> --add-labels``, client 1.3.12+). The Board applies
++    the delta to the stored set inside its Durable Object, in the same storage transaction that reads it, so a
++    concurrent writer's labels are never dropped and there is no client-side compare-and-set. The answer is the
++    resulting set; the call is ``applied`` only when it holds the whole delta (a later write may change it again,
++    which is that writer's decision, not a lost update). A read first skips the write (and its audit row) when every
++    label is already there, and refuses an unknown or retired machine and a delta past the Board's label cap; the
++    Board re-checks both inside the write."""
++    want = set(delta)
++    cur = _current(machine)
++    if cur is None:
++        return "refused", f"unknown_machine: no active gateway {machine} in the Board registry", None
++    if want <= cur:
++        return "already_applied", "", sorted(cur)
++    if len(cur | want) > BOARD_MAX_LABELS:
++        return "refused", f"too_many_labels: {len(cur | want)} exceed the Board cap of {BOARD_MAX_LABELS}", None
++    after = _own(_admin("machine", machine, "--add-labels", ",".join(sorted(want))), machine)
++    if after is None:
++        return "failed", f"the Board's answer to the labels_add on {machine} carries no label set", None
++    if not want <= after:
++        return "failed", (f"the Board's answer to the labels_add on {machine} lacks {sorted(want - after)}: is the "
++                          "Board older than hermes-hub 3ddfe728a8 (labels_add)?"), None
++    return "applied", "", sorted(after)
++
++
++def execute(machine: str, labels: list[str]) -> tuple[str, str, Optional[list[str]]]:
++    """Hub side, in the job thread: prove, then publish."""
++    if not _admin_key_present():
++        return "refused", "no_admin_key: this gateway has no Board admin key, only the hub publishes labels", None
++    try:
++        probe = _probe(machine)
++    except Exception as exc:  # health: allow BLE001 -- an unreadable probe is an unproven label, never a publish
++        return "failed", f"proof_unavailable: {type(exc).__name__}: {str(exc)[:200]}", None
++    why = verify(machine, labels, probe)
++    if why:
++        return "refused", f"bad_proof: the hub's probe of {machine} does not prove {why}", None
++    try:
++        return publish(machine, labels)
++    except Exception as exc:  # health: allow BLE001 -- recorded as a failed call, never silent
++        _log.exception("kanban label_publish on %s failed", machine)
++        return "failed", f"{type(exc).__name__}: {str(exc)[:300]}", None
++
++
++# --- home side: queue, run, deliver --------------------------------------------------------------
++
++def handle(conn: sqlite3.Connection, own: str, event: dict, payload: dict, refusal: Optional[str]) -> str:
++    """Queue one proven call (or record its refusal) on the hub; :func:`tick` runs and answers it."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_operator_call as kox
++    uid, caller = payload["request_uid"], payload.get("caller") or {}
++    args = payload.get("args") or {}
++    machine, labels = str(args.get("machine") or "")[:64], []
++    if refusal is None:
++        try:
++            machine = check_machine(args.get("machine"))
++            labels = check_labels(args.get("labels"))
++            check_proof(args.get("proof"))
++        except ValueError as exc:
++            refusal = f"invalid: {exc}"
++    if refusal is None and not _admin_key_present():
++        refusal = "no_admin_key: this gateway has no Board admin key, only the hub publishes labels"
++    outcome = "refused" if refusal else "queued"
++    op = {"action": ACTION, "machine": machine, "labels": labels}
++    now = int(time.time())
++    with kb.write_txn(conn):
++        kox.log(conn, request_uid=uid, side="execute", outcome=outcome, op=op, caller=caller, detail=refusal,
++                board=payload.get("board"), executor_gateway=own,
++                supervisor_request_id=payload.get("supervisor_request_id"), finished=bool(refusal))
++        conn.execute(
++            "INSERT OR IGNORE INTO operator_label_jobs (request_uid, board, machine, labels, caller, result_task_id, "
++            "state, outcome, detail, event_uid, supervisor_request_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
++            (uid, payload.get("board"), machine, json.dumps(labels),
++             json.dumps({k: caller.get(k) for k in ("gateway", "task_id", "run_id")}), event["task_id"],
++             "done" if refusal else "queued", "refused" if refusal else None, refusal, str(uuid.uuid4()),
++             payload.get("supervisor_request_id"), now))
++    return outcome
++
++
++def _finish_job(conn: sqlite3.Connection, uid: str, attempt: int, outcome: str, detail: str,
++                after: Optional[list[str]]) -> None:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_operator_call as kox
++    with kb.write_txn(conn):
++        cur = conn.execute("UPDATE operator_label_jobs SET state='done', outcome=?, detail=?, labels_after=? "
++                           "WHERE request_uid=? AND state='running' AND attempts=?",
++                           (outcome, detail or None, json.dumps(after) if after is not None else None, uid, attempt))
++        if cur.rowcount == 1:
++            kox.log(conn, request_uid=uid, side="execute", outcome=outcome, detail=detail or None, finished=True)
++
++
++def _run_job(db_path: str, uid: str, attempt: int) -> None:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect
++    conn = connect(Path(db_path))
++    try:
++        with _lock(conn):
++            row = conn.execute("SELECT machine, labels, state, attempts FROM operator_label_jobs WHERE request_uid=?",
++                               (uid,)).fetchone()
++            if row is None or row[2] != "running" or int(row[3]) != attempt:
++                return
++            with kb.write_txn(conn):  # the stale clock starts once the lock is ours, not at the claim
++                conn.execute("UPDATE operator_label_jobs SET started_at=? WHERE request_uid=? AND attempts=?",
++                             (int(time.time()), uid, attempt))
++            outcome, detail, after = execute(row[0], json.loads(row[1]))
++            _finish_job(conn, uid, attempt, outcome, detail, after)
++            _log.info("kanban label_publish %s %s on %s: %s %s", uid, json.loads(row[1]), row[0], outcome, detail)
++    except Exception:  # health: allow BLE001 -- the row stays running; the stale sweep retries it
++        _log.exception("kanban label_publish job %s crashed", uid)
++    finally:
++        conn.close()
++
++
++def _claim(conn: sqlite3.Connection, now: int) -> Optional[tuple[str, int]]:
++    """Take the oldest queued (or stale running) job; a job that died :data:`MAX_JOB_ATTEMPTS` times fails."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_operator_call as kox
++    pick = ("SELECT request_uid, attempts FROM operator_label_jobs WHERE state='queued' OR "
++            "(state='running' AND started_at < ?) ORDER BY created_at LIMIT 1")
++    if conn.execute(pick, (now - JOB_STALE_S,)).fetchone() is None:
++        return None  # an idle hub costs no write per tick
++    with kb.write_txn(conn):
++        row = conn.execute(pick, (now - JOB_STALE_S,)).fetchone()
++        if row is None:
++            return None
++        uid, attempts = row[0], int(row[1])
++        if attempts >= MAX_JOB_ATTEMPTS:
++            detail = f"the label job stopped {attempts} times without an answer"
++            conn.execute("UPDATE operator_label_jobs SET state='done', outcome='failed', detail=? WHERE request_uid=?",
++                         (detail, uid))
++            kox.log(conn, request_uid=uid, side="execute", outcome="failed", detail=detail, finished=True)
++            return None
++        conn.execute("UPDATE operator_label_jobs SET state='running', attempts=?, started_at=? WHERE request_uid=?",
++                     (attempts + 1, now, uid))
++        return uid, attempts + 1
++
++
++def _delivery_due(tries: int, last: Optional[int], now: int) -> bool:
++    if tries < DELIVERY_FREE_RETRIES or last is None:
++        return True
++    return now - int(last) >= min(60 * 2 ** (tries - DELIVERY_FREE_RETRIES), DELIVERY_BACKOFF_CAP_S)
++
++
++def _deliver(conn: sqlite3.Connection, own: str, board: str, now: Optional[int] = None) -> int:
++    from hermes_cli import kanban_db as kb
++    now = int(time.time()) if now is None else now
++    rows = conn.execute("SELECT request_uid, board, machine, labels, caller, result_task_id, outcome, detail, "
++                        "labels_after, event_uid, delivery_attempts, last_delivery_at FROM operator_label_jobs "
++                        "WHERE state='done' AND delivered_at IS NULL ORDER BY created_at").fetchall()
++    rows = [r for r in rows if _delivery_due(int(r[10] or 0), r[11], now)][:MAX_DELIVERIES_PER_TICK]
++    sent = 0
++    for (uid, jboard, machine, labels, caller, task, outcome, detail, after, euid, tries, _last) in rows:
++        payload = {"request_uid": uid, "action": ACTION, "outcome": outcome, "detail": detail,
++                   "executor_gateway": own, "machine": machine, "labels": json.loads(labels or "[]"),
++                   "labels_after": json.loads(after) if after else None, "caller": json.loads(caller or "{}")}
++        try:
++            status, why = _push_event(conn, jboard or board, own, task, euid, payload)
++        except Exception as exc:  # health: allow BLE001 -- unreachable Board: retried next tick
++            status, why = "error", f"{type(exc).__name__}: {exc}"
++        done = status in ("applied", "merged") or (status == "rejected" and why.startswith("not_found")) \
++            or tries + 1 >= MAX_DELIVERY_ATTEMPTS
++        with kb.write_txn(conn):
++            conn.execute("UPDATE operator_label_jobs SET delivery_attempts=delivery_attempts+1, last_error=?, "
++                         "delivered_at=?, last_delivery_at=? WHERE request_uid=?",
++                         (None if status in ("applied", "merged") else why[:300], int(time.time()) if done else None,
++                          now, uid))
++        sent += status in ("applied", "merged")
++    return sent
++
++
++def tick(conn: sqlite3.Connection, own: str, board: str, *, now: Optional[int] = None) -> None:
++    """Each home dispatcher tick: start the next job (one per process at a time), deliver finished answers."""
++    from hermes_cli import kanban_operator_call as kox
++    now = int(time.time()) if now is None else now
++    alive = _THREAD.get("t")
++    if not (alive is not None and alive.is_alive()):
++        path = kox._db_path(conn)
++        claimed = _claim(conn, now) if path else None
++        if path and claimed is not None:
++            uid, attempt = claimed
++            _THREAD["t"] = _start(lambda: _run_job(path, uid, attempt))
++    _deliver(conn, own, board, now)
+diff --git a/tests/hermes_cli/test_kanban_operator_call.py b/tests/hermes_cli/test_kanban_operator_call.py
+index 187436ee3e..127986d0b7 100644
+--- a/tests/hermes_cli/test_kanban_operator_call.py
++++ b/tests/hermes_cli/test_kanban_operator_call.py
+@@ -216,10 +216,10 @@ def test_owner_only_ops_are_refused(fleet, action):
+     assert exc.value.code == "operator_action_refused"
+ 
+ 
+-def test_label_publish_is_not_offered_yet(fleet):
++def test_label_publish_needs_machine_labels_and_proof(fleet):
+     with pytest.raises(ksr.SupervisorRequestError) as exc:
+         _submit(fleet, {"op": "operator", "action": "label_publish", "task_id": fleet.target})
+-    assert exc.value.code == "operator_action_refused"
++    assert exc.value.code == "invalid_ops"
+ 
+ 
+ def test_only_one_named_card_per_call(fleet):
+diff --git a/tests/hermes_cli/test_kanban_operator_labels.py b/tests/hermes_cli/test_kanban_operator_labels.py
+new file mode 100644
+index 0000000000..b249fb33c9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_operator_labels.py
+@@ -0,0 +1,489 @@
++"""Operator call label_publish: a worker asks the hub to ADD proven skill:/capability: labels to a machine. [daveey]
++
++The two-gateway fleet of ``test_kanban_operator_call`` (worker-5 runs the caller card, ``hub`` is the label home)
++plus a fake Board machine registry (the admin CLI's ``machines`` read and the atomic ``machine --add-labels``
++delta), a fake hub probe, and a fake Board row op that lands the hub's answer on the requester's card in the
++replica, stamped as written by the hub.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_operator_call as kox
++from hermes_cli import kanban_operator_labels as kol
++from hermes_cli import kanban_supervisor_requests as ksr
++from tests.hermes_cli import test_kanban_operator_call as toc
++
++fleet = toc.fleet
++_submit, _round, _log = toc._submit, toc._round, toc._log
++_REAL_PROBE = kol._probe
++
++
++class Registry:
++    """The Board machine registry as the admin CLI sees it: ``--add-labels`` adds to the STORED set atomically (the
++    Durable Object reads, adds and writes in one transaction) and answers with the resulting row."""
++
++    def __init__(self):
++        self.labels = {"worker-3": {"linux", "profile:default", "skill:git", "capability:token-broker"}}
++        self.calls: list[tuple] = []
++        self.before_write = None  # (name) -> None: another writer whose write lands just before ours
++        self.after_write = None
++        self.answer = None  # (name, row) -> row: override the Board's answer
++
++    def write(self, name, labels):
++        self.labels[name] = set(labels)
++
++    def _row(self, n):
++        return {"name": n, "state": "active", "labels": sorted(self.labels[n] | {f"machine:{n}"})}
++
++    def admin(self, *args):
++        self.calls.append(args)
++        if args[0] == "machines":
++            return {"gateways": [self._row(n) for n in self.labels]}
++        assert args[0] == "machine" and args[2] == "--add-labels" and len(args) == 4, args
++        name, add = args[1], [x for x in args[3].split(",") if x]
++        if name not in self.labels:
++            raise RuntimeError("hermes_mail.py exited 1: no such gateway")
++        if self.before_write:
++            self.before_write(name)
++        self.labels[name] = self.labels[name] | set(add)  # the delta applies to the stored set, not our read
++        row = self._row(name)
++        if self.after_write:
++            self.after_write(name)
++        return self.answer(name, row) if self.answer else row
++
++    def writes(self):
++        return [c for c in self.calls if c[0] == "machine"]
++
++
++@pytest.fixture
++def hub(fleet, monkeypatch):
++    f = fleet
++    reg = Registry()
++    probes: list[str] = []
++    f.probe = {"complete": True, "skills": ["skill:git", "skill:pdf"],
++               "proofs": {"capability:hub-read": {"ok": True, "detail": "forced-command help"},
++                          "capability:ssh-mini": {"ok": False, "detail": "Permission denied (publickey)"}}}
++    f.push_down = False
++
++    def probe(machine):
++        probes.append(machine)
++        if isinstance(f.probe, Exception):
++            raise f.probe
++        return {"machine": machine, **f.probe}
++
++    def push(conn, board, own, task_id, event_uid, payload):
++        if f.push_down:
++            raise OSError("board unreachable")
++        with kb.write_txn(f.rep):  # the Board stores the row; the replica gets it from the feed
++            f.rep.execute("INSERT INTO task_events (task_id, kind, payload, created_at, uid) VALUES (?,?,?,?,?)",
++                          (task_id, kox.RESULT_KIND, json.dumps(payload), int(time.time()), event_uid))
++        f.origin[event_uid] = own
++        return "applied", ""
++
++    monkeypatch.setattr(kol, "_admin", reg.admin)
++    monkeypatch.setattr(kol, "_probe", probe)
++    monkeypatch.setattr(kol, "_push_event", push)
++    monkeypatch.setattr(kol, "_admin_key_present", lambda: True)
++    monkeypatch.setattr(kol, "_start", lambda fn: fn())  # the job thread, run inline
++    kol._THREAD.clear()
++    f.reg, f.probes = reg, probes
++    yield f
++
++
++def _op(**kw):
++    return {"op": "operator", "action": "label_publish", "machine": "worker-3", "labels": ["capability:hub-read"],
++            "proof": {"kind": "hub_probe"}, **kw}
++
++
++def _result(f, uid=None):
++    rows = f.rep.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                         (f.caller, kox.RESULT_KIND)).fetchall()
++    out = [json.loads(r[0]) for r in rows]
++    return [p for p in out if uid is None or p["request_uid"] == uid]
++
++
++def test_accepted_publish_adds_the_delta_and_answers_on_the_requesters_card(hub):
++    f = hub
++    out = _submit(f, _op(labels=["capability:hub-read", "skill:pdf"]))
++    assert out["ops"][0]["verdict"] == "supervisor" and out["ops"][0]["home"] == "hub", out
++    _round(f)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "done", (req["error"], req["result"])
++    assert req["result"][0]["outcome"] == "applied" and req["result"][0]["home"] == "hub"
++    # A delta: every label already there is kept, the two proven ones are added, machine:* is never written.
++    assert f.reg.labels["worker-3"] == {"linux", "profile:default", "skill:git", "capability:token-broker",
++                                        "capability:hub-read", "skill:pdf"}
++    assert all("machine:" not in w[3] for w in f.reg.writes())
++    assert f.probes == ["worker-3"]  # the hub re-ran its own probe
++    (res,) = _result(f)
++    assert res["executor_gateway"] == "hub" and res["outcome"] == "applied" and res["machine"] == "worker-3"
++    assert "skill:pdf" in res["labels_after"]
++    for side, conn in (("request", f.w), ("execute", f.h)):
++        (row,) = _log(conn, side)
++        assert (row["action"], row["target_machine"], row["caller_task_id"], row["outcome"]) == (
++            "label_publish", "worker-3", f.caller, "applied" if side == "execute" else "done"), dict(row)
++        assert row["finished_at"]
++
++
++def test_labels_already_there_are_already_applied_without_a_write(hub):
++    f = hub
++    out = _submit(f, _op(labels=["capability:hub-read"]))
++    f.reg.labels["worker-3"].add("capability:hub-read")
++    _round(f)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "done" and req["result"][0]["outcome"] == "already_applied"
++    assert f.reg.writes() == []
++
++
++@pytest.mark.parametrize("labels,why", [
++    (["machine:worker-3"], "machine:* labels are never published"),
++    (["capability:hub-read", "machine:hub"], "machine:* labels are never published"),
++    (["profile:default"], "only skill:* and capability:*"),
++    (["linux"], "only skill:* and capability:*"),
++    (["capability:Hub Read"], "not a valid label"),
++])
++def test_machine_and_other_namespaces_are_refused(hub, labels, why):
++    f = hub
++    with pytest.raises(ksr.SupervisorRequestError) as exc:
++        _submit(f, _op(labels=labels))
++    assert exc.value.code == "label_refused" and why in str(exc.value)
++    row = _log(f.w, "request")[0]
++    assert row["outcome"] == "refused" and row["target_machine"] == "worker-3"
++    _round(f)
++    assert f.reg.calls == [] and f.probes == []
++
++
++def test_home_revalidates_a_machine_label_smuggled_past_the_requester(hub):
++    """The hub never trusts the request's args: a machine:* label written straight into an event is refused."""
++    f = hub
++    out = _submit(f, _op())
++    ksr.drain(f.w)
++    with kb.write_txn(f.w):
++        row = f.w.execute("SELECT id, payload FROM task_events WHERE kind = ?", (kox.REQUEST_KIND,)).fetchone()
++        p = json.loads(row[1])
++        p["args"]["labels"] = ["machine:hub"]
++        f.w.execute("UPDATE task_events SET payload = ? WHERE id = ?", (json.dumps(p), row[0]))
++    f.board()
++    ksr.drain(f.h)
++    f.board()
++    ksr.drain(f.w)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "rejected" and "machine:* labels are never published" in req["error"]
++    assert f.reg.calls == [] and f.probes == []
++
++
++@pytest.mark.parametrize("proof", [None, {}, {"kind": "trust_me"}, {"kind": "hub_probe", "ok": True}, "hub_probe"])
++def test_malformed_proof_is_refused_at_submit(hub, proof):
++    with pytest.raises(ksr.SupervisorRequestError) as exc:
++        _submit(hub, _op(proof=proof))
++    assert exc.value.code == "bad_proof"
++
++
++@pytest.mark.parametrize("labels,why", [
++    (["capability:ssh-mini"], "probe failed: Permission denied"),
++    (["capability:core-ship"], "no probe proves it"),
++    (["skill:xlsx"], "not in worker-3's skill inventory"),
++    (["capability:hub-read", "skill:xlsx"], "skill:xlsx"),  # one unproven label refuses the whole call
++])
++def test_label_the_hub_probe_does_not_prove_is_refused_bad_proof(hub, labels, why):
++    f = hub
++    before = set(f.reg.labels["worker-3"])
++    out = _submit(f, _op(labels=labels))
++    _round(f)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "rejected" and "bad_proof" in req["error"] and why in req["error"], req["error"]
++    assert f.reg.writes() == [] and f.reg.labels["worker-3"] == before
++    assert _log(f.h, "execute")[0]["outcome"] == "refused"
++
++
++def test_incomplete_inventory_or_another_machines_probe_proves_nothing(hub):
++    f = hub
++    f.probe = {**f.probe, "complete": False}
++    out = _submit(f, _op(labels=["skill:pdf"]))
++    _round(f)
++    assert "bad_proof" in ksr.get_request(f.w, out["request_id"])["error"]
++    f.probe = {**f.probe, "complete": True, "machine": "worker-9"}  # answers for the wrong machine
++    out = _submit(f, _op(labels=["capability:hub-read"]))
++    _round(f)
++    assert "did not answer for worker-3" in ksr.get_request(f.w, out["request_id"])["error"]
++    assert f.reg.writes() == []
++
++
++def test_unreadable_probe_fails_without_publishing(hub):
++    f = hub
++    f.probe = TimeoutError("SSM inventory timed out")
++    out = _submit(f, _op())
++    _round(f)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "failed" and "proof_unavailable" in req["error"]
++    assert f.reg.writes() == []
++
++
++def test_hub_without_the_probe_installed_fails_closed(hub, monkeypatch, tmp_path):
++    f = hub
++    monkeypatch.setattr(kol, "_probe", _REAL_PROBE)
++    monkeypatch.setattr(kol, "PROBE_COMMAND", str(tmp_path / "no-such-probe"))
++    out = _submit(f, _op())
++    _round(f)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "failed" and "proof_unavailable: FileNotFoundError" in req["error"]
++    assert f.reg.writes() == []
++
++
++def test_concurrent_writer_label_survives_the_delta(hub):
++    """The CAS-conflict case: another writer adds a label between the hub's read and its write. The Board adds the
++    delta to the stored set, so that label survives, in ONE write and with no client-side compare-and-set."""
++    f = hub
++    f.reg.before_write = lambda name: f.reg.write(name, f.reg.labels[name] | {"capability:tailnet-exec"})
++    out = _submit(f, _op())
++    _round(f)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "done" and req["result"][0]["outcome"] == "applied", req
++    assert {"capability:hub-read", "capability:tailnet-exec", "linux"} <= f.reg.labels["worker-3"]
++    assert f.reg.writes() == [("machine", "worker-3", "--add-labels", "capability:hub-read")]
++    (res,) = _result(f)
++    assert "capability:tailnet-exec" in res["labels_after"] and "machine:worker-3" not in res["labels_after"]
++
++
++def test_concurrent_removal_is_kept_not_undone(hub):
++    """A writer that removes an unrelated label before our write keeps its removal: the delta never re-adds what it
++    read (a whole-set replace would have)."""
++    f = hub
++    f.reg.before_write = lambda name: f.reg.write(name, f.reg.labels[name] - {"skill:git"})
++    out = _submit(f, _op())
++    _round(f)
++    assert ksr.get_request(f.w, out["request_id"])["status"] == "done"
++    assert "capability:hub-read" in f.reg.labels["worker-3"] and "skill:git" not in f.reg.labels["worker-3"]
++
++
++def test_delta_is_sent_as_labels_add_only(hub):
++    f = hub
++    out = _submit(f, _op(labels=["skill:pdf", "capability:hub-read"]))
++    _round(f)
++    assert ksr.get_request(f.w, out["request_id"])["status"] == "done"
++    assert f.reg.writes() == [("machine", "worker-3", "--add-labels", "capability:hub-read,skill:pdf")]
++    assert not any("--labels" in c for c in f.reg.calls)
++
++
++def test_board_answer_without_the_delta_is_a_failure_not_applied(hub):
++    """A Board that predates labels_add (or a later writer racing the answer) returns a set without the delta: the
++    call fails and says so, it never reports applied."""
++    f = hub
++    f.reg.answer = lambda name, row: {**row, "labels": [x for x in row["labels"] if x != "capability:hub-read"]}
++    out = _submit(f, _op())
++    _round(f)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "failed" and "lacks ['capability:hub-read']" in req["error"], req
++    (res,) = _result(f)
++    assert res["outcome"] == "failed" and res["labels_after"] is None
++
++
++def test_board_answer_without_a_label_set_is_a_failure(hub):
++    f = hub
++    f.reg.answer = lambda name, row: {"error": "boom"}
++    out = _submit(f, _op())
++    _round(f)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "failed" and "carries no label set" in req["error"], req
++
++
++def test_delta_past_the_board_label_cap_is_refused_without_a_write(hub):
++    f = hub
++    f.reg.labels["worker-3"] |= {f"skill:s{i}" for i in range(kol.BOARD_MAX_LABELS - 4)}
++    out = _submit(f, _op())
++    _round(f)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "rejected" and "too_many_labels" in req["error"], req
++    assert f.reg.writes() == []
++
++
++def test_delivery_backs_off_after_the_free_retries():
++    now = 10_000
++    assert all(kol._delivery_due(t, now - 1, now) for t in range(kol.DELIVERY_FREE_RETRIES))
++    assert not kol._delivery_due(kol.DELIVERY_FREE_RETRIES, now - 59, now)
++    assert kol._delivery_due(kol.DELIVERY_FREE_RETRIES, now - 60, now)
++    assert not kol._delivery_due(kol.DELIVERY_FREE_RETRIES + 2, now - 239, now)
++    assert not kol._delivery_due(kol.MAX_DELIVERY_ATTEMPTS - 1, now - kol.DELIVERY_BACKOFF_CAP_S + 1, now)
++    assert kol._delivery_due(kol.MAX_DELIVERY_ATTEMPTS - 1, now - kol.DELIVERY_BACKOFF_CAP_S, now)
++    span = sum(min(60 * 2 ** (t - kol.DELIVERY_FREE_RETRIES), kol.DELIVERY_BACKOFF_CAP_S)
++               for t in range(kol.DELIVERY_FREE_RETRIES, kol.MAX_DELIVERY_ATTEMPTS))
++    assert 6 * 3600 < span < 24 * 3600  # retries outlast a Board outage but end before the requester's deadline
++
++
++def test_job_stale_bound_exceeds_the_worst_job():
++    worst = kol.PROBE_TIMEOUT_S + kol.ADMIN_CALLS_PER_JOB * kol.ADMIN_TIMEOUT_S
++    assert kol.JOB_STALE_S > 2 * worst
++    assert not hasattr(kol, "CAS_ROUNDS")  # no client-side compare-and-set loop is left
++
++
++def test_unknown_machine_is_refused(hub):
++    f = hub
++    out = _submit(f, _op(machine="worker-77"))
++    f.probe = {**f.probe}
++    _round(f)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "rejected" and "unknown_machine" in req["error"]
++
++
++def test_forged_result_on_the_requesters_own_card_is_ignored(hub):
++    """The worker owns its card, so it could write a result there itself: only the Board's word that the hub wrote
++    it counts."""
++    f = hub
++    out = _submit(f, _op())
++    ksr.drain(f.w)
++    uid = json.loads(f.w.execute("SELECT payload FROM task_events WHERE kind = ?",
++                                 (kox.REQUEST_KIND,)).fetchone()[0])["request_uid"]
++    with kb.write_txn(f.w):
++        kb._append_event(f.w, f.caller, kox.RESULT_KIND, {"request_uid": uid, "action": "label_publish",
++                                                          "outcome": "applied", "executor_gateway": "hub"})
++    f.board()  # the Board says worker-5 wrote it
++    ksr.drain(f.w)
++    assert ksr.get_request(f.w, out["request_id"])["status"] == "accepted"
++    ksr.drain(f.h)
++    f.board()
++    ksr.drain(f.w)
++    assert ksr.get_request(f.w, out["request_id"])["status"] == "done"
++    assert "capability:hub-read" in f.reg.labels["worker-3"]
++
++
++def test_unreachable_board_keeps_the_answer_until_it_is_delivered(hub):
++    f = hub
++    out = _submit(f, _op())
++    ksr.drain(f.w)
++    f.board()
++    f.push_down = True
++    ksr.drain(f.h)
++    job = f.h.execute("SELECT state, delivered_at, delivery_attempts FROM operator_label_jobs").fetchone()
++    assert (job[0], job[1], job[2]) == ("done", None, 1)
++    f.push_down = False
++    ksr.drain(f.h)
++    f.board()
++    ksr.drain(f.w)
++    assert ksr.get_request(f.w, out["request_id"])["status"] == "done"
++    assert len(_result(f)) == 1 and len(f.reg.writes()) == 1  # published once, answered once
++
++
++def test_replayed_request_is_not_published_twice(hub):
++    f = hub
++    _submit(f, _op())
++    _round(f)
++    kox._MARK.clear()
++    with kb.write_txn(f.h):
++        f.h.execute("DELETE FROM operator_call_scan")
++    kox.apply_incoming(f.h)
++    assert len(f.reg.writes()) == 1 and len(f.probes) == 1
++
++
++def test_a_job_that_keeps_dying_fails_after_bounded_attempts(hub, monkeypatch):
++    f = hub
++    out = _submit(f, _op())
++    ksr.drain(f.w)
++    f.board()
++    monkeypatch.setattr(kol, "_start", lambda fn: None)  # the thread never runs (a crash every time)
++    kox.apply_incoming(f.h)
++    now = int(time.time())
++    for i in range(kol.MAX_JOB_ATTEMPTS):
++        kol.tick(f.h, "hub", "default", now=now + (i + 1) * (kol.JOB_STALE_S + 1))
++    row = f.h.execute("SELECT state, outcome, attempts FROM operator_label_jobs").fetchone()
++    assert (row[0], row[1], row[2]) == ("done", "failed", kol.MAX_JOB_ATTEMPTS)
++    f.board()
++    ksr.drain(f.w)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "failed" and "stopped" in req["error"]
++
++
++def test_hub_without_the_admin_key_refuses_and_never_runs_an_admin_command(hub, monkeypatch, tmp_path):
++    f = hub
++    monkeypatch.setattr(kol, "ADMIN_KEY", str(tmp_path / "absent" / "admin.key"))
++    monkeypatch.setattr(kol, "_admin_key_present", _real_key_check)
++    out = _submit(f, _op())
++    _round(f)
++    req = ksr.get_request(f.w, out["request_id"])
++    assert req["status"] == "rejected" and "no_admin_key" in req["error"]
++    assert f.reg.calls == [] and f.probes == []
++
++
++def _real_key_check():
++    from pathlib import Path
++    return Path(kol.ADMIN_KEY).expanduser().is_file()
++
++
++def test_workers_never_touch_an_admin_key_or_execute_label_publish(hub, tmp_path, monkeypatch):
++    """Behaviour: with an admin key on disk, the worker's whole side (submit, forward, poll) never opens it or
++    spawns an admin command, and a non-hub gateway's home tick never takes a label_publish call, even one that
++    names it as home."""
++    import builtins
++    import io
++    import os
++    import subprocess
++    f = hub
++    key = tmp_path / ".config" / "hermes-mail" / "admin.key"
++    key.parent.mkdir(parents=True)
++    key.write_text("secret")
++    monkeypatch.setattr(kol, "ADMIN_KEY", str(key))
++    out = _submit(f, _op())
++    ksr.drain(f.w)
++    with kb.write_txn(f.w):  # a request that names worker-5 itself as the label home
++        row = f.w.execute("SELECT payload FROM task_events WHERE kind = ?", (kox.REQUEST_KIND,)).fetchone()
++        kb._append_event(f.w, f.caller, kox.REQUEST_KIND, {**json.loads(row[0]), "request_uid": "self-home",
++                                                           "home": "worker-5"})
++    f.board()
++    opened, spawned = [], []
++    real_open, real_os_open, real_popen = builtins.open, os.open, subprocess.Popen
++
++    def spy_open(file, *a, **k):
++        opened.append(str(file))
++        return real_open(file, *a, **k)
++
++    def spy_os_open(path, *a, **k):
++        opened.append(str(path))
++        return real_os_open(path, *a, **k)
++
++    class SpyPopen(real_popen):
++        def __init__(self, args, *a, **k):
++            spawned.append(args)
++            super().__init__(args, *a, **k)
++    monkeypatch.setattr(builtins, "open", spy_open)
++    monkeypatch.setattr(io, "open", spy_open)
++    monkeypatch.setattr(os, "open", spy_os_open)
++    monkeypatch.setattr(subprocess, "Popen", SpyPopen)
++    monkeypatch.setattr(kol, "_admin_key_present", _real_key_check)
++    calls_before = len(f.reg.calls)
++    kox.apply_incoming(f.w)  # worker-5's home tick
++    ksr.drain(f.w)
++    assert not [p for p in opened if "admin" in p], opened
++    assert not [a for a in spawned if "admin" in json.dumps(a, default=str)], spawned
++    assert len(f.reg.calls) == calls_before and f.probes == []
++    assert not f.w.execute("SELECT 1 FROM sqlite_master WHERE name = 'operator_label_jobs'").fetchone() or \
++        not f.w.execute("SELECT 1 FROM operator_label_jobs").fetchone()
++    assert ksr.get_request(f.w, out["request_id"])["status"] == "accepted"  # still waiting on the hub
++
++
++def test_dry_run_reports_the_hub_as_executor(hub):
++    out = _submit(hub, _op(), dry_run=True)
++    assert out["ops"][0]["verdict"] == "supervisor" and out["ops"][0]["home"] == kol.HOME
++    assert _log(hub.w) == []
++
++
++def test_label_publish_takes_no_card(hub):
++    with pytest.raises(ksr.SupervisorRequestError) as exc:
++        _submit(hub, _op(task_id=hub.caller))
++    assert exc.value.code == "invalid_ops" and "names a machine" in str(exc.value)
++
++
++def test_result_payload_is_bound_to_this_request(hub):
++    """Two calls in flight: each request finishes on its own answer."""
++    f = hub
++    a = _submit(f, _op(labels=["capability:hub-read"]))
++    b = _submit(f, _op(labels=["skill:xlsx"]))
++    _round(f)
++    _round(f)  # one label job per hub tick: the second call runs on the next one
++    assert ksr.get_request(f.w, a["request_id"])["status"] == "done"
++    assert ksr.get_request(f.w, b["request_id"])["status"] == "rejected"
++    assert {p["outcome"] for p in _result(f)} == {"applied", "refused"}
++    assert len({p["request_uid"] for p in _result(f)}) == 2
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 5761e4ae91..07a69227f4 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -1060,7 +1060,11 @@ KANBAN_SUPERVISOR_REQUEST_SCHEMA = _schema(
+         "created (the ones kanban_comment/kanban_move/kanban_unblock refuse as foreign_card): action "
+         "comment {text}, move {runs_on, reason} (not while it runs) or unblock {reason} (an agent's block "
+         "only, never one waiting on a human). That card's home gateway executes it; complete/archive/link/"
+-        "unlink of a foreign card are refused (its owner's), one op per request, every call logged."
++        "unlink of a foreign card are refused (its owner's), one op per request, every call logged. "
++        "Action label_publish {machine, labels, proof: {kind: 'hub_probe'}} (no task_id) asks the hub to ADD "
++        "skill:/capability: labels to one machine's Board registry entry (never machine:*, never a removal): the "
++        "hub re-runs its own probe of that machine and publishes only what it proves, as one atomic add on the Board; "
++        "the answer lands on this card."
+     ),
+     {
+         "ops": {
+@@ -1072,11 +1076,16 @@ KANBAN_SUPERVISOR_REQUEST_SCHEMA = _schema(
+                 "properties": {
+                     "op": {"type": "string", "enum": ["link", "unlink", "reconcile_notify", "resume", "retry_limit",
+                                                          "archive", "operator"]},
+-                    "action": {"type": "string", "enum": ["comment", "move", "unblock"],
+-                               "description": "operator: what to do on the foreign card."},
++                    "action": {"type": "string", "enum": ["comment", "move", "unblock", "label_publish"],
++                               "description": "operator: what to do on the foreign card (label_publish: on a "
++                                              "machine's registry labels)."},
+                     "text": {"type": "string", "description": "operator comment: the comment body."},
+                     "runs_on": {"type": "array", "items": {"type": "string"},
+                                 "description": "operator move: the new machine labels."},
++                    "machine": {"type": "string", "description": "operator label_publish: the Board machine."},
++                    "labels": {"type": "array", "items": {"type": "string"},
++                               "description": "operator label_publish: skill:/capability: labels to add."},
++                    "proof": {"type": "object", "description": "operator label_publish: {kind: 'hub_probe'}."},
+                     "reason": {"type": "string", "description": "operator move/unblock: why (required)."},
+                     "parent_id": {"type": "string"},
+                     "child_id": {"type": "string"},
+-- 
+2.43.0
+

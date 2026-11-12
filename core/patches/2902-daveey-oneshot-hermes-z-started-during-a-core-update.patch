@@ -1,0 +1,552 @@
+From 19b88d51840380a9680164aa2a7f440b97ecd124 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:34:49 +0000
+Subject: [PATCH] [daveey] oneshot: `hermes -z` started during a core-update
+ swap waits for the restarted gateway
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A finite run (`hermes -z`, `chat -q`) started while an instant core update swapped the gateway exited at
+once with `Error: Gateway draining: update_paused` and lost its prompt (hermes-hub 2026-11-12 17:54Z and
+18:02Z, found in the live proof of t_01a1d08863024254). A one-shot that was already running waits up to
+10 min for the restarted owner (`GatewayChatView._redial`); a new one did not, so selfheal probes and
+scripts running `hermes -z` on a timer failed on every apply.
+
+New `hermes_cli/gateway_update_wait.UpdateWait`: a finite run retries the refusals that admit nothing
+while an update swaps the owner, for at most 10 min from the first one, with one stderr notice
+(none in stream-json):
+- ensure's `draining` (update_paused, restart_wait, replaced) / `starting` verdicts on the dial, and,
+  once waiting, a refused or half-started dial;
+- a draining owner's `runtime_draining` / `runtime_retired` answer to runtime.describe /
+  session.create / session.resume (that attempt's connection is closed, the next owner is asked again);
+- the same answer to `prompt.submit` (`GatewayChatView._submit_finite`): dial the next owner,
+  re-attach the same session and submit again.
+Any other refusal, a dial failure before any update refusal, and interactive chats keep the old exit.
+
+Proof: tests/hermes_cli/test_gateway_chat_update_wait.py — 10 tests; on the previous source 5 fail
+(the update_paused wait, the window bound, both session refusals, the refused submit), with the
+change all pass. Every test file importing gateway_chat / gateway_chat_view / gateway_update_wait
+(41 files, 451 tests) passes; scripts/check --only health ok.
+---
+ hermes_cli/gateway_chat.py                    | 146 +++++++++------
+ hermes_cli/gateway_chat_view.py               |  40 ++++-
+ hermes_cli/gateway_update_wait.py             |  84 +++++++++
+ .../test_gateway_chat_update_wait.py          | 169 ++++++++++++++++++
+ 4 files changed, 382 insertions(+), 57 deletions(-)
+ create mode 100644 hermes_cli/gateway_update_wait.py
+ create mode 100644 tests/hermes_cli/test_gateway_chat_update_wait.py
+
+diff --git a/hermes_cli/gateway_chat.py b/hermes_cli/gateway_chat.py
+index 8cff3ca838..5252c416ce 100644
+--- a/hermes_cli/gateway_chat.py
++++ b/hermes_cli/gateway_chat.py
+@@ -170,60 +170,17 @@ async def run_gateway_chat(args, emitter=None):
+     oneshot = bool(oneshot_prompt or getattr(args, "oneshot_exit", False) or quiet or
+                    (query and not (sys.stdin.isatty() and sys.stdout.isatty())))
+     async with contextlib.AsyncExitStack() as connections:
+-        client = await connections.enter_async_context(connect_gateway())
+-        description = await client.rpc("runtime.describe")
+-        title = continue_title(args)
+-        create_if_missing = bool(title and getattr(args, "create_if_missing", False))
+-        latest = wants_latest(args)
+-        if latest:
+-            snapshot = await _resume_latest(client, args)
+-            check_resume_policy(args, snapshot)
+-        elif getattr(args, "resume", None) or (title and not create_if_missing):
+-            name = getattr(args, "resume", None) or title
+-            try:
+-                # Exact id first, then title (latest lineage continuation), as the classic CLI did.
+-                snapshot = await _resume(client, args, session_id=name)
+-            except GatewayClientError as exc:
+-                if str(exc) != "not_found":
+-                    raise
+-                try:
+-                    snapshot = await _resume(client, args, title=name)
+-                except GatewayClientError as exc:
+-                    if str(exc) != "not_found":
+-                        raise
+-                    raise GatewayClientError(
+-                        f"No session found matching '{name}'. Use 'hermes sessions list' to see available "
+-                        "sessions, or pass -c <name> --create-if-missing to start a new session with that title.")
+-            check_resume_policy(args, snapshot)
++        wait = None
++        if oneshot:
++            # [daveey] Started while a core update holds the gateway: wait for the restarted owner
++            # (``gateway_update_wait``) instead of exiting on its refusal with the prompt lost.
++            from hermes_cli.gateway_update_wait import UpdateWait
++            wait = UpdateWait(announce=emitter is None)
++            client, snapshot = await _attach_through_update(connections, wait, args, oneshot, oneshot_prompt)
+         else:
+-            contract = description.get("session_create", {})
+-            # Finite runs are stored as ``oneshot`` (hidden from human pickers, still CLI history);
+-            # an explicit ``--source`` always wins. A remote gateway predating the label stores ``cli``.
+-            sources = contract.get("sources", [])
+-            from agent.session_source import create_surface
+-            source = create_surface(getattr(args, "source", None) or ("oneshot" if oneshot and "oneshot" in sources else "cli"))
+-            if source not in sources:
+-                raise GatewayClientError(f"Gateway does not support source {source!r}")
+-            parameters = contract.get("parameters", [])
+-            policy = _requested_policy(args)
+-            policy.pop("source", None)
+-            if create_if_missing:
+-                policy["title"] = title
+-            policy.update(env_launch_flags())
+-            policy.update(client_env_policy(parameters))
+-            cwd = await asyncio.to_thread(_caller_cwd, args)
+-            if "cwd" in parameters:
+-                policy["cwd"] = cwd
+-            elif getattr(args, "in_dir", None):
+-                raise GatewayClientError("Gateway does not support --in / caller cwd; update the gateway")
+-            else:
+-                print("Warning: this gateway cannot preserve caller cwd; it uses its configured execution directory.", file=sys.stderr)
+-            missing = sorted(set(policy) - set(parameters))
+-            if missing:
+-                raise GatewayClientError("Gateway does not support creation options: " + ", ".join(missing))
+-            snapshot = await client.rpc("session.create", request_id=uuid.uuid4().hex, source=source, **policy)
+-            if (warning := (snapshot.get("info") or {}).get("config_warning")) and not isinstance(oneshot_prompt, str):
+-                print(f"Warning: {warning}", file=sys.stderr)
++            client = await connections.enter_async_context(connect_gateway())
++            snapshot = await _open_session(client, args, oneshot, oneshot_prompt)
++        title, latest = continue_title(args), wants_latest(args)
+         if not isinstance(oneshot_prompt, str):  # main's -z writes nothing to stderr on success
+             print("Session: " + snapshot["stored_session_id"], file=sys.stderr, flush=True)
+         if not oneshot:
+@@ -237,8 +194,10 @@ async def run_gateway_chat(args, emitter=None):
+         view.unattended = isinstance(oneshot_prompt, str)
+         view.resume_footer = oneshot and not quiet
+         # [daveey] A core update restarting the owner parks a finite turn and continues it on the next owner:
+-        # the one-shot wait redials it (``GatewayChatView._redial``). Each dial is closed on exit.
++        # the one-shot wait redials it (``GatewayChatView._redial``). Each dial is closed on exit. A submit the
++        # draining owner refused is taken to the next owner within the same wait (``_submit_finite``).
+         view.reconnect = lambda: connections.enter_async_context(connect_gateway())
++        view.update_wait = wait
+         if (getattr(args, "resume", None) or title or latest) and not quiet:
+             from agent.context_compressor import MODEL_ONLY_DISPLAY_METADATA_KEY
+             for row in snapshot.get("messages", []):
+@@ -250,6 +209,85 @@ async def run_gateway_chat(args, emitter=None):
+         return await view.run(query, oneshot=oneshot)
+ 
+ 
++async def _attach_through_update(connections, wait, args, oneshot, oneshot_prompt):
++    """[daveey] A finite run's connection and session, retried while the owner refuses them only because a
++    core update is swapping it (``UpdateWait``); every retry dials afresh. Each refusal admitted nothing:
++    ensure answered before any socket, and a draining owner's ``session.create``/``session.resume`` refusal
++    creates nothing, so the next attempt asks the next owner the same question."""
++    while True:
++        attempt = contextlib.AsyncExitStack()
++        try:
++            client = await wait.dial(lambda: attempt.enter_async_context(connect_gateway()))
++            snapshot = await _open_session(client, args, oneshot, oneshot_prompt)
++        except GatewayClientError as exc:
++            await attempt.aclose()
++            await wait.retry(exc)  # raises exc unless it is a restart refusal inside the window
++            continue
++        except BaseException:
++            await attempt.aclose()
++            raise
++        await connections.enter_async_context(attempt)
++        return client, snapshot
++
++
++async def _open_session(client, args, oneshot, oneshot_prompt):
++    """The session this run attaches to: resumed (``-c``/``--resume``) or created."""
++    description = await client.rpc("runtime.describe")
++    title = continue_title(args)
++    create_if_missing = bool(title and getattr(args, "create_if_missing", False))
++    latest = wants_latest(args)
++    if latest:
++        snapshot = await _resume_latest(client, args)
++        check_resume_policy(args, snapshot)
++    elif getattr(args, "resume", None) or (title and not create_if_missing):
++        name = getattr(args, "resume", None) or title
++        try:
++            # Exact id first, then title (latest lineage continuation), as the classic CLI did.
++            snapshot = await _resume(client, args, session_id=name)
++        except GatewayClientError as exc:
++            if str(exc) != "not_found":
++                raise
++            try:
++                snapshot = await _resume(client, args, title=name)
++            except GatewayClientError as exc:
++                if str(exc) != "not_found":
++                    raise
++                raise GatewayClientError(
++                    f"No session found matching '{name}'. Use 'hermes sessions list' to see available "
++                    "sessions, or pass -c <name> --create-if-missing to start a new session with that title.")
++        check_resume_policy(args, snapshot)
++    else:
++        contract = description.get("session_create", {})
++        # Finite runs are stored as ``oneshot`` (hidden from human pickers, still CLI history);
++        # an explicit ``--source`` always wins. A remote gateway predating the label stores ``cli``.
++        sources = contract.get("sources", [])
++        from agent.session_source import create_surface
++        source = create_surface(getattr(args, "source", None) or ("oneshot" if oneshot and "oneshot" in sources else "cli"))
++        if source not in sources:
++            raise GatewayClientError(f"Gateway does not support source {source!r}")
++        parameters = contract.get("parameters", [])
++        policy = _requested_policy(args)
++        policy.pop("source", None)
++        if create_if_missing:
++            policy["title"] = title
++        policy.update(env_launch_flags())
++        policy.update(client_env_policy(parameters))
++        cwd = await asyncio.to_thread(_caller_cwd, args)
++        if "cwd" in parameters:
++            policy["cwd"] = cwd
++        elif getattr(args, "in_dir", None):
++            raise GatewayClientError("Gateway does not support --in / caller cwd; update the gateway")
++        else:
++            print("Warning: this gateway cannot preserve caller cwd; it uses its configured execution directory.", file=sys.stderr)
++        missing = sorted(set(policy) - set(parameters))
++        if missing:
++            raise GatewayClientError("Gateway does not support creation options: " + ", ".join(missing))
++        snapshot = await client.rpc("session.create", request_id=uuid.uuid4().hex, source=source, **policy)
++        if (warning := (snapshot.get("info") or {}).get("config_warning")) and not isinstance(oneshot_prompt, str):
++            print(f"Warning: {warning}", file=sys.stderr)
++    return snapshot
++
++
+ _RESUME_POLICY_MISMATCH = "Resume retains gateway session policy; creation overrides are unsupported on resume."
+ # A refused resume flag as the user typed it, and the slash command that changes it on the resumed session.
+ _RESUME_FLAG_HINTS = {"model": ("-m/--model", "/model"), "provider": ("--provider", "/model"),
+diff --git a/hermes_cli/gateway_chat_view.py b/hermes_cli/gateway_chat_view.py
+index fb3f129e48..b2597a3366 100644
+--- a/hermes_cli/gateway_chat_view.py
++++ b/hermes_cli/gateway_chat_view.py
+@@ -135,6 +135,9 @@ class GatewayChatView:
+         # connection (set by ``run_gateway_chat``); None never redials.
+         self.reconnect: Callable[[], Awaitable[Any]] | None = None
+         self.redials = 0
++        # [daveey] A finite run's bounded pre-admission wait (``gateway_update_wait.UpdateWait``), shared with
++        # its attach: a submit a draining owner refused goes to the next owner (``_submit_finite``).
++        self.update_wait: Any = None
+         self._renderer: asyncio.Task | None = None
+ 
+     def unknown_admissions(self):
+@@ -244,6 +247,12 @@ class GatewayChatView:
+                     logger.debug("gateway redial gave up: %s", exc)
+                     return False
+                 await asyncio.sleep(REDIAL_RETRY_S)
++        await self._swap_client(client)
++        await self._reattach()
++        return self.failure is None
++
++    async def _swap_client(self, client):
++        """Render from *client* (a fresh connection to the restarted owner) instead of the old one."""
+         renderer = self._renderer
+         if renderer is not None:
+             renderer.cancel()
+@@ -252,8 +261,32 @@ class GatewayChatView:
+         self.client, self.failure = client, None
+         self.failed.clear()
+         self._renderer = asyncio.create_task(self.render())
+-        await self._reattach()
+-        return self.failure is None
++
++    async def _submit_finite(self, query):
++        """[daveey] The one-shot's submit. An owner draining for a core update refuses it (``runtime_draining``,
++        ``runtime_retired``) with nothing admitted, so the prompt goes to the restarted owner instead: dial it,
++        re-attach the session and submit again, within the run's ``update_wait`` window. Any other refusal, or
++        a view without a dialer or wait, raises as before."""
++        from hermes_cli.gateway_client import GatewayRPCError
++        wait = self.update_wait
++        while True:
++            try:
++                return await self.submit(query)
++            except GatewayRPCError as exc:
++                if wait is None or self.reconnect is None:
++                    raise
++                await wait.retry(exc)
++            while True:
++                client = await wait.dial(self.reconnect)
++                try:
++                    snapshot = await client.rpc("session.resume", session_id=self.session_id)
++                    break
++                except GatewayRPCError as exc:
++                    await wait.retry(exc)
++            await self._swap_client(client)
++            self.generation = snapshot.get("execution_generation", self.generation)
++            self.pending = snapshot.get("pending", self.pending)
++            self.prompts = {p["prompt_id"]: p for p in snapshot.get("prompts", [])}
+ 
+     async def _redial_or_raise(self):
+         """The one-shot wait's failure: redialled (``_redial``), or raised as before."""
+@@ -607,7 +640,8 @@ class GatewayChatView:
+                                 "and /discard the paused turn there; then send it again.")
+         renderer = self._renderer = asyncio.create_task(self.render())
+         try:
+-            receipt = await self.submit(query) if query else None
++            submit = self._submit_finite if oneshot else self.submit
++            receipt = await submit(query) if query else None
+             if oneshot:
+                 admission = _oneshot_admission(receipt)
+                 if admission is None:
+diff --git a/hermes_cli/gateway_update_wait.py b/hermes_cli/gateway_update_wait.py
+new file mode 100644
+index 0000000000..4c9adcdacf
+--- /dev/null
++++ b/hermes_cli/gateway_update_wait.py
+@@ -0,0 +1,84 @@
++"""[daveey] A finite run (``hermes -z``, ``chat -q``) started while a core update holds the gateway waits for
++the restarted owner instead of failing.
++
++During an update's swap the owner admits nothing new: ``ensure_gateway_runtime`` answers ``draining``
++(``update_paused`` while the update fence is up, ``restart_wait`` inside a restart's after-turn wait) or
++``starting``, and an attached owner that is draining refuses ``session.create`` / ``prompt.submit`` with
++``runtime_draining`` (``runtime_retired`` once its authority retired). Each of these refusals means nothing
++was admitted, so asking the next owner again is safe. A finite run used to exit 1 on the first one
++(``Error: Gateway draining: update_paused``) and lose its prompt; selfheal probes and scripts that run
++``hermes -z`` on a timer hit it on every hub apply. ``UpdateWait`` retries them for at most
++``ADMISSION_WAIT_S`` from the first refusal (the same 10 minutes a running one-shot waits for its restarted
++owner, ``GatewayChatView._redial``), with one stderr notice. Any other refusal, and every failure while not
++yet waiting, keeps the old exit.
++"""
++import asyncio
++import logging
++import sys
++
++from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError, GatewayUnavailableError
++
++logger = logging.getLogger(__name__)
++
++ADMISSION_WAIT_S = 600.0
++ADMISSION_RETRY_S = 2.0
++# ``ensure_gateway_runtime`` verdicts of an owner that is going away or coming up (never ``inaccessible``,
++# ``incompatible`` or a failed start, which stay final).
++_WAIT_STATES = frozenset({"draining", "starting"})
++# In-band refusals of an owner that admits nothing new while it drains (or whose authority retired).
++_WAIT_RPC_REASONS = frozenset({"runtime_draining", "runtime_retired"})
++
++
++def refused_for_restart(exc) -> bool:
++    """True when *exc* is an owner refusing new work only because it is draining, retiring or starting."""
++    if isinstance(exc, GatewayUnavailableError):
++        return exc.state in _WAIT_STATES
++    if isinstance(exc, GatewayRPCError):
++        return str(exc) in _WAIT_RPC_REASONS
++    return False
++
++
++def _dial_failure(exc) -> bool:
++    """A refused, timed-out or half-started dial (websockets' handshake rejections pass through raw)."""
++    from websockets.exceptions import InvalidHandshake
++    return isinstance(exc, (OSError, TimeoutError, InvalidHandshake))
++
++
++class UpdateWait:
++    """One finite run's bounded pre-admission wait; its window opens at the first refusal and is shared
++    by every later refusal of the same run (attach and submit), so the whole wait stays bounded."""
++
++    def __init__(self, *, announce=True):
++        self.announce = announce  # False for stream-json: stderr notices are not part of that protocol
++        self.deadline = None
++        self.retries = 0
++
++    @property
++    def waiting(self) -> bool:
++        return self.deadline is not None
++
++    async def retry(self, exc):
++        """Sleep before the next attempt, or raise *exc*: it is not a restart refusal (a dial failure
++        counts once waiting), or the window has passed."""
++        if not (refused_for_restart(exc) or (self.waiting and _dial_failure(exc))):
++            raise exc
++        loop = asyncio.get_running_loop()
++        if self.deadline is None:
++            self.deadline = loop.time() + ADMISSION_WAIT_S
++            if self.announce:
++                print(f"Gateway is restarting for an update ({exc}); waiting up to {ADMISSION_WAIT_S / 60:.0f} "
++                      "min for the restarted gateway to take this prompt.", file=sys.stderr, flush=True)
++        elif loop.time() >= self.deadline:
++            logger.debug("gateway admission wait gave up: %s", exc)
++            raise exc
++        self.retries += 1
++        await asyncio.sleep(ADMISSION_RETRY_S)
++
++    async def dial(self, connect):
++        """``await connect()`` until an owner takes the connection, retrying restart refusals."""
++        from websockets.exceptions import InvalidHandshake
++        while True:
++            try:
++                return await connect()
++            except (GatewayClientError, OSError, TimeoutError, InvalidHandshake) as exc:
++                await self.retry(exc)
+diff --git a/tests/hermes_cli/test_gateway_chat_update_wait.py b/tests/hermes_cli/test_gateway_chat_update_wait.py
+new file mode 100644
+index 0000000000..f95d20ba7f
+--- /dev/null
++++ b/tests/hermes_cli/test_gateway_chat_update_wait.py
+@@ -0,0 +1,169 @@
++"""[daveey] A finite run (``hermes -z``) started while a core update swaps the gateway waits for the restarted
++owner instead of failing with ``Error: Gateway draining: update_paused`` and losing its prompt.
++
++hermes-hub 2026-11-12 17:54Z and 18:02Z: ``hermes -z`` started mid-swap exited at once on that refusal. Every
++refusal retried here admitted nothing (ensure's ``draining``/``starting`` verdict before any socket, a draining
++owner's ``runtime_draining``/``runtime_retired`` answer to ``session.create``/``prompt.submit``), so the run
++asks again, for at most ``ADMISSION_WAIT_S`` from the first refusal, like the running one-shot's redial.
++"""
++import argparse
++import asyncio
++from contextlib import asynccontextmanager
++
++import pytest
++
++from hermes_cli import gateway_chat, gateway_update_wait
++from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError, GatewayUnavailableError
++
++UPDATE_PAUSED = ("Gateway draining: update_paused", "draining", "update_paused")
++NOTICE = "waiting up to 10 min for the restarted gateway to take this prompt"
++
++
++def _paused():
++    return GatewayUnavailableError(*UPDATE_PAUSED)
++
++
++class Owner:
++    """One gateway process: answers the finite run's RPCs; ``refuse`` maps a method to its refusal."""
++
++    def __init__(self, refuse=None, session="s"):
++        self.events, self.calls, self.refuse, self.session = asyncio.Queue(), [], dict(refuse or {}), session
++        self.closed = False
++
++    async def rpc(self, method, **params):
++        self.calls.append(method)
++        if method in self.refuse:
++            raise self.refuse[method]
++        if method == "runtime.describe":
++            return {"session_create": {"sources": ["cli", "oneshot"], "parameters": ["cwd", "request_id", "source"]}}
++        if method in ("session.create", "session.resume"):
++            return {"stored_session_id": self.session, "execution_generation": 1, "pending": [], "prompts": []}
++        if method == "prompt.submit":
++            assert params["session_id"] == self.session and params["text"] == "ping"
++            self.events.put_nowait({"method": "event", "params": {
++                "type": "message.complete", "session_id": self.session, "admission_id": "a",
++                "payload": {"text": "pong", "outcome": "completed"}}})
++            return {"admission_id": "a", "status": "queued"}
++        if method == "prompt.receipt":
++            return {"admission_id": "a", "status": "terminal", "outcome": "completed",
++                    "result": {"final_response": "pong", "completed": True}}
++        raise AssertionError(method)
++
++
++@pytest.fixture
++def dials(monkeypatch, tmp_path):
++    """``connect_gateway`` answering from a script: an exception is that dial's refusal, an Owner attaches."""
++    monkeypatch.setattr(gateway_update_wait, "ADMISSION_RETRY_S", 0.01)
++    monkeypatch.chdir(tmp_path)
++    script, made = [], []
++
++    @asynccontextmanager
++    async def connect():
++        made.append(None)
++        nxt = script.pop(0)
++        if isinstance(nxt, BaseException):
++            raise nxt
++        try:
++            yield nxt
++        finally:
++            nxt.closed = True
++
++    monkeypatch.setattr(gateway_chat, "connect_gateway", connect)
++    return script, made
++
++
++async def _z():
++    return await asyncio.wait_for(gateway_chat.run_gateway_chat(argparse.Namespace(oneshot="ping")), 10)
++
++
++@pytest.mark.asyncio
++async def test_oneshot_started_during_an_update_waits_for_the_restarted_owner(dials, capsys):
++    script, made = dials
++    owner = Owner()
++    # The fence, the owner coming up, a half-started socket, then the restarted owner.
++    script += [_paused(), _paused(), GatewayUnavailableError("Gateway starting: deadline", "starting", "deadline"),
++               ConnectionRefusedError("starting"), owner]
++    assert await _z() == 0
++    assert len(made) == 5 and owner.calls[:3] == ["runtime.describe", "session.create", "prompt.submit"]
++    out, err = capsys.readouterr()
++    assert "pong" in out
++    assert err.count(NOTICE) == 1 and "update_paused" in err
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("refusal", [
++    GatewayUnavailableError("Gateway inaccessible: unsafe_control_node", "inaccessible", "unsafe_control_node"),
++    GatewayUnavailableError("Gateway could not start: boom", "inaccessible", "runtime_exited"),
++    ConnectionRefusedError("no owner"),  # a failed dial is retried only once an update refusal opened the wait
++], ids=["inaccessible", "failed-start", "dial-before-wait"])
++async def test_a_refusal_that_is_not_an_update_swap_still_fails_at_once(dials, capsys, refusal):
++    script, made = dials
++    script += [refusal, Owner()]
++    with pytest.raises(type(refusal)):
++        await _z()
++    assert len(made) == 1 and NOTICE not in capsys.readouterr().err
++
++
++@pytest.mark.asyncio
++async def test_an_owner_that_never_returns_fails_after_the_window(dials, monkeypatch):
++    script, made = dials
++    monkeypatch.setattr(gateway_update_wait, "ADMISSION_WAIT_S", 0.05)
++    script += [_paused() for _ in range(1000)]
++    with pytest.raises(GatewayUnavailableError, match="update_paused"):
++        await _z()
++    assert 2 < len(made) < 1000
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("reason", ["runtime_draining", "runtime_retired"])
++async def test_a_draining_owner_refusing_the_session_is_left_for_the_next_one(dials, capsys, reason):
++    script, made = dials
++    draining, restarted = Owner(refuse={"session.create": GatewayRPCError(reason)}), Owner()
++    script += [draining, restarted]
++    assert await _z() == 0
++    assert len(made) == 2 and draining.closed and "prompt.submit" not in draining.calls  # closed before the next dial
++    assert restarted.calls[:3] == ["runtime.describe", "session.create", "prompt.submit"]
++    assert "pong" in capsys.readouterr().out
++
++
++@pytest.mark.asyncio
++async def test_a_refused_submit_goes_to_the_restarted_owner_on_the_same_session(dials, capsys):
++    script, made = dials
++    draining = Owner(refuse={"prompt.submit": GatewayRPCError("runtime_draining")})
++    restarted = Owner(refuse={"session.create": AssertionError("a second session")})
++    # The next owner is still behind the fence for one dial, then refuses the re-attach once.
++    later = Owner(refuse={"session.create": AssertionError("a second session")})
++    restarted.refuse["session.resume"] = GatewayRPCError("runtime_draining")
++    script += [draining, _paused(), restarted, later]
++    assert await _z() == 0
++    assert len(made) == 4 and draining.calls.count("session.create") == 1
++    assert restarted.calls == ["session.resume"]
++    assert later.calls[:2] == ["session.resume", "prompt.submit"]
++    out, err = capsys.readouterr()
++    assert "pong" in out and err.count(NOTICE) == 1
++
++
++@pytest.mark.asyncio
++async def test_a_refused_submit_without_a_wait_or_dialer_keeps_the_old_exit():
++    from hermes_cli.gateway_chat_view import GatewayChatView
++    for wait, reconnect in ((None, Owner), (gateway_update_wait.UpdateWait(), None)):
++        owner = Owner(refuse={"prompt.submit": GatewayRPCError("runtime_draining")})
++        view = GatewayChatView(owner, {"stored_session_id": "s"}, quiet=True)
++        view.update_wait, view.reconnect = wait, reconnect
++        with pytest.raises(GatewayRPCError, match="runtime_draining"):
++            await asyncio.wait_for(view.run("ping", oneshot=True), 5)
++    other = Owner(refuse={"prompt.submit": GatewayRPCError("invalid_params")})
++    view = GatewayChatView(other, {"stored_session_id": "s"}, quiet=True)
++    view.update_wait, view.reconnect = gateway_update_wait.UpdateWait(), pytest.fail
++    with pytest.raises(GatewayRPCError, match="invalid_params"):
++        await asyncio.wait_for(view.run("ping", oneshot=True), 5)
++
++
++@pytest.mark.asyncio
++async def test_stream_json_waits_without_a_stderr_notice(monkeypatch, capsys):
++    monkeypatch.setattr(gateway_update_wait, "ADMISSION_RETRY_S", 0)
++    wait = gateway_update_wait.UpdateWait(announce=False)
++    await wait.retry(_paused())
++    assert wait.waiting and wait.retries == 1 and capsys.readouterr().err == ""
++    with pytest.raises(GatewayClientError, match="session_replay_gap"):
++        await wait.retry(GatewayClientError("session_replay_gap"))
+-- 
+2.43.0
+

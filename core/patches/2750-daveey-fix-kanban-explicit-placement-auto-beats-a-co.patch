@@ -1,0 +1,330 @@
+From e2ac131b352bebaf746a2eb2ea923b665fbe43ef Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:46:02 +0000
+Subject: [PATCH] [daveey] fix(kanban): explicit placement='auto' beats a
+ context skill's local marker; remedy names 'auto'
+
+The local-marker remedy told callers to re-create with placement='hub', but hub
+admission refuses portable work and creates nothing, leaving an archived card and
+no replacement (t_01a1cfbd8f74bf87, skill myapp-development).
+
+- An explicit placement='auto' drops context skill markers (^myapp, ^bb-;
+  kanban.placement.auto_overridable_skill_markers replaces the list) from the
+  local-marker scan (kanban_placement.marker_skills), so the card queues for
+  pool:worker. Device-bound skills (apple-*, computer-use, macos-, ios-, a local
+  Chrome) still pin, since 'auto' is also the routine default callers spell out.
+  An omitted placement still keeps every skill-marker card local. Title/body
+  markers are unchanged.
+- Remedies (kanban_placement.marker_remedy): context skill -> re-create with
+  placement='auto'; device skill -> re-create without the skill; text marker ->
+  drop the machine from the title/body. KANBAN_GUIDANCE and the kanban_archive
+  schema now point at placement.remedy instead of placement='hub'.
+- The local-pin 'would run elsewhere' note simulates an omitted placement, not
+  an explicit 'auto' (tested).
+---
+ agent/prompt_builder.py                       |  6 +-
+ hermes_cli/kanban_placement.py                | 52 ++++++++++++-
+ hermes_cli/kanban_placement_diagnostics.py    |  2 +-
+ tests/hermes_cli/test_kanban_placement.py     |  3 +-
+ .../test_kanban_placement_marker_remedy.py    | 30 ++++++++
+ tests/hermes_cli/test_kanban_pool_queue.py    | 74 +++++++++++++++++++
+ tools/kanban_tools_placement.py               |  5 +-
+ tools/kanban_tools_schemas.py                 |  6 +-
+ 8 files changed, 165 insertions(+), 13 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_placement_marker_remedy.py
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 8e474d705a..e17ec8c685 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -363,9 +363,9 @@ KANBAN_GUIDANCE = (
+     "Workers may only attach to their own task.\n"
+     "- **Created cards.** List ids in `kanban_complete(created_cards=[...])` ONLY when captured from a successful "
+     "`kanban_create` return — never invent or paste ids; the kernel rejects the completion on any phantom id. "
+-    "If that result has `placement.where` `local` because of a text marker and the work does not need this "
+-    "machine, `kanban_archive` the unclaimed card (only one your task created) and re-create it with "
+-    "`placement='hub'`.\n"
++    "If that result has `placement.where` `local` because of a local marker and the work does not need this "
++    "machine, `kanban_archive` the unclaimed card (only one your task created) and re-create it as its "
++    "`placement.remedy` says (`placement='auto'` for a context skill such as myapp-*).\n"
+     "- **Orchestrating: discover profiles first.** The dispatcher SILENTLY drops a card with an unknown assignee (it "
+     "sits in `ready` forever). Ground every assignee in a real profile (`hermes profile list`, or ask the user), and "
+     "express dependencies via `parents=[...]` on `kanban_create`, not prose.\n"
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index f5c949fc8e..58be36354a 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -155,8 +155,17 @@ APPLE_CONTEXT_MARKERS = (
+     r"\bcatalyst\b", r"\bcore ?ml\b", r"\bwatch app\b", r"\bav(foundation|audiosession)\b", r"\bapple\b",
+     r"\bmac\b", MACOS_MARKER, r"\bmacbook\b", r"\bmac ?mini\b", r"\bthe mini\b", r"\bkeychain\b", r"\btcc\b",
+ )
++# A context skill marker (:data:`DEFAULT_AUTO_OVERRIDABLE_SKILL_MARKERS`) yields to an explicit placement='auto'
++# (:func:`marker_skills`). A 'hub' pin is refused by hub admission for portable work, so naming it here left callers
++# with an archived card and nothing created. [daveey]
+ LOCAL_MARKER_REMEDY = (
+-    "if the work doesn't need this machine, archive and re-create with placement='hub'")
++    "if the work doesn't need this machine, archive and re-create with placement='auto'")
++DEVICE_SKILL_MARKER_REMEDY = (
++    "this skill drives this machine and placement='auto' does not override it; if the work doesn't need this "
++    "machine, archive and re-create without it in skills (name it in the body instead)")
++TEXT_MARKER_REMEDY = (
++    "if the work doesn't need this machine, archive and re-create without naming the machine in the title or body "
++    "(placement='auto' overrides only a context skill such as myapp-*)")
+ PINNED_LOCAL_WHY = "placement pinned local by the caller"
+ 
+ 
+@@ -175,6 +184,11 @@ DEFAULT_LOCAL_SKILL_MARKERS = (
+     r"^apple", r"^imessage$", r"^findmy$", r"^macos-", r"^mac-", r"^invisible-chrome-agent$",
+     r"^local-chrome-remote-debugging$", r"^computer-use$", r"^myapp", r"^bb-", r"^ios-",
+ )
++# Skill markers that only say what a card is about (a Baby Bear repo skill on a Python fix), not that it drives this
++# machine: an explicit placement='auto' drops them from the local-marker scan. Device-bound skills (apple-*, macos-,
++# computer-use, ios-, a local Chrome) stay local even then, since 'auto' is also the routine default callers spell
++# out. Replace with kanban.placement.auto_overridable_skill_markers. [daveey]
++DEFAULT_AUTO_OVERRIDABLE_SKILL_MARKERS = (r"^myapp", r"^bb-")
+ # Phrases that mean the card runs tests, builds or benchmarks (CPU/IO heavy): with ``heavy_route`` set it
+ # runs on a worker node rather than the routed target. Case-insensitive, title + body.
+ DEFAULT_HEAVY_MARKERS = (
+@@ -267,6 +281,18 @@ class _Cfg:
+         pats = list(base) if isinstance(base, list) else list(DEFAULT_LOCAL_SKILL_MARKERS)
+         return [re.compile(str(p), re.IGNORECASE) for p in pats]
+ 
++    def auto_overridable_skill(self, skill) -> bool:
++        """True when an explicit placement='auto' drops ``skill`` from the local-marker scan (a context skill)."""
++        base = self.raw.get("auto_overridable_skill_markers")
++        pats = list(base) if isinstance(base, list) else list(DEFAULT_AUTO_OVERRIDABLE_SKILL_MARKERS)
++        for p in pats:
++            try:
++                if re.search(str(p), str(skill), re.IGNORECASE):
++                    return True
++            except re.error:
++                continue
++        return False
++
+     def creator_session(self, target: str) -> str:
+         v = self.raw.get("creator_session")
+         if isinstance(v, dict):
+@@ -734,6 +760,27 @@ def explicit_foreign_pin(args: dict, self_gw: Optional[str], cfg: Optional[dict]
+     return pin
+ 
+ 
++def marker_skills(args: dict, cfg: _Cfg):
++    """The skills a local-marker scan checks. With placement='auto' passed outright, context skills
++    (:data:`DEFAULT_AUTO_OVERRIDABLE_SKILL_MARKERS`) are dropped: myapp-development on a Python fix says what the
++    card is about, not that it needs this machine. Device-bound skills (apple-*, computer-use, ...) are kept, and an
++    omitted placement honours every skill. Title and body markers are never overridden: 'auto' is also the routine
++    default callers spell out. [daveey]"""
++    skills = args.get("skills")
++    if not skills or str(args.get("placement") or "").strip().lower() != "auto":
++        return skills
++    return [s for s in skills if not cfg.auto_overridable_skill(s)]
++
++
++def marker_remedy(why: str, cfg: Optional[dict] = None) -> str:
++    """The remedy for a ``local marker: ...`` decision: 'auto' only when it would actually move the card."""
++    if not why.startswith("local marker: skill "):
++        return TEXT_MARKER_REMEDY
++    skill = why[len("local marker: skill "):]
++    overridable = _Cfg(config() if cfg is None else cfg).auto_overridable_skill(skill)
++    return LOCAL_MARKER_REMEDY if overridable else DEVICE_SKILL_MARKER_REMEDY
++
++
+ def _raw_explicit_pin(args: dict) -> str:
+     """Explicit pin when identity is unknown: not auto/local/here, else ''.
+ 
+@@ -875,8 +922,7 @@ def _decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+             if not on_target:
+                 return {"where": "local", "why": f"needs {need}, which {target} does not hold"}
+         if not explicit:
+-            hit = _local_marker(args.get("title") or "", args.get("body") or "",
+-                                args.get("skills"), c)
++            hit = _local_marker(args.get("title") or "", args.get("body") or "", marker_skills(args, c), c)
+             if hit:
+                 return {"where": "local", "why": f"local marker: {hit}"}
+             worker = c.heavy_target(self_gw)
+diff --git a/hermes_cli/kanban_placement_diagnostics.py b/hermes_cli/kanban_placement_diagnostics.py
+index 54868987e3..14962c940a 100644
+--- a/hermes_cli/kanban_placement_diagnostics.py
++++ b/hermes_cli/kanban_placement_diagnostics.py
+@@ -24,7 +24,7 @@ def portability(args: dict, cfg=None) -> tuple[str | None, str | None]:
+         return refusal, None
+     title = args.get("title") or ""
+     body = p.without_evidence(p.without_placement_note(args.get("body") or ""))
+-    if hit := p._local_marker(title, body, args.get("skills"), c):
++    if hit := p._local_marker(title, body, p.marker_skills(args, c), c):
+         return "local marker", hit
+     full = without_carried_inputs(f"{title}\n{body}", c.raw)
+     if refusal := coordination.check(full, c.raw, skills=args.get("skills"), requires=reqs):
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 3f2df1805c..ac79c7cbeb 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -937,7 +937,8 @@ def test_identity_lookup_failure_without_a_pin_still_creates_locally(mac, monkey
+ _SIDEBAR_TITLE = (
+     "Fix sidebar count vs task strip split under kanban.sync.links_reader=replica (Upkeep 14 vs 9)")
+ _SIDEBAR_BODY = (Path(__file__).parent / "fixtures" / "t_01a180aae388e142_body.txt").read_text()
+-_MARKER_REMEDY = "if the work doesn't need this machine, archive and re-create with placement='hub'"
++_MARKER_REMEDY = ("if the work doesn't need this machine, archive and re-create without naming the machine in the title "
++                  "or body (placement='auto' overrides only a context skill such as myapp-*)")
+ 
+ 
+ def test_marker_cases_a_through_e():
+diff --git a/tests/hermes_cli/test_kanban_placement_marker_remedy.py b/tests/hermes_cli/test_kanban_placement_marker_remedy.py
+new file mode 100644
+index 0000000000..a72f40d790
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placement_marker_remedy.py
+@@ -0,0 +1,30 @@
++"""The local-marker remedy names an override that works. [daveey]
++
++11-12: the skill-marker remedy said re-create with placement='hub', which hub admission refuses for portable work
++(code placement_unavailable), so a caller following it was left with an archived card and nothing created
++(t_01a1cfbd8f74bf87, skill myapp-development).
++"""
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_placement as kp
++
++pytest_plugins = ["tests.hermes_cli.test_kanban_placement"]  # its ``mac`` fixture (fake hub + board)
++
++
++def test_a_skill_marker_remedy_names_auto_only_when_auto_would_move_the_card(mac, monkeypatch):
++    """A context skill (myapp-*) names 'auto', and following it moves the card; a device skill (computer-use)
++    stays local even with 'auto', so its remedy says to drop the skill instead."""
++    from hermes_cli import kanban_skill_check
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kanban_skill_check, "check_task_skills", lambda *a, **k: None)
++    card = {"title": "Fix the parser and push", "body": "Python only.", "skills": ["myapp-development"]}
++    out = json.loads(kt._handle_create(card))
++    assert out["ok"] and out["placement"]["why"] == "local marker: skill myapp-development", out
++    assert out["remedy"] == "if the work doesn't need this machine, archive and re-create with placement='auto'"
++    moved = json.loads(kt._handle_create({**card, "placement": "auto"}))
++    assert moved["ok"] and moved.get("placed", {}).get("gateway") == "hub", moved  # the remedy works
++    device = json.loads(kt._handle_create({**card, "skills": ["computer-use"], "placement": "auto"}))
++    assert device["ok"] and device["placement"]["why"] == "local marker: skill computer-use", device
++    assert device["remedy"] == kp.DEVICE_SKILL_MARKER_REMEDY, device
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index ad8d09c7e7..e2ccc20431 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -105,6 +105,80 @@ def test_cli_create_queues_a_portable_card_for_the_pool(hub):
+     assert _runs_on(hub.conn, json.loads(out)["id"]) == ["machine:worker-2"], out  # an explicit pin wins
+ 
+ 
++def test_explicit_auto_beats_a_skill_local_marker_and_the_remedy_names_it(hub, monkeypatch):
++    """11-12: the marker remedy said re-create with placement='hub'; hub admission refuses portable work, so the
++    caller was left with an archived card and no replacement. An explicit 'auto' now queues it for the pool;
++    an omitted placement still keeps it local, and the remedy names 'auto'. [daveey]"""
++    from hermes_cli import kanban_skill_check
++    from tools import kanban_tools
++    monkeypatch.setattr(kanban_skill_check, "check_task_skills", lambda *a, **k: None)  # no skills dir here
++    _registry()
++    card = {"title": "Fix the parser and add unit tests", "assignee": "default", "requires": [],
++            "skills": ["myapp-development"]}
++    out = json.loads(kanban_tools._handle_create({**card, "placement": "auto"}))
++    assert out.get("ok") and out["runs_on"] == [POOL] and "remedy" not in out, out
++    assert _runs_on(hub.conn, out["task_id"]) == [POOL]
++    out = json.loads(kanban_tools._handle_create({**card, "title": "Fix the lexer and add unit tests"}))
++    assert out.get("ok") and _runs_on(hub.conn, out["task_id"]) is None, out
++    placement = out["placement"]
++    assert (placement["where"], placement["why"]) == ("local", "local marker: skill myapp-development"), out
++
++
++def test_explicit_auto_keeps_a_device_skill_local(hub, monkeypatch):
++    """Review of #1441: 'auto' is also the routine default callers spell out, so it must not move a card whose
++    skill drives this machine (apple-*, computer-use, macos-, ios-, a local Chrome). [daveey]"""
++    from hermes_cli import kanban_skill_check
++    from tools import kanban_tools
++    monkeypatch.setattr(kanban_skill_check, "check_task_skills", lambda *a, **k: None)
++    _registry()
++    titles = ("Click through the Settings pane", "Tag the reading list notes", "Reorder the dock icons",
++              "Sign the shortcut bundle")
++    for title, skill in zip(titles, ("computer-use", "apple-notes", "macos-dock-management", "ios-shortcuts-build")):
++        out = json.loads(kanban_tools._handle_create({
++            "title": title, "assignee": "default", "requires": [], "skills": [skill],
++            "placement": "auto"}))
++        assert out.get("ok") and _runs_on(hub.conn, out["task_id"]) is None, out
++        assert out["placement"]["why"] == f"local marker: skill {skill}", out
++    # A device skill beside a context skill still pins: 'auto' drops only the context one.
++    assert kp.marker_skills({"skills": ["myapp-development", "computer-use"], "placement": "auto"},
++                            kp._Cfg(CFG)) == ["computer-use"]
++    assert kp.marker_skills({"skills": ["bb-self-fix"]}, kp._Cfg(CFG)) == ["bb-self-fix"]  # omitted: unchanged
++
++
++def test_marker_remedies_name_the_override_that_works():
++    skill = kp.marker_remedy("local marker: skill myapp-development", {})
++    assert skill == "if the work doesn't need this machine, archive and re-create with placement='auto'"
++    assert kp.marker_remedy("local marker: skill bb-self-fix", {}) == skill
++    assert kp.marker_remedy("local marker: skill computer-use", {}) == kp.DEVICE_SKILL_MARKER_REMEDY
++    text = kp.marker_remedy("local marker: mentions 'macbook'", {})
++    assert text == kp.TEXT_MARKER_REMEDY and "placement='hub'" not in text, text
++    # A replaced overridable list is honoured.
++    assert kp.marker_remedy("local marker: skill computer-use",
++                            {"auto_overridable_skill_markers": ["^computer-use$"]}) == skill
++    cfg, live = {"route": {"macbook": HUB}}, (lambda _t: None)
++    card = {"title": "Fix the parser", "skills": ["myapp-development"]}
++    assert kp.decide(card, cfg=cfg, self_gw="macbook", live=live)["why"] == "local marker: skill myapp-development"
++    assert kp.decide({**card, "placement": "auto"}, cfg=cfg, self_gw="macbook", live=live)["where"] == HUB
++    apple = {"title": "Fix the parser", "skills": ["apple-notes"], "placement": "auto"}
++    assert kp.decide(apple, cfg=cfg, self_gw="macbook", live=live)["why"] == "local marker: skill apple-notes"
++    title = {"title": "Verify 57094b7a60 live on the MacBook", "placement": "auto"}
++    assert kp.decide(title, cfg=cfg, self_gw="macbook", live=live)["why"].startswith("local marker: mentions")
++
++
++def test_a_local_pin_note_simulates_an_omitted_placement_not_an_explicit_auto(hub):
++    """A context-skill card pinned local stays local without the pin too (the skill marker holds when placement is
++    omitted), so it gets no "would run elsewhere" note; the same card without the skill does. [daveey]"""
++    from tools.kanban_tools_placement import _local_placement
++    _registry()
++    pinned = {"where": "local", "why": kp.PINNED_LOCAL_WHY}
++    card = {"title": "summarise the failing CI jobs", "assignee": "default", "requires": [], "placement": "local"}
++    plain = _local_placement(kp, card, pinned, machine_ok=None, note_local_pin=True)
++    assert plain.get("note"), plain  # control: portable work pinned local is told where it would go
++    skilled = _local_placement(kp, {**card, "skills": ["myapp-development"]}, pinned, machine_ok=None,
++                               note_local_pin=True)
++    assert "note" not in skilled, skilled
++
++
+ def test_heavy_route_accepts_a_pool_label_and_checks_it_is_live(hub):
+     cfg = {"heavy_route": {HUB: POOL}}
+     _registry(held=("worker-1",))
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index 710bd20471..32e6709dbf 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -149,10 +149,11 @@ def _local_placement(kp, view: dict, decision: dict, *, machine_ok, note_local_p
+         return {"where": "local", "runs_on": decision["runs_on"], "why": why}
+     logger.info("kanban placement: local (%s)", why)
+     if why.startswith("local marker"):
+-        return {"where": "local", "why": why, "remedy": kp.LOCAL_MARKER_REMEDY}
++        return {"where": "local", "why": why, "remedy": kp.marker_remedy(why)}
+     placement = {"where": "local", "why": why}
+     if note_local_pin and why == kp.PINNED_LOCAL_WHY:
+-        unpinned = kp.decide({**view, "placement": "auto"}, machine_ok=machine_ok)
++        # Unpinned means placement omitted: an explicit 'auto' would also drop a skill marker (marker_skills).
++        unpinned = kp.decide({k: v for k, v in view.items() if k != "placement"}, machine_ok=machine_ok)
+         where = unpinned.get("where")
+         elsewhere = (unpinned.get("defer") or ", ".join(unpinned.get("runs_on") or ())) if where == "local" else where
+         if elsewhere and where != "refuse":
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 07a69227f4..2e0da64789 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -1002,9 +1002,9 @@ KANBAN_ARCHIVE_SCHEMA = _schema(
+     (
+         "Archive a card. A dispatcher worker may archive an unclaimed or done card "
+         "its own task created (creator_task_id is the caller's task): the "
+-        "cleanup when kanban_create kept a card local because of a text "
+-        "marker and the work does not need this machine (re-create it with "
+-        "placement='hub'), or of a scratch card (e.g. a live-proof waiter) that "
++        "cleanup when kanban_create kept a card local because of a local "
++        "marker and the work does not need this machine (re-create it as the "
++        "result's placement.remedy says), or of a scratch card (e.g. a live-proof waiter) that "
+         "has finished. A done card is refused while an open card lists it as a "
+         "parent. It may also archive a done or unclaimed capability "
+         "owner card (idempotency_key capability-owner:<card>:...) when <card> "
+-- 
+2.43.0
+

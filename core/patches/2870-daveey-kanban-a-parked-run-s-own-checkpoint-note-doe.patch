@@ -1,0 +1,396 @@
+From 74b9347149f2139e9ea16a5309c9a2fd656db121 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:16:27 +0000
+Subject: [PATCH] [daveey] kanban: a parked run's own checkpoint note does not
+ re-arm active_pr
+
+An owner that parks orderly (scheduled/continued) and then writes its checkpoint note
+restating its PR a few seconds later was held on its wake: the guard read its own note as
+publication newer than the park (MacBook t_01a1cff0541bf30c, park 06:48:32 PST, own note
+06:48:39 naming PR #1486, held until an operator `kanban resume`).
+
+The note now belongs to the park when its commented event names exactly the parking run
+(portable writer_run_uid on synced schemas, the local integer only on unsynced ones, one
+event per row), it precedes any later claim, and every PR it names was already named in this
+card's own PR comments before the park. Other runs' notes, chats, new PRs and unreadable
+provenance keep today's hold. test_kanban_pickup_event_history's park+repeat case now covers
+both: restating the parked PR resumes (hub and picked-up replica), a new PR still holds.
+
+Proof:
+- RED on the base: the 4 repro cases (scheduled/continued x local/synced) returned
+  active_pr; GREEN after.
+- Replay over copies of every hub kanban DB and sync-shadow (2,089 evaluations at now and
+  park+600 s, 7 days): 2 changed, both this class. The incident cut at 15:04:45Z goes
+  active_pr -> None; t_01a1af251a1c7525 (run 25830 continued 05:43:17, same-uid note at
+  05:43:38 restating daveey/hermes#907) goes active_pr -> None.
+- Mutants: 21 run, 19 killed. 2 survivors are equivalent: an unreadable park time read as
+  epoch 0 leaves the known-PR set empty, and re-timing pre-park comments to park-1 keeps
+  them before the park.
+
+Card: t_01a1d04fee42c1c7
+---
+ hermes_cli/kanban_db_dispatch_pr_state.py     |  23 ++-
+ hermes_cli/kanban_pr_park_note.py             |  87 +++++++++
+ .../test_kanban_pickup_event_history.py       |   8 +-
+ .../test_kanban_pr_comment_provenance.py      | 176 ++++++++++++++++++
+ 4 files changed, 286 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_pr_park_note.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 0e4ca842aa..d80f5b9728 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -455,6 +455,10 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     merge is resumed by that unblock to ship/verify THAT PR. So does an orderly park AFTER the
+     PR comment (``continued`` checkpoint or ``scheduled`` timed wait): the owner parked knowing
+     its PR, and the wake resumes it from that checkpoint, not a context-free respawn.
++    The parking run's own note written just after that park, restating PRs this card
++    already named, belongs to the park and does not post-date it
++    (:mod:`hermes_cli.kanban_pr_park_note`); any other run's note, a new PR or unreadable
++    provenance keeps the hold.
+     So does a supported operator reopen of the done card (``reopened``, strictly after): the
+     rerun resumes THAT PR; its ``REOPENED:`` note carries chat provenance, so it is FYI here.
+     An ordering ``dependency_wait`` strictly after the newest PR comment also permits
+@@ -504,15 +508,22 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     # Own/unknown candidates only: drop another live card's contract pull and pulls named
+     # only as not blocking this card; only comments that keep a pull order the watermark.
+     holding = holding_urls(conn, task_id, [(u, body) for _, _, body, urls in candidates for u in urls])
++    kept_by_comment = [(t, comment_id, [u for u in urls if norm_pr(u) in holding])
++                       for t, comment_id, _body, urls in candidates]
++    kept_by_comment = [c for c in kept_by_comment if c[2]]
++    # The parked run's own post-park note restating known PRs is part of its park. [daveey]
++    from hermes_cli.kanban_pr_park_note import restated_after_park
++    restated, parked_at = restated_after_park(conn, task_id, kept_by_comment)
+     pr_times: list[int] = []
+     pr_urls: list[str] = []
+     latest_pr_comment_id = 0
+-    for t, comment_id, _body, urls in candidates:
+-        kept = [u for u in urls if norm_pr(u) in holding]
+-        if kept:
+-            latest_pr_comment_id = max(latest_pr_comment_id, comment_id)
+-            pr_times.append(t)
+-            pr_urls.extend(kept)
++    for t, comment_id, kept in kept_by_comment:
++        pr_urls.extend(kept)
++        if comment_id in restated:
++            pr_times.append(parked_at - 1)  # ordered before the park it belongs to
++            continue
++        latest_pr_comment_id = max(latest_pr_comment_id, comment_id)
++        pr_times.append(t)
+     if not pr_times:
+         # Foreign handoffs may still carry queue-rejection repair instructions,
+         # but cannot create a duplicate-publication hold.
+diff --git a/hermes_cli/kanban_pr_park_note.py b/hermes_cli/kanban_pr_park_note.py
+new file mode 100644
+index 0000000000..98961f88d5
+--- /dev/null
++++ b/hermes_cli/kanban_pr_park_note.py
+@@ -0,0 +1,87 @@
++"""The parked run's own checkpoint note does not post-date its park. [daveey]
++
++A worker that parks orderly (``scheduled`` timed wait or ``continued`` checkpoint) often
++writes its checkpoint note a few seconds AFTER the park lands: the tool call ends the run,
++then the agent posts its summary. When that note restates the card's PR, the respawn
++guard's ``active_pr`` rule read it as fresh publication newer than the park, so the park no
++longer counted as a handoff and the owner's wake was held (2026-11-12 MacBook
++t_01a1cff0541bf30c: park 06:48:32, own note 06:48:39 naming PR #1486, wake held until an
++operator ``kanban resume``).
++
++Such a note is part of the park, not new evidence, but only when every fact is proven:
++
++* its ``commented`` event names exactly the run that recorded the latest orderly park
++  (the portable ``writer_run_uid`` on a synced schema; the database-local integer only on
++  an unsynced one), with one event per comment row;
++* it was written at or after the park and before any later claim of the card;
++* every PR it names was already named in this card's own PR comments before the park.
++
++A note naming a new PR, any other run's note, or unreadable provenance keeps today's rules.
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Optional
++
++from hermes_cli.kanban_db_dispatch_pr_policy import norm_pr
++
++_PARK_KINDS = ("scheduled", "continued")
++
++
++def _writer_matches(conn: sqlite3.Connection, data: dict, run_id: int) -> bool:
++    try:
++        row = conn.execute("SELECT uid FROM task_runs WHERE id = ?", (run_id,)).fetchone()
++    except sqlite3.OperationalError:
++        # Unsynced schema: the integer is this database's own run id.
++        writer = data.get("writer_run_id")
++        return "writer_run_uid" not in data and type(writer) is int and writer == run_id
++    uid = row[0]  # the caller proved the run row exists
++    return isinstance(uid, str) and data.get("writer_run_uid") == uid
++
++
++def restated_after_park(
++    conn: sqlite3.Connection, task_id: str, candidates: list[tuple[int, int, list[str]]],
++) -> tuple[set[int], int]:
++    """(ids of ``candidates`` that are the parked run's own restatements, park epoch).
++
++    ``candidates`` are the guard's own/unknown PR comments as (epoch, local row id, urls).
++    Nothing proven: ``(set(), 0)``.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_dispatch_pr_state import _comment_events
++
++    park = conn.execute(
++        "SELECT id, run_id, created_at FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
++        "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id, *_PARK_KINDS),
++    ).fetchone()
++    if park is None:
++        return set(), 0
++    park_id, run_id, parked_at = park["id"], park["run_id"], kb._to_epoch(park["created_at"])
++    if parked_at is None:
++        return set(), 0
++    if conn.execute("SELECT 1 FROM task_runs WHERE id = ?", (run_id,)).fetchone() is None:
++        return set(), 0  # a park naming no run row (or none) proves no writer
++    claims = [(kb._to_epoch(r["created_at"]), r["id"]) for r in conn.execute(
++        "SELECT id, created_at FROM task_events WHERE task_id = ? AND kind = 'claimed'", (task_id,))]
++    later: list[int] = []
++    for at, eid in claims:
++        if at is None:
++            return set(), 0  # an unreadable claim time cannot be ordered against the note
++        if (at, eid) > (parked_at, park_id):
++            later.append(at)
++    bound = min(later, default=None)
++    # Unreadable comment events (None) prove nothing; a row with two events is ambiguous below.
++    by_row: dict[Optional[int], list[dict]] = {}
++    for data, _at, cid in _comment_events(conn, task_id) or []:
++        by_row.setdefault(cid, []).append(data)
++    known = {norm_pr(u) for t, _cid, urls in candidates if t < parked_at for u in urls}
++    restated: set[int] = set()
++    for t, cid, urls in candidates:
++        if t < parked_at or (bound is not None and t >= bound):
++            continue
++        datas = by_row.get(cid, [])
++        if len(datas) != 1 or not _writer_matches(conn, datas[0], run_id):
++            continue
++        if all(norm_pr(u) in known for u in urls):
++            restated.add(cid)
++    return restated, parked_at
+diff --git a/tests/hermes_cli/test_kanban_pickup_event_history.py b/tests/hermes_cli/test_kanban_pickup_event_history.py
+index 8ea57977e3..cad4c6165e 100644
+--- a/tests/hermes_cli/test_kanban_pickup_event_history.py
++++ b/tests/hermes_cli/test_kanban_pickup_event_history.py
+@@ -14,6 +14,7 @@ from tests.hermes_cli import test_kanban_worker_node as helpers
+ gws = helpers.gws
+ svc = helpers.svc
+ PR = "https://github.com/example/project/pull/123"
++NEW_PR = "https://github.com/example/project/pull/124"
+ 
+ 
+ def _owner(hub, monkeypatch, *, park=True, repeat=False):
+@@ -41,8 +42,11 @@ def _owner(hub, monkeypatch, *, park=True, repeat=False):
+             hub.conn.execute("UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+                              "claim_expires=NULL WHERE id=?", (tid,))
+     if repeat:
++        # The parking run's own note after its park: restating the PR it parked on belongs to
++        # the park; naming a NEW PR is fresh publication and holds.
+         clock[0] += 1
+-        kb.add_comment(hub.conn, tid, author="default", body=f"Published again {PR}")
++        kb.add_comment(hub.conn, tid, author="default",
++                       body=f"Published again {PR}" if repeat == "same" else f"Published another {NEW_PR}")
+     # Preserve the incident shape: noisy queue/guard events push ALL policy events
+     # outside the old 200-row tail, while comments and runs still travel in full.
+     with kb.write_txn(hub.conn):
+@@ -53,7 +57,7 @@ def _owner(hub, monkeypatch, *, park=True, repeat=False):
+ 
+ 
+ @pytest.mark.parametrize("park,repeat,expected", [(True, False, None), (False, False, "active_pr"),
+-                                                  (True, True, "active_pr")])
++                                                  (True, "same", None), (True, "new", "active_pr")])
+ @pytest.mark.parametrize("github_state", ["OPEN", None])
+ def test_pickup_preserves_guard_decision_and_event_identity(gws, monkeypatch, park, repeat, expected, github_state):
+     hub, worker = gws
+diff --git a/tests/hermes_cli/test_kanban_pr_comment_provenance.py b/tests/hermes_cli/test_kanban_pr_comment_provenance.py
+index c030d0e84d..415b7d2cfd 100644
+--- a/tests/hermes_cli/test_kanban_pr_comment_provenance.py
++++ b/tests/hermes_cli/test_kanban_pr_comment_provenance.py
+@@ -92,3 +92,179 @@ def test_own_or_unreadable_pr_comment_after_continued_still_guards(monkeypatch,
+         if provenance in mutations:
+             conn.execute(*mutations[provenance])
+         assert prs.active_pr_reason(conn, tid, now + 62) == "active_pr"
++
++
++def _park(conn, tid, kind):
++    if kind == "scheduled":
++        assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z review of the PR",
++                                clock_only=True)
++    else:
++        assert kc.continue_task(conn, tid, checkpoint="wait for review", resume_after_seconds=60)["ok"]
++
++
++def _owner_parked_then_noted(conn, monkeypatch, now, kind, note=URL, synced=False):
++    """Run R reports ``URL``, parks orderly at now+1, then writes its checkpoint note at now+8
++    (2026-11-12 MacBook t_01a1cff0541bf30c: park 06:48:32, own checkpoint comment 06:48:39).
++    ``synced``: a Board-synced schema, where runs carry a portable uid and comments name it."""
++    if synced:
++        conn.execute("ALTER TABLE task_runs ADD COLUMN uid TEXT")
++    tid = kb.create_task(conn, title="finish owned PR", assignee="a")
++    kb.claim_task(conn, tid)
++    run_id = conn.execute("SELECT id FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0]
++    if synced:
++        conn.execute("UPDATE task_runs SET uid = '01a1d022-04f4-7ae7-b583-' || printf('%012d', id) WHERE id=?",
++                     (run_id,))
++    _worker_comment(conn, tid, run_id, monkeypatch, f"Opened {URL}")
++    monkeypatch.setattr(time, "time", lambda: now + 1)
++    _park(conn, tid, kind)
++    monkeypatch.setattr(time, "time", lambda: now + 8)
++    _worker_comment(conn, tid, run_id, monkeypatch, f"Checkpoint: waiting on review of {note}")
++    return tid, run_id
++
++
++@pytest.mark.parametrize("synced", [False, True], ids=["local", "synced"])
++@pytest.mark.parametrize("kind", ["scheduled", "continued"])
++def test_own_checkpoint_note_after_orderly_park_keeps_the_park_as_handoff(monkeypatch, kind, synced):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++    with kbc.connect() as conn:
++        tid, _run = _owner_parked_then_noted(conn, monkeypatch, now, kind, synced=synced)
++        assert prs.active_pr_reason(conn, tid, now + 700) is None
++
++
++@pytest.mark.parametrize("kind", ["scheduled", "continued"])
++def test_own_note_after_park_naming_a_new_pr_still_guards(monkeypatch, kind):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++    with kbc.connect() as conn:
++        tid, _run = _owner_parked_then_noted(conn, monkeypatch, now, kind, note=NEW_URL)
++        assert prs.active_pr_reason(conn, tid, now + 700) == "active_pr"
++
++
++@pytest.mark.parametrize("kind", ["scheduled", "continued"])
++def test_pr_note_after_park_from_another_run_of_the_card_still_guards(monkeypatch, kind):
++    """A lingering earlier run of the same card is not the run that parked."""
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="finish owned PR", assignee="a")
++        kb.claim_task(conn, tid)
++        first = conn.execute("SELECT id FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0]
++        _worker_comment(conn, tid, first, monkeypatch, f"Opened {URL}")
++        assert kc.continue_task(conn, tid, checkpoint="next run", resume_after_seconds=0)["ok"]
++        monkeypatch.setattr(time, "time", lambda: now + 1)
++        kb.claim_task(conn, tid)
++        monkeypatch.setattr(time, "time", lambda: now + 2)
++        _park(conn, tid, kind)
++        monkeypatch.setattr(time, "time", lambda: now + 9)
++        _worker_comment(conn, tid, first, monkeypatch, f"Checkpoint: waiting on review of {URL}")
++        assert prs.active_pr_reason(conn, tid, now + 700) == "active_pr"
++
++
++@pytest.mark.parametrize("gap", [0, 1], ids=["same_second_as_claim", "after_claim"])
++def test_parked_run_note_after_a_later_claim_still_guards(monkeypatch, gap):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="finish owned PR", assignee="a")
++        kb.claim_task(conn, tid)
++        run_id = conn.execute("SELECT id FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0]
++        _worker_comment(conn, tid, run_id, monkeypatch, f"Opened {URL}")
++        monkeypatch.setattr(time, "time", lambda: now + 1)
++        _park(conn, tid, "scheduled")
++        monkeypatch.setattr(time, "time", lambda: now + 600)
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))  # the wake
++        kb.claim_task(conn, tid)
++        monkeypatch.setattr(time, "time", lambda: now + 600 + gap)
++        _worker_comment(conn, tid, run_id, monkeypatch, f"Still on {URL}")
++        assert prs.active_pr_reason(conn, tid, now + 700) == "active_pr"
++
++
++def test_pr_notes_with_no_park_still_guard(monkeypatch):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="finish owned PR", assignee="a")
++        kb.claim_task(conn, tid)
++        run_id = conn.execute("SELECT id FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0]
++        _worker_comment(conn, tid, run_id, monkeypatch, f"Opened {URL}")
++        monkeypatch.setattr(time, "time", lambda: now + 8)
++        _worker_comment(conn, tid, run_id, monkeypatch, f"Checkpoint {URL}")
++        conn.execute("UPDATE task_runs SET status='crashed', outcome='crashed', ended_at=? WHERE id=?",
++                     (now + 9, run_id))
++        assert prs.active_pr_reason(conn, tid, now + 700) == "active_pr"
++
++
++def test_chat_note_after_scheduled_park_stays_fyi(monkeypatch):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="finish owned PR", assignee="a")
++        kb.claim_task(conn, tid)
++        run_id = conn.execute("SELECT id FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0]
++        _worker_comment(conn, tid, run_id, monkeypatch, f"Opened {URL}")
++        monkeypatch.setattr(time, "time", lambda: now + 1)
++        _park(conn, tid, "scheduled")
++        monkeypatch.setattr(time, "time", lambda: now + 8)
++        kb.add_comment(conn, tid, "a", f"FYI review of {URL} is running")
++        assert prs.active_pr_reason(conn, tid, now + 700) is None
++
++
++_FOREIGN_UID = "01a1d022-0000-7000-8000-000000000000"
++
++
++def _set(key, value):
++    return lambda conn, tid, run_id, data, raw, now: data.__setitem__(key, value(run_id) if callable(value) else value)
++
++
++def _uid_less_run(conn, tid, run_id, data, raw, now):  # a legacy uid-less note against a uid-less run
++    conn.execute("UPDATE task_runs SET uid=NULL WHERE id=?", (run_id,))
++    data.pop("writer_run_uid")
++
++
++def _missing_park_run(conn, tid, run_id, data, raw, now):  # the park and the note name a run with no row
++    conn.execute("UPDATE task_events SET run_id=? WHERE task_id=? AND kind='scheduled'", (run_id + 50, tid))
++    data["writer_run_id"] = run_id + 50
++
++
++_SYNCED_PROVENANCE = {
++    "no_uid": lambda conn, tid, run_id, data, raw, now: data.pop("writer_run_uid"),  # an integer can't vouch here
++    "foreign_uid": _set("writer_run_uid", _FOREIGN_UID),
++    "uid_less_park_run": _uid_less_run,
++    "duplicate_event": lambda conn, tid, run_id, data, raw, now: conn.execute(
++        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'commented', ?, ?)", (tid, raw, now + 8)),
++}
++_LOCAL_PROVENANCE = {
++    "boolean_run": _set("writer_run_id", True),
++    "other_run": _set("writer_run_id", lambda run_id: run_id + 1),
++    "stray_uid": _set("writer_run_uid", _FOREIGN_UID),  # unsynced schema: unreadable
++    "unmatched_row": lambda conn, tid, run_id, data, raw, now: conn.execute(
++        "UPDATE task_comments SET author='someone-else' WHERE id=?", (data["comment_id"],)),
++    "missing_park_run": _missing_park_run,
++    "unreadable_park_time": lambda conn, tid, run_id, data, raw, now: conn.execute(
++        "UPDATE task_events SET created_at='later' WHERE task_id=? AND kind='scheduled'", (tid,)),
++    "unreadable_claim_time": lambda conn, tid, run_id, data, raw, now: conn.execute(
++        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'claimed', '{}', 'x')", (tid,)),
++}
++
++
++@pytest.mark.parametrize("provenance", [*_SYNCED_PROVENANCE, *_LOCAL_PROVENANCE])
++def test_unproven_writer_of_post_park_note_still_guards(monkeypatch, provenance):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    monkeypatch.setattr(prs, "pr_state", lambda url: "OPEN")
++    with kbc.connect() as conn:
++        tid, run_id = _owner_parked_then_noted(conn, monkeypatch, now, "scheduled",
++                                               synced=provenance in _SYNCED_PROVENANCE)
++        event, raw = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='commented' "
++                                  "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++        data = json.loads(raw)
++        {**_SYNCED_PROVENANCE, **_LOCAL_PROVENANCE}[provenance](conn, tid, run_id, data, raw, now)
++        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(data), event))
++        assert prs.active_pr_reason(conn, tid, now + 700) == "active_pr"
+-- 
+2.43.0
+

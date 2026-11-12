@@ -1,0 +1,254 @@
+From 7901243e19f61e1101489d2291faa5e934aa0112 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:38:22 -0800
+Subject: [PATCH] fix(tests): lockguard darwin + repair snapshot tests patch
+ module seams, not shared os/time [daveey]
+
+test_lockguard_darwin_safety's abi fixture patched the process-wide os.fstat,
+os.open, os.close, platform.machine and ctypes.PyDLL. pytest >= 9.2's
+FDCapture.snap reads os.fstat(tmpfile).st_size, so under the hermes-mods test
+site (pytest 9.2.0, CPython 3.14.9) all 24 tests errored at setup with
+"'SimpleNamespace' object has no attribute 'st_size'". CI's uv.lock env pins
+pytest 9.0.3 (no fstat in snap), so the macOS lane stayed green on the same
+interpreter.
+
+test_interrupted_snapshot_rolls_back_destination patched the shared
+time.monotonic with a two-tick iterator; any extra caller in the process
+raised StopIteration (teardown error in full tests/hermes_state runs).
+
+Production change is only the seams: hermes_state_lockguard_darwin gets
+_open/_close/_fstat/_machine/_load_libc, hermes_state_repair gets _monotonic
+for the snapshot deadline. Tests patch those; the clock fake never runs dry.
+New guard test asserts the abi fixture leaves the shared functions untouched.
+---
+ hermes_state_lockguard_darwin.py              | 25 +++++++++---
+ hermes_state_repair.py                        |  5 ++-
+ .../test_lockguard_darwin_safety.py           | 39 ++++++++++++++-----
+ .../test_lockguard_fd_scan_darwin.py          |  2 +-
+ .../test_state_db_repair_non_destructive.py   | 13 ++++++-
+ 5 files changed, 64 insertions(+), 20 deletions(-)
+
+diff --git a/hermes_state_lockguard_darwin.py b/hermes_state_lockguard_darwin.py
+index e9faa53461..dd2e62aa74 100644
+--- a/hermes_state_lockguard_darwin.py
++++ b/hermes_state_lockguard_darwin.py
+@@ -13,14 +13,27 @@ import sys
+ 
+ MAX_FDS = 8192
+ 
++# Module-local seams: tests patch these, never the shared os/platform/ctypes
++# functions every other caller in the process (pytest's fd capture included) uses.
++_open = os.open
++_close = os.close
++_fstat = os.fstat
++_machine = platform.machine
++
++
++def _load_libc():
++    import ctypes
++
++    return ctypes.PyDLL(None)
++
+ 
+ def build():
+-    if sys.platform != "darwin" or platform.machine() not in ("arm64", "x86_64"):
++    if sys.platform != "darwin" or _machine() not in ("arm64", "x86_64"):
+         return None
+     try:
+         import ctypes
+ 
+-        libc = ctypes.PyDLL(None)
++        libc = _load_libc()
+         fstat = getattr(libc, "fstat$INODE64", None) or libc.fstat
+         fstat.argtypes, fstat.restype = [ctypes.c_int, ctypes.c_void_p], ctypes.c_int
+         pidinfo = libc.proc_pidinfo
+@@ -42,7 +55,7 @@ def build():
+         # GIL-releasing fstat) and learn its conversion only from a consistent
+         # answer. Python's own st_dev is always the authoritative identity.
+         try:
+-            st = os.fstat(fd)
++            st = _fstat(fd)
+         except OSError:
+             return None
+         if st.st_ino == ino and st.st_dev in (dev, dev & mask):
+@@ -77,11 +90,11 @@ def build():
+         return [fd for fd, _kind in struct.iter_unpack("=iI", buf.raw[:size])]
+ 
+     try:
+-        probe = os.open(os.devnull, os.O_RDONLY)
++        probe = _open(os.devnull, os.O_RDONLY)
+     except OSError:
+         return None
+     try:
+-        st = os.fstat(probe)
++        st = _fstat(probe)
+         # A negative /dev/null device proves the conversion now; a nonnegative
+         # one (devfs numbering varies by host) leaves it to learn() at runtime.
+         # Either way the native identity must match Python's exactly.
+@@ -102,5 +115,5 @@ def build():
+     except (OSError, ValueError, TypeError, struct.error, ctypes.ArgumentError):
+         return None
+     finally:
+-        os.close(probe)
++        _close(probe)
+     return identity, descriptors
+diff --git a/hermes_state_repair.py b/hermes_state_repair.py
+index d4921f5712..c021da8bdb 100644
+--- a/hermes_state_repair.py
++++ b/hermes_state_repair.py
+@@ -34,6 +34,7 @@ from hermes_state_common import (
+ logger = logging.getLogger("hermes_state")
+ 
+ _REPAIR_LOCK_POLL_SECONDS = 0.1
++_monotonic = time.monotonic  # snapshot-deadline clock seam: tests patch this, never the shared time module
+ # Snapshot copies are data transfer, not locking: bounded separately at 10 MiB/s (historical two-minute floor).
+ _REPAIR_SNAPSHOT_MIN_THROUGHPUT_BYTES_PER_SECOND = 10 * 1024 * 1024
+ # ── Repair-loop bounding + dead-backup hygiene (#86747) ───────────────────── ``_claim_repair_attempt``
+@@ -708,10 +709,10 @@ def _copy_database_snapshot(source_path: Path, destination_path: Path, *,
+     back if interrupted), so ``state.db`` is never swapped out from under handles that refer to it."""
+     # Deadline first: a sidecar vanishing mid-stat must not leak a just-opened descriptor.
+     deadline_seconds = _repair_snapshot_timeout_seconds(source_path)
+-    deadline = time.monotonic() + deadline_seconds
++    deadline = _monotonic() + deadline_seconds
+ 
+     def _check_deadline(_status: int, _remaining: int, _total: int) -> None:
+-        if time.monotonic() >= deadline:
++        if _monotonic() >= deadline:
+             raise TimeoutError(f"timed out copying SQLite repair snapshot after {deadline_seconds:.0f}s")
+ 
+     with contextlib.ExitStack() as owned:  # closes only connections opened here, destination first
+diff --git a/tests/hermes_state/test_lockguard_darwin_safety.py b/tests/hermes_state/test_lockguard_darwin_safety.py
+index 038ed668c4..26b8d5a37e 100644
+--- a/tests/hermes_state/test_lockguard_darwin_safety.py
++++ b/tests/hermes_state/test_lockguard_darwin_safety.py
+@@ -1,6 +1,9 @@
+ """Exercise Darwin ABI refusal with injected native-call failures."""
+ import ctypes
++import os
++import platform
+ import struct
++import sys
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -34,15 +37,33 @@ def abi(monkeypatch):
+         return state.listed
+ 
+     libc = SimpleNamespace(fstat=Function(fstat), proc_pidinfo=Function(pidinfo))
+-    monkeypatch.setattr(darwin.platform, "machine", lambda: "arm64")
+-    monkeypatch.setattr(ctypes, "PyDLL", lambda _: libc)
+-    monkeypatch.setattr(darwin.os, "open", lambda *args: 42)
+-    monkeypatch.setattr(darwin.os, "close", state.closes.append)
+-    monkeypatch.setattr(darwin.os, "fstat", lambda fd: SimpleNamespace(st_dev=state.stat_dev, st_ino=123))
++    # Patch only the module's own seams: the shared os/platform/ctypes functions
++    # serve the whole process (pytest >= 9.2's fd capture reads os.fstat().st_size).
++    monkeypatch.setattr(darwin, "_machine", lambda: "arm64")
++    monkeypatch.setattr(darwin, "_load_libc", lambda: libc)
++    monkeypatch.setattr(darwin, "_open", lambda *args: 42)
++    monkeypatch.setattr(darwin, "_close", state.closes.append)
++    monkeypatch.setattr(darwin, "_fstat", lambda fd: SimpleNamespace(st_dev=state.stat_dev, st_ino=123))
+     state.libc = libc
+     return state
+ 
+ 
++def _shared():
++    return (os.open, os.close, os.fstat, platform.machine, ctypes.PyDLL)
++
++
++def test_fakes_leave_shared_stdlib_untouched(request):
++    # Regression: patching os.fstat itself broke every other caller in the
++    # process (pytest 9.2's FDCapture.snap errored on .st_size at setup).
++    before = _shared()
++    abi = request.getfixturevalue("abi")
++    assert _shared() == before
++    assert os.fstat(sys.stderr.fileno()).st_size >= 0
++    native, _descriptors = darwin.build()
++    assert native(42) == (-7, 123)
++    assert abi.closes == [42]
++
++
+ @pytest.mark.parametrize("unsigned", [False, True])
+ def test_runtime_dev_conversion(abi, unsigned):
+     abi.stat_dev = ((1 << 64) - 7) if unsigned else -7
+@@ -76,7 +97,7 @@ def test_nonnegative_sentinel_learns_conversion_at_runtime(abi, monkeypatch, uns
+     def fail(fd):
+         raise AssertionError("conversion is learned; no Python fstat handoff")
+ 
+-    monkeypatch.setattr(darwin.os, "fstat", fail)
++    monkeypatch.setattr(darwin, "_fstat", fail)
+     assert native(42) == (abi.stat_dev, 123)
+     assert descriptors() == [42]
+ 
+@@ -118,7 +139,7 @@ def test_runtime_fstat_failure_before_learning_reports_closed(abi, monkeypatch):
+     def closed(fd):
+         raise OSError(9, "closed")
+ 
+-    monkeypatch.setattr(darwin.os, "fstat", closed)
++    monkeypatch.setattr(darwin, "_fstat", closed)
+     assert native(42) is None
+ 
+ 
+@@ -136,12 +157,12 @@ def test_missing_symbol_disarms(abi):
+ 
+ 
+ def test_unsupported_architecture_disarms(abi, monkeypatch):
+-    monkeypatch.setattr(darwin.platform, "machine", lambda: "unknown")
++    monkeypatch.setattr(darwin, "_machine", lambda: "unknown")
+     assert darwin.build() is None
+     assert abi.closes == []
+ 
+ 
+ def test_probe_not_listed_disarms(abi, monkeypatch):
+-    monkeypatch.setattr(darwin.os, "open", lambda *args: 43)
++    monkeypatch.setattr(darwin, "_open", lambda *args: 43)
+     assert darwin.build() is None
+     assert abi.closes == [43]
+diff --git a/tests/hermes_state/test_lockguard_fd_scan_darwin.py b/tests/hermes_state/test_lockguard_fd_scan_darwin.py
+index c47df54590..ae0b208963 100644
+--- a/tests/hermes_state/test_lockguard_fd_scan_darwin.py
++++ b/tests/hermes_state/test_lockguard_fd_scan_darwin.py
+@@ -82,5 +82,5 @@ def test_probe_open_failure_disarms(monkeypatch):
+     def unavailable(*args):
+         raise OSError("descriptor limit")
+ 
+-    monkeypatch.setattr(darwin.os, "open", unavailable)
++    monkeypatch.setattr(darwin, "_open", unavailable)  # the module seam, never the shared os.open
+     assert darwin.build() is None
+diff --git a/tests/hermes_state/test_state_db_repair_non_destructive.py b/tests/hermes_state/test_state_db_repair_non_destructive.py
+index 64478ae79b..2f1f7f817f 100644
+--- a/tests/hermes_state/test_state_db_repair_non_destructive.py
++++ b/tests/hermes_state/test_state_db_repair_non_destructive.py
+@@ -53,6 +53,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import hashlib
++import itertools
+ import multiprocessing
+ import os
+ import shutil
+@@ -739,12 +740,20 @@ def test_interrupted_snapshot_rolls_back_destination(tmp_path, monkeypatch):
+         conn.execute("INSERT INTO marker VALUES ('original')")
+         conn.commit()
+ 
+-    ticks = iter((0.0, hermes_state._REPAIR_LOCK_TIMEOUT_SECONDS + 1.0))
+-    monkeypatch.setattr(hermes_state.time, "monotonic", lambda: next(ticks))
++    # The fake clock is the repair module's own seam (never the shared time
++    # module, which teardown and other callers read) and never runs dry: after
++    # the start tick it stays past the deadline for any number of reads.
++    expired = hermes_state._REPAIR_LOCK_TIMEOUT_SECONDS + 1.0
++    ticks = itertools.chain((0.0,), itertools.repeat(expired))
++    monkeypatch.setattr(hermes_state_repair, "_monotonic", lambda: next(ticks))
++    real_monotonic = time.monotonic
+ 
+     with pytest.raises(TimeoutError):
+         hermes_state_repair._copy_database_snapshot(source, destination)
+ 
++    assert time.monotonic is real_monotonic
++    assert [hermes_state_repair._monotonic() for _ in range(5)] == [expired] * 5
++
+     with sqlite3.connect(str(destination)) as conn:
+         assert conn.execute("SELECT value FROM marker").fetchall() == [("original",)]
+ 
+-- 
+2.43.0
+

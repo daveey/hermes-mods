@@ -1,0 +1,127 @@
+From feabfcbbfd578023306de72485dc9d896fa44550 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:17:27 -0800
+Subject: [PATCH] [daveey] Arm the browse reconcile budget before the macOS
+ durability pragmas
+
+On macOS the browse catch-up's DDL connection runs PRAGMA checkpoint_fullfsync
+and PRAGMA synchronous=FULL first, and synchronous=FULL loads the schema. The
+budget's progress handler was armed only after them, and BEGIN IMMEDIATE ran
+outside the rollback try. So on darwin a slow store held gateway.lock for an
+unbounded schema load (gateway boot's 5 s wait gave up with OwnershipConflict),
+and the late interrupt hit BEGIN and surfaced as a "corrupt store" 503 instead
+of the retryable "nothing was changed" one. Linux never runs these pragmas.
+
+Arm the budget first and run the barriers and BEGIN inside the try.
+test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out[ddl]
+failed 5/5 on laptop-1 before and passes 5/5 after. The new
+test_browse_budget_is_armed_before_the_macos_durability_pragmas runs the darwin
+pragmas on every platform, because the macOS CI lane covers only tests/hermes_state.
+(t_01a1cfdfa4c7e85f)
+---
+ hermes_state_reconcile.py                    |  7 +-
+ tests/hermes_cli/test_browse_schema_drift.py | 68 ++++++++++++++++++++
+ 2 files changed, 73 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_state_reconcile.py b/hermes_state_reconcile.py
+index 80f90b6e63..049205c98b 100644
+--- a/hermes_state_reconcile.py
++++ b/hermes_state_reconcile.py
+@@ -232,10 +232,13 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
+     budget.check()
+     with closing(connect_tracked(path, tracking_path=path, timeout=budget.busy_timeout(),
+                                  isolation_level=None)) as conn:
+-        _reapply_durability_barriers(conn)
++        # Armed before the first statement: on macOS the durability pragmas run first and load the
++        # schema, so arming after them left that work (and BEGIN) outside the budget under the lock.
+         budget.arm(conn)
+-        conn.execute('BEGIN IMMEDIATE')
+         try:
++            _reapply_durability_barriers(conn)  # swallows an interrupt; check() below reports it
++            budget.check()
++            conn.execute('BEGIN IMMEDIATE')
+             cursor = conn.cursor()
+             apply_declared_schema(cursor)
+             # Postcondition, still inside the transaction: every declared table/column resolves.
+diff --git a/tests/hermes_cli/test_browse_schema_drift.py b/tests/hermes_cli/test_browse_schema_drift.py
+index 43f18f6cc2..b076f40439 100644
+--- a/tests/hermes_cli/test_browse_schema_drift.py
++++ b/tests/hermes_cli/test_browse_schema_drift.py
+@@ -608,6 +608,74 @@ def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(
+     assert "last_read_at" not in _session_columns(path)
+ 
+ 
++class _ArmTrackingConnection:
++    """Records each statement with whether the budget's progress handler was armed when it ran;
++    the handler fires on every VM op so an expired deadline interrupts the very next statement."""
++
++    def __init__(self, conn, executed):
++        self._conn, self._executed, self._armed = conn, executed, False
++
++    def __getattr__(self, name):
++        return getattr(self._conn, name)
++
++    def set_progress_handler(self, handler, n):
++        self._armed = handler is not None
++        return self._conn.set_progress_handler(handler, 1 if handler is not None else n)
++
++    def execute(self, sql, *args):
++        self._executed.append((sql, self._armed))
++        return self._conn.execute(sql, *args)
++
++    def close(self):
++        return self._conn.close()
++
++
++@pytest.mark.parametrize("deadline_hits", ["never", "during_macos_pragma"])
++def test_browse_budget_is_armed_before_the_macos_durability_pragmas(tmp_path, monkeypatch, deadline_hits):
++    """On macOS the DDL connection's first statements are the durability pragmas, and the first one
++    that needs the schema loads it. Armed after them, that load ran unbounded under gateway.lock, so a
++    slow store outlasted gateway boot's wait (OwnershipConflict, t_01a1cfdfa4c7e85f), and the late
++    interrupt hit BEGIN outside the rollback path as a 'corrupt' 503. Runs the darwin pragmas on
++    every platform: Linux CI never executes them otherwise."""
++    import contextlib
++
++    import hermes_cli.sqlite_safe_read as ssr
++    import hermes_state_reconcile as reconcile
++    import hermes_state_wal as wal
++
++    def darwin_pragma(conn, pragma):  # wal._darwin_pragma's macOS branch
++        with contextlib.suppress(sqlite3.OperationalError):
++            conn.execute(pragma)
++
++    path = _lagging_store_with_history(_profile_home(tmp_path), rows=10)
++    before = _file_state(path)
++    executed = []
++    original = ssr.connect_tracked
++    monkeypatch.setattr(wal, "_darwin_pragma", darwin_pragma)
++    monkeypatch.setattr(ssr, "connect_tracked",
++                        lambda *a, **kw: _ArmTrackingConnection(original(*a, **kw), executed))
++    budget = reconcile._Budget(60)
++    deadline = budget.deadline
++    expires = deadline_hits == "during_macos_pragma"
++
++    def clock():  # the deadline passes once the schema-loading pragma starts
++        in_pragma = any("synchronous" in sql for sql, _ in executed)
++        return deadline + 1 if expires and in_pragma else deadline - 30
++
++    budget._clock = clock
++
++    if expires:
++        with pytest.raises(reconcile.BrowseBudgetExceeded):
++            reconcile._apply_additive_schema(path, budget)
++        assert _file_state(path) == before
++        assert "last_read_at" not in _session_columns(path)
++    else:
++        reconcile._apply_additive_schema(path, budget)
++        assert "last_read_at" in _session_columns(path)
++    assert [sql for sql, _ in executed][:2] == ["PRAGMA checkpoint_fullfsync=1", "PRAGMA synchronous=FULL"]
++    assert [sql for sql, armed in executed if not armed] == []
++
++
+ def test_equal_cardinality_corrupt_index_plus_drift_is_not_written(tmp_path):
+     """R2-3: quick_check does not compare index keys with the table, so two equal-size indexes
+     with swapped root pages pass it. Browse must still refuse as corrupt and write nothing."""
+-- 
+2.43.0
+

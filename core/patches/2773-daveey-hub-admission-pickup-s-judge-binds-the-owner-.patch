@@ -1,0 +1,217 @@
+From 69f1eadc0427bcdf1ccf076e837a8dc874573690 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 14:00:05 +0000
+Subject: [PATCH] [daveey] hub admission: pickup's judge binds the owner secret
+ scope in the gateway dispatcher; log each unavailable branch
+
+Hub pickup skipped every cache-miss hub-bound foreign card as "hub admission unavailable; retried next
+tick" (t_01a1cff283f89392). Reproduced in the live hub gateway (sys.remote_exec probe, fresh-Context
+thread like the dispatcher): admit() returned the default Verdict in 0.01 s because call_llm's credential
+pool seeding read ANTHROPIC_TOKEN through get_secret with no secret scope bound, and the multiplexing
+gateway raises UnscopedSecretError there. The dispatcher ticks in an empty Context; the auto-decomposer
+already binds the launch profile's scope, the pickup judge did not. A cache hit reads no credential,
+which is why only pre-warmed verdicts got through.
+
+admit() now binds owner_secret_scope(get_hermes_home()) around the judge call when multiplexing is on
+and no scope is bound (a creating turn's scope is kept; the judge thread inherits it via copy_context).
+Each unavailable branch (routing off, timeout, route mismatch, exception type) and pickup's
+in-transaction deferral log a warning naming it.
+
+Tests: tests/test_kanban_hub_admission_dispatcher_scope.py (RED on main: the empty-Context multiplexing
+call denies unavailable and nothing is logged; GREEN here).
+---
+ hermes_cli/kanban_hub_admission.py            | 38 ++++++++-
+ hermes_cli/kanban_hub_admission_pickup.py     |  2 +
+ ...t_kanban_hub_admission_dispatcher_scope.py | 77 +++++++++++++++++++
+ 3 files changed, 114 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_kanban_hub_admission_dispatcher_scope.py
+
+diff --git a/hermes_cli/kanban_hub_admission.py b/hermes_cli/kanban_hub_admission.py
+index fa8b2cf3d0..240acf9deb 100644
+--- a/hermes_cli/kanban_hub_admission.py
++++ b/hermes_cli/kanban_hub_admission.py
+@@ -1,15 +1,18 @@
+ """Evidence-checked hub admission, using an exact subscription-only judge."""
+ from __future__ import annotations
+ 
++import contextlib
+ import contextvars
+ import hashlib
+ import json
++import logging
+ import sqlite3
+ import threading
+ import time
+ from contextlib import closing
+ from dataclasses import asdict, dataclass, replace
+ 
++_log = logging.getLogger(__name__)
+ MODEL = "claude-sonnet-5-5"
+ PROVIDER = "anthropic"
+ TIMEOUT = 30
+@@ -88,7 +91,7 @@ def _cache(key, verdict=None):
+ 
+ 
+ def admit(card_fields, *, hub_reason=None) -> Verdict:
+-    """Deny if the managed subscription pool, rubric or judge is unavailable."""
++    """Deny if the managed subscription pool, rubric or judge is unavailable (each branch logs why)."""
+     sha = ""
+     try:
+         from hermes_cli import kanban_comment_relay
+@@ -98,6 +101,7 @@ def admit(card_fields, *, hub_reason=None) -> Verdict:
+         from agent import auxiliary_client as aux
+         from agent.model_routing_managed import managed_config
+         if managed_config() is None:
++            _log.warning("hub admission unavailable: managed subscription routing is off")
+             return Verdict()
+         body, sha = _skill()
+         key = hashlib.sha256(json.dumps([card_fields.get("title") or "", card_fields.get("body") or "",
+@@ -108,19 +112,47 @@ def admit(card_fields, *, hub_reason=None) -> Verdict:
+             return replace(_parse(json.dumps(payload), card_fields, hub_reason, sha), cached=True)
+         route = {}
+         deadline = time.monotonic() + TIMEOUT
+-        response = _bounded(lambda: _ask(aux, body, card_fields, hub_reason, route, deadline), deadline)
++        with _owner_scope():
++            response = _bounded(lambda: _ask(aux, body, card_fields, hub_reason, route, deadline), deadline)
+         if response is None:
++            _log.warning("hub admission unavailable: the judge did not answer within %ss", TIMEOUT)
+             return Verdict(skill_sha=sha)
+         if (route.get("provider"), route.get("model"), route.get("billing_group")) != (
+                 PROVIDER, MODEL, "subscription"):
++            _log.warning("hub admission unavailable: route %s/%s/%s is not the subscription judge",
++                         route.get("provider"), route.get("model"), route.get("billing_group"))
+             return Verdict(skill_sha=sha)
+         verdict = _parse(response.choices[0].message.content, card_fields, hub_reason, sha)
+         _cache(key, verdict)
+         return verdict
+-    except Exception:  # health: allow BLE001 -- a judge outage must deny placement, never fall back
++    except Exception as exc:  # health: allow BLE001 -- a judge outage must deny placement, never fall back
++        _log.warning("hub admission unavailable: %s: %s", type(exc).__name__, str(exc)[:300])
+         return Verdict(skill_sha=sha)
+ 
+ 
++@contextlib.contextmanager
++def _owner_scope():
++    """Bind the launch profile's secret scope for a judge call made outside any turn. [daveey]
++
++    The gateway dispatcher ticks in an empty Context, so hub pickup's judge ran unscoped and, on a
++    multiplexing gateway, its first credential read raised ``UnscopedSecretError``: every cache-miss
++    card was "unavailable" (t_01a1cff283f89392). The auto-decomposer binds the same scope. A bound
++    scope (a creating turn's) is kept; the judge thread inherits it via ``copy_context``.
++    """
++    from agent.secret_scope import current_secret_scope, is_multiplex_active, reset_secret_scope, set_secret_scope
++    if not is_multiplex_active() or current_secret_scope() is not None:
++        yield
++        return
++    from hermes_constants import get_hermes_home
++    from tui_gateway.launch_profile_policy import owner_secret_scope
++    home = get_hermes_home()
++    token = set_secret_scope(owner_secret_scope(home), profile_home=str(home))
++    try:
++        yield
++    finally:
++        reset_secret_scope(token)
++
++
+ def _ask(aux, body, card_fields, hub_reason, route, deadline):
+     with aux.aux_stream_deadline(deadline):
+         return aux.call_llm(
+diff --git a/hermes_cli/kanban_hub_admission_pickup.py b/hermes_cli/kanban_hub_admission_pickup.py
+index 82e175c778..9e4bc2c812 100644
+--- a/hermes_cli/kanban_hub_admission_pickup.py
++++ b/hermes_cli/kanban_hub_admission_pickup.py
+@@ -129,6 +129,8 @@ def screen(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, ids:
+             skips[tid] = ("other", f"hub admission denied: {str(prior.get('why') or '')[:150]}")
+             continue
+         if down or conn.in_transaction:
++            if not down:
++                _log.warning("hub admission: pickup of %s deferred, the board connection is in a transaction", tid)
+             skips[tid] = ("other", UNAVAILABLE)
+             continue
+         fields = _fields(card, board)
+diff --git a/tests/test_kanban_hub_admission_dispatcher_scope.py b/tests/test_kanban_hub_admission_dispatcher_scope.py
+new file mode 100644
+index 0000000000..750f6354bd
+--- /dev/null
++++ b/tests/test_kanban_hub_admission_dispatcher_scope.py
+@@ -0,0 +1,77 @@
++"""Hub pickup's judge answers live inside the gateway dispatcher (multiplexing, no turn scope). [daveey]
++
++t_01a1cff283f89392: the dispatcher ticks in an empty Context, so on the multiplexing hub gateway the
++judge's first credential read raised ``UnscopedSecretError`` and every cache-miss card was skipped as
++"hub admission unavailable". Only a pre-warmed verdict cache (no credential read) got through.
++"""
++if not __name__.startswith("tests."): raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")  # unittest-discovery guard
++import contextvars
++import importlib
++import json
++import logging
++from types import SimpleNamespace
++
++import pytest
++
++REPLY = {"admit": True, "need": "hub_chrome", "evidence": "signed-in Chrome", "why": "Needs the browser session."}
++
++
++@pytest.fixture
++def judge(tmp_path, monkeypatch):
++    gate = importlib.import_module("hermes_cli.kanban_hub_admission")
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
++    (tmp_path / ".env").write_text("ANTHROPIC_TOKEN=owner-token\n")
++    skill = tmp_path / "skills/devops/hub-admission-test/SKILL.md"
++    skill.parent.mkdir(parents=True)
++    skill.write_text("---\nname: hub-admission-test\n---\nJudge the card.")
++    from agent import auxiliary_client as aux
++    from agent import model_routing_managed as managed
++    from agent import secret_scope as ss
++    monkeypatch.setattr(managed, "managed_config", lambda: {"managed": True})
++    seen = []
++
++    def fake(**kwargs):  # like credential_pool._seed_anthropic_singletons: reads the token first
++        seen.append(ss.get_secret("ANTHROPIC_TOKEN"))
++        kwargs["route_info"].update(provider="anthropic", model="claude-sonnet-5-5", billing_group="subscription")
++        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(REPLY)))])
++
++    monkeypatch.setattr(aux, "call_llm", fake)
++    ss.set_multiplex_active(True)
++    try:
++        yield gate, seen, ss
++    finally:
++        ss.set_multiplex_active(False)
++
++
++def test_dispatcher_context_gets_a_live_verdict_under_the_owner_scope(judge):
++    """The failing branch: an unscoped, empty-Context call on a multiplexing gateway (cache miss)."""
++    gate, seen, ss = judge
++    verdict = contextvars.Context().run(gate.admit, {"title": "Use signed-in Chrome", "body": "new card"})
++    assert verdict.admit is True and verdict.cached is False
++    assert seen == ["owner-token"]
++    assert ss.current_secret_scope() is None  # the scope is the call's own, never left behind
++
++
++def test_a_bound_turn_scope_is_kept(judge):
++    gate, seen, ss = judge
++    token = ss.set_secret_scope({"ANTHROPIC_TOKEN": "turn-token"})
++    try:
++        assert gate.admit({"title": "Use signed-in Chrome", "body": "turn card"}).admit is True
++    finally:
++        ss.reset_secret_scope(token)
++    assert seen == ["turn-token"]
++
++
++def test_unavailable_logs_the_branch(judge, monkeypatch, caplog):
++    gate, _, _ = judge
++    from agent import auxiliary_client as aux
++
++    def fail(**kwargs):
++        raise RuntimeError("provider down")
++
++    monkeypatch.setattr(aux, "call_llm", fail)
++    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_hub_admission"):
++        verdict = gate.admit({"title": "Use signed-in Chrome", "body": "logged card"})
++    assert verdict.why == "admission unavailable"
++    assert "hub admission unavailable: RuntimeError: provider down" in caplog.text
+-- 
+2.43.0
+

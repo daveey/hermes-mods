@@ -1,0 +1,317 @@
+From 16fbcfaa9872775582a33d5a0778bbaceac4ad6c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:20:25 +0000
+Subject: [PATCH] [daveey] kanban chat links: classify ledger sessions once per
+ origin profile, not once per row
+
+_ledger_links called is_machine_session for every eligible origin-ledger row, so
+scoped_sources (profile discovery and a state.db read per home) ran once per row
+although most rows share one profile. Group the eligible refs by exact
+origin_profile and call the existing bulk machine_sessions once per profile, as
+_local_links does; membership is tested as str(session), the classifier's key.
+Filters, row order, duplicate-uid last write, the single now and the link dicts
+are unchanged; no new cache.
+
+Tests: K bulk calls and zero per-row calls for N rows over K profiles, exact
+output equality with the frozen per-row implementation over mixed rows,
+changed rows/profiles observed by the next call, and the unchanged-board gate
+still skipping. Synthetic 10-board bench: 127 -> 10 CPU-ms, equal outputs.
+---
+ hermes_cli/kanban_chat_links.py               |  22 +-
+ .../test_kanban_ledger_links_bulk.py          | 242 ++++++++++++++++++
+ 2 files changed, 259 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_ledger_links_bulk.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index de02e0ec0c..49c55a9a8b 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -96,20 +96,32 @@ def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str,
+ 
+ 
+ def _ledger_links(board: str, gateway: str) -> dict[str, dict[str, Any]]:
+-    """This gateway's chats' links to other gateways' cards on ``board``, from the origin-ledger projection."""
++    """This gateway's chats' links to other gateways' cards on ``board``, from the origin-ledger projection.
++
++    Machine sessions are classified once per origin profile (``machine_sessions``, keyed ``str(ref)``), not once
++    per row: each per-row ``is_machine_session`` repeated profile discovery and the state.db reads. [daveey]"""
++    from hermes_cli.kanban_db_notify import machine_sessions
++    from hermes_cli.kanban_placement import is_placeholder_session
+     from hermes_cli.kanban_session_activity import _remote_links
+     now = int(time.time())
+     out: dict[str, dict[str, Any]] = {}
++    eligible: list[tuple[dict[str, Any], tuple]] = []
++    groups: dict[tuple, tuple[Any, list[Any]]] = {}  # exact profile (type, value) -> (profile, refs)
+     for card in _remote_links():
+         if card.get("board") != board or card.get("origin_gateway") not in (None, gateway) or not card.get("session"):
+             continue
+-        from hermes_cli.kanban_placement import is_placeholder_session
+-        kind = "created" if card.get("via") == "origin" else "shepherd"
+         if is_placeholder_session(card["session"]):
+             continue
+-        from hermes_cli.kanban_db_notify import is_machine_session
+-        if is_machine_session(gateway, card["session"], local_gateway=gateway, profile=card.get("origin_profile")):
++        profile = card.get("origin_profile")
++        key = (type(profile), profile)
++        groups.setdefault(key, (profile, []))[1].append(card["session"])
++        eligible.append((card, key))
++    machine = {key: machine_sessions(gateway, refs, local_gateway=gateway, profile=profile)
++               for key, (profile, refs) in groups.items()}
++    for card, key in eligible:
++        if str(card["session"]) in machine[key]:
+             continue
++        kind = "created" if card.get("via") == "origin" else "shepherd"
+         profile = card.get("origin_profile")
+         uid = link_uid(card["id"], gateway, profile, card["session"], kind)
+         out[uid] = {"uid": uid, "task_id": card["id"], "chat_gateway": gateway, "chat_profile": profile,
+diff --git a/tests/hermes_cli/test_kanban_ledger_links_bulk.py b/tests/hermes_cli/test_kanban_ledger_links_bulk.py
+new file mode 100644
+index 0000000000..e9ce131c85
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ledger_links_bulk.py
+@@ -0,0 +1,242 @@
++"""``_ledger_links`` classifies its ledger sessions once per origin profile, not once per row. [daveey]
++
++Profile (task t_01a1d0f21e3554ee, parent t_01a1a80b7d6cc910): a full links reconcile called ``is_machine_session``
++for every eligible origin-ledger row, so ``scoped_sources`` (profile discovery plus a state.db read per home) ran
++thousands of times although most rows share one profile. The bulk ``machine_sessions`` classifier ``_local_links``
++already uses gives the same verdict per ref. These tests pin the call count, exact output equality with the
++per-row implementation over mixed rows, and that every call recomputes from its current input.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++import time
++from typing import Any
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db_notify as notify
++from hermes_cli import kanban_session_provenance as provenance
++from hermes_state import SessionDB
++from tests.tools.test_kanban_worker_created_chats import make_home, WORKER
++
++CHAT = "local-" + "cd" * 32       # desktop chat in the default store
++UNKNOWN = "local-" + "ef" * 32    # a hash no store knows: suppressed as a receipt
++RCHAT = "local-" + "12" * 32      # desktop in research, kanban in default: machine wins for a bare legacy lookup
++SPLIT = "local-" + "34" * 32      # desktop in default, cli in research: conflicting, no affirmative proof
++PLAIN_SPLIT = "20261101_000000_split"
++
++
++def _frozen_ledger_links(board: str, gateway: str) -> dict[str, dict[str, Any]]:
++    """The per-row implementation this change replaced (origin/main 765903ea26), kept verbatim as the oracle."""
++    from hermes_cli.kanban_session_activity import _remote_links
++    now = int(time.time())
++    out: dict[str, dict[str, Any]] = {}
++    for card in _remote_links():
++        if card.get("board") != board or card.get("origin_gateway") not in (None, gateway) or not card.get("session"):
++            continue
++        from hermes_cli.kanban_placement import is_placeholder_session
++        kind = "created" if card.get("via") == "origin" else "shepherd"
++        if is_placeholder_session(card["session"]):
++            continue
++        from hermes_cli.kanban_db_notify import is_machine_session
++        if is_machine_session(gateway, card["session"], local_gateway=gateway, profile=card.get("origin_profile")):
++            continue
++        profile = card.get("origin_profile")
++        uid = links.link_uid(card["id"], gateway, profile, card["session"], kind)
++        out[uid] = {"uid": uid, "task_id": card["id"], "chat_gateway": gateway, "chat_profile": profile,
++                    "chat_session": card["session"], "kind": kind,
++                    "released": 1 if card.get("released") else 0, "created_at": now}
++    return out
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = make_home(tmp_path, monkeypatch)
++    monkeypatch.setattr("hermes_cli.kanban_origin.gateway_names", lambda: ("here", {"here", "away"}))
++    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
++    db = SessionDB(db_path=home / "state.db")
++    for sid, source in ((CHAT, "desktop"), (RCHAT, "kanban"), (SPLIT, "desktop"), (PLAIN_SPLIT, "desktop"),
++                        ("20261101_000000_cron", "cron"), ("20261101_000000_human", "cli"), ("12345", "desktop")):
++        db.create_session(sid, source=source)
++    db._conn.execute("UPDATE sessions SET source='local', created_source='desktop' WHERE id=?", (CHAT,))
++    db._conn.commit()
++    db.close()
++    research = home / "profiles" / "research"
++    research.mkdir(parents=True)
++    db = SessionDB(db_path=research / "state.db")
++    for sid, source in ((RCHAT, "desktop"), (SPLIT, "cli"), (PLAIN_SPLIT, "tui"), ("20261101_000000_rworker", "kanban")):
++        db.create_session(sid, source=source)
++    db.close()
++    notify._source_cache.clear()
++    yield home
++    notify._source_cache.clear()
++
++
++def _row(task_id, session, *, profile: Any = "default", via: Any = "origin", board: Any = "default",
++         origin: Any = "here", released=None):
++    row = {"id": task_id, "board": board, "origin_gateway": origin, "origin_profile": profile, "session": session,
++           "via": via, "status": "ready"}
++    if released is not None:
++        row["released"] = released
++    return row
++
++
++def _mixed() -> list[dict]:
++    rows = []
++    for profile in (None, "default", "research", "", "Bad Name!"):
++        for via in ("origin", "shepherd", None):
++            for session in (CHAT, WORKER, UNKNOWN, RCHAT, SPLIT, PLAIN_SPLIT, "20261101_000000_cron",
++                            "20261101_000000_human", "20261101_000000_rworker", "20261101_000000_nosuch",
++                            "cron_20261101_x", 12345, "kanban-placement", "kanban-placement-x",
++                            f"here/default/{CHAT}", f"here/research/{CHAT}", f"here/research/{RCHAT}",
++                            f"away/default/{CHAT}", "away/default/20261101_000000_human", "a/b",
++                            f"here/default/{WORKER}"):
++                rows.append(_row(f"t_{len(rows)}", session, profile=profile, via=via, released=len(rows) % 3 or None))
++    rows += [
++        _row("t_board", CHAT, board="other"), {**_row("t_noboard", CHAT), "board": None},
++        _row("t_away", CHAT, origin="away"), _row("t_noorigin", CHAT, origin=None),
++        _row("t_empty", ""), _row("t_none", None), {k: v for k, v in _row("t_missing", CHAT).items() if k != "session"},
++        # duplicates: the last row of one uid wins, at the first row's position (dict order)
++        _row("t_dup", CHAT, released=True), _row("t_mid", "20261101_000000_human"), _row("t_dup", CHAT, released=False),
++        # None and "" profiles share a uid ("-"): last write wins there too
++        _row("t_pdup", "s_p", profile=None, released=1), _row("t_pdup", "s_p", profile="", released=0),
++    ]
++    return rows
++
++
++@pytest.fixture
++def ledger(monkeypatch):
++    rows: list[dict] = []
++    monkeypatch.setattr("hermes_cli.kanban_session_activity._remote_links", lambda stale_ok=False: list(rows))
++    return rows
++
++
++def _same(monkeypatch, board="default", gateway="here"):
++    monkeypatch.setattr(time, "time", lambda: 1794500000.25)
++    notify._source_cache.clear()
++    old = _frozen_ledger_links(board, gateway)
++    notify._source_cache.clear()
++    new = links._ledger_links(board, gateway)
++    assert list(new.items()) == list(old.items())
++    return new
++
++
++def test_mixed_rows_match_the_per_row_implementation_exactly(home, ledger, monkeypatch):
++    ledger.extend(_mixed())
++    out = _same(monkeypatch)
++    # the corpus exercises both verdicts, both kinds, both released values and the duplicate rules
++    sessions = {r["chat_session"] for r in out.values()}
++    assert CHAT in sessions and 12345 in sessions and "20261101_000000_nosuch" in sessions
++    leaked = sessions & {WORKER, UNKNOWN, "cron_20261101_x", "kanban-placement-x", f"away/default/{CHAT}"}
++    assert not leaked, leaked
++    assert {r["kind"] for r in out.values()} == {"created", "shepherd"}
++    assert {r["released"] for r in out.values()} == {0, 1}
++    assert out["t_dup:here:default:" + CHAT + ":created"]["released"] == 0
++    assert not any(r["chat_session"] == "20261101_000000_cron" and r["chat_profile"] in (None, "default")
++                   for r in out.values())  # a cron run of this store; unknown to research, so kept there
++    assert out["t_pdup:here:-:s_p:created"]["chat_profile"] == ""
++    assert any(r["task_id"] == "t_noorigin" for r in out.values())
++    assert not any(r["task_id"] in {"t_board", "t_noboard", "t_away", "t_empty", "t_none", "t_missing"}
++                   for r in out.values())
++    _same(monkeypatch, board="other")
++    _same(monkeypatch, gateway="away")
++
++
++def test_one_bulk_classification_per_profile_and_none_per_row(home, ledger, monkeypatch):
++    profiles = [None, "default", "research", "default", None, "research", "Bad Name!"]
++    for i in range(70):
++        ledger.append(_row(f"t_{i}", [CHAT, WORKER, "20261101_000000_human", f"s_{i}"][i % 4],
++                           profile=profiles[i % len(profiles)]))
++    ledger.append(_row("t_ph", "kanban-placement", profile="only-placeholder"))  # no eligible ref: no call
++    calls = {"bulk": [], "row": 0, "scoped": 0}
++    real_bulk, real_scoped = notify.machine_sessions, provenance.scoped_sources
++
++    def bulk(gateway, sessions, **kw):
++        sessions = list(sessions)
++        calls["bulk"].append((gateway, kw.get("profile"), kw.get("local_gateway"), len(sessions)))
++        return real_bulk(gateway, sessions, **kw)
++
++    def row(*a, **kw):
++        calls["row"] += 1
++        return provenance.is_machine_session(*a, **kw)
++
++    def scoped(*a, **kw):
++        calls["scoped"] += 1
++        return real_scoped(*a, **kw)
++
++    monkeypatch.setattr(notify, "machine_sessions", bulk)
++    monkeypatch.setattr(notify, "is_machine_session", row)
++    monkeypatch.setattr(provenance, "scoped_sources", scoped)
++    out = links._ledger_links("default", "here")
++    assert calls["row"] == 0
++    per_profile: dict = {}
++    for r in ledger[:70]:
++        per_profile[r["origin_profile"]] = per_profile.get(r["origin_profile"], 0) + 1
++    assert sorted(calls["bulk"], key=repr) == sorted(
++        [("here", p, "here", n) for p, n in per_profile.items()], key=repr)
++    assert len(calls["bulk"]) == 4 and calls["scoped"] == 4
++    assert 0 < len(out) < 70
++    monkeypatch.setattr(notify, "machine_sessions", real_bulk)
++    monkeypatch.setattr(notify, "is_machine_session", provenance.is_machine_session)
++    monkeypatch.setattr(provenance, "scoped_sources", real_scoped)
++    _same(monkeypatch)
++
++
++def test_each_call_reflects_changed_rows_and_profiles(home, ledger, monkeypatch):
++    ledger.append(_row("t_a", RCHAT, profile="research"))  # desktop in research
++    assert [r["task_id"] for r in links._ledger_links("default", "here").values()] == ["t_a"]
++    ledger[0] = _row("t_a", RCHAT, profile="default")  # kanban in default: now a machine session
++    assert links._ledger_links("default", "here") == {}
++    ledger.append(_row("t_b", "20261101_000000_rworker", profile=None))  # legacy lookup finds research's worker
++    ledger.append(_row("t_c", "20261101_000000_rworker", profile="default"))  # unknown in default: kept
++    assert [r["task_id"] for r in links._ledger_links("default", "here").values()] == ["t_c"]
++    ledger[:] = [_row("t_c", "20261101_000000_rworker", profile="research", via="shepherd", released=True)]
++    assert links._ledger_links("default", "here") == {}
++    ledger[:] = [_row("t_d", CHAT, profile=None, via="shepherd", released=True)]
++    (row,) = links._ledger_links("default", "here").values()
++    assert (row["task_id"], row["kind"], row["released"], row["chat_profile"]) == ("t_d", "shepherd", 1, None)
++    _same(monkeypatch)
++
++
++def test_unchanged_board_gate_still_skips_the_ledger_classification(home, ledger, monkeypatch):
++    from hermes_cli import kanban_session_activity as ksa
++    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli.kanban_sync_connections import connection_scope
++    monkeypatch.setattr(ksc, "_LINKS_DONE", {})
++    ksa._reset_cache_for_tests()
++    ledger.extend([_row("t_a", CHAT, profile=None), _row("t_b", "20261101_000000_human", profile="default"),
++                   _row("t_c", RCHAT, profile="research", via="shepherd")])
++    calls = []
++    real_bulk = notify.machine_sessions
++
++    def bulk(*a, **kw):
++        calls.append(kw.get("profile"))
++        return real_bulk(*a, **kw)
++
++    monkeypatch.setattr(notify, "machine_sessions", bulk)
++    boards = [("default", home / "kanban.db")]
++
++    def links_now():
++        conn = sqlite3.connect(home / "kanban.db")
++        try:
++            return sorted(conn.execute("SELECT task_id, chat_session, kind, released FROM task_chat_links"))
++        finally:
++            conn.close()
++
++    with connection_scope():
++        ksc.reconcile_links(boards, "here", skip_unchanged=True)
++        assert {"default", "research"} <= set(calls)  # the ledger's profiles, among the other passes' calls
++        for _ in range(2):  # the first pass's own writes move the board revision; the third pass is stable
++            ksc.reconcile_links(boards, "here", skip_unchanged=True)
++        settled = links_now()
++        assert ("t_c", RCHAT, "shepherd", 0) in settled and ("t_b", "20261101_000000_human", "created", 0) in settled
++        calls.clear()
++        for _ in range(3):
++            ksc.reconcile_links(boards, "here", skip_unchanged=True)
++        assert calls == [] and links_now() == settled
++        ledger.append(_row("t_d", "20261101_000000_rworker", profile="default"))
++        ksc.reconcile_links(boards, "here", skip_unchanged=True)
++        assert ("t_d", "20261101_000000_rworker", "created", 0) in links_now()
++    ksa._reset_cache_for_tests()
+-- 
+2.43.0
+

@@ -1,0 +1,144 @@
+From 1be64589948f6e93c8f730f67d98f1e85da65a0e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:18:07 +0000
+Subject: [PATCH] [daveey] Take over: pin an EPERM writer to the ACK deadline;
+ a failed reset save keeps the 4090 refusal
+
+Follow-up to #1252 review (t_01a1ce87ed6dd1df). The foreign-pid-namespace
+test is owned by #1531.
+
+- test: a same-namespace pid whose kill(pid, 0) answers EPERM is not provably
+  alive, so Take over is refused 4090 SESSION_NOT_OWNED at the ACK deadline,
+  not after the live-writer cap. Coverage of existing behaviour; it kills the
+  mutant that treats PermissionError as alive.
+- Desktop sendIdentityless: if saving legacyAttempted=false after a definite
+  refusal rejects, warn '[prepared-submission-reset]' and rethrow the original
+  refusal instead of the storage error.
+---
+ .../submit-legacy-identity.test.tsx           | 42 +++++++++++++++++++
+ .../hooks/use-prompt-actions/submit.ts        |  5 ++-
+ tests/tui_gateway/test_session_takeover.py    | 32 ++++++++++++++
+ 3 files changed, 78 insertions(+), 1 deletion(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx
+index 93e2baa324..a953c96581 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx
+@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { getLatestSessionMessages } from '@/hermes'
+ import { en } from '@/i18n/en'
+ import { $notifications, clearNotifications } from '@/store/notifications'
++import { pageStorage } from '@/test/page-storage'
+ 
+ import { actRender, Harness, type HarnessHandle, RUNTIME_SESSION_ID } from './index-test-utils'
+ import { clearStoredJournal } from './prepared-submissions-test-utils'
+@@ -187,6 +188,47 @@ describe('a refused identityless send', () => {
+     }
+   })
+ 
++  it('a refused legacy send whose reset cannot be saved still surfaces the 4090 refusal, not the storage error', async () => {
++    const submits: Array<Record<string, unknown>> = []
++    clearNotifications()
++
++    const refusal = new JsonRpcGatewayError('This chat is active in another Hermes window/terminal.', {
++      code: 4090,
++      data: { reason: 'SESSION_NOT_OWNED' }
++    })
++
++    const storageError = new Error('QuotaExceededError: the journal is full')
++    const storage = pageStorage()
++    const setItem = storage.setItem
++    let resetWrites = 0
++
++    // Only the reset of `legacyAttempted` after the refusal fails to save.
++    vi.spyOn(storage, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
++      if (legacySends(submits) === 1 && JSON.parse(value)?.legacyAttempted === false) {
++        resetWrites += 1
++        throw storageError
++      }
++
++      return setItem.call(this, key, value)
++    })
++    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
++
++    const requestGateway = refusingGateway(refusal, submits)
++    let handle: HarnessHandle | null = null
++    await actRender(
++      <Harness onReady={h => (handle = h)} rawAdmissionReceipts refreshSessions={async () => undefined} requestGateway={requestGateway} />
++    )
++    expect(await handle!.submitText('take me over', { submission_id: 'refused-unsaved' })).toBe(false)
++    expect(legacySends(submits)).toBe(1)
++    expect(resetWrites).toBe(1)
++
++    const errors = handle!.state().messages.flatMap(m => (m.error ? [m.error] : []))
++    expect(errors.at(-1)).toContain('active in another Hermes window')
++    expect(errors.join('\n')).not.toContain('journal is full')
++    expect($notifications.get().map(n => n.message).join('\n')).not.toContain('journal is full')
++    expect(warn).toHaveBeenCalledWith('[prepared-submission-reset]', storageError)
++  })
++
+   it('a legacy send refused session busy (4009) is retried by the busy loop instead of failing as unconfirmed', async () => {
+     const submits: Array<Record<string, unknown>> = []
+     const requestGateway = refusingGateway(new JsonRpcGatewayError('session busy', { code: 4009 }), submits)
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+index b32ad1098c..4ec33edfc0 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+@@ -1223,7 +1223,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
+                     // may send it again. Every other failure keeps the send unconfirmed.
+                     if (isDefiniteSubmitRefusal(error)) {
+                       prepared.legacyAttempted = false
+-                      await writePreparedSubmission(retryKey, prepared)
++                      // A failed save must not mask the refusal: the caller acts on the 4090.
++                      await writePreparedSubmission(retryKey, prepared).catch(storageError =>
++                        console.warn('[prepared-submission-reset]', storageError)
++                      )
+                     }
+ 
+                     throw error
+diff --git a/tests/tui_gateway/test_session_takeover.py b/tests/tui_gateway/test_session_takeover.py
+index c21e1492ba..f0403aa793 100644
+--- a/tests/tui_gateway/test_session_takeover.py
++++ b/tests/tui_gateway/test_session_takeover.py
+@@ -427,6 +427,38 @@ def test_take_over_refuses_a_live_writer_that_never_releases_at_the_live_cap(
+     assert durable_writer.db.session_turn_lease_owner(KEY)["holder"] == holder
+ 
+ 
++def test_take_over_refuses_a_same_namespace_writer_it_may_not_signal_at_the_ack_deadline(
++        durable_writer, sleeper, rpc, monkeypatch):
++    """kill(pid, 0) answering EPERM (another user's process) does not prove the writer alive."""
++    import time
++    monkeypatch.setenv("HERMES_SESSION_TAKEOVER_ACK_TIMEOUT_S", "0.3")
++    monkeypatch.setenv("HERMES_SESSION_TAKEOVER_LIVE_WRITER_WAIT_S", "10")
++    proc = sleeper()
++    holder = _same_ns_holder(proc.pid)
++    durable_writer.hold(holder)
++    real_kill = os.kill
++    probed: list[int] = []
++
++    def kill(pid, sig):
++        if pid == proc.pid and sig == 0:
++            probed.append(pid)
++            raise PermissionError(1, "Operation not permitted")
++        return real_kill(pid, sig)
++
++    monkeypatch.setattr(os, "kill", kill)
++    started = time.monotonic()
++    resp = rpc()
++    elapsed = time.monotonic() - started
++    monkeypatch.setattr(os, "kill", real_kill)
++    assert probed  # the probe really ran and was refused
++    assert resp["error"]["code"] == 4090, resp
++    assert resp["error"]["data"] == {"reason": "SESSION_NOT_OWNED"}
++    assert 0.3 <= elapsed < 3  # the 0.3 s ACK deadline, not the 10 s live-writer cap
++    assert "alive" not in resp["error"]["message"]
++    assert resp["error"]["message"].endswith("No writer was forced out.")
++    assert durable_writer.db.session_turn_lease_owner(KEY)["holder"] == holder
++
++
+ @pytest.mark.parametrize(("why", "label"), [("lease_takeover", "taken_over"), ("backend_exit", "shutdown"),
+                                             ("session_close", "session_closed"), (None, "interrupted")])
+ def test_interrupting_a_turn_names_why_in_the_pending_clarify_result(env, why, label):
+-- 
+2.43.0
+

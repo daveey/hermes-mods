@@ -1,0 +1,197 @@
+From 0422346d050421f367e00984540ed0ec8c4645aa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:58:11 +0000
+Subject: [PATCH] fix(kanban): recover stale machine pins through Board
+ authority [daveey]
+
+---
+ hermes_cli/kanban_placement_recovery.py       | 65 +++++++++++++++----
+ hermes_cli/kanban_worker_placement.py         |  6 +-
+ .../test_kanban_stale_pin_recovery.py         | 64 ++++++++++++++++++
+ 3 files changed, 119 insertions(+), 16 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_stale_pin_recovery.py
+
+diff --git a/hermes_cli/kanban_placement_recovery.py b/hermes_cli/kanban_placement_recovery.py
+index d1ae6e82ed..e0541ca336 100644
+--- a/hermes_cli/kanban_placement_recovery.py
++++ b/hermes_cli/kanban_placement_recovery.py
+@@ -2,6 +2,57 @@
+ from __future__ import annotations
+ 
+ import json
++import math
++import time
++
++
++def recovery_mode(conn, row, cfg):
++    """Propose a stale-pin recovery only from an affirmative registry observation."""
++    from hermes_cli import kanban_worker_node as node
++    from hermes_cli.kanban_worker_placement import requested_move
++
++    if row.get("placement_policy") and requested_move(conn, row["id"]) is not None:
++        return None  # an unapplied owner move takes precedence over automatic recovery
++    if row.get("runs_on") is None:
++        return promotion_mode(conn, row, cfg) if row.get("placement_policy") is None else None
++    try:
++        labels = node.normalize_runs_on(row["runs_on"])
++    except (TypeError, ValueError):
++        return None
++    names = [label.removeprefix("machine:") for label in labels or [] if label.startswith("machine:")]
++    if len(names) != 1:
++        return None
++    entry = ((node.registry() or {}).get("machines") or {}).get(names[0])
++    if not isinstance(entry, dict):
++        return None
++    seen = entry.get("last_seen")
++    stale = (type(seen) in (int, float) and math.isfinite(seen) and seen > 0
++             and time.time() * 1000 - seen > 30 * 60 * 1000)
++    if entry.get("state") not in ("revoked", "inactive") and not entry.get("hold") and not stale:
++        return None
++    return "stale_pin" if current_portable(conn, row, cfg) else None
++
++
++def current_portable(conn, row, cfg):
++    from hermes_cli.kanban_placement import portable_reason
++
++    args = dict(row)
++    event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
++                         "ORDER BY id LIMIT 1", (row["id"],)).fetchone()
++    try:
++        created = json.loads(event[0]) if event else None
++        if not isinstance(created, dict):
++            return False
++        # Allocated scratch path is not an input, but declared paths/projects remain constraints.
++        args["workspace_path"] = created.get("workspace_path")
++        args["project_id"] = created.get("project_id")
++        args["board"] = "default"
++        args["runs_on"] = None  # Board preserves/rechecks the replacement's other labels.
++        for key in ("requires", "skills"):
++            args[key] = json.loads(args[key]) if isinstance(args.get(key), str) else args.get(key)
++    except (TypeError, ValueError):
++        return False
++    return portable_reason(args, cfg) is None
+ 
+ 
+ def promotion_mode(conn, row, cfg):
+@@ -10,8 +61,6 @@ def promotion_mode(conn, row, cfg):
+     An old policy cleared by an owner repin must never be silently re-enrolled.
+     Created portability is historical diagnostics, not today's eligibility decision.
+     """
+-    from hermes_cli.kanban_placement import portable_reason
+-
+     if row.get("runs_on") is not None:
+         return None
+     event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
+@@ -27,14 +76,4 @@ def promotion_mode(conn, row, cfg):
+     if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind IN "
+                     "('moved','placement_repinned') LIMIT 1", (row["id"],)).fetchone():
+         return None
+-    args = dict(row)
+-    # An allocated scratch directory is not a declared input. Never erase a declared one.
+-    args["workspace_path"] = created.get("workspace_path")
+-    args["project_id"] = created.get("project_id")
+-    args["board"] = "default"
+-    try:
+-        for key in ("requires", "skills"):
+-            args[key] = json.loads(args[key]) if isinstance(args.get(key), str) else args.get(key)
+-    except (TypeError, ValueError):
+-        return None
+-    return "promote" if portable_reason(args, cfg) is None else None
++    return "promote" if current_portable(conn, row, cfg) else None
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 96a3236187..9c21825596 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -289,8 +289,8 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+     try:
+         for row in rows:
+             last = row["id"]
+-            from hermes_cli.kanban_placement_recovery import promotion_mode
+-            mode = promotion_mode(conn, dict(row), cfg) if row["placement_policy"] is None else None
++            from hermes_cli.kanban_placement_recovery import recovery_mode
++            mode = recovery_mode(conn, dict(row), cfg)
+             if row["placement_policy"] is None and mode is None:
+                 continue
+             key = (board, row["id"])
+@@ -301,7 +301,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+             if len(_refused) > 1024:  # cards that left the query never come back to clear their entry
+                 for stale in [k for k, (_, until) in _refused.items() if until <= now]:
+                     del _refused[stale]
+-            labels = requested_move(conn, row["id"])
++            labels = None if mode else requested_move(conn, row["id"])
+             stage = "recover" if mode else ("reserve" if labels is None else "repin")
+             held = _queued.get(key)
+             identity = _local_identity(conn, row["id"]) if labels is None else None
+diff --git a/tests/hermes_cli/test_kanban_stale_pin_recovery.py b/tests/hermes_cli/test_kanban_stale_pin_recovery.py
+new file mode 100644
+index 0000000000..95d3bf4785
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_stale_pin_recovery.py
+@@ -0,0 +1,64 @@
++"""Stale pins are recovery hints, never permission to assign without the Board."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_worker_node as node
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_placement_recovery as fixtures
++
++conn = fixtures.conn
++setup = fixtures.setup
++
++
++@pytest.mark.parametrize("entry", [
++    {"state": "revoked"}, {"state": "active", "hold": True},
++    {"state": "active", "last_seen": 1},
++])
++def test_stale_pin_recovery_requests_board_recheck(setup, monkeypatch, entry):
++    conn, hub = setup
++    tid = fixtures.make(conn, runs_on='["machine:worker-1", "linux"]')
++    monkeypatch.setattr(node, "registry", lambda: {"machines": {"worker-1": entry}})
++    assert wp.reevaluate(conn, hub, "default", "hub") == 1
++    assert hub.calls[0][1] == {"task_id": tid, "expected_revision": 4,
++                                "mode": "stale_pin", "candidates": ["worker-2"]}
++    assert json.loads(conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0]) == [
++        "machine:worker-1", "linux"]
++
++
++@pytest.mark.parametrize("registry", [None, {}, {"machines": {}},
++    {"machines": {"worker-1": {"state": "active"}}},
++    {"machines": {"worker-1": {"state": "active", "last_seen": "bad"}}},
++    {"machines": {"worker-1": {"state": "active", "last_seen": 0}}},
++])
++def test_unknown_registry_does_not_authorize_stale_recovery(setup, monkeypatch, registry):
++    conn, hub = setup
++    fixtures.make(conn, runs_on='["machine:worker-1"]')
++    monkeypatch.setattr(node, "registry", lambda: registry)
++    assert wp.reevaluate(conn, hub, "default", "hub") == 0
++    assert not hub.calls
++
++
++@pytest.mark.parametrize("fields", [
++    {"requires": '["host_repo"]'}, {"workspace_kind": "worktree"},
++    {"lease_holder": "worker-1", "lease_expires": 1}, {"claim_lock": "owner"},
++    {"status": "running"}, {"status": "review"}, {"created_on": "other"},
++    {"body": "Read credentials on the hub"},
++])
++def test_stale_machine_never_overrides_independent_constraints(setup, monkeypatch, fields):
++    conn, hub = setup
++    fixtures.make(conn, runs_on='["machine:worker-1"]', **fields)
++    monkeypatch.setattr(node, "registry", lambda: {"machines": {"worker-1": {"state": "revoked"}}})
++    assert wp.reevaluate(conn, hub, "default", "hub") == 0
++    assert not hub.calls
++
++
++@pytest.mark.parametrize("age,expected", [(1800, 0), (1801, 1), (1799, 0), (-1, 0)])
++def test_stale_threshold_uses_milliseconds(setup, monkeypatch, age, expected):
++    from hermes_cli import kanban_placement_recovery as recovery
++    conn, hub = setup
++    fixtures.make(conn, runs_on='["machine:worker-1"]')
++    monkeypatch.setattr(recovery.time, "time", lambda: 2000)
++    monkeypatch.setattr(node, "registry", lambda: {"machines": {
++        "worker-1": {"state": "active", "last_seen": (2000 - age) * 1000}}})
++    assert wp.reevaluate(conn, hub, "default", "hub") == expected
+-- 
+2.43.0
+

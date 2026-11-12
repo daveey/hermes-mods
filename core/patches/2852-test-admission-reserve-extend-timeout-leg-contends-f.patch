@@ -1,0 +1,85 @@
+From 57672ef5518f6a3d356558954ea2f0dabdf3eca7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:28:58 +0000
+Subject: [PATCH] test(admission): reserve()/extend() timeout= leg contends for
+ a held lock, so ignoring timeout= fails [daveey]
+
+After ca144ace46 the long-timeout leg still ran reserve(timeout=60) first, which waited out the Timer release,
+so extend(timeout=60) found the lock free and an extend() that ignored timeout= passed. Each leg now has its own
+holder that releases only once the caller has waited >= 1 s (signalled from af's retry pause), so a reserve or
+extend that ignores timeout= raises AdmissionBusy. No new sleep, no Timer race.
+---
+ tests/hermes_cli/test_admission_fence.py | 53 +++++++++++++++---------
+ 1 file changed, 34 insertions(+), 19 deletions(-)
+
+diff --git a/tests/hermes_cli/test_admission_fence.py b/tests/hermes_cli/test_admission_fence.py
+index ae07026371..d5eef3aa4b 100644
+--- a/tests/hermes_cli/test_admission_fence.py
++++ b/tests/hermes_cli/test_admission_fence.py
+@@ -396,29 +396,44 @@ def test_standalone_capability_uses_only_stdlib():
+ 
+ 
+ 
+-def test_reserve_and_extend_default_to_one_short_try_and_accept_a_longer_timeout(tmp_path):
+-    """[daveey] N3: callers holding the session-map lock keep the 50 ms default; lock-free callers (cron) may wait."""
++def test_reserve_and_extend_default_to_one_short_try_and_accept_a_longer_timeout(tmp_path, monkeypatch):
++    """[daveey] N3: callers holding the session-map lock keep the 50 ms default; lock-free callers (cron) may wait.
++
++    Each leg contends for a lock another process still holds: the holder releases only once the long-timeout
++    call has kept waiting well past the 50 ms default, so a ``reserve``/``extend`` that ignores ``timeout=``
++    raises AdmissionBusy instead of finding the lock free."""
+     import time
+ 
+-    # Held until ``finish`` is set, not for a fixed time: a CPU-starved runner must not see the lock
+-    # drop before the short tries run, nor have the short tries measured against a sub-second bound.
++    released_after_s = 1.0  # far past the 50 ms default: a timeout-ignoring call has given up long before
+     ctx = multiprocessing.get_context("spawn")
+-    ready, finish = ctx.Event(), ctx.Event()
+-    child = ctx.Process(target=_lock_child, args=(tmp_path, ready, finish))
+-    child.start()
+-    release = threading.Timer(0.3, finish.set)
+-    try:
+-        assert ready.wait(20)
+-        for fn in (af.reserve, af.extend):
++    for fn in (af.reserve, af.extend):
++        ready, finish = ctx.Event(), ctx.Event()
++        child = ctx.Process(target=_lock_child, args=(tmp_path, ready, finish))
++        child.start()
++        try:
++            assert ready.wait(20)
+             started = time.monotonic()
+             with pytest.raises(af.AdmissionBusy):
+                 fn(tmp_path)
+             # One short try, not admission_lock's 10 s wait (the holder keeps the lock up to 20 s).
+-            assert time.monotonic() - started < 5
+-        release.start()  # the holder lets go while the longer-timeout caller waits
+-        af.reserve(tmp_path, timeout=60).close()
+-        af.extend(tmp_path, timeout=60).close()
+-    finally:
+-        release.cancel()
+-        finish.set()
+-        _reap(child)
++            assert time.monotonic() - started < 5, fn.__name__
++
++            class _ReleaseWhileWaiting:
++                """af's clock: its retry pause frees the holder once the caller has outwaited the default."""
++
++                def __getattr__(self, name):
++                    return getattr(time, name)
++
++                def sleep(self, seconds):
++                    if time.monotonic() - started >= released_after_s:
++                        finish.set()
++                    time.sleep(seconds)  # health: allow HX013 -- af's own retry pause, delegated unchanged
++
++            started = time.monotonic()
++            with monkeypatch.context() as m:
++                m.setattr(af, "time", _ReleaseWhileWaiting())
++                fn(tmp_path, timeout=60).close()
++            assert finish.is_set(), f"{fn.__name__} got the lock without waiting out the holder"
++        finally:
++            finish.set()
++            _reap(child)
+-- 
+2.43.0
+

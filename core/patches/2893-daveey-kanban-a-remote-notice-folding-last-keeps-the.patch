@@ -1,0 +1,146 @@
+From 45ad781b4cdcd1994c4c2d2e3d2411cb12338626 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:11:59 -0800
+Subject: [PATCH] [daveey] kanban: a remote notice folding last keeps the
+ batch's guidance; tests for _drop_written and the cancelled-row key pop
+ (review t_01a1d03acceb95c1)
+
+---
+ gateway/kanban_wake_fold.py                   |  4 +
+ .../test_kanban_remote_owner_delivery.py      | 79 ++++++++++++++++++-
+ 2 files changed, 81 insertions(+), 2 deletions(-)
+
+diff --git a/gateway/kanban_wake_fold.py b/gateway/kanban_wake_fold.py
+index b15acf02aa..9b69cfc724 100644
+--- a/gateway/kanban_wake_fold.py
++++ b/gateway/kanban_wake_fold.py
+@@ -310,6 +310,10 @@ def fold_into(event, waiting, identity):
+     old_cards = descriptor.get('kanban_cards') or _legacy_cards(str(waiting['payload'].get('text') or ''))
+     if not descriptor.get('kanban_cards') and guidance and old_cards[0]['text'].endswith(guidance):
+         old_cards[0]['text'] = old_cards[0]['text'][:-len(guidance)].rstrip()
++    if not guidance and descriptor.get('kanban_cards'):
++        # [daveey] A remote notice carries no guidance: keep the waiting batch's, or a local wake folded under
++        # it loses its "inspect the board, don't re-decompose" line (review t_01a1d03acceb95c1).
++        guidance = _guidance(str(waiting['payload'].get('text') or ''), old_cards) or ''
+     # The stored cards stay as delivered; the live relabel is redone each time the batch is rebuilt.
+     cards = _merge(old_cards, new_cards)
+     event.text = _compose(cards, guidance)
+diff --git a/tests/gateway/test_kanban_remote_owner_delivery.py b/tests/gateway/test_kanban_remote_owner_delivery.py
+index 31cc506308..20725f7fee 100644
+--- a/tests/gateway/test_kanban_remote_owner_delivery.py
++++ b/tests/gateway/test_kanban_remote_owner_delivery.py
+@@ -40,7 +40,7 @@ from tui_gateway import kanban_remote_notices as krn
+ from tui_gateway import kanban_unloaded as ku
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+-from tests.gateway.test_kanban_wake_fold import _local_chat, _wake
++from tests.gateway.test_kanban_wake_fold import GUIDANCE, _local_chat, _wake
+ 
+ CHAT = "20261026_235722_bef6c6"
+ GW_HOLDER = f"pid={os.getpid()}:turn={CHAT}:x:platform=local"
+@@ -569,6 +569,60 @@ def test_a_successor_adopts_the_held_member_of_a_late_group_and_releases_the_res
+     assert kro._admitted == {}
+ 
+ 
++def _write_notice_row(db, session_id, key):
++    """A kanban_notice row carrying ``key``, written by some other path (an earlier root-keyed claim)."""
++    db.append_message(session_id, "user", "✔ Remote Kanban card done.", display_kind="kanban_notice",
++                      display_metadata={"display_text": "✔ done", "kanban_event_keys": [key]})
++
++
++def _tip_ledger(tid):
++    with contextlib.closing(sqlite3.connect(krn.ledger_path())) as conn:
++        return conn.execute("SELECT session, delivered, holder_pid FROM notices WHERE ref=?",
++                            (f"worker-2/default/default/{tid}",)).fetchall()
++
++
++def test_a_notice_already_in_the_lineage_with_no_ledger_row_under_the_link_is_acked_not_admitted(env):
++    """Review t_01a1d03acceb95c1: the row is already in the chat's lineage (written under the root's ledger
++    key), and the link names the compression tip, which has no ledger row yet. The busy-chat pass claims it
++    fresh under the tip; it must ack that claim against the transcript, never admit a second turn."""
++    hub, runner, authority, fifo, db = env
++    key = _key("t_01a1cfabf44499dd")
++    _write_notice_row(db, CHAT, key)
++    db.end_session(CHAT, "compression")
++    db.create_session(TIP, "desktop", parent_session_id=CHAT)
++    authority.sessions[CHAT] = _Live(CHAT)
++    fifo.row_session = TIP
++    _busy(db, fifo)
++    _publish(hub, [_done("t_01a1cfabf44499dd", chat=TIP)])
++    assert _tick(runner) == []
++    assert fifo.queued() == []
++    assert _tip_ledger("t_01a1cfabf44499dd") == [(TIP, krn.DELIVERED, None)]
++    assert len(_lineage_rows(key)) == 1
++    assert kro._admitted == {}
++
++
++def test_a_late_group_with_one_member_already_written_acks_it_and_releases_the_rest(env):
++    """The partly written late group: the written member is acked, the other goes back unclaimed and is
++    admitted on its own by the next pass, so each lands exactly once."""
++    hub, runner, authority, fifo, db = env
++    authority.sessions[CHAT] = _Live(CHAT)
++    _publish(hub, [])  # baseline: arrivals after it are new
++    _write_notice_row(db, CHAT, _key("t_01a1cf4eda4b1ad4", 336647))
++    _busy(db, fifo)
++    _publish(hub, [_late("t_01a1cf4eda4b1ad4", 336647), _late("t_01a1cfd7578b3af4", 466999)])
++    assert _tick(runner) == []
++    assert fifo.queued() == []
++    assert _ledger("t_01a1cf4eda4b1ad4")["delivered"] == krn.DELIVERED
++    assert _ledger("t_01a1cfd7578b3af4") is None  # released, not left in flight
++    assert len(_tick(runner)) == 1  # offered on its own and admitted
++    fifo.boundary()
++    _tick(runner)
++    assert len(_rows(_key("t_01a1cf4eda4b1ad4", 336647))) == 1
++    assert len(_rows(_key("t_01a1cfd7578b3af4", 466999))) == 1
++    assert _ledger("t_01a1cfd7578b3af4")["delivered"] == krn.DELIVERED
++    assert kro._admitted == {}
++
++
+ @pytest.fixture
+ def board(tmp_path, monkeypatch):
+     """A real local Kanban board (``test_kanban_wake_fold``'s fixture)."""
+@@ -611,6 +665,7 @@ async def test_local_and_remote_notices_queued_during_one_turn_run_as_one_turn(t
+         assert len(rows) == 1, [row["payload"]["text"][:80] for row in rows]
+         text = rows[0]["payload"]["text"]
+         assert text.startswith("[IMPORTANT: 4 Kanban task updates arrived while this session was busy.")
++        assert text.count(GUIDANCE) == 1 and text.endswith(GUIDANCE)  # the local wakes' guidance, once, last
+         for needle in (f"[kanban] Task {a} completed.", f"[kanban] Task {b} completed.", "card t_remote_r1 ",
+                        "card t_remote_r2 "):
+             assert text.count(needle) == 1, needle
+@@ -627,8 +682,9 @@ async def test_local_and_remote_notices_queued_during_one_turn_run_as_one_turn(t
+             assert krn.notice_in_transcript(authority.db, sid, key, "")
+         delivered = [m for m in authority.db.get_messages(sid) if m.get("display_kind") == "kanban_notice"]
+         assert len(delivered) == 1
+-        cancelled = [row for row in list_session_admissions(authority.db, session_id=sid)
++        cancelled = [row for row in list_session_admissions(authority.db, session_id=sid, pending_only=False)
+                      if row["status"] != "queued" and row["principal_id"].startswith("automation:")]
++        assert cancelled  # the folded-away rows (review t_01a1d03acceb95c1: this list was always empty)
+         assert all("kanban_event_keys" not in json.dumps(row["payload"]) for row in cancelled)
+     finally:
+         authority.db.close()
+@@ -653,3 +709,22 @@ async def test_a_local_wake_folds_into_a_remote_notice_waiting_at_the_tail(tmp_p
+         assert f"[kanban] Task {a} completed." in rows[0]["payload"]["text"]
+     finally:
+         authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_a_remote_notice_folding_last_keeps_the_local_wakes_guidance(tmp_path, monkeypatch, board):
++    """Review t_01a1d03acceb95c1: local A waits, remote R1 folds into it. R1 carries no guidance, and the
++    batch must keep A's "inspect the board, don't re-decompose" line, once, at the end."""
++    authority, adapter, source, queued, _human = await _local_chat(tmp_path, monkeypatch)
++    try:
++        a = board("local A")
++        await _wake(adapter, source, a, "completed")
++        md = kro._metadata(_remote_item("t_remote_r1", 1001))
++        assert await session_automation.admit_route_wake(authority.runner, adapter, source,
++                                                         md["kanban_cards"][0]["text"], "kanban-wake", md)
++        [row] = [row for row in queued() if row["principal_id"].startswith("automation:")]
++        text = row["payload"]["text"]
++        assert f"[kanban] Task {a} completed." in text and "card t_remote_r1 " in text
++        assert text.count(GUIDANCE) == 1 and text.endswith(GUIDANCE)
++    finally:
++        authority.db.close()
+-- 
+2.43.0
+

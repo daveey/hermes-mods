@@ -1,0 +1,161 @@
+From bf8cd31e5f3c5293e28194db118479e1428859a0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:55:53 +0000
+Subject: [PATCH] fix(kanban): remote_links_and_origin_rows takes stale_ok for
+ display routes [daveey]
+
+hermes-mods bfe75689 made user-steps /session-cards read terminal history through
+remote_links_and_origin_rows(), which is always strict: it computes
+_links_fingerprint() and waits on the global _links_lock while any projection runs.
+On hermes-hub (serve PID 460982) that route had 11 of 31 requests over 2 s, max
+7.1 s, with stacks parked on the `with _links_lock:` line, while the stale-only
+/api/session-kanban-tasks stayed under 1.5 s. test_web_links_stale
+[user-steps-ledger] and [user-steps-unreadable-replica] fail against that plugin.
+
+remote_links_and_origin_rows(stale_ok=False) now forwards stale_ok to
+_links_entry. The default stays strict: chat-closeout needs read-your-writes. A
+warm stale entry already carries the origin rows (entry[4]) and returns before any
+fingerprint or lock work; a cold scope still projects synchronously.
+
+run_tests.sh forwards HERMES_TEST_USER_STEPS_API through its env -i, so
+test_web_links_stale can be pointed at a candidate plugin worktree (it was a
+silent no-op before: the cases always loaded ~/code/hermes-mods).
+
+Proof:
+- New tests in test_kanban_links_stale_scopes.py: stale_ok=True returns the warm
+  (cards, rows) entry while the fingerprint is held; the default still waits.
+  Mutants killed: forwarding False again fails the stale test; defaulting
+  stale_ok=True fails the strict test.
+- With the patched plugin (HERMES_TEST_USER_STEPS_API): test_web_links_stale 8
+  passed, 0 skipped; with the current hermes-mods plugin, 2 failed as on the hub.
+- 15-file suite tests/hermes_cli/test_kanban_{links,replica,busy,remote_inventory,
+  chat_links,session_activity}*.py tests/hermes_cli/test_web_links_stale.py plus
+  tests/scripts/test_run_tests_shell.py: 199 passed, 0 failed.
+---
+ hermes_cli/kanban_session_activity.py         | 10 ++-
+ scripts/run_tests.sh                          |  5 +-
+ .../test_kanban_links_stale_scopes.py         | 65 +++++++++++++++++++
+ 3 files changed, 76 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 911fc2f87e..e62fad78e0 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -893,11 +893,15 @@ def _links_fingerprint() -> tuple:
+     return tuple(signature)
+ 
+ 
+-def remote_links_and_origin_rows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
++def remote_links_and_origin_rows(stale_ok: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+     """[daveey] ``(_remote_links(), origin rows)`` from one cached projection: the origin rows are the ledger
+     ``project()`` rows behind the cards, released rows included (the cards omit those). Plugins that need released
+-    rows (chat-closeout) take them here instead of projecting the ledger again on every pass."""
+-    return _links_entry(False, with_rows=True)
++    rows (chat-closeout) take them here instead of projecting the ledger again on every pass.
++
++    The default stays strict (read-your-writes) for closeout-style callers. Display routes that are documented as
++    stale-only (user-steps session-cards) pass ``stale_ok=True``: a warm entry, rows included, returns before any
++    fingerprint or ``_links_lock`` work and refreshes in the background; a cold scope still projects synchronously."""
++    return _links_entry(stale_ok, with_rows=True)
+ 
+ 
+ def _remote_links(stale_ok: bool = False) -> list[dict[str, Any]]:
+diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
+index add578529c..d05749ac30 100755
+--- a/scripts/run_tests.sh
++++ b/scripts/run_tests.sh
+@@ -210,6 +210,9 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
+ #     tests/tools/test_docker_backend_real.py); remote-backends.yml points them at
+ #     a throwaway sshd container and a small public image. The key is a
+ #     per-run throwaway, never a credential.
++#   * HERMES_TEST_USER_STEPS_API points tests/hermes_cli/test_web_links_stale.py at a
++#     user-steps plugin_api.py other than ~/code/hermes-mods (a candidate worktree, or
++#     hermes-mods CI running that core regression against its own plugin).
+ #
+ # These are test-infrastructure knobs, not credentials — same class as the
+ # HERMES_RUN_SLOW_PET_TESTS / HERMES_E2E_BROWSER / HERMES_RUN_E2E opt-ins
+@@ -223,7 +226,7 @@ TEST_ENV=()
+ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
+   HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE HERMES_TEST_FORKSERVER \
+   HERMES_TEST_SLOW_CASE_S HERMES_TEST_FLAKY_REPORT HERMES_TEST_REQUIRE_EXTRAS \
+-  HERMES_TEST_HOST_SLOTS HERMES_TEST_SLOT_DIR HERMES_TEST_SLOT_HELD \
++  HERMES_TEST_HOST_SLOTS HERMES_TEST_SLOT_DIR HERMES_TEST_SLOT_HELD HERMES_TEST_USER_STEPS_API \
+   SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
+   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \
+   HERMES_E2E_STRICT_ACCEPTANCE HERMES_E2E_UPGRADE_BASE HERMES_E2E_N1_REF \
+diff --git a/tests/hermes_cli/test_kanban_links_stale_scopes.py b/tests/hermes_cli/test_kanban_links_stale_scopes.py
+index c9fe1de0f3..d2c1f2294b 100644
+--- a/tests/hermes_cli/test_kanban_links_stale_scopes.py
++++ b/tests/hermes_cli/test_kanban_links_stale_scopes.py
+@@ -110,3 +110,68 @@ def test_warm_stale_returns_while_fingerprint_is_held(monkeypatch):
+         reader.join(5)
+         wait_until(lambda: not activity._links_refresher.busy, what='refresh cleanup')
+         activity._reset_cache_for_tests()
++
++
++def _warm_rows_projection(monkeypatch):
++    activity._reset_cache_for_tests()
++    monkeypatch.setattr(activity, '_origin_scope', lambda: ('A',))
++    monkeypatch.setattr(activity, '_links_fingerprint', lambda: ('first',))
++
++    def project():
++        activity._origin_rows_sink.rows.append({'origin': 'released'})
++        return [{'id': 'A'}]
++
++    monkeypatch.setattr(activity, '_project_remote_links', project)
++    expected = activity.remote_links_and_origin_rows()
++    assert expected == ([{'id': 'A'}], [{'origin': 'released'}])
++    entered, release = threading.Event(), threading.Event()
++
++    def fingerprint():
++        entered.set()
++        assert release.wait(5)
++        return ('next',)
++
++    monkeypatch.setattr(activity, '_links_fingerprint', fingerprint)
++    return expected, entered, release
++
++
++def _read_rows_in_thread(**kwargs):
++    results, returned = [], threading.Event()
++
++    def read():
++        results.append(activity.remote_links_and_origin_rows(**kwargs))
++        returned.set()
++
++    reader = threading.Thread(target=read)
++    reader.start()
++    return reader, results, returned
++
++
++def test_history_rows_stale_read_returns_while_fingerprint_is_held(monkeypatch):
++    """user-steps session-cards reads history rows with stale_ok=True: a warm entry (rows included) must
++    return before fingerprint/lock work, like the plain linked-card stale read."""
++    expected, entered, release = _warm_rows_projection(monkeypatch)
++    reader, results, returned = _read_rows_in_thread(stale_ok=True)
++    try:
++        assert entered.wait(2), 'stale read did not start a background refresh'
++        assert returned.wait(2), 'warm stale history read waited for fingerprint'
++        assert results == [expected]
++    finally:
++        release.set()
++        reader.join(5)
++        wait_until(lambda: not activity._links_refresher.busy, what='refresh cleanup')
++        activity._reset_cache_for_tests()
++
++
++def test_history_rows_default_stays_strict(monkeypatch):
++    """chat-closeout needs read-your-writes: the default call still waits on the fingerprint."""
++    _, entered, release = _warm_rows_projection(monkeypatch)
++    reader, results, returned = _read_rows_in_thread()
++    try:
++        assert entered.wait(2)
++        assert not returned.wait(0.3), 'strict history read returned before the fingerprint'
++    finally:
++        release.set()
++        reader.join(5)
++        activity._reset_cache_for_tests()
++    assert returned.is_set() and len(results) == 1
+-- 
+2.43.0
+

@@ -1,0 +1,248 @@
+From ae03f11de6cf97dbda87f6d34e59c030d5ee7a4f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:54:52 +0000
+Subject: [PATCH] fix(kanban): recompute promotion eligibility before Board
+ recovery [daveey]
+
+---
+ hermes_cli/kanban_placement_recovery.py       | 40 ++++++++
+ hermes_cli/kanban_sync_client.py              |  7 ++
+ hermes_cli/kanban_worker_placement.py         | 23 +++--
+ .../test_kanban_placement_recovery.py         | 91 +++++++++++++++++++
+ 4 files changed, 155 insertions(+), 6 deletions(-)
+ create mode 100644 hermes_cli/kanban_placement_recovery.py
+ create mode 100644 tests/hermes_cli/test_kanban_placement_recovery.py
+
+diff --git a/hermes_cli/kanban_placement_recovery.py b/hermes_cli/kanban_placement_recovery.py
+new file mode 100644
+index 0000000000..d1ae6e82ed
+--- /dev/null
++++ b/hermes_cli/kanban_placement_recovery.py
+@@ -0,0 +1,40 @@
++"""Current-input recovery eligibility; the Board alone changes assignments."""
++from __future__ import annotations
++
++import json
++
++
++def promotion_mode(conn, row, cfg):
++    """Legacy local routing was not a machine pin; preserve explicit durable intent.
++
++    An old policy cleared by an owner repin must never be silently re-enrolled.
++    Created portability is historical diagnostics, not today's eligibility decision.
++    """
++    from hermes_cli.kanban_placement import portable_reason
++
++    if row.get("runs_on") is not None:
++        return None
++    event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
++                         "ORDER BY id LIMIT 1", (row["id"],)).fetchone()
++    if event is None:
++        return None
++    try:
++        created = json.loads(event[0])
++    except (TypeError, ValueError):
++        return None
++    if not isinstance(created, dict) or created.get("placement_intent") == "explicit" or created.get("placement_policy"):
++        return None
++    if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind IN "
++                    "('moved','placement_repinned') LIMIT 1", (row["id"],)).fetchone():
++        return None
++    args = dict(row)
++    # An allocated scratch directory is not a declared input. Never erase a declared one.
++    args["workspace_path"] = created.get("workspace_path")
++    args["project_id"] = created.get("project_id")
++    args["board"] = "default"
++    try:
++        for key in ("requires", "skills"):
++            args[key] = json.loads(args[key]) if isinstance(args.get(key), str) else args.get(key)
++    except (TypeError, ValueError):
++        return None
++    return "promote" if portable_reason(args, cfg) is None else None
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 13eb4e867d..a67adc91c6 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -438,6 +438,13 @@ class Hub:
+         return self._call("POST", f"/v2/boards/{board}/placement/repin", {
+             "task_id": task_id, "expected_revision": expected_revision, "runs_on": runs_on})
+ 
++    def recover(self, board: str, *, task_id: str, expected_revision: int, mode: str,
++                candidates: list[str]) -> dict:
++        """Creator/CAS recovery; pull authoritative state after success or uncertain delivery."""
++        return self._call("POST", f"/v2/boards/{board}/placement/recover", {
++            "task_id": task_id, "expected_revision": expected_revision, "mode": mode,
++            "policy": "worker-first-v1", "candidates": candidates})
++
+     def reserve(self, board: str, *, task_id: str, expected_revision: int, candidates: list[str]) -> dict:
+         """Atomic Board placement; errors leave the persisted local queue fence intact."""
+         return self._call("POST", f"/v2/boards/{board}/placement/reserve", {
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 863b057bd3..96a3236187 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -99,7 +99,9 @@ def creation_audit(args, cfg=None):
+ 
+     try:
+         cfg = placement.config() if cfg is None else cfg
+-        return {"portable_reason": placement.portable_reason(args, cfg)}
++        explicit = args.get("placement") not in (None, "", "auto") or args.get("runs_on") is not None
++        return {"portable_reason": placement.portable_reason(args, cfg),
++                "placement_intent": "explicit" if explicit else "auto"}
+     except Exception:  # health: allow BLE001 -- an audit field never blocks a create
+         logger.warning("portable_reason audit failed", exc_info=True)
+         return {"portable_reason": "audit failed"}
+@@ -270,7 +272,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+         return 0
+     cursor = (sync.sync_state(conn) or {}).get("worker_reserve_cursor") or ""
+     rows = conn.execute(
+-        "SELECT id, sync_version FROM tasks WHERE placement_policy=? AND status='ready' "
++        "SELECT * FROM tasks WHERE (placement_policy=? OR placement_policy IS NULL) AND status='ready' "
+         "AND created_on=? AND claim_lock IS NULL AND lease_holder IS NULL AND sync_version IS NOT NULL "
+         "AND NOT EXISTS (SELECT 1 FROM kanban_sync_outbox o WHERE o.table_name='tasks' "
+         "AND o.row_uid=tasks.id AND o.state='pending') ORDER BY (id <= ?), id LIMIT ?",
+@@ -287,6 +289,10 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+     try:
+         for row in rows:
+             last = row["id"]
++            from hermes_cli.kanban_placement_recovery import promotion_mode
++            mode = promotion_mode(conn, dict(row), cfg) if row["placement_policy"] is None else None
++            if row["placement_policy"] is None and mode is None:
++                continue
+             key = (board, row["id"])
+             held = _refused.get(key)
+             if held and held[0] == row["sync_version"] and now < held[1]:
+@@ -296,7 +302,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                 for stale in [k for k, (_, until) in _refused.items() if until <= now]:
+                     del _refused[stale]
+             labels = requested_move(conn, row["id"])
+-            stage = "reserve" if labels is None else "repin"  # provenance for a failure below
++            stage = "recover" if mode else ("reserve" if labels is None else "repin")
+             held = _queued.get(key)
+             identity = _local_identity(conn, row["id"]) if labels is None else None
+             if labels is None and held and held[:2] == (row["sync_version"], identity) and now < held[2]:
+@@ -317,8 +323,12 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                         logger.warning("repinned %s on the Board but could not record it locally", row["id"],
+                                        exc_info=True)
+                 else:
+-                    reply = hub.reserve(board, task_id=row["id"], expected_revision=row["sync_version"],
+-                                        candidates=candidates)
++                    if mode:
++                        reply = hub.recover(board, task_id=row["id"], expected_revision=row["sync_version"],
++                                            mode=mode, candidates=candidates)
++                    else:
++                        reply = hub.reserve(board, task_id=row["id"], expected_revision=row["sync_version"],
++                                            candidates=candidates)
+                     if reply.get("state") == "queued":
+                         # Never adopt an arbitrary post-pull revision: it may be somebody else's edit.
+                         version = reply.get("task_version", row["sync_version"])
+@@ -483,7 +493,8 @@ def dispatch_tick(conn):
+     if sync.board_mode(conn) != "primary":
+         return
+     state = sync.sync_state(conn) or {}
+-    if not conn.execute("SELECT 1 FROM tasks WHERE placement_policy=? AND status='ready' LIMIT 1", (POLICY,)).fetchone():
++    if not conn.execute("SELECT 1 FROM tasks WHERE status='ready' AND created_on=? LIMIT 1",
++                        (state.get("gateway_id"),)).fetchone():
+         return
+     try:
+         ident = client.load_identity()
+diff --git a/tests/hermes_cli/test_kanban_placement_recovery.py b/tests/hermes_cli/test_kanban_placement_recovery.py
+new file mode 100644
+index 0000000000..aaf000461e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placement_recovery.py
+@@ -0,0 +1,91 @@
++"""Promotion recomputes current inputs, without manufacturing Board assignments."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_placement as placement
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++
++conn = fixtures.conn
++
++
++class Hub:
++    def __init__(self):
++        self.calls = []
++
++    def recover(self, board, **body):
++        self.calls.append((board, body))
++        return {"state": "assigned", "machine": "worker-2", "task_version": 5}
++
++
++@pytest.fixture
++def setup(conn, monkeypatch):
++    monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": ["worker-2"]}})
++    monkeypatch.setattr(client, "pull", lambda *a, **kw: None)
++    return conn, Hub()
++
++
++def make(conn, **fields):
++    tid = fixtures.acknowledged(conn, placement_policy=None, **fields)
++    conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='created'",
++                 (json.dumps({"placement_policy": None, "portable_reason": None}), tid))
++    conn.commit()
++    return tid
++
++
++def test_promotion_recomputes_stale_creation_reason(setup):
++    conn, hub = setup
++    tid = make(conn)
++    conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='created'",
++                 (json.dumps({"portable_reason": "assignee not allowlisted"}), tid))
++    conn.commit()
++    assert wp.reevaluate(conn, hub, "default", "hub") == 1
++    assert hub.calls == [("default", {"task_id": tid, "expected_revision": 4,
++                                     "mode": "promote", "candidates": ["worker-2"]})]
++    row = conn.execute("SELECT placement_policy,runs_on FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert tuple(row) == (None, None)  # response is not authority; only a feed pull may change this
++
++
++@pytest.mark.parametrize("fields", [
++    {"status": "todo"}, {"status": "running"}, {"status": "review"},
++    {"claim_lock": "owner"}, {"lease_holder": "worker-1", "lease_expires": 1},
++    {"created_on": "other"}, {"sync_version": None}, {"runs_on": "[]"},
++    {"requires": '["host_repo"]'}, {"workspace_kind": "dir"},
++    {"body": "Read secrets on the hub"},
++])
++def test_promotion_retains_independent_fences(setup, fields):
++    conn, hub = setup
++    make(conn, **fields)
++    assert wp.reevaluate(conn, hub, "default", "hub") == 0
++    assert not hub.calls
++
++
++def test_promotion_does_not_trust_creation_portability(setup):
++    conn, hub = setup
++    tid = make(conn, requires='["host_repo"]')
++    assert wp.reevaluate(conn, hub, "default", "hub") == 0
++    assert not hub.calls
++    assert kb.get_task(conn, tid).requires == ["host_repo"]
++
++
++def test_promotion_preserves_explicit_local_intent(setup):
++    conn, hub = setup
++    tid = make(conn)
++    conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='created'",
++                 (json.dumps({"placement_intent": "explicit"}), tid))
++    conn.commit()
++    assert wp.reevaluate(conn, hub, "default", "hub") == 0
++    assert not hub.calls
++
++
++def test_recovery_http_payload(monkeypatch):
++    hub = client.Hub(client.Identity("http://localhost", "synthetic", "hub"))
++    calls = []
++    monkeypatch.setattr(hub, "_call", lambda *a, **kw: calls.append((a, kw)) or {})
++    hub.recover("default", task_id="task", expected_revision=4, mode="promote", candidates=["worker-2"])
++    assert calls == [(("POST", "/v2/boards/default/placement/recover", {
++        "task_id": "task", "expected_revision": 4, "mode": "promote",
++        "policy": wp.POLICY, "candidates": ["worker-2"]}), {})]
+-- 
+2.43.0
+

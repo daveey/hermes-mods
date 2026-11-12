@@ -1,0 +1,125 @@
+From 595b2f6427380e63c5f2c81b467e9a44705947ce Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 13:01:48 +0000
+Subject: [PATCH] fix(kanban): record a Board guard hold as guard_held, not the
+ registry 'hold'
+
+Review t_01a1cfcee5250afb: 'hold' is the pickup-stall detector's host-wide machine-registry
+hold ('do not lift it'). A pinned card held by a dispatcher respawn guard now records
+guard_held and, if it stalls, gets a per-card repair naming the guard instead.
+---
+ hermes_cli/kanban_pickup_held.py              |  3 ++-
+ hermes_cli/kanban_pickup_stall.py             | 16 ++++++++++++-
+ hermes_cli/kanban_worker_node.py              |  5 ++--
+ .../test_kanban_pickup_held_budget.py         | 24 ++++++++++++++++++-
+ 4 files changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_pickup_held.py b/hermes_cli/kanban_pickup_held.py
+index 9e7ff36013..42a9d6f450 100644
+--- a/hermes_cli/kanban_pickup_held.py
++++ b/hermes_cli/kanban_pickup_held.py
+@@ -11,7 +11,8 @@ The card is still copied, outside the budget (at most :data:`FREE_PER_TICK` per
+ decided where the card would run: a quota or PR hold can lift, and only a dispatcher that holds a copy re-checks it.
+ A copy the local dispatcher then holds is kept (``kanban_worker_node._guard_held``). One it does not hold is
+ evicted, and is not copied again for :data:`RECHECK_SECONDS` unless its Board hold changes (new hold start or a
+-task row change), so an unkept copy is not re-imported every tick.
++task row change), so an unkept copy is not re-imported every tick. The signature includes the row's
++``sync_version``, so any Board change to the card re-arms one copy; :data:`FREE_PER_TICK` still bounds those.
+ """
+ from __future__ import annotations
+ 
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index ebd3bef0b1..605e26c265 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -39,7 +39,9 @@ _log = logging.getLogger(__name__)
+ 
+ TABLE = "kanban_pickup_skips"
+ REASONS = ("budget_exhausted", "profile_ineligible", "capability_missing", "parents_incomplete", "hold", "other",
+-           "evidence_missing", "quota_hold")
++           "evidence_missing", "quota_hold", "guard_held")
++# ``hold`` is this machine's registry hold (host-wide, an operator's); ``guard_held`` is one card the Board shows held
++# by a dispatcher respawn guard (active_pr, subscription_quota_reset, ...), which lifts when that guard does.
+ DEFAULT_STALL_SECONDS = 600
+ REFRESH_SECONDS = 60
+ RETENTION_SECONDS = 7 * 86400
+@@ -564,6 +566,18 @@ def file_repairs(conn, own: str, cards: list[dict[str, Any]], *, now: Optional[f
+             continue
+         reason = (card["skip"] or {}).get("reason") or "none recorded"
+         waited = _minutes(card["since_ms"], now_ms)
++        if reason == "guard_held":
++            ids.append(_create(
++                conn, key=f"{KEY_PREFIX}{own}:{card['id']}:", tenant=card["tenant"], own=own, now_ms=now_ms,
++                title=(f"Pickup stalled: {card['id']} pinned to machine:{own}, ready {waited} min, held by a "
++                       f"respawn guard ({card['skip'].get('detail') or 'guard_held'})"),
++                body=(f"Card {card['id']} ({card['title']}) has been ready on the Board, pinned to machine:{own}, "
++                      f"for {waited} min (threshold {stall_seconds()} s). {own} is not on a registry hold: the "
++                      f"card's Board history shows a dispatcher respawn guard holding it, and that hold lifts when "
++                      f"the guard does. Check whether the guard named below is still right (an open PR, a quota "
++                      f"reset clock, a shared blocker) rather than the machine.\n\nLast pickup skip recorded on "
++                      f"{own}: {describe(card['skip'])}.")))
++            continue
+         ids.append(_create(
+             conn, key=f"{KEY_PREFIX}{own}:{card['id']}:", tenant=card["tenant"], own=own, now_ms=now_ms,
+             title=f"Pickup stalled: {card['id']} pinned to machine:{own}, ready {waited} min, not imported ({reason})",
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 9c76b4f674..8aad77872a 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -531,7 +531,8 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+     to this machine that the pass leaves on the Board, why. ``budget_exhausted`` only for a card this pass would
+     otherwise have copied, so a refusal is never hidden behind a full queue. A card the Board shows held by a
+     respawn guard never takes the budget (``kanban_pickup_held``): with ``held`` it is copied outside ``limit``
+-    (its id and hold signature added to ``held``), else it is left as ``hold``."""
++    (its id and hold signature added to ``held``), else it is left as ``guard_held`` (never ``hold``: that
++    one is this machine's registry hold)."""
+     from hermes_cli import kanban_pickup_held as kph
+     from hermes_cli.kanban_db_dispatch import review_dispatch_enabled
+     mine = _unimported_pinned(conn, replica, own)
+@@ -564,7 +565,7 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+                 picked.append(card["id"])
+                 free += 1
+                 continue
+-            reason = ("hold", f"respawn_guarded: {hold[0]}")
++            reason = ("guard_held", f"respawn_guarded: {hold[0]}")
+         if reason is None and full:
+             reason = ("budget_exhausted", full_detail)
+         if reason is None:
+diff --git a/tests/hermes_cli/test_kanban_pickup_held_budget.py b/tests/hermes_cli/test_kanban_pickup_held_budget.py
+index fe79551c55..010ab1d249 100644
+--- a/tests/hermes_cli/test_kanban_pickup_held_budget.py
++++ b/tests/hermes_cli/test_kanban_pickup_held_budget.py
+@@ -138,7 +138,29 @@ def test_a_capped_tick_reports_a_held_pinned_card_as_held(gws):
+     worker.round()
+     worker.enter()
+     wn.note_capped(worker.conn)
+-    assert _skip(worker.conn, tid) == "hold"
++    assert _skip(worker.conn, tid) == "guard_held"
++
++
++def test_a_stalled_guard_held_card_does_not_file_the_registry_hold_repair(gws):
++    """A Board guard hold is not this machine's registry hold: no "Pickup held on <own>" / "do not lift it" card."""
++    from hermes_cli import kanban_pickup_stall as kps
++    from tests.hermes_cli.test_kanban_pickup_stall import _age, _repairs
++    hub, worker = gws
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="pinned held", assignee="default", priority=0, runs_on=PIN)
++    with write_txn(hub.conn):
++        append_event(hub.conn, tid, "respawn_guarded", {"reason": "active_pr"})
++    hub.round()
++    worker.round()
++    worker.enter()
++    wn.note_capped(worker.conn)
++    assert _skip(worker.conn, tid) == "guard_held"
++    _age(worker, tid, 900)
++    kps.sweep(worker.conn)
++    [repair] = _repairs(worker.conn)
++    assert tid in repair["title"] and "respawn guard" in repair["title"] and "active_pr" in repair["title"]
++    assert "Pickup held on" not in repair["title"]
++    assert "do not lift it" not in repair["body"] and "not on a registry hold" in repair["body"]
+ 
+ 
+ def test_an_unreadable_board_hold_takes_the_budget_as_before(gws, monkeypatch):
+-- 
+2.43.0
+

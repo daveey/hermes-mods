@@ -1,0 +1,349 @@
+From 65f80f4ff540666a8861f36c52f8b6eec0740b9c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:12:09 -0800
+Subject: [PATCH] [daveey] fix(compression): an answered request is not "in
+ flight" during a later notice turn
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A mid-turn compaction of a Kanban-notice turn restated a human request answered an hour
+earlier as "STILL IN PROGRESS — this is the active request"; the agent re-answered it
+(~25 API calls at 180-220k input tokens) while queued notices waited.
+
+_find_inflight_user_task took the newest actionable human row and only checked the
+transcript END for a completed reply. Notice rows (kanban_notice, internal_notification,
+process_complete, async_delegation_complete) are never actionable, so a notice-started turn
+has no visible trigger, and a mid-turn compaction always ends on a tool result.
+
+A request is now in flight only while its turn has not ended: a completed assistant reply
+followed by a turn-starting notice row ends it (agent/context_compressor_turns.py).
+Same-turn rows (auto_continue, steer, scaffolding, unknown kinds) do not. Replay/merge
+layout unchanged. The facade's stale image-anchor comment in _find_inflight_user_task
+(copied from the image stripper) is removed to offset the FILE_LINES cap.
+
+Proof: tests/agent/test_inflight_turn_ended_by_notice.py: 9 fail on the base, 19 pass
+after (incl. the observed 04:21 transcript shape from state.db and an end-to-end compress()).
+Mutants on every added condition killed (10/10). 109 compressor test files green locally.
+---
+ agent/context_compressor.py                   |  16 +-
+ agent/context_compressor_turns.py             |  35 +++
+ .../test_inflight_turn_ended_by_notice.py     | 216 ++++++++++++++++++
+ 3 files changed, 256 insertions(+), 11 deletions(-)
+ create mode 100644 agent/context_compressor_turns.py
+ create mode 100644 tests/agent/test_inflight_turn_ended_by_notice.py
+
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 02f7293ac7..cd380f220a 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -44,6 +44,7 @@ from agent.context_compressor_tail import (
+     elide_keeping_skill_safety_rule, with_skill_safety_rule, without_skill_safety_rule, tail_cut_progress_floor,
+ )
+ from agent.context_compressor_telemetry import CompressionTelemetryMixin
++from agent.context_compressor_turns import turn_ended_after
+ from agent.error_classifier import ClassifiedError, FailoverReason, classify_api_error
+ from agent.micro_compaction import MicroCompactionMixin
+ from agent.prompt_builder import STEER_DISPLAY_KIND
+@@ -4717,6 +4718,9 @@ Write only the summary body. Do not include any preamble or prefix."""
+         no pending ``tool_calls``.  A trailing ``tool`` result or an assistant
+         message that still has ``tool_calls`` outstanding means the run was
+         interrupted mid-task and the instruction is still owed an answer.
++        A request whose turn already ended (``turn_ended_after``: a completed
++        reply, then a notice-started turn) is never in flight, wherever the
++        transcript ends.
+ 
+         Handoff carriers and synthetic scaffolding rows are excluded via the
+         same filter pair as ``_find_last_user_message_idx``, so an idle session
+@@ -4726,16 +4730,6 @@ Write only the summary body. Do not include any preamble or prefix."""
+         from agent.conversation_compression import _is_real_user_message
+ 
+         last_user_idx = -1
+-        # Find the newest user message that carries at least one image part. We anchor on image-bearing user
+-        # messages (not all user messages) so a plain text follow-up after a big-image turn still strips the
+-        # old image — matching the problem kilocode#9434 set out to solve.
+-        # Newest tool message carrying an image. Tool-result images (``vision_analyze``,
+-        # screenshot-returning tools) accumulate on their own timeline and the user anchor never protects
+-        # the stale ones: a session whose only image-bearing user message is the FIRST one leaves ``anchor
+-        # <= 0`` and strips nothing at all, so twenty tool results keep multi-MB of base64 in every request
+-        # body until the provider answers 413 -- and the 413 handler's recovery compaction lands right back
+-        # here and frees nothing, which is the wedge in #89938. Keep the newest tool image, since that is
+-        # the one the model is reasoning about, and drop every older one wherever it sits.
+         for i in range(len(messages) - 1, -1, -1):
+             msg = messages[i]
+             # _is_real_user_message also rejects metadata-flagged scaffolding
+@@ -4749,7 +4743,7 @@ Write only the summary body. Do not include any preamble or prefix."""
+                 # carrier; it is the only copy left, so it is still the task.
+                 last_user_idx = i
+                 break
+-        if last_user_idx < 0:
++        if last_user_idx < 0 or turn_ended_after(messages, last_user_idx):
+             return None
+ 
+         for msg in reversed(messages[last_user_idx + 1:]):
+diff --git a/agent/context_compressor_turns.py b/agent/context_compressor_turns.py
+new file mode 100644
+index 0000000000..7558df31d9
+--- /dev/null
++++ b/agent/context_compressor_turns.py
+@@ -0,0 +1,35 @@
++"""Turn boundaries for ContextCompressor's in-flight request detection.
++
++A request is in flight only while its turn has not ended. Notice-started turns (Kanban notices,
++background-process and delegation reports) have no actionable user row, so the newest human row
++can be a request answered several turns ago; restating it after a mid-turn compaction makes the
++model redo finished work.
++"""
++
++from typing import Any
++
++# User-row kinds that start a new turn (persisted notices, not same-turn continuations such as
++# auto_continue or steer): after a completed reply, one of these means the earlier request is done.
++TURN_STARTING_NOTICE_KINDS = frozenset(
++    {"kanban_notice", "internal_notification", "process_complete", "async_delegation_complete"}
++)
++
++
++def turn_ended_after(messages: list[dict[str, Any]], idx: int) -> bool:
++    """Whether the turn begun at *idx* already ended: a completed reply, then a turn-starting notice row.
++
++    A completed reply is a text-bearing assistant row with no ``tool_calls`` that is not a summary
++    carrier. Same-turn rows (auto_continue, steer, scaffolding, unknown kinds) never end the turn.
++    """
++    from agent.context_compressor import ContextCompressor, _content_text_for_contains
++
++    replied = False
++    for msg in messages[idx + 1:]:
++        if not isinstance(msg, dict):
++            continue
++        role = msg.get("role")
++        if role == "assistant" and not msg.get("tool_calls") and not ContextCompressor._is_context_summary_message(msg):
++            replied = replied or bool(_content_text_for_contains(msg.get("content")).strip())
++        elif replied and role == "user" and msg.get("display_kind") in TURN_STARTING_NOTICE_KINDS:
++            return True
++    return False
+diff --git a/tests/agent/test_inflight_turn_ended_by_notice.py b/tests/agent/test_inflight_turn_ended_by_notice.py
+new file mode 100644
+index 0000000000..1f12e43d09
+--- /dev/null
++++ b/tests/agent/test_inflight_turn_ended_by_notice.py
+@@ -0,0 +1,216 @@
++"""A request is in flight only while its turn has not ended.
++
++Observed 2026-11-12 (Desktop chat, core 36f9904158): a human request was answered, later turns
++were started by Kanban notices (display_kind rows, never actionable), and a mid-turn compaction of
++one of those notice turns restated the long-answered request after the handoff as
++"STILL IN PROGRESS — this is the active request". The agent re-answered it for ~25 API calls.
++
++``_find_inflight_user_task`` picked the newest actionable human row and only checked the
++transcript END for a completed reply; a mid-turn compaction always ends on a tool result.
++A completed reply followed by a turn-starting notice row now ends the earlier request's turn.
++Same-turn continuations (auto_continue, scaffolding) do not.
++"""
++
++from typing import Any
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from agent.context_compressor import (
++    _INFLIGHT_TASK_REPLAY_HEADER,
++    _SUMMARY_END_MARKER,
++    COMPRESSED_SUMMARY_METADATA_KEY,
++    SUMMARY_PREFIX,
++    ContextCompressor,
++)
++
++HUMAN = "HUMAN_REQUEST_sentinel_withdrew_nothing_for_the_abc_choice"
++find = ContextCompressor._find_inflight_user_task
++
++
++def _h() -> dict[str, Any]:
++    return {"role": "user", "content": HUMAN}
++
++
++def _reply(text: str = "Done: nothing was waiting on you.") -> dict[str, Any]:
++    return {"role": "assistant", "content": text}
++
++
++def _notice(kind: str, text: str = "✔ Kanban t_x done — review approved") -> dict[str, Any]:
++    return {"role": "user", "content": text, "display_kind": kind}
++
++
++def _tool_pairs(count: int, start: int = 0, *, big: bool = False) -> list[dict[str, Any]]:
++    rows: list[dict[str, Any]] = []
++    for i in range(start, start + count):
++        rows.append({"role": "assistant", "content": "",
++                     "tool_calls": [{"id": f"c{i}", "function": {"name": "terminal", "arguments": "{}"}}]})
++        rows.append({"role": "tool", "tool_call_id": f"c{i}",
++                     "content": ("tool output " * 200 if big else "ok") + f" {i}"})
++    return rows
++
++
++# --- T1 / T2: a notice-started turn after a completed reply ends the earlier request -------------
++
++@pytest.mark.parametrize("kinds", [
++    ("kanban_notice",),                       # T1
++    ("internal_notification",),               # T2
++    ("process_complete", "kanban_notice"),    # T2 variant
++    ("async_delegation_complete",),
++])
++def test_answered_request_is_not_inflight_during_a_notice_turn(kinds):
++    msgs = [{"role": "system", "content": "sys"}, _h(), _reply(),
++            *[_notice(k) for k in kinds], *_tool_pairs(1)]
++    assert find(msgs) is None
++
++
++# --- T3 and other same-turn shapes: still in flight ---------------------------------------------
++
++def test_auto_continue_after_reply_keeps_request_inflight():
++    """T3 (unchanged): an auto_continue row resumes the same turn."""
++    msgs = [_h(), _reply("partial"), _notice("auto_continue", "[System note: Your previous turn was "
++                                             "interrupted mid-run]"), *_tool_pairs(1)]
++    assert find(msgs) is msgs[0]
++
++
++def test_scaffolding_row_after_reply_keeps_request_inflight():
++    msgs = [_h(), _reply("partial"),
++            {"role": "user", "content": "[Your active task list was preserved]", "_todo_snapshot_synthetic": True},
++            *_tool_pairs(1)]
++    assert find(msgs) is msgs[0]
++
++
++def test_notice_without_a_completed_reply_does_not_end_the_turn():
++    """A notice persisted mid-turn (between tool rounds) is not a new turn: no reply came first."""
++    msgs = [_h(), *_tool_pairs(1), _notice("kanban_notice"), *_tool_pairs(1, start=1)]
++    assert find(msgs) is msgs[0]
++
++
++def test_text_bearing_tool_call_round_is_not_a_completed_reply():
++    msgs = [_h(), {"role": "assistant", "content": "checking the board",
++                   "tool_calls": [{"id": "c9", "function": {"name": "terminal", "arguments": "{}"}}]},
++            {"role": "tool", "tool_call_id": "c9", "content": "ok"}, _notice("kanban_notice"), *_tool_pairs(1)]
++    assert find(msgs) is msgs[0]
++
++
++def test_summary_carrier_is_not_a_completed_reply():
++    carrier = {"role": "assistant", "content": SUMMARY_PREFIX + "\nran steps\n\n" + _SUMMARY_END_MARKER,
++               COMPRESSED_SUMMARY_METADATA_KEY: True}
++    msgs = [_h(), carrier, _notice("kanban_notice"), *_tool_pairs(1)]
++    assert find(msgs) is msgs[0]
++
++
++def test_empty_assistant_stub_after_reply_does_not_reopen_the_turn():
++    msgs = [_h(), _reply(), {"role": "assistant", "content": ""}, _notice("kanban_notice"), *_tool_pairs(1)]
++    assert find(msgs) is None
++
++
++def test_only_user_role_notice_rows_start_a_turn():
++    typed_tool = {"role": "tool", "tool_call_id": "c0", "content": "ok", "display_kind": "kanban_notice"}
++    msgs = [_h(), _reply("partial"), _tool_pairs(1)[0], typed_tool]
++    assert find(msgs) is msgs[0]
++
++
++def test_whitespace_only_assistant_row_is_not_a_completed_reply():
++    msgs = [_h(), {"role": "assistant", "content": "  \n"}, _notice("kanban_notice"), *_tool_pairs(1)]
++    assert find(msgs) is msgs[0]
++
++
++def test_non_dict_rows_are_skipped():
++    msgs = [_h(), None, _reply(), _notice("kanban_notice"), *_tool_pairs(1)]
++    assert find(msgs) is None  # type: ignore[arg-type]
++
++
++def test_unknown_display_kind_after_reply_is_not_turn_starting():
++    """Only the known notice kinds start a turn; anything else stays conservative (in flight)."""
++    msgs = [_h(), _reply("partial"), _notice("hidden"), *_tool_pairs(1)]
++    assert find(msgs) is msgs[0]
++
++
++def test_merged_replay_carrier_is_not_inflight_after_its_turn_ended():
++    """A carrier holding a merged restatement is the candidate too; an ended turn drops it as well."""
++    carrier = {"role": "user", "content": (SUMMARY_PREFIX + "\nran steps\n\n" + _SUMMARY_END_MARKER + "\n\n"
++                                           + _INFLIGHT_TASK_REPLAY_HEADER + "\n" + HUMAN),
++               COMPRESSED_SUMMARY_METADATA_KEY: True}
++    assert ContextCompressor._has_merged_inflight_replay(carrier)
++    assert find([carrier, *_tool_pairs(1)]) is carrier
++    assert find([carrier, *_tool_pairs(1), _reply(), _notice("kanban_notice"), *_tool_pairs(1, start=1)]) is None
++
++
++# --- T6: the observed 04:21 shape -----------------------------------------------------------------
++
++# state.db (MacBook) session 20261026_235722_bef6c6, rows 877967..878609 in id order: the transcript
++# compaction 878610 summarised. S=summary carrier, U=human row 877982, A=assistant tool_calls,
++# T=tool, R=assistant text reply, P=process_complete, C=auto_continue, K=kanban_notice.
++OBSERVED_0421 = ("SATATTATTATATTRUATATATTATTATTATATATATATATATATATATTATATATTATTATTATATRPATTTTATATTTATATATATATT"
++                 "TATTATTTATATTRCRKRKRKRKRKRKRKRKATTTTATATTTATATTTATATTATATTTT")
++
++
++def _call_row(n: int) -> dict[str, Any]:
++    return {"role": "assistant", "content": "",
++            "tool_calls": [{"id": f"c{n}", "function": {"name": "terminal", "arguments": "{}"}}]}
++
++
++_SHAPE_ROWS = {
++    "S": lambda n: {"role": "user", "content": SUMMARY_PREFIX + "\nearlier\n\n" + _SUMMARY_END_MARKER,
++                    COMPRESSED_SUMMARY_METADATA_KEY: True},
++    "U": lambda n: _h(),
++    "A": _call_row,
++    "T": lambda n: {"role": "tool", "tool_call_id": f"c{n}", "content": "ok"},
++    "R": lambda n: _reply(),
++    "P": lambda n: _notice("process_complete"),
++    "C": lambda n: _notice("auto_continue"),
++    "K": lambda n: _notice("kanban_notice"),
++}
++
++
++def _replay_shape(shape: str) -> list[dict[str, Any]]:
++    """One row per shape letter; ``A`` opens tool call ``c<n>`` and the following ``T`` rows answer it."""
++    rows: list[dict[str, Any]] = [{"role": "system", "content": "sys"}]
++    for n, ch in enumerate(shape):
++        call = shape[: n + 1].count("A")
++        rows.append(_SHAPE_ROWS[ch](call))
++    return rows
++
++
++def test_observed_0421_shape_is_not_inflight():
++    assert find(_replay_shape(OBSERVED_0421)) is None
++
++
++def test_observed_shape_before_the_answer_was_inflight():
++    """Control: cut at the 03:11 compaction's view (before reply 878116) the request WAS in flight."""
++    cut = OBSERVED_0421.index("U") + OBSERVED_0421[OBSERVED_0421.index("U"):].index("R")
++    found = find(_replay_shape(OBSERVED_0421[:cut]))
++    assert found is not None and found["content"] == HUMAN
++
++
++# --- T5: end-to-end compress() mid-turn ---------------------------------------------------------
++
++def _compress(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    response = MagicMock()
++    response.choices = [MagicMock()]
++    response.choices[0].message.content = "## Historical Task Snapshot\nUser asked: '" + HUMAN + "'\n## Summary\nsteps."
++    with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
++        compressor = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
++    compressor.tail_token_budget = 500
++    with patch("agent.context_compressor.call_llm", return_value=response):
++        return compressor.compress(messages, current_tokens=200_000, force=True)
++
++
++def _replays(rows: list[dict[str, Any]]) -> int:
++    return sum(str(m.get("content")).count(_INFLIGHT_TASK_REPLAY_HEADER) for m in rows)
++
++
++def test_compress_mid_notice_turn_does_not_restate_the_answered_request():
++    out = _compress([{"role": "system", "content": "sys"}, _h(), _reply(), _notice("kanban_notice"),
++                     *_tool_pairs(40, big=True)])
++    assert any(ContextCompressor._is_context_summary_message(m) for m in out)
++    assert _replays(out) == 0
++
++
++def test_compress_mid_continued_turn_still_restates_the_request():
++    """Control for T5: the same shape with an auto_continue row is still restated."""
++    out = _compress([{"role": "system", "content": "sys"}, _h(), _reply("partial"),
++                     _notice("auto_continue", "[System note: Your previous turn was interrupted mid-run]"),
++                     *_tool_pairs(40, big=True)])
++    assert _replays(out) == 1
+-- 
+2.43.0
+

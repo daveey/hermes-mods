@@ -1,0 +1,194 @@
+From b7867b7be79f7a4b7fce184b2a38fedc216e27be Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 10:56:52 +0000
+Subject: [PATCH] fix(kanban): notify legacy probe losses exactly once [daveey]
+
+---
+ hermes_cli/kanban_ask_resolved_backfill.py    |  8 +--
+ hermes_cli/kanban_block_notice.py             | 20 +++++++-
+ tests/hermes_cli/test_kanban_ask_backfill.py  |  8 ++-
+ .../test_kanban_ask_mutation_fences.py        | 16 ++++++
+ .../test_kanban_resolved_check_drop_notice.py | 49 +++++++++++++++++++
+ 5 files changed, 95 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_ask_resolved_backfill.py b/hermes_cli/kanban_ask_resolved_backfill.py
+index 385fe3d454..4900b290f5 100644
+--- a/hermes_cli/kanban_ask_resolved_backfill.py
++++ b/hermes_cli/kanban_ask_resolved_backfill.py
+@@ -4,9 +4,10 @@ Older cores appended ``BROKEN_EVENT`` / ``LOST_EVENT`` without marking the ask.
+ skips such a card forever (a terminal event follows its latest filing), so nothing tells origins or readers that
+ the probe stopped. This marks only a card that is still blocked, still names a resolved_check, has no probe row
+ and no mark, and whose *latest* ``blocked`` filing is followed by a drop event and no resolution. The mark takes
+-the drop event's own time and kind; no event or comment is written (the drop was already reported), and the read
+-pass takes no write txn. A refiled ask has a newer ``blocked`` event, so an older drop never marks it. An ask whose
+-probe another gateway owns, or a worker-node copy of another gateway's card, is left to that owner.
++the drop event's own time and kind. The first mark atomically re-emits that kind so local origin cursors that
++consumed the historical event get a notice; no comment is written, and the read pass takes no write txn.
++A refiled ask has a newer ``blocked`` event, so an older drop never marks it. An ask whose probe another gateway
++owns, or a worker-node copy of another gateway's card, is left to that owner.
+ """
+ from __future__ import annotations
+ 
+@@ -73,5 +74,6 @@ def backfill(conn: sqlite3.Connection) -> list[str]:
+             if _latest_drop(conn, tid) != drop or not _eligible(conn, tid):
+                 continue
+             kar.mark_dropped(conn, tid, drop[2], drop[3])
++            kb._append_event(conn, tid, drop[2], {"backfilled": True, "origin_event_id": drop[1]})
+             marked.append(tid)
+     return marked
+diff --git a/hermes_cli/kanban_block_notice.py b/hermes_cli/kanban_block_notice.py
+index fb407c1433..0e3e2d687d 100644
+--- a/hermes_cli/kanban_block_notice.py
++++ b/hermes_cli/kanban_block_notice.py
+@@ -70,6 +70,24 @@ DROP_EVENTS = ("resolved_check_broken", "resolved_check_lost")
+ _DROP_CAUSE = {"resolved_check_broken": "its probe kept failing", "resolved_check_lost": "its probe went missing"}
+ 
+ 
++def _drop_backfilled_origins(events):
++    """Remove a historical drop event when a backfill re-emission in the same batch names it as its origin.
++
++    Only the exact ``origin_event_id`` of a ``backfilled`` drop event of the same kind goes; distinct drops stay.
++    """
++    origins = set()
++    for e in events:
++        payload = getattr(e, "payload", None)
++        if e.kind in DROP_EVENTS and isinstance(payload, dict) and payload.get("backfilled") is True:
++            try:
++                origins.add((int(payload["origin_event_id"]), e.kind))
++            except (KeyError, TypeError, ValueError):
++                pass
++    if not origins:
++        return events
++    return [e for e in events if (int(e.id), e.kind) not in origins]
++
++
+ def coalesce_superseded_blocks(events):
+     """Drop ``blocked`` events that a later drop event in the same unseen batch supersedes. [daveey]
+ 
+@@ -78,7 +96,7 @@ def coalesce_superseded_blocks(events):
+     in this batch go; an ordinary block, or one re-filed after the drop, is kept. Callers keep the full claimed
+     cursor range, so ack/rewind semantics are unchanged.
+     """
+-    events = list(events)
++    events = _drop_backfilled_origins(list(events))
+     last_drop = max((int(e.id) for e in events if e.kind in DROP_EVENTS), default=None)
+     if last_drop is None:
+         return events
+diff --git a/tests/hermes_cli/test_kanban_ask_backfill.py b/tests/hermes_cli/test_kanban_ask_backfill.py
+index f3f70af009..8fb75b91d3 100644
+--- a/tests/hermes_cli/test_kanban_ask_backfill.py
++++ b/tests/hermes_cli/test_kanban_ask_backfill.py
+@@ -36,17 +36,21 @@ def _snapshot(conn):
+ 
+ 
+ @pytest.mark.parametrize("kind", DROPS)
+-def test_old_drop_is_marked_once_without_new_events(board, kind):
++def test_old_drop_is_marked_once_with_one_reemitted_event(board, kind):
+     with kbc.connect_closing() as conn:
+         tid = helpers._blocked_ask(conn, "exit 1")
+         _legacy(conn, tid, kind, at=5000)
+         events = _count(conn)
++        original = max(kb.list_events(conn, tid), key=lambda e: e.id)
+         out = kar.reconcile(conn, now=99999)
+         assert out["restored"] == out["lost"] == []
+         req = _request(conn, tid)
+         assert (req["resolved_check_dropped_at"], req["resolved_check_drop_reason"]) == (5000, kind)
+         assert req["resolved_check"] == "exit 1"
+-        assert _count(conn) == events and kwc.get_state(conn, tid) is None
++        assert _count(conn) == events + 1 and kwc.get_state(conn, tid) is None
++        emitted = max(kb.list_events(conn, tid), key=lambda e: e.id)
++        assert emitted.kind == kind
++        assert emitted.payload == {"backfilled": True, "origin_event_id": original.id}
+         assert kb.get_task(conn, tid).status == "blocked"
+         before = _snapshot(conn)
+         assert not any(kar.reconcile(conn, now=199999).values())
+diff --git a/tests/hermes_cli/test_kanban_ask_mutation_fences.py b/tests/hermes_cli/test_kanban_ask_mutation_fences.py
+index 12b9b492a6..65ed5c98a0 100644
+--- a/tests/hermes_cli/test_kanban_ask_mutation_fences.py
++++ b/tests/hermes_cli/test_kanban_ask_mutation_fences.py
+@@ -164,6 +164,22 @@ def test_coalesce_keeps_other_events_and_uses_latest_drop():
+     assert [e.id for e in bn.coalesce_superseded_blocks([_ev(1, "resolved_check_lost"), _ev(2, "blocked")])] == [1, 2]
+ 
+ 
++def test_backfill_coalesces_only_exact_same_kind_references():
++    broken, lost = kar.BROKEN_EVENT, kar.LOST_EVENT
++    originals = [_ev(1, broken), _ev(2, broken), _ev(3, lost)]
++    replay = SimpleNamespace(id=4, kind=broken, payload={"backfilled": True, "origin_event_id": 1})
++    assert [e.id for e in bn.coalesce_superseded_blocks(originals + [replay])] == [2, 3, 4]
++    for kind, payload in [("comment", replay.payload), (broken, None), (broken, []),
++                          (broken, {"backfilled": False, "origin_event_id": 1}),
++                          (broken, {"backfilled": True}),
++                          (broken, {"backfilled": True, "origin_event_id": None}),
++                          (broken, {"backfilled": True, "origin_event_id": "bad"}),
++                          (broken, {"backfilled": True, "origin_event_id": 3})]:
++        candidate = SimpleNamespace(id=4, kind=kind, payload=payload)
++        batch = originals + [candidate]
++        assert bn.coalesce_superseded_blocks(batch) == batch
++
++
+ def test_drop_warning_names_cause_from_mark_else_from_event():
+     assert "its probe kept failing" in bn.drop_warning({"resolved_check_drop_reason": "resolved_check_broken"})
+     assert "its probe went missing" in bn.drop_warning({}, "resolved_check_lost")
+diff --git a/tests/hermes_cli/test_kanban_resolved_check_drop_notice.py b/tests/hermes_cli/test_kanban_resolved_check_drop_notice.py
+index b2c6c1ef50..538926d6c7 100644
+--- a/tests/hermes_cli/test_kanban_resolved_check_drop_notice.py
++++ b/tests/hermes_cli/test_kanban_resolved_check_drop_notice.py
+@@ -136,6 +136,55 @@ def test_tui_origin_gets_one_notice_per_drop_event(event):
+         assert server._collect_kanban_notifications({"session_key": "drop-chat"}) == []
+ 
+ 
++@pytest.mark.parametrize("event", ["resolved_check_broken", "resolved_check_lost"])
++@pytest.mark.parametrize("platform", ["tui", "telegram"])
++@pytest.mark.parametrize("consumed", [True, False])
++def test_legacy_drop_is_notified_once_after_backfill(tmp_path, monkeypatch, event, platform, consumed):
++    from hermes_cli import kanban_ask_resolved as kar
++    from tests.hermes_cli.test_kanban_ask_backfill import _legacy
++
++    if platform == "telegram":
++        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "legacy.db"))
++    kb.init_db()
++    chat = "drop-chat" if platform == "tui" else "chat-1"
++    adapter = helpers.RecordingAdapter()
++    runner = helpers._runner(adapter)
++    texts = []
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="DNS", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat, delivery_mode="notify+wake")
++        _drop(conn, tid, produce=False)
++        _legacy(conn, tid, event, at=DROPPED_AT)
++        original = max(kb.list_events(conn, tid), key=lambda e: e.id)
++        # Consumed: the old notifier read the event before drop notices existed. Unconsumed: the origin was offline
++        # and sees the historical drop and the backfill re-emission in one unseen batch.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE kanban_notify_subs SET last_event_id=? WHERE task_id=?",
++                         (original.id if consumed else original.id - 1, tid))
++        for _ in range(3):
++            kar.reconcile(conn, now=DROPPED_AT + 100)
++            if platform == "tui":
++                claims = []
++                texts.extend(server._collect_kanban_notifications({"session_key": chat}, claims))
++                for claim in claims:
++                    assert kbn.ack_notify_claim(conn, task_id=tid, platform=platform, chat_id=chat, thread_id="",
++                                                upto=claim["new"], from_cursor=claim["old"])
++            else:
++                runner._running = True
++                asyncio.run(helpers._run_one_tick(monkeypatch, runner))
++        if platform == "telegram":
++            texts = [s["text"] for s in adapter.sent]
++            assert len(adapter.handled) == 1
++        assert len(texts) == 1, texts
++        _assert_drop_wording(texts[0])
++        drops = sorted((e for e in kb.list_events(conn, tid) if e.kind == event), key=lambda e: e.id)
++        assert len(drops) == 2
++        assert drops[-1].payload == {"backfilled": True, "origin_event_id": original.id}
++        request = kar._request(kb.get_task(conn, tid).human_request)
++        assert request["resolved_check_dropped_at"] == DROPPED_AT
++        assert request["resolved_check_drop_reason"] == event
++
++
+ # -- remote (hub replica) path -----------------------------------------------------------------------
+ 
+ # -- offline origin: unseen original block followed by a drop ------------------------------------------
+-- 
+2.43.0
+

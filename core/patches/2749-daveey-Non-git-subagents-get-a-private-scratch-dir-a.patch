@@ -1,0 +1,250 @@
+From 30bf1db6664397b09d72350cad83cca1ca9e11c9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:59:39 +0000
+Subject: [PATCH] [daveey] Non-git subagents get a private scratch dir and a
+ SHARED-cwd prompt block
+
+A delegated child without git worktree isolation inherits its parent's cwd,
+which the parent and its siblings also write; in a plain scratch folder a
+helper wrote and removed generic names (resolve.py, runv.sh, w, v-*) that
+could belong to them (self-heal agent-c97f5ffde4).
+
+seed_workspace now gives such a child (local backend only) a mkdtemp folder
+under TMPDIR (subagent-<id>-*, pruned with scratch) and appends to its
+ephemeral system prompt: PRIVATE SCRATCH: <path> (yours alone), and that the
+working directory <parent cwd> is SHARED, so it must not overwrite or delete
+files it did not create there. The session cwd stays the parent's. A
+git-isolated child gets no block (the worktree note covers it); a non-local
+backend gets none (a host folder is invisible to its tools).
+
+Proof: tests/tools/test_delegate_private_scratch.py was RED on 8665aa9858
+(3 failed: no private_scratch), GREEN after (5 passed); the 66 test files
+importing the delegate modules pass (727 tests).
+---
+ tests/tools/test_delegate_private_scratch.py | 131 +++++++++++++++++++
+ tools/delegate_tool_child_run.py             |  25 ++++
+ tools/delegate_tool_progress.py              |  10 ++
+ 3 files changed, 166 insertions(+)
+ create mode 100644 tests/tools/test_delegate_private_scratch.py
+
+diff --git a/tests/tools/test_delegate_private_scratch.py b/tests/tools/test_delegate_private_scratch.py
+new file mode 100644
+index 0000000000..0dbc2cb377
+--- /dev/null
++++ b/tests/tools/test_delegate_private_scratch.py
+@@ -0,0 +1,131 @@
++"""A delegated child without git worktree isolation shares its parent's cwd; it
++gets its own private scratch folder, named in its system prompt together with
++the warning that the inherited cwd is SHARED (self-heal agent-c97f5ffde4)."""
++
++import os
++import subprocess
++from pathlib import Path
++from types import SimpleNamespace
++from unittest import mock
++
++from tools import subagent_worktree
++from tools.delegate_tool_child_run import _ChildRun
++from tools.delegate_tool_progress import _build_private_scratch_block
++from tools.terminal_tool import clear_session_cwd, get_session_cwd, record_session_cwd
++
++_BASE_PROMPT = "You are a focused subagent working on a specific delegated task."
++
++
++def _seed(parent_task_id: str, subagent_id: str) -> tuple[_ChildRun, SimpleNamespace]:
++    child = SimpleNamespace(ephemeral_system_prompt=_BASE_PROMPT, _delegate_profile_home=None)
++    parent = SimpleNamespace(_current_task_id=parent_task_id)
++    run = _ChildRun(child, parent, 0, "do the thing", subagent_id, None)
++    run.seed_workspace()
++    return run, child
++
++
++def _scratch_tmp(tmp_path: Path, monkeypatch) -> Path:
++    tmpdir = tmp_path / "tmpdir"
++    tmpdir.mkdir()
++    monkeypatch.setenv("TMPDIR", str(tmpdir))
++    return tmpdir
++
++
++def test_non_git_children_get_distinct_private_scratch_named_in_prompt(tmp_path, monkeypatch):
++    tmpdir = _scratch_tmp(tmp_path, monkeypatch)
++    shared = tmp_path / "shared-scratch"
++    shared.mkdir()
++    record_session_cwd("parent-ps-1", str(shared))
++    runs = []
++    try:
++        for sid in ("sa-0-aaaa1111", "sa-1-bbbb2222"):
++            runs.append(_seed("parent-ps-1", sid))
++        dirs = []
++        for (run, child), sid in zip(runs, ("sa-0-aaaa1111", "sa-1-bbbb2222")):
++            private = run.private_scratch
++            assert private and os.path.isdir(private)
++            assert Path(private).parent == tmpdir
++            assert Path(private).name.startswith(f"subagent-{sid}-")
++            prompt = child.ephemeral_system_prompt
++            assert prompt.startswith(_BASE_PROMPT)
++            assert "PRIVATE SCRATCH" in prompt and private in prompt
++            assert "SHARED" in prompt and str(shared) in prompt
++            # The session cwd stays the parent's: brief paths are relative to it.
++            assert get_session_cwd(run.child_task_id) == str(shared)
++            assert run.worktree_info is None
++            dirs.append(private)
++        assert dirs[0] != dirs[1]
++        # Each prompt names only its own private folder.
++        assert dirs[1] not in runs[0][1].ephemeral_system_prompt
++        assert dirs[0] not in runs[1][1].ephemeral_system_prompt
++    finally:
++        clear_session_cwd("parent-ps-1")
++        for run, _ in runs:
++            clear_session_cwd(run.child_task_id)
++
++
++def test_unrecorded_parent_cwd_falls_back_to_workspace_hint(tmp_path, monkeypatch):
++    _scratch_tmp(tmp_path, monkeypatch)
++    hinted = tmp_path / "hinted"
++    hinted.mkdir()
++    child = SimpleNamespace(ephemeral_system_prompt=None, _delegate_profile_home=None)
++    parent = SimpleNamespace(_current_task_id="parent-ps-4-unrecorded", terminal_cwd=str(hinted))
++    run = _ChildRun(child, parent, 0, "goal", "sa-0-eeee5555", None)
++    try:
++        run.seed_workspace()
++        prompt = child.ephemeral_system_prompt
++        assert prompt.startswith("PRIVATE SCRATCH: ")
++        assert f"Your working directory {hinted} is SHARED" in prompt
++    finally:
++        clear_session_cwd(run.child_task_id)
++
++
++def test_block_without_known_cwd_still_says_shared():
++    block = _build_private_scratch_block("/tmp/x", None)
++    assert block.startswith("PRIVATE SCRATCH: /tmp/x (yours alone). Your working directory is SHARED")
++
++
++def test_git_isolated_child_gets_no_private_scratch_block(tmp_path, monkeypatch):
++    tmpdir = _scratch_tmp(tmp_path, monkeypatch)
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-C", str(repo)]
++    subprocess.run([*git, "init", "-q"], check=True)
++    (repo / "f.txt").write_text("x", encoding="utf-8")
++    subprocess.run([*git, "add", "f.txt"], check=True)
++    subprocess.run([*git, "commit", "-qm", "init"], check=True)
++    record_session_cwd("parent-ps-2", str(repo))
++    run = None
++    try:
++        with mock.patch("tools.delegate_tool._get_worktree_isolation", return_value=True), \
++                mock.patch.object(subagent_worktree, "local_backend_active", return_value=True):
++            run, child = _seed("parent-ps-2", "sa-0-cccc3333")
++        assert run.worktree_info is not None
++        assert run.private_scratch is None
++        assert child.ephemeral_system_prompt == _BASE_PROMPT
++        assert list(tmpdir.iterdir()) == []
++    finally:
++        if run is not None and run.worktree_info is not None:
++            subagent_worktree.finalize_subagent_worktree(run.worktree_info)
++        clear_session_cwd("parent-ps-2")
++        if run is not None:
++            clear_session_cwd(run.child_task_id)
++
++
++def test_non_local_backend_gets_no_host_private_scratch(tmp_path, monkeypatch):
++    """A host TMPDIR folder is invisible to a docker/ssh child's tools: naming it would mislead."""
++    tmpdir = _scratch_tmp(tmp_path, monkeypatch)
++    shared = tmp_path / "shared"
++    shared.mkdir()
++    record_session_cwd("parent-ps-3", str(shared))
++    run = None
++    try:
++        with mock.patch.object(subagent_worktree, "local_backend_active", return_value=False):
++            run, child = _seed("parent-ps-3", "sa-0-dddd4444")
++        assert run.private_scratch is None
++        assert child.ephemeral_system_prompt == _BASE_PROMPT
++        assert list(tmpdir.iterdir()) == []
++    finally:
++        clear_session_cwd("parent-ps-3")
++        if run is not None:
++            clear_session_cwd(run.child_task_id)
+diff --git a/tools/delegate_tool_child_run.py b/tools/delegate_tool_child_run.py
+index 0a77d947f2..0854e61b61 100644
+--- a/tools/delegate_tool_child_run.py
++++ b/tools/delegate_tool_child_run.py
+@@ -7,6 +7,7 @@ import logging
+ import contextvars
+ import json
+ import os
++import tempfile
+ import threading
+ import time
+ from tools.delegation_redaction import redact_child_result, redact_child_text
+@@ -797,6 +798,7 @@ class _ChildRun:
+     heartbeat: Any = None
+     child_start: float = field(default_factory=time.monotonic)
+     worktree_info: Optional[dict[str, str]] = None
++    private_scratch: Optional[str] = None
+     child_task_id: str = ""
+     parent_task_id: Optional[str] = None
+     wall_start: float = 0.0
+@@ -838,6 +840,7 @@ class _ChildRun:
+         # The parent's record is read in the parent's scope; the child's is written in the child's (cwd records
+         # are keyed by the active profile, and a profile-routed child looks its own up as that profile).
+         from tools.delegate_tool_routes import child_profile_scope
++        parent_cwd: Optional[str] = None
+         with _quiet("Child cwd seed failed: %s"):
+             from tools.terminal_tool import get_session_cwd, record_session_cwd, register_container_alias
+             parent_cwd = get_session_cwd(self.parent_task_id)
+@@ -854,9 +857,31 @@ class _ChildRun:
+             # the goal message instead (same turn, no system-prompt mutation).
+             from tools.subagent_worktree import build_worktree_context_note
+             self.goal = self.goal + build_worktree_context_note(self.worktree_info)
++        else:
++            self.attach_private_scratch(parent_cwd)
+         self.wall_start = time.time()
+         self.parent_reads_snapshot = list(file_state.known_reads(self.parent_task_id)) if self.parent_task_id else []
+ 
++    def attach_private_scratch(self, parent_cwd: Optional[str]) -> None:
++        """Without git isolation the child shares its parent's cwd with the parent and its siblings: give it a
++        private folder under TMPDIR (pruned with the rest of scratch) and name both in its system prompt. The session
++        cwd stays the parent's, since brief paths are relative to it. The ephemeral prompt is injected at API-call
++        time, so setting it before ``run_conversation`` reaches the first call. Local backend only: a host folder is
++        invisible to a docker/ssh child's tools."""
++        from tools import subagent_worktree
++        from tools.delegate_tool_progress import _build_private_scratch_block, _resolve_workspace_hint
++        if not subagent_worktree.local_backend_active():
++            return
++        with _quiet("private scratch setup failed: %s"):
++            self.private_scratch = tempfile.mkdtemp(
++                prefix=f"subagent-{self.subagent_id or self.child_task_id}-",
++                dir=os.environ.get("TMPDIR") or tempfile.gettempdir(),
++            )
++            shared = parent_cwd or _resolve_workspace_hint(self.parent_agent)
++            block = _build_private_scratch_block(self.private_scratch, shared)
++            base = getattr(self.child, "ephemeral_system_prompt", None) or ""
++            self.child.ephemeral_system_prompt = "\n\n".join(filter(None, (base, block)))
++
+     def finish_failed(
+         self, entry: dict[str, Any], late_steer: Optional[str], *, preview: str, summary: str = "", status: Optional[str] = None,
+     ) -> dict[str, Any]:
+diff --git a/tools/delegate_tool_progress.py b/tools/delegate_tool_progress.py
+index 2a44597b0b..cea34fbcb7 100644
+--- a/tools/delegate_tool_progress.py
++++ b/tools/delegate_tool_progress.py
+@@ -219,6 +219,16 @@ def _build_child_system_prompt(
+         )
+     return "\n".join(parts)
+ 
++def _build_private_scratch_block(private_scratch: str, shared_cwd: Optional[str]) -> str:
++    """System-prompt block for a child without git worktree isolation: it inherits the parent's cwd, which the parent
++    and sibling subagents also write, so it gets a private folder for its own scratch files (self-heal agent-c97f5ffde4)."""
++    where = f"Your working directory {shared_cwd}" if shared_cwd else "Your working directory"
++    return (
++        f"PRIVATE SCRATCH: {private_scratch} (yours alone). {where} is SHARED with your parent and sibling "
++        "subagents: never overwrite or delete files there that you did not create in this task; put new scratch "
++        "files, scripts and logs in the private folder."
++    )
++
+ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
+     """Best-effort local workspace hint for child prompts: only a concrete
+     absolute directory is ever injected (never a fake container path).
+-- 
+2.43.0
+

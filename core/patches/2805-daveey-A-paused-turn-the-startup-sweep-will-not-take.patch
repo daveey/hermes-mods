@@ -1,0 +1,211 @@
+From 23cd22828e2a7917f689d0b52b5b091314773058 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:35:53 +0000
+Subject: [PATCH] [daveey] A paused turn the startup sweep will not take is
+ owed to no successor; automation replays recheck past the yield window
+
+Follow-up to the review of #1435 (t_01a1cfcca83f9266), two non-blocking findings:
+
+- update_pause.successor_owes_continuation reported a dead writer's pause as owed for the first
+  SUCCESSOR_YIELD_S of every newly started process, whatever its age: a 2 h old pause (past the
+  sweep's freshness window) or one out of attempts delayed the chat's headless deliveries by up to
+  300 s after each restart, though no successor would ever continue it. It now returns False when
+  the startup sweep would skip the marker (startup_resume._skip_reason with the sweep's own
+  _settings) or the sweep is off, so the two cannot drift. No new age constant.
+- automation_replay rechecked a "busy" wake 10 x 60 s = 600 s, less than SUCCESSOR_YIELD_UNKNOWN_S
+  (660 s): a replay first fired just after a dead writer's pause stamp gave up before the window
+  ended. BUSY_RECHECKS_MAX is now derived from the window plus one recheck interval (12).
+
+Tests (test_cold_resume_yields_paused_turn.py, real session.resume path): a stale or
+out-of-attempts pause with a reader started 10 s ago is not owed and the wake resumes the chat; a
+pause the sweep takes is owed; a busy replay is still pending when the window ends and delivers on
+its next fire. All three fail on the parent. test_wake_yields_paused_turn.py patches the writer
+probe where the sweep's check reads it.
+---
+ .../test_cold_resume_yields_paused_turn.py    | 84 +++++++++++++++++++
+ .../test_wake_yields_paused_turn.py           |  6 +-
+ tui_gateway/automation_replay.py              |  9 +-
+ tui_gateway/update_pause.py                   | 16 ++--
+ 4 files changed, 107 insertions(+), 8 deletions(-)
+
+diff --git a/tests/tui_gateway/test_cold_resume_yields_paused_turn.py b/tests/tui_gateway/test_cold_resume_yields_paused_turn.py
+index ea4377805b..fdc5411de2 100644
+--- a/tests/tui_gateway/test_cold_resume_yields_paused_turn.py
++++ b/tests/tui_gateway/test_cold_resume_yields_paused_turn.py
+@@ -153,3 +153,87 @@ def test_process_start_is_this_process_birth():
+     started = up._process_started_at()
+     assert 0 < started <= time.time()
+     assert wait_until(lambda: up._process_started_at() == started, timeout=1)  # stable across calls
++
++
++# ── only a pause the startup sweep takes is owed ─────────────────────────────────────────────────────────────
++
++def _set_marker(home, **fields) -> None:
++    path = home / "desktop" / "interrupted_turns.json"
++    entries = json.loads(path.read_text())
++    entries[KEY].update(fields)
++    path.write_text(json.dumps(entries))
++
++
++def _stale(home) -> None:
++    _age_pause(home, _recovery.CFG["desktop"]["auto_continue"]["freshness_minutes"] * 60 + 60)
++
++
++def _out_of_attempts(home) -> None:
++    _set_marker(home, attempts=2)  # desktop.auto_continue.max_attempts defaults to 2
++
++
++@pytest.mark.parametrize("skipped", [_stale, _out_of_attempts], ids=["stale", "out-of-attempts"])
++def test_a_pause_the_startup_sweep_skips_is_owed_to_no_one(recovery, home, monkeypatch, skipped):
++    """Review t_01a1cfcca83f9266: a 2 h old pause was owed to a reader started 10 s earlier, so each restart
++    delayed the chat's headless deliveries by ``SUCCESSOR_YIELD_S`` though no successor would ever take it."""
++    from tui_gateway import startup_resume as sr
++    skipped(home)
++    assert sr.pending_resumes(home, _recovery.CFG, log_skips=False) == []  # the sweep leaves it alone
++    monkeypatch.setattr(up, "_process_started_at", lambda: time.time() - 10)
++    assert not up.successor_owes_continuation(home, KEY)
++    assert _wake() != "busy"
++    assert _loaded()
++
++
++def test_a_pause_the_startup_sweep_takes_is_owed_to_a_fresh_reader(recovery, home, monkeypatch):
++    from tui_gateway import startup_resume as sr
++    _age_pause(home, 2 * 3600)
++    assert [r["session_key"] for r in sr.pending_resumes(home, _recovery.CFG, log_skips=False)] == [KEY]
++    monkeypatch.setattr(up, "_process_started_at", lambda: time.time() - 10)
++    assert up.successor_owes_continuation(home, KEY)
++    assert _wake() == "busy"
++    assert not recovery.done.wait(0.3) and recovery.calls == [] and not _loaded()
++
++
++# ── an automation replay outlasts the yield window ───────────────────────────────────────────────────────────
++
++def test_a_busy_replay_is_still_pending_when_the_yield_window_ends(recovery, home, monkeypatch):
++    """A replay that first fires just after a dead writer's pause stamp, in a process that did not restart and
++    with no successor coming, keeps rechecking past ``SUCCESSOR_YIELD_UNKNOWN_S`` and delivers then (10 x 60 s
++    gave up at 600 s of the 660 s window)."""
++    from tui_gateway import automation_replay as ar
++    stamp = time.time()
++    clock = [stamp - 30]  # the replay is scheduled 30 s before the pause stamp, so it first fires 30 s after
++    timers = []
++    monkeypatch.setattr(up, "_now", lambda: clock[0])
++    monkeypatch.setattr(ar, "ENABLED", True)
++    monkeypatch.setattr(ar, "_arm", lambda key, entry, delay, fire: timers.append((delay, fire, key)))
++    verdicts = []
++    real_wake = server._wake_session_turn
++    monkeypatch.setattr(server, "_wake_session_turn",
++                        lambda *a, **kw: (verdicts.append(real_wake(*a, **kw)), verdicts[-1])[1])
++    ar.reset()
++    try:
++        assert ar.schedule(KEY, text="a card finished", display_kind="kanban_notice", display_metadata={}, due=0,
++                           cause="lease", persisted=True, now=clock[0])
++        while timers and clock[0] - stamp < up.SUCCESSOR_YIELD_UNKNOWN_S:
++            delay, fire, key = timers.pop()
++            clock[0] += delay
++            if clock[0] - stamp >= up.SUCCESSOR_YIELD_UNKNOWN_S:
++                assert ar.pending(KEY), f"the replay gave up {clock[0] - stamp:.0f} s after the pause stamp"
++            fire(key)
++        assert clock[0] - stamp >= up.SUCCESSOR_YIELD_UNKNOWN_S, (
++            f"the replay gave up {clock[0] - stamp:.0f} s after the pause stamp; nothing more is scheduled")
++        assert set(verdicts) == {"busy"}  # the window's last fire resumed the chat; its paused turn went first
++        assert _loaded()
++        assert_continued(recovery)
++        assert ar.pending(KEY) and timers, "the replay gave up behind the paused turn's continuation"
++        _, session = server._find_live_session_by_key(KEY)
++        session["running"] = False  # the continuation finished
++        delay, fire, key = timers.pop()
++        clock[0] += delay
++        fire(key)
++        assert verdicts[-1] == "started" and not ar.pending(KEY)
++        assert len(recovery.calls) == 2 and "a card finished" in recovery.calls[1][0]
++    finally:
++        ar.reset()
+diff --git a/tests/tui_gateway/test_wake_yields_paused_turn.py b/tests/tui_gateway/test_wake_yields_paused_turn.py
+index ead12828b1..3a263a687d 100644
+--- a/tests/tui_gateway/test_wake_yields_paused_turn.py
++++ b/tests/tui_gateway/test_wake_yields_paused_turn.py
+@@ -78,7 +78,8 @@ def test_successor_owes_continuation_reads_the_durable_pause(recovery, fields, o
+ 
+ 
+ def test_a_pause_whose_writer_lives_is_not_owed_by_a_successor(recovery, monkeypatch):
+-    monkeypatch.setattr("tui_gateway.turn_marker.marker_writer_state", lambda marker: "alive")
++    for where in ("tui_gateway.turn_marker", "tui_gateway.startup_resume"):  # the sweep's own check reads it
++        monkeypatch.setattr(f"{where}.marker_writer_state", lambda marker: "alive")
+     assert up.successor_owes_continuation(recovery.home, KEY) is False
+ 
+ 
+@@ -115,7 +116,8 @@ def test_a_non_conforming_profile_dir_does_not_fail_the_wake(recovery, profiles_
+ 
+ 
+ def test_a_fresh_pause_in_a_profile_home_is_left_to_its_successor(recovery, profiles_root, monkeypatch):
+-    monkeypatch.setattr("tui_gateway.turn_marker.marker_writer_state", lambda marker: "dead")  # no real pid probe
++    for where in ("tui_gateway.turn_marker", "tui_gateway.startup_resume"):  # no real pid probe
++        monkeypatch.setattr(f"{where}.marker_writer_state", lambda marker: "dead")
+     _profile(profiles_root.root, "Not A Profile!")
+     work = _profile(profiles_root.root, "work")
+     old = time.time() - up.SUCCESSOR_YIELD_UNKNOWN_S - 1
+diff --git a/tui_gateway/automation_replay.py b/tui_gateway/automation_replay.py
+index 2354958571..dbbce7ed35 100644
+--- a/tui_gateway/automation_replay.py
++++ b/tui_gateway/automation_replay.py
+@@ -26,12 +26,15 @@ guarantee own that case). The boundary row an automation turn leaves says what f
+ from __future__ import annotations
+ 
+ import logging
++import math
+ import re
+ import threading
+ import time
+ from dataclasses import dataclass, field
+ from typing import Any, Callable
+ 
++from tui_gateway.update_pause import SUCCESSOR_YIELD_UNKNOWN_S
++
+ logger = logging.getLogger(__name__)
+ 
+ AUTOMATION_KINDS = frozenset({"kanban_notice", "process_complete"})
+@@ -40,7 +43,11 @@ REPLAY_METADATA_KEY = "automation_replay"
+ REPLAY_MIN_DELAY_S = 60.0
+ # The replay found a turn running: it looks again this much later, at most this many times, then gives up.
+ BUSY_RECHECK_S = 60.0
+-BUSY_RECHECKS_MAX = 10
++# [daveey] "busy" also means a dead writer's paused turn is left to its successor (``update_pause``), for up to
++# ``SUCCESSOR_YIELD_UNKNOWN_S`` from the pause stamp. The rechecks outlast that window by one interval, so a
++# replay that first fired just after the stamp is still pending when the window ends (10 x 60 s gave up at
++# 600 s of a 660 s window; review t_01a1cfcca83f9266).
++BUSY_RECHECKS_MAX = math.ceil((SUCCESSOR_YIELD_UNKNOWN_S + BUSY_RECHECK_S) / BUSY_RECHECK_S)
+ # Tests switch this off (tests/tui_gateway/conftest.py) so no real timer outlives the test that armed it.
+ ENABLED = True
+ 
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index e5b368da02..5d69a40545 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -642,13 +642,19 @@ def successor_owes_continuation(home: Path | str, session_key: str) -> bool:
+     gateway's kanban sweeper did so 21 s after a pause, the continuation re-asked a clarify form no Desktop
+     window could see, and the user's next message cancelled it. The window is ``SUCCESSOR_YIELD_S`` from this
+     process's start when it started after the pause, else ``SUCCESSOR_YIELD_UNKNOWN_S`` from the pause stamp.
+-    Past it no successor came and any reader continues, as before."""
+-    from tui_gateway.turn_marker import freshness_since, marker_writer_state, read_turn_marker
++    Past it no successor came and any reader continues, as before. Nothing is owed for a marker the startup
++    sweep leaves alone (``startup_resume._skip_reason``: stale, out of attempts, writer alive, opted out) or
++    when the sweep is off: no successor would continue it, and a fresh reader held a 2 h old pause for its
++    first ``SUCCESSOR_YIELD_S`` (review t_01a1cfcca83f9266)."""
++    from tui_gateway import server
++    from tui_gateway.startup_resume import _settings, _skip_reason
++    from tui_gateway.turn_marker import freshness_since, read_turn_marker
+     marker = read_turn_marker(home, session_key)
+-    if not marker or marker.get("reason") != PAUSE_REASON or not marker.get("auto_continue", True):
++    if not marker or marker.get("reason") != PAUSE_REASON:
++        return False
++    on_startup, fresh_s, max_attempts, _ = _settings(server._load_cfg())
++    if not on_startup or _skip_reason(marker, _now(), fresh_s, max_attempts) is not None:
+         return False
+-    if marker_writer_state(marker) == "alive":
+-        return False  # its own backend still holds the pause (in-place watcher)
+     paused, started = freshness_since(marker), _process_started_at()
+     if started > paused:
+         return 0 <= _now() - started < SUCCESSOR_YIELD_S
+-- 
+2.43.0
+

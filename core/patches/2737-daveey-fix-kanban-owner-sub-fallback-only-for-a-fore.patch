@@ -1,0 +1,101 @@
+From d506aa9f82a4f4f44116fdf68957cba3cacd01f4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 13:22:16 +0000
+Subject: [PATCH] [daveey] fix(kanban): owner-sub fallback only for a foreign
+ creator copy; an unsubscribed local chat stays unsubscribed
+
+Review t_01a1cfde2403c623 (PR #1456 @187d8d97f6): the unconditional _copy_delivery fallback could not tell a
+picked-up copy (subs never synced) from this gateway's own owner card whose chat removed its sub on purpose, so
+every new worker child re-subscribed that chat. Fall back to _owner_delivery only when the owner card's
+tasks.created_on is set and is not this gateway. Tests: the copy fixture sets created_on, plus a negative case
+(created_on NULL or this gateway, hub and local chat) asserting the child gets no sub.
+---
+ hermes_cli/kanban_creator_chats.py            | 20 ++++++++++++---
+ .../test_kanban_creator_copy_owner_sub.py     | 25 +++++++++++++++++--
+ 2 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_creator_chats.py b/hermes_cli/kanban_creator_chats.py
+index bc30c6380c..f943ca60c3 100644
+--- a/hermes_cli/kanban_creator_chats.py
++++ b/hermes_cli/kanban_creator_chats.py
+@@ -130,8 +130,10 @@ def resolve_chats(conn: sqlite3.Connection, creator_task_id: str) -> list[dict]:
+ def _copy_delivery(conn: sqlite3.Connection, task_id: str, owner: dict) -> None:
+     """Retain every delivery column, never the source card's notification cursor.
+ 
+-    A picked-up or synced copy of the owner card carries its links but never its subs (they do not sync): with
+-    nothing to copy, the link alone still owns the child, as on the replica path. [daveey]"""
++    A picked-up or synced copy of another gateway's owner card (``created_on`` set and not this gateway) carries
++    its links but never its subs (they do not sync): with nothing to copy, the link alone still owns the child, as
++    on the replica path. This gateway's own card is authoritative: a chat that removed its sub there stays
++    unsubscribed, so its children get no sub either. [daveey]"""
+     hub_chat = f"{owner['chat_gateway']}/{owner['chat_profile'] or 'default'}/{owner['chat_session']}"
+     match = "((platform='hub' AND chat_id=?) OR (platform='tui' AND chat_id=?))"
+     conn.execute(
+@@ -143,11 +145,21 @@ def _copy_delivery(conn: sqlite3.Connection, task_id: str, owner: dict) -> None:
+         "(SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?) "
+         "FROM kanban_notify_subs WHERE task_id=? AND " + match,
+         (task_id, task_id, owner["task_id"], hub_chat, owner["chat_session"]))
+-    if not conn.execute(f"SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND {match}",
+-                        (task_id, hub_chat, owner["chat_session"])).fetchone():
++    if _foreign_copy(conn, owner["task_id"]) and not conn.execute(
++            f"SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND {match}",
++            (task_id, hub_chat, owner["chat_session"])).fetchone():
+         _owner_delivery(conn, task_id, owner)
+ 
+ 
++def _foreign_copy(conn: sqlite3.Connection, task_id: str) -> bool:
++    """True for a local copy of another gateway's card (its subs live on that gateway, not here). [daveey]"""
++    from hermes_cli.kanban_origin import gateway_names
++    if not any(c[1] == "created_on" for c in conn.execute("PRAGMA table_info(tasks)")):
++        return False
++    row = conn.execute("SELECT created_on FROM tasks WHERE id=?", (task_id,)).fetchone()
++    return bool(row and row[0] and row[0] != gateway_names()[0])
++
++
+ class _ReplicaReader:
+     """One lazy guarded handle per repair pass, never cached ownership or misses.
+ 
+diff --git a/tests/tools/test_kanban_creator_copy_owner_sub.py b/tests/tools/test_kanban_creator_copy_owner_sub.py
+index 6ac977deef..df26bc67d9 100644
+--- a/tests/tools/test_kanban_creator_copy_owner_sub.py
++++ b/tests/tools/test_kanban_creator_copy_owner_sub.py
+@@ -25,9 +25,13 @@ def home(tmp_path, monkeypatch):
+     return home
+ 
+ 
+-def _copy_with_link(conn, gateway, profile):
+-    """A creator card whose link rows are in this file but whose subs are not (a picked-up or synced copy)."""
++def _copy_with_link(conn, gateway, profile, created_on="away"):
++    """A creator card whose link rows are in this file but whose subs are not (a picked-up or synced copy of
++    another gateway's card when ``created_on`` names that gateway)."""
+     creator = kb.create_task(conn, title="picked-up creator", assignee="default")
++    if not any(c[1] == "created_on" for c in conn.execute("PRAGMA table_info(tasks)")):
++        conn.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++    conn.execute("UPDATE tasks SET created_on=? WHERE id=?", (created_on, creator))
+     conn.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
+                  "released, created_at) VALUES (?, ?, ?, ?, ?, 'created', 0, 1)",
+                  (links.link_uid(creator, gateway, profile, CHAT, "created"), creator, gateway, profile, CHAT))
+@@ -75,3 +79,20 @@ def test_owner_sub_in_this_file_is_still_copied_once(home, monkeypatch, capsys):
+         subs = notify.list_notify_subs(conn, child)
+         assert [(s["platform"], s["chat_id"], s["delivery_mode"], s["delivery_metadata"]) for s in subs] == [
+             ("hub", f"away/research/{CHAT}", "notify+wake", {"reason": "origin", "keep": 1})]
++
++
++@pytest.mark.parametrize("created_on", [None, "here"])
++@pytest.mark.parametrize("gateway,profile", [("away", "research"), ("here", None)])
++def test_own_card_whose_chat_unsubscribed_gives_its_child_no_sub(home, monkeypatch, capsys, created_on,
++                                                                 gateway, profile):
++    """This gateway's own owner card is authoritative: a chat that removed its sub there is not re-subscribed on
++    the card's new worker children, although its unreleased ``created`` link still names it. [daveey]"""
++    with kbc.connect_closing() as conn:
++        creator = _copy_with_link(conn, gateway, profile, created_on=created_on)
++        assert _subs(conn, creator) == []
++    monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
++    monkeypatch.setenv("HERMES_SESSION_ID", WORKER)
++    monkeypatch.setenv("HERMES_SESSION_KEY", WORKER)
++    child = create("tool", monkeypatch, capsys)
++    with kbc.connect_closing() as conn:
++        assert _subs(conn, child) == []
+-- 
+2.43.0
+

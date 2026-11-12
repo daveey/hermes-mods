@@ -1,0 +1,173 @@
+From f595f4b484b347db365324a1c45630b6d9f3a32e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:08:50 -0800
+Subject: [PATCH] [daveey] kanban: a waking local wake settles the chat's tui
+ sibling (archived card, stuck tui claim)
+
+---
+ gateway/kanban_wake_sibling.py                | 57 ++++++++++++++++++-
+ gateway/kanban_watchers_notifier.py           | 10 ++++
+ .../test_kanban_notify_wake_one_turn.py       | 50 ++++++++++++++++
+ 3 files changed, 114 insertions(+), 3 deletions(-)
+
+diff --git a/gateway/kanban_wake_sibling.py b/gateway/kanban_wake_sibling.py
+index d028143885..b8f5c9bb3c 100644
+--- a/gateway/kanban_wake_sibling.py
++++ b/gateway/kanban_wake_sibling.py
+@@ -61,9 +61,11 @@ def tui_formatter(conn: Any, sub: dict, fmt: Callable) -> Callable:
+ 
+ def has_tui_sibling(conn: Any, sub: dict) -> bool:
+     """For a waking ``local`` row: a ``tui`` row for the same card and chat defers its notice to this wake."""
+-    if (sub.get("platform") or "").lower() != "local" or (sub.get("delivery_mode") or "notify") not in WAKE_MODES:
+-        return False
+-    return _sibling(conn, sub, "tui")
++    return _waking_local(sub) and _sibling(conn, sub, "tui")
++
++
++def _waking_local(sub: dict) -> bool:
++    return (sub.get("platform") or "").lower() == "local" and (sub.get("delivery_mode") or "notify") in WAKE_MODES
+ 
+ 
+ def notice_lines(sub: dict, task: Any, events, board_slug: Optional[str]) -> list[str]:
+@@ -74,3 +76,52 @@ def notice_lines(sub: dict, task: Any, events, board_slug: Optional[str]) -> lis
+         if covered(ev) and (text := _format_kanban_event_text(sub, task, ev, board_slug or "")):
+             lines.append(text)
+     return lines
++
++
++def settle_tui_sibling(board: Optional[str], sub: dict, upto: int) -> bool:
++    """After this waking ``local`` row delivered its batch up to event ``upto``: record that on the ``tui`` sibling
++    too, when everything the ``tui`` row would show up to there is covered. True when the row changed.
++
++    The silence in :func:`tui_cover` needs the ``local`` row to still exist when the ``tui`` row is read. An
++    archived card drains and removes the ``local`` row; a ``tui`` claim rewound after that (held 15 min, then
++    "rewound to event 239597 for redelivery") found no sibling and delivered the completion as a second turn
++    (t_01a1cfb6db097701: rows 879522 and 880235, 2026-11-12). So:
++
++    - no claim on the ``tui`` row: its cursor moves to ``upto``;
++    - a claim in flight: its rewind point (``inflight_from``) moves up to ``upto`` (never past the claim's end),
++      so a rewind hands back only what the wake did not carry; the holder's own ack is unchanged.
++    """
++    import contextlib
++    import json
++    from types import SimpleNamespace
++
++    from hermes_cli import kanban_db_connect as kbc
++    from tui_gateway.session_notifications import _KANBAN_EVENT_FORMATTERS
++    if not _waking_local(sub):
++        return False
++    ident = (sub["task_id"], sub["chat_id"], sub.get("thread_id") or "")
++    key = "task_id = ? AND platform = 'tui' AND chat_id = ? AND thread_id = ?"
++    with contextlib.closing(kbc.connect(board=board)) as conn, kbc.write_txn(conn):
++        row = conn.execute(f"SELECT last_event_id, inflight_from FROM kanban_notify_subs WHERE {key}", ident).fetchone()
++        if row is None:
++            return False
++        last, held = int(row[0] or 0), row[1]
++        start = last if held is None else int(held)
++        stop = upto if held is None else min(upto, last)
++        if start >= stop:
++            return False
++        for kind, payload in conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
++                                          "AND id <= ?", (ident[0], start, stop)):
++            try:
++                data = json.loads(payload) if payload else {}
++            except ValueError:
++                data = {}
++            if kind in _KANBAN_EVENT_FORMATTERS and not covered(SimpleNamespace(kind=kind, payload=data)):
++                return False  # the tui row still owes a notice the wake did not carry
++        if held is None:
++            cur = conn.execute(f"UPDATE kanban_notify_subs SET last_event_id = ? WHERE {key} "
++                               "AND last_event_id = ? AND inflight_from IS NULL", (stop, *ident, last))
++        else:
++            cur = conn.execute(f"UPDATE kanban_notify_subs SET inflight_from = ? WHERE {key} "
++                               "AND inflight_from = ?", (stop, *ident, held))
++        return cur.rowcount == 1
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index e5f3dfbb0b..4d2f2bcbe0 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -829,6 +829,14 @@ class _KanbanNotification:
+                 logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
+         return True
+ 
++    async def _settle_tui_sibling(self) -> None:
++        """Record this wake on the chat's tui row too (kanban_wake_sibling.settle_tui_sibling); never fails delivery."""
++        from gateway.kanban_wake_sibling import settle_tui_sibling
++        try:
++            await _to_thread_process_service(partial(settle_tui_sibling, self.board_slug, self.sub, int(self.d["cursor"])))
++        except Exception:  # health: allow BLE001 -- the wake is delivered; the tui row's claim-time check still covers it
++            logger.warning("kanban notifier: settling the tui sibling of %s failed", self.task_id, exc_info=True)
++
+     async def failure_receipts(self, lane, run_uids=()):
+         return await _to_thread_process_service(partial(
+             self.runner._kanban_sub_op, self.board_slug, "notify_failure_receipts", self.sub,
+@@ -966,6 +974,8 @@ class _KanbanNotification:
+                 return
+ 
+         # Delivery complete: advance the cursor (the dedup mechanism).
++        if wake_payloads and self.d.get("tui_notice"):
++            await self._settle_tui_sibling()
+         await self.advance()
+         if not is_push:
+             self.clear_failures()
+diff --git a/tests/gateway/test_kanban_notify_wake_one_turn.py b/tests/gateway/test_kanban_notify_wake_one_turn.py
+index 2fc7d97c15..44b2b1cae4 100644
+--- a/tests/gateway/test_kanban_notify_wake_one_turn.py
++++ b/tests/gateway/test_kanban_notify_wake_one_turn.py
+@@ -199,3 +199,53 @@ def test_unloaded_sweeper_leaves_a_covered_event_to_the_wake_turn(board, tmp_pat
+     assert subs["tui"] == (last, None)
+     _wake_leg(runner)
+     assert len(adapter.turns) == 1 and NOTICE["completed"].format(tid=tid) in adapter.turns[0]
++
++
++def test_archived_card_after_the_wake_leaves_no_second_notice_turn(board):
++    """t_01a1cfb6db097701 (2026-11-12): the wake delivered at 04:40:25, the card was archived at 04:41:22 (its local
++    row went with it), and the tui row's later claim found no sibling and started a second turn at 04:59:20."""
++    from hermes_cli.kanban_db_archive import archive_task
++
++    runner, adapter = board
++    tid = _card()
++    _event(tid, "completed")
++    _wake_leg(runner)
++    conn = kbc.connect()
++    try:
++        archive_task(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ? AND platform = 'local'", (tid,))
++    finally:
++        conn.close()
++    assert _notice_leg() == []
++    assert len(adapter.turns) == 1
++
++
++def test_a_stuck_tui_claim_rewound_after_the_wake_and_archive_starts_no_second_turn(board):
++    """The live shape (t_01a1cfb6db097701): the tui row was claimed before the wake (04:25:06), the wake delivered
++    (04:40:25), the card was archived (04:41:22), and the stuck claim was rewound for redelivery (04:46:05)."""
++    from hermes_cli.kanban_db_archive import archive_task
++
++    runner, adapter = board
++    tid = _card()
++    _event(tid, "completed")
++    conn = kbc.connect()
++    try:
++        old, cur, events = kbn.claim_unseen_events_for_sub(conn, task_id=tid, platform="tui", chat_id=CHAT,
++                                                           thread_id="", durable=True)
++        assert events and cur > old
++    finally:
++        conn.close()
++    _wake_leg(runner)
++    conn = kbc.connect()
++    try:
++        archive_task(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ? AND platform = 'local'", (tid,))
++            row = conn.execute("SELECT * FROM kanban_notify_subs WHERE task_id = ? AND platform = 'tui'",
++                               (tid,)).fetchone()
++            assert kbn._rewind_orphan(conn, kbn._sub_key(tid, "tui", CHAT, ""), row, why="stopped serving the chat")
++    finally:
++        conn.close()
++    assert _notice_leg() == []
++    assert len(adapter.turns) == 1
+-- 
+2.43.0
+

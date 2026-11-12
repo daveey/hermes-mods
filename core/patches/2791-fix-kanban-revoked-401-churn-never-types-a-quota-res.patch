@@ -1,0 +1,562 @@
+From 4dd02e7ef56364e25598538e77455f7e492de8da Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:04:18 +0000
+Subject: [PATCH] fix(kanban): revoked-401 churn never types a quota reset;
+ quota-release --probe refuses a confirmed wall [daveey]
+
+A pool emptied by auth failures (401/revoked rows) raises SubscriptionAuthUnavailable: exit 75, receipt
+quota_unconfirmed, a short capped backoff, and no quota_episode or provider wall. A start-time
+SubscriptionQuotaUnavailable the live /api/oauth/usage read contradicts is booked as QuotaContradicted
+(same unconfirmed path). `hermes kanban quota-release <id> --probe` releases only when the live usage
+read shows headroom on every walled provider; otherwise it records an audited quota_release_refused.
+---
+ agent/model_routing_runtime.py             |  10 +-
+ agent/model_routing_unavailable.py         |  44 ++++++++
+ gateway/session_kanban.py                  |   9 +-
+ hermes_cli/kanban_parser.py                |   2 +
+ hermes_cli/kanban_provider_walls.py        |   2 +
+ hermes_cli/kanban_quota_episode.py         |  22 ++--
+ hermes_cli/kanban_quota_episode_release.py |  46 ++++++--
+ hermes_cli/kanban_quota_probe.py           | 117 +++++++++++++++++++++
+ hermes_cli/kanban_quota_receipt.py         |  17 ++-
+ hermes_cli/kanban_quota_release.py         |  10 +-
+ hermes_cli/turn_exit.py                    |   4 +-
+ 11 files changed, 258 insertions(+), 25 deletions(-)
+ create mode 100644 hermes_cli/kanban_quota_probe.py
+
+diff --git a/agent/model_routing_runtime.py b/agent/model_routing_runtime.py
+index 0212753a9c..770e9f14c7 100644
+--- a/agent/model_routing_runtime.py
++++ b/agent/model_routing_runtime.py
+@@ -75,6 +75,7 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+         config = load_user_config_effective()
+     pools = {}
+     unavailable = []
++    churned = []  # [daveey] routes emptied by 401-benched rows: capacity unknown, never a quota reset
+     available = []
+     dropped = {}  # (provider, model) -> why that route left the candidate list
+     if _temporary_resolution.get():
+@@ -95,9 +96,11 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+             return True
+         dropped[route["provider"], route["model"]] = "no available credential"
+         if route["billing"] == "subscription":
+-            from agent.model_routing_unavailable import quota_unavailable
++            from agent.model_routing_unavailable import SubscriptionAuthUnavailable, auth_churned, quota_unavailable
+             if error := quota_unavailable(pools[key], route["model"]):
+                 unavailable.append(error)
++            elif auth_churned(pools[key], route["model"]):
++                churned.append(SubscriptionAuthUnavailable(route["provider"], route["model"]))
+         return False
+ 
+     failed = list(excluded)
+@@ -129,6 +132,7 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+     rechecked = False
+     while True:
+         unavailable.clear()
++        churned.clear()
+         available.clear()
+         try:
+             resolve_model_route(model, provider, config=config, session_id=session_id,
+@@ -142,7 +146,9 @@ def resolve_class_runtime(model, provider, *, config=None, session_id=None,
+         except ModelRoutingError:
+             # Only credential eligibility was lost: policy/capability refusals
+             # never enter eligible(), and a prepared runtime's errors stay fatal.
+-            if unavailable and not available and not resolved:
++            if churned and not available and not resolved and (rechecked or not exact_pin):
++                raise churned[0] from None  # a 401-churned route may serve after re-read: no quota reset
++            if unavailable and not churned and not available and not resolved:
+                 raise min(unavailable, key=lambda error: error.resets_at) from None
+             if not exact_pin or available or resolved or not dropped:
+                 raise
+diff --git a/agent/model_routing_unavailable.py b/agent/model_routing_unavailable.py
+index 63688ca4d3..2426255cde 100644
+--- a/agent/model_routing_unavailable.py
++++ b/agent/model_routing_unavailable.py
+@@ -14,6 +14,50 @@ class SubscriptionQuotaUnavailable(ModelRoutingError):
+         super().__init__(message)
+ 
+ 
++class SubscriptionAuthUnavailable(ModelRoutingError):
++    """[daveey] The OAuth pool is empty because rows are auth-benched (401/revoked), not only quota-capped.
++
++    Capacity is unknown, so it carries no reset: a worker retries soon (exit 75) without a quota
++    episode or provider wall. 2026-11-12: 3 revoked rows + 4 opus-capped rows read as a 5-day wall."""
++
++    status_code = 503
++
++    def __init__(self, provider, model):
++        self.provider, self.model = provider, model
++        super().__init__(f"Subscription credentials for {provider}/{model} are auth-benched (401); "
++                         "quota unconfirmed, retry after the pool re-reads its tokens")
++
++
++class QuotaContradicted(SubscriptionAuthUnavailable):
++    """[daveey] The pool read quota-walled, but the provider's live usage windows show an account with
++    headroom (``hermes_cli.kanban_quota_probe.contradicted``): unconfirmed, so it carries no reset either."""
++
++    def __init__(self, provider, model, detail):
++        super().__init__(provider, model)
++        self.args = (f"Subscription quota for {provider}/{model} unconfirmed: the pool is empty but live usage "
++                     f"shows headroom ({str(detail)[:200]}); retrying without a quota deadline",)
++
++
++def auth_benched(entry, model, now):
++    """True for a row benched by a 401 whose own capacity for *model* is unknown (no model cap of its own)."""
++    from agent.credential_pool import STATUS_EXHAUSTED
++    from agent.credential_pool_model_cooldowns import model_cooldown_until
++    if entry.last_status != STATUS_EXHAUSTED or entry.last_error_code != 401:
++        return False
++    return not ((model_cooldown_until(entry, model) or 0) > now)
++
++
++def auth_churned(pool, model):
++    """At least one live OAuth row of *pool* is benched only by a 401 (see ``auth_benched``)."""
++    from agent.credential_pool import STATUS_DEAD
++    import time
++    if pool is None:
++        return False
++    now = time.time()
++    return any(entry.auth_type == "oauth" and entry.last_status != STATUS_DEAD and auth_benched(entry, model, now)
++               for entry in pool.entries())
++
++
+ def _quota_scan(pool, model):
+     """``(room, waits)`` for *model*: room when a live OAuth entry can serve it now, else its quota resets.
+ 
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index 6b98e7de2f..23bbc9c210 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -359,12 +359,15 @@ def record_start_failure(frame, exc):
+         return
+     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
+     from hermes_cli.kanban_host_refusal import PROOF_KEY, startup_proof
+-    proof = startup_proof(exc)
++    from hermes_cli.kanban_quota_probe import contradicted
++    booked = contradicted(exc)  # [daveey] a typed wall the live usage read disputes books no reset
++    proof = startup_proof(booked)
+     if proof is None:
+-        code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
++        code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(booked))
+     else:
+         from hermes_cli.kanban_owner_unavailable import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE as code
+-    _record_worker_result(context, code, start_failure_line(exc), exc, extra={PROOF_KEY: proof} if proof else None)
++    _record_worker_result(context, code, start_failure_line(booked), booked,
++                          extra={PROOF_KEY: proof} if proof else None)
+     exc._kanban_failure_booked = True
+ 
+ 
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 271db7a02d..312b98e8f1 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -555,6 +555,8 @@ _SPECS = [
+     _cmd("quota-release", [
+         _TASK_ID,
+         _arg("--reason", default="", help="Why the quota episode no longer holds (recorded as an event + comment)"),
++        _arg("--probe", action="store_true",
++             help="Release only when a live usage read shows headroom on every walled provider (else refuse, audited)"),
+     ], help="Operator-only: end the card's quota episode (a stale 'resets at' hold) so it is admissible again"),
+     _cmd("promote", [
+         _TASK_ID,
+diff --git a/hermes_cli/kanban_provider_walls.py b/hermes_cli/kanban_provider_walls.py
+index 1472d933b2..eaeed472b5 100644
+--- a/hermes_cli/kanban_provider_walls.py
++++ b/hermes_cli/kanban_provider_walls.py
+@@ -109,6 +109,8 @@ def record_wall_for_run(conn: sqlite3.Connection, task_id: str, run_id: Optional
+     from hermes_cli.kanban_quota_episode import _disproved, _unhinted, episode
+     state = episode(conn, task_id)
+     if state and state['run_id'] == run_id:
++        if state.get('auth_churn'):
++            return None  # [daveey] an unconfirmed (auth-churn) refusal never walls the provider
+         # Exact-run receipt/backoff owns the deadline; never extend it with an
+         # unscoped log tail or the legacy provider-wide default. A hint the live
+         # pool already disproves is mirrored as its backoff only.
+diff --git a/hermes_cli/kanban_quota_episode.py b/hermes_cli/kanban_quota_episode.py
+index bd481b8606..759393ab18 100644
+--- a/hermes_cli/kanban_quota_episode.py
++++ b/hermes_cli/kanban_quota_episode.py
+@@ -19,14 +19,19 @@ logger = logging.getLogger(__name__)
+ MAX_BACKOFF_SECONDS = 7200
+ # A wall this gateway recorded holds as recorded for this long; after it, only while this pool agrees.
+ LOCAL_WALL_TRUST_SECONDS = 30 * 60
++# [daveey] An unconfirmed (auth-churn) refusal retries soon: tokens are re-read within minutes, and a
++# short cap keeps its backoff below provider_walls.MIN_WALL_SECONDS, so it never becomes a wall.
++AUTH_CHURN_MAX_BACKOFF_SECONDS = 600
+ 
+ 
+-def _backoff(ended_at, count):
+-    """The doubling-backoff deadline after the *count*-th consecutive rate_limited run ending at *ended_at*."""
++def _backoff(ended_at, count, *, cap=None):
++    """The doubling-backoff deadline after the *count*-th consecutive rate_limited run ending at *ended_at*;
++    *cap* (an auth-churn refusal) bounds the delay below ``MAX_BACKOFF_SECONDS``."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_quota_receipt import valid_deadline
+     cooldown = max(0, kb._resolve_rate_limit_cooldown_seconds())
+-    delay = min(MAX_BACKOFF_SECONDS, cooldown * 2 ** min(max(count, 1) - 1, 20))
++    limit = MAX_BACKOFF_SECONDS if cap is None else min(cap, MAX_BACKOFF_SECONDS)
++    delay = min(limit, cooldown * 2 ** min(max(count, 1) - 1, 20))
+     ended = kb._to_epoch(ended_at)
+     # An unreadable end stamp anchors backoff at now; an unrepresentable sum holds one full cap.
+     return valid_deadline((ended if ended is not None else time.time()) + delay)
+@@ -34,7 +39,7 @@ def _backoff(ended_at, count):
+ 
+ def episode(conn, task_id, *, run_id=None):
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_quota_receipt import receipt_deadline, receipt_route
++    from hermes_cli.kanban_quota_receipt import receipt_deadline, receipt_route, receipt_unconfirmed
+     runs = []
+     bound = conn.execute("SELECT ended_at,id FROM task_runs WHERE task_id=? AND id=? AND ended_at IS NOT NULL",
+                          (task_id, run_id)).fetchone() if run_id is not None else None
+@@ -58,7 +63,8 @@ def episode(conn, task_id, *, run_id=None):
+     if stored:
+         return kb._json_dict(stored[0])
+     reset = receipt_deadline(conn, task_id, latest['id'])
+-    backoff = _backoff(latest['ended_at'], len(runs))
++    churn = receipt_unconfirmed(conn, task_id, latest['id'])
++    backoff = _backoff(latest['ended_at'], len(runs), cap=AUTH_CHURN_MAX_BACKOFF_SECONDS if churn else None)
+     # A hint extends the wait, never shortens it below the doubling backoff ('retry after 5s' x N).
+     found = [t for t in (reset, backoff) if t is not None]
+     until = max(found) if found else None
+@@ -74,7 +80,7 @@ def episode(conn, task_id, *, run_id=None):
+             'until': until if until is not None else time.time() + MAX_BACKOFF_SECONDS,
+             'backoff_until': backoff, 'hinted': reset is not None,
+             'provider': actual or admitted, 'providers': providers,
+-            'model': route.get('model')}
++            'model': route.get('model'), 'auth_churn': churn}
+ 
+ 
+ def _providers(state):
+@@ -396,8 +402,8 @@ def record_episode(conn, task_id, run_id, *, captured=False):
+     the notice's wording falls back to the bare wait, so it can never leave a card running."""
+     from hermes_cli import kanban_db as kb
+     state = episode(conn, task_id, run_id=run_id if captured else None)
+-    if not state or state['run_id'] != run_id:
+-        return
++    if not state or state['run_id'] != run_id or state.get('auth_churn'):
++        return  # an auth-churn (unconfirmed) refusal is a short retry, never a recorded quota episode
+     exists = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='quota_episode'",
+                           (task_id, run_id)).fetchone()
+     if not exists:
+diff --git a/hermes_cli/kanban_quota_episode_release.py b/hermes_cli/kanban_quota_episode_release.py
+index a776d81c9f..74e0222803 100644
+--- a/hermes_cli/kanban_quota_episode_release.py
++++ b/hermes_cli/kanban_quota_episode_release.py
+@@ -20,6 +20,7 @@ from __future__ import annotations
+ import time
+ 
+ KIND = "quota_episode_released"
++REFUSED_KIND = "quota_release_refused"  # [daveey] a ``--probe`` release the live usage read did not disprove
+ 
+ 
+ class ReleaseRefused(ValueError):
+@@ -49,16 +50,42 @@ def covers_latest(conn, task_id) -> dict | None:
+     return None if later else payload
+ 
+ 
+-def record(conn, task_id, state, *, reason, via, actor):
++def record(conn, task_id, state, *, reason, via, actor, verdicts=None):
+     """Append the release event (boundary for ``episode()``) inside the caller's transaction."""
+     from hermes_cli import kanban_db as kb
+     payload = {"reason": reason, "via": via, "actor": actor, "run_id": state["run_id"],
+                "episode_id": state["episode_id"], "until": state["until"], "hinted": bool(state.get("hinted")),
+                "providers": list(state.get("providers") or [])}
++    if verdicts is not None:
++        payload["verdicts"] = verdicts
+     kb._append_event(conn, task_id, KIND, payload)
+     return payload
+ 
+ 
++def _probe(conn, task_id, verdict, actor):
++    """``--probe``: every provider the held walls name must show live headroom; else record an audited
++    ``quota_release_refused`` and raise. Returns the verdicts, or None when no episode holds the card (the
++    release itself refuses that). The usage read runs outside any write transaction. [daveey]"""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_quota_probe as qp
++    from hermes_cli.kanban_db_connect import write_txn
++    from hermes_cli.kanban_quota_episode import _outstanding, episode
++    from hermes_cli.kanban_wake_check import foreign_copy
++    state = episode(conn, task_id) if kb.get_task(conn, task_id) and not foreign_copy(conn, task_id) else None
++    if not state:
++        return None
++    held = _outstanding(conn, task_id, state, time.time()) or [state]
++    found = qp.verdicts(held, qp.probe_model(conn, task_id, state), verdict)
++    if found and all(v["state"] == "headroom" for v in found.values()):
++        return found
++    with write_txn(conn):
++        kb._append_event(conn, task_id, REFUSED_KIND, {
++            "actor": actor, "run_id": state["run_id"], "episode_id": state["episode_id"],
++            "until": max(wall["until"] for wall in held), "verdicts": found}, run_id=state["run_id"])
++    states = ", ".join(f"{name}={v['state']}" for name, v in found.items()) or "no provider named"
++    raise ReleaseRefused(f"live probe does not disprove the wall ({states}); {REFUSED_KIND} recorded")
++
++
+ def _drop_walls(walls):
+     """Clear provider_walls.json entries copied from the released hints (``record_wall`` never shrinks one), so
+     retiering other cards stops treating the provider as walled. A later wall stays."""
+@@ -72,8 +99,11 @@ def _drop_walls(walls):
+         pw.drop_wall(name, not_after=until)
+ 
+ 
+-def release(conn, task_id: str, *, reason: str, actor: str) -> dict:
+-    """Operator release of the card's quota episode; raises ReleaseRefused."""
++def release(conn, task_id: str, *, reason: str, actor: str, probe=None) -> dict:
++    """Operator release of the card's quota episode; raises ReleaseRefused.
++
++    *probe* (``kanban_quota_probe.live_verdict`` for ``--probe``) gates it on a live usage read that
++    disproves every walled provider; a confirmed or unreadable wall refuses, audited. [daveey]"""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_db_connect import write_txn
+     from hermes_cli.kanban_db_dispatch_quota import clear_quota_error, is_quota_error
+@@ -83,6 +113,7 @@ def release(conn, task_id: str, *, reason: str, actor: str) -> dict:
+     marker = worker_lineage()
+     if marker:
+         raise ReleaseRefused(f"operator-only: refused under worker lineage ({marker})")
++    verdicts = _probe(conn, task_id, probe, actor) if probe is not None else None
+     reason = (reason or "").strip() or "operator release"
+     with write_txn(conn):
+         task = kb.get_task(conn, task_id)
+@@ -94,7 +125,8 @@ def release(conn, task_id: str, *, reason: str, actor: str) -> dict:
+         if not state:
+             raise ReleaseRefused("no quota episode holds this card")
+         held = _outstanding(conn, task_id, state, time.time())
+-        payload = record(conn, task_id, state, reason=reason[:500], via="operator", actor=actor)
++        payload = record(conn, task_id, state, reason=reason[:500], via="probe" if verdicts else "operator",
++                         actor=actor, verdicts=verdicts)
+         stamp = kb._lossy_text(task.last_failure_error)
+         if stamp and is_quota_error(stamp):
+             clear_quota_error(conn, task_id, stamp)
+@@ -104,13 +136,15 @@ def release(conn, task_id: str, *, reason: str, actor: str) -> dict:
+ 
+ 
+ def cmd(args) -> int:
+-    """``hermes kanban quota-release <id> [--reason ...]``."""
++    """``hermes kanban quota-release <id> [--reason ...] [--probe]``."""
+     from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_quota_probe as qp
+     from hermes_cli.kanban import _profile_author
+     from hermes_cli.kanban_output import _err
++    probe = qp.live_verdict if getattr(args, "probe", False) else None
+     try:
+         with kbc.connect_closing() as conn:
+-            payload = release(conn, args.task_id, reason=args.reason, actor=_profile_author())
++            payload = release(conn, args.task_id, reason=args.reason, actor=_profile_author(), probe=probe)
+     except ReleaseRefused as exc:
+         return _err(f"kanban quota-release: {exc}", 2)
+     until = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(payload["until"]))
+diff --git a/hermes_cli/kanban_quota_probe.py b/hermes_cli/kanban_quota_probe.py
+new file mode 100644
+index 0000000000..64c82090ac
+--- /dev/null
++++ b/hermes_cli/kanban_quota_probe.py
+@@ -0,0 +1,117 @@
++"""Live usage probe for a typed subscription quota wall. [daveey]
++
++2026-11-12: a revoked-401 window typed every worker's anthropic pool as quota-walled until 11-17, and
++cards with no class alternate sat in ``respawn_guarded subscription_quota_reset`` although three
++accounts had weekly headroom. The only way out was hand SQL on the ``quota_episode`` payload.
++
++``live_verdict`` reads every pooled OAuth account's live usage windows (``agent.account_usage``, the
++``/api/oauth/usage`` read for anthropic, read-only for Codex). Two callers:
++
++- ``contradicted``: a start-time ``SubscriptionQuotaUnavailable`` the live read contradicts is booked as an
++  unconfirmed retry (no reset, so no quota episode and no provider wall).
++- ``hermes kanban quota-release <id> --probe`` (``kanban_quota_episode_release``): the operator release
++  refuses, with an audited ``quota_release_refused`` event, unless every walled provider shows headroom.
++"""
++from __future__ import annotations
++
++from collections import namedtuple
++
++PROBE_DEADLINE_SECONDS = 25.0
++Verdict = namedtuple('Verdict', 'state detail')  # state: headroom | walled | unknown
++
++
++def _family(model):
++    name = str(model or '').lower()
++    return next((family for family in ('opus', 'sonnet') if family in name), None)
++
++
++def _headroom(snapshot, model):
++    """True/False for one account's usage snapshot, None when it could not be read."""
++    if snapshot is None or not snapshot.available:
++        return None
++    family = _family(model)
++    for window in snapshot.windows:
++        used = window.used_percent
++        if used is None or used < 100:
++            continue
++        if window.scope != 'model' or (family and str(window.label).lower().startswith(family)):
++            return False
++    return True
++
++
++def _describe(snapshot):
++    if snapshot is None or not snapshot.available:
++        return 'unreadable'
++    return ', '.join(f'{w.label} {w.used_percent:.0f}%' for w in snapshot.windows if w.used_percent is not None)
++
++
++def usage_verdict(snapshots, model, labels=None):
++    """Headroom when any account can serve *model*; walled only when every account was read and is capped."""
++    states = [_headroom(snapshot, model) for snapshot in snapshots]
++    labels = labels or [f'account{n}' for n in range(1, len(snapshots) + 1)]
++    detail = '; '.join(f'{label}: {_describe(snapshot)}' for label, snapshot in zip(labels, snapshots))
++    if any(state is True for state in states):
++        return Verdict('headroom', detail)
++    if states and all(state is False for state in states):
++        return Verdict('walled', detail)
++    return Verdict('unknown', detail or 'no pooled OAuth account')
++
++
++def live_verdict(provider, model):
++    """Read every live pooled OAuth account's usage windows (bounded, read-only; tokens never leave here)."""
++    from concurrent.futures import ThreadPoolExecutor, wait
++
++    from agent.account_usage import fetch_account_usage
++    from agent.credential_pool import STATUS_DEAD, load_pool
++    if provider not in ('anthropic', 'openai-codex'):
++        return Verdict('unknown', f'no usage endpoint for {provider}')
++    entries = [entry for entry in load_pool(provider, allowed_auth_types={'oauth'}).entries()
++               if entry.auth_type == 'oauth' and entry.last_status != STATUS_DEAD and entry.runtime_api_key]
++    pool = ThreadPoolExecutor(max_workers=max(1, len(entries)))
++    try:
++        futures = [pool.submit(fetch_account_usage, provider, api_key=entry.runtime_api_key, read_only=True)
++                   for entry in entries]
++        wait(futures, timeout=PROBE_DEADLINE_SECONDS)
++        snapshots = [f.result() if f.done() and not f.exception() else None for f in futures]
++    finally:
++        pool.shutdown(wait=False, cancel_futures=True)
++    return usage_verdict(snapshots, model, [entry.label or entry.id[:8] for entry in entries])
++
++
++def probe_model(conn, task_id, state):
++    """The model the episode's run was routed to (its receipt), else the episode's recorded model."""
++    from hermes_cli.kanban_quota_receipt import _owned_receipt
++    owned = _owned_receipt(conn, task_id, state['run_id'])
++    model = owned[0].get('route_model') if owned else None
++    return model if isinstance(model, str) and model else state.get('model')
++
++
++def verdicts(walls, model, verdict=None):
++    """``provider -> Verdict._asdict()`` for every provider *walls* name (``kanban_quota_episode._providers``)."""
++    from hermes_cli.kanban_quota_episode import _providers
++    verdict = verdict or live_verdict
++    names = sorted({provider for wall in walls for provider in _providers(wall)})
++    return {provider: verdict(provider, model)._asdict() for provider in names}
++
++
++def contradicted(exc, *, verdict=live_verdict):
++    """A start-time typed quota refusal the live usage read contradicts becomes an unconfirmed retry.
++
++    The worker books the returned exception instead of *exc* (``gateway.session_kanban``): exit 75 with
++    no reset, so no quota episode or provider wall rests on a pool view the provider itself disputes.
++    Any other exception, or a probe that confirms or cannot read the wall, returns *exc* unchanged."""
++    from agent.model_routing_unavailable import (
++        QuotaContradicted, SubscriptionAuthUnavailable, SubscriptionQuotaUnavailable)
++    wall, seen = exc, set()
++    while wall is not None and id(wall) not in seen and not isinstance(wall, SubscriptionQuotaUnavailable):
++        seen.add(id(wall))
++        wall = wall.__cause__ or wall.__context__
++    if wall is None or isinstance(wall, SubscriptionAuthUnavailable) or not isinstance(wall, SubscriptionQuotaUnavailable):
++        return exc
++    try:
++        found = verdict(wall.provider, wall.model)
++    except Exception:  # health: allow BLE001 -- a failed probe keeps the typed refusal (fail closed) [daveey]
++        return exc
++    if found.state != 'headroom':
++        return exc
++    return QuotaContradicted(wall.provider, wall.model, found.detail)
+diff --git a/hermes_cli/kanban_quota_receipt.py b/hermes_cli/kanban_quota_receipt.py
+index a248105d22..1e5802b374 100644
+--- a/hermes_cli/kanban_quota_receipt.py
++++ b/hermes_cli/kanban_quota_receipt.py
+@@ -1,15 +1,22 @@
+ """Typed quota deadlines retained in attempt receipts, not provider-wide guesses."""
+ import math
+ 
++# Receipt reason of a start-time refusal whose quota was not confirmed (auth churn, or a live usage
++# read that contradicted the pool). It is retryable and never carries a deadline.
++UNCONFIRMED = 'quota_unconfirmed'
++
+ 
+ def quota_fields(failure):
+     """Allowlisted, credential-free fields from a failed turn or startup exception."""
+-    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from agent.model_routing_unavailable import SubscriptionAuthUnavailable, SubscriptionQuotaUnavailable
+     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+     import time
+     seen = set()
+     while isinstance(failure, BaseException) and id(failure) not in seen:
+         seen.add(id(failure))
++        if isinstance(failure, SubscriptionAuthUnavailable):
++            # [daveey] Auth churn: retryable, but no deadline (no episode, no provider wall).
++            return {'failure_reason': UNCONFIRMED, 'failure_retryable': True}
+         if isinstance(failure, SubscriptionQuotaUnavailable):
+             failure = {'failure_reason': 'rate_limit', 'failure_resets_at': failure.resets_at}
+             break
+@@ -97,6 +104,8 @@ def receipt_deadline(conn, task_id, run_id):
+     if owned is None:
+         return None
+     receipt, created = owned
++    if receipt.get('failure_reason') == UNCONFIRMED:
++        return None  # an unconfirmed quota refusal never yields a deadline, whatever its text says
+     reset = valid_deadline(quota_fields(receipt).get('failure_resets_at'))
+     if reset is not None:
+         return reset
+@@ -146,6 +155,12 @@ def route_fields(failure, agent=None):
+     return {'route_provider': provider, 'route_model': _route_name(getattr(agent, 'model', None))}
+ 
+ 
++def receipt_unconfirmed(conn, task_id, run_id):
++    """True when the exact attempt's own receipt says its quota refusal was unconfirmed (auth churn)."""
++    owned = _owned_receipt(conn, task_id, run_id)
++    return bool(owned) and owned[0].get('failure_reason') == UNCONFIRMED
++
++
+ def receipt_route(conn, task_id, run_id):
+     """``route_provider`` recorded by the exact attempt's own quota receipt, or None."""
+     owned = _owned_receipt(conn, task_id, run_id)
+diff --git a/hermes_cli/kanban_quota_release.py b/hermes_cli/kanban_quota_release.py
+index 5fd7088bd0..ef16fdd41b 100644
+--- a/hermes_cli/kanban_quota_release.py
++++ b/hermes_cli/kanban_quota_release.py
+@@ -23,10 +23,14 @@ def prepare(conn, row):
+         quota.record_episode(conn, row['task_id'], row['run_id'], captured=True)
+         event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                              "AND kind='quota_episode'", (row['task_id'], row['run_id'])).fetchone()
+-        if event is None:
++        churn = quota.episode(conn, row['task_id'], run_id=row['run_id']) if event is None else None
++        if churn and churn['run_id'] == row['run_id'] and churn.get('auth_churn'):
++            state = {**churn, 'write_wall': False}  # [daveey] auth churn: no episode event, no wall
++        elif event is None:
+             raise RuntimeError('quota release is not the latest ended run; refusing admission')
+-        state = kb._json_dict(event[0])
+-        state['write_wall'] = bool(state.get('provider') and state['until'] - time.time() >= walls.MIN_WALL_SECONDS)
++        else:
++            state = kb._json_dict(event[0])
++            state['write_wall'] = bool(state.get('provider') and state['until'] - time.time() >= walls.MIN_WALL_SECONDS)
+         conn.execute("INSERT INTO kanban_quota_effects (run_uid,state) VALUES (?,?)",
+                      (row['run_uid'], json.dumps(state)))
+     return state
+diff --git a/hermes_cli/turn_exit.py b/hermes_cli/turn_exit.py
+index 45100caca5..d58df07555 100644
+--- a/hermes_cli/turn_exit.py
++++ b/hermes_cli/turn_exit.py
+@@ -51,11 +51,11 @@ def credential_failure_flags(exc) -> dict:
+     ``AuthError`` is transient, only an explicit re-authentication requirement is terminal. The
+     cause chain is walked because agent construction wraps the resolver's error."""
+     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+-    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from agent.model_routing_unavailable import SubscriptionAuthUnavailable, SubscriptionQuotaUnavailable
+     seen = set()
+     while exc is not None and id(exc) not in seen:
+         seen.add(id(exc))
+-        if isinstance(exc, SubscriptionQuotaUnavailable):
++        if isinstance(exc, (SubscriptionQuotaUnavailable, SubscriptionAuthUnavailable)):
+             return {"credentials_rate_limited": True, "credentials_terminal": False}
+         if isinstance(exc, AuthError):
+             return {"credentials_rate_limited": is_rate_limited_auth_error(exc),
+-- 
+2.43.0
+

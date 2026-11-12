@@ -1,0 +1,120 @@
+From 465e7d1fa1821f154d8926e9c35727cee5ebcf1a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:01:59 +0000
+Subject: [PATCH] [daveey] test(local-models): hold the tail so the pause test
+ always sees a partial transfer
+
+test_browsed_download_can_pause_and_resume_pm_transfer waited 5 s for a
+progress tick with 0 < done < total. The downloader's coordinator coalesces
+snapshots, so on a CPU-throttled runner the eight loopback range workers could
+finish the whole 8 MiB before the coordinator first woke: its only ticks were
+done == total and the wait timed out ("browsed download bypassed PM's
+downloader", CI run 43195857962).
+
+The range test server can now withhold pieces past a payload offset until an
+event is set; the test holds the last piece until it has paused, so the job is
+provably mid-transfer whatever the scheduling. The fixed waits become generous
+deadlines that return as soon as the condition holds (60 s).
+
+RED: deschedule the coordinator 0.5 s per wake (pytest plugin wrapping
+pm.downloader's Event.wait) -> fails with the CI message on main; GREEN with
+this change.
+---
+ tests/hermes_cli/test_local_download_jobs.py | 13 ++++++++++---
+ tests/pm/_range_server.py                    | 12 ++++++++++++
+ 2 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/tests/hermes_cli/test_local_download_jobs.py b/tests/hermes_cli/test_local_download_jobs.py
+index 5b3c5f070c..861faf64ea 100644
+--- a/tests/hermes_cli/test_local_download_jobs.py
++++ b/tests/hermes_cli/test_local_download_jobs.py
+@@ -47,7 +47,8 @@ def client(tmp_path, monkeypatch):
+ 
+ 
+ def poll(client, job_id, until=("done", "error", "paused")):
+-    deadline = time.monotonic() + 15
++    # Generous: returns as soon as the job settles, so only a hung job waits it out.
++    deadline = time.monotonic() + 60
+     while time.monotonic() < deadline:
+         response = client.get(f"/api/local-models/jobs/{job_id}")
+         assert response.status_code == 200, response.text
+@@ -63,6 +64,11 @@ def test_browsed_download_can_pause_and_resume_pm_transfer(client, monkeypatch,
+ 
+     payload = bytes(range(256)) * (32 * 1024)
+     RangeHandler.payloads["/test.gguf"] = payload
++    # The server withholds the payload's last piece until the pause is in, so
++    # the job is still mid-transfer when it is paused. Without this, a throttled
++    # runner let the range workers finish all of it before the downloader's
++    # coalescing progress coordinator first ran: no partial tick ever arrived.
++    RangeHandler.hold_from, RangeHandler.hold = len(payload) - 1, threading.Event()
+     monkeypatch.setattr(lm, "_hf_url", lambda repo, path: url(dl_server, "/test.gguf"))
+     flowing, release = threading.Event(), threading.Event()
+     real_download = lm.Download
+@@ -74,17 +80,18 @@ def test_browsed_download_can_pause_and_resume_pm_transfer(client, monkeypatch,
+                     progress(done, total, ranges)
+                 if 0 < done < total and not flowing.is_set():
+                     flowing.set()
+-                    assert release.wait(15)
++                    assert release.wait(60)
+             return super().run(progress=tick)
+ 
+     monkeypatch.setattr(lm, "Download", ObservedDownload)
+     response = client.post("/api/local-models/download-browsed", json={"repo": "a/b", "paths": ["test.gguf"]})
+     job_id = response.json()["job_id"]
+     try:
+-        assert flowing.wait(5), "browsed download bypassed PM's downloader"
++        assert flowing.wait(60), "browsed download bypassed PM's downloader"
+         assert client.post("/api/local-models/download/pause", json={"job_id": job_id}).json()["paused"]
+     finally:
+         release.set()
++        RangeHandler.hold.set()
+     job = poll(client, job_id)
+     assert job["status"] == "paused", job
+     assert job["can_resume"] and not job["can_pause"]
+diff --git a/tests/pm/_range_server.py b/tests/pm/_range_server.py
+index fdeab89b22..901061f9aa 100644
+--- a/tests/pm/_range_server.py
++++ b/tests/pm/_range_server.py
+@@ -24,6 +24,11 @@ class RangeHandler(BaseHTTPRequestHandler):
+     no_range: bool = False           # ignore Range, serve 200 full body
+     etags: bool = True
+     chunk: int = 1 << 20             # serve piece size
++    # Ranged pieces reaching past this payload offset wait for ``hold`` to be
++    # set, so a test can observe a transfer that is provably still incomplete
++    # however the downloader's threads are scheduled.
++    hold_from: int | None = None
++    hold: threading.Event | None = None
+ 
+     def log_message(self, *args):
+         pass
+@@ -90,6 +95,9 @@ class RangeHandler(BaseHTTPRequestHandler):
+                 if self.abort_after is not None:
+                     end = min(end, self.abort_after - start)
+                 piece = body[served:end]
++                if self.hold_from is not None and self.hold is not None \
++                        and start + served + len(piece) > self.hold_from:
++                    self.hold.wait(120)
+                 self.wfile.write(piece)
+                 self.wfile.flush()
+                 served += len(piece)
+@@ -110,6 +118,8 @@ def dl_server():
+     RangeHandler.no_range = False
+     RangeHandler.etags = True
+     RangeHandler.chunk = 1 << 20
++    RangeHandler.hold_from = None
++    RangeHandler.hold = None
+     # Threaded, like any real file host: the downloader opens up to 8 range
+     # connections at once. A single-threaded server (listen backlog 5)
+     # served them one by one, so a paused download had to wait for every
+@@ -124,6 +134,8 @@ def dl_server():
+     try:
+         yield server
+     finally:
++        if RangeHandler.hold is not None:
++            RangeHandler.hold.set()
+         server.shutdown()
+         server.server_close()
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,447 @@
+From 2e6de36904b07063aed42476be67c9f759e718a0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:49:20 +0000
+Subject: [PATCH] [daveey] relay-minted 401 revoked: re-pull and adopt the
+ pushed token before rotating (a hub re-mint no longer gives Kanban cards up)
+
+---
+ agent/credential_auth_recovery.py             |   8 +
+ agent/credential_relay_repull.py              | 199 ++++++++++++++++++
+ tests/agent/test_credential_relay_repull.py   | 164 +++++++++++++++
+ .../hermes_cli/test_kanban_pool_auth_wall.py  |  27 +++
+ 4 files changed, 398 insertions(+)
+ create mode 100644 agent/credential_relay_repull.py
+ create mode 100644 tests/agent/test_credential_relay_repull.py
+
+diff --git a/agent/credential_auth_recovery.py b/agent/credential_auth_recovery.py
+index 02836de0d3..3fe0a7c0d3 100644
+--- a/agent/credential_auth_recovery.py
++++ b/agent/credential_auth_recovery.py
+@@ -137,6 +137,14 @@ def recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_con
+     warn_foreign_failing_key(pool, api_key_hint, credential_id)
+     refreshed = pool.try_refresh_matching(**refresh_kwargs)
+     if refreshed is None:
++        # A relay-minted row revoked by the hub's re-mint: re-pull and adopt the pushed token before
++        # rotating, since the same push revoked every sibling row too (t_01a1d064a8dc8bd6).
++        from agent.credential_relay_repull import recover_revoked_relay_row
++        repulled = recover_revoked_relay_row(
++            agent, pool, status_code=status_code, error_context=error_context,
++            api_key_hint=api_key_hint, credential_id=credential_id, episode=_episode)
++        if repulled is not None:
++            return repulled, has_retried_429
+         # Refresh failed; rotate (the failed entry is already marked exhausted).
+         if rotate_and_swap(401, "auth refresh failed"):
+             return True, False
+diff --git a/agent/credential_relay_repull.py b/agent/credential_relay_repull.py
+new file mode 100644
+index 0000000000..a570d144bf
+--- /dev/null
++++ b/agent/credential_relay_repull.py
+@@ -0,0 +1,199 @@
++"""Recover a relay-minted OAuth row whose access token the minting host just revoked. [daveey]
++
++The hub refreshes its Anthropic grants on a timer, and each refresh revokes the previous access
++token at once. Worker nodes (and the mini's BB pool) hold those tokens as ``manual:hub_minted``
++rows with no refresh token, copied by a pull job (``worker-oauth-pull``, every 30 s). A request
++that lands between the hub's refresh and that pull gets ``401 OAuth access token has been
++revoked``. The hub re-mints every account in one push, so rotating to the next row only hits the
++next revoked token, and the whole pool is benched in under a second: the turn failed with
++``auth`` and a Kanban worker exited 78 (terminal_provider), a manual unblock per card
++(t_01a1d064a8dc8bd6: worker-4 run 10089, 15:30:35Z 401, hub push 15:30:37Z, pull 15:30:38Z).
++
++No refresh can heal such a row; only a newer token on disk can. So on that 401 the agent runs
++the pull itself (when this host has one), re-reads the pool and adopts the pushed token, polling
++for up to ``oauth_relay.repull_wait_s`` (default 120 s) while the hub's push lands.
++A host with no pull command keeps the old path (re-read, rotate, ``auth_wall_is_transient``).
++Once per row per auth episode: a re-pulled token that is refused again is a genuine auth failure
++and takes the old path (rotate, then fail). Rows with a refresh token, borrowed rows and other
++401s never come here.
++"""
++
++from __future__ import annotations
++
++import os
++import shlex
++import subprocess
++import time
++from pathlib import Path
++from typing import Any, Optional
++
++MINTED_SOURCES = frozenset({"manual:hub_minted"})
++DEFAULT_WAIT_S = 120.0
++_PULL_EVERY_S = 10.0
++_PULL_TIMEOUT_S = 60.0
++_POLL_S = 1.0
++_ACTIVITY_TOUCH_S = 30.0
++
++
++def _ra():
++    import run_agent
++    return run_agent
++
++
++def _settings() -> dict:
++    """``oauth_relay`` in config.yaml: ``pull_command`` (an argv string) and ``repull_wait_s``."""
++    try:
++        from hermes_cli.config import load_config_readonly
++        section = load_config_readonly().get("oauth_relay")
++    except Exception:  # health: allow BLE001 -- an unreadable config keeps the defaults; the 401 path must not raise
++        return {}
++    return section if isinstance(section, dict) else {}
++
++
++def is_relay_managed(entry: Any) -> bool:
++    """An OAuth row a relay pushes (no refresh token of its own, not a borrowed singleton)."""
++    from agent.credential_pool import AUTH_TYPE_OAUTH
++    return (
++        entry is not None
++        and getattr(entry, "auth_type", None) == AUTH_TYPE_OAUTH
++        and not (getattr(entry, "refresh_token", None) or "").strip()
++        and (getattr(entry, "source", None) or "") in MINTED_SOURCES
++    )
++
++
++def is_revoked_401(status_code: Optional[int], error_context: Optional[dict]) -> bool:
++    """A 401 whose body says the access token was revoked."""
++    if status_code != 401 or not isinstance(error_context, dict):
++        return False
++    text = " ".join(str(error_context.get(k) or "") for k in ("message", "reason", "code")).lower()
++    return "revoked" in text
++
++
++def pull_command() -> Optional[list[str]]:
++    """The host's relay pull: ``oauth_relay.pull_command``, else the worker's ``~/bin/worker-oauth-pull``.
++
++    That script writes the default home's ``auth.json`` only, so it is used only for that home.
++    """
++    configured = str(_settings().get("pull_command") or "").strip()
++    if configured:
++        return shlex.split(configured)
++    from hermes_constants import get_hermes_home
++    home = Path.home()  # health: allow HX001 -- the worker pull script and its target live in the user's home
++    script = home / "bin" / "worker-oauth-pull"
++    try:
++        default_home = Path(get_hermes_home()).resolve() == (home / ".hermes").resolve()
++    except OSError:
++        return None
++    if default_home and script.is_file() and os.access(script, os.X_OK):
++        return [str(script)]
++    return None
++
++
++def _wait_budget() -> float:
++    try:
++        return max(0.0, float(_settings().get("repull_wait_s", DEFAULT_WAIT_S)))
++    except (TypeError, ValueError):
++        return DEFAULT_WAIT_S
++
++
++def _run_pull(cmd: list[str]) -> None:
++    """Run the pull once; a peer process already pulling (lock held) is left to finish on its own."""
++    from hermes_constants import get_hermes_home
++    lock_path = Path(get_hermes_home()) / "state" / "oauth-relay-repull.lock"
++    log = _ra().logger
++    try:
++        import fcntl
++    except ImportError:  # Windows has no relay pull host; run unlocked
++        fcntl = None
++    try:
++        lock_path.parent.mkdir(parents=True, exist_ok=True)
++        with open(lock_path, "a", encoding="utf-8") as lock:
++            if fcntl is not None:
++                try:
++                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                except BlockingIOError:
++                    return
++            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
++                                  timeout=_PULL_TIMEOUT_S, stdin=subprocess.DEVNULL, check=False)
++            if proc.returncode != 0:
++                log.warning("OAuth relay re-pull %s exited %s: %s", cmd[0], proc.returncode,
++                            (proc.stderr or proc.stdout or "").strip()[-300:])
++    except (OSError, subprocess.SubprocessError) as exc:
++        log.warning("OAuth relay re-pull %s failed: %s", cmd[0], exc)
++
++
++def _find(pool: Any, entry_id: Optional[str], failed_key: Optional[str]) -> Any:
++    entries = pool.entries()
++    found = next((e for e in entries if entry_id and e.id == entry_id), None)
++    return found or next((e for e in entries if failed_key and e.runtime_api_key == failed_key), None)
++
++
++def await_pushed_token(agent: Any, pool: Any, *, entry_id: Optional[str], failed_key: Optional[str],
++                       cmd: list[str]) -> Any:
++    """Re-pull and poll until the failing row holds a new token; the adopted entry, or None.
++
++    Every other relay row the push replaced is adopted too, so a rotation after this never
++    lands on a token the same push already revoked.
++    """
++    log = _ra().logger
++    start = time.monotonic()
++    deadline = start + _wait_budget()
++    next_pull = start
++    next_touch = start + _ACTIVITY_TOUCH_S
++    while True:
++        if time.monotonic() >= next_pull:
++            _run_pull(cmd)
++            next_pull = time.monotonic() + _PULL_EVERY_S
++        adopted = None
++        for entry in list(pool.entries()):
++            if not is_relay_managed(entry):
++                continue
++            fresh = pool._adopt_pushed_norefresh_row(entry)
++            if fresh is not entry and fresh.id == entry_id:
++                adopted = fresh
++        if adopted is None:
++            current = _find(pool, entry_id, failed_key)
++            if current is not None and failed_key and current.runtime_api_key not in (None, "", failed_key):
++                adopted = current  # a peer in this process already adopted the pushed token
++        if adopted is not None:
++            log.info("OAuth relay: adopted the pushed token for pool entry %s after %.1fs",
++                     adopted.id, time.monotonic() - start)
++            return adopted
++        if time.monotonic() >= deadline or getattr(agent, "_interrupt_requested", False):
++            log.warning("OAuth relay: no new token for pool entry %s within %.0fs of a revoked 401",
++                        entry_id, time.monotonic() - start)
++            return None
++        time.sleep(_POLL_S)
++        if time.monotonic() >= next_touch:
++            touch = getattr(agent, "_touch_activity", None)
++            if callable(touch):
++                touch("waiting for the OAuth relay to push a re-minted token")
++            next_touch = time.monotonic() + _ACTIVITY_TOUCH_S
++
++
++def recover_revoked_relay_row(agent: Any, pool: Any, *, status_code: Optional[int],
++                              error_context: Optional[dict], api_key_hint: Optional[str],
++                              credential_id: Optional[str], episode: Any) -> Optional[bool]:
++    """``True``/``False`` when this path owned the 401 (swap result), ``None`` to fall through.
++
++    *episode* is ``credential_auth_recovery._episode`` (per-turn, per-entry state).
++    """
++    if not is_revoked_401(status_code, error_context):
++        return None
++    entry = _find(pool, credential_id, api_key_hint)
++    if not is_relay_managed(entry):
++        return None
++    cmd = pull_command()
++    if cmd is None:
++        return None  # nothing to pull with here: the existing re-read/rotation path decides
++    state = episode(agent, f"relay:{getattr(pool, 'provider', '')}", entry.id)
++    if state.get("repulls"):
++        # The re-pulled token was refused too: a genuine auth failure, not a pull lag.
++        return None
++    state["repulls"] = 1
++    _ra().logger.info("OAuth relay: pool entry %s token revoked by a re-mint; re-pulling", entry.id)
++    adopted = await_pushed_token(agent, pool, entry_id=entry.id, failed_key=api_key_hint, cmd=cmd)
++    if adopted is None:
++        return None
++    pool._current_id = adopted.id
++    return agent._swap_credential(adopted) is not False
+diff --git a/tests/agent/test_credential_relay_repull.py b/tests/agent/test_credential_relay_repull.py
+new file mode 100644
+index 0000000000..11c0100536
+--- /dev/null
++++ b/tests/agent/test_credential_relay_repull.py
+@@ -0,0 +1,164 @@
++"""A hub re-mint revokes every relay-minted token at once: re-pull, don't give up (t_01a1d064a8dc8bd6).
++
++worker-4, run 10089 (2026-11-12): the hub refreshed its Anthropic grants (revoking each previous
++access token), a turn's request landed before the worker's pull, and the 401 ``OAuth access
++token has been revoked`` cascaded through every ``manual:hub_minted`` row in under a second.
++The turn failed with ``auth`` and the Kanban worker exited 78 (terminal_provider -> gave_up).
++
++These tests drive the real pool recovery (``recover_with_credential_pool``) against a fake
++Anthropic that accepts only the tokens the relay has pushed, and a fake ``worker-oauth-pull``
++that writes the re-minted rows to auth.json.
++"""
++
++import json
++import shlex
++import sys
++import time
++
++import pytest
++
++import agent.credential_pool as cp
++from agent.agent_runtime_helpers import recover_with_credential_pool
++from hermes_cli.turn_exit import turn_exit_code
++
++LABELS = ("a@example.com", "b@example.com", "c@example.com")
++REVOKED = {"message": "OAuth access token has been revoked.", "reason": "authentication_error"}
++
++_PULL = r'''
++import json, sys
++auth, counter, ready_after = sys.argv[1], sys.argv[2], int(sys.argv[3])
++try:
++    n = int(open(counter).read())
++except OSError:
++    n = 0
++open(counter, "w").write(str(n + 1))
++if n + 1 < ready_after:
++    sys.exit(0)  # the hub's push has not landed in SSM yet
++doc = json.load(open(auth))
++for row in doc["credential_pool"]["anthropic"]:
++    row["access_token"] = "new-" + row["label"]
++    for k in ("last_status", "last_status_at", "last_error_code", "last_error_reason", "last_error_message"):
++        row.pop(k, None)
++json.dump(doc, open(auth, "w"))
++'''
++
++
++def _row(label, idx, now):
++    return dict(id=f"r{idx}", label=label, auth_type="oauth", priority=idx, source="manual:hub_minted",
++                access_token="old-" + label, expires_at_ms=int((now + 7200) * 1000))
++
++
++class _Agent:
++    provider = "anthropic"
++    base_url = "https://api.anthropic.com"
++    model = "claude-opus-5-5"
++    api_mode = "anthropic_messages"
++    log_prefix = ""
++    _interrupt_requested = False
++
++    def __init__(self, pool):
++        self._credential_pool = pool
++        entry = pool.select()
++        self.api_key = entry.runtime_api_key
++        self._credential_pool_entry_id = entry.id
++
++    def _swap_credential(self, entry):
++        self.api_key = entry.runtime_api_key
++        self._credential_pool_entry_id = entry.id
++        return True
++
++    def _is_entitlement_failure(self, *_a):
++        return False
++
++    def _vprint(self, *_a, **_k):
++        pass
++
++    def _touch_activity(self, *_a):
++        pass
++
++
++def _turn(agent, accepted):
++    """One turn's request loop: the result dict the conversation loop would hand back."""
++    for _ in range(20):
++        if agent.api_key in accepted:
++            return {"completed": True, "final_response": "ok"}
++        recovered, _ = recover_with_credential_pool(
++            agent, status_code=401, has_retried_429=False, error_context=dict(REVOKED))
++        if not recovered:
++            return {"failed": True, "completed": False, "failure_reason": "auth",
++                    "error": "HTTP 401: OAuth access token has been revoked."}
++    raise AssertionError("request loop did not settle")
++
++
++@pytest.fixture
++def relay(tmp_path, monkeypatch):
++    home = tmp_path / "hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    now = time.time()
++    auth = home / "auth.json"
++    auth.write_text(json.dumps({"version": 1, "credential_pool": {
++        "anthropic": [_row(label, i, now) for i, label in enumerate(LABELS)]}}))
++    script = tmp_path / "fake_pull.py"
++    script.write_text(_PULL)
++    counter = tmp_path / "pulls"
++    settings = {}
++    try:  # absent before the fix: the exit code, not an ImportError, is what fails there
++        from agent import credential_relay_repull as rr
++        monkeypatch.setattr(rr, "_PULL_EVERY_S", 0.05)
++        monkeypatch.setattr(rr, "_POLL_S", 0.02)
++        monkeypatch.setattr(rr, "_settings", lambda: settings)
++    except ImportError:
++        pass
++
++    def configure(ready_after=1, wait_s=5.0):
++        settings.update(pull_command=shlex.join([sys.executable, str(script), str(auth), str(counter), str(ready_after)]),
++                        repull_wait_s=wait_s)
++        pool = cp.load_pool("anthropic")
++        assert {e.source for e in pool.entries()} == {"manual:hub_minted"}
++        return pool
++
++    def pulls():
++        return int(counter.read_text()) if counter.exists() else 0
++
++    return configure, pulls
++
++
++def test_revoked_hub_minted_401_repulls_and_the_turn_succeeds(relay):
++    configure, pulls = relay
++    pool = configure(ready_after=3)  # the push lands two pulls after the 401
++    agent = _Agent(pool)
++    result = _turn(agent, accepted={"new-" + label for label in LABELS})
++
++    assert turn_exit_code(result, kanban_worker=True) == 0, result
++    assert agent.api_key.startswith("new-")
++    assert pulls() >= 3
++    # The same push re-minted the siblings: they are adopted and healthy, not benched.
++    entries = pool.entries()
++    assert all(e.access_token.startswith("new-") for e in entries)
++    assert all(e.last_status in (None, "ok") for e in entries), [e.last_status for e in entries]
++
++
++def test_a_re_pulled_token_refused_again_is_still_an_auth_failure(relay):
++    configure, pulls = relay
++    pool = configure(ready_after=1, wait_s=0.3)
++    agent = _Agent(pool)
++    started = time.monotonic()
++    result = _turn(agent, accepted=set())  # the account is genuinely locked out
++
++    assert turn_exit_code(result, kanban_worker=True) == 78
++    assert time.monotonic() - started < 10, "the re-pull wait must stay bounded"
++    assert pulls() >= 1
++
++
++def test_only_revoked_401s_on_relay_rows_take_the_re_pull_path():
++    from agent.credential_relay_repull import is_relay_managed, is_revoked_401
++
++    minted = cp.PooledCredential.from_dict("anthropic", _row("a@example.com", 0, time.time()))
++    own_grant = cp.PooledCredential.from_dict(
++        "anthropic", {**_row("a@example.com", 0, time.time()), "source": "manual", "refresh_token": "rt"})
++    assert is_relay_managed(minted)
++    assert not is_relay_managed(own_grant)
++    assert is_revoked_401(401, REVOKED)
++    assert not is_revoked_401(401, {"message": "invalid x-api-key"})
++    assert not is_revoked_401(403, REVOKED)
+diff --git a/tests/hermes_cli/test_kanban_pool_auth_wall.py b/tests/hermes_cli/test_kanban_pool_auth_wall.py
+index 78d9984424..e10a4c4571 100644
+--- a/tests/hermes_cli/test_kanban_pool_auth_wall.py
++++ b/tests/hermes_cli/test_kanban_pool_auth_wall.py
+@@ -267,3 +267,30 @@ def test_revoked_requeue_carries_no_quota_reset_of_the_benched_siblings(home, mo
+     assert turn_exit_code(result, kanban_worker=True) == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+     assert "failure_resets_at" not in result
+     assert _receipt_deadline(result, monkeypatch) is None
++
++
++def test_one_re_mint_revoking_every_account_re_pulls_and_continues_the_turn(home, tmp_path, monkeypatch):
++    """15:30Z shape (worker-4 run 10089): the hub's re-mint revoked EVERY pushed row at once and the
++    request beat the worker's pull. The 401 runs the pull, adopts the pushed rows and the turn goes
++    on; before the fix the cascade benched every row and the worker exited 78 (gave_up)."""
++    import shlex
++    import sys
++    _write_pool(home, [_pushed("acct-A", "tok-A-old", 0), _pushed("acct-B", "tok-B-old", 1)])
++    agent = _agent_on("acct-A")
++    pull = tmp_path / "pull.py"
++    pull.write_text(
++        "import json, sys\n"
++        "p = sys.argv[1]; doc = json.load(open(p))\n"
++        "for r in doc['credential_pool']['anthropic']:\n"
++        "    r['access_token'] = r['access_token'].replace('-old', '-new')\n"
++        "    [r.pop(k, None) for k in ('last_status', 'last_status_at', 'last_error_code', 'last_error_reason')]\n"
++        "json.dump(doc, open(p, 'w'))\n")
++    from agent import credential_relay_repull as rr
++    monkeypatch.setattr(rr, "_settings", lambda: {
++        "pull_command": shlex.join([sys.executable, str(pull), str(home / 'auth.json')]), "repull_wait_s": 10})
++
++    assert _recover_from_revoked(agent) is True
++    assert agent._credential_pool_entry_id == "acct-A"
++    assert agent._anthropic_api_key == "tok-A-new"
++    assert {e.id: e.access_token for e in agent._credential_pool.entries()} == {
++        "acct-A": "tok-A-new", "acct-B": "tok-B-new"}
+-- 
+2.43.0
+

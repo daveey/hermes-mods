@@ -1,0 +1,435 @@
+From 60800c97577ea53338bb066b0ca87cc684938c6c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:59:18 -0800
+Subject: [PATCH] [daveey] Bound the hub-replica remote-links read's heap:
+ packed rows, slim records, paged reads
+
+Each gateway, dashboard and Desktop serve kept the whole hub replica (~13.5k task rows, ~60 MB JSON) decoded plus
+its text, and every full read built one json_group_array string (256 MB once a row holds an emoji), so the mini's
+gateway/dashboard sat at 1-2 GB footprints and full GC walked the heap (t_01a1cf67a93c05b6).
+
+- kanban_replica_rows: kept rows hold zlib-packed text (bytes, never GC-tracked); full and delta reads page by
+  rowid in one snapshot, ~2 MB of text a page (page_rows from the probe's mean row size).
+- kanban_replica_projection: a row that links no session of this origin keeps only SLIM_FIELDS; the rare slim
+  row a legacy alias folds links into is decoded whole again from its packed text (stats['rehydrated']).
+
+Live hub.db on the mini, one /api/profiles/sessions?profile=all call in-process (tracemalloc): peak 540 MB ->
+103 MB, retained 324 MB (main) / 540 MB (deployed) -> ~80 MB of replica state.
+
+Tests: tests/hermes_cli/test_kanban_replica_rows_memory.py (3; 2,000 x 20 KB rows: retained < 0.75x text, transient
+< 0.4x text, only the 20 linked records kept whole; RED on main: 86.9 MB retained for 40.4 MB of text).
+test_replica_bounded_reads allows one fetch per page.
+---
+ hermes_cli/kanban_replica_projection.py       |  50 +++++++-
+ hermes_cli/kanban_replica_rows.py             |  70 +++++++++--
+ .../test_kanban_replica_rows_memory.py        | 110 ++++++++++++++++++
+ .../tui_gateway/test_replica_bounded_reads.py |   5 +-
+ 4 files changed, 216 insertions(+), 19 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_replica_rows_memory.py
+
+diff --git a/hermes_cli/kanban_replica_projection.py b/hermes_cli/kanban_replica_projection.py
+index c7f3cfeed4..550a10eaf1 100644
+--- a/hermes_cli/kanban_replica_projection.py
++++ b/hermes_cli/kanban_replica_projection.py
+@@ -7,7 +7,13 @@
+ aggregates built from them, and on a miss re-projects only the rows ``kanban_replica_rows`` reports changed. The
+ clock-dependent inputs (hub staleness, each owner scope's freshness verdict) are the state's key: when one of them
+ changes, the aggregates are rebuilt from the kept rows without decoding any. ``project`` answers exactly what
+-``_project_replica`` does for the same rows; ``tests/hermes_cli/test_kanban_replica_projection.py`` pins that.
++``_project_replica`` does for the same rows; ``tests/hermes_cli/test_kanban_replica_incremental.py`` pins that.
++
++A kept row holds its whole decoded record only when it links a session of this origin (``sids``): only such a record
++can become a card, and a card reads the whole record (hash-bound owner evidence, receipts, run, wait fields). Every
++other row keeps ``SLIM_FIELDS``, all the release, fold and moved logic reads, and is decoded again from its packed
++text in the rare case a legacy alias folds a link of this origin into it. Keeping every record whole was ~150 MB of
++each gateway/dashboard/serve heap for ~13.5k replica cards of which 54 linked the mini (t_01a1cf67a93c05b6).
+ """
+ from __future__ import annotations
+ 
+@@ -19,6 +25,9 @@ from hermes_cli.kanban_session_activity_records import _fold_legacy_aliases
+ from hermes_cli.kanban_session_activity_release import record_attests_terminal
+ 
+ LINK_RELS = ('shepherd', 'cross_task', 'create-task', 'adopt-task')
++# Every field a kept record without links to this origin is read for after ``_stage``: the unknown-status copy and
++# ``_fold_legacy_aliases`` (status, sessions, created_at, created_by), and the record's own identity.
++SLIM_FIELDS = ('id', 'status', 'profile', 'board', 'gateway', 'created_at', 'created_by', 'sessions')
+ _REMOTE_FIELDS = ("title", "status", "block_kind", "human_request", "assignee", "created_at", "started_at", "priority")
+ 
+ 
+@@ -85,6 +94,7 @@ class _Stage:
+         'row',
+         'seen',
+         'sids',
++        'slim',
+         't',
+         'tkey',
+         'unknown',
+@@ -93,14 +103,15 @@ class _Stage:
+ 
+ 
+ def _stage(row: tuple, me: str, origin_profile: str) -> _Stage:
++    from hermes_cli.kanban_replica_rows import text
+     from hermes_cli.kanban_session_activity import LISTED_STATUSES, _decode_replica_task
+ 
+     stats["projected"] += 1
+     gw, record_key, data, updated, version = row
+     st = _Stage()
+-    st.row, st.error, st.order = row, None, (str(gw), str(record_key))
++    st.row, st.error, st.order, st.slim = row, None, (str(gw), str(record_key)), False
+     try:
+-        t, digest, evidence = _decode_replica_task(record_key, data)
++        t, digest, evidence = _decode_replica_task(record_key, text(data))
+         parts = str(record_key).split('/')
+         if len(parts) == 3:
+             owner_profile, board, tid = parts
+@@ -116,6 +127,10 @@ def _stage(row: tuple, me: str, origin_profile: str) -> _Stage:
+         return st
+     gw = str(gw)
+     st.tkey = (gw, owner_profile, board, tid)
++    st.sids = linked_sessions(t, me, origin_profile)
++    if not st.sids:
++        st.slim = True
++        t = {f: t[f] for f in SLIM_FIELDS if f in t}
+     st.t = t
+     st.legacy = {'key': record_key, 'version': version, 'digest': digest} if owner_profile is None else None
+     st.seen = (updated or 0) / 1000.0
+@@ -129,11 +144,33 @@ def _stage(row: tuple, me: str, origin_profile: str) -> _Stage:
+     created = t.get('created_at')
+     st.published = (board, tid, created) if owner_profile is not None and created is not None else None
+     st.owner3 = (gw, board, tid)
+-    st.sids = linked_sessions(t, me, origin_profile)
+     st.historical = st.cards = None
+     return st
+ 
+ 
++def _record(st: _Stage) -> dict[str, Any]:
++    """The stage's whole decoded record: kept for a record linking this origin, else decoded again from its text."""
++    if not st.slim:
++        return st.t
++    from hermes_cli.kanban_replica_rows import text
++    from hermes_cli.kanban_session_activity import _decode_replica_task
++
++    stats["rehydrated"] += 1
++    return _decode_replica_task(st.row[1], text(st.row[2]))[0]
++
++
++def _whole(st: _Stage, base: dict[str, Any], t: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
++    """``(record, t)`` with the whole record: ``base`` is what the state holds for the stage (its record or its
++    unknown-status copy) and ``t`` is ``base`` or a fold of it, which reads ``base`` with links added."""
++    record = _record(st)
++    if record is st.t:
++        return record, t
++    whole = record
++    if base is st.unknown:
++        whole = {**record, 'reported_status': record.get('status'), 'status': 'unknown', 'unfinished': True}
++    return record, {**whole, **{k: v for k, v in t.items() if k not in base or base[k] is not v}}
++
++
+ @dataclass
+ class _State:
+     """Aggregates of every kept row under one clock key (``stale``, fresh scopes)."""
+@@ -161,7 +198,7 @@ class _State:
+ 
+ _lock = threading.Lock()
+ _states: dict[str, _State] = {}
+-stats = {"projected": 0, "rebuilt": 0, "historical": 0, "considered": 0}
++stats = {"projected": 0, "rebuilt": 0, "historical": 0, "considered": 0, "rehydrated": 0}
+ 
+ 
+ def _new_state(tag: str, key: tuple) -> _State:
+@@ -352,9 +389,10 @@ def _emit(s: _State, me: str, origin_profile: str, last_ok, stale: bool, fresh:
+         sids = st.sids if tk not in changed else linked_sessions(t, me, origin_profile)
+         if not sids:
+             continue
++        record, t = _whole(st, s.tasks[tk], t)  # only a slim twin a legacy alias folded links into decodes here
+         if st.historical is None:
+             stats["historical"] += 1
+-            st.historical = historical_fields(st.t, tk)
++            st.historical = historical_fields(record, tk)
+         owner_seen = s.seen.get(gw) or None
+         synced = min(owner_seen, last_ok) if (owner_seen and last_ok) else (owner_seen or last_ok)
+         inputs = (t, sids, tk in s.released, synced, stale, me, origin_profile)
+diff --git a/hermes_cli/kanban_replica_rows.py b/hermes_cli/kanban_replica_rows.py
+index cdf25b7adb..bd59d9b528 100644
+--- a/hermes_cli/kanban_replica_rows.py
++++ b/hermes_cli/kanban_replica_rows.py
+@@ -8,6 +8,11 @@ checks the merged rows against the caller's probe aggregate (``count``, ``total(
+ ``total(octet_length(data))``). When they disagree (rows were deleted), one identity aggregate drops the vanished
+ keys; anything else it cannot explain (a row rewritten at an older seq, a seq that went back, a replaced file)
+ falls back to the full read. The result is always exactly the rows a full read returns, in ``(gw, key)`` order.
++
++Kept rows hold each row's text zlib-compressed (``pack``), never the decoded string: the gateway, the dashboard and
++every Desktop serve keep one view each, and ~56 MB of row text (UCS-4 once any row holds an emoji, so up to 4 bytes a
++character) was ~115 MB of every such process's heap on the mini (t_01a1cf67a93c05b6). Equal text compresses to equal
++bytes, so a kept row still compares equal exactly when its text is unchanged; ``text`` restores the text.
+ """
+ from __future__ import annotations
+ 
+@@ -15,11 +20,19 @@ import json
+ import os
+ import sqlite3
+ import threading
++import zlib
+ from dataclasses import dataclass, field
+ 
+ _COLUMNS = "gw, key, data, updated_at, {version}, seq, octet_length(data)"
+-_FULL_SQL = f"SELECT json_group_array(json_array({_COLUMNS})) FROM replica WHERE coll = 'tasks'"
+-_DELTA_SQL = _FULL_SQL + " AND seq > ?"
++# Rows are read in rowid pages (all inside the caller's one read transaction, so still one snapshot) of at most
++# ``_PAGE`` rows and about ``_PAGE_BYTES`` of row text at the replica's mean row size: one ``json_group_array`` over
++# every row was a 256 MB string (UCS-4) plus its decode, a ~400 MB peak per full read on the mini.
++_PAGE = 1000
++_PAGE_BYTES = 2 << 20
++_PAGE_SQL = (f"SELECT json_group_array(json_array({_COLUMNS})), max(rowid) FROM (SELECT rowid, * FROM replica"
++             " WHERE coll = 'tasks' AND rowid > ? {where} ORDER BY rowid LIMIT ?)")
++_FULL_SQL = _PAGE_SQL.format(version="{version}", where="")
++_DELTA_SQL = _PAGE_SQL.format(version="{version}", where="AND seq > ?")
+ _IDENTITY_SQL = "SELECT json_group_array(json_array(gw, key, seq)) FROM replica WHERE coll = 'tasks'"
+ 
+ 
+@@ -29,7 +42,7 @@ class Rows:
+     path: str
+     ident: tuple | None  # (st_dev, st_ino) of the file the rows came from
+     version_column: str
+-    by_key: dict[tuple, tuple]  # (gw, key) -> (gw, key, data, updated_at, version), as ``_read_remote_links`` reads
++    by_key: dict[tuple, tuple]  # (gw, key) -> (gw, key, packed data, updated_at, version); ``text`` unpacks data
+     meta: dict[tuple, tuple]  # (gw, key) -> (seq, octet length of data)
+     sums: tuple  # (count, total seq, total integer version, total octets): ``_REPLICA_PROBE``'s terms
+     last_seq: int  # the highest seq these rows had (an upper bound once rows were deleted)
+@@ -39,8 +52,24 @@ class Rows:
+     removed: frozenset = field(default_factory=frozenset)
+ 
+     def rows(self) -> list[tuple]:
++        """Every row as ``_read_remote_links`` reads it, ``(gw, key, data, updated_at, version)``, in key order."""
+         by_key = self.by_key
+-        return [by_key[k] for k in sorted(by_key, key=_sort_key)]
++        return [_unpacked(by_key[k]) for k in sorted(by_key, key=_sort_key)]
++
++
++def pack(data):
++    """``data`` as kept: text becomes zlib-compressed ``bytes`` (never GC-tracked); anything else stays as read.
++    A row read through ``json_array`` never holds ``bytes`` (JSON cannot hold a BLOB), so ``bytes`` is always packed."""
++    return zlib.compress(data.encode("utf-8", "surrogatepass"), 1) if isinstance(data, str) else data
++
++
++def text(data):
++    """The stored text of a kept row's ``data`` (anything not packed is returned as it was read)."""
++    return zlib.decompress(data).decode("utf-8", "surrogatepass") if isinstance(data, bytes) else data
++
++
++def _unpacked(row: tuple) -> tuple:
++    return (row[0], row[1], text(row[2]), *row[3:])
+ 
+ 
+ _lock = threading.Lock()
+@@ -68,6 +97,24 @@ def _decode(packed: str) -> list[tuple]:
+     return [tuple(item) for item in json.loads(packed)]
+ 
+ 
++def page_rows(probe) -> int:
++    """Rows per page for a replica whose ``_REPLICA_PROBE`` is ``probe`` (count first, total octets last)."""
++    mean = float((probe[5] if probe else 0) or 0) / max(int((probe[0] if probe else 0) or 0), 1)
++    return max(50, min(_PAGE, int(_PAGE_BYTES // max(mean, 1.0))))
++
++
++def _paged(conn: sqlite3.Connection, sql: str, probe, args: tuple = ()):
++    """Every row ``sql`` (``_FULL_SQL``/``_DELTA_SQL``) selects, one page decoded at a time."""
++    size, after = page_rows(probe), -1 << 63
++    while True:
++        packed, last = conn.execute(sql, (after, *args, size)).fetchone()
++        rows = _decode(packed) if last is not None else []
++        yield from rows
++        if len(rows) < size:  # a short page is the last: no extra query to find the end
++            return
++        after = last
++
++
+ def _sort_key(key: tuple) -> tuple:
+     return str(key[0]), str(key[1])
+ 
+@@ -86,12 +133,11 @@ def _matches(sums: tuple, probe) -> bool:
+             and float(sums[2]) == float(probe[4] or 0) and float(sums[3]) == float(probe[5] or 0))
+ 
+ 
+-def _full(conn: sqlite3.Connection, path: str, ident, version_column: str) -> Rows:
++def _full(conn: sqlite3.Connection, path: str, ident, version_column: str, probe) -> Rows:
+     stats["full"] += 1
+     by_key, meta, sums = {}, {}, (0, 0, 0, 0)
+-    for gw, key, data, updated, version, seq, size in _decode(
+-            conn.execute(_FULL_SQL.format(version=version_column)).fetchone()[0]):
+-        row, m = (gw, key, data, updated, version), (seq or 0, size or 0)
++    for gw, key, data, updated, version, seq, size in _paged(conn, _FULL_SQL.format(version=version_column), probe):
++        row, m = (gw, key, pack(data), updated, version), (seq or 0, size or 0)
+         by_key[(gw, key)], meta[(gw, key)] = row, m
+         sums = _plus(sums, _terms(row, m))
+     return Rows(path, ident, version_column, by_key, meta, sums, max((m[0] for m in meta.values()), default=0),
+@@ -102,7 +148,7 @@ def _delta(conn: sqlite3.Connection, base: Rows, probe) -> Rows | None:
+     """``base`` advanced to the snapshot ``probe`` describes, or None when only a full read can tell."""
+     last = base.last_seq
+     stats["delta"] += 1
+-    fresh = _decode(conn.execute(_DELTA_SQL.format(version=base.version_column), (last,)).fetchone()[0])
++    fresh = list(_paged(conn, _DELTA_SQL.format(version=base.version_column), probe, (last,)))
+     stats["delta_rows"] += len(fresh)
+     by_key, meta, sums = dict(base.by_key), dict(base.meta), base.sums
+     changed = set()
+@@ -110,7 +156,7 @@ def _delta(conn: sqlite3.Connection, base: Rows, probe) -> Rows | None:
+         k = (gw, key)
+         if k in by_key:
+             sums = _plus(sums, _terms(by_key[k], meta[k]), -1)
+-        by_key[k], meta[k] = (gw, key, data, updated, version), (seq or 0, size or 0)
++        by_key[k], meta[k] = (gw, key, pack(data), updated, version), (seq or 0, size or 0)
+         sums = _plus(sums, _terms(by_key[k], meta[k]))
+         changed.add(k)
+     removed: set = set()
+@@ -138,14 +184,14 @@ def read(conn: sqlite3.Connection, path, version_column: str, probe, ident) -> R
+     whose every task row carries a ``seq`` (``probe[0] == probe[1]``) and that has a ``version`` column."""
+     tag = str(path)
+     if ident is None:  # no file identity, so no base to trust
+-        return _full(conn, tag, None, version_column)
++        return _full(conn, tag, None, version_column, probe)
+     with _lock:
+         base = _views.get(tag)
+     view = None
+     if base is not None and base.ident == ident:
+         view = _delta(conn, base, probe)
+     if view is None:
+-        view = _full(conn, tag, ident, version_column)
++        view = _full(conn, tag, ident, version_column, probe)
+     with _lock:
+         if len(_views) >= 16 and tag not in _views:
+             _views.pop(next(iter(_views)))
+diff --git a/tests/hermes_cli/test_kanban_replica_rows_memory.py b/tests/hermes_cli/test_kanban_replica_rows_memory.py
+new file mode 100644
+index 0000000000..7ab23e7ee4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_rows_memory.py
+@@ -0,0 +1,110 @@
++"""What a live remote-links read keeps, and how much it allocates on the way, is bounded by the row text. [daveey]
++
++hermes-hub's replica held ~13.5k task rows (~60 MB of JSON, mostly bodies, comments and run logs) of which 54 linked a
++session of the mini. Each gateway, dashboard and Desktop serve kept the whole decoded replica plus its text (~300 MB)
++and built a 256 MB string (UCS-4: one emoji anywhere widens it) on every full read, which put 1-2 GB heaps on the
++mini (t_01a1cf67a93c05b6). Here 2,000 rows with 20 KB bodies, 1 in 100 linking this origin, must keep under
++75% of their text (the old code kept over twice the text) (zlib-packed rows, slim records) with a peak well under the text itself, decode only the linked
++records whole, and still answer exactly what the explicit full read answers.
++"""
++import gc
++import json
++import random
++import sqlite3
++import tracemalloc
++
++from hermes_cli import kanban_replica_projection as projection
++from hermes_cli import kanban_replica_rows as replica_rows
++from hermes_cli import kanban_session_activity as activity
++from tests.hermes_cli import test_kanban_replica_read_memo as _memo_tests
++from tests.hermes_cli.test_kanban_remote_terminal_release import observed
++from tests.hermes_cli.test_kanban_replica_incremental import World, _ok, _scopes
++from tests.hermes_cli.test_kanban_replica_read_memo import card
++
++hub = _memo_tests.hub
++N, BODY, LINKED_EVERY = 2000, 20_000, 100
++_WORDS = [''.join(random.Random(i).choices('abcdefghijklmnopqrstuvwxyz', k=3 + i % 7)) for i in range(3000)]
++
++
++def _body(i):
++    rng = random.Random(i)
++    return ' '.join(rng.choices(_WORDS, k=BODY // 5))[:BODY - 2] + ('😀' if i == 7 else ' .')  # one emoji: the old packed string went UCS-4
++
++
++def _task(i):
++    t = card(f't_{i}', body=_body(i))
++    if i % LINKED_EVERY:
++        t['sessions'] = [{'gw': 'elsewhere', 'profile': 'default', 'session': 's9', 'rel': 'shepherd'}]
++    return t
++
++
++def _fill(path):
++    rows = [('owner', f'work/build/t_{i}', i + 1, json.dumps(_task(i))) for i in range(N)]
++    with sqlite3.connect(path) as db:
++        db.executemany("INSERT INTO replica VALUES (?,'tasks',?,1,?,?,1000000)", rows)
++    _scopes(path, [_ok(1000.0)], seq=N + 50)  # the owner scope is fresh: a done card is released
++    return sum(len(r[3].encode()) for r in rows)
++
++
++def test_a_live_read_keeps_packed_slim_rows_and_peaks_below_the_text(hub):
++    path, _, _, clock = hub
++    text_bytes = _fill(path)
++    w = World(path, clock)
++    w.seq = N + 100
++    gc.collect()
++    tracemalloc.start()
++    try:
++        tracemalloc.reset_peak()
++        base = tracemalloc.get_traced_memory()[0]
++        live = activity._read_remote_links(path)
++        gc.collect()
++        current, peak = tracemalloc.get_traced_memory()
++    finally:
++        tracemalloc.stop()
++    retained, transient = current - base, peak - current
++    assert len(live) == N // LINKED_EVERY
++    assert retained < 0.75 * text_bytes, (retained, text_bytes)
++    # Above what it keeps, a read allocates at most a page at a time: the old whole-replica string alone was 1x
++    # the text, 4x here (the emoji row made it UCS-4).
++    assert transient < 0.4 * text_bytes, (transient, text_bytes)
++    (state,) = projection._states.values()
++    whole = [st for st in state.stages.values() if not st.slim]
++    assert len(whole) == N // LINKED_EVERY  # only the linked records are kept whole
++    assert all(set(st.t) <= set(projection.SLIM_FIELDS) for st in state.stages.values() if st.slim)
++    (view,) = replica_rows._views.values()
++    assert all(isinstance(row[2], bytes) for row in view.by_key.values())
++    assert sum(len(row[2]) for row in view.by_key.values()) < 0.6 * text_bytes  # zlib level 1: ~53% here
++    assert not any(gc.is_tracked(row[2]) for row in view.by_key.values())
++    full = activity._read_remote_links(path, now=clock['now'])
++    assert live == full
++
++
++def test_a_full_read_pages_the_rows(hub):
++    path, _, statements, clock = hub
++    _fill(path)
++    size = replica_rows.page_rows((N, 0, 0, 0, 0, N * BODY))
++    assert size == (2 << 20) // BODY  # ~2 MB of text a page: 104 rows of 20 KB
++    live = activity._read_remote_links(path)
++    pages = [s for s in statements if 'max(rowid)' in s]
++    assert len(pages) == -(-N // size)  # the short last page ends the read
++    assert live == activity._read_remote_links(path, now=clock['now'])
++    assert len(replica_rows._views[str(path)].by_key) == N
++
++
++def test_a_slim_row_a_legacy_alias_links_decodes_whole_again(hub):
++    """An unlinked qualified row kept slim gets this origin's link from its frozen ``board/id`` twin: the card is
++    built from the whole record, decoded again from the packed text."""
++    path, _, _, clock = hub
++    _fill(path)
++    w = World(path, clock)
++    w.seq = N + 100
++    w.same()
++    same_card = {'created_at': 500, 'created_by': 'u'}
++    w.put('work/build/t_5', json.dumps(observed({**_task(5), 'status': 'done', **same_card})))  # released
++    w.put('build/t_5', json.dumps({**card('t_5'), 'profile': None, **same_card}))
++    w.tick(1005.0)
++    projection.stats['rehydrated'] = 0
++    rows = w.same()
++    t5 = [r for r in rows if r['id'] == 't_5']
++    assert t5 and t5[0]['legacy_key'] == 'owner/build/t_5'
++    assert projection.stats['rehydrated'] >= 1
+diff --git a/tests/tui_gateway/test_replica_bounded_reads.py b/tests/tui_gateway/test_replica_bounded_reads.py
+index cc30c778df..7e11f6e298 100644
+--- a/tests/tui_gateway/test_replica_bounded_reads.py
++++ b/tests/tui_gateway/test_replica_bounded_reads.py
+@@ -78,7 +78,10 @@ def test_remote_links_miss_preserves_rows_with_bounded_fetches(tmp_path, monkeyp
+     if modern:
+         expected = sorted(expected, key=lambda r: (r[0], r[1]))
+     assert activity._read_remote_links(path) == expected
+-    assert conn.fetched <= 12
++    # [daveey] The incremental reader fetches one aggregate row per page of ``_PAGE`` task rows (a single
++    # whole-replica string was a 256 MB+ transient): still bounded by rows / page, never once per task.
++    pages = -(-len(rows) // activity._replica_rows._PAGE) if modern else 0  # rows this small fill whole pages
++    assert conn.fetched <= 12 + pages
+ 
+ 
+ def test_warm_observation_identity_scan_is_bounded(tmp_path, monkeypatch):
+-- 
+2.43.0
+

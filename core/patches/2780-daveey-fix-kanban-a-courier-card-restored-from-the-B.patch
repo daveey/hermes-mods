@@ -1,0 +1,400 @@
+From 34a3144fe09b3d5633f31b966d97ae8bf424f4ae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 13:24:45 +0000
+Subject: [PATCH] [daveey] fix(kanban): a courier card restored from the Board
+ publishes its exact origin marker again
+
+origin_creation_intents is machine-local and its binding_id is a random secret, so a
+gateway reprovisioned from the Board got its courier cards back without their intent
+rows. The hermes-hub collector publishes a card's origin_bindings only from that table,
+so it republished them as [] and the origin gateway's ledger
+(kanban_origin_ledger._advanced_observation) never advanced the obligation again
+(fail-closed, but the origin chat never saw completion; an in-flight receipt stayed
+origin_publication_pending) (t_01a1cf7ee5a6103e).
+
+create_with_origin / adopt_with_origin now append one synced task event,
+origin_intent_recorded, holding the whole intent row, in the same transaction. When the
+sync apply inserts that event for a card the file got back from the Board
+(kanban_restored_cards, primary live file only) and the binding names this gateway and
+this card as owner, the exact row is re-inserted (INSERT OR IGNORE, never changed).
+Foreign copies, unmarked cards and malformed payloads are skipped. Local gc_events keeps
+the kind like 'decomposed'. Residual gap: the Board service drops events after 30 days,
+so a card open longer than that before it was lost still fails closed as before.
+
+Measured first: 0 unreleased obligations in the hub ledgers (default 156 rows, bb-tuner
+16) name a worker-N owner; 2 of 1093 worker-owned records in the hub replica ever carried
+origin_bindings (worker-1 t_01a1cdcdd0627aaa, worker-2 t_01a1ce02b36b6969, both done,
+macbook origin). The path is live but rare, so the fix is small and additive.
+
+Tests: tests/hermes_cli/test_kanban_sync_restore_origin_intents.py. RED on the base:
+after the restore the republished record has origin_bindings=[] and the obligation stays
+at observation 1 (create and adopt), no carry event, gc drops it; the installed hermes-hub
+collector publishes origin_bindings=[] after the restore. GREEN 4/4, and the installed
+collector republishes the exact marker.
+---
+ hermes_cli/kanban_db.py                       |   6 +-
+ hermes_cli/kanban_db_sync.py                  |   3 +
+ hermes_cli/kanban_origin_creation.py          |  17 +-
+ hermes_cli/kanban_origin_intent_carry.py      |  92 +++++++++++
+ .../hermes_cli/test_kanban_origin_adoption.py |   4 +-
+ ...test_kanban_sync_restore_origin_intents.py | 155 ++++++++++++++++++
+ 6 files changed, 269 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin_intent_carry.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_restore_origin_intents.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index f952d71179..e66523985c 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3841,7 +3841,7 @@ def _retention_seconds(older_than_seconds: int) -> int:
+ 
+ 
+ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
+-    """Prune old done/archived events, retaining decomposition identity until task deletion.
++    """Prune old done/archived events, retaining decomposition identity and carried origin intents until task deletion.
+ 
+     ``older_than_seconds=0`` means everything older than now; the CLI maps
+     ``--event-retention-days 0`` to "disabled" before calling this.
+@@ -3849,8 +3849,8 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
+     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
+     with write_txn(conn):
+         cur = conn.execute(
+-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
+-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
++            "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN ('decomposed', 'origin_intent_recorded') "
++            "AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
+         )
+     return int(cur.rowcount or 0)
+ 
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index af6492e33e..989ab76ba8 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1374,6 +1374,9 @@ def _upsert_row(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: Ap
+     if table == "task_chat_links":
+         from hermes_cli.kanban_restore_chat_subs import restore_link_sub
+         restore_link_sub(conn, cols, own)  # a restored card's hub delivery (kanban_notify_subs does not sync)
++    if table == "task_events" and cols.get("kind") == "origin_intent_recorded":
++        from hermes_cli.kanban_origin_intent_carry import restore_from_event
++        restore_from_event(conn, cols, own)  # a restored courier card's origin intent (a machine-local table)
+     return True
+ 
+ 
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index c863f48db6..be04ac9fcf 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -36,6 +36,15 @@ def _subscribe_origin(conn, task_id: str, origin: dict) -> None:
+         (task_id, chat_id, origin["profile"], int(time.time()), task_id))
+ 
+ 
++def _insert_intent(conn, row: tuple) -> None:
++    """Store the intent row and its synced copy in one transaction. The row is machine-local and its binding id is a
++    random secret, so only the copy lets an owner restored from the Board rebuild it (``kanban_origin_intent_carry``)."""
++    from hermes_cli.kanban_origin_intent_carry import record
++    conn.execute("INSERT INTO origin_creation_intents VALUES (?,?,?,?,?)", row)
++    request_id, intent_json, task_id, binding_json, child_request_id = row
++    record(conn, task_id, request_id, intent_json, binding_json, child_request_id)
++
++
+ def create_with_origin(conn, intent: dict, options: dict) -> str:
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_origin_ledger import validate_binding
+@@ -104,8 +113,8 @@ def create_with_origin(conn, intent: dict, options: dict) -> str:
+         marker = {"binding_id": "binding-" + secrets.token_hex(16), "version": 1,
+                   "owner": {**intent["owner"], "task_id": task_id}, "origin": intent["origin"],
+                   "task_record_key": f"{intent['owner']['profile']}/{intent['owner']['board']}/{task_id}"}
+-        conn.execute("INSERT INTO origin_creation_intents VALUES (?,?,?,?,?)",
+-                     (intent["request_id"], immutable, task_id, _json(marker), "origin-bind-" + secrets.token_hex(16)))
++        _insert_intent(conn, (intent["request_id"], immutable, task_id, _json(marker),
++                              "origin-bind-" + secrets.token_hex(16)))
+         _subscribe_origin(conn, task_id, intent["origin"])
+         return task_id
+ 
+@@ -164,7 +173,7 @@ def adopt_with_origin(conn, intent: dict, *, board: str) -> str:
+             if previous.get("owner") == owner and previous.get("origin") == intent["origin"]:
+                 raise OriginError("origin_already_bound", "retry existing origin request " + row["request_id"])
+         marker["binding_id"] = "binding-" + secrets.token_hex(16)
+-        conn.execute("INSERT INTO origin_creation_intents VALUES (?,?,?,?,?)",
+-                     (intent["request_id"], immutable, task_id, _json(marker), "origin-bind-" + secrets.token_hex(16)))
++        _insert_intent(conn, (intent["request_id"], immutable, task_id, _json(marker),
++                              "origin-bind-" + secrets.token_hex(16)))
+         _subscribe_origin(conn, task_id, intent["origin"])
+         return task_id
+diff --git a/hermes_cli/kanban_origin_intent_carry.py b/hermes_cli/kanban_origin_intent_carry.py
+new file mode 100644
+index 0000000000..048d1f2944
+--- /dev/null
++++ b/hermes_cli/kanban_origin_intent_carry.py
+@@ -0,0 +1,92 @@
++"""Carry a courier origin intent through the Board so a restored owner can rebuild it. [daveey]
++
++``origin_creation_intents`` (``kanban_origin_creation``) is machine-local and does not sync, and its
++``binding_json.binding_id`` is a random secret, so nothing on the Board could rebuild it. The hermes-hub collector
++publishes a card's ``origin_bindings`` only from that table, and an origin gateway's ledger
++(``kanban_origin_ledger._advanced_observation``) advances an obligation only from a newer owner record that still
++carries the exact marker. An owner reprovisioned from the Board therefore republished every courier card with
++``origin_bindings: []``, and the origin chat's obligation stayed at its last observation forever (fail-closed: never
++falsely released, but never completed either); a receipt still in flight stayed ``origin_publication_pending``
++(t_01a1cf7ee5a6103e).
++
++Two hooks:
++
++- :func:`record` runs in the writer's transaction right after the intent row is inserted and appends one task event
++  (``origin_intent_recorded``) holding the whole row. Task events sync, so the Board keeps a copy.
++- :func:`restore_from_event` runs when the sync apply inserts such an event. For a card this file got back from the
++  Board (``kanban_restored_cards``, written by ``kanban_restore_chat_subs.note_restored_task`` in a primary live
++  board file) whose binding names THIS gateway as owner and this card, it re-inserts the exact row
++  (``INSERT OR IGNORE``: an existing row is never changed). Foreign copies, replicas, unmarked cards and
++  malformed payloads are skipped.
++
++Retention: local ``gc_events`` keeps this kind (like ``decomposed``). The Board service drops events older than its
++30-day window, so a card that was open longer than that before it was lost still cannot be rebuilt: it fails closed
++exactly as before.
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++from typing import Any, Mapping
++
++EVENT_KIND = "origin_intent_recorded"
++_FIELDS = ("request_id", "intent_json", "binding_json", "child_request_id")
++INTENTS_DDL = """CREATE TABLE IF NOT EXISTS origin_creation_intents (
++            request_id TEXT PRIMARY KEY NOT NULL,
++            intent_json TEXT NOT NULL,
++            task_id TEXT NOT NULL REFERENCES tasks(id),
++            binding_json TEXT NOT NULL,
++            child_request_id TEXT NOT NULL UNIQUE)"""
++
++
++def record(conn: sqlite3.Connection, task_id: str, request_id: str, intent_json: str, binding_json: str,
++           child_request_id: str) -> None:
++    """Append the synced copy of a just-inserted ``origin_creation_intents`` row (caller's transaction).
++
++    A plain row, not ``append_event``: it records an identity, not a lifecycle step, so it must not stamp recovery
++    history or snapshot wake evidence (an adoption leaves the owner card's state untouched)."""
++    payload = {"v": 1, "request_id": request_id, "intent_json": intent_json, "binding_json": binding_json,
++               "child_request_id": child_request_id}
++    conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, NULL, ?, ?, ?)",
++                 (task_id, EVENT_KIND, json.dumps(payload, ensure_ascii=False), int(time.time())))
++
++
++def _row(payload: Any, task_id: str, own: str) -> tuple | None:
++    """The exact intent row an event payload carries for ``task_id`` owned by ``own``, or None."""
++    from hermes_cli.kanban_origin_ledger import validate_binding
++    try:
++        data = json.loads(payload) if isinstance(payload, str) else payload
++        if not isinstance(data, dict) or data.get("v") != 1:
++            return None
++        values = [data.get(f) for f in _FIELDS]
++        if not all(isinstance(v, str) and v for v in values):
++            return None
++        binding = json.loads(data["binding_json"])
++        validate_binding({**binding, "publication_version": 1})
++        json.loads(data["intent_json"])
++    except (TypeError, ValueError):
++        return None
++    owner = binding["owner"]
++    if owner["gateway"] != own or owner["task_id"] != task_id:
++        return None  # another gateway's card (its owner rebuilds it), or a payload naming another card
++    request_id, intent_json, binding_json, child_request_id = values
++    return request_id, intent_json, task_id, binding_json, child_request_id
++
++
++def restore_from_event(conn: sqlite3.Connection, cols: Mapping[str, Any], own: str) -> bool:
++    """Rebuild the intent row a just-inserted ``origin_intent_recorded`` event of a restored card carries."""
++    if cols.get("kind") != EVENT_KIND or not own:
++        return False
++    task_id = cols.get("task_id")
++    if not task_id or not conn.execute(
++            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_restored_cards'").fetchone():
++        return False
++    if conn.execute("SELECT 1 FROM kanban_restored_cards WHERE task_id = ?", (task_id,)).fetchone() is None:
++        return False  # only a card this primary live file got back from the Board
++    row = _row(cols.get("payload"), task_id, own)
++    if row is None:
++        return False
++    conn.execute(INTENTS_DDL)
++    return conn.execute("INSERT OR IGNORE INTO origin_creation_intents VALUES (?,?,?,?,?)", row).rowcount == 1
+diff --git a/tests/hermes_cli/test_kanban_origin_adoption.py b/tests/hermes_cli/test_kanban_origin_adoption.py
+index 1f468f59d6..9977d044af 100644
+--- a/tests/hermes_cli/test_kanban_origin_adoption.py
++++ b/tests/hermes_cli/test_kanban_origin_adoption.py
+@@ -43,7 +43,9 @@ def test_adopt_done_task_without_creating_or_changing_owner_state(board):
+     assert "publication_version" not in marker
+     assert dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == before
+     assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+-    assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == events
++    # The only new event is the synced copy of the intent row (kanban_origin_intent_carry): no lifecycle event.
++    assert [r[0] for r in conn.execute("SELECT kind FROM task_events ORDER BY id")][events:] == [
++        "origin_intent_recorded"]
+     assert creation.adopt_with_origin(conn, intent(tid), board="default") == tid
+     assert dict(conn.execute("SELECT * FROM origin_creation_intents").fetchone()) == dict(row)
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_restore_origin_intents.py b/tests/hermes_cli/test_kanban_sync_restore_origin_intents.py
+new file mode 100644
+index 0000000000..0695924816
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_restore_origin_intents.py
+@@ -0,0 +1,155 @@
++"""A courier card restored from the Board publishes its exact origin marker again. [daveey]
++
++``origin_creation_intents`` is machine-local. An owner reprovisioned from the Board got its courier cards back but
++not their intent rows, so the hermes-hub collector published ``origin_bindings: []`` for them and the origin
++gateway's ledger never advanced the obligation again (t_01a1cf7ee5a6103e).
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_origin_ledger as ledger
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli.kanban_origin_intent_carry import EVENT_KIND, restore_from_event
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli import test_kanban_sync_restore_origin_subs as base
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++BOARD, ME = base.BOARD, base.ME
++ORIGIN = {"gateway": "macbook", "profile": "default", "session": "sess-a"}
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True)
++
++
++@pytest.fixture
++def live(kanban_home, svc):
++    conn = base._open(kanban_home, svc)
++    previous = sync.set_lease_client(ksc.HubLeaseClient(svc.hub(ME)))
++    try:
++        yield conn
++    finally:
++        sync.set_lease_client(previous)
++        conn.close()
++
++
++def _intent(request_id="request-restore-001"):
++    return {"request_id": request_id, "owner": {"gateway": ME, "profile": "default", "board": BOARD},
++            "origin": ORIGIN}
++
++
++def _bindings(conn, tid):
++    """The collector's ``origin_bindings`` (``hermes_hub.py collect_tasks``: ``origin_creation_intents`` rows)."""
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='origin_creation_intents'").fetchone():
++        return []
++    return [json.loads(r[0]) for r in conn.execute(
++        "SELECT binding_json FROM origin_creation_intents WHERE task_id=? ORDER BY request_id", (tid,))]
++
++
++def _publish(conn, replica, tid, version):
++    """Publish the owner record the collector would (observation attached on the owner) into the hub replica."""
++    card = kb.get_task(conn, tid)
++    assert card is not None
++    task = {"id": tid, "status": card.status, "gateway": ME, "profile": "default",
++            "board": BOARD, "origin_bindings": _bindings(conn, tid)}
++    conn.execute("BEGIN")
++    try:
++        record = ledger.observe_owner_task(conn, task, now=time.time())
++    finally:
++        conn.execute("ROLLBACK")
++    with sqlite3.connect(replica) as rep:
++        rep.execute("CREATE TABLE IF NOT EXISTS replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, data TEXT, "
++                    "PRIMARY KEY (gw, coll, key))")
++        rep.execute("INSERT OR REPLACE INTO replica VALUES (?, 'tasks', ?, ?, ?)",
++                    (ME, f"default/{BOARD}/{tid}", version, json.dumps(record)))
++    return record
++
++
++def _observation(path):
++    with sqlite3.connect(path) as conn:
++        return conn.execute("SELECT observation_version, released FROM origin_obligations").fetchone()
++
++
++@pytest.mark.parametrize("how", ["create", "adopt"])
++def test_restored_courier_card_republishes_its_exact_marker_and_the_obligation_advances(
++        live, svc, kanban_home, tmp_path, how):
++    if how == "create":
++        tid = kb.create_task(live, title="courier card", assignee="worker", origin_intent=_intent())
++    else:
++        from hermes_cli.kanban_origin_creation import adopt_with_origin
++        tid = kb.create_task(live, title="existing card", assignee="worker")
++        adopt_with_origin(live, {**_intent(), "owner": {**_intent()["owner"], "task_id": tid}}, board=BOARD)
++    [marker] = _bindings(live, tid)
++    row = live.execute("SELECT * FROM origin_creation_intents").fetchone()
++    before = tuple(row)
++
++    # The origin gateway accepts the binding from the owner's first publication.
++    replica, path = tmp_path / "hub-replica.db", tmp_path / "origin-ledger.db"
++    _publish(live, replica, tid, 1)
++    ack = ledger.accept_binding(path=path, replica=replica, binding={**marker, "publication_version": 1},
++                                request_id="receipt-restore-001", sender=f"gw:{ME}", gateway="macbook",
++                                profile="default", resolve_session=lambda s: s)
++    assert ack["status"] == "accepted"
++    assert _observation(path) == (1, 0)
++    base._round(kanban_home, svc)
++
++    restored = base._reprovision(kanban_home, svc, live)
++    try:
++        republished = _publish(restored, replica, tid, 2)
++        ledger.refresh_observations(path, replica)
++        # Before the fix the record carried origin_bindings=[] (the intent row stayed on the old machine), so the
++        # obligation stayed at version 1 forever.
++        assert (_observation(path), republished["origin_bindings"]) == ((2, 0), [marker])
++        assert tuple(restored.execute("SELECT * FROM origin_creation_intents").fetchone()) == before
++        base._round(kanban_home, svc)  # idempotent
++        assert restored.execute("SELECT COUNT(*) FROM origin_creation_intents").fetchone()[0] == 1
++        if how == "create":  # an exact courier retry after the restore is answered by the request ID, no duplicate
++            assert kb.create_task(restored, title="courier card", assignee="worker", origin_intent=_intent()) == tid
++            assert restored.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++    finally:
++        restored.close()
++
++
++def test_restore_hook_only_rebuilds_an_own_restored_card_from_a_valid_payload(live):
++    tid = kb.create_task(live, title="courier card", assignee="worker", origin_intent=_intent())
++    payload = live.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, EVENT_KIND)).fetchone()[0]
++    with kb.write_txn(live):
++        live.execute("DELETE FROM origin_creation_intents WHERE task_id=?", (tid,))
++    cols = {"task_id": tid, "kind": EVENT_KIND, "payload": payload}
++    with kb.write_txn(live):
++        assert restore_from_event(live, cols, ME) is False  # not a restored card: never resurrected
++        live.execute("CREATE TABLE IF NOT EXISTS kanban_restored_cards (task_id TEXT PRIMARY KEY, "
++                     "restored_at INTEGER NOT NULL)")
++        live.execute("INSERT INTO kanban_restored_cards VALUES (?, ?)", (tid, int(time.time())))
++        assert restore_from_event(live, cols, "worker-2") is False  # another gateway's card: its owner rebuilds
++        assert restore_from_event(live, {**cols, "task_id": "t_other"}, ME) is False
++        assert restore_from_event(live, {**cols, "kind": "created"}, ME) is False
++        for bad in ("not json", json.dumps({"v": 2}), json.dumps({**json.loads(payload), "binding_json": "{}"})):
++            assert restore_from_event(live, {**cols, "payload": bad}, ME) is False
++        assert _bindings(live, tid) == []
++        assert restore_from_event(live, cols, ME) is True
++        assert restore_from_event(live, cols, ME) is False  # an existing row is never changed
++    assert len(_bindings(live, tid)) == 1
++
++
++def test_event_gc_keeps_the_carried_intent(live):
++    tid = kb.create_task(live, title="courier card", assignee="worker", origin_intent=_intent())
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
++        live.execute("UPDATE task_events SET created_at=0 WHERE task_id=?", (tid,))
++    kb.gc_events(live, older_than_seconds=1)
++    assert [r[0] for r in live.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))] == [EVENT_KIND]
+-- 
+2.43.0
+

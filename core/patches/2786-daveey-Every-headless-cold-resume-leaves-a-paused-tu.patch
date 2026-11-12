@@ -1,0 +1,410 @@
+From 068960d1d4b42c1e1f304f91d703ade7330c72b9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:25:12 +0000
+Subject: [PATCH] [daveey] Every headless cold resume leaves a paused turn to
+ the restarting backend; the window covers the hand-off
+
+Follow-up to aa3a75eb9da (PR 1278): _wake_session_turn yields a turn paused for a
+Hermes update to the dead writer's successor, so its continuation and re-asked
+clarify form run where the chat's viewers attach. Two gaps were left.
+
+1. Two more producers resume an unloaded chat in-process with no viewer and took
+   the continuation the same way (session.resume schedules it):
+   - producer_admission._sweep_owner (every `hermes serve`/dashboard process,
+     every 15 s): now returns verdict "paused_turn" while
+     successor_owes_continuation holds; the row stays queued for the next pass.
+   - _wake_chat_for_readopted_exit (each Desktop-owned backend sharing the home):
+     its parked exit is lost if it gives up, so it waits the hand-off out
+     (update_pause.wait_out_successor, rereading every 5 s), then resumes as
+     before unless the chat was loaded here meanwhile.
+
+2. The window (135 s from the pause stamp) ended before the successor arrived.
+   hermes-hub gui.log, 2026-10-30..11-12, 81 continuations of a dead writer's
+   pause: scheduled 11-2781 s after the stamp (50 at or past 135 s), because a
+   writer holds its pause until the update applies. Against the checkout's
+   reflog the schedule came 42-198 s after the move; with no move, up to 545 s
+   after the stamp. The window now counts from this process's own start when it
+   started after the pause (it restarted in the same update): SUCCESSOR_YIELD_S
+   = 300 s. A reader that did not restart cannot date the writer's exit and
+   counts from the stamp: SUCCESSOR_YIELD_UNKNOWN_S = 660 s. Past either, any
+   reader continues, as before.
+
+The wake's log line moved with the predicate to tui_gateway.update_pause
+(left_to_successor), keeping session_notifications.py at its line cap.
+
+RED on 2ff7a5cadbe (production files reverted): 6 of 7 tests in
+test_cold_resume_yields_paused_turn.py fail, "the sweep took the paused turn's
+continuation" / "the wake took the paused turn's continuation".
+GREEN: 92 files importing the changed modules, 1195 passed.
+---
+ .../test_cold_resume_yields_paused_turn.py    | 155 ++++++++++++++++++
+ .../test_wake_yields_paused_turn.py           |  13 +-
+ tui_gateway/producer_admission.py             |   7 +
+ tui_gateway/session_notifications.py          |  12 +-
+ tui_gateway/update_pause.py                   |  81 +++++++--
+ 5 files changed, 248 insertions(+), 20 deletions(-)
+ create mode 100644 tests/tui_gateway/test_cold_resume_yields_paused_turn.py
+
+diff --git a/tests/tui_gateway/test_cold_resume_yields_paused_turn.py b/tests/tui_gateway/test_cold_resume_yields_paused_turn.py
+new file mode 100644
+index 0000000000..ea4377805b
+--- /dev/null
++++ b/tests/tui_gateway/test_cold_resume_yields_paused_turn.py
+@@ -0,0 +1,155 @@
++"""Every headless cold resume leaves a turn paused for an update to the restarting backend. [daveey]
++
++``server._wake_session_turn`` yields a fresh update pause to the dead writer's successor
++(test_wake_yields_paused_turn.py). Two more producers resume an unloaded chat in-process without a viewer and so
++took the paused turn's continuation the same way: the producer-admission sweeper (every ``hermes serve`` /
++dashboard process) and the re-adopted-exit waker (each Desktop-owned backend sharing the home). Both now read the
++same ``update_pause.successor_owes_continuation``.
++
++The yield window also has to cover the hand-off it waits for. On hermes-hub (gui.log, 2026-10-30..11-12, 81
++continuations of a dead writer's pause) the successor scheduled 42-198 s after the checkout moved, which was up
++to 2781 s after the pause stamp; with no checkout move, up to 545 s after the stamp. 135 s from the stamp ended
++before 50 of them.
++"""
++import json
++import threading
++import time
++
++import pytest
++
++import hermes_state_producer_admission as pa
++from tests.tui_gateway import test_update_pause_recovery as _recovery
++from tests.waiting import wait_until
++from tui_gateway import producer_admission as delivery
++from tui_gateway import server, update_pause as up
++from tui_gateway.turn_marker import read_turn_marker
++
++recovery = _recovery.recovery  # the real session.resume wiring over a dead writer's durable pause
++assert_continued = _recovery.assert_continued
++
++KEY = "paused"
++# Past the stamp-counted window (the parent commit had one window, SUCCESSOR_YIELD_S).
++PAST_WINDOW = getattr(up, "SUCCESSOR_YIELD_UNKNOWN_S", up.SUCCESSOR_YIELD_S) + 1
++PRODUCER = json.dumps(["user-terminal", "job-1", "final"], separators=(",", ":"))
++TEXT = "[User-terminal completion - tool result, not user input]\njob_id: job-1\nstatus: exited\nexit_code: 0"
++
++
++def _loaded() -> bool:
++    return server._find_live_session_by_key(KEY) is not None
++
++
++def _age_pause(home, seconds: float) -> None:
++    path = home / "desktop" / "interrupted_turns.json"
++    entries = json.loads(path.read_text())
++    stamp = time.time() - seconds
++    entries[KEY].update(started_at=stamp, paused_at=stamp)
++    path.write_text(json.dumps(entries))
++
++
++@pytest.fixture
++def home(recovery, monkeypatch):
++    """The recovery store as this process's launch home, as the sweepers resolve it."""
++    monkeypatch.setenv("HERMES_HOME", str(recovery.home))
++    monkeypatch.setattr(up, "_process_started_at", lambda: 0.0, raising=False)  # this process predates the pause
++    return recovery.home
++
++
++# ── producer-admission sweeper ───────────────────────────────────────────────────────────────────────────────
++
++@pytest.fixture
++def completion(home):
++    receipt = pa.admit_producer_completion(producer=PRODUCER, profile_home=home, stored_session_id=KEY, text=TEXT)
++    assert receipt["status"] == "queued", receipt
++    return receipt
++
++
++def test_producer_sweep_leaves_a_fresh_paused_turn_to_its_successor(recovery, home, completion):
++    before = read_turn_marker(home, KEY)
++    [rec] = delivery.sweep_once()
++    assert not recovery.done.wait(0.5) and recovery.calls == [], "the sweep took the paused turn's continuation"
++    assert not _loaded(), "the sweep resumed the paused chat in a process without its viewers"
++    assert rec["verdict"] == "paused_turn"
++    assert read_turn_marker(home, KEY) == before
++    db = pa.open_profile_db(home)
++    try:
++        assert pa.pending_owners(db) == [KEY]  # still queued: the next pass delivers it
++    finally:
++        db.close()
++
++
++def test_producer_sweep_wakes_a_pause_no_successor_picked_up(recovery, home, completion):
++    _age_pause(home, PAST_WINDOW)
++    [rec] = delivery.sweep_once()
++    assert rec["verdict"] != "paused_turn"
++    assert _loaded()
++    assert_continued(recovery)
++
++
++# ── re-adopted-exit waker ────────────────────────────────────────────────────────────────────────────────────
++
++def test_readopt_wake_waits_out_a_fresh_pause_then_resumes(recovery, home, monkeypatch):
++    monkeypatch.setattr(up, "SUCCESSOR_POLL_S", 0.02, raising=False)
++    out = []
++    waker = threading.Thread(target=lambda: out.append(server._wake_chat_for_readopted_exit(KEY)), daemon=True)
++    waker.start()
++    assert not recovery.done.wait(0.5) and recovery.calls == [], "the wake took the paused turn's continuation"
++    assert not _loaded(), "the wake resumed the paused chat in a process without its viewers"
++    assert waker.is_alive()  # it waits; the parked exit is not dropped
++    _age_pause(home, PAST_WINDOW)  # no successor came
++    waker.join(5)
++    assert not waker.is_alive() and out == [None]  # resumed under the launch profile
++    assert _loaded()
++    assert_continued(recovery)
++
++
++def test_readopt_wake_finds_the_chat_its_successor_loaded_here(recovery, home, monkeypatch):
++    """The startup sweep of this same backend continues the turn while the waker yields: the waker then has
++    nothing to resume (the chat's poller takes the parked exit)."""
++    monkeypatch.setattr(up, "SUCCESSOR_POLL_S", 0.02, raising=False)
++    resumes = []
++    real = server._methods["session.resume"]
++    monkeypatch.setitem(server._methods, "session.resume", lambda rid, p: (resumes.append(rid), real(rid, p))[1])
++    waker = threading.Thread(target=server._wake_chat_for_readopted_exit, args=(KEY,), daemon=True)
++    waker.start()
++    assert not recovery.done.wait(0.3)
++    _recovery.mount()  # the successor's resume
++    assert_continued(recovery)
++    waker.join(5)
++    assert not waker.is_alive()
++    assert resumes == ["resume"]  # the waker resumed nothing
++    assert len(recovery.calls) == 1
++
++
++# ── the window covers the measured hand-off ──────────────────────────────────────────────────────────────────
++
++def _wake() -> str:
++    return server._wake_session_turn(KEY, "a card finished", display_kind="kanban_notice", label="kanban-sweep-wake")
++
++
++def test_a_waker_restarted_with_the_writer_counts_from_its_own_start(recovery, home, monkeypatch):
++    """Hub 2026-11-10 19:46: schedules 2760-2781 s after the pause stamp, 197-198 s after the checkout moved."""
++    _age_pause(home, 2781)
++    monkeypatch.setattr(up, "_process_started_at", lambda: time.time() - 197, raising=False)
++    assert _wake() == "busy"
++    assert not recovery.done.wait(0.5) and recovery.calls == [] and not _loaded()
++    monkeypatch.setattr(up, "_process_started_at", lambda: time.time() - up.SUCCESSOR_YIELD_S - 1)
++    _wake()
++    assert _loaded()
++    assert_continued(recovery)
++
++
++def test_a_waker_that_did_not_restart_counts_from_the_pause_stamp(recovery, home):
++    """Hub 2026-11-12 03:23: a schedule 545 s after the stamp with no checkout move (longest of that kind)."""
++    _age_pause(home, 544)
++    assert _wake() == "busy"
++    assert not recovery.done.wait(0.5) and recovery.calls == [] and not _loaded()
++    _age_pause(home, PAST_WINDOW)
++    _wake()
++    assert _loaded()
++    assert_continued(recovery)
++
++
++def test_process_start_is_this_process_birth():
++    started = up._process_started_at()
++    assert 0 < started <= time.time()
++    assert wait_until(lambda: up._process_started_at() == started, timeout=1)  # stable across calls
+diff --git a/tests/tui_gateway/test_wake_yields_paused_turn.py b/tests/tui_gateway/test_wake_yields_paused_turn.py
+index f529983a1b..ead12828b1 100644
+--- a/tests/tui_gateway/test_wake_yields_paused_turn.py
++++ b/tests/tui_gateway/test_wake_yields_paused_turn.py
+@@ -27,6 +27,13 @@ KEY = "paused"
+ _REAL_PROFILE_HOME = server._profile_home  # the recovery fixture stubs it; these tests need the real resolver
+ 
+ 
++@pytest.fixture(autouse=True)
++def _waker_predates_the_pause(monkeypatch):
++    """This process did not restart with the writer: the window counts from the pause stamp (the other clock is
++    covered in test_cold_resume_yields_paused_turn.py)."""
++    monkeypatch.setattr(up, "_process_started_at", lambda: 0.0)
++
++
+ def _loaded() -> bool:
+     return server._find_live_session_by_key(KEY) is not None
+ 
+@@ -41,7 +48,7 @@ def _edit_marker(home, **fields) -> None:
+ def test_headless_wake_leaves_a_fresh_paused_turn_to_its_successor(recovery, caplog):
+     before = read_turn_marker(recovery.home, KEY)
+     assert before["reason"] == up.PAUSE_REASON
+-    with caplog.at_level("INFO", logger="tui_gateway.server"):
++    with caplog.at_level("INFO", logger="tui_gateway.update_pause"):
+         verdict = server._wake_session_turn(KEY, "a card finished", display_kind="kanban_notice",
+                                             label="kanban-sweep-wake")
+     assert verdict == "busy"  # the sweeper writes the passive notice row; the continuation reads it
+@@ -52,7 +59,7 @@ def test_headless_wake_leaves_a_fresh_paused_turn_to_its_successor(recovery, cap
+ 
+ 
+ def test_wake_continues_a_pause_no_successor_picked_up(recovery):
+-    old = time.time() - up.SUCCESSOR_YIELD_S - 1
++    old = time.time() - up.SUCCESSOR_YIELD_UNKNOWN_S - 1
+     _edit_marker(recovery.home, started_at=old, paused_at=old)
+     server._wake_session_turn(KEY, "a card finished", display_kind="kanban_notice", label="kanban-sweep-wake")
+     assert _loaded()
+@@ -111,7 +118,7 @@ def test_a_fresh_pause_in_a_profile_home_is_left_to_its_successor(recovery, prof
+     monkeypatch.setattr("tui_gateway.turn_marker.marker_writer_state", lambda marker: "dead")  # no real pid probe
+     _profile(profiles_root.root, "Not A Profile!")
+     work = _profile(profiles_root.root, "work")
+-    old = time.time() - up.SUCCESSOR_YIELD_S - 1
++    old = time.time() - up.SUCCESSOR_YIELD_UNKNOWN_S - 1
+     _edit_marker(recovery.home, started_at=old, paused_at=old)  # the launch home owes nothing
+     record_turn_start(work, KEY, "finish the request")
+     mark_turn_paused(work, KEY, up.PAUSE_REASON)
+diff --git a/tui_gateway/producer_admission.py b/tui_gateway/producer_admission.py
+index a9113b4790..24ca4c67a8 100644
+--- a/tui_gateway/producer_admission.py
++++ b/tui_gateway/producer_admission.py
+@@ -192,6 +192,13 @@ def _sweep_owner(server, db, profile: Optional[str], owner: str) -> dict:
+     tip = db.get_compression_tip(owner) or owner
+     live = _live(server, tip, profile)
+     if live is None:
++        # A turn paused for an update is its restarting backend's to continue (update_pause); resuming the chat
++        # here would run it in a process its viewers are not attached to. The row stays queued for the next pass.
++        from tui_gateway.update_pause import successor_owes_continuation
++        if any(successor_owes_continuation(_profile_home(profile), k) for k in {owner, tip}):
++            logger.info("producer admission: %s is paused for a Hermes update and its backend is restarting; "
++                        "left to that backend's continuation", tip)
++            return {**record, "verdict": "paused_turn"}
+         handler = server._methods.get("session.resume")
+         if handler is None:
+             return {**record, "verdict": "no_resume"}
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 4a87ca764f..5f383c1eb4 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -1639,6 +1639,9 @@ def _wake_chat_for_readopted_exit(key: str):
+     if handler is None:
+         logger.warning("readopt wake: session.resume not installed; %s waits until it is opened", key)
+         return None
++    from tui_gateway.update_pause import readopt_wake_yields
++    if readopt_wake_yields(key):  # [daveey] waited out a paused turn's hand-off and the chat is now loaded here
++        return None
+     for n, profile in zip(_it.count(1), _readopt_wake_profiles()):
+         params = {"session_id": key, "omit_messages": True, **({"profile": profile} if profile else {})}
+         try:
+@@ -1699,12 +1702,9 @@ def _wake_session_turn(session_key: str, text: str, *, display_kind: str | None
+     try:
+         live = _find_live_session_by_key(key)
+         if live is None:
+-            # [daveey] A turn paused for an update belongs to the restarting backend's startup sweep; resuming it
+-            # here would continue it in a process its viewers are not attached to (update_pause).
+-            from tui_gateway.update_pause import paused_turn_homes, successor_owes_continuation
+-            if any(successor_owes_continuation(h, key) for h in paused_turn_homes(_hermes_home, _readopt_wake_profiles())):
+-                logger.info("%s: %s is paused for a Hermes update and its backend is restarting; left to that "
+-                            "backend's continuation", label, key)
++            # [daveey] A paused turn is its restarting backend's: here its viewers are not attached (update_pause).
++            from tui_gateway.update_pause import left_to_successor
++            if left_to_successor(_hermes_home, _readopt_wake_profiles(), key, label):
+                 return "busy"
+             handler = _methods.get("session.resume")
+             if handler is None:
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 9cf57a6ae6..e5b368da02 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -86,10 +86,18 @@ KICKOFF_HOLD_S = 120.0 + DUE_HOLD_S
+ # Automatic turns never wait for a paused turn longer than this past the window's end (a continuation that
+ # keeps failing to schedule, e.g. a live foreign marker writer, must not starve the chat's notices).
+ HOLD_MAX_S = LEAVE_GRACE_S + WATCH_POLL_S
+-# [daveey] A headless wake of a chat no backend holds (``successor_owes_continuation``) leaves a pause this fresh
+-# to the dead writer's replacement: its startup sweep schedules the continuation within seconds of the restart
+-# and the kickoff may wait out an agent build.
+-SUCCESSOR_YIELD_S = KICKOFF_HOLD_S
++# [daveey] A headless cold resume of a chat no backend holds (``successor_owes_continuation``) leaves a paused turn
++# to the dead writer's replacement for this long. The clock is the hand-off, not the pause: a writer holds its
++# pause until the update applies, so the stamp can be 46 min old when the writer exits. Measured on hermes-hub
++# (gui.log 2026-10-30..11-12, 81 continuations of a dead writer's pause): the successor scheduled 42-198 s after
++# the checkout moved, up to 2781 s after the stamp; 135 s from the stamp ended before 50 of them. A reader that
++# itself started after the pause restarted in that same update, so the window counts from its own start.
++SUCCESSOR_YIELD_S = 300.0
++# A reader that did not restart cannot date the writer's exit and counts from the stamp: the longest hand-off
++# with no checkout move was 545 s.
++SUCCESSOR_YIELD_UNKNOWN_S = 660.0
++# How often a waker that must not drop its delivery (``wait_out_successor``) rereads the pause.
++SUCCESSOR_POLL_S = 5.0
+ # A capped pause parked between drain windows restamps its freshness clock this often (``_keep_parked``).
+ PARK_STAMP_S = 30.0
+ # [daveey] t_01a18b11cabcd2c2: a capped pause used to stay parked for its drainer's whole life (example-laptop
+@@ -614,20 +622,71 @@ def replacement_outlook() -> str:
+     return "coming" if idle is True else "blocked"
+ 
+ 
++_STARTED_AT: float | None = None
++
++
++def _process_started_at() -> float:
++    """This process's start (epoch seconds); 0.0 when it cannot be read, which counts from the pause stamp."""
++    global _STARTED_AT
++    if _STARTED_AT is None:
++        from hermes_cli.process_identity import _process_create_time
++        _STARTED_AT = float(_process_create_time() or 0.0)
++    return _STARTED_AT
++
++
+ def successor_owes_continuation(home: Path | str, session_key: str) -> bool:
+-    """[daveey] True while unloaded chat ``session_key`` carries a fresh core-update pause whose writer is gone:
+-    the backend that paused it is restarting for the update and its startup sweep continues the turn where
+-    the chat's viewers attach. A wake that cold-resumed the chat here first (``session.resume`` schedules the
+-    continuation) moved the turn into this process: on 2026-11-11 the gateway's kanban sweeper did so 21 s
+-    after a pause, the continuation re-asked a clarify form no Desktop window could see, and the user's next
+-    message cancelled it. Past ``SUCCESSOR_YIELD_S`` no successor came and any reader continues, as before."""
++    """[daveey] True while unloaded chat ``session_key`` carries a core-update pause whose writer is gone and
++    whose hand-off window is open: the backend that paused it is restarting for the update and its startup
++    sweep continues the turn where the chat's viewers attach. A headless resume that loaded the chat here
++    first (``session.resume`` schedules the continuation) moved the turn into this process: on 2026-11-11 the
++    gateway's kanban sweeper did so 21 s after a pause, the continuation re-asked a clarify form no Desktop
++    window could see, and the user's next message cancelled it. The window is ``SUCCESSOR_YIELD_S`` from this
++    process's start when it started after the pause, else ``SUCCESSOR_YIELD_UNKNOWN_S`` from the pause stamp.
++    Past it no successor came and any reader continues, as before."""
+     from tui_gateway.turn_marker import freshness_since, marker_writer_state, read_turn_marker
+     marker = read_turn_marker(home, session_key)
+     if not marker or marker.get("reason") != PAUSE_REASON or not marker.get("auto_continue", True):
+         return False
+     if marker_writer_state(marker) == "alive":
+         return False  # its own backend still holds the pause (in-place watcher)
+-    return 0 <= _now() - freshness_since(marker) < SUCCESSOR_YIELD_S
++    paused, started = freshness_since(marker), _process_started_at()
++    if started > paused:
++        return 0 <= _now() - started < SUCCESSOR_YIELD_S
++    return 0 <= _now() - paused < SUCCESSOR_YIELD_UNKNOWN_S
++
++
++def left_to_successor(launch_home: Path | str, profiles, session_key: str, label: str = "") -> bool:
++    """``successor_owes_continuation`` over every home a headless resume would try (``paused_turn_homes``);
++    a named ``label`` logs the yield."""
++    owed = any(successor_owes_continuation(h, session_key) for h in paused_turn_homes(launch_home, profiles))
++    if owed and label:
++        logger.info("%s: %s is paused for a Hermes update and its backend is restarting; left to that backend's "
++                    "continuation", label, session_key)
++    return owed
++
++
++def wait_out_successor(launch_home: Path | str, profiles, session_key: str, loaded, label: str) -> bool:
++    """For a waker whose delivery is lost if it gives up (a re-adopted job's parked exit): block while the paused
++    turn is ``left_to_successor`` and ``loaded()`` is false, rereading every ``SUCCESSOR_POLL_S``. Returns
++    ``loaded()``: True when the chat was loaded in this process meanwhile (nothing to resume), False when the
++    window ended or nothing was owed, and the caller resumes as before. ``profiles`` is a callable (a profile
++    can appear while waiting). Bounded by the yield window."""
++    announced = False
++    while not loaded() and left_to_successor(launch_home, profiles(), session_key, "" if announced else label):
++        announced = True
++        time.sleep(SUCCESSOR_POLL_S)
++    return bool(loaded())
++
++
++def readopt_wake_yields(session_key: str) -> bool:
++    """The re-adopted-exit waker's ``wait_out_successor``: a turn paused for an update is its restarting backend's
++    to continue, and the parked exit must not be dropped, so the wake waits the hand-off out. True when the chat
++    is loaded here afterwards (its poller takes the parked exit); False tells the waker to resume it."""
++    from tui_gateway import server
++    return wait_out_successor(
++        server._hermes_home, server._readopt_wake_profiles, session_key,
++        lambda: server._notif_live_session_matches({session_key, server._notif_resolve_event_key(session_key)}),
++        "readopt wake")
+ 
+ 
+ def paused_turn_homes(launch_home: Path | str, profiles) -> list[Path]:
+-- 
+2.43.0
+

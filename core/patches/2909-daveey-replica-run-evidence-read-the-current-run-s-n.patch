@@ -1,0 +1,350 @@
+From 79dfcc03fbd86bb2b0566c6cec520aac044148ec Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:54:23 +0000
+Subject: [PATCH] [daveey] replica run evidence: read the current run's newest
+ liveness event outside the link-row memo
+
+Review t_01a1d0f7c4cc4688 (B1): a pulled heartbeat task_event, plus the heartbeat
+columns it bumps, is bookkeeping for kanban_activity_revision. The shadow content
+key therefore never moved for it, so _read_replica served the memoised run_beat.
+A live remote card froze on its first beat and expired to unknown 180 s later on
+a quiet board, and a rolled-over run never got its first event.
+
+- The run terms leave the memoised _read_replica_links. kanban_replica_execution.read_runs
+  reads {task: run_uid, run_beat} on every _read_replica with ONE bound-parameter
+  query, driven from this gateway's unreleased links (idx_task_chat_links_chat ->
+  tasks PK -> task_runs PK -> task_events(run_id, id)). On a real default-board
+  replica: ~4 ms incl. schema probe for 154 links / 3 running cards. The
+  task-driven EXISTS form took 77 ms.
+- The link-row memo, the shadow key, SHADOW_TABLES and the triggers are unchanged:
+  a heartbeat still re-reads no board, links projection or counts by itself.
+  The counts pick up the new beat on their next recompute, within their existing
+  3 s TTL / 30 s revalidation bound, the same lag local heartbeats already have.
+  The beat stays source-dated, so the lag only ever ages it. Never the pull clock.
+- The SQL interpolates nothing; an assert pins the placeholder count to LIVENESS_KINDS.
+- A trigger-backed kbc.connect shadow test covers memoised rows + new heartbeat,
+  quiet-board run rollover (an old run's late beat is never served, and the new run's
+  first event dates it), and sidebar counts + session_tasks seeing the same new beat.
+  All 3 are RED at 18113d0e57 and GREEN here.
+---
+ hermes_cli/kanban_activity_revision.py        |   4 +-
+ hermes_cli/kanban_chat_links.py               |  25 ++--
+ hermes_cli/kanban_replica_execution.py        |  40 ++++--
+ .../test_kanban_activity_revision.py          |   2 +-
+ .../test_kanban_replica_execution_memo.py     | 127 ++++++++++++++++++
+ 5 files changed, 173 insertions(+), 25 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_replica_execution_memo.py
+
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index 8567518f0c..e616b73772 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -41,7 +41,9 @@ PREFIX = "kanban_activity_rev_"
+ LOCAL_TABLES = ("tasks", "task_links", "task_runs", "task_events", "task_comments", "kanban_notify_subs",
+                 "task_chat_links")
+ # A sync replica (``sync-shadow/<board>.db``) is read only for this gateway's chat links and their card rows
+-# (``kanban_chat_links._read_replica``). Its events/runs mirror the whole board's traffic and are never read.
++# (``kanban_chat_links._read_replica``). Its events/runs mirror the whole board's traffic; the one read of them (the
++# linked running cards' newest liveness event, ``kanban_replica_execution.read_runs``) runs on every read, outside
++# any cache keyed on this revision, so their (bookkeeping) heartbeat writes need not, and do not, move it.
+ SHADOW_TABLES = ("tasks", "task_chat_links")
+ # Columns no activity reader selects, written by claims, leases, heartbeats, the sync apply path and the notifier's
+ # delivery claim. An update that changes only these is bookkeeping.
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 59ce079291..f641a7d629 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -24,7 +24,7 @@ import time
+ from pathlib import Path
+ from typing import Any, Iterable, Optional
+ 
+-from hermes_cli.kanban_replica_execution import run_evidence, select_terms as run_select
++from hermes_cli.kanban_replica_execution import read_runs, run_evidence
+ from hermes_cli.kanban_run_machine import placement_select, run_machine
+ 
+ _log = logging.getLogger(__name__)
+@@ -282,7 +282,7 @@ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: boo
+ TERMINAL_STATUSES = ("done", "archived")
+ UNKNOWN = "unknown"
+ # Rows last read from each replica, so an unreadable replica keeps its rows (stale) instead of dropping them.
+-_last_good: dict[tuple[str, str, str], tuple[list[dict[str, Any]], Optional[float]]] = {}
++_last_good: dict[tuple[str, str, str], tuple[list[dict[str, Any]], Optional[float], dict[str, dict]]] = {}
+ 
+ 
+ def _reset_for_tests() -> None:
+@@ -303,9 +303,11 @@ def _stale_after_s() -> float:
+     return max(HUB_STALE_AFTER_S, 3 * period)
+ 
+ 
+-def _read_replica(path: Path, gateway: str, profile: str) -> tuple[list[dict[str, Any]], Optional[float]]:
++def _read_replica(path: Path, gateway: str,
++                  profile: str) -> tuple[list[dict[str, Any]], Optional[float], dict[str, dict]]:
+     """Every unreleased link of this gateway+profile's chats in one replica, with its card row (or none when the
+-    card row is missing), and the replica's last successful pull. Raises ``sqlite3.Error`` when unreadable.
++    card row is missing), the replica's last successful pull, and the current-run terms of the linked running cards
++    (``kanban_replica_execution.read_runs``). Raises ``sqlite3.Error`` when unreadable.
+ 
+     ``chat_released`` is 1 when another link of the same card and chat (other kind) is released. [daveey] The owner
+     writes a ``created`` link for a remote origin chat (``kanban_creator_chats``) that no gateway ever releases: the
+@@ -326,12 +328,15 @@ def _read_replica(path: Path, gateway: str, profile: str) -> tuple[list[dict[str
+         if rows is None:
+             rows = _read_replica_links(conn, gateway, profile)
+             _replica_rows[memo_key] = (content, rows)
++        # Never memoised: a pulled heartbeat is bookkeeping, so ``content`` does not move for it, while the run's
++        # newest liveness event is exactly what dates the card (review t_01a1d0f7c4cc4688).
++        runs = read_runs(conn, gateway, profile)
+         try:
+             row = conn.execute("SELECT pulled_at FROM kanban_sync_state LIMIT 1").fetchone()
+             pulled = float(row[0]) if row and row[0] is not None else None
+         except sqlite3.OperationalError:  # replica written before pulls were stamped
+             pulled = None
+-    return rows, pulled
++    return rows, pulled, runs
+ 
+ 
+ # (replica path, gateway, profile) -> (content key, link rows) of the last ``_read_replica``.
+@@ -342,7 +347,6 @@ def _read_replica_links(conn: sqlite3.Connection, gateway: str, profile: str) ->
+     return [dict(r) for r in conn.execute(
+         "SELECT l.task_id AS id, t.id AS task_row, t.title, t.status, t.assignee, t.created_at, t.started_at, "
+         f"t.priority, t.block_kind, t.human_request, t.created_on, {placement_select(conn, 't')}, "
+-        f"{run_select(conn, 't')}, "
+         "l.chat_session, l.chat_profile, l.kind, "
+         "EXISTS (SELECT 1 FROM task_chat_links r WHERE r.task_id = l.task_id AND r.chat_gateway = l.chat_gateway "
+         "AND r.chat_profile IS l.chat_profile AND r.chat_session = l.chat_session AND r.released = 1) "
+@@ -452,8 +456,8 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+     for board, path in replicas:
+         memo_key = (str(path), gateway, profile)
+         try:
+-            rows, pulled = _read_replica(path, gateway, profile)
+-            _last_good[memo_key] = (rows, pulled)
++            rows, pulled, runs = _read_replica(path, gateway, profile)
++            _last_good[memo_key] = (rows, pulled, runs)
+             stale = pulled is None or now - pulled > stale_after
+         except sqlite3.Error as exc:
+             if unreadable_out is not None:
+@@ -468,7 +472,7 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+                     if ids is None or c["session"] in ids:
+                         out.setdefault((c["session"], c["key"]), c)
+                 continue
+-            rows, pulled = hit
++            rows, pulled, runs = hit
+             stale = True
+         if owners is None and rows:
+             owners = _ledger_owners(stale_ok)
+@@ -509,7 +513,8 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+             if machine := run_machine(r):
+                 out[pair]["run_machine"] = machine
+             # Executor-stamped liveness of the current run (kanban_replica_execution), never the pull clock.
+-            if named and owner is not None and not unknown and (run := run_evidence(r)) is not None:
++            if named and owner is not None and not unknown and (run := run_evidence(
++                    {"status": status, **runs.get(tid, {})})) is not None:
+                 out[pair]["_replica_run"] = run
+     return list(out.values())
+ 
+diff --git a/hermes_cli/kanban_replica_execution.py b/hermes_cli/kanban_replica_execution.py
+index e3c1e06d69..2e45497702 100644
+--- a/hermes_cli/kanban_replica_execution.py
++++ b/hermes_cli/kanban_replica_execution.py
+@@ -17,26 +17,40 @@ from hermes_cli.execution_observations import epoch, ident
+ 
+ # Executor-written lifecycle events of an attempt; liveness only, never progress.
+ LIVENESS_KINDS = ("heartbeat", "claimed", "spawned")
+-_TERMS = ("run_uid", "run_beat")
+ 
++# Bound parameters, never interpolated: the statement text is a constant. Driven from this gateway's links
++# (``idx_task_chat_links_chat``) into ``tasks`` by primary key: a running-task-driven EXISTS re-scanned every link of
++# the gateway once per running card (77 ms on a real default-board replica vs 2.6 ms).
++_RUNS_SQL = (
++    "SELECT DISTINCT t.id AS id, "
++    "(SELECT r.uid FROM task_runs r WHERE r.id = t.current_run_id AND r.task_id = t.id "
++    " AND r.status = 'running' AND r.ended_at IS NULL) AS run_uid, "
++    "(SELECT json_array(e.created_at, e.uid) FROM task_events e WHERE e.run_id = t.current_run_id "
++    " AND e.task_id = t.id AND e.kind IN (?, ?, ?) ORDER BY e.created_at DESC, e.uid DESC LIMIT 1) AS run_beat "
++    "FROM task_chat_links l JOIN tasks t ON t.id = l.task_id "
++    "WHERE l.chat_gateway = ? AND l.chat_profile = ? AND l.released = 0 "
++    "AND t.status = 'running' AND t.created_on IS NOT NULL AND t.created_on != ?")
++assert _RUNS_SQL.count("?") == len(LIVENESS_KINDS) + 3
+ 
+-def select_terms(conn: sqlite3.Connection, alias: str = "t") -> str:
+-    """SELECT terms for the current run's identity and newest liveness event; NULL on boards lacking the columns.
+ 
+-    Correlated, evaluated only for ``running`` rows, through the ``task_runs`` primary key and the
+-    ``task_events(run_id, id)`` index: bounded by the open running cards, not the link count."""
++def read_runs(conn: sqlite3.Connection, gateway: str, profile: str) -> dict[str, dict]:
++    """``{task id: {'run_uid', 'run_beat'}}`` for the running replica cards linked to this gateway+profile's chats.
++
++    Read on EVERY replica read, outside the link-row memo: a pulled heartbeat event (and the heartbeat columns it
++    bumps) is bookkeeping for ``kanban_activity_revision``, so the replica's content key, and with it the memo and
++    the counts fingerprint, never move for it (review t_01a1d0f7c4cc4688). Bounded by this gateway's unreleased links
++    (``idx_task_chat_links_chat``, the ``tasks`` and ``task_runs`` primary keys, the ``task_events(run_id, id)``
++    index; ~4 ms including the schema probe for 154 links / 3 running cards on a real default-board replica).
++    Empty on a replica whose schema lacks the run columns."""
+     tasks = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+     runs = {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
+     events = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
+-    if not ({"current_run_id", "status"} <= tasks and {"id", "task_id", "uid", "status", "ended_at"} <= runs
++    if not ({"current_run_id", "status", "created_on"} <= tasks
++            and {"id", "task_id", "uid", "status", "ended_at"} <= runs
+             and {"task_id", "run_id", "kind", "created_at", "uid"} <= events):
+-        return ", ".join(f"NULL AS {name}" for name in _TERMS)
+-    kinds = ",".join(f"'{k}'" for k in LIVENESS_KINDS)
+-    return (f"CASE WHEN {alias}.status = 'running' THEN (SELECT r.uid FROM task_runs r WHERE r.id = {alias}.current_run_id "
+-            f"AND r.task_id = {alias}.id AND r.status = 'running' AND r.ended_at IS NULL) END AS run_uid, "
+-            f"CASE WHEN {alias}.status = 'running' THEN (SELECT json_array(e.created_at, e.uid) FROM task_events e "
+-            f"WHERE e.run_id = {alias}.current_run_id AND e.task_id = {alias}.id AND e.kind IN ({kinds}) "
+-            f"ORDER BY e.created_at DESC, e.uid DESC LIMIT 1) END AS run_beat")
++        return {}
++    return {str(r[0]): {"run_uid": r[1], "run_beat": r[2]}
++            for r in conn.execute(_RUNS_SQL, (*LIVENESS_KINDS, gateway, profile, gateway))}
+ 
+ 
+ def run_evidence(row: dict) -> dict | None:
+diff --git a/tests/hermes_cli/test_kanban_activity_revision.py b/tests/hermes_cli/test_kanban_activity_revision.py
+index 6b90e08e02..678a7b5ac6 100644
+--- a/tests/hermes_cli/test_kanban_activity_revision.py
++++ b/tests/hermes_cli/test_kanban_activity_revision.py
+@@ -195,7 +195,7 @@ def test_shadow_key_ignores_pull_stamps_and_unread_tables(home):
+         before = ksa._board_content_key(path, rev.SHADOW_TABLES)
+         assert rev.is_revision(before)
+         sync.mark_pulled(conn)
+-        with kbc.write_txn(conn):  # a replicated event of a hub card: the replica's readers never read events
++        with kbc.write_txn(conn):  # a replicated heartbeat: read uncached by read_runs, never through this key
+             conn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t_hub', 'heartbeat', 1)")
+         assert ksa._board_content_key(path, rev.SHADOW_TABLES) == before
+         with kbc.write_txn(conn):
+diff --git a/tests/hermes_cli/test_kanban_replica_execution_memo.py b/tests/hermes_cli/test_kanban_replica_execution_memo.py
+new file mode 100644
+index 0000000000..e10c83dc83
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_execution_memo.py
+@@ -0,0 +1,127 @@
++"""A heartbeat pulled into a trigger-backed Board replica reaches the remote card's observation, although it never
++moves the replica's content key (review t_01a1d0f7c4cc4688, B1). [daveey]
++
++Heartbeat events and the ``last_heartbeat_at`` columns are bookkeeping for ``kanban_activity_revision``: they do not
++bump the shadow key, so the replica link-row memo and the counts fingerprint stay put (by design: heartbeats must not
++re-read every board). The run terms (current run uid + newest liveness event) are therefore read outside that memo,
++on every ``replica_cards`` call, with one bounded query over this gateway's linked running cards. Without that, a live
++remote card froze on its first memoised beat and expired to unknown 180 s later on a quiet board.
++"""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as rev
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++
++ME, OWNER = "macbook", "hub"
++
++
++@pytest.fixture
++def shadow(tmp_path, monkeypatch):
++    from hermes_cli import profiles
++    home = support.kanban_home(tmp_path, monkeypatch)
++    (home / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n    links_reader: replica\n")
++    local = kbc.connect(home / "kanban.db")
++    ksc.ensure_identity(local, "default", ME)
++    local.close()
++    path = home / "kanban" / sync.SHADOW_DIR / "default.db"
++    monkeypatch.setattr(ksc, "load_identity", lambda cfg=None: ksc.Identity("https://hub.test", "k", ME))
++    monkeypatch.setattr(ksc, "board_paths", lambda: [("default", home / "kanban.db")])
++    monkeypatch.setattr(ksc, "shadow_path", lambda slug: path)
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [
++        {"id": "t_hub", "board": "default", "gateway": OWNER, "profile": "work", "session": "s1", "released": False}])
++    ksa._reset_cache_for_tests()
++    links._reset_for_tests()
++    conn = kbc.connect(path)  # real writer init: the revision triggers are installed
++    now = time.time()
++    with kbc.write_txn(conn):
++        conn.execute("INSERT INTO tasks (id, title, status, created_at, created_on, current_run_id) "
++                     "VALUES ('t_hub', 'hub card', 'running', 1, ?, 7)", (OWNER,))
++        conn.execute("INSERT INTO task_runs (id, task_id, status, started_at, uid) "
++                     "VALUES (7, 't_hub', 'running', 1, 'run-uid-7')")
++        conn.execute("INSERT INTO task_events (task_id, run_id, kind, created_at, uid) "
++                     "VALUES ('t_hub', 7, 'heartbeat', ?, 'ev1')", (int(now - 170),))
++        conn.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                     "released, created_at) VALUES ('u1', 't_hub', ?, 'default', 's1', 'shepherd', 0, 1)", (ME,))
++    sync.mark_pulled(conn, at=now)
++    try:
++        yield path, conn, now
++    finally:
++        conn.close()
++        ksa._reset_cache_for_tests()
++        links._reset_for_tests()
++
++
++def _beat(conn, uid: str, at: float, *, run_id: int = 7) -> None:
++    """What a pull applies for one executor heartbeat: the event plus the bookkeeping heartbeat columns only."""
++    with kbc.write_txn(conn):
++        conn.execute("INSERT INTO task_events (task_id, run_id, kind, created_at, uid) "
++                     "VALUES ('t_hub', ?, 'heartbeat', ?, ?)", (run_id, int(at), uid))
++        conn.execute("UPDATE tasks SET last_heartbeat_at = ? WHERE id = 't_hub'", (int(at),))
++        conn.execute("UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?", (int(at), run_id))
++    sync.mark_pulled(conn, at=at)
++
++
++def test_new_heartbeat_reaches_the_memoised_rows(shadow, monkeypatch):
++    path, conn, now = shadow
++    reads = []
++    real = links._read_replica_links
++    monkeypatch.setattr(links, "_read_replica_links", lambda *a: reads.append(1) or real(*a))
++    (first,) = links.replica_cards(["s1"], ME, replicas=[("default", path)], now=now)
++    assert first["_replica_run"] == {"run_id": "run-uid-7", "at": int(now - 170), "ref": "event:ev1"}
++    key = ksa._board_content_key(path, rev.SHADOW_TABLES)
++    _beat(conn, "ev2", now)
++    assert ksa._board_content_key(path, rev.SHADOW_TABLES) == key  # still bookkeeping: no board re-read
++    (second,) = links.replica_cards(["s1"], ME, replicas=[("default", path)], now=now)
++    assert second["_replica_run"]["ref"] == "event:ev2" and second["_replica_run"]["at"] == int(now)
++    assert len(reads) == 1  # the link rows stayed memoised; only the bounded run read ran again
++
++
++def test_run_rollover_on_a_quiet_board_never_borrows_the_old_run(shadow):
++    path, conn, now = shadow
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE task_runs SET status = 'released', ended_at = ? WHERE id = 7", (int(now - 5),))
++        conn.execute("INSERT INTO task_runs (id, task_id, status, started_at, uid) "
++                     "VALUES (8, 't_hub', 'running', ?, 'run-uid-8')", (int(now - 4),))
++        conn.execute("UPDATE tasks SET current_run_id = 8 WHERE id = 't_hub'")
++    _beat(conn, "ev-late-old", now, run_id=7)  # the previous attempt's late heartbeat arrives last
++    (card,) = links.replica_cards(["s1"], ME, replicas=[("default", path)], now=now)
++    assert "_replica_run" not in card  # the new run has no liveness event yet: explicit unknown, not run 7's beat
++    _beat(conn, "ev-new", now, run_id=8)
++    (card,) = links.replica_cards(["s1"], ME, replicas=[("default", path)], now=now)
++    assert card["_replica_run"] == {"run_id": "run-uid-8", "at": int(now), "ref": "event:ev-new"}
++
++
++def _counted_observation():
++    row = {"id": "s1", "_lineage_ids": ["s1"]}
++    ksa.annotate_kanban_activity([row])
++    (obs,) = row["execution_observations"]
++    return obs
++
++
++def test_sidebar_counts_pick_up_the_new_heartbeat_on_their_next_recompute(shadow, monkeypatch):
++    _path, conn, _now = shadow
++    # The shadow key will not move for the heartbeat, so only the counts' own age bound (3 s TTL, 30 s revalidation;
++    # unchanged by this fix) triggers their recompute; zero it instead of sleeping 30 s.
++    monkeypatch.setattr(ksa, "_CACHE_TTL_S", 0.0)
++    monkeypatch.setattr(ksa, "_COUNTS_MAX_AGE_S", 0.0)
++    first = _counted_observation()
++    assert first["state"] == "running" and first["source_revision"] == "event:ev1"
++    _beat(conn, "ev2", time.time())
++    second = _counted_observation()
++    assert second["state"] == "running" and second["source_revision"] == "event:ev2"
++    assert second["identity"]["run_id"] == "run-uid-7"
++    # The task list (``/api/session-kanban-tasks``) projects the same record from the same read.
++    from hermes_cli.kanban_execution_observations import add_cards
++    (listed,) = add_cards([{**c, "session_id": "s1"} for c in ksa.session_tasks(["s1"])])
++    assert listed["execution_observations"][0]["source_revision"] == "event:ev2"
++    assert listed["execution_observations"][0]["identity"] == second["identity"]
+-- 
+2.43.0
+

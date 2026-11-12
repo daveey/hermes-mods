@@ -1,0 +1,371 @@
+From 9810e8988b719d12b69cb88ff4b66bb554e1d716 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 14:31:29 +0000
+Subject: [PATCH] fix(update): a checkpoint refusal names its cause; a
+ duplicate `gateway run` is not a second gateway
+
+hermes-hub 2026-11-12 13:53-13:56Z: three instant applies exited 1 with only "busy or cannot
+acknowledge an idle pause", and the second one drained and restarted the real gateway on the
+old code.
+
+- gateway/update_checkpoint.py: every refusal of `checkpoint-for-update` carries a `reason`
+  naming the check (no live intent, nonce, cron inventory, admission not held, unpublished
+  reservations, async delegations, unpreservable work by kind with chat session keys, loop
+  timeout). The hub's refusals were a gateway-hosted chat turn (lane/oneshot) the checkpoint
+  does not preserve.
+- hermes_cli/update_cmd_posix_pause.py: `_ask_to_drain` keeps that reason and the deferral
+  prints it as `[cause: ...]` after the existing "busy or cannot acknowledge an idle pause"
+  token (hermes-sync's retry match is unchanged).
+- `_discover_bare` skips a `gateway run` PID that is not its home's verified gateway
+  (`live_gateway_pid_for_home` names another PID): a duplicate start that exits once it finds
+  the home served. The hub inventoried such PIDs (487116 at 13:54, 2807628 at 12:29, 3768639
+  at 13:15) next to the unit gateway: the unit gateway ACKed and drained (Kanban workers
+  checkpointed), the duplicate refused, and the rollback restarted the unit on the old code
+  (owner_restart_lost, reclaim). Unprovable identity keeps the old behaviour.
+---
+ gateway/update_checkpoint.py                  | 75 ++++++++++++++---
+ hermes_cli/update_cmd_posix_pause.py          | 37 ++++++++-
+ tests/gateway/test_update_checkpoint.py       | 31 +++++++
+ .../test_update_checkpoint_pause.py           | 82 +++++++++++++++++++
+ 4 files changed, 210 insertions(+), 15 deletions(-)
+
+diff --git a/gateway/update_checkpoint.py b/gateway/update_checkpoint.py
+index 578377ecad..30ecc59917 100644
+--- a/gateway/update_checkpoint.py
++++ b/gateway/update_checkpoint.py
+@@ -67,43 +67,91 @@ def checkpoint_inventory():
+             "reservation_ids": sorted(known_cron_reservations())}
+ 
+ 
++def _unpreservable_work(runner, managed: int, cron: int) -> str:
++    """Name the work a checkpoint cannot carry, by kind (and session for chat turns), for the refusal
++    reason the updater prints. Best effort: the count check itself already decided."""
++    parts = []
++    with_keys = getattr(runner, "_running_agents", None)
++    probes = (("chat turn", getattr(runner, "_running_agent_count", None)),
++              ("API-server run", getattr(runner, "_active_api_run_count", None)),
++              ("deferred agent worker", getattr(runner, "_active_deferred_agent_worker_count", None)))
++    for label, probe in probes:
++        try:
++            value = probe() if callable(probe) else 0
++            count = value if isinstance(value, int) else 0
++        except Exception:  # health: allow BLE001 -- a diagnostic read never changes the verdict
++            count = 0
++        if count <= 0:
++            continue
++        text = f"{count} {label}{'s' if count != 1 else ''}"
++        if label == "chat turn" and isinstance(with_keys, dict) and with_keys:
++            text += " (" + ", ".join(sorted(str(k) for k in with_keys)[:4]) + ")"
++        parts.append(text)
++    try:
++        total = int(runner._active_work_count())
++    except Exception:  # health: allow BLE001 -- see above
++        total = -1
++    summary = "; ".join(parts) or "work the gateway cannot classify"
++    return (f"unpreservable work: {summary} (active={total}, preservable managed={managed}, cron={cron}); "
++            "retry once it finishes")
++
++
+ def checkpoint_for_update(runner, loop, params):
+     home = get_hermes_home()
+     root = get_default_hermes_root(home=home)
+-    refused = {"pausing": False, "already_stopping": False, "busy": True, "pid": os.getpid()}
++    pid = os.getpid()
++
++    def refused(reason: str) -> dict:
++        # ``reason`` names the refusing check: the updater prints it instead of a generic "busy".
++        return {"pausing": False, "already_stopping": False, "busy": True, "pid": pid, "reason": reason}
++
+     intent = checkpoint_intent(home)
+     intent_path = Path(home) / "core-update/intent"
+-    if intent is None or params.get("nonce") != intent["nonce"]:
+-        return refused
++    if intent is None:
++        return refused("no live instant-update intent (missing, expired, owner gone or admission not held)")
++    if params.get("nonce") != intent["nonce"]:
++        return refused("the request's nonce is not the live update intent's")
+     # No admission lock is held while reading cron's lock (cron uses the reverse order).
+     try:
+         known = known_cron_reservations() if intent.get("cron_cut") is True else set()
+-    except (OSError, TimeoutError):
+-        return refused
++    except (OSError, TimeoutError) as exc:
++        return refused(f"cron reservation inventory unreadable ({exc or type(exc).__name__})")
+     done = threading.Event()
+     result = []
++    why = [f"the gateway event loop did not answer within {_REQUEST_WAIT_S:.0f}s"]
+     deadline = time.monotonic() + _REQUEST_WAIT_S
+     gate = threading.Lock()
+     cancelled = False
+     claimed = False
+     pending = {"pausing": False, "already_stopping": True, "checkpoint": True,
+-               "nonce": intent["nonce"], "pid": os.getpid(), "drain_timeout": CHECKPOINT_DRAIN_S}
++               "nonce": intent["nonce"], "pid": pid, "drain_timeout": CHECKPOINT_DRAIN_S}
+ 
+     def request():
+         nonlocal claimed
+         try:
+-            if time.monotonic() >= deadline or checkpoint_intent(home) != intent:
++            if time.monotonic() >= deadline:
++                return
++            if checkpoint_intent(home) != intent:
++                why[0] = "the update intent changed before the gateway loop took the request"
+                 return
+             # No waiting on the event loop. A lock race or an unpublished reservation retries.
+             state = admission_fence.state(root, details=True, timeout=0)
+-            if not state["held"] or not set(state["reservation_ids"]).issubset(known):
++            if not state["held"]:
++                why[0] = "update admission is not held"
++                return
++            if unknown := sorted(set(state["reservation_ids"]) - known):
++                why[0] = f"{len(unknown)} admission reservation(s) not published by a cut cron run"
+                 return
+             from gateway.run_active_work_verb import _delegation_units
+             # A cut cron run includes its agent turn on this owner (``cron_turn_count``).
+             cron = (runner._active_cron_job_count() + cron_turn_count(runner)
+                     if intent.get("cron_cut") is True else 0)
+-            if (_delegation_units(time.time())
+-                    or runner._active_work_count() != kanban_managed_count(runner) + cron):
++            if delegations := _delegation_units(time.time()):
++                why[0] = f"{len(delegations)} live async delegation(s) the checkpoint cannot preserve"
++                return
++            managed = kanban_managed_count(runner)
++            if runner._active_work_count() != managed + cron:
++                why[0] = _unpreservable_work(runner, managed, cron)
+                 return
+             preserve_cron_slots(runner.config)
+             # Atomically claim permission versus the handler's timeout. Never hold
+@@ -115,8 +163,9 @@ def checkpoint_for_update(runner, loop, params):
+             # The admitted path, not a fresh lookup: a withdrawal during preserve must still cancel.
+             accepted = runner.request_restart(detached=False, via_service=True, update_intent=intent_path)
+             result.append({"pausing": bool(accepted), "already_stopping": not accepted,
+-                           "checkpoint": True, "nonce": intent["nonce"], "pid": os.getpid(), "drain_timeout": CHECKPOINT_DRAIN_S})
+-        except (OSError, TimeoutError, ValueError, TypeError, KeyError):
++                           "checkpoint": True, "nonce": intent["nonce"], "pid": pid, "drain_timeout": CHECKPOINT_DRAIN_S})
++        except (OSError, TimeoutError, ValueError, TypeError, KeyError) as exc:
++            why[0] = f"checkpoint check failed ({type(exc).__name__}: {exc})"
+             return
+         finally:
+             done.set()
+@@ -127,4 +176,4 @@ def checkpoint_for_update(runner, loop, params):
+         cancelled = True
+         # Claimed-but-incomplete is unknown, not refusal: the updater must settle
+         # the recorded identity, never assume an ACK authorizes tree mutation.
+-        return result[0] if result else (pending if claimed else refused)
++        return result[0] if result else (pending if claimed else refused(why[0]))
+diff --git a/hermes_cli/update_cmd_posix_pause.py b/hermes_cli/update_cmd_posix_pause.py
+index 0a4b27e0af..1aaf5e486c 100644
+--- a/hermes_cli/update_cmd_posix_pause.py
++++ b/hermes_cli/update_cmd_posix_pause.py
+@@ -300,6 +300,22 @@ def _respawning_service(pid: int) -> str | None:
+     return None
+ 
+ 
++def home_served_by_other(pid: int, home) -> int | None:
++    """The verified gateway PID serving *home* when it is not *pid*, else None.
++
++    A ``gateway run`` that is not its home's canonical gateway (PID file + runtime lock, then the
++    runtime status record) cannot serve it: a duplicate start exits once it finds the home served.
++    The process scan still sees it for that moment; pausing it as a second gateway made the update
++    drain the real one, then refuse on the duplicate and restart the real one on the old code
++    (hermes-hub 2026-11-12 12:29, 13:15, 13:55Z). Unprovable identity returns None (kept, as before)."""
++    from gateway.status import live_gateway_pid_for_home
++    try:
++        served = live_gateway_pid_for_home(Path(home))
++    except Exception:  # health: allow BLE001 -- unreadable identity proves nothing either way
++        return None
++    return int(served) if served and int(served) != int(pid) else None
++
++
+ def _discover_bare(service_pids: set[int]) -> tuple[list[dict], list[str]]:
+     """``(bare gateways, notices)``: this install's ``gateway run`` processes outside any unit."""
+     if _stop_busy_opted_in():
+@@ -316,6 +332,10 @@ def _discover_bare(service_pids: set[int]) -> tuple[list[dict], list[str]]:
+         pid = int(pid)
+         marker = _supervisor_markers(pid)
+         argv, home = _capture_gateway_argv(pid), gateway_pid_home(pid)
++        if home and not marker and (served := home_served_by_other(pid, home)) is not None:
++            notices.append(f"  ↷ gateway PID {pid} is not the gateway of {home} (PID {served} serves it; "
++                           "a duplicate start exits on its own): not paused")
++            continue
+         if marker or not argv or not home:
+             why = f"supervised by {marker}" if marker else "its command line could not be read" if not argv \
+                 else "its Hermes home could not be proved"
+@@ -554,6 +574,7 @@ def _ask_to_drain(entry: dict) -> bool | None:
+         return False  # no request was sent
+     entry.pop("checkpoint_drain_timeout", None)
+     entry.pop("checkpoint_settle_timeout", None)
++    entry.pop("refusal_reason", None)
+     nonce = _checkpoint_nonce(entry)
+     try:
+         if nonce is not None:
+@@ -571,14 +592,21 @@ def _ask_to_drain(entry: dict) -> bool | None:
+                 if ack.get("pausing"):
+                     entry["checkpoint_drain_timeout"] = float(ack["drain_timeout"])
+                 return True
++            elif ack and ack.get("busy"):
++                # The cause is printed with the refusal (core's ``checkpoint_for_update`` reason).
++                entry["refusal_reason"] = ("gateway refused the update checkpoint: "
++                                           + str(ack.get("reason") or "no reason given (older gateway)"))
+         else:
+             ack = pause_gateway_for_update(Path(entry["home"]), idle_only=True)
+-    except Exception:  # health: allow BLE001 -- unknown/busy gateways must not authorize a tree mutation
++    except Exception as exc:  # health: allow BLE001 -- unknown/busy gateways must not authorize a tree mutation
++        entry["refusal_reason"] = f"did not answer the pause request ({type(exc).__name__}: {exc})"
+         return None
+     if ack and (ack.get("pausing") or ack.get("already_stopping")):
+         return True
+     if ack and ack.get("unsupported"):
+         entry["pause_unsupported"] = True
++    if not ack:
++        entry.setdefault("refusal_reason", "gave no answer on its control socket")
+     return False if ack and (ack.get("busy") or ack.get("unsupported")) else None
+ 
+ 
+@@ -793,8 +821,13 @@ def _stop_gateways(token: dict, entries: list[dict], deadline: float | None = No
+         else:
+             if acknowledged is False:
+                 pause_record.mark_stop_refused(token, entry["pid"])
++            # "busy or cannot acknowledge an idle pause" is the token hermes-sync matches to retry (keep it);
++            # the bracketed cause names the refusing check.
++            cause = entry.get("refusal_reason")
+             reason = ("does not support idle pause; restart that gateway on the installed code when idle"
+-                      if entry.get("pause_unsupported") else "is busy or cannot acknowledge an idle pause; retry when idle")
++                      if entry.get("pause_unsupported") else
++                      "is busy or cannot acknowledge an idle pause" + (f" [cause: {cause}]" if cause else "")
++                      + "; retry when idle")
+             refusals.append(f"{_names([entry])} {reason}")
+             refused.append(_names([entry]))
+             if acknowledged is None:
+diff --git a/tests/gateway/test_update_checkpoint.py b/tests/gateway/test_update_checkpoint.py
+index 1d02ff418e..983fa08383 100644
+--- a/tests/gateway/test_update_checkpoint.py
++++ b/tests/gateway/test_update_checkpoint.py
+@@ -217,3 +217,34 @@ def test_withdrawal_after_admission_cancels_real_restart_without_stop(checkpoint
+     asyncio.run(scenario())
+     runner.stop.assert_not_awaited()
+     assert runner._restart_requested is False and runner._draining is False
++
++
++@pytest.mark.parametrize("change, cause", [
++    ("no-hold", "no live instant-update intent"),
++    ("nonce", "nonce is not the live update intent's"),
++])
++def test_invalid_episode_refusal_names_its_check(checkpoint, change, cause):
++    module, home, runner, _intent = checkpoint
++    if change == "no-hold":
++        admission_fence.clear_hold(home)
++    result = invoke(module, runner, nonce="wrong" if change == "nonce" else "episode-one")
++    assert result["busy"] and cause in result["reason"]
++
++
++def test_unknown_work_refusal_names_the_kinds_and_chat_sessions(checkpoint):
++    module, _home, runner, _intent = checkpoint
++    runner._active_work_count = lambda: 3
++    runner._running_agent_count = lambda: 1
++    runner._running_agents = {"agent:main:local:dm:local-7829": object()}
++    runner._active_api_run_count = lambda: 1
++    result = invoke(module, runner)
++    assert not result["pausing"]
++    assert result["reason"].startswith("unpreservable work: 1 chat turn (agent:main:local:dm:local-7829); "
++                                       "1 API-server run (active=3, preservable managed=1, cron=0)")
++
++
++def test_live_delegation_refusal_says_so(checkpoint, monkeypatch):
++    module, _home, runner, _intent = checkpoint
++    monkeypatch.setattr("gateway.run_active_work_verb._delegation_units", lambda now: [{"id": "d1"}])
++    result = invoke(module, runner)
++    assert "1 live async delegation(s)" in result["reason"]
+diff --git a/tests/hermes_cli/test_update_checkpoint_pause.py b/tests/hermes_cli/test_update_checkpoint_pause.py
+index c6cb928e52..f1836e23f0 100644
+--- a/tests/hermes_cli/test_update_checkpoint_pause.py
++++ b/tests/hermes_cli/test_update_checkpoint_pause.py
+@@ -265,3 +265,85 @@ def test_lost_checkpoint_ack_settles_seventy_seconds_without_authorizing_mutatio
+         assert 70 <= now[0] < 71
+         disarm.assert_not_called()
+ 
++
++
++# ---- a refusal names its cause (hermes-hub 2026-11-12 13:53-13:56Z) ---------------------
++
++def test_a_gateway_chat_turn_refusal_names_the_turn_through_the_real_socket(episode):
++    """The hub's three refusals said only "busy or cannot acknowledge an idle pause": the gateway refused
++    the checkpoint for a gateway-hosted chat turn (lane ``boundary-opus-review``, a ``oneshot``) and the
++    updater threw the reason away. The real handler on a real socket must say which unit and session."""
++    write_intent(episode.home)
++    hold(episode)
++    episode.runner.active = 2  # one managed card + one gateway chat turn
++    episode.runner._running_agent_count = lambda: 1
++    episode.runner._running_agents = {"agent:main:local:dm:local-be7f": object()}
++    result, entry, idle = ask(episode)
++    assert result is False and idle == []
++    episode.runner.request_restart.assert_not_called()
++    assert entry["refusal_reason"].startswith("gateway refused the update checkpoint: unpreservable work: ")
++    assert "1 chat turn (agent:main:local:dm:local-be7f)" in entry["refusal_reason"]
++
++
++@pytest.mark.parametrize("change, cause", [
++    ("nonce", "nonce is not the live update intent's"),
++    ("reservation", "admission reservation(s) not published by a cut cron run"),
++])
++def test_every_refusing_check_names_itself(episode, monkeypatch, change, cause):
++    write_intent(episode.home)
++    hold(episode)
++    if change == "nonce":
++        monkeypatch.setattr(pause, "_checkpoint_nonce", lambda entry: "other-episode")
++    else:
++        reservation(episode, cron=False)
++    result, entry, _ = ask(episode)
++    assert result is False and cause in entry["refusal_reason"]
++
++
++def test_the_refusal_message_keeps_the_retry_token_and_adds_the_cause(monkeypatch):
++    """hermes-sync retries only output containing "busy or cannot acknowledge an idle pause"; the cause
++    rides along in brackets so the sync log names it."""
++    monkeypatch.setattr(record, "mark_stop_sent", lambda *a: None)
++    monkeypatch.setattr(record, "mark_stop_refused", lambda *a: None)
++    def refuse(e):
++        e["refusal_reason"] = "gateway refused the update checkpoint: unpreservable work: 1 chat turn (s1)"
++        return False
++    monkeypatch.setattr(pause, "_ask_to_drain", refuse)
++    with pytest.raises(pause.PauseRefused) as raised:
++        pause._stop_gateways({}, [entry()])
++    text = str(raised.value)
++    assert "busy or cannot acknowledge an idle pause [cause: gateway refused the update checkpoint: " \
++           "unpreservable work: 1 chat turn (s1)]; retry when idle" in text
++
++
++# ---- a duplicate `gateway run` is not a second gateway (12:29, 13:15, 13:55Z) -------------
++
++def _bare_scan(monkeypatch, *, served, pids=(5555,)):
++    from gateway import status
++    from hermes_cli import gateway as gw, update_cmd_fleet, update_fleet_scope
++    monkeypatch.setattr(pause, "_stop_busy_opted_in", lambda: False)
++    monkeypatch.setattr(pause, "_supervisor_markers", lambda pid: None)
++    monkeypatch.setattr(gw, "_get_service_pids", lambda **k: [4242])
++    monkeypatch.setattr(gw, "find_gateway_pids", lambda **k: list(pids))
++    monkeypatch.setattr(gw, "_capture_gateway_argv", lambda pid: ["hermes", "gateway", "run"])
++    monkeypatch.setattr(update_cmd_fleet, "_scoped_manual_gateway_pids", lambda found: list(found))
++    monkeypatch.setattr(update_fleet_scope, "gateway_pid_home", lambda pid: Path("/h/.hermes"))
++    monkeypatch.setattr(status, "live_gateway_pid_for_home", lambda home: served)
++    monkeypatch.setattr(status, "get_process_start_time", lambda pid: 1.0)
++    return pause._discover_bare({4242})
++
++
++def test_a_gateway_run_that_is_not_its_homes_gateway_is_not_paused(monkeypatch):
++    """The hub update asked the real gateway (unit, PID 322771) to checkpoint, then asked a transient
++    `gateway run` PID 487116 for the same home, which refused; the rollback restarted the drained real
++    gateway on the old code. A PID that is not its home's verified gateway is not inventoried."""
++    bare, notices = _bare_scan(monkeypatch, served=4242)
++    assert bare == []
++    assert notices == ["  ↷ gateway PID 5555 is not the gateway of /h/.hermes (PID 4242 serves it; "
++                       "a duplicate start exits on its own): not paused"]
++
++
++@pytest.mark.parametrize("served", [5555, None])
++def test_a_bare_gateway_that_serves_its_home_or_is_unprovable_is_still_paused(monkeypatch, served):
++    bare, notices = _bare_scan(monkeypatch, served=served)
++    assert [b["pid"] for b in bare] == [5555] and notices == []
+-- 
+2.43.0
+

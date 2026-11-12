@@ -1,0 +1,227 @@
+From 99148d3cd6e6c32c37e12fe3d25149c5f4dee5ec Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:25:17 +0000
+Subject: [PATCH] [daveey] fix(kanban): expire supervisor requests pending >
+ DEADLINE_S at accept
+
+A supervisor request had no age cap: with no executor online it stayed
+pending and ran whenever one finally appeared, possibly days later. Since
+#1502 a done requester's request is no longer voided, so that late run
+became reachable for requesters that finished long ago.
+
+The executor now rejects, at accept, any request that no executor
+accepted within DEADLINE_S (24 h, the same cap kanban_operator_call puts
+on a forwarded call at its home gateway). The rejection is the ordinary
+receipt: supervisor_request_rejected event, a comment, and a wake for a
+parked requester, error "expired: pending > DEADLINE_S (24 h) ...", every
+op reported not_applied. No op runs and no target is touched.
+
+- Only never-accepted rows expire (attempts == 0). A request an executor
+  took and lost (attempts >= 1) is still finished by redelivery and the
+  MAX_ATTEMPTS breaker, as before.
+- _expire takes the row by compare-and-swap on (attempts 0, active
+  status, the holder it was scanned with); attempts stays 0, so an
+  expirer that crashes before its receipt is expired again next drain.
+- A fresh request from a done requester still runs (#1502); an archived
+  requester still voids its requests at execution.
+
+Proof:
+- RED on main: test_a_request_pending_past_the_deadline_is_rejected_as_
+  expired_at_accept fails (drain returned [(1, 'done')]); 27 others pass.
+- GREEN: test_kanban_supervisor_requests.py + test_kanban_operator_call.py
+  59 passed, 0 failed (hermes-core-wt test).
+- On #1502's head d1928d6559 with this diff applied (applies cleanly):
+  the three #1502 test files pass 88/0, including
+  test_unlink_applies_after_requester_completes.
+- Mutants (sdlc-review mutants.py, 8/8 killed): attempts==0 dropped, expiry
+  never fires, age comparison flipped, CAS attempts/status/holder each
+  dropped, rejection not reported in processed, per-op results dropped.
+---
+ hermes_cli/kanban_supervisor_requests.py      | 42 ++++++++--
+ .../test_kanban_supervisor_requests.py        | 80 +++++++++++++++++++
+ 2 files changed, 116 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_supervisor_requests.py b/hermes_cli/kanban_supervisor_requests.py
+index c7871e5d24..8db39e1821 100644
+--- a/hermes_cli/kanban_supervisor_requests.py
++++ b/hermes_cli/kanban_supervisor_requests.py
+@@ -21,7 +21,8 @@ This module is the narrow contract between the two:
+   ``kanban_link`` / ``kanban_unlink`` tool handlers, and records a correlated result.
+   A crash after acceptance leaves the row ``accepted``; the lease expiring (or the
+   executor pid being gone on this host) puts it back up for redelivery, and ops are
+-  idempotent (an edge already present/absent counts as applied).
++  idempotent (an edge already present/absent counts as applied). A request no executor accepted
++  within ``DEADLINE_S`` (24 h) is rejected at accept as ``expired``, never run late.
+ * **reconcile_notify** ops (``kanban_notify_reconcile_exec``) retire a wrong-local refused-send tui
+   subscription. Their execution waits on the owner gateway's own receipt read (phase
+   ``awaiting_owner``), which ``drain`` polls without spending delivery attempts.
+@@ -46,7 +47,7 @@ import os
+ import socket
+ import sqlite3
+ import time
+-from typing import Any, Callable, Optional
++from typing import Any, Callable, Optional, cast
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -54,6 +55,9 @@ MAX_OPS = 20
+ MAX_ATTEMPTS = 5
+ LEASE_SECONDS = 120
+ EXECUTOR_FRESH_SECONDS = 300
++# A request no executor accepted within this long is rejected as expired at accept, not run late (the same
++# 24 h cap kanban_operator_call.DEADLINE_S puts on a forwarded call at its home gateway).
++DEADLINE_S = 24 * 3600
+ OPS = ("link", "unlink", "reconcile_notify", "resume", "retry_limit", "archive")  # link: preview only (dry_run); a request carries unlink ops
+ # reconcile_notify: retire a wrong-local refused-send tui subscription on owner-read receipts
+ # (hermes_cli/kanban_notify_reconcile_exec.py). A request carries only those, or only edge ops.
+@@ -497,14 +501,19 @@ def _apply_op(op: dict, board: Optional[str]) -> dict:
+ 
+ 
+ def _accept_next(conn: sqlite3.Connection, executor: str, now: int,
+-                 abandoned: list) -> Optional[dict]:
++                 abandoned: list, expired: list) -> Optional[dict]:
+     from hermes_cli import kanban_db as kb
+ 
+     with kb.write_txn(conn):
+         for r in conn.execute(
+-                "SELECT id, status, executor, lease_expires, result_json FROM supervisor_requests "
+-                "WHERE status IN ('pending','accepted') ORDER BY id ASC").fetchall():
++                "SELECT id, status, executor, lease_expires, result_json, created_at, attempts "
++                "FROM supervisor_requests WHERE status IN ('pending','accepted') ORDER BY id ASC").fetchall():
+             rid, status, holder, lease = int(r[0]), r[1], r[2], r[3]
++            # Never accepted (attempts 0: pending, or an _expire that crashed before its receipt) in time:
++            # rejected by the caller (_expire), never run late.
++            if int(r[6]) == 0 and now - int(r[5]) > DEADLINE_S:
++                expired.append((rid, holder))
++                continue
+             if status == "accepted" and _awaiting_owner(r[4]):
+                 continue  # waiting on another gateway: polled (kanban_notify_reconcile_exec.poll), no attempt spent
+             if status == "accepted" and lease and int(lease) > now and not _executor_dead(holder):
+@@ -675,7 +684,11 @@ def drain(conn: sqlite3.Connection, *, board: Optional[str] = None, role: str =
+     _rewake_late_parkers(conn)
+     for _ in range(max(0, int(limit))):
+         abandoned: list = []
+-        req = _accept_next(conn, executor, now, abandoned)
++        expired: list = []
++        req = _accept_next(conn, executor, now, abandoned, expired)
++        for rid, holder in expired:
++            if _expire(conn, rid, holder, executor):
++                processed.append((rid, "rejected"))
+         for rid, holder in abandoned:
+             if _abandon(conn, rid, holder, executor):
+                 processed.append((rid, "failed"))
+@@ -714,6 +727,23 @@ def _abandon(conn: sqlite3.Connection, rid: int, holder: Optional[str], executor
+                    error=f"abandoned after {MAX_ATTEMPTS} deliveries whose executor never finished")
+ 
+ 
++def _expire(conn: sqlite3.Connection, rid: int, holder: Optional[str], executor: str) -> bool:
++    """Reject a request no executor accepted within ``DEADLINE_S`` without running any op. Takes it only from
++    the holder it was found with (compare-and-swap; attempts stays 0, so a crash here is expired again next
++    drain). The requester gets the usual rejection receipt."""
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(conn):
++        cur = conn.execute(
++            "UPDATE supervisor_requests SET status='accepted', executor=? WHERE id=? AND attempts=0 AND "
++            "status IN ('pending','accepted') AND COALESCE(executor,'')=?", (executor, rid, holder or ""))
++        if cur.rowcount != 1:
++            return False
++    req = cast(dict, get_request(conn, rid))  # the row the CAS above just took
++    detail = f"expired: pending > DEADLINE_S ({DEADLINE_S // 3600} h) with no executor accepting it"
++    results = [{**op, "outcome": "not_applied", "detail": "expired"} for op in req["ops"] or []]
++    return _finish(conn, req, executor, "rejected", results=results, error=detail)
++
++
+ _skip_logged = False
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_supervisor_requests.py b/tests/hermes_cli/test_kanban_supervisor_requests.py
+index 4d9fc91077..86c3f08666 100644
+--- a/tests/hermes_cli/test_kanban_supervisor_requests.py
++++ b/tests/hermes_cli/test_kanban_supervisor_requests.py
+@@ -504,3 +504,83 @@ def test_a_batch_with_any_link_op_is_refused_up_front(board):
+     assert out["code"] == "link_not_requested", out
+     with kbc.connect() as conn:
+         assert ksr.list_requests(conn) == []
++
++
++def _age(conn, rid, seconds):
++    with kb.write_txn(conn):
++        conn.execute("UPDATE supervisor_requests SET created_at = ? WHERE id = ?", (int(time.time()) - seconds, rid))
++
++
++def test_a_request_pending_past_the_deadline_is_rejected_as_expired_at_accept(board, monkeypatch):
++    """No executor for over a day: the request is not run late; the requester gets a rejection receipt."""
++    from tools import kanban_tools as kt
++    out = _tool({"ops": _reorder(board)})
++    assert _park(kt, out["request_id"])["ok"]
++    _as_executor(monkeypatch)
++    with kbc.connect() as conn:
++        _age(conn, out["request_id"], 24 * 3600 + 60)
++        assert ksr.drain(conn)["processed"] == [(out["request_id"], "rejected")]
++        assert (board["qa119"], board["dev116"]) in _edges(conn)  # target not mutated
++        assert (board["dev67"], board["dev81"]) in _edges(conn)
++        req = ksr.get_request(conn, out["request_id"])
++        assert req["status"] == "rejected" and req["error"].startswith("expired: pending > ")
++        assert [r["outcome"] for r in req["result"]] == ["not_applied"] * 2
++        kinds = [k for k, _ in _events(conn, board["requester"])]
++        assert kinds == ["supervisor_request_queued", "supervisor_request_rejected", "supervisor_request_wake"]
++        comments = [c for c in kb.list_comments(conn, board["requester"]) if c.author == ksr.COMMENT_AUTHOR]
++        assert len(comments) == 1 and "expired" in comments[0].body
++        assert ksr.drain(conn)["processed"] == []  # settled, not retried
++        assert ksr._expire(conn, out["request_id"], req["executor"], "me:1:x") is False  # terminal: not re-taken
++
++
++def test_a_request_pending_just_under_the_deadline_still_runs(board, monkeypatch):
++    out = _tool({"ops": _reorder(board)})
++    _as_executor(monkeypatch)
++    with kbc.connect() as conn:
++        _age(conn, out["request_id"], 24 * 3600 - 600)
++        assert ksr.drain(conn)["processed"] == [(out["request_id"], "done")]
++        assert (board["qa119"], board["dev116"]) not in _edges(conn)
++
++
++def test_an_old_accepted_request_is_redelivered_not_expired(board, monkeypatch):
++    """Only a never-accepted request expires: one an executor took (and then lost) is finished by redelivery."""
++    out = _tool({"ops": _reorder(board)})
++    _as_executor(monkeypatch)
++    with kbc.connect() as conn:
++        _age(conn, out["request_id"], 3 * 24 * 3600)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE supervisor_requests SET status='accepted', executor='otherhost:1:x', "
++                         "lease_expires=1, attempts=1 WHERE id=?", (out["request_id"],))
++        assert ksr.drain(conn)["processed"] == [(out["request_id"], "done")]
++
++
++def test_an_expiry_that_crashed_before_its_receipt_is_expired_again(board, monkeypatch):
++    """_expire takes the row (accepted, attempts still 0) then dies: the next drain expires it, never runs it."""
++    out = _tool({"ops": _reorder(board)})
++    _as_executor(monkeypatch)
++    with kbc.connect() as conn:
++        _age(conn, out["request_id"], 2 * 24 * 3600)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE supervisor_requests SET status='accepted', executor='otherhost:1:x' "
++                         "WHERE id=?", (out["request_id"],))
++        assert ksr.drain(conn)["processed"] == [(out["request_id"], "rejected")]
++        assert (board["qa119"], board["dev116"]) in _edges(conn)
++        assert ksr.get_request(conn, out["request_id"])["error"].startswith("expired: ")
++
++
++def test_expiry_loses_the_row_to_a_peer_that_took_it_first(board, monkeypatch):
++    """_expire's compare-and-swap: a holder change or an acceptance since the scan keeps the row untouched."""
++    out = _tool({"ops": _reorder(board)})
++    rid = out["request_id"]
++    _as_executor(monkeypatch)
++    with kbc.connect() as conn:
++        _age(conn, rid, 2 * 24 * 3600)
++        with kb.write_txn(conn):  # another expirer took it after our scan (attempts still 0)
++            conn.execute("UPDATE supervisor_requests SET status='accepted', executor='peer:1:x' WHERE id=?", (rid,))
++        assert ksr._expire(conn, rid, None, "me:1:x") is False
++        with kb.write_txn(conn):  # a peer accepted it to run (attempts 1), seen by us as unheld
++            conn.execute("UPDATE supervisor_requests SET status='pending', executor=NULL, attempts=1 "
++                         "WHERE id=?", (rid,))
++        assert ksr._expire(conn, rid, None, "me:1:x") is False
++        req = ksr.get_request(conn, rid)
++        assert req["status"] == "pending" and req["error"] is None
+-- 
+2.43.0
+

@@ -1,0 +1,362 @@
+From 743751ecb2dc6b5773d54cb6dfaa5963d1686799 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:45:21 +0000
+Subject: [PATCH] [daveey] fix(agent): a deleted process cwd no longer crashes
+ compaction's system-prompt rebuild
+
+build_context_files_prompt (and list_context_file_sources) fell back to a bare os.getcwd()
+when no cwd was configured. A Kanban worker whose workspace dir was removed and recreated
+mid-run keeps a cwd on a deleted inode, so the compaction boundary's prompt rebuild raised
+FileNotFoundError and killed the worker.
+
+Add runtime_cwd.process_cwd_or_fallback(): the process cwd, else the first existing of the
+scope's TERMINAL_CWD, HERMES_KANBAN_WORKSPACE, $HOME, with one warning per process. Route
+resolve_agent_cwd and every other agent/ os.getcwd() (coding_context, subdirectory_hints,
+tool_executor checkpoint, codex app-server session, lsp cli, trace_upload) through it, and
+extend the bare-getcwd guard test from tools/ to all of agent/.
+---
+ agent/coding_context.py                      |   3 +-
+ agent/context_file_sources.py                |   6 +-
+ agent/lsp/cli.py                             |   3 +-
+ agent/prompt_builder.py                      |   6 +-
+ agent/runtime_cwd.py                         |  30 ++++-
+ agent/subdirectory_hints.py                  |   5 +-
+ agent/tool_executor.py                       |   4 +-
+ agent/trace_upload.py                        |   5 +-
+ agent/transports/codex_app_server_session.py |   5 +-
+ tests/agent/test_deleted_cwd_prompt.py       | 117 +++++++++++++++++++
+ tests/tools/test_deleted_process_cwd.py      |  12 +-
+ 11 files changed, 179 insertions(+), 17 deletions(-)
+ create mode 100644 tests/agent/test_deleted_cwd_prompt.py
+
+diff --git a/agent/coding_context.py b/agent/coding_context.py
+index 84e382f071..952a479ca5 100644
+--- a/agent/coding_context.py
++++ b/agent/coding_context.py
+@@ -202,7 +202,8 @@ def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
+         from agent.runtime_cwd import resolve_agent_cwd
+         return resolve_agent_cwd()
+     except Exception:
+-        return Path(os.getcwd())
++        from agent.runtime_cwd import process_cwd_or_fallback
++        return Path(process_cwd_or_fallback())
+ 
+ 
+ def _git_root(cwd: Path) -> Optional[Path]:
+diff --git a/agent/context_file_sources.py b/agent/context_file_sources.py
+index 53af56fe23..3c12ebe73d 100644
+--- a/agent/context_file_sources.py
++++ b/agent/context_file_sources.py
+@@ -72,7 +72,11 @@ def list_context_file_sources(
+     duplicate / missing. Global files (``agent.global_context_files``) come first, labelled ``<path> (global)``;
+     ``include_project=False`` lists only them (``build_global_context_prompt``: cron without a workdir).
+     """
+-    cwd_path = Path(cwd if cwd is not None else os.getcwd()).resolve()
++    if cwd is None:
++        from agent.runtime_cwd import process_cwd_or_fallback
++        cwd_path = Path(process_cwd_or_fallback()).resolve()
++    else:
++        cwd_path = Path(cwd).resolve()
+     max_chars = _pb._get_context_file_max_chars(context_length)
+     suppressed = _pb._project_context_suppressed(cwd, cwd_path, allow_install_tree_fallback)
+     sources: list[dict[str, Any]] = []
+diff --git a/agent/lsp/cli.py b/agent/lsp/cli.py
+index 2d1e805e9f..23066c2622 100644
+--- a/agent/lsp/cli.py
++++ b/agent/lsp/cli.py
+@@ -73,7 +73,8 @@ def _status_for(server_id: str) -> str:
+     from agent.lsp.servers import SERVERS, ServerContext
+     custom = next((s for s in _all_servers() if s.server_id == server_id and s not in SERVERS), None)
+     if custom is not None:  # no install recipe: installed iff the configured command resolves
+-        cwd = os.getcwd()
++        from agent.runtime_cwd import process_cwd_or_fallback
++        cwd = process_cwd_or_fallback()
+         return "installed" if custom.build_spawn(cwd, ServerContext(cwd, install_strategy="manual")) else "manual-only"
+     return detect_status(_recipe_pkg_for(server_id))
+ 
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index e17ec8c685..630b435784 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -1973,7 +1973,11 @@ def build_context_files_prompt(
+ 
+     if safe_worker_enabled():
+         return ""
+-    cwd_path = Path(cwd if cwd is not None else os.getcwd()).resolve()
++    if cwd is None:
++        from agent.runtime_cwd import process_cwd_or_fallback  # a deleted process cwd must not kill the turn
++        cwd_path = Path(process_cwd_or_fallback()).resolve()
++    else:
++        cwd_path = Path(cwd).resolve()
+     global_paths = global_context_file_paths(home_override)
+     if _project_context_suppressed(cwd, cwd_path, allow_install_tree_fallback):
+         logger.warning(
+diff --git a/agent/runtime_cwd.py b/agent/runtime_cwd.py
+index c541306ed5..cc50128d08 100644
+--- a/agent/runtime_cwd.py
++++ b/agent/runtime_cwd.py
+@@ -114,9 +114,35 @@ def process_cwd() -> str:
+         return ""
+ 
+ 
++_deleted_cwd_warned = False
++
++
++def process_cwd_or_fallback() -> str:
++    """The process cwd, or — when it is gone (a Kanban workspace removed and recreated mid-run leaves
++    the worker in a deleted inode) — the first existing of: the scope's TERMINAL_CWD, the Kanban
++    workspace (HERMES_KANBAN_WORKSPACE), $HOME. Logs one warning per process. The turn path (system
++    prompt rebuild at compaction, context-file discovery) reads through this so a deleted cwd
++    degrades the prompt instead of killing the turn."""
++    global _deleted_cwd_warned
++    cwd = process_cwd()
++    if cwd:
++        return cwd
++    label, chosen = "HOME", os.path.expanduser("~")
++    for name, raw in (("TERMINAL_CWD", scope_terminal_cwd()),
++                      ("HERMES_KANBAN_WORKSPACE", os.environ.get("HERMES_KANBAN_WORKSPACE", ""))):
++        path = os.path.expanduser(raw.strip()) if raw and raw.strip() else ""
++        if path and os.path.isdir(path):
++            label, chosen = name, path
++            break
++    if not _deleted_cwd_warned:
++        _deleted_cwd_warned = True
++        logger.warning("process working directory was deleted (or is unreadable); using %s=%s instead", label, chosen)
++    return chosen
++
++
+ def resolve_agent_cwd() -> Path:
+-    """Configured cwd, else the launch dir (os.getcwd()'s OSError on a deleted cwd deliberately propagates)."""
+-    return _resolve_configured_cwd(override_is_final=False) or Path(os.getcwd())
++    """Configured cwd, else the launch dir; a deleted launch dir falls back via ``process_cwd_or_fallback``."""
++    return _resolve_configured_cwd(override_is_final=False) or Path(process_cwd_or_fallback())
+ 
+ 
+ def resolve_context_cwd(*, include_session_override: bool = True) -> Path | None:
+diff --git a/agent/subdirectory_hints.py b/agent/subdirectory_hints.py
+index e45966ec29..951af798a4 100644
+--- a/agent/subdirectory_hints.py
++++ b/agent/subdirectory_hints.py
+@@ -145,7 +145,10 @@ class SubdirectoryHintTracker:
+         # AGENTS.md/CLAUDE.md injection at startup must not get the same files spliced into
+         # tool results later — cron jobs relaying exact stdout leaked them to chat (#9441).
+         self.enabled = enabled
+-        self.working_dir = Path(working_dir or os.getcwd()).resolve()
++        if not working_dir:
++            from agent.runtime_cwd import process_cwd_or_fallback
++            working_dir = process_cwd_or_fallback()
++        self.working_dir = Path(working_dir).resolve()
+         # $HOME is not a project (#76902): the packaged Desktop app with no default project
+         # dir configured resolves its cwd (and TERMINAL_CWD) to home, and the containment
+         # check is then vacuously true for the whole home subtree — every AGENTS.md /
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index f59b515db7..1fcf7416db 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -913,8 +913,8 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
+             if _is_destructive_command(command):
+                 from tools.file_tools_paths import container_backend_for_task
+                 if container_backend_for_task(effective_task_id or "default") is None:
+-                    from agent.runtime_cwd import scope_terminal_cwd
+-                    cwd = function_args.get("workdir") or scope_terminal_cwd() or os.getcwd()
++                    from agent.runtime_cwd import process_cwd_or_fallback, scope_terminal_cwd
++                    cwd = function_args.get("workdir") or scope_terminal_cwd() or process_cwd_or_fallback()
+                     agent._checkpoint_mgr.ensure_checkpoint(cwd, f"before terminal: {command[:60]}")
+ 
+ 
+diff --git a/agent/trace_upload.py b/agent/trace_upload.py
+index fbf51a5fdc..75ff835b23 100644
+--- a/agent/trace_upload.py
++++ b/agent/trace_upload.py
+@@ -149,6 +149,9 @@ def build_trace_jsonl(messages: list[dict[str, Any]], *, session_id: str, model:
+     parent: Optional[str] = None
+     base_ts = _now_iso()
+     git_branch = _git_branch(cwd)
++    if not cwd:
++        from agent.runtime_cwd import process_cwd
++        cwd = process_cwd()  # "" when the process cwd was deleted
+     for msg in messages:
+         role = msg.get("role")
+         if role == "system":
+@@ -156,7 +159,7 @@ def build_trace_jsonl(messages: list[dict[str, Any]], *, session_id: str, model:
+         turn_uuid = str(uuid.uuid4())
+         line_type, render = _ROLE_RENDERERS.get(role, ("user", _user_message))
+         entry = {  # key order is the wire order
+-            "parentUuid": parent, "isSidechain": False, "userType": "external", "cwd": cwd or os.getcwd(),
++            "parentUuid": parent, "isSidechain": False, "userType": "external", "cwd": cwd,
+             "sessionId": session_id, "version": _HERMES_VERSION, "gitBranch": git_branch, "uuid": turn_uuid,
+             "timestamp": base_ts, "type": line_type, "message": render(msg, model, redact),
+         }
+diff --git a/agent/transports/codex_app_server_session.py b/agent/transports/codex_app_server_session.py
+index 5c7c9f671d..5444dc3d28 100644
+--- a/agent/transports/codex_app_server_session.py
++++ b/agent/transports/codex_app_server_session.py
+@@ -219,7 +219,10 @@ class CodexAppServerSession:
+         developer_instructions: Optional[str] = None, resume_thread_id: Optional[str] = None,
+         history_seed: Optional[str] = None,
+     ) -> None:
+-        self._cwd = cwd or os.getcwd()
++        if not cwd:
++            from agent.runtime_cwd import process_cwd_or_fallback
++            cwd = process_cwd_or_fallback()
++        self._cwd = cwd
+         self._codex_bin = codex_bin
+         self._codex_home = codex_home
+         # A codex thread id persisted by an earlier process for this Hermes session: the first
+diff --git a/tests/agent/test_deleted_cwd_prompt.py b/tests/agent/test_deleted_cwd_prompt.py
+new file mode 100644
+index 0000000000..7ee74d4f75
+--- /dev/null
++++ b/tests/agent/test_deleted_cwd_prompt.py
+@@ -0,0 +1,117 @@
++"""A deleted process cwd must not crash system-prompt builds or the compaction rebuild.
++
++A Kanban worker whose workspace dir was removed and recreated mid-run keeps a process cwd
++pointing at a deleted inode; ``os.getcwd()`` then raises FileNotFoundError on every call. The
++compaction boundary rebuilds the system prompt, context-file discovery fell back to
++``os.getcwd()`` and the whole worker died. Discovery now falls back to the configured terminal
++cwd, then the Kanban workspace, then $HOME, with one warning.
++"""
++
++import logging
++import os
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++pytestmark = pytest.mark.platforms("linux", "macos")  # Windows cannot delete a process cwd
++
++
++@pytest.fixture
++def deleted_cwd(tmp_path, monkeypatch):
++    """chdir into a directory, then delete it; restore the original cwd afterwards."""
++    from agent import runtime_cwd
++    monkeypatch.setattr(runtime_cwd, "_deleted_cwd_warned", False, raising=False)
++    monkeypatch.delenv("TERMINAL_CWD", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_WORKSPACE", raising=False)
++    original = os.getcwd()
++    gone = tmp_path / "removed-workspace"
++    gone.mkdir()
++    os.chdir(gone)
++    gone.rmdir()
++    with pytest.raises(FileNotFoundError):
++        os.getcwd()
++    try:
++        yield gone
++    finally:
++        os.chdir(original)
++
++
++def _project(tmp_path, name, marker):
++    d = tmp_path / name
++    d.mkdir()
++    (d / "AGENTS.md").write_text(f"# rules\n{marker}\n")
++    return d
++
++
++def test_build_context_files_prompt_falls_back_to_kanban_workspace(deleted_cwd, tmp_path, monkeypatch, caplog):
++    from agent.prompt_builder import build_context_files_prompt
++
++    ws = _project(tmp_path, "ws", "KANBAN-WORKSPACE-RULES")
++    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(ws))
++    with caplog.at_level(logging.WARNING):
++        out = build_context_files_prompt(skip_soul=True)
++        build_context_files_prompt(skip_soul=True)
++    assert "KANBAN-WORKSPACE-RULES" in out
++    warnings = [r for r in caplog.records if "working directory was deleted" in r.getMessage()]
++    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
++
++
++def test_fallback_prefers_terminal_cwd_then_workspace_then_home(deleted_cwd, tmp_path, monkeypatch):
++    from agent.runtime_cwd import process_cwd_or_fallback
++
++    term = _project(tmp_path, "term", "T")
++    ws = _project(tmp_path, "ws", "W")
++    home = _project(tmp_path, "home", "H")
++    monkeypatch.setenv("HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(ws))
++    monkeypatch.setenv("TERMINAL_CWD", str(term))
++    assert process_cwd_or_fallback() == str(term)
++    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path / "also-gone"))
++    assert process_cwd_or_fallback() == str(ws)
++    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path / "gone-too"))
++    assert process_cwd_or_fallback() == str(home)
++
++
++def test_resolve_agent_cwd_survives_deleted_process_cwd(deleted_cwd, tmp_path, monkeypatch):
++    from agent.runtime_cwd import resolve_agent_cwd
++
++    ws = _project(tmp_path, "ws", "W")
++    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(ws))
++    assert resolve_agent_cwd() == ws
++
++
++def test_list_context_file_sources_survives_deleted_process_cwd(deleted_cwd, tmp_path, monkeypatch):
++    from agent.context_file_sources import list_context_file_sources
++
++    ws = _project(tmp_path, "ws", "W")
++    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(ws))
++    sources = list_context_file_sources(skip_soul=True)
++    assert any(s["path"] and str(ws) in str(s["path"]) and s["loaded"] for s in sources), sources
++
++
++def test_compaction_rebuild_boundary_survives_deleted_process_cwd(deleted_cwd, tmp_path, monkeypatch):
++    """The production crash path: compress_context -> _rebuild_system_prompt_at_boundary ->
++    build_system_prompt -> _context_files_part -> build_context_files_prompt(cwd=None)."""
++    from agent.conversation_compression import _rebuild_system_prompt_at_boundary
++    from agent.system_prompt import build_system_prompt, invalidate_system_prompt
++
++    ws = _project(tmp_path, "ws", "KANBAN-WORKSPACE-RULES")
++    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(ws))
++    agent = SimpleNamespace(
++        _cached_system_prompt="OLD PROMPT", _cached_system_prompt_static="OLD",
++        _memory_store=None, _memory_manager=None, provider="", model="gpt-4o", platform="kanban",
++        _memory_enabled=False, _user_profile_enabled=False, load_soul_identity=False,
++        skip_context_files=False, valid_tool_names={"terminal"}, _task_completion_guidance=False,
++        _parallel_tool_call_guidance=False, _tool_use_enforcement=False, _execution_guidance=False,
++        _environment_probe=False, _bot_mode_protocol=False, _kanban_worker_guidance="",
++        pass_session_id=False, session_id="s1", _emit_status=lambda *a, **k: None,
++    )
++    agent._invalidate_system_prompt = lambda: invalidate_system_prompt(agent)
++    agent._build_system_prompt = lambda system_message=None: build_system_prompt(agent, system_message)
++    with patch("agent.prompt_builder.load_soul_md", return_value=""), \
++         patch("agent.prompt_builder.build_environment_hints", return_value="ENV HINTS"), \
++         patch("agent.conversation_compression_tools.refresh_agent_tool_definitions", lambda _a: None):
++        rebuilt = _rebuild_system_prompt_at_boundary(agent, "")
++    assert "KANBAN-WORKSPACE-RULES" in rebuilt
++    assert agent._cached_system_prompt == rebuilt
+diff --git a/tests/tools/test_deleted_process_cwd.py b/tests/tools/test_deleted_process_cwd.py
+index 7da209e96d..7b67c9ca66 100644
+--- a/tests/tools/test_deleted_process_cwd.py
++++ b/tests/tools/test_deleted_process_cwd.py
+@@ -102,8 +102,6 @@ _REPO = Path(__file__).resolve().parents[2]
+ # Sites where a bare os.getcwd() is the deliberate primitive behind the safe helpers.
+ _ALLOWED = {
+     ("agent/runtime_cwd.py", "process_cwd"),
+-    # Documented upstream to propagate the OSError (prompt/context callers); not a tool path.
+-    ("agent/runtime_cwd.py", "resolve_agent_cwd"),
+ }
+ _CATCHES = {"OSError", "FileNotFoundError", "Exception", "BaseException", "EnvironmentError"}
+ 
+@@ -147,11 +145,13 @@ def _bare_getcwd_sites(path: Path):
+             yield node.lineno, enclosing_function(node)
+ 
+ 
+-def test_no_bare_os_getcwd_in_tools():
+-    """Every tools/ cwd consumer goes through agent.runtime_cwd.process_cwd() (or the terminal
+-    tool's _safe_getcwd built on it) or guards os.getcwd() with an OSError handler."""
++def test_no_bare_os_getcwd_in_tools_or_agent():
++    """Every tools/ and agent/ cwd consumer goes through agent.runtime_cwd.process_cwd() /
++    process_cwd_or_fallback() (or the terminal tool's _safe_getcwd built on it) or guards
++    os.getcwd() with an OSError handler. agent/ covers the turn path: the compaction rebuild of
++    the system prompt crashed a Kanban worker whose workspace had been removed and recreated."""
+     offenders = []
+-    for path in sorted([*(_REPO / "tools").rglob("*.py"), _REPO / "agent" / "runtime_cwd.py"]):
++    for path in sorted([*(_REPO / "tools").rglob("*.py"), *(_REPO / "agent").rglob("*.py")]):
+         rel = path.relative_to(_REPO).as_posix()
+         for lineno, func in _bare_getcwd_sites(path):
+             if (rel, func) not in _ALLOWED:
+-- 
+2.43.0
+

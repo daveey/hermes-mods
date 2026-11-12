@@ -1,0 +1,220 @@
+From 209cee82df60fc55955a9419c93f47547c379e56 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 23:45:43 +0000
+Subject: [PATCH] fix(kanban): preserve local custody and current specs during
+ recovery [daveey]
+
+---
+ hermes_cli/kanban_placement_recovery.py       | 27 +++++-
+ hermes_cli/kanban_worker_placement.py         | 20 ++--
+ .../hermes_cli/test_kanban_recovery_safety.py | 91 +++++++++++++++++++
+ 3 files changed, 125 insertions(+), 13 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_recovery_safety.py
+
+diff --git a/hermes_cli/kanban_placement_recovery.py b/hermes_cli/kanban_placement_recovery.py
+index e0541ca336..46ef5efeca 100644
+--- a/hermes_cli/kanban_placement_recovery.py
++++ b/hermes_cli/kanban_placement_recovery.py
+@@ -6,6 +6,22 @@ import math
+ import time
+ 
+ 
++def request_assignment(hub, board, row, mode, candidates):
++    """Keep recovery opt-in; ordinary reservations retain their existing wire contract."""
++    args = {"task_id": row["id"], "expected_revision": row["sync_version"], "candidates": candidates}
++    return hub.recover(board, mode=mode, **args) if mode else hub.reserve(board, **args)
++
++
++def unchanged_ready(conn, row):
++    """Recheck the selected snapshot after preceding network calls, without a network-spanning lock."""
++    current = conn.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
++    if current is None or dict(current) != dict(row):
++        return False
++    return not conn.execute(
++        "SELECT 1 FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=? "
++        "AND state IN ('pending','rejected') LIMIT 1", (row["id"],)).fetchone()
++
++
+ def recovery_mode(conn, row, cfg):
+     """Propose a stale-pin recovery only from an affirmative registry observation."""
+     from hermes_cli import kanban_worker_node as node
+@@ -36,6 +52,10 @@ def recovery_mode(conn, row, cfg):
+ def current_portable(conn, row, cfg):
+     from hermes_cli.kanban_placement import portable_reason
+ 
++    # Even scratch work can contain unpublished outputs from an earlier run.
++    if row.get("workspace_path") or conn.execute(
++            "SELECT 1 FROM task_runs WHERE task_id=? LIMIT 1", (row["id"],)).fetchone():
++        return False
+     args = dict(row)
+     event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created' "
+                          "ORDER BY id LIMIT 1", (row["id"],)).fetchone()
+@@ -45,14 +65,17 @@ def current_portable(conn, row, cfg):
+             return False
+         # Allocated scratch path is not an input, but declared paths/projects remain constraints.
+         args["workspace_path"] = created.get("workspace_path")
+-        args["project_id"] = created.get("project_id")
++        args["project_id"] = row.get("project_id") or created.get("project_id")
+         args["board"] = "default"
+         args["runs_on"] = None  # Board preserves/rechecks the replacement's other labels.
+         for key in ("requires", "skills"):
+             args[key] = json.loads(args[key]) if isinstance(args.get(key), str) else args.get(key)
++            if args[key] is not None and (not isinstance(args[key], list)
++                                         or not all(isinstance(v, str) for v in args[key])):
++                return False
++        return portable_reason(args, cfg) is None
+     except (TypeError, ValueError):
+         return False
+-    return portable_reason(args, cfg) is None
+ 
+ 
+ def promotion_mode(conn, row, cfg):
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 9c21825596..8612e53cd0 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -97,14 +97,14 @@ def creation_audit(args, cfg=None):
+     """
+     from hermes_cli import kanban_placement as placement
+ 
++    explicit = args.get("placement") not in (None, "", "auto") or args.get("runs_on") is not None
++    intent = "explicit" if explicit else "auto"
+     try:
+         cfg = placement.config() if cfg is None else cfg
+-        explicit = args.get("placement") not in (None, "", "auto") or args.get("runs_on") is not None
+-        return {"portable_reason": placement.portable_reason(args, cfg),
+-                "placement_intent": "explicit" if explicit else "auto"}
++        return {"portable_reason": placement.portable_reason(args, cfg), "placement_intent": intent}
+     except Exception:  # health: allow BLE001 -- an audit field never blocks a create
+         logger.warning("portable_reason audit failed", exc_info=True)
+-        return {"portable_reason": "audit failed"}
++        return {"portable_reason": "audit failed", "placement_intent": intent}
+ 
+ 
+ def resolved_db_placement(fields):
+@@ -289,7 +289,9 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+     try:
+         for row in rows:
+             last = row["id"]
+-            from hermes_cli.kanban_placement_recovery import recovery_mode
++            from hermes_cli.kanban_placement_recovery import recovery_mode, unchanged_ready
++            if not unchanged_ready(conn, row):
++                continue
+             mode = recovery_mode(conn, dict(row), cfg)
+             if row["placement_policy"] is None and mode is None:
+                 continue
+@@ -323,12 +325,8 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+                         logger.warning("repinned %s on the Board but could not record it locally", row["id"],
+                                        exc_info=True)
+                 else:
+-                    if mode:
+-                        reply = hub.recover(board, task_id=row["id"], expected_revision=row["sync_version"],
+-                                            mode=mode, candidates=candidates)
+-                    else:
+-                        reply = hub.reserve(board, task_id=row["id"], expected_revision=row["sync_version"],
+-                                            candidates=candidates)
++                    from hermes_cli.kanban_placement_recovery import request_assignment
++                    reply = request_assignment(hub, board, row, mode, candidates)
+                     if reply.get("state") == "queued":
+                         # Never adopt an arbitrary post-pull revision: it may be somebody else's edit.
+                         version = reply.get("task_version", row["sync_version"])
+diff --git a/tests/hermes_cli/test_kanban_recovery_safety.py b/tests/hermes_cli/test_kanban_recovery_safety.py
+new file mode 100644
+index 0000000000..14966a16a1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_recovery_safety.py
+@@ -0,0 +1,91 @@
++"""Recovery must not move unpublished work or locally diverged specifications."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_placement_recovery as fixtures
++
++conn = fixtures.conn
++setup = fixtures.setup
++
++
++@pytest.mark.parametrize("fields", [
++    {"workspace_path": "/retained/scratch"},
++    {"requires": "5"}, {"skills": "5"},
++    {"requires": '{"terminal": true}'},
++])
++def test_recovery_rejects_unsafe_current_inputs(setup, fields):
++    db, hub = setup
++    fixtures.make(db, **fields)
++    assert wp.reevaluate(db, hub, "default", "hub") == 0
++    assert hub.calls == []
++
++
++def test_recovery_rejects_rejected_local_spec(setup):
++    db, hub = setup
++    tid = fixtures.make(db)
++    db.execute("UPDATE tasks SET body='changed specification' WHERE id=?", (tid,))
++    db.execute("UPDATE kanban_sync_outbox SET state='rejected' WHERE table_name='tasks' AND row_uid=?", (tid,))
++    db.commit()
++    assert wp.reevaluate(db, hub, "default", "hub") == 0
++    assert hub.calls == []
++
++
++def test_recovery_rechecks_local_spec_between_calls(setup):
++    db, hub = setup
++    first, second = fixtures.make(db), fixtures.make(db)
++    original = hub.recover
++
++    def recover(board, **body):
++        other = second if body['task_id'] == first else first
++        db.execute("UPDATE tasks SET requires=? WHERE id=?", ('["host_repo"]', other))
++        db.commit()
++        return original(board, **body)
++
++    hub.recover = recover
++    assert wp.reevaluate(db, hub, "default", "hub") == 1
++    assert len(hub.calls) == 1
++
++
++def test_audit_failure_retains_explicit_intent(monkeypatch):
++    from hermes_cli import kanban_placement as placement
++
++    def unavailable(*args):
++        raise OSError("unavailable")
++
++    monkeypatch.setattr(placement, "portable_reason", unavailable)
++    result = wp.creation_audit({"placement": "local"}, {})
++    assert result == {"portable_reason": "audit failed", "placement_intent": "explicit"}
++
++
++@pytest.mark.parametrize("payload", ["null", "[]", "5", "broken"])
++def test_invalid_creation_provenance_is_not_portable(setup, payload):
++    db, hub = setup
++    tid = fixtures.make(db)
++    db.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='created'", (payload, tid))
++    db.commit()
++    assert wp.reevaluate(db, hub, "default", "hub") == 0
++    assert not hub.calls
++
++
++@pytest.mark.parametrize("labels", [None, '["machine:worker-1"]'])
++def test_prior_run_preserves_unpublished_custody(setup, monkeypatch, labels):
++    from hermes_cli import kanban_worker_node as node
++    db, hub = setup
++    tid = fixtures.make(db, runs_on=labels)
++    db.execute("INSERT INTO task_runs (task_id,profile,status,started_at) VALUES (?,'default','completed',1)", (tid,))
++    db.commit()
++    monkeypatch.setattr(node, "registry", lambda: {"machines": {"worker-1": {"state": "revoked"}}})
++    assert wp.reevaluate(db, hub, "default", "hub") == 0
++    assert not hub.calls
++
++
++def test_stored_creation_path_is_retained(setup):
++    db, hub = setup
++    tid = fixtures.make(db)
++    db.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='created'",
++               (json.dumps({"workspace_path": "/declared/input"}), tid))
++    db.commit()
++    assert wp.reevaluate(db, hub, "default", "hub") == 0
++    assert not hub.calls
+-- 
+2.43.0
+

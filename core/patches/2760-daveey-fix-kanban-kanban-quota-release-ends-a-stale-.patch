@@ -1,0 +1,521 @@
+From 536e7b0abca2d253599073a732e6e7f0c4f072b3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:37:53 +0000
+Subject: [PATCH] [daveey] fix(kanban): `kanban quota-release` ends a stale
+ quota episode; the release is an episode boundary
+
+During the 11-12 revoked-token outage every usable Claude account failed with 401, so worker
+startup raised SubscriptionQuotaUnavailable with the reset of the accounts genuinely at 100%.
+That hint became a hinted episode which decision() trusted until its deadline: 10+ ready cards
+were held 1-6 days while anthropic had capacity again.
+
+PR #1409 (18877042c6/7eaf64bd63/f0c7044430) landed the automatic path: _outstanding drops a
+hinted wall the live OAuth pool disproves to its doubling backoff, and the reclaim phase prunes
+disproved provider walls. This change, rebased onto it, keeps only what that path does not cover
+(the auto-release half of the earlier head, _held/live_pool_capacity/admit, is dropped as
+redundant with _disproved):
+
+- `hermes kanban quota-release <id> [--reason]`: operator-only, home gateway. Appends a
+  quota_episode_released event, clears the card's quota error stamp, comments QUOTA RELEASED.
+- episode() treats quota_episode_released as a boundary: the released runs never form an
+  episode again.
+- The release clears the provider_walls.json entry copied from the released hint
+  (record_wall only extends); a later wall stays (kanban_provider_walls.drop_wall).
+- Queue note says "quota hold released (...)" until the next run; guard_hold_until no longer
+  falls back to the old receipt reset after a release.
+
+Card: t_01a1cfac4046a296
+---
+ hermes_cli/kanban.py                          |   6 +-
+ hermes_cli/kanban_db_dispatch_clock.py        |   5 +-
+ hermes_cli/kanban_parser.py                   |   5 +
+ hermes_cli/kanban_provider_walls.py           |  23 +++
+ hermes_cli/kanban_queue_position.py           |  27 ++-
+ hermes_cli/kanban_quota_episode.py            |   4 +-
+ hermes_cli/kanban_quota_episode_release.py    | 119 +++++++++++++
+ .../test_kanban_quota_episode_live_release.py | 167 ++++++++++++++++++
+ 8 files changed, 349 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_quota_episode_release.py
+ create mode 100644 tests/hermes_cli/test_kanban_quota_episode_live_release.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 4dd0a9cb57..1a53076fd8 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -45,7 +45,7 @@ from hermes_cli.kanban_cli_park import (
+ from hermes_cli.kanban_ops import (
+     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_recover, _cmd_repair, _cmd_tail, _cmd_watch,
+ )
+-from hermes_cli.kanban_parser import build_parser, cmd_resume as _cmd_resume
++from hermes_cli.kanban_parser import build_parser, cmd_resume as _cmd_resume, cmd_quota_release as _cmd_quota_release
+ from hermes_cli.kanban_sync_cli import cmd_sync as _cmd_sync
+ from hermes_cli.kanban_archive_scope import (  # moved here from this module; re-exported for callers
+     _capability_owner_waiting_card, _creator_task_id, _is_stranded_runs_on_copy,
+@@ -272,7 +272,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
+     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair", "recover",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+-    "request-review", "request-changes", "reopen-review", "reopen", "resume",
++    "request-review", "request-changes", "reopen-review", "reopen", "resume", "quota-release",
+     "gc", "origin-bind", "origin-create", "origin-adopt", "sync", "supervisor-requests",
+ })
+ 
+@@ -1882,7 +1882,7 @@ _HANDLERS = {
+     "complete": _cmd_complete, "edit": _cmd_edit, "reopen": _cmd_reopen, "block": _cmd_block,
+     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+-    "reopen-review": _cmd_reopen_review, "promote": _cmd_promote, "resume": _cmd_resume,
++    "reopen-review": _cmd_reopen_review, "promote": _cmd_promote, "resume": _cmd_resume, "quota-release": _cmd_quota_release,
+     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
+     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
+     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
+diff --git a/hermes_cli/kanban_db_dispatch_clock.py b/hermes_cli/kanban_db_dispatch_clock.py
+index eba8b707fe..3e44758b21 100644
+--- a/hermes_cli/kanban_db_dispatch_clock.py
++++ b/hermes_cli/kanban_db_dispatch_clock.py
+@@ -33,10 +33,13 @@ def guard_hold_until(conn: sqlite3.Connection, task_id: str, reason: str, now: i
+     from hermes_cli import kanban_db as kb
+     if reason in _EPISODE_REASONS:
+         # A quota episode's deadline (doubling backoff, every provider's wall) is what the guard holds on.
+-        from hermes_cli.kanban_quota_episode import hold_until
++        from hermes_cli.kanban_quota_episode import episode, hold_until
+         until = hold_until(conn, task_id, now)
+         if until is not None:
+             return int(until) if until > now else None
++        from hermes_cli.kanban_quota_episode_release import covers_latest
++        if covers_latest(conn, task_id) or episode(conn, task_id):  # released, expired or stale: no clock
++            return None
+     if reason == "subscription_quota_reset":
+         reset = _receipt_reset_at(conn, task_id)
+         return int(reset) if reset is not None and reset > now else None
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index df52f6920b..271db7a02d 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -17,6 +17,7 @@ from hermes_cli import kanban_db_notify as kbn
+ # The `resume` handler rides kanban.py's existing kanban_parser import, so kanban.py (at its
+ # FILE_LINES cap) gains no line for it. [daveey]
+ from hermes_cli.kanban_operator_resume import cmd as cmd_resume
++from hermes_cli.kanban_quota_episode_release import cmd as cmd_quota_release  # same ride as cmd_resume
+ 
+ 
+ def _arg(*flags: str, **kw):
+@@ -551,6 +552,10 @@ _SPECS = [
+         _TASK_ID,
+         _arg("--reason", required=True, help="Why this owner should continue its PR (recorded as an event + comment)"),
+     ], help="Operator-only: let a READY card held by the active_pr respawn guard run once more"),
++    _cmd("quota-release", [
++        _TASK_ID,
++        _arg("--reason", default="", help="Why the quota episode no longer holds (recorded as an event + comment)"),
++    ], help="Operator-only: end the card's quota episode (a stale 'resets at' hold) so it is admissible again"),
+     _cmd("promote", [
+         _TASK_ID,
+         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
+diff --git a/hermes_cli/kanban_provider_walls.py b/hermes_cli/kanban_provider_walls.py
+index d5342c0885..1472d933b2 100644
+--- a/hermes_cli/kanban_provider_walls.py
++++ b/hermes_cli/kanban_provider_walls.py
+@@ -251,6 +251,29 @@ def prune_disproved_walls(*, now: Optional[float] = None, path: Optional[Path] =
+     return dropped
+ 
+ 
++def drop_wall(provider: str, *, not_after: float, path: Optional[Path] = None) -> bool:
++    """Remove ``provider``'s wall when it ends no later than ``not_after`` (an operator-released episode's deadline:
++    the reaper copied the wall from that hint). A later wall came from other evidence and stays. True when removed.
++
++    ``record_wall`` only ever extends, so without this a released hint's wall outlived its episode's release.
++    """
++    provider = _norm(provider)
++    p = path or walls_path()
++    walls = _load(p)
++    until = walls.get(provider)
++    if until is None or until > not_after + 1:
++        return False
++    del walls[provider]
++    try:
++        tmp = p.with_suffix(".tmp")
++        tmp.write_text(json.dumps(walls), encoding="utf-8")
++        tmp.replace(p)
++    except OSError as exc:
++        logger.warning("kanban walls: cannot write %s (%s)", p, exc)
++        return False
++    return True
++
++
+ def rate_limit_storm(conn: sqlite3.Connection, *, now: Optional[float] = None, prefix: Optional[str] = None) -> int:
+     """``rate_limited`` runs in the last hour claimed by this host (claim ``prefix``, default this host's).
+ 
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index fa418344ed..2edc5b3284 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -135,9 +135,10 @@ def recorded_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_diagnostics import _READY_WAIT_FLOOR_KINDS
++    from hermes_cli.kanban_quota_episode_release import KIND as QUOTA_RELEASED
+ 
+     kinds = {*_READY_WAIT_FLOOR_KINDS, "respawn_guarded", "continued", "scheduled", "reassigned", "reopened",
+-             "hold_released", "dispatch_skipped"}  # a later dispatcher skip is the newer verdict
++             "hold_released", "dispatch_skipped", QUOTA_RELEASED}  # a later dispatcher skip is the newer verdict
+     slots = ",".join("?" for _ in kinds)
+     row = conn.execute(
+         f"SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ({slots}) "
+@@ -150,7 +151,20 @@ def recorded_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+ 
+ 
+ def position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Optional[dict[str, Any]]:
+-    """The queue a ``ready`` ``task`` in this gateway's live file waits in; None for any other status."""
++    """The queue a ``ready`` ``task`` in this gateway's live file waits in; None for any other status.
++
++    A quota episode released since the card's last run (``quota_episode_released``) is named on the place, so
++    a read says the quota hold is gone instead of echoing the old ``subscription_quota_reset``."""
++    place = _position(conn, task, board)
++    if place:
++        from hermes_cli.kanban_quota_episode_release import covers_latest
++        released = covers_latest(conn, task.id)
++        if released:
++            place["quota_released"] = {k: released.get(k) for k in ("reason", "via", "actor", "until")}
++    return place
++
++
++def _position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Optional[dict[str, Any]]:
+     if task is None or task.status != "ready":
+         return None
+     # [daveey] A ready card still holding a local claim is never picked (the dispatcher claims only claim_lock IS
+@@ -261,6 +275,15 @@ def describe(place: Optional[dict[str, Any]]) -> Optional[str]:
+     """One line for card reads (``kanban_show`` ``queue_note``, ``hermes kanban show``) saying what the card waits
+     for, so "ready, no run" never reads as stuck. [daveey] kanban-7d720d4ab8: a chat saw only a null
+     ``queue_reason`` for a card waiting on a full hub, called it stuck and ran its work in a subagent."""
++    words = _describe_lane(place)
++    released = (place or {}).get("quota_released")
++    if words and isinstance(released, dict):
++        words = (f"quota hold released ({released.get('reason') or 'no reason'}, via {released.get('via')}); "
++                 "the card is admissible again. " + words)
++    return words
++
++
++def _describe_lane(place: Optional[dict[str, Any]]) -> Optional[str]:
+     if not place:
+         return None
+     lane = place.get("lane")
+diff --git a/hermes_cli/kanban_quota_episode.py b/hermes_cli/kanban_quota_episode.py
+index 893aaefb4d..b325832868 100644
+--- a/hermes_cli/kanban_quota_episode.py
++++ b/hermes_cli/kanban_quota_episode.py
+@@ -40,11 +40,13 @@ def episode(conn, task_id, *, run_id=None):
+                          (task_id, run_id)).fetchone() if run_id is not None else None
+     if run_id is not None and bound is None:
+         return None
++    from hermes_cli.kanban_quota_episode_release import released_run
++    released = released_run(conn, task_id)  # a quota_episode_released event closes every run up to it
+     for row in conn.execute(
+         "SELECT id, outcome, ended_at FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+         "AND (? IS NULL OR (ended_at,id)<=(?,?)) ORDER BY ended_at DESC, id DESC",
+         (task_id, run_id, bound['ended_at'] if bound else None, run_id)):
+-        if row['outcome'] != 'rate_limited':
++        if row['outcome'] != 'rate_limited' or (released is not None and row['id'] <= released):
+             break
+         runs.append(row)
+     if not runs:
+diff --git a/hermes_cli/kanban_quota_episode_release.py b/hermes_cli/kanban_quota_episode_release.py
+new file mode 100644
+index 0000000000..a776d81c9f
+--- /dev/null
++++ b/hermes_cli/kanban_quota_episode_release.py
+@@ -0,0 +1,119 @@
++"""``hermes kanban quota-release``: an operator ends a card's quota episode. [daveey]
++
++2026-11-12 (t_01a1cfac4046a296): during a revoked-token outage every usable Claude account failed with
++401, so worker startup raised ``SubscriptionQuotaUnavailable ... resets at <the earliest reset of the
++accounts genuinely at 100%>``. That hint became a hinted episode, and ``decision`` trusted it until the
++deadline: 10+ ready cards were held 1-6 days while anthropic had room again.
++
++The automatic path is ``kanban_quota_episode._disproved`` (PR #1409): a hinted wall the live OAuth pool
++contradicts keeps only its doubling backoff. This module is the operator escape for what that check cannot
++see (an unreadable or empty pool, a hint the operator knows is wrong): ``quota-release <id> [--reason]``
++appends a ``quota_episode_released`` event. ``episode()`` treats it as a boundary, so the released runs
++never form an episode again, and the queue note names the release until the card's next run.
++
++The release also clears the provider_walls.json entry the reaper copied from the released hint
++(``record_wall`` only extends one, so it outlived the episode and kept other cards off the provider); a
++wall ending later than the episode came from other evidence and stays. [daveey]
++"""
++from __future__ import annotations
++
++import time
++
++KIND = "quota_episode_released"
++
++
++class ReleaseRefused(ValueError):
++    pass
++
++
++def _latest(conn, task_id):
++    from hermes_cli import kanban_db as kb
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? "
++                       "ORDER BY id DESC LIMIT 1", (task_id, KIND)).fetchone()
++    return kb._json_dict(row[0]) if row else None
++
++
++def released_run(conn, task_id):
++    """Run id the latest release closed (runs up to it form no episode), or None."""
++    run = (_latest(conn, task_id) or {}).get("run_id")
++    return run if type(run) is int else None
++
++
++def covers_latest(conn, task_id) -> dict | None:
++    """The latest release's payload while no run has ended after it, else None (queue notes, clocks)."""
++    payload = _latest(conn, task_id)
++    run = (payload or {}).get("run_id")
++    if type(run) is not int:
++        return None
++    later = conn.execute("SELECT 1 FROM task_runs WHERE task_id=? AND id>? LIMIT 1", (task_id, run)).fetchone()
++    return None if later else payload
++
++
++def record(conn, task_id, state, *, reason, via, actor):
++    """Append the release event (boundary for ``episode()``) inside the caller's transaction."""
++    from hermes_cli import kanban_db as kb
++    payload = {"reason": reason, "via": via, "actor": actor, "run_id": state["run_id"],
++               "episode_id": state["episode_id"], "until": state["until"], "hinted": bool(state.get("hinted")),
++               "providers": list(state.get("providers") or [])}
++    kb._append_event(conn, task_id, KIND, payload)
++    return payload
++
++
++def _drop_walls(walls):
++    """Clear provider_walls.json entries copied from the released hints (``record_wall`` never shrinks one), so
++    retiering other cards stops treating the provider as walled. A later wall stays."""
++    from hermes_cli import kanban_provider_walls as pw
++    from hermes_cli.kanban_quota_episode import _providers
++    deadline = {}
++    for wall in walls:
++        for name in _providers(wall):
++            deadline[name] = max(deadline.get(name, 0), wall["until"])
++    for name, until in deadline.items():
++        pw.drop_wall(name, not_after=until)
++
++
++def release(conn, task_id: str, *, reason: str, actor: str) -> dict:
++    """Operator release of the card's quota episode; raises ReleaseRefused."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import write_txn
++    from hermes_cli.kanban_db_dispatch_quota import clear_quota_error, is_quota_error
++    from hermes_cli.kanban_operator_resume import worker_lineage
++    from hermes_cli.kanban_quota_episode import _outstanding, episode
++    from hermes_cli.kanban_wake_check import foreign_copy
++    marker = worker_lineage()
++    if marker:
++        raise ReleaseRefused(f"operator-only: refused under worker lineage ({marker})")
++    reason = (reason or "").strip() or "operator release"
++    with write_txn(conn):
++        task = kb.get_task(conn, task_id)
++        if task is None:
++            raise ReleaseRefused(f"unknown task {task_id}")
++        if foreign_copy(conn, task_id):
++            raise ReleaseRefused("quota-release must run on the card's home gateway")
++        state = episode(conn, task_id)
++        if not state:
++            raise ReleaseRefused("no quota episode holds this card")
++        held = _outstanding(conn, task_id, state, time.time())
++        payload = record(conn, task_id, state, reason=reason[:500], via="operator", actor=actor)
++        stamp = kb._lossy_text(task.last_failure_error)
++        if stamp and is_quota_error(stamp):
++            clear_quota_error(conn, task_id, stamp)
++        kb.add_comment(conn, task_id, actor, f"QUOTA RELEASED: {reason}")
++    _drop_walls(held)
++    return payload
++
++
++def cmd(args) -> int:
++    """``hermes kanban quota-release <id> [--reason ...]``."""
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli.kanban import _profile_author
++    from hermes_cli.kanban_output import _err
++    try:
++        with kbc.connect_closing() as conn:
++            payload = release(conn, args.task_id, reason=args.reason, actor=_profile_author())
++    except ReleaseRefused as exc:
++        return _err(f"kanban quota-release: {exc}", 2)
++    until = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(payload["until"]))
++    print(f"Released {args.task_id}: quota episode {payload['episode_id']} (held until {until}) no longer "
++          f"holds admission ({KIND})")
++    return 0
+diff --git a/tests/hermes_cli/test_kanban_quota_episode_live_release.py b/tests/hermes_cli/test_kanban_quota_episode_live_release.py
+new file mode 100644
+index 0000000000..ed756c8d29
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_quota_episode_live_release.py
+@@ -0,0 +1,167 @@
++"""A hinted quota episode the live OAuth pool disproves stops holding; operators can release one. [daveey]
++
++t_01a1cfac4046a296: during a revoked-token outage the worker raised ``SubscriptionQuotaUnavailable ... resets
++at <the earliest reset of the accounts genuinely at 100%>``. The hint became a hinted episode that ``decision``
++trusted until its deadline, so 10+ ready cards waited 1-6 days while anthropic had room again.
++"""
++import argparse
++
++import pytest
++
++from agent.credential_pool import CredentialPool, PooledCredential
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_provider_walls as walls
++from hermes_cli import kanban_quota_episode_release as release
++from hermes_cli import kanban_queue_position as queue
++from hermes_cli.kanban_db_dispatch_clock import guard_hold_until
++from hermes_cli.kanban_quota_episode import MAX_BACKOFF_SECONDS, episode, hold_until
++from tests.hermes_cli.test_kanban_quota_episode import board as board, routing  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
++
++NOW = 1_800_000_000
++DAYS = 86400
++
++
++def _entry(i, *, exhausted_until=None):
++    status = {'last_status': 'exhausted', 'last_status_at': NOW - 60, 'last_error_code': 429,
++              'last_error_reset_at': exhausted_until} if exhausted_until else {'last_status': 'ok'}
++    return PooledCredential(provider='anthropic', id=f'acct{i}', label=f'acct{i}', auth_type='oauth', priority=i,
++                            source='test', access_token=f'sk-ant-oat-{i}', **status)
++
++
++@pytest.fixture
++def pool(monkeypatch):
++    """The anthropic OAuth pool the live serving check reads; ``seen`` records the (provider, model) it asked for."""
++    entries, seen = [], []
++
++    def load(provider, **_kw):
++        seen.append(provider)
++        return CredentialPool(provider, [e for e in entries if e.provider == provider],
++                              allowed_auth_types={'oauth'})
++    monkeypatch.setattr('agent.credential_pool.load_pool', load)
++    monkeypatch.setattr(kb.time, 'time', lambda: NOW)
++    for key in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_WORKER_TASK', 'HERMES_DELEGATED_CHILD_CONTEXT'):
++        monkeypatch.delenv(key, raising=False)
++    return entries, seen
++
++
++def _reap(conn, tid, *, provider='anthropic', model='claude-opus-5-5', route_provider='anthropic'):
++    """One rate_limited run whose receipt says the subscription resets in 3 days (a hinted episode)."""
++    task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++    pid = 71001
++    conn.execute('UPDATE tasks SET worker_pid=? WHERE id=?', (pid, tid))
++    kb._append_event(conn, tid, 'run_route', {'model': model, 'provider': provider, 'source': 'pin',
++                     'tier_reason': 'pinned', 'lane': 'ready'}, run_id=task.current_run_id)
++    fields = {'route_provider': route_provider, 'route_model': model} if route_provider else {}
++    kb._append_event(conn, tid, 'worker_result', {
++        'pid': pid, 'claim_lock': task.claim_lock, 'exit_code': 75,
++        'last_output': f'SubscriptionQuotaUnavailable: Subscription quota unavailable for anthropic/{model}; '
++                       f'resets at {NOW + 3 * DAYS}.0', **fields}, run_id=task.current_run_id)
++    conn.commit()
++    dispatch._record_worker_exit(pid, 75 << 8)
++    dispatch.detect_crashed_workers(conn)
++    assert kb.get_task(conn, tid).status == 'ready'
++    state = episode(conn, tid)
++    assert state['hinted'] and state['until'] == NOW + 3 * DAYS
++    return state
++
++
++def _released(conn, tid):
++    return [kb._json_dict(r[0]) for r in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='quota_episode_released'", (tid,))]
++
++
++def test_hinted_episode_with_a_non_exhausted_pool_entry_is_admitted(board, pool):
++    """The live pool disproves the outage hint (PR #1409's ``_disproved``): only the doubling backoff holds."""
++    entries, seen = pool
++    entries += [_entry(1, exhausted_until=NOW + 3 * DAYS), _entry(2)]  # one account at 100%, one with room
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='stale outage hint', assignee='a')
++        _reap(conn, tid)
++        until = hold_until(conn, tid, NOW + 1)
++        assert until is not None and until <= NOW + MAX_BACKOFF_SECONDS  # never the 3-day hint
++        assert hold_until(conn, tid, until + 1) is None
++        assert guard_hold_until(conn, tid, 'subscription_quota_reset', until + 1) is None
++        assert _released(conn, tid) == []  # the automatic path writes no boundary: backoff pacing survives
++    assert 'anthropic' in seen
++
++
++def test_hinted_episode_with_every_pool_entry_exhausted_still_holds(board, pool):
++    entries, _ = pool
++    entries += [_entry(1, exhausted_until=NOW + 3 * DAYS), _entry(2, exhausted_until=NOW + 4 * DAYS)]
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='genuine wall', assignee='a')
++        _reap(conn, tid)
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        assert hold_until(conn, tid, NOW + 600) == NOW + 3 * DAYS
++        assert _released(conn, tid) == [] and episode(conn, tid) is not None
++
++
++@pytest.mark.parametrize('why', ['empty_pool', 'model_cooldown'])
++def test_a_pool_with_no_usable_entry_still_holds(board, pool, why):
++    """An empty pool is unknown (not capacity); an entry cooled for the walled model cannot serve it."""
++    entries, _ = pool
++    if why == 'model_cooldown':
++        entry = _entry(1)
++        entry.model_cooldowns = {'claude-opus-5-5': NOW + 3 * DAYS}
++        entries.append(entry)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title=why, assignee='a')
++        _reap(conn, tid)
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++
++
++def test_unknown_provider_episode_still_holds(board, pool):
++    entries, _ = pool
++    entries.append(_entry(1))  # anthropic has room, but nobody recorded which provider hit the wall
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='unknown provider', assignee='a')
++        state = _reap(conn, tid, provider=None, route_provider=None)
++        assert state['providers'] == []
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        assert _released(conn, tid) == []
++
++
++def test_quota_release_makes_the_card_admissible_and_shows_in_the_queue_note(board, pool, capsys):
++    entries, _ = pool
++    entries.append(_entry(1, exhausted_until=NOW + 3 * DAYS))  # the live pool still says walled
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='operator release', assignee='a')
++        _reap(conn, tid)
++        assert dispatch.check_respawn_guard(conn, tid) == 'subscription_quota_reset'
++        dispatch.dispatch_once(conn, spawn_fn=lambda *_a: pytest.fail('held card spawned'))
++    walls.record_wall('openai-codex', 2 * DAYS)  # another provider's wall is never touched
++    assert release.cmd(argparse.Namespace(task_id=tid, reason='revoked-token outage hint')) == 0
++    assert 'Released' in capsys.readouterr().out
++    assert set(walls.active_walls()) == {'openai-codex'}
++    with kbc.connect() as conn:
++        assert dispatch.check_respawn_guard(conn, tid) is None
++        assert episode(conn, tid) is None
++        events = _released(conn, tid)
++        assert [(e['reason'], e['via']) for e in events] == [('revoked-token outage hint', 'operator')]
++        place = queue.position(conn, kb.get_task(conn, tid))
++        note = queue.describe(place)
++        assert 'quota hold released (revoked-token outage hint, via operator)' in note
++        assert place['lane'] != 'respawn_guard'
++        assert any('QUOTA RELEASED' in c.body for c in kb.list_comments(conn, tid))
++        assert release.cmd(argparse.Namespace(task_id=tid, reason='')) == 2  # nothing left to release
++
++
++def test_drop_wall_keeps_a_wall_that_outlasts_the_released_hint(tmp_path):
++    path = tmp_path / 'provider_walls.json'
++    walls.record_wall('anthropic', 3 * DAYS, now=NOW, path=path)
++    assert walls.drop_wall('anthropic', not_after=NOW + 2 * DAYS, path=path) is False  # other evidence: stays
++    assert walls.drop_wall('anthropic', not_after=NOW + 3 * DAYS, path=path) is True
++    assert walls.active_walls(now=NOW, path=path) == {}
++    assert walls.drop_wall('anthropic', not_after=NOW + 3 * DAYS, path=path) is False
++
++
++def test_quota_release_refuses_worker_lineage(board, pool, monkeypatch):
++    monkeypatch.setenv('HERMES_KANBAN_TASK', 't_worker')
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='self release', assignee='a')
++        _reap(conn, tid)
++        with pytest.raises(release.ReleaseRefused, match='operator-only'):
++            release.release(conn, tid, reason='x', actor='w')
++        assert _released(conn, tid) == []
+-- 
+2.43.0
+

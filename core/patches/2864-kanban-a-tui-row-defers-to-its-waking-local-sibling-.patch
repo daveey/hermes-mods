@@ -1,0 +1,265 @@
+From e073a53f06095ca64a7aa60ffe2e1731a868c9ca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:32:12 -0800
+Subject: [PATCH] kanban: a tui row defers to its waking local sibling only
+ until the wake delivers (no lost notice when the wake never lands)
+
+Review of PR #1465 at 67d5fb1cfc: tui_cover silenced covered kinds because a waking local row existed, so in
+notice-first order the tui row was acked past an event the wake still owed; a wake dropped after
+MAX_SEND_FAILURES (or never claimed: no LOCAL adapter) lost the event. Now the tui consumers silence only events
+at or below the local row's acknowledged cursor, and leave the tui row unclaimed (tui_defer) while the wake owes a
+covered event younger than DEFER_MAX_S (600 s). The wake then carries the notice line and settles the tui row; a
+dropped local row or an expired window hands the notice back to the tui row. Guards: both reviewer probes plus the
+sweeper past the window. [daveey]
+---
+ gateway/kanban_wake_sibling.py                | 80 +++++++++++++++++--
+ .../test_kanban_notify_wake_one_turn.py       | 71 +++++++++++++++-
+ tui_gateway/kanban_unloaded.py                |  4 +-
+ tui_gateway/session_notifications.py          |  3 +
+ 4 files changed, 146 insertions(+), 12 deletions(-)
+
+diff --git a/gateway/kanban_wake_sibling.py b/gateway/kanban_wake_sibling.py
+index b8f5c9bb3c..a267fe0027 100644
+--- a/gateway/kanban_wake_sibling.py
++++ b/gateway/kanban_wake_sibling.py
+@@ -6,10 +6,13 @@ no-op) and a ``tui`` ``notify`` row (the legacy Desktop poller and the unloaded
+ row and start a turn). Each row has its own cursor, so one completion started two model turns minutes apart
+ (t_01a1ce9070eee14c: messages 872084 and 872153 for t_01a1ce83e793e24f).
+ 
+-The waking ``local`` row owns the turn for every event it wakes on. The ``tui`` consumers treat those events as
+-silent (claimed and acked, no row, no turn), in whichever order the two legs run, and the wake turn carries the
+-notice line the ``tui`` row would have shown (:func:`notice_lines`). Kinds the wake leg does not wake on
+-(``status``, quota and re-pin notices) stay with the ``tui`` row. A ``notify``-only ``local`` row covers nothing.
++The waking ``local`` row owns the turn for every event it wakes on, and the wake turn carries the notice line the
++``tui`` row would have shown (:func:`notice_lines`). The ``tui`` consumers stay silent only for events that row has
++already delivered (:func:`tui_cover`); while it still owes a covered event they leave the ``tui`` row unclaimed
++(:func:`tui_defer`), so a wake that never lands (the row dropped after repeated failures, no LOCAL adapter, past
++:data:`DEFER_MAX_S`) still leaves the ``tui`` notice owed and delivered: a duplicate beats a lost notice. Kinds the
++wake leg does not wake on (``status``, quota and re-pin notices) stay with the ``tui`` row. A ``notify``-only
++``local`` row covers nothing.
+ """
+ 
+ from __future__ import annotations
+@@ -18,6 +21,9 @@ import sqlite3
+ from typing import Any, Callable, Optional
+ 
+ WAKE_MODES = ("notify+wake", "wake")
++# How long a ``tui`` row waits for its waking ``local`` sibling to deliver a covered event before delivering it
++# itself. A healthy wake acks at admission to the chat's FIFO, seconds after the event.
++DEFER_MAX_S = 600.0
+ 
+ 
+ def _sibling(conn: Any, sub: dict, platform: str, modes: Optional[tuple] = None) -> bool:
+@@ -40,12 +46,70 @@ def covered(ev: Any) -> bool:
+     return getattr(ev, "kind", "") in _WAKE_KINDS and not provisional_failure(ev)
+ 
+ 
+-def tui_cover(conn: Any, sub: dict) -> Optional[Callable[[Any], bool]]:
+-    """For a ``tui`` row: :func:`covered` when a waking ``local`` row for the same card and chat delivers its
+-    events, else None (deliver everything as before)."""
++def _local_acked(conn: Any, sub: dict) -> Optional[int]:
++    """The event id up to which the waking ``local`` sibling of this ``tui`` row has delivered (its cursor, or the
++    start of its in-flight claim), or None when there is no such row (or it is unreadable)."""
+     if (sub.get("platform") or "").lower() != "tui":
+         return None
+-    return covered if _sibling(conn, sub, "local", WAKE_MODES) else None
++    try:
++        row = conn.execute(
++            "SELECT last_event_id, inflight_from FROM kanban_notify_subs WHERE task_id = ? AND platform = 'local' "
++            f"AND chat_id = ? AND thread_id = ? AND delivery_mode IN ({','.join('?' * len(WAKE_MODES))}) "
++            "ORDER BY last_event_id LIMIT 1",
++            (sub["task_id"], sub["chat_id"], sub.get("thread_id") or "", *WAKE_MODES)).fetchone()
++    except sqlite3.Error:
++        return None  # unreadable: deliver as before (a duplicate beats a lost notice)
++    if row is None:
++        return None
++    return int((row[0] if row[1] is None else row[1]) or 0)
++
++
++def tui_cover(conn: Any, sub: dict) -> Optional[Callable[[Any], bool]]:
++    """For a ``tui`` row: a predicate for the events its waking ``local`` sibling has already delivered a turn for
++    (:func:`covered` and at or below that row's acknowledged cursor), else None (deliver everything as before).
++
++    Silence must follow the wake's delivery, not the row's existence: silencing on existence acked the ``tui`` row
++    past an event the wake still owed, and a wake that then never landed lost the event (review of PR #1465)."""
++    acked = _local_acked(conn, sub)
++    if acked is None:
++        return None
++
++    def delivered(ev: Any) -> bool:
++        return covered(ev) and int(getattr(ev, "id", 0) or 0) <= acked
++    return delivered
++
++
++def tui_defer(conn: Any, sub: dict, now: Optional[float] = None) -> bool:
++    """True when this ``tui`` row should stay unclaimed this pass: its waking ``local`` sibling still owes a
++    covered event past both cursors, younger than :data:`DEFER_MAX_S`. The wake then carries its notice and
++    settles the row (:func:`settle_tui_sibling`); if the wake never lands, the row delivers it after the window or
++    once the ``local`` row is gone."""
++    import json
++    import time
++    from types import SimpleNamespace
++
++    acked = _local_acked(conn, sub)
++    if acked is None:
++        return False
++    try:
++        row = conn.execute("SELECT last_event_id, inflight_from FROM kanban_notify_subs WHERE task_id = ? "
++                           "AND platform = 'tui' AND chat_id = ? AND thread_id = ?",
++                           (sub["task_id"], sub["chat_id"], sub.get("thread_id") or "")).fetchone()
++        if row is None or row[1] is not None:
++            return False  # gone, or a claim is already in flight: the claim path owns it
++        since = (now if now is not None else time.time()) - DEFER_MAX_S
++        pending = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
++                               "AND created_at > ?", (sub["task_id"], max(int(row[0] or 0), acked), since)).fetchall()
++    except sqlite3.Error:
++        return False
++    for kind, payload in pending:
++        try:
++            data = json.loads(payload) if payload else {}
++        except ValueError:
++            data = {}
++        if covered(SimpleNamespace(kind=kind, payload=data)):
++            return True
++    return False
+ 
+ 
+ def tui_formatter(conn: Any, sub: dict, fmt: Callable) -> Callable:
+diff --git a/tests/gateway/test_kanban_notify_wake_one_turn.py b/tests/gateway/test_kanban_notify_wake_one_turn.py
+index 44b2b1cae4..425aebfbca 100644
+--- a/tests/gateway/test_kanban_notify_wake_one_turn.py
++++ b/tests/gateway/test_kanban_notify_wake_one_turn.py
+@@ -94,12 +94,13 @@ def _cursors(tid):
+         conn.close()
+ 
+ 
+-def _wake_leg(runner):
++def _wake_leg(runner, fail_counts=None):
+     async def tick():
+         deliveries = await asyncio.to_thread(_notifier_collect, runner, kb, notifier_profile="default",
+                                              gc_due=False, gc_retention_days=30)
+         for d in deliveries:
+-            await _KanbanNotification(runner, d, platform_cls=Platform, sub_fail_counts={}).deliver()
++            await _KanbanNotification(runner, d, platform_cls=Platform,
++                                      sub_fail_counts={} if fail_counts is None else fail_counts).deliver()
+     asyncio.run(tick())
+ 
+ 
+@@ -181,6 +182,8 @@ def test_wake_without_a_tui_sibling_keeps_its_text(board):
+ 
+ 
+ def test_unloaded_sweeper_leaves_a_covered_event_to_the_wake_turn(board, tmp_path, monkeypatch):
++    from gateway import kanban_wake_sibling
++    monkeypatch.setattr(kanban_wake_sibling, "DEFER_MAX_S", 7200.0)  # the sweeper runs an hour on; the wake is due
+     monkeypatch.setenv("HERMES_KANBAN_UNLOADED_WAKE", "0")
+     db = SessionDB(tmp_path / "state.db")
+     db.create_session(CHAT, "desktop")
+@@ -196,9 +199,12 @@ def test_unloaded_sweeper_leaves_a_covered_event_to_the_wake_turn(board, tmp_pat
+     assert ku.sweep_once(set(), now=time.time() + 3600, session_db=opener) == []
+     assert [m for m in db.get_messages(CHAT) if m.get("display_kind") == "kanban_notice"] == []
+     last, subs = _cursors(tid)
+-    assert subs["tui"] == (last, None)
++    assert subs["tui"][0] < last and subs["tui"][1] is None  # left unclaimed for the wake, not acked past it
+     _wake_leg(runner)
+     assert len(adapter.turns) == 1 and NOTICE["completed"].format(tid=tid) in adapter.turns[0]
++    last, subs = _cursors(tid)
++    assert subs["tui"] == (last, None)  # the wake settled it
++    assert ku.sweep_once(set(), now=time.time() + 3600, session_db=opener) == []
+ 
+ 
+ def test_archived_card_after_the_wake_leaves_no_second_notice_turn(board):
+@@ -249,3 +255,62 @@ def test_a_stuck_tui_claim_rewound_after_the_wake_and_archive_starts_no_second_t
+         conn.close()
+     assert _notice_leg() == []
+     assert len(adapter.turns) == 1
++
++
++# Review of PR #1465 at 67d5fb1cfc: silencing the tui row because a waking local row EXISTS lost the event when the
++# tui leg ran first and the wake never landed. These pass on the merge-base and must keep passing.
++
++class FailingAdapter(LocalAdapter):
++    async def handle_message(self, event):
++        raise RuntimeError("local FIFO refused the wake")
++
++
++def test_notice_first_then_a_wake_that_fails_until_dropped_still_delivers_the_notice(board):
++    from gateway.kanban_watchers_notifier import MAX_SEND_FAILURES
++
++    runner, _ = board
++    failing = FailingAdapter()
++    runner.adapters = {Platform.LOCAL: failing}
++    tid = _card()
++    _event(tid, "completed")
++    texts = _notice_leg()  # the tui leg first: the wake still owes the event, so nothing is acked here
++    counts: dict = {}
++    for _ in range(MAX_SEND_FAILURES + 1):
++        _wake_leg(runner, counts)
++    _last, subs = _cursors(tid)
++    assert "local" not in subs  # dropped after MAX_SEND_FAILURES
++    texts += _notice_leg()
++    assert len(texts) == 1 and NOTICE["completed"].format(tid=tid) in texts[0]
++
++
++def test_notice_first_with_no_local_adapter_delivers_the_notice_once_the_wait_ends(board, monkeypatch):
++    from gateway import kanban_wake_sibling
++
++    runner, _ = board
++    runner.adapters = {}
++    tid = _card()
++    _event(tid, "completed")
++    _wake_leg(runner)
++    assert _notice_leg() == []  # within the window: left to the wake
++    monkeypatch.setattr(kanban_wake_sibling, "DEFER_MAX_S", -1.0)  # the wake never landed in time
++    _wake_leg(runner)
++    texts = _notice_leg()
++    assert len(texts) == 1 and NOTICE["completed"].format(tid=tid) in texts[0]
++
++
++def test_unloaded_sweeper_delivers_a_covered_event_the_wake_never_delivered(board, tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_UNLOADED_WAKE", "0")
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session(CHAT, "desktop")
++    db.append_message(CHAT, "user", "start the cards")
++
++    @contextlib.contextmanager
++    def opener(chat_id):
++        yield (db, chat_id) if db.get_session(chat_id) else (None, None)
++
++    board[0].adapters = {}
++    tid = _card()
++    _event(tid, "completed")
++    ku.sweep_once(set(), now=time.time() + 3600, session_db=opener)  # an hour on, past DEFER_MAX_S
++    rows = [m for m in db.get_messages(CHAT) if m.get("display_kind") == "kanban_notice"]
++    assert len(rows) == 1 and NOTICE["completed"].format(tid=tid) in (rows[0].get("content") or "")
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 35ce63b0a9..a60e16b714 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -366,7 +366,9 @@ def _sweep_sub(conn, slug, sub, grace_s, now, session_db, _kb, _kbn, kinds, fmt,
+     if oldest > now - grace_s:
+         return None  # a live poller still has time to take it
+     done = None
+-    from gateway.kanban_wake_sibling import tui_formatter
++    from gateway.kanban_wake_sibling import tui_defer, tui_formatter
++    if tui_defer(conn, sub, now):
++        return None  # the chat's waking local row still owes this event's turn; it settles this row [daveey]
+     fmt = tui_formatter(conn, sub, fmt)  # a waking local row's turn carries the events it wakes on [daveey]
+     try:
+         done = _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, kinds, fmt, wake, holders,
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index b7b2f44d7f..450fc9c4b5 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -766,6 +766,9 @@ def _kb_poll_board_now(_kb, _kbc, _kbn, slug: str, session_key: str, claims: lis
+                 continue
+             sub_ident = dict(task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                              thread_id=sub.get("thread_id") or "")
++            from gateway.kanban_wake_sibling import tui_defer
++            if tui_defer(conn, sub):
++                continue  # the chat's waking local row still owes this event's turn; it settles this row [daveey]
+             # durable: the claim stays IN FLIGHT (owned by this process) until the notice is in the transcript
+             # (_kb_ack_durable acks it); a process that dies first hands it back. [daveey]
+             _old, _new, events = _kbn.claim_unseen_events_for_sub(conn, kinds=_KANBAN_NOTIFY_KINDS,
+-- 
+2.43.0
+

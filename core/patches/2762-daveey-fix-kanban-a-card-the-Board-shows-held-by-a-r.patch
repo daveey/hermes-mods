@@ -1,0 +1,338 @@
+From 9abd7a982301ce70d1ad5f57ef7b122be08367e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:47:18 +0000
+Subject: [PATCH] [daveey] fix(kanban): a card the Board shows held by a
+ respawn guard never takes the worker pickup budget
+
+worker-1 2026-11-12 11:40-11:57Z: four guarded hub cards (subscription_quota_reset,
+active_pr) at priority 360..20801 sat at the top of the pickup order and filled the
+3-card batch every tick (49 imports in 17 min), so six cards pinned to machine:worker-1
+waited budget_exhausted while running < max_in_progress (t_01a1cf9fa5c6616f).
+
+The dispatcher's respawn_guarded events travel with the card history, so the replica
+shows the hold before this machine copies the card. _evaluate now reads that hold
+(kanban_pickup_held.board_hold, read-only) and copies such a card outside the budget
+(at most FREE_PER_TICK per tick): the local guard still decides on its own copy, and
+eba518b16a keeps a copy it holds. A copy it does not hold is evicted and is not copied
+again for RECHECK_SECONDS unless its Board hold changes, so it is not re-imported every
+tick. A capped tick (note_capped) records a held pinned card as `hold`, keeping
+budget_exhausted for cards a slot would start. An unreadable hold takes the budget as
+before.
+---
+ hermes_cli/kanban_pickup_held.py              |  64 ++++++++
+ hermes_cli/kanban_worker_node.py              |  30 +++-
+ .../test_kanban_pickup_held_budget.py         | 153 ++++++++++++++++++
+ 3 files changed, 241 insertions(+), 6 deletions(-)
+ create mode 100644 hermes_cli/kanban_pickup_held.py
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_held_budget.py
+
+diff --git a/hermes_cli/kanban_pickup_held.py b/hermes_cli/kanban_pickup_held.py
+new file mode 100644
+index 0000000000..9e7ff36013
+--- /dev/null
++++ b/hermes_cli/kanban_pickup_held.py
+@@ -0,0 +1,64 @@
++"""Pickup budget for foreign cards the Board already shows held by a respawn guard. [daveey]
++
++A dispatcher that holds a card (``active_pr``, ``subscription_quota_reset``, cooldowns, ...) records a
++``respawn_guarded`` event, and the event travels to the Board with the card's history, so the replica shows the hold
++before this machine copies the card. Such a card does not take the pickup budget: the budget is for cards a slot
++would start. worker-1 2026-11-12 11:40-11:57Z: four guarded hub cards at priority 360..20801 filled the 3-card batch
++on every tick (49 imports in 17 min), and six cards pinned to ``machine:worker-1`` waited ``budget_exhausted``
++(t_01a1cf9fa5c6616f).
++
++The card is still copied, outside the budget (at most :data:`FREE_PER_TICK` per tick), because the guard is
++decided where the card would run: a quota or PR hold can lift, and only a dispatcher that holds a copy re-checks it.
++A copy the local dispatcher then holds is kept (``kanban_worker_node._guard_held``). One it does not hold is
++evicted, and is not copied again for :data:`RECHECK_SECONDS` unless its Board hold changes (new hold start or a
++task row change), so an unkept copy is not re-imported every tick.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import time
++from typing import Optional
++
++_log = logging.getLogger(__name__)
++
++FREE_PER_TICK = 4
++RECHECK_SECONDS = 600
++
++# task id -> (hold signature, monotonic time it was copied outside the budget). Process-local: a restart re-checks.
++_COPIED: dict[str, tuple[tuple, float]] = {}
++
++
++def board_hold(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tuple[str, tuple]]:
++    """``(guard reason, signature)`` when the card's Board history ends in an unbroken ``respawn_guarded`` run,
++    else None. Read-only. A failed read is None: the card then takes the budget as before."""
++    from hermes_cli.kanban_db_dispatch_guard_notice import guard_hold_reason, guard_hold_started_at
++    try:
++        reason = guard_hold_reason(replica, card["id"], include_replies=False)
++        if reason is None:
++            return None
++        version = card["sync_version"] if "sync_version" in card.keys() else None
++        return reason, (version, guard_hold_started_at(replica, card["id"]), reason)
++    except Exception:  # health: allow BLE001 -- advisory; the local guard and the Board lease still decide
++        _log.warning("kanban worker node: could not read the Board hold of %s", card["id"], exc_info=True)
++        return None
++
++
++def recently_copied(tid: str, signature: tuple, *, now: Optional[float] = None) -> bool:
++    """True when this card was copied outside the budget under the same hold within :data:`RECHECK_SECONDS`."""
++    seen = _COPIED.get(tid)
++    now = time.monotonic() if now is None else now
++    return seen is not None and seen[0] == signature and now - seen[1] < RECHECK_SECONDS
++
++
++def remember(copied: dict[str, tuple], *, now: Optional[float] = None) -> None:
++    """Record the cards copied outside the budget this tick; forget entries past the recheck window."""
++    now = time.monotonic() if now is None else now
++    for tid in [t for t, (_, at) in _COPIED.items() if now - at >= RECHECK_SECONDS]:
++        del _COPIED[tid]
++    for tid, signature in copied.items():
++        _COPIED[tid] = (signature, now)
++
++
++def reset() -> None:
++    _COPIED.clear()
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index f57274f234..9c76b4f674 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -525,10 +525,14 @@ def _unimported_pinned(conn: sqlite3.Connection, replica: sqlite3.Connection, ow
+ 
+ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *, mode: str, limit: int,
+               profile_exists: Optional[Callable[[str], bool]], full_detail: str,
++              held: Optional[dict[str, tuple]] = None,
+               ) -> tuple[list[str], dict[str, tuple[str, Optional[str]]]]:
+     """One pass over the candidates: ids to copy (at most ``limit``, in candidate order) and, for each card pinned
+     to this machine that the pass leaves on the Board, why. ``budget_exhausted`` only for a card this pass would
+-    otherwise have copied, so a refusal is never hidden behind a full queue."""
++    otherwise have copied, so a refusal is never hidden behind a full queue. A card the Board shows held by a
++    respawn guard never takes the budget (``kanban_pickup_held``): with ``held`` it is copied outside ``limit``
++    (its id and hold signature added to ``held``), else it is left as ``hold``."""
++    from hermes_cli import kanban_pickup_held as kph
+     from hermes_cli.kanban_db_dispatch import review_dispatch_enabled
+     mine = _unimported_pinned(conn, replica, own)
+     reg = registry()
+@@ -544,14 +548,23 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+     skips: dict[str, tuple[str, Optional[str]]] = {
+         tid: ("parents_incomplete", "a parent is not done") for tid in mine - {c["id"] for c in listed}}
+     picked: list[str] = []
++    free = 0
+     for card in listed:
+-        full = len(picked) >= limit
++        full = len(picked) - free >= limit
+         if full and card["id"] not in mine:
+             continue
+         reason = _skip_reason(conn, card, own, reg["machines"], mode=mode, review_enabled=review_enabled,
+                               profile_exists=profile_exists)
+         if reason is None:
+             reason = _quota_held(replica, card)
++        hold = kph.board_hold(replica, card) if reason is None else None
++        if hold is not None:
++            if held is not None and free < kph.FREE_PER_TICK and not kph.recently_copied(card["id"], hold[1]):
++                held[card["id"]] = hold[1]
++                picked.append(card["id"])
++                free += 1
++                continue
++            reason = ("hold", f"respawn_guarded: {hold[0]}")
+         if reason is None and full:
+             reason = ("budget_exhausted", full_detail)
+         if reason is None:
+@@ -624,13 +637,15 @@ def pickup(conn: sqlite3.Connection, *, budget: Optional[int],
+     if replica is None:
+         return []
+     from hermes_cli import kanban_hub_admission_pickup as admission
++    from hermes_cli import kanban_pickup_held as kph
+     own = _own(conn)
++    held: dict[str, tuple] = {}
+     try:
+         picked, skips = _evaluate(conn, replica, own, mode=mode, limit=limit, profile_exists=profile_exists,
+-                                  full_detail="pickup batch full this tick")
++                                  full_detail="pickup batch full this tick", held=held)
+         # [daveey] The hub judges a hub-bound foreign card before copying it (t_01a1cf65a941bf43).
+-        picked, plans, held = admission.screen(conn, replica, own, picked)
+-        skips.update(held)
++        picked, plans, judged = admission.screen(conn, replica, own, picked)
++        skips.update(judged)
+         imported = import_cards(conn, replica, picked)
+     finally:
+         replica.close()
+@@ -638,9 +653,12 @@ def pickup(conn: sqlite3.Connection, *, budget: Optional[int],
+     skips.update({tid: ("other", "import failed") for tid in picked if tid not in imported})
+     skips.update(denied)
+     imported = [tid for tid in imported if tid not in denied]
++    kph.remember({tid: sig for tid, sig in held.items() if tid in imported})
+     _record_skips(conn, {tid: why for tid, why in skips.items() if tid not in imported})
+     if imported:
+-        _log.info("kanban worker node: picked up %d card(s) from other gateways: %s", len(imported), imported)
++        guarded = [tid for tid in imported if tid in held]
++        _log.info("kanban worker node: picked up %d card(s) from other gateways: %s%s", len(imported), imported,
++                  f" ({len(guarded)} held on the Board, outside the budget: {guarded})" if guarded else "")
+     return imported
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_pickup_held_budget.py b/tests/hermes_cli/test_kanban_pickup_held_budget.py
+new file mode 100644
+index 0000000000..fe79551c55
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_held_budget.py
+@@ -0,0 +1,153 @@
++"""A card the Board shows held by a respawn guard never takes the pickup budget (``kanban_pickup_held``).
++
++worker-1 2026-11-12 11:40-11:57Z: four guarded hub cards at the top of the dispatch order filled the 3-card pickup
++batch every tick, so six cards pinned to ``machine:worker-1`` waited ``budget_exhausted`` (t_01a1cf9fa5c6616f)."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_pickup_held as kph
++from hermes_cli import kanban_worker_node as wn
++from hermes_cli.kanban_db_connect import write_txn
++from hermes_cli.kanban_db_events import append_event
++from tests.hermes_cli import test_kanban_worker_node as support
++
++svc = support.svc
++gws = support.gws
++PIN = [f"machine:{support.WORKER}"]
++
++
++@pytest.fixture(autouse=True)
++def _fresh_cache():
++    kph.reset()
++    yield
++    kph.reset()
++
++
++@pytest.fixture
++def guard(monkeypatch):
++    """``check_respawn_guard`` holding the ids in ``held`` on this machine too."""
++    held: dict[str, str] = {}
++    real = kbd.check_respawn_guard
++    monkeypatch.setattr(kbd, "check_respawn_guard",
++                        lambda conn, tid, lane="ready": held.get(tid) or real(conn, tid, lane=lane))
++    return held
++
++
++@pytest.fixture
++def imports(monkeypatch):
++    seen: list[str] = []
++    real = wn.import_cards
++
++    def counting(conn, replica, ids):
++        done = real(conn, replica, ids)
++        seen.extend(done)
++        return done
++    monkeypatch.setattr(wn, "import_cards", counting)
++    return seen
++
++
++def _held_on_board(hub, priority, reason="subscription_quota_reset"):
++    """A hub card another machine's dispatcher holds: its ``respawn_guarded`` event is in the Board history."""
++    hub.enter()
++    tid = kb.create_task(hub.conn, title=f"held {priority}", assignee="default", priority=priority, runs_on=[])
++    with write_txn(hub.conn):
++        append_event(hub.conn, tid, "respawn_guarded", {"reason": reason})
++    hub.round()
++    return tid
++
++
++def _skip(conn, tid):
++    from hermes_cli import kanban_pickup_stall as kps
++    latest = kps.latest(conn, tid)
++    return latest["reason"] if latest else None
++
++
++def _pickup(worker, budget):
++    worker.round()
++    worker.enter()
++    return wn.pickup(worker.conn, budget=budget)
++
++
++def test_guarded_cards_do_not_fill_the_batch_and_a_pinned_card_is_picked(gws, guard, imports):
++    hub, worker = gws
++    held = [_held_on_board(hub, p) for p in (20801, 1000, 1000, 360)]
++    pinned = support._hub_card(hub, title="pinned", priority=0, runs_on=PIN)
++    guard.update({tid: "subscription_quota_reset" for tid in held})
++
++    got = _pickup(worker, 3)
++    assert pinned in got
++    assert set(held) <= set(got)  # copied outside the budget: the local guard decides on its own copy
++    assert _skip(worker.conn, pinned) != "budget_exhausted"
++
++    worker.tick(max_spawn=3)  # the local dispatcher holds the four and starts the pinned card
++    assert kb.get_task(worker.conn, pinned).status == "running"
++    for _ in range(3):  # the held copies are kept, never copied again
++        _pickup(worker, 2)
++        worker.tick(max_spawn=2)
++    assert all(imports.count(tid) == 1 for tid in held)
++    assert all(kb.get_task(worker.conn, tid).status == "ready" for tid in held)
++
++
++def test_an_unkept_held_copy_is_not_reimported_every_tick(gws, imports, monkeypatch):
++    hub, worker = gws
++    tid = _held_on_board(hub, 900, "active_pr")
++    clock = [1000.0]
++    monkeypatch.setattr(kph.time, "monotonic", lambda: clock[0])
++
++    assert _pickup(worker, 1) == [tid]
++    worker.enter()
++    assert wn.evict(worker.conn) == [tid]  # this machine's dispatcher never held it
++    for _ in range(3):
++        assert _pickup(worker, 1) == []
++    assert imports.count(tid) == 1
++    clock[0] += kph.RECHECK_SECONDS  # the recheck window passed: copy it again to re-check the guard here
++    assert _pickup(worker, 1) == [tid]
++
++
++def test_a_new_hold_is_rechecked_at_once(gws, imports):
++    hub, worker = gws
++    tid = _held_on_board(hub, 900, "active_pr")
++    assert _pickup(worker, 1) == [tid]
++    worker.enter()
++    assert wn.evict(worker.conn) == [tid]
++    hub.enter()
++    with write_txn(hub.conn):
++        append_event(hub.conn, tid, "unblocked", {})
++        append_event(hub.conn, tid, "respawn_guarded", {"reason": "recent_success"})
++    hub.round()
++    assert _pickup(worker, 1) == [tid]
++
++
++def test_the_held_imports_per_tick_are_bounded(gws, monkeypatch):
++    hub, worker = gws
++    monkeypatch.setattr(kph, "FREE_PER_TICK", 2)
++    held = [_held_on_board(hub, 900 - i) for i in range(3)]
++    plain = support._hub_card(hub, title="plain", priority=0, runs_on=PIN)
++    got = _pickup(worker, 1)
++    assert got == held[:2] + [plain]
++
++
++def test_a_capped_tick_reports_a_held_pinned_card_as_held(gws):
++    hub, worker = gws
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="pinned held", assignee="default", priority=0, runs_on=PIN)
++    with write_txn(hub.conn):
++        append_event(hub.conn, tid, "respawn_guarded", {"reason": "active_pr"})
++    hub.round()
++    worker.round()
++    worker.enter()
++    wn.note_capped(worker.conn)
++    assert _skip(worker.conn, tid) == "hold"
++
++
++def test_an_unreadable_board_hold_takes_the_budget_as_before(gws, monkeypatch):
++    hub, worker = gws
++    tid = _held_on_board(hub, 900)
++    pinned = support._hub_card(hub, title="pinned", priority=0, runs_on=PIN)
++
++    def boom(*a, **kw):
++        raise RuntimeError("bad history")
++    monkeypatch.setattr("hermes_cli.kanban_db_dispatch_guard_notice.guard_hold_reason", boom)
++    assert _pickup(worker, 1) == [tid]
++    assert _skip(worker.conn, pinned) == "budget_exhausted"
+-- 
+2.43.0
+

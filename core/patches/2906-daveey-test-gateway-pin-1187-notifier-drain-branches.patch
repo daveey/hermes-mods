@@ -1,0 +1,222 @@
+From 61d126fbce8addb0c1f32d61c3d6ced4e4ea54e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:37:58 +0000
+Subject: [PATCH] [daveey] test(gateway): pin #1187 notifier-drain branches
+ that mutants survived
+
+Independent verification t_01a1d0b770ae45db of #1187 found three surviving
+mutants in gateway/session_authority.py over the 255-test notifier/update-pause
+set. New tests, each RED with its mutant at the exact anchor and GREEN at main:
+
+- M5b (started checkpoint filtered by notifier eligibility): a started
+  checkpoint that is itself a notifier wake resumes ahead of a queued human
+  while held() is true and update_held() is false.
+- M10 / M10b (conflict-cancel successor branch removed / disabled): with a
+  held notifier wake at the FIFO front, the selected human row conflicts, then
+  conflicts again while it is cancelled (cancel) or deleted (vanish) mid-check;
+  the next eligible row runs, nothing pauses, the drain parks on the wake.
+  The vanish variant kills both mutants; in the cancel variant they are
+  equivalent (the refusal of an already-cancelled row returns True).
+- M12 (claim_changed never cleared): a notifier-held pump claims once and
+  waits; a spin guard on _claim_next fails it with PumpSpins instead of the
+  former 600 s event-loop hang.
+
+Card: t_01a1d0eac3c2908a
+---
+ .../gateway/test_conflict_cancel_successor.py | 122 ++++++++++++++++++
+ .../test_notifier_checkpoint_precedence.py    |  37 ++++++
+ 2 files changed, 159 insertions(+)
+
+diff --git a/tests/gateway/test_conflict_cancel_successor.py b/tests/gateway/test_conflict_cancel_successor.py
+index 421f928994..ce6d484f46 100644
+--- a/tests/gateway/test_conflict_cancel_successor.py
++++ b/tests/gateway/test_conflict_cancel_successor.py
+@@ -6,11 +6,14 @@ thread during the async check), the drain re-reads and runs the follower rather
+ pausing ``admission_conflict`` with the follower still queued.
+ """
+ import asyncio
++import contextlib
++import json
+ 
+ import pytest
+ 
+ from hermes_state_runtime import RuntimeStoreError, cancel_session_input, list_session_admissions
+ from tests.gateway.test_session_authority_cancel_settlement import REF, _authority, _submit
++from tests.waiting import async_wait_until
+ 
+ 
+ @pytest.mark.asyncio
+@@ -44,3 +47,122 @@ async def test_successor_runs_when_conflicted_head_is_cancelled_mid_check(tmp_pa
+                     for r in list_session_admissions(db, session_id='s', pending_only=False)}
+         assert executed == ['follower'], statuses
+         assert statuses['stale'][0] != 'queued' and statuses['follower'][0] != 'queued', statuses
++
++
++class PumpSpins(AssertionError):
++    """The drain re-claimed in a loop that never yields to the event loop."""
++
++
++def _held_wake_front(db, authority, monkeypatch):
++    """A notifier wake held by a core-update drain at the FIFO front: the queued identity the
++    claim selects (and the conflict branch must re-read) is the row behind it, not the front.
++
++    Returns the wake row and the drain's claim log. A pump that re-claims without waiting (a
++    claim_changed never cleared) never yields to the event loop, so the claim wrapper fails it
++    with PumpSpins rather than hanging the test."""
++    from gateway import session_authority, session_notifier_drain
++    from hermes_state_runtime import admit_session_input
++    from tests.hermes_state.test_notifier_claim_eligibility import wake_payload
++    monkeypatch.setattr(session_authority, '_CLAIM_RETRY_MIN_S', 60)  # no hold-expiry poll in the window
++    monkeypatch.setattr(session_notifier_drain, 'held', lambda: True)
++    claims, real_claim = [], authority._claim_next
++
++    async def claim_next(ref, live, attempted=None):
++        claims.append(1)
++        if len(claims) > 50:
++            raise PumpSpins(f'{len(claims)} claims: the notifier-held pump never waits')
++        return await real_claim(ref, live, attempted)
++    authority._claim_next = claim_next
++    identity = json.dumps(['kanban-wake', 'route', 'held'])
++    wake = admit_session_input(db, epoch=authority.epoch, session_id='s', principal_id='automation:route',
++                               request_id=identity, payload=wake_payload(identity, local=True))
++    return wake, claims
++
++
++async def _stop(task):
++    task.cancel()
++    with contextlib.suppress(asyncio.CancelledError, PumpSpins):
++        await task
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('settle', ['cancel', 'vanish'])
++async def test_successor_behind_held_wake_runs_when_conflicted_row_settles_mid_check(tmp_path, monkeypatch, settle):
++    """A held notifier wake leads the FIFO; the human row the claim selects conflicts once, then
++    conflicts again while it is settled (cancelled, or gone from the ledger). The drain re-reads
++    and runs the next eligible row: it never pauses or refuses on the settled row's verdict."""
++    from gateway import session_api_turn, session_finite
++    from gateway.config import Platform
++    db, authority = _authority(tmp_path, monkeypatch, platform=Platform.API_SERVER)
++    executed, ids, paused, checks = [], {}, [], []
++    real_pause = authority._pause
++
++    def pause(ref, reason):
++        paused.append(reason)
++        real_pause(ref, reason)
++    authority._pause = pause
++
++    def check_api_turn(authority_, ref, payload):
++        checks.append(payload.get('text'))
++        if payload.get('text') != 'stale':
++            return
++        if checks.count('stale') == 1:
++            # First verdict: the route moved under the row; nothing has settled it yet.
++            raise RuntimeStoreError('admission_conflict')
++        # The same row conflicts again and was settled while this check ran: a /stop cancel
++        # committed from a worker thread, or the row left the ledger entirely.
++        if settle == 'cancel':
++            cancel_session_input(db, epoch=authority.epoch, admission_id=ids['stale'])
++            authority._settle_cancelled(REF, ids['stale'])
++        else:
++            db._execute_write(lambda conn: conn.execute(
++                'DELETE FROM session_admissions WHERE admission_id=?', (ids['stale'],)))
++        raise RuntimeStoreError('admission_conflict')
++    monkeypatch.setattr(session_api_turn, 'check_api_turn', check_api_turn)
++
++    async def execute(authority_, ref, row):
++        executed.append(row['payload'].get('text'))
++        return 'done'
++    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
++
++    with db:
++        authority._schedule = lambda ref: None
++        wake, _claims = _held_wake_front(db, authority, monkeypatch)
++        ids['stale'] = (await _submit(authority, 'stale')).admission_id
++        await _submit(authority, 'follower')
++        del authority._schedule
++        live = authority.sessions['s']
++        authority._schedule(REF)
++        try:
++            def settled():
++                rows = list_session_admissions(db, session_id='s')
++                return [r['admission_id'] for r in rows] == [wake['admission_id']]
++            await async_wait_until(lambda: (executed == ['follower'] and settled()) or live.task.done(),
++                                   timeout=5, what='the next eligible row runs and settles')
++            pending = [r['admission_id'] for r in list_session_admissions(db, session_id='s')]
++            assert executed == ['follower'], (paused, checks)
++            assert paused == [], f'the drain paused behind a settled row: {paused}'
++            assert pending == [wake['admission_id']], 'only the held notifier wake stays queued'
++            assert not live.task.done(), 'the drain stays parked on the held wake'
++        finally:
++            await _stop(live.task)
++
++
++@pytest.mark.asyncio
++async def test_notifier_held_pump_waits_instead_of_spinning(tmp_path, monkeypatch):
++    """Only held notifier wakes queued: the pump waits on claim_changed (cleared at each claim)
++    and must not re-claim in a busy loop while the hold lasts."""
++    from gateway.config import Platform
++    db, authority = _authority(tmp_path, monkeypatch, platform=Platform.API_SERVER)
++    with db:
++        _wake, claims = _held_wake_front(db, authority, monkeypatch)
++        live = authority.sessions['s']
++        authority._schedule(REF)
++        try:
++            await async_wait_until(lambda: claims, timeout=5, what='the pump claims once')
++            for _ in range(50):
++                await asyncio.sleep(0)
++            assert not live.task.done(), live.task.exception()
++            assert len(claims) == 1, f'{len(claims)} claims while only a held notifier wake was queued'
++        finally:
++            await _stop(live.task)
+diff --git a/tests/gateway/test_notifier_checkpoint_precedence.py b/tests/gateway/test_notifier_checkpoint_precedence.py
+index 00b407c745..9e40ebfee6 100644
+--- a/tests/gateway/test_notifier_checkpoint_precedence.py
++++ b/tests/gateway/test_notifier_checkpoint_precedence.py
+@@ -35,6 +35,43 @@ async def test_checkpoint_resumes_ahead_of_held_notifier_wake(tmp_path, monkeypa
+     assert [r['admission_id'] for r in selected] == [head['admission_id']]
+ 
+ 
++@pytest.mark.asyncio
++async def test_started_notifier_wake_checkpoint_resumes_ahead_of_queued_rows(tmp_path, monkeypatch):
++    """The checkpoint is itself a notifier wake: notifier eligibility filters only queued
++    selection, so a held drain never hands its resume to a queued human behind it."""
++    from gateway import session_notifier_drain, session_update_pause
++    from hermes_state_runtime import claim_session_input
++    from hermes_state_update_pause import checkpoint_session_input
++    from tests.gateway.test_authority_update_pause import tool_boundary
++    from tests.gateway.test_session_authority_cancel_settlement import _authority
++    db, owner = _authority(tmp_path, monkeypatch)
++    identity = json.dumps(['kanban-wake', 'route', 'started'])
++    admit_session_input(db, epoch=owner.epoch, session_id='s', principal_id='automation:route',
++                        request_id=identity, payload=wake_payload(identity, local=True))
++    started = claim_session_input(db, epoch=owner.epoch, session_id='s')
++    tool_boundary(db)
++    checkpoint_session_input(db, epoch=owner.epoch, admission_id=started['admission_id'],
++        generation=started['generation'], physical_session_id='s', transcript_mark=started['transcript_mark'])
++    assert session_notifier_drain.notifier_wake(started)
++    admit_session_input(db, epoch=owner.epoch, session_id='s', principal_id='human',
++                        request_id='human', payload={'text': 'human'})
++    monkeypatch.setattr(owner, '_schedule', lambda ref: None)
++    monkeypatch.setattr(session_notifier_drain, 'held', lambda: True)
++    monkeypatch.setattr(session_update_pause, 'update_held', lambda authority: False)
++    resumed = []
++
++    async def resume(authority, ref, live, first):
++        resumed.append(first['admission_id'] if first else None)
++        return first
++    monkeypatch.setattr(session_update_pause, 'resume_checkpoint', resume)
++    selected = []
++    with db:
++        row, _first = await owner._claim_next(REF, owner.sessions['s'], selected)
++    assert row != 'notifier_held'
++    assert resumed == [started['admission_id']], 'held notifier eligibility filtered the started checkpoint'
++    assert [r['admission_id'] for r in selected] == [started['admission_id']]
++
++
+ @pytest.mark.asyncio
+ async def test_update_hold_parks_checkpoint_before_notifier_selection(tmp_path, monkeypatch):
+     from gateway import session_notifier_drain, session_update_pause
+-- 
+2.43.0
+

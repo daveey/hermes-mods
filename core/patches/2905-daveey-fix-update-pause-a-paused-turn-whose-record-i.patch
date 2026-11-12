@@ -1,0 +1,345 @@
+From b366bd19bffcd97d2e991bf22280fb070bbe41e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:47:52 +0000
+Subject: [PATCH] [daveey] fix(update-pause): a paused turn whose record its
+ live writer closed still continues in place
+
+hermes-hub 2026-11-12: two headless kanban-notice turns in the gateway paused for a
+core update; the detached-turn reaper closed their records 60 s later, the in-place
+watcher read the closed record as 'the user moved on' and quit, and every reader
+skipped the marker because its writer (the gateway) was alive. Both turns waited
+60-70 min, with no 'window ended' line and no stuck WARNING, until the next gateway
+restart.
+
+A closed record is no longer 'busy' while the marker is still this process's own
+pause: the watcher keeps watching (STUCK_WARN fires) and, when the window ends,
+re-opens the chat here via session.resume from the stored source, which schedules
+the continuation. A pause another process rewrote, or a chat in no store, ends the
+watch; a refused re-open is retried each poll.
+---
+ .../test_update_pause_closed_session.py       | 177 ++++++++++++++++++
+ tui_gateway/update_pause.py                   |  87 +++++++--
+ 2 files changed, 252 insertions(+), 12 deletions(-)
+ create mode 100644 tests/tui_gateway/test_update_pause_closed_session.py
+
+diff --git a/tests/tui_gateway/test_update_pause_closed_session.py b/tests/tui_gateway/test_update_pause_closed_session.py
+new file mode 100644
+index 0000000000..35a2ecb31d
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_closed_session.py
+@@ -0,0 +1,177 @@
++"""A paused turn whose record its own (live) writer closed still continues within the window's bound.
++
++hermes-hub 2026-11-12 (t_01a1d0e86b497ca4): two headless kanban-notice turns in the gateway paused for an update.
++The detached-turn reaper closed their records 60 s later, the in-place watcher read the closed record as "the user
++moved on" and stopped, and every reader skipped the marker because its writer (the gateway) was alive: both turns
++waited 60-70 min, with no "window ended" line and no stuck WARNING, until the next gateway restart.
++"""
++import logging
++import os
++import time
++import types
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from tui_gateway import server, startup_resume as sr, update_pause as up
++from tui_gateway.turn_marker import mark_turn_paused, marker_writer_state, read_turn_marker, record_turn_start
++
++from tests.tui_gateway import test_update_pause_recovery as base
++
++recovery = base.recovery
++CFG = base.CFG
++
++
++class _Clock:
++    def __init__(self, on_tick):
++        self.now, self.on_tick = 0.0, on_tick
++
++    def sleep(self, seconds):
++        self.now += seconds
++        self.on_tick(self.now)
++
++    def monotonic(self):
++        return self.now
++
++
++def _reap(sid):
++    """The detached-turn reaper's close (``detached_turn_cleanup._arm``): pop, then tear down."""
++    popped = server._pop_session_by_id(sid)
++    assert popped is not None
++    server._teardown_popped_session(popped, end_reason="ws_orphan_reap")
++    return popped
++
++
++def _paused_here(home):
++    # This process paused the turn: its writer is alive, as the gateway was on the hub.
++    record_turn_start(home, "paused", "finish the request")
++    mark_turn_paused(home, "paused", up.PAUSE_REASON)
++    marker = read_turn_marker(home, "paused")
++    assert marker["writer_pid"] == os.getpid() and marker_writer_state(marker) == "alive"
++
++
++def _watch_closed(monkeypatch, recovery, *, close_at, clear_at, max_s, on_tick=None, resume=None):
++    monkeypatch.setattr(up, "_detect_skew", lambda: None)
++    monkeypatch.setattr(up, "WATCH_MAX_S", max_s)
++    af.set_hold(recovery.home)  # the drain window is up while the turn pauses
++    sid = base.mount()["session_id"]
++    _paused_here(recovery.home)
++    session = server._sessions[sid]
++    state = {}
++    if resume is not None:  # only the watcher's re-open goes through it, not the mount above
++        monkeypatch.setitem(server._methods, "session.resume", resume(server._methods["session.resume"]))
++
++    def tick(now):
++        if now >= close_at and "closed" not in state:
++            state["closed"] = _reap(sid)
++            assert session.get("_closing") and session.get("_finalized")
++        if now >= clear_at and "cleared" not in state:
++            af.clear_hold(recovery.home)  # the window ends without an update
++            state["cleared"] = now
++        if on_tick is not None:
++            on_tick(now)
++
++    clock = _Clock(tick)
++    monkeypatch.setattr(up, "time", types.SimpleNamespace(sleep=clock.sleep, monotonic=clock.monotonic,
++                                                          time=time.time))
++    watcher = up.start_in_place_watcher(sid, session, "paused")
++    watcher.join(10)
++    assert not watcher.is_alive()
++    return sid, clock, state
++
++
++def test_closed_record_of_a_live_writer_continues_when_the_window_ends(recovery, monkeypatch, caplog):
++    caplog.set_level(logging.INFO, logger="tui_gateway.update_pause")
++    sid, clock, state = _watch_closed(monkeypatch, recovery, close_at=60.0, clear_at=150.0, max_s=up.PARK_MAX_S)
++    base.assert_continued(recovery)
++    # Within one poll of the window's end, well inside PARK_MAX_S, and on a fresh record (the old one is gone).
++    assert clock.now <= state["cleared"] + up.WATCH_POLL_S
++    assert sid not in server._sessions
++    assert any(s.get("session_key") == "paused" for s in server._sessions.values())
++    assert "window ended without an update; continuing session paused" in caplog.text
++
++
++def test_closed_record_left_flagged_running_still_continues(recovery, monkeypatch):
++    # A torn-down record keeps whatever flags it had: a stale ``running`` on it is no turn in this process.
++    def reap_stale(sid, _reap=_reap):
++        popped = _reap(sid)
++        with popped["history_lock"]:
++            popped["running"] = True
++        return popped
++    monkeypatch.setitem(globals(), "_reap", reap_stale)
++    _watch_closed(monkeypatch, recovery, close_at=60.0, clear_at=150.0, max_s=up.PARK_MAX_S)
++    base.assert_continued(recovery)
++
++
++def test_readers_still_leave_a_live_writers_pause_alone(recovery, monkeypatch):
++    # The precondition on the hub: the startup sweep of another backend skips the marker (writer alive), so only
++    # the writer itself can continue it.
++    _paused_here(recovery.home)
++    rows = sr.pending_resumes(recovery.home, CFG)
++    assert rows == []
++
++
++def test_closed_record_whose_reopen_keeps_failing_warns_as_stuck(recovery, monkeypatch, caplog):
++    # The window ended but the re-open keeps being refused: the watch stays up and says so at STUCK_WARN_S
++    # (the hub logged nothing for 60-70 min).
++    caplog.set_level(logging.INFO, logger="tui_gateway.update_pause")
++    def refused(real):
++        return lambda rid, params: {"id": rid, "error": {"code": 5000, "message": "busy"}}
++    _watch_closed(monkeypatch, recovery, close_at=60.0, clear_at=150.0,
++                  max_s=up.STUCK_WARN_S + 3 * up.WATCH_POLL_S, resume=refused)
++    assert recovery.calls == []
++    assert "has been paused for" in caplog.text and "continuation not yet admitted" in caplog.text
++
++
++def test_closed_record_whose_pause_another_process_took_is_not_continued_here(recovery, monkeypatch):
++    def foreign(now):
++        if now == 90.0:  # e.g. a successor rewrote the pause as its own
++            path = recovery.home / "desktop" / "interrupted_turns.json"
++            import json
++            entries = json.loads(path.read_text())
++            entries["paused"]["writer_pid"] = 2 ** 22 - 3
++            path.write_text(json.dumps(entries))
++    _, clock, _ = _watch_closed(monkeypatch, recovery, close_at=60.0, clear_at=150.0, max_s=up.PARK_MAX_S,
++                                on_tick=foreign)
++    assert recovery.calls == []
++    assert clock.now <= 150.0 + up.WATCH_POLL_S  # the watch ended at once, not at WATCH_MAX_S
++
++
++@pytest.mark.parametrize("first", [
++    {"error": {"code": 5000, "message": "busy"}},
++    {"result": {"session_id": "x"}},  # re-opened, but no continuation scheduled yet (e.g. a slot backoff)
++])
++def test_closed_record_resume_refused_once_is_retried(recovery, monkeypatch, first):
++    calls = []
++
++    def flaky(real):
++        def handler(rid, params):
++            calls.append(params)
++            if len(calls) == 1:
++                return {"id": rid, **first}
++            return real(rid, params)
++        return handler
++    _, clock, state = _watch_closed(monkeypatch, recovery, close_at=60.0, clear_at=150.0, max_s=up.PARK_MAX_S,
++                                    resume=flaky)
++    base.assert_continued(recovery)
++    assert len(calls) == 2 and all(p["source_from_store"] for p in calls)
++    assert clock.now <= state["cleared"] + 2 * up.WATCH_POLL_S
++
++
++def test_closed_record_in_no_store_ends_the_watch(recovery, monkeypatch, caplog):
++    caplog.set_level(logging.INFO, logger="tui_gateway.update_pause")
++    def missing(real):
++        return lambda rid, params: {"id": rid, "error": {"code": 4007, "message": "not found"}}
++    _, clock, state = _watch_closed(monkeypatch, recovery, close_at=60.0, clear_at=150.0, max_s=up.PARK_MAX_S,
++                                    resume=missing)
++    assert recovery.calls == []
++    assert clock.now <= state["cleared"] + up.WATCH_POLL_S
++    assert "is in no store" in caplog.text
++
++
++@pytest.mark.parametrize("flag", ["_closing", "_finalized"])
++def test_closed_flags_count_as_closed(flag):
++    import threading
++    session = {"history_lock": threading.Lock(), flag: True}
++    assert up.session_closed(session)
++    assert not up.session_closed({"history_lock": threading.Lock()})
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 9a9facedc2..200d9562a3 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -15,7 +15,9 @@ A turn the next backend would not auto-continue is never paused. A paused turn w
+ an update (expired, apply refused) continues in place (``start_in_place_watcher``), unless its pause
+ budget is spent and the drainer still runs. Drainer exit/cancellation releases that wait automatically, and
+ so does ``PARK_MAX_S`` since the pause: a paused turn never waits on a drainer that cannot apply. A turn
+-paused ``STUCK_WARN_S`` logs a WARNING naming what it waits on.
++paused ``STUCK_WARN_S`` logs a WARNING naming what it waits on. A record this writer closed meanwhile (a headless
++notice turn reaped after the pause, an evicted session) is no reason to stop: no reader takes over a live writer's
++pause, so the watcher re-opens the chat here (``resume_closed_session``) when the window ends.
+ When the update did move the checkout, the turn is left for a successor only while one is coming: this
+ process's skew watchdog runs and its idle proof holds (or a retirement is already under way). A backend
+ kept busy by other work for ``NO_REPLACEMENT_S``, one no watchdog retires, or one that has not begun
+@@ -535,6 +537,63 @@ def drain_retry_pending(session: dict, marker: dict) -> bool:
+     return False
+ 
+ 
++def session_closed(session: dict) -> bool:
++    """[daveey] The record left this process's registry (``_pop_session_by_id``) or was finalized."""
++    with session["history_lock"]:
++        return bool(session.get("_closing") or session.get("_finalized"))
++
++
++def _written_here(marker: dict) -> bool:
++    import os
++    return marker.get("writer_pid") == os.getpid()
++
++
++def resume_closed_session(marker_key: str) -> str:
++    """[daveey] Continue a pause whose record this writer closed (t_01a1d0e86b497ca4): hermes-hub 2026-11-12, two
++    headless kanban-notice turns in the gateway paused for an update, the detached-turn reaper closed their records
++    60 s later, and the watcher took the closed record for "the user moved on". Every reader skipped the marker
++    because its writer (the gateway) was alive, so both turns waited 60-70 min for the next gateway restart.
++    Re-opens the chat in this process the way the startup sweep does (``session.resume`` from the stored source),
++    which schedules the continuation. ``scheduled``; ``missing`` (no store has the chat); ``retry`` otherwise."""
++    from tui_gateway import server
++    handler = server._methods["session.resume"]
++    for n, profile in enumerate(server._readopt_wake_profiles(), 1):
++        params = {"session_id": marker_key, "omit_messages": True, "source_from_store": True,
++                  **({"profile": profile} if profile else {})}
++        env = handler(f"update-pause-resume-{n}", params) or {}
++        err = env.get("error") if isinstance(env, dict) else None
++        if not err:
++            res = env.get("result") if isinstance(env, dict) else None
++            return "scheduled" if isinstance(res, dict) and res.get("auto_continue") else "retry"
++        if not (isinstance(err, dict) and err.get("code") == 4007):
++            logger.debug("core-update pause: resume of closed session %s refused (%s); retrying", marker_key, err)
++            return "retry"
++    return "missing"
++
++
++def _announce_window_end(marker_key: str, left_at: float | None, announced: bool) -> bool:
++    if left_at is None and not announced:
++        logger.info("core-update pause: window ended without an update; continuing session %s here", marker_key)
++        return True
++    return announced
++
++
++def _schedule_here(sid: str, session: dict, marker_key: str) -> str:
++    """[daveey] ``scheduled`` (on this record), ``stop`` (a closed record's chat re-opened, or in no store), or
++    ``retry`` (the next poll decides again)."""
++    from tui_gateway import server
++    if not session_closed(session):
++        return "retry" if server._maybe_schedule_auto_continue(sid, session, marker_key) is None else "scheduled"
++    # Its record is gone from this process: re-open the chat here (a fresh record schedules the continuation),
++    # since no reader takes over a live writer's pause.
++    outcome = resume_closed_session(marker_key)
++    if outcome == "missing":
++        logger.info("core-update pause: closed session %s is in no store; dropping its watch", marker_key)
++    elif outcome == "scheduled":
++        logger.info("core-update pause: closed session %s re-opened; continuation scheduled", marker_key)
++    return "retry" if outcome == "retry" else "stop"
++
++
+ def in_place_resume_action(session: dict, marker_key: str, *, skew: Callable[[], Any] | None = None) -> str:
+     """What a paused turn's own backend does now: ``wait`` (the window is still up), ``carried`` (the window
+     is over but a synthesized turn runs over the pause: wait for it), ``leave`` (the checkout moved: the next
+@@ -557,9 +616,11 @@ def in_place_resume_action(session: dict, marker_key: str, *, skew: Callable[[],
+         why("update admission is held (drain window or update in progress)")
+         return "wait"
+     # Settled first: a turn the user (or another path) already moved on is never handed off or resumed.
++    # [daveey] A closed record (headless notice turn reaped 60 s after the pause, LRU/idle eviction) is not
++    # the user moving on: the pause is still this process's, and no reader takes over a live writer's marker.
++    closed = session_closed(session)
+     with session["history_lock"]:
+-        busy = bool(session.get("running") or session.get("_closing") or session.get("_finalized")
+-                    or session.get("_auto_continue_scheduled"))
++        busy = not closed and bool(session.get("running") or session.get("_auto_continue_scheduled"))
+     if busy:
+         # A synthesized turn running over the paused marker (prompt_turn._carry_paused_marker) is not the
+         # user moving on: wait for it, then continue the paused turn.
+@@ -571,6 +632,8 @@ def in_place_resume_action(session: dict, marker_key: str, *, skew: Callable[[],
+     marker = read_turn_marker(_home(session), marker_key)
+     if not marker or marker.get("reason") != PAUSE_REASON:
+         return "done"
++    if closed and not _written_here(marker):
++        return "done"  # another process owns this pause now
+     if (skew or _detect_skew)() is not None:
+         _keep_parked(session, marker_key, last=True)
+         why("the checkout moved; waiting for a replacement backend")
+@@ -832,7 +895,7 @@ def start_in_place_watcher(sid: str, session: dict, marker_key: str) -> threadin
+         from tui_gateway import server
+         from hermes_cli.backend_retirement import retirement
+         started, left_at, last_outlook, scheduled, over_at = time.monotonic(), None, None, False, None
+-        warned = False
++        warned = announced = False
+         try:
+             while time.monotonic() - started < WATCH_MAX_S:
+                 time.sleep(WATCH_POLL_S)
+@@ -884,15 +947,15 @@ def start_in_place_watcher(sid: str, session: dict, marker_key: str) -> threadin
+                             continue
+                         action = "resume"
+                     if action == "resume":
+-                        if left_at is None:
+-                            logger.info("core-update pause: window ended without an update; continuing session %s "
+-                                        "here", marker_key)
+-                        if server._maybe_schedule_auto_continue(sid, session, marker_key) is None:
++                        announced = _announce_window_end(marker_key, left_at, announced)
++                        outcome = _schedule_here(sid, session, marker_key)
++                        if outcome == "retry":
+                             continue  # admission refused or not yet idle: the next poll decides again
+-                        scheduled = True
+-                        # The kickoff may wait for an agent build before it claims the session: hold until
+-                        # the continuation records its marker (prompt_turn pops this), bounded by the build.
+-                        _hold_automatic_turns(session, KICKOFF_HOLD_S)
++                        if outcome == "scheduled":
++                            scheduled = True
++                            # The kickoff may wait for an agent build before it claims the session: hold until
++                            # the continuation records its marker (prompt_turn pops this), bounded by the build.
++                            _hold_automatic_turns(session, KICKOFF_HOLD_S)
+                     return
+                 except Exception:
+                     logger.debug("core-update pause watcher for %s failed a poll", marker_key, exc_info=True)
+-- 
+2.43.0
+

@@ -1,0 +1,367 @@
+From 30abb5e51af65423151b06a3d2b03af82a24bf77 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:59:30 -0800
+Subject: [PATCH] [daveey] kanban: one turn per event when a chat holds a tui
+ row and a waking local row for a card
+
+---
+ gateway/kanban_wake_sibling.py                |  76 +++++++
+ gateway/kanban_watchers_notifier.py           |   9 +-
+ .../test_kanban_notify_wake_one_turn.py       | 201 ++++++++++++++++++
+ tui_gateway/kanban_unloaded.py                |   2 +
+ tui_gateway/session_notifications.py          |   4 +-
+ 5 files changed, 290 insertions(+), 2 deletions(-)
+ create mode 100644 gateway/kanban_wake_sibling.py
+ create mode 100644 tests/gateway/test_kanban_notify_wake_one_turn.py
+
+diff --git a/gateway/kanban_wake_sibling.py b/gateway/kanban_wake_sibling.py
+new file mode 100644
+index 0000000000..d028143885
+--- /dev/null
++++ b/gateway/kanban_wake_sibling.py
+@@ -0,0 +1,76 @@
++"""One Kanban event, one turn, when a chat holds both a ``tui`` and a waking ``local`` row for a card. [daveey]
++
++A Desktop chat on the canonical gateway subscribes to its cards twice: a ``local`` row with
++``delivery_mode='notify+wake'`` (the gateway notifier wakes the chat; the LOCAL adapter's text ping is a
++no-op) and a ``tui`` ``notify`` row (the legacy Desktop poller and the unloaded sweeper write a ``kanban_notice``
++row and start a turn). Each row has its own cursor, so one completion started two model turns minutes apart
++(t_01a1ce9070eee14c: messages 872084 and 872153 for t_01a1ce83e793e24f).
++
++The waking ``local`` row owns the turn for every event it wakes on. The ``tui`` consumers treat those events as
++silent (claimed and acked, no row, no turn), in whichever order the two legs run, and the wake turn carries the
++notice line the ``tui`` row would have shown (:func:`notice_lines`). Kinds the wake leg does not wake on
++(``status``, quota and re-pin notices) stay with the ``tui`` row. A ``notify``-only ``local`` row covers nothing.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++from typing import Any, Callable, Optional
++
++WAKE_MODES = ("notify+wake", "wake")
++
++
++def _sibling(conn: Any, sub: dict, platform: str, modes: Optional[tuple] = None) -> bool:
++    sql = ("SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND platform = ? AND chat_id = ? "
++           "AND thread_id = ?")
++    args: list = [sub["task_id"], platform, sub["chat_id"], sub.get("thread_id") or ""]
++    if modes:
++        sql += f" AND delivery_mode IN ({','.join('?' * len(modes))})"
++        args.extend(modes)
++    try:
++        return conn.execute(sql + " LIMIT 1", args).fetchone() is not None
++    except sqlite3.Error:
++        return False  # unreadable: deliver as before (a duplicate beats a lost notice)
++
++
++def covered(ev: Any) -> bool:
++    """The waking ``local`` leg starts a turn for this event (``_WAKE_KINDS``, not a provisional failure)."""
++    from gateway.kanban_watchers_notifier import _WAKE_KINDS
++    from hermes_cli.kanban_failure_notice import provisional_failure
++    return getattr(ev, "kind", "") in _WAKE_KINDS and not provisional_failure(ev)
++
++
++def tui_cover(conn: Any, sub: dict) -> Optional[Callable[[Any], bool]]:
++    """For a ``tui`` row: :func:`covered` when a waking ``local`` row for the same card and chat delivers its
++    events, else None (deliver everything as before)."""
++    if (sub.get("platform") or "").lower() != "tui":
++        return None
++    return covered if _sibling(conn, sub, "local", WAKE_MODES) else None
++
++
++def tui_formatter(conn: Any, sub: dict, fmt: Callable) -> Callable:
++    """``fmt`` (``(sub, task, ev, board) -> text | None``) with the events :func:`tui_cover` covers silenced."""
++    cover = tui_cover(conn, sub)
++    if cover is None:
++        return fmt
++
++    def silenced(s, task, ev, board):
++        return None if cover(ev) else fmt(s, task, ev, board)
++    return silenced
++
++
++def has_tui_sibling(conn: Any, sub: dict) -> bool:
++    """For a waking ``local`` row: a ``tui`` row for the same card and chat defers its notice to this wake."""
++    if (sub.get("platform") or "").lower() != "local" or (sub.get("delivery_mode") or "notify") not in WAKE_MODES:
++        return False
++    return _sibling(conn, sub, "tui")
++
++
++def notice_lines(sub: dict, task: Any, events, board_slug: Optional[str]) -> list[str]:
++    """The notice text the deferring ``tui`` row would have written for the covered events, for the wake turn."""
++    from tui_gateway.session_notifications import _format_kanban_event_text
++    lines = []
++    for ev in events:
++        if covered(ev) and (text := _format_kanban_event_text(sub, task, ev, board_slug or "")):
++            lines.append(text)
++    return lines
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index 80503d3520..e5f3dfbb0b 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -337,7 +337,9 @@ class _Collector:
+         task = self.kb.get_task(conn, sub["task_id"])
+         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
+                      len(events), sub["task_id"], slug, old_cursor, cursor)
+-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
++        from gateway.kanban_wake_sibling import has_tui_sibling
++        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug,
++                "tui_notice": has_tui_sibling(conn, sub)}
+ 
+     def collect_board(self, slug: str) -> None:
+         """Claim events on one board, appending delivery dicts to ``deliveries``."""
+@@ -707,6 +709,11 @@ class _KanbanNotification:
+             synth += "\n" + t("gateway.kanban.wake.handoff", summary=self.wake_handoff)
+         if self.wake_review_detail:
+             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
++        if self.d.get("tui_notice"):
++            # The chat's tui row stays silent for these events (kanban_wake_sibling): this turn shows its notice.
++            from gateway.kanban_wake_sibling import notice_lines
++            if lines := notice_lines(sub, task, self.d["events"], self.board_slug):
++                synth += "\n" + "\n".join(lines)
+         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
+         # What a later wake for the same chat folds from while this one still waits (kanban_wake_fold).
+         self.wake_card = {"task_id": sub["task_id"], "board": self.board_slug or "",
+diff --git a/tests/gateway/test_kanban_notify_wake_one_turn.py b/tests/gateway/test_kanban_notify_wake_one_turn.py
+new file mode 100644
+index 0000000000..2fc7d97c15
+--- /dev/null
++++ b/tests/gateway/test_kanban_notify_wake_one_turn.py
+@@ -0,0 +1,201 @@
++"""One Kanban event starts one model turn in a chat holding both a ``tui`` row and a waking ``local`` row for the
++card (t_01a1ce9070eee14c). [daveey]
++
++Chat 20261026_235722_bef6c6 got t_01a1ce83e793e24f's completion twice: the ``local`` notify+wake row woke the chat
++(message 872084, 22:54:07 PST) and the ``tui`` notify row's notice started a second turn (872153, 22:59:50 PST).
++Real SQLite board and session store, real collector/delivery/poller/sweeper; only the LOCAL adapter is a recorder
++(its ``handle_message`` is the wake turn) and a legacy poller batch counts as one turn when it has text.
++"""
++
++import asyncio
++import contextlib
++import time
++
++import pytest
++
++from gateway.config import Platform
++from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
++from gateway.run import GatewayRunner
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_state import SessionDB
++from tui_gateway import kanban_unloaded as ku
++from tui_gateway.server import _collect_kanban_notifications
++
++CHAT = "20261026_235722_bef6c6"
++WAIT_PAYLOAD = {"parent": "t_parent", "parent_title": "the card this chat waits on", "ready_minutes": 30}
++
++
++class LocalAdapter:
++    """The gateway's LOCAL adapter: ``send`` is a no-op ack (session_local.py), a wake is a turn."""
++
++    def __init__(self):
++        self.sent, self.turns = [], []
++
++    async def send(self, chat_id, text, metadata=None):
++        self.sent.append(text)
++
++    async def handle_message(self, event):
++        self.turns.append(event.text)
++        event._gateway_accepted = True
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    kb.init_db()
++    adapter = LocalAdapter()
++    runner = GatewayRunner.__new__(GatewayRunner)
++    runner._running = True
++    runner.adapters = {Platform.LOCAL: adapter}
++    runner._profile_adapters = {}
++    runner._kanban_sub_fail_counts = {}
++    runner._kanban_dispatcher_lock_handle = object()
++    runner._kanban_notifier_profile = "default"
++    runner.config = None
++    return runner, adapter
++
++
++def _card(*, local_mode="notify+wake", tui=True):
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="review exact head", assignee="default")
++        if local_mode:
++            kbn.add_notify_sub(conn, task_id=tid, platform="local", chat_id=CHAT, chat_type="dm",
++                               notifier_profile="default", delivery_mode=local_mode)
++        if tui:
++            kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=CHAT, chat_type="dm",
++                               notifier_profile="default", delivery_mode="notify")
++        return tid
++    finally:
++        conn.close()
++
++
++def _event(tid, kind):
++    conn = kbc.connect()
++    try:
++        if kind == "completed":
++            assert kb.complete_task(conn, tid, summary="I approve PR #1250 at its exact head.", force=True)
++        else:
++            with kb.write_txn(conn):
++                kb._append_event(conn, tid, kind, dict(WAIT_PAYLOAD))
++    finally:
++        conn.close()
++
++
++def _cursors(tid):
++    conn = kbc.connect()
++    try:
++        last = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0]
++        rows = conn.execute("SELECT platform, last_event_id, inflight_from FROM kanban_notify_subs WHERE task_id = ?",
++                            (tid,)).fetchall()
++        return last, {r[0]: (r[1], r[2]) for r in rows}
++    finally:
++        conn.close()
++
++
++def _wake_leg(runner):
++    async def tick():
++        deliveries = await asyncio.to_thread(_notifier_collect, runner, kb, notifier_profile="default",
++                                             gc_due=False, gc_retention_days=30)
++        for d in deliveries:
++            await _KanbanNotification(runner, d, platform_cls=Platform, sub_fail_counts={}).deliver()
++    asyncio.run(tick())
++
++
++def _notice_leg():
++    """The legacy Desktop poller's collection: a batch with text becomes one notice turn."""
++    return _collect_kanban_notifications({"session_key": CHAT})
++
++
++NOTICE = {"completed": "✔ [default] @default Kanban {tid} done",
++          "chat_wait_unclaimed": "⏳ [default] @default Kanban {tid}: t_parent (the card this chat waits on)"}
++
++
++@pytest.mark.parametrize("kind", ["completed", "chat_wait_unclaimed"])
++@pytest.mark.parametrize("wake_first", [True, False], ids=["wake-first", "notice-first"])
++def test_notify_wake_event_starts_one_turn_in_either_order_and_both_legs_settle(board, kind, wake_first):
++    runner, adapter = board
++    tid = _card()
++    _event(tid, kind)
++
++    texts = []
++    for leg in (("wake", "notice") if wake_first else ("notice", "wake")):
++        if leg == "wake":
++            _wake_leg(runner)
++        else:
++            texts += _notice_leg()
++
++    turns = len(adapter.turns) + (1 if texts else 0)
++    assert turns == 1, (adapter.turns, texts)
++    assert texts == []
++    [turn] = adapter.turns
++    assert f"[kanban] Task {tid}" in turn  # follow-through's wake-leg proof stays intact
++    assert NOTICE[kind].format(tid=tid) in turn  # the notice text is not dropped: it rides the wake turn
++    last, subs = _cursors(tid)
++    assert subs["local"] == (last, None) and subs["tui"] == (last, None)  # both legs settled
++    # A later poll of either leg starts nothing.
++    _wake_leg(runner)
++    assert _notice_leg() == [] and len(adapter.turns) == 1
++
++
++def test_notify_only_local_row_leaves_the_tui_notice_turn(board):
++    runner, adapter = board
++    tid = _card(local_mode="notify")
++    _event(tid, "completed")
++    _wake_leg(runner)
++    texts = _notice_leg()
++    assert adapter.turns == []
++    assert len(texts) == 1 and NOTICE["completed"].format(tid=tid) in texts[0]
++
++
++def test_tui_only_row_still_gets_its_notice_turn(board):
++    runner, adapter = board
++    tid = _card(local_mode=None)
++    _event(tid, "completed")
++    _wake_leg(runner)
++    assert adapter.turns == [] and len(_notice_leg()) == 1
++
++
++def test_kinds_the_wake_leg_does_not_wake_on_stay_with_the_tui_row(board):
++    runner, adapter = board
++    tid = _card()
++    conn = kbc.connect()
++    try:
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "status", {"status": "ready"})
++    finally:
++        conn.close()
++    _wake_leg(runner)
++    texts = _notice_leg()
++    assert adapter.turns == [] and len(texts) == 1 and "→ ready" in texts[0]
++
++
++def test_wake_without_a_tui_sibling_keeps_its_text(board):
++    runner, adapter = board
++    tid = _card(tui=False)
++    _event(tid, "completed")
++    _wake_leg(runner)
++    [turn] = adapter.turns
++    assert f"[kanban] Task {tid} completed." in turn and f"Kanban {tid} done" not in turn
++
++
++def test_unloaded_sweeper_leaves_a_covered_event_to_the_wake_turn(board, tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_UNLOADED_WAKE", "0")
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session(CHAT, "desktop")
++    db.append_message(CHAT, "user", "start the cards")
++
++    @contextlib.contextmanager
++    def opener(chat_id):
++        yield (db, chat_id) if db.get_session(chat_id) else (None, None)
++
++    runner, adapter = board
++    tid = _card()
++    _event(tid, "completed")
++    assert ku.sweep_once(set(), now=time.time() + 3600, session_db=opener) == []
++    assert [m for m in db.get_messages(CHAT) if m.get("display_kind") == "kanban_notice"] == []
++    last, subs = _cursors(tid)
++    assert subs["tui"] == (last, None)
++    _wake_leg(runner)
++    assert len(adapter.turns) == 1 and NOTICE["completed"].format(tid=tid) in adapter.turns[0]
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 3a5eb25ed4..35ce63b0a9 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -366,6 +366,8 @@ def _sweep_sub(conn, slug, sub, grace_s, now, session_db, _kb, _kbn, kinds, fmt,
+     if oldest > now - grace_s:
+         return None  # a live poller still has time to take it
+     done = None
++    from gateway.kanban_wake_sibling import tui_formatter
++    fmt = tui_formatter(conn, sub, fmt)  # a waking local row's turn carries the events it wakes on [daveey]
+     try:
+         done = _deliver_sub(conn, slug, sub, ident, grace_s, now, session_db, _kb, _kbn, kinds, fmt, wake, holders,
+                             spawn)
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 5f383c1eb4..b7b2f44d7f 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -779,11 +779,13 @@ def _kb_poll_board_now(_kb, _kbc, _kbn, slug: str, session_key: str, claims: lis
+                          "claimed_mono": time.monotonic()}
+                 claims.append(claim)
+             task = _kb.get_task(conn, sub["task_id"])
++            from gateway.kanban_wake_sibling import tui_formatter
+             from gateway.kanban_watchers_notifier import coalesce_superseded_blocks, diagnostic_event
+             from gateway.warning_notifications import DiagnosticText
+             sub_texts = []
++            fmt = tui_formatter(conn, sub, _format_kanban_event_text)  # a waking local row's turn carries some [daveey]
+             for ev in coalesce_superseded_blocks(events):  # a block superseded by a drop in this batch renders once
+-                text = _format_kanban_event_text(sub, task, ev, slug)
++                text = fmt(sub, task, ev, slug)
+                 if text:
+                     text = DiagnosticText(text) if diagnostic_event(ev) else _KanbanText(text)
+                     from hermes_cli.kanban_failure_notice import event_key
+-- 
+2.43.0
+

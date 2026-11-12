@@ -1,0 +1,116 @@
+From fd8abfc23a05a0a884d14415514d8de9bed83912 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 13:02:11 +0000
+Subject: [PATCH] [daveey] outcome: a chat ending on a failed_turn row is
+ unresolved{turn_failed}, not judged prose
+
+_tail_reason named turn_failed only from finish_reason in _ERROR_FINISH_REASONS. A closer's failed-turn
+row has finish_reason NULL, and _lost_request skips it when the turn's trigger was a notice (not a
+typed row), so the boundary's error copy ("Couldn't process the notice ... HTTP 429 ... Retrying once
+at ...") went to the summary judge and landed unresolved{no_summary}: the session-status auditor then
+filed it under the wrong card family (MacBook chat "Fleet scheduling regression suite", msg 878269,
+card t_01a1cfc0a75d486f).
+
+_tail_reason now also returns turn_failed for an assistant tail whose display_kind (or, for legacy
+rows, untyped_failed_turn_display_kind on the exact notice text) is failed_turn, except the
+AUTOMATION_INTERRUPTED_NOTICE boundary, which keeps _lost_request's carve-out semantics.
+
+Proof:
+- RED first: the notice + failed_turn (NULL finish_reason) and legacy untyped-boundary tests failed
+  on main (reason no_summary / done), pass now; a reply quoting the notice is still judged, and the
+  interrupted-automation boundary (typed and untyped) still is.
+- Mutants (each condition dropped or flipped): 5/5 killed by tests/hermes_state/test_session_outcome.py.
+- Replay over the hub's real state.db (read-only, 499 sessions with rows): 7 change, all kanban
+  worker sessions (ws_orphan_reap) ending on the PARTIAL_FAILED_TURN_NOTICE boundary, None ->
+  turn_failed; no other tail changes.
+- tests/hermes_state/ + session outcome surfaces/refresh/completion-note suites: 2392 passed.
+---
+ hermes_state_outcome.py                    | 17 +++++++++
+ tests/hermes_state/test_session_outcome.py | 40 ++++++++++++++++++++++
+ 2 files changed, 57 insertions(+)
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 2d861438b4..29157e6999 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -502,9 +502,26 @@ def _tail_reason(tail: list[dict]) -> Optional[str]:
+         return "interrupted"
+     if (last.get("finish_reason") or "").strip().lower() in _ERROR_FINISH_REASONS:
+         return "turn_failed"
++    if _failed_turn_boundary(last):  # the only role left here is assistant
++        # [daveey] A closer's failed-turn row (finish_reason NULL) after a notice or an untyped trigger, which
++        # ``_lost_request`` does not cover: error copy is not a summary, so it never reaches the judge.
++        return "turn_failed"
+     return None
+ 
+ 
++def _failed_turn_boundary(row: dict) -> bool:
++    """[daveey] ``row`` is a failed-turn boundary (typed, or a legacy row with the exact notice text), other than
++    the interrupted-automation notice, which ``_lost_request`` also leaves to the rest of the derivation."""
++    from agent.turn_failure_copy import (
++        AUTOMATION_INTERRUPTED_NOTICE,
++        FAILED_TURN_DISPLAY_KIND,
++        untyped_failed_turn_display_kind,
++    )
++
++    kind = row.get("display_kind") or untyped_failed_turn_display_kind(row["role"], _text(row.get("content")))
++    return kind == FAILED_TURN_DISPLAY_KIND and _text(row.get("content")) != AUTOMATION_INTERRUPTED_NOTICE
++
++
+ def looks_like_summary(text: str) -> bool:
+     """Heuristic fallback when no judge can tell: a closing report is more than a line, is not a
+     question back to the user, and does not announce more work."""
+diff --git a/tests/hermes_state/test_session_outcome.py b/tests/hermes_state/test_session_outcome.py
+index 9ef51be26a..61f60cbb80 100644
+--- a/tests/hermes_state/test_session_outcome.py
++++ b/tests/hermes_state/test_session_outcome.py
+@@ -477,6 +477,46 @@ def test_failed_turn_with_no_live_work_is_turn_failed_not_judged(db):
+     assert so.derive_outcome("chat", db=db)["reason"] == "turn_failed"
+ 
+ 
++def test_a_notice_triggered_failed_turn_with_no_finish_reason_is_turn_failed_not_judged(db):
++    # A kanban notice ran a turn that hit a provider 429: the closer typed its error row failed_turn with a NULL
++    # finish_reason. _lost_request skips it (the trigger was a notice), so only the tail row can name it.
++    so.register_outcome_judge(lambda sid, text, source=None: False)
++    say(db, "assistant", SUMMARY)
++    say(db, "user", "t_x done; PR1131 request_changes", display_kind=so._NOTICE_KIND)
++    failed_turn(db, "Couldn't process the notice: HTTP 429 rate limit. Retrying once at 21:59 PT.")
++    out = so.derive_outcome("chat", db=db)
++    assert (out["kind"], out["reason"]) == ("unresolved", "turn_failed")
++    assert "judged" not in out
++
++
++def test_an_untyped_legacy_failed_turn_boundary_tail_is_turn_failed(db):
++    from agent.turn_failure_copy import PARTIAL_FAILED_TURN_NOTICE
++    so.register_outcome_judge(lambda sid, text, source=None: True)
++    say(db, "user", "card moved", display_kind=so._NOTICE_KIND)
++    say(db, "assistant", PARTIAL_FAILED_TURN_NOTICE)  # persisted before the closers typed it
++    assert so.derive_outcome("chat", db=db)["reason"] == "turn_failed"
++
++
++def test_a_reply_quoting_the_failed_turn_notice_is_still_judged(db):
++    from agent.turn_failure_copy import FAILED_TURN_NOTICE
++    so.register_outcome_judge(lambda sid, text, source=None: True)
++    say(db, "user", "what does the error row say?")
++    say(db, "assistant", f"It says: {FAILED_TURN_NOTICE}")
++    assert so.derive_outcome("chat", db=db)["kind"] == "done"
++
++
++@pytest.mark.parametrize("typed", [True, False])
++def test_an_interrupted_automation_boundary_tail_is_not_turn_failed(db, typed):
++    from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
++    so.register_outcome_judge(lambda sid, text, source=None: True)
++    say(db, "user", "a cron delivery", display_kind="cron_delivery")
++    if typed:
++        failed_turn(db, AUTOMATION_INTERRUPTED_NOTICE)
++    else:
++        say(db, "assistant", AUTOMATION_INTERRUPTED_NOTICE)
++    assert so.derive_outcome("chat", db=db)["kind"] == "done"
++
++
+ def test_a_real_reply_after_the_failure_clears_it(db, board):
+     add_card(board, "t_run", "chat", "scheduled")
+     say(db, "user", "archive my receipts")
+-- 
+2.43.0
+

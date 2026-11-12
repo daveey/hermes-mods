@@ -1,0 +1,191 @@
+From 737193be691cbb55f2215b98a08c7438207774b5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 14:15:59 +0000
+Subject: [PATCH] [daveey] kanban_complete: gate a core-PR review even when its
+ brief asked for `pr`, not `reviewed_pr`
+
+The review-contract gate (2e870e8f71, PR #1392) only refused an unreadable review when the card body itself
+spelled out `reviewed_pr` and `reviewed_sha`/`reviewed_head`. A builder-written brief that asked for `pr`
+(the URL) switched the gate off. The reviewer then wrote exactly what it was asked for, so ship refused the
+approval later: review t_01a1d004070d3361 for PR #1462 completed with `verdict`, `reviewed_sha` and `pr`.
+
+refusal() now gates a review result (unchanged is_review_result) when the body states the contract OR names a
+core-fork pull (`_PULL` with a repo in CORE_REPOS). On a body that only names the pull, the completion must
+also carry a verdict key (verdict / review_verdict / review_outcome / approved / approval). Landing and cleanup
+handoffs on core-PR cards record `reviewed_sha`/`reviewed_head`/`reviewed_pr` without a verdict and without
+`published_pr`, and they are not reviews. states_contract(), problems(), VERDICTS, _PR_REF and the refusal
+text are unchanged.
+
+Proof:
+- tests/tools/test_kanban_review_contract.py has 50 tests on main; all 50 pass unchanged. With this change the
+  file has 69 tests, all passing. The new tests run against main's module: 67 pass and 2 fail. The 2 failures
+  are test_body_asking_for_pr_key_is_still_gated (T1) and its kanban_complete-tool twin.
+- 5 mutants of the new conditions (drop the verdict clause, drop the core-pull clause, force or skip the
+  body-wording branch, names_core_pull -> True) were each killed: 4 to 9 failures.
+- Replayed old vs new rule over real completion rows, read-only. On the canonical sync-shadow default board
+  (1553 rows naming a pull), completed runs newly gated: 66. Of those, 62 are reviews with a non-standard
+  verdict or a missing reviewed_pr (includes t_01a1d004070d3361), 1 has a prose verdict, and 3 are live-proof
+  cards that use `verdict: PASS/loaded/pass` (t_01a1cbf24012b1f6, t_01a1cdd6be314e71, t_01a1ce7ed420c6bf).
+  Without the verdict-key condition, 10 more verdictless landing or cleanup handoffs would have been refused
+  (e.g. t_01a1ce4e6eb94bb2, t_01a1ce18d01255fc).
+---
+ hermes_cli/kanban_review_contract.py       | 28 ++++++--
+ tests/tools/test_kanban_review_contract.py | 74 +++++++++++++++++++++-
+ 2 files changed, 94 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_review_contract.py b/hermes_cli/kanban_review_contract.py
+index afddfc9155..4d61907c42 100644
+--- a/hermes_cli/kanban_review_contract.py
++++ b/hermes_cli/kanban_review_contract.py
+@@ -7,11 +7,12 @@ and approved, ship refused it later and a whole new review card was filed for th
+ 
+ This module catches that gap at completion time, while the reviewer can still fix it in the same run:
+ 
+-- A card *states the contract* when its body names a pull request of the core fork, ``reviewed_pr`` and the
+-  head key (``reviewed_sha``, or the ``reviewed_head`` some briefs misnamed it). Ship-filed and re-issued review
+-  cards do; so do hand-filed ones whose brief misnamed a key (``review_verdict``, ``reviewed_head``), which is
+-  exactly the case to fix. A verdict word is not required: one reviewer-lane brief asked for none and the reviewer
+-  wrote ``review_outcome``.
++- The gate applies to a card whose body names a pull request of the core fork (``names_core_pull``). It does not
++  require the body to spell out ``reviewed_pr`` or ``reviewed_sha``: a hand-written brief that asked for the wrong
++  key (``pr`` for the URL, PR #1462's land-lane review) turned the earlier wording rule off exactly when the
++  reviewer was about to write a completion ship cannot read. When the body does not spell the contract out
++  (``states_contract``), the completion must also carry a verdict key: landing and cleanup handoffs on core-pull
++  cards record ``reviewed_sha``/``reviewed_pr`` without one (replayed over the real boards) and are not reviews.
+ - On such a card, a completion whose metadata looks like a review result (any review key) must carry exactly
+   ``verdict`` in {approve, request_changes}, a lowercase 40-hex ``reviewed_sha`` and ``reviewed_pr`` naming the
+   pull. A landing/implementation handoff (``published_pr``) and a completion with no review key at all (a card
+@@ -36,6 +37,9 @@ _PR_REF = re.compile(r"(?:https://github\.com/[\w.-]+/[\w.-]+/pull/\d+|[\w.-]+/[
+ # Keys a reviewer uses for its verdict or the reviewed head: their presence makes the completion a review result.
+ _REVIEW_KEYS = ("verdict", "review_verdict", "review_outcome", "reviewed_sha", "reviewed_head", "reviewed_pr",
+                 "approved", "approval")
++# The subset that carries a verdict. On a core-pull card whose body does not spell the contract out, only these
++# make a completion a review: landing and cleanup handoffs record `reviewed_sha`/`reviewed_pr` without a verdict.
++_VERDICT_KEYS = ("verdict", "review_verdict", "review_outcome", "approved", "approval")
+ 
+ 
+ def states_contract(body: Optional[str]) -> bool:
+@@ -48,6 +52,11 @@ def states_contract(body: Optional[str]) -> bool:
+     return any(m.group("repo").lower() in CORE_REPOS for m in _PULL.finditer(text))
+ 
+ 
++def names_core_pull(body: Optional[str]) -> bool:
++    """True when ``body`` names a pull request of the core fork: the cards whose review ship lands from."""
++    return any(m.group("repo").lower() in CORE_REPOS for m in _PULL.finditer(body or ""))
++
++
+ def is_review_result(metadata: Any) -> bool:
+     """True when the completion metadata reports a review (a review key) and is not a landing handoff."""
+     if not isinstance(metadata, dict) or metadata.get("published_pr"):
+@@ -78,9 +87,14 @@ def problems(metadata: Any) -> list[str]:
+ 
+ 
+ def refusal(body: Optional[str], metadata: Any) -> Optional[str]:
+-    """The refusal text for a contract card's unreadable review completion, else None."""
+-    if not states_contract(body) or not is_review_result(metadata):
++    """The refusal text for a review result on a core-fork pull card that ship cannot read, else None."""
++    if not is_review_result(metadata):
+         return None
++    if not states_contract(body):
++        # The body does not spell the contract out: a core-fork pull card still gates a review that carries a
++        # verdict (PR1462's brief asked for `pr`); a verdictless landing/cleanup handoff is not a review.
++        if not names_core_pull(body) or not any(key in metadata for key in _VERDICT_KEYS):
++            return None
+     found = problems(metadata)
+     if not found:
+         return None
+diff --git a/tests/tools/test_kanban_review_contract.py b/tests/tools/test_kanban_review_contract.py
+index d2a0a36772..31febc5d54 100644
+--- a/tests/tools/test_kanban_review_contract.py
++++ b/tests/tools/test_kanban_review_contract.py
+@@ -44,7 +44,9 @@ def test_states_contract(body):
+     # Another repository's review keeps its own contract (myapp accepts APPROVE).
+     SHIP_BODY.replace("example-org/hermes", "example-org/myapp"),
+     SHIP_BODY.replace("daveey-hermes", "daveey-hermes-mods"),
+-    # A core PR without a reviewed head key, or without reviewed_pr, is not the ship contract.
++    # A core PR without a reviewed head key, or without reviewed_pr, does not spell out the ship contract. Since
++    # PR1462's `pr`-keyed brief, refusal() still gates such a body when the completion is a review result (it names a
++    # core-fork pull); the wording alone never makes a non-review completion refusable.
+     SHIP_BODY.replace("reviewed_sha", "head"),
+     SHIP_BODY.replace("reviewed_pr", "pr"),
+ ])
+@@ -193,6 +195,76 @@ def test_tool_accepts_exact_review(board, monkeypatch):
+     assert _status(board, tid) == "done"
+ 
+ 
++# --- a core-fork review whose brief asked for the wrong key -------------------------------------------------
++# PR1462's land-lane review brief (t_01a1d004070d3361, by t_01a1cfa4fc605bbd) asked for `pr`, not `reviewed_pr`.
++# The reviewer wrote what it was asked for and ship refused the approval. The gate keys on the core-fork pull the
++# body names, not on the body spelling the contract keys out.
++PR_KEY_PULL = "https://github.com/example-org/hermes/pull/1462"
++PR_KEY_BODY = ("Complete with `kanban_complete`, `metadata` holding `verdict` (`approve` or `request_changes`), "
++               "`reviewed_sha` (the 40-hex sha above, only if reviewed), `pr` (the URL) and `findings`.\n"
++               f"{PR_KEY_PULL}\n")
++PR_KEY_MD = {"verdict": "approve", "reviewed_sha": SHA, "pr": PR_KEY_PULL, "findings": ["none blocking"]}
++
++
++def test_body_asking_for_pr_key_is_still_gated():  # T1: fails on 2e870e8f71
++    msg = krc.refusal(PR_KEY_BODY, dict(PR_KEY_MD))
++    assert msg and "reviewed_pr: metadata.reviewed_pr is None" in msg
++    assert [p.split(":")[0] for p in krc.problems(PR_KEY_MD)] == ["reviewed_pr"]
++
++
++def test_body_asking_for_pr_key_accepts_reviewed_pr():  # T2
++    assert krc.refusal(PR_KEY_BODY, {**PR_KEY_MD, "reviewed_pr": PR_KEY_PULL}) is None
++
++
++@pytest.mark.parametrize("body", [  # T3: the same review on a card that names no core-fork pull
++    PR_KEY_BODY.replace(PR_KEY_PULL, "https://github.com/me/myapp/pull/3730"),
++    PR_KEY_BODY.replace(PR_KEY_PULL, "https://github.com/example-org/hermes-mods/pull/12"),
++    PR_KEY_BODY.replace(PR_KEY_PULL, "PR #1462"),  # a bare number names no pull
++])
++def test_body_without_core_pull_is_not_gated(body):
++    assert krc.refusal(body, dict(PR_KEY_MD)) is None
++
++
++def test_landing_handoff_on_core_pull_card_is_not_gated():  # T4
++    assert krc.refusal(PR_KEY_BODY, {"published_pr": PR_KEY_PULL, "verdict": "approve", "pr": PR_KEY_PULL}) is None
++
++
++@pytest.mark.parametrize("md", [{"pr": PR_KEY_PULL, "findings": ["x"]}, {"changed_files": ["a.py"]}, {}, None])
++def test_no_review_keys_on_core_pull_card_is_not_gated(md):  # T5
++    assert krc.refusal(PR_KEY_BODY, md) is None
++
++
++# Real landing/cleanup handoffs on core-pull cards record the reviewed head without a verdict and without
++# published_pr (t_01a1ce4e6eb94bb2, t_01a1ce18d01255fc, t_01a1cd83c4d14ff7): they are not reviews.
++LANDING_MDS = [
++    {"pr": PR_KEY_PULL, "reviewed_sha": SHA, "landed_sha": SHA, "review_task": "t_x", "pr_state": "MERGED"},
++    {"pr": PR_KEY_PULL, "reviewed_head": SHA, "landed_sha": SHA, "impl_task": "t_y"},
++    {"merge_commit": SHA, "pr": PR_KEY_PULL, "reviewed_head": SHA, "worktree": "/x"},
++    {"new_head": SHA, "review_task": "t_x", "reviewed_pr": PR_KEY_PULL},
++]
++
++
++@pytest.mark.parametrize("md", LANDING_MDS)
++def test_verdictless_handoff_on_core_pull_card_is_not_gated(md):
++    assert krc.refusal(PR_KEY_BODY, md) is None
++
++
++@pytest.mark.parametrize("md", LANDING_MDS)
++def test_verdictless_handoff_on_contract_card_is_still_gated(md):
++    assert krc.refusal(SHIP_BODY, md)
++
++
++def test_tool_refuses_pr_key_review_then_accepts_reviewed_pr(board, monkeypatch):
++    tid = _claim(board, monkeypatch, PR_KEY_BODY)
++    out = _complete(dict(PR_KEY_MD))
++    assert out.get("error") and out["rejection"] == "review_contract", out
++    assert "metadata.reviewed_pr" in out["error"]
++    assert _status(board, tid) == "running"
++    ok = _complete({**PR_KEY_MD, "reviewed_pr": PR_KEY_PULL})
++    assert not ok.get("error"), ok
++    assert _status(board, tid) == "done"
++
++
+ def test_tool_leaves_cards_without_contract_alone(board, monkeypatch):
+     tid = _claim(board, monkeypatch, "Fix the sidebar scroll. Done when its tests pass.")
+     out = _complete({"review_verdict": "approve", "reviewed_head": "abc"})
+-- 
+2.43.0
+

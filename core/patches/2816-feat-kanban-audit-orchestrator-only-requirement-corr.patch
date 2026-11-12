@@ -1,0 +1,188 @@
+From fd2d1bfa819788eeb5e8d69eec9aff0cbfb88415 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:47:27 +0000
+Subject: [PATCH] feat(kanban): audit orchestrator-only requirement corrections
+ [daveey]
+
+---
+ hermes_cli/kanban.py                          |  3 +
+ hermes_cli/kanban_parser.py                   |  3 +
+ hermes_cli/kanban_requires_edit.py            | 59 +++++++++++++++
+ tests/hermes_cli/test_kanban_edit_requires.py | 71 +++++++++++++++++++
+ 4 files changed, 136 insertions(+)
+ create mode 100644 hermes_cli/kanban_requires_edit.py
+ create mode 100644 tests/hermes_cli/test_kanban_edit_requires.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 1a53076fd8..166b2e1abc 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1320,6 +1320,9 @@ _OPERATOR_EDIT_FLAGS = ("max_retries", "goal_mode", "goal_max_turns", "max_runti
+ 
+ 
+ def _cmd_edit(args: argparse.Namespace) -> int:
++    if getattr(args, "requires", None) is not None:
++        from hermes_cli.kanban_requires_edit import cmd_edit_requires
++        return cmd_edit_requires(args)
+     if getattr(args, "completion_contract", None) is not None:
+         return _contract_cli.cmd_edit_contract(args)
+     reason = getattr(args, "reason", None)
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 312b98e8f1..f3e30e7870 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -476,6 +476,9 @@ _SPECS = [
+     ], help="Mark one or more tasks done"),
+     _cmd("edit", [
+         _TASK_ID,
++        _arg("--requires", metavar="CAPABILITIES",
++             help="Orchestrator only: replace declared requirements with a comma-separated list; empty clears. "
++                  "Idle open cards only; workspace/skill needs remain. Cannot combine with other edit flags."),
+         _arg("--title", help="Replace the task title"),
+         _arg("--body", help="Replace the task body"),
+         _arg("--priority", type=int, help="Replace priority (cap 1000; lowering requires --reason)"),
+diff --git a/hermes_cli/kanban_requires_edit.py b/hermes_cli/kanban_requires_edit.py
+new file mode 100644
+index 0000000000..ebe3355f5e
+--- /dev/null
++++ b/hermes_cli/kanban_requires_edit.py
+@@ -0,0 +1,59 @@
++"""Audited operator correction of declared task capabilities, never a worker escape hatch."""
++from __future__ import annotations
++
++import json
++import os
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_operator as operator
++
++
++def set_requires(conn, task_id, requires):
++    """Replace declared requirements on idle, open work; retain workspace/skill-implied needs."""
++    from hermes_cli.kanban_capabilities import _required_capabilities, skill_requirements
++    from hermes_cli.kanban_cli_actor import cli_actor
++
++    if os.environ.get("HERMES_KANBAN_TASK") or os.environ.get("HERMES_KANBAN_WORKER_TASK"):
++        raise operator.KanbanEditRefused("--requires is orchestrator-only; workers cannot change task capabilities")
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++        if row is None:
++            return None
++        row = dict(row)
++        if row["status"] in ("done", "archived", "running", "review") or row.get("claim_lock") or row.get("lease_holder"):
++            raise operator.KanbanEditRefused("--requires needs an idle, open card without a claim or lease")
++        skills = json.loads(row.get("skills") or "[]")
++        wanted = _required_capabilities([*requires, *skill_requirements(skills, row.get("assignee"))],
++                                        row.get("workspace_kind") or "scratch")
++        previous = json.loads(row.get("requires") or "[]")
++        if wanted == previous:
++            return {}
++        changes = {"requires": {"old": previous, "new": wanted}}
++        conn.execute("UPDATE tasks SET requires=? WHERE id=?", (json.dumps(wanted), task_id))
++        kb._append_event(conn, task_id, "edited", {"fields": ["requires"], "changes": changes, "actor": cli_actor()})
++    kb.notify_task_updated(conn, task_id, ["requires"])
++    return changes
++
++
++def cmd_edit_requires(args):
++    """Separate edit transaction: reject mixed flags rather than partially applying an edit."""
++    from hermes_cli.kanban import _OPERATOR_EDIT_FLAGS, _err
++
++    other = (*_OPERATOR_EDIT_FLAGS, "title", "body", "priority", "priority_bump", "result", "summary",
++             "metadata", "completion_contract", "reason")
++    if any(getattr(args, key, None) is not None for key in other) or getattr(args, "force", False):
++        return _err("kanban edit: --requires cannot be combined with other edit flags", 2)
++    value = args.requires
++    requires = [] if value == "" else [part.strip() for part in value.split(",")]
++    try:
++        with kbc.connect_closing() as conn:
++            changes = set_requires(conn, args.task_id, requires)
++    except ValueError as exc:
++        return _err(f"kanban edit: {exc}", 2)
++    if changes is None:
++        return _err(f"cannot edit {args.task_id} (unknown id)")
++    detail = changes.get("requires")
++    message = f"requires: {detail['old']!r} -> {detail['new']!r}" if detail else "requires unchanged"
++    print(f"Edited {args.task_id} ({message})")
++    return 0
+diff --git a/tests/hermes_cli/test_kanban_edit_requires.py b/tests/hermes_cli/test_kanban_edit_requires.py
+new file mode 100644
+index 0000000000..b16c0ec53f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_edit_requires.py
+@@ -0,0 +1,71 @@
++"""Operator-only capability corrections are validated, durable and audited."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_edit_operator_fields as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def test_edit_requires_cli_readback_and_audit(kanban_home, capsys):
++    tid = helpers._new(requires=["terminal", "host_repo"])
++    assert helpers._main(["edit", tid, "--requires", "terminal,file,git"]) == 0
++    assert "requires:" in capsys.readouterr().out
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, tid).requires == ["terminal", "file", "git"]
++        event = [e for e in kb.list_events(conn, tid) if e.kind == "edited"][-1]
++        assert event.payload["changes"]["requires"] == {
++            "old": ["terminal", "host_repo"], "new": ["terminal", "file", "git"]}
++    assert helpers._main(["edit", tid, "--requires", "terminal,file,git"]) == 0
++    assert len(helpers._edited_events(tid)) == 1
++
++
++@pytest.mark.parametrize("variable", ["HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK"])
++def test_worker_cannot_edit_requires(kanban_home, monkeypatch, variable, capsys):
++    tid = helpers._new(requires=["host_repo"])
++    monkeypatch.setenv(variable, tid)
++    assert helpers._main(["edit", tid, "--requires", "terminal"]) == 2
++    assert "orchestrator-only" in capsys.readouterr().err
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, tid).requires == ["host_repo"]
++    assert helpers._edited_events(tid) == []
++
++
++@pytest.mark.parametrize("value", ["bogus", "terminal,,file", "terminal,ssh:"])
++def test_edit_requires_invalid_values_leave_card_unchanged(kanban_home, value):
++    tid = helpers._new(requires=["host_repo"])
++    assert helpers._main(["edit", tid, "--requires", value]) == 2
++    assert helpers._edited_events(tid) == []
++
++
++def test_edit_requires_can_explicitly_clear(kanban_home):
++    tid = helpers._new(requires=["host_repo"])
++    assert helpers._main(["edit", tid, "--requires", ""]) == 0
++    with kbc.connect() as conn:
++        assert json.loads(conn.execute('SELECT requires FROM tasks WHERE id=?', (tid,)).fetchone()[0]) == []
++
++
++@pytest.mark.parametrize("status", ["running", "review", "done", "archived"])
++def test_requires_edit_preserves_nonidle_or_closed_cards(kanban_home, status):
++    tid = helpers._new(requires=["host_repo"])
++    with kbc.connect() as conn:
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
++        conn.commit()
++    assert helpers._main(["edit", tid, "--requires", "terminal"]) == 2
++    assert helpers._edited_events(tid) == []
++
++
++def test_requires_edit_retains_workspace_needs(kanban_home, tmp_path):
++    tid = helpers._new(workspace_kind="dir", workspace_path=str(tmp_path), requires=["host_repo"])
++    assert helpers._main(["edit", tid, "--requires", ""]) == 0
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, tid).requires == ["terminal", "file", "host_repo"]
++
++
++def test_requires_edit_refuses_combined_flags(kanban_home):
++    tid = helpers._new(requires=["host_repo"])
++    assert helpers._main(["edit", tid, "--requires", "terminal", "--title", "replacement"]) == 2
++    assert helpers._edited_events(tid) == []
+-- 
+2.43.0
+

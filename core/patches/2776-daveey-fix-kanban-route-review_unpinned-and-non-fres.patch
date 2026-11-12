@@ -1,0 +1,384 @@
+From 723f40aa7c518e297625628615ee81a264dd1313 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 14:26:17 +0000
+Subject: [PATCH] [daveey] fix(kanban): route review_unpinned and non-fresh
+ pins off a known quota wall before spawn
+
+PR #1071 only moved base-tier `default` cards off a wall the host already
+knows (provider_walls.json or the live pool). Two routes still spawned one
+exit-75 run into it per card:
+
+- Review lane: `review_unpinned` picked openai-codex while provider_walls.json
+  held it for days (hub run 174730, card t_01a1c4799083f6b4).
+  `resolve_dispatch_tier` now tries the other independent reviewers the
+  resolver itself would choose (strong tier, then deep routes distinct from the
+  implementer) and takes the first on an unwalled provider
+  (`review_unpinned+wall:<provider>`). None free, or a `require_model: true`
+  line: the route is kept, never a second wall. An active quota episode still
+  decides first.
+- Pinned cards: `kanban_pin_reroute` rule 1 accepted only the card's own wall
+  or a live-pool wall on a fresh card, so a card woken from `scheduled` paid one
+  wall run (MBP run 13181, t_c21c170e). Rule 1 now also accepts a wall the
+  provider file or live pool knows on the pin's provider, fresh or not
+  (`known_wall`). The other rules (min hours, non-mandatory, ready lane, one
+  class, free peer) are unchanged; `record` reads the same wall for resets_at.
+
+Tests: RED->GREEN for both gaps with controls (mandatory column and marker,
+walled peer, near wall, no/walled alternative reviewer), plus the M2f mutant
+test: a default card naming `require_model` in prose is still moved off a
+walled default provider by `_class_alternate_off_wall`.
+---
+ hermes_cli/kanban_model_tier.py               |  41 +++++-
+ hermes_cli/kanban_pin_reroute.py              |  34 +++--
+ hermes_cli/kanban_review_model.py             |  25 ++++
+ tests/hermes_cli/test_kanban_pin_reroute.py   | 124 +++++++++++++++++-
+ .../test_kanban_quota_episode_walls.py        |  21 +++
+ 5 files changed, 230 insertions(+), 15 deletions(-)
+
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 86de502d1c..9e3c331953 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -308,12 +308,11 @@ def resolve_dispatch_tier(conn, task, *, lane, cfg=None):
+     if base[2] == 'pinned':
+         from hermes_cli.kanban_pin_reroute import REASON, pinned_route
+         if not route and not active(conn, task.id):
+-            # The episode is closed (a rerouted run ended) but the pin's wall may still be up.
++            # No live episode (none yet, or a rerouted run ended) but the pin's wall may still be up: the card's
++            # own, or one the provider file / live pool knows (kanban_pin_reroute rule 1).
+             import time
+-            from hermes_cli.kanban_pin_reroute import fresh_live_wall
+             try:
+-                now = time.time()  # a fresh card's live-pool wall stands in for its own run's (kanban-dd62aef001)
+-                route = pinned_route(conn, task, lane=lane, now=now, current=fresh_live_wall(conn, task, now),
++                route = pinned_route(conn, task, lane=lane, now=time.time(),
+                                      cfg=load_tier_config() if cfg is None else cfg)
+             except sqlite3.Error:
+                 raise
+@@ -336,9 +335,43 @@ def resolve_dispatch_tier(conn, task, *, lane, cfg=None):
+             probe, load_tier_config() if cfg is None else cfg)
+         if moved:
+             return moved[0], moved[1], f'{base[2]}+wall:{moved[2]}'
++    if base[2] == 'review_unpinned':
++        moved = _review_off_wall(conn, task, base, load_tier_config() if cfg is None else cfg)
++        if moved:
++            return moved[0], moved[1], f'{base[2]}+wall:{moved[2]}'
+     return base
+ 
+ 
++def _review_off_wall(conn, task, base, cfg):
++    """``(model, provider, walled_provider)``: another independent reviewer when the ``review_unpinned`` route's
++    provider is walled right now (provider file or live pool), else None. [daveey]
++
++    Candidates are the ones the review resolver itself would pick (strong tier, then deep routes distinct
++    from the implementer), skipping any on a walled provider. None keeps the route: never a second wall.
++    Hub run 174730 (2026-11-12): review_unpinned chose openai-codex while provider_walls.json held it for
++    days, and the reviewer exited 75 into the wall."""
++    import time
++    from hermes_cli import kanban_provider_walls as pw
++    from hermes_cli.kanban_review_model import _implementer_model, independent_routes
++    model, provider = _str(base[0]), pw._norm(base[1])
++    if not model or not provider or provider == 'auto' or pw.requires_model(task):
++        return None
++    now = time.time()
++    walled = pw.active_walls(now=now)
++    if not (walled.get(provider) or pw.live_quota_wall(provider, model)):
++        return None
++    implementer = _implementer_model(conn, task)
++    if not implementer:
++        return None
++    for alt_model, alt_provider in independent_routes(implementer, cfg, getattr(task, 'assignee', None)):
++        alt_provider = pw._norm(alt_provider)
++        if (not alt_provider or alt_provider == 'auto' or alt_provider == provider or alt_provider in walled
++                or pw.live_quota_wall(alt_provider, alt_model)):
++            continue
++        return alt_model, alt_provider, provider
++    return None
++
++
+ def _class_alternate_off_wall(conn, task, base):
+     """``(model, provider, walled_provider)`` from the assignee's routing class when *base*'s provider is walled
+     right now (provider file or live pool), else None. [daveey]
+diff --git a/hermes_cli/kanban_pin_reroute.py b/hermes_cli/kanban_pin_reroute.py
+index 5e2aacc97b..364322369c 100644
+--- a/hermes_cli/kanban_pin_reroute.py
++++ b/hermes_cli/kanban_pin_reroute.py
+@@ -8,9 +8,10 @@ an explicit pin had no fallback, and workers cannot re-pin a card. David, 11-11
+ Rule (:func:`pinned_route`); every condition must hold, anything else keeps the pin as before:
+ 
+ 1. one of the card's own runs hit a wall on the pin's provider (its ``quota_episode`` receipts, an
+-   earlier ``model_reroute``, or the live episode), and that wall is still up; or the card has no earlier
+-   run and the live pool is quota-walled for the pinned model right now (:func:`fresh_live_wall`): its
+-   first run would only exit 75 into that wall to learn it (kanban-dd62aef001);
++   earlier ``model_reroute``, or the live episode), and that wall is still up; or the pin's provider is
++   walled right now in ``provider_walls.json`` or the live pool is quota-walled for the pinned model
++   (:func:`known_wall`), fresh card or not: its next run would only exit 75 into that wall to learn it
++   (kanban-dd62aef001; t_c21c170e, 11-12: a card woken from ``scheduled`` paid one wall run);
+ 2. it resets ``kanban.pin_quota_reroute_min_hours`` (default 6) or more from now;
+ 3. the pin is not mandatory: neither ``tasks.model_pin_mandatory`` nor a ``require_model: true`` body line;
+ 4. the lane is ready, not review;
+@@ -123,13 +124,25 @@ def fresh_live_wall(conn: Any, task: Any, now: Optional[float] = None,
+     return {pinned[1]: float(until)}
+ 
+ 
++def known_wall(pinned: tuple[str, str], now: Optional[float] = None) -> Optional[dict[str, float]]:
++    """``{provider: reset}`` when the pin's provider is walled right now in ``provider_walls.json`` or the live
++    pool is quota-walled for the pinned model (the later reset of the two), whatever the card's history."""
++    from hermes_cli.kanban_provider_walls import active_walls, live_quota_wall
++    now = time.time() if now is None else now
++    model, provider = pinned
++    resets = [until for until in (active_walls(now=now).get(provider), live_quota_wall(provider, model))
++              if isinstance(until, (int, float)) and until > now]
++    return {provider: float(max(resets))} if resets else None
++
++
+ def pinned_route(conn: Any, task: Any, *, lane: str, now: float, cfg: Optional[dict],
+                  current: Optional[dict[str, float]] = None) -> Optional[tuple[str, str]]:
+     """Same-class ``(model, provider)`` this pinned card's run may use instead of its walled pin, or None.
+ 
+-    ``current`` is the live quota episode's walls. Other cards' walls (the provider wall files and the
+-    live pool) only rule peers out, never move a pin. Non-allocating: reads config and the credential
+-    pool and writes nothing, so preview and admission decide alike."""
++    ``current`` is the live quota episode's walls. A wall the provider file or the live pool knows on the
++    pin's own provider counts as the card's (rule 1); on any other provider it only rules peers out.
++    Non-allocating: reads config and the credential pool and writes nothing, so preview and admission
++    decide alike."""
+     from agent.model_routing import ModelRoutingError, eligible_routes, validate_policy
+     from agent.model_routing_agent import class_requirements
+     from hermes_cli.config import is_provider_enabled
+@@ -140,6 +153,8 @@ def pinned_route(conn: Any, task: Any, *, lane: str, now: float, cfg: Optional[d
+         return None
+     model, provider = pinned
+     own = own_walls(conn, task.id, now, current)
++    if provider not in own:
++        own.update({name: (until, None) for name, until in (known_wall(pinned, now) or {}).items()})
+     if provider not in own or own[provider][0] - now < min_wall_seconds(cfg):
+         return None
+     config = _assignee_config(getattr(task, "assignee", None)) or {}
+@@ -181,9 +196,10 @@ def record(conn: Any, task: Any, origin: tuple[str, str], target: tuple[str, str
+     for wall in (_outstanding(conn, task.id, state, now) if state else []):
+         if origin[1] in _providers(wall):
+             current[origin[1]] = max(current.get(origin[1], 0), wall["until"])
+-    if not current:
+-        current = fresh_live_wall(conn, task, now, pinned=origin) or {}
+-    resets_at, episode_id = own_walls(conn, task.id, now, current).get(origin[1], (None, None))
++    own = own_walls(conn, task.id, now, current)
++    if origin[1] not in own:  # moved by a wall the provider file / live pool knows (pinned_route rule 1)
++        own.update({name: (until, None) for name, until in (known_wall(origin, now) or {}).items()})
++    resets_at, episode_id = own.get(origin[1], (None, None))
+     payload = {"from_model": origin[0], "from_provider": origin[1], "to_model": target[0],
+                "to_provider": target[1], "walled_provider": origin[1], "resets_at": resets_at,
+                "episode_id": episode_id, "run_id": getattr(task, "current_run_id", None)}
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index aa2cb907f1..93dd77818a 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -157,6 +157,31 @@ def _independent(pin, cfg, assignee, *, registered=False):
+     return _distinct_deep(pin, assignee, registered=registered)
+ 
+ 
++def independent_routes(pin, cfg, assignee):
++    """Every ``(model, provider)`` :func:`_independent` may pick for an implementer on *pin*, in its order:
++    the concrete strong tier, then each eligible deep route. Read-only; an unreadable policy yields none."""
++    strong = str(cfg.get("strong_model") or "").strip()
++    if strong and strong != pin and not is_class_selector(strong):
++        from hermes_cli.kanban_model_tier import infer_provider
++        yield strong, str(cfg.get("strong_provider") or "").strip() or infer_provider(strong)
++    from agent.model_routing_agent import class_requirements
++    from hermes_cli.config import is_provider_enabled
++    from hermes_cli.kanban_model_assignment import _assignee_config
++    config = _assignee_config(assignee) or {}
++    policy = config.get("model_routing") or {}
++    try:
++        validate_policy(policy)
++    except ModelRoutingError:  # no provable alternate; the caller keeps its route
++        return
++    if not policy.get("enabled", False):
++        return
++    providers = config.get("providers") or {}
++    for route in eligible_routes(policy, "deep", class_requirements(config), eligible=lambda r: is_provider_enabled(
++            providers.get(r["provider"], {}))):
++        if route["model"] != pin:
++            yield route["model"], route["provider"]
++
++
+ def resolve_review_model(conn, task, cfg):
+     """Return a review override/distinct route, or None for legacy unpinned reviews."""
+     override = _override(conn, task)
+diff --git a/tests/hermes_cli/test_kanban_pin_reroute.py b/tests/hermes_cli/test_kanban_pin_reroute.py
+index 386004fbea..a78708a91f 100644
+--- a/tests/hermes_cli/test_kanban_pin_reroute.py
++++ b/tests/hermes_cli/test_kanban_pin_reroute.py
+@@ -227,8 +227,9 @@ def test_an_expired_earlier_wall_does_not_rule_out_its_provider(board, monkeypat
+ 
+ 
+ def test_pin_walled_only_by_another_cards_wall_holds(board, monkeypatch, all_assignees_spawnable):
+-    """Rule 1: the card's own episode must have hit the pin's provider. Here its run was walled on
+-    anthropic and codex is walled only by another card's wall: the pin waits, as before."""
++    """The card's live episode walled anthropic; codex is walled only by another card's wall. That known
++    codex wall counts for rule 1, but the only class peer is anthropic, behind the card's own wall: the pin
++    waits, never into a second wall."""
+     clock = _clock(monkeypatch)
+     _deep(monkeypatch)
+     with kbc.connect() as conn:
+@@ -354,6 +355,125 @@ def test_fresh_pin_with_no_reroute_is_held_on_its_live_wall(board, monkeypatch,
+         assert diags[0].data['hold_reason'] == 'pinned_quota_wall' and diags[0].data['hold_until'] == int(until[0])
+ 
+ 
++# --- a non-fresh pin on a wall the host already knows (t_c21c170e, 2026-11-12) ---------------------------
++
++def _known_codex_wall(monkeypatch, evidence, until):
++    if evidence == 'provider_file':
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': until})
++    else:
++        monkeypatch.setattr(walls, 'live_quota_wall', lambda p, m: until if (m, p) == PIN else None)
++
++
++def _card_with_an_earlier_run(conn, **kw):
++    """A pinned card whose earlier run ended without any wall (it ran on its pin, then was reclaimed)."""
++    tid = _pinned_card(conn, **kw)
++    assert _tick(conn) == [PIN]
++    kb.reclaim_task(conn, tid, reason='test')
++    assert kb.get_task(conn, tid).status == 'ready'
++    assert conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL',
++                        (tid,)).fetchone()[0] == 1
++    return tid
++
++
++@pytest.mark.parametrize('evidence', ['provider_file', 'live_pool'])
++def test_non_fresh_pin_on_a_known_wall_reroutes_before_its_next_spawn(
++        board, monkeypatch, all_assignees_spawnable, evidence):
++    """MBP run 13181: a pinned card with earlier runs, woken while provider_walls.json held codex, spawned on
++    codex and exited 75; only run 13184 rerouted. The known wall on the pin's provider now counts for
++    rule 1 whatever the card's history, so no run pays the wall to learn it."""
++    clock = _clock(monkeypatch)
++    _deep(monkeypatch)
++    with kbc.connect() as conn:
++        tid = _card_with_an_earlier_run(conn)
++        until = float(clock[0] + 55 * 3600)
++        _known_codex_wall(monkeypatch, evidence, until)
++        clock[0] += 60
++        assert _tick(conn) == [PEER]
++        task = kb.get_task(conn, tid)
++        assert (task.model_override, task.provider_override) == PIN
++        assert _events(conn, tid, 'run_route')[-1]['tier_reason'] == 'pinned+pin_quota_reroute:openai-codex'
++        [event] = _events(conn, tid, 'model_reroute')
++        assert (event['walled_provider'], event['resets_at'], event['episode_id']) == ('openai-codex', until, None)
++        assert len(_comments(conn, tid)) == 1
++
++
++@pytest.mark.parametrize('case', ['flag', 'marker', 'peer_walled', 'near_wall'])
++def test_non_fresh_pin_on_a_known_wall_controls_never_move(board, monkeypatch, all_assignees_spawnable, case):
++    """Controls: a mandatory pin (column or ``require_model: true`` line), a walled only peer, or a wall under
++    the min-hours threshold keep the pin exactly as before."""
++    clock = _clock(monkeypatch)
++    _deep(monkeypatch)
++    with kbc.connect() as conn:
++        tid = _card_with_an_earlier_run(conn, mandatory=case == 'flag',
++                                        body='must run on astra\nrequire_model: true' if case == 'marker' else None)
++        hours = 2 if case == 'near_wall' else 55
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': float(clock[0] + hours * 3600)})
++        if case == 'peer_walled':
++            monkeypatch.setattr(walls, 'live_quota_wall',
++                                lambda p, m: float(clock[0] + 3600) if p == 'anthropic' else None)
++        clock[0] += 60
++        assert _tick(conn) == [PIN]
++        assert _events(conn, tid, 'model_reroute') == [] and _comments(conn, tid) == []
++
++
++# --- the review lane on a known wall (hub run 174730, 2026-11-12) ---------------------------------------
++
++GROK = ('grok-5', 'xai-oauth')
++
++
++def _review_card(conn, body=None):
++    """A card in review whose implementer ran opus: strong tier = opus, so review_unpinned picks the next
++    deep route distinct from it, astra on openai-codex."""
++    tid = kb.create_task(conn, title='review me', body=body, assignee='a', model_override=PEER[0],
++                         provider_override=PEER[1])
++    conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++    conn.commit()
++    return tid
++
++
++@pytest.mark.parametrize('evidence', ['provider_file', 'live_pool'])
++def test_review_unpinned_on_a_walled_provider_moves_to_a_free_independent_reviewer(
++        board, monkeypatch, evidence):
++    clock = _clock(monkeypatch)
++    config, _ = _deep(monkeypatch)
++    config['model_routing']['routes']['deep'].append(
++        dict(config['model_routing']['routes']['deep'][0], model=GROK[0], provider=GROK[1]))
++    with kbc.connect() as conn:
++        tid = _review_card(conn)
++        task = kb.get_task(conn, tid)
++        assert tier.resolve_dispatch_tier(conn, task, lane='review') == (*PIN, 'review_unpinned')  # no wall yet
++        _known_codex_wall(monkeypatch, evidence, float(clock[0] + 55 * 3600))
++        assert tier.resolve_dispatch_tier(conn, task, lane='review') == (
++            *GROK, 'review_unpinned+wall:openai-codex')
++        # Admission (before the first spawn) pins the free reviewer on the in-memory task and records it.
++        reason = tier.apply_model_tier(conn, task, lane='review')
++        assert reason == 'review_unpinned+wall:openai-codex'
++        assert (task.model_override, task.provider_override) == GROK
++        tier_event = _events(conn, tid, 'model_tier')[-1]
++        assert (tier_event['model'], tier_event['provider'], tier_event['implementer_model']) == (*GROK, PEER[0])
++        persisted = kb.get_task(conn, tid)
++        assert (persisted.model_override, persisted.provider_override) == PEER  # the row never moves
++
++
++@pytest.mark.parametrize('case', ['no_alternative', 'alternative_walled', 'marker'])
++def test_review_unpinned_keeps_its_route_without_a_free_alternative(board, monkeypatch, case):
++    """Never a second wall: with every other independent reviewer walled (or none), or a ``require_model``
++    line, the review keeps its route, as before."""
++    clock = _clock(monkeypatch)
++    config, _ = _deep(monkeypatch)
++    if case != 'no_alternative':
++        config['model_routing']['routes']['deep'].append(
++            dict(config['model_routing']['routes']['deep'][0], model=GROK[0], provider=GROK[1]))
++    until = float(clock[0] + 55 * 3600)
++    if case == 'alternative_walled':
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': until, 'xai-oauth': until})
++    else:
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': until})
++    with kbc.connect() as conn:
++        tid = _review_card(conn, body='must review on astra\nrequire_model: true' if case == 'marker' else None)
++        assert tier.resolve_dispatch_tier(conn, kb.get_task(conn, tid), lane='review') == (*PIN, 'review_unpinned')
++
++
+ # --- the mandatory mark: create, set-model, tool, sync ---------------------------------------------
+ 
+ def test_create_flag_requires_a_pin_and_persists(board):
+diff --git a/tests/hermes_cli/test_kanban_quota_episode_walls.py b/tests/hermes_cli/test_kanban_quota_episode_walls.py
+index a99d2ecfec..d9594038fd 100644
+--- a/tests/hermes_cli/test_kanban_quota_episode_walls.py
++++ b/tests/hermes_cli/test_kanban_quota_episode_walls.py
+@@ -306,6 +306,27 @@ def test_fresh_card_skips_a_known_wall_before_its_first_spawn(board, monkeypatch
+         assert receipt['tier_reason'] == 'default+wall:openai-codex'
+ 
+ 
++def test_class_alternate_ignores_require_model_named_in_prose(board, monkeypatch, all_assignees_spawnable):
++    """Mutant M2f (t_01a1d00e5aa896fd): ``_class_alternate_off_wall`` must use the deliberate-line check, not a
++    substring. A default card whose prose names `require_model` (the storm alert's own body did) still moves
++    off the walled default provider before its first spawn; only the class alternate can move it here."""
++    clock = _clock(monkeypatch)
++    config, _ = routing(monkeypatch)
++    route = config['model_routing']['routes']['standard'][0]
++    config['model_routing']['routes'] = {'deep': [dict(route, model='claude-opus-5-5'),
++                                                   dict(route, provider='openai-codex', model='gpt-6-astra')]}
++    monkeypatch.setattr(tier, 'load_tier_config', lambda: LIVE_CFG)
++    monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': float(clock[0] + 5000)})
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='storm alert', assignee='a', body=(
++            'Cards pinned to the walled provider (`require_model`) keep their route.\n'
++            'require_model: false'))
++        assert not walls.requires_model(kb.get_task(conn, tid))
++        assert tier.resolve_dispatch_tier(conn, kb.get_task(conn, tid), lane='ready') == (
++            'claude-opus-5-5', 'anthropic', 'default+wall:openai-codex')
++
++
+ def test_fresh_card_class_alternate_never_lands_on_another_wall(board, monkeypatch, all_assignees_spawnable):
+     """Control: the class alternate is walled too (live pool); with no usable route the card keeps its
+     default route rather than being sent into a second wall."""
+-- 
+2.43.0
+

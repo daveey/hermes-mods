@@ -1,0 +1,846 @@
+From 2526091a856dc4bc36aad4172866d2810fa6b633 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:40:54 +0000
+Subject: [PATCH] [daveey] always-on roll: paused turns wait for the warming
+ successor; proxy keeps half-closed responses; fenced reaper
+
+Review 5878814630 of #1611 (t_01a1d0b9223dd165):
+
+B1: a turn paused for a core update on an always-on backend gave up at
+update_pause.HANDOFF_WAIT_S (90 s) while its successor was still booting and
+warming, continued on stale code, and the roller's 900 s backstop could
+SIGTERM it mid-turn.
+- The superseded watchdog polls every 2 s (10 s while a live turn refuses the
+  fence), so an idle superseded backend retires seconds after the switch.
+- web_server_skew_exit.successor_pending(): true while active.json shows a roll
+  in flight (another port warming) or already switched away. While it holds,
+  _leave_decision skips HANDOFF_WAIT_S and the in-place backstop is
+  SUCCESSOR_WARMING_GRACE_S (420 s) instead of LEAVE_GRACE_S. A busy backend
+  still continues after NO_REPLACEMENT_S as before.
+- reap_superseded retires through the backend's own idle fence
+  (/api/health/retirement prepare+commit) after the grace and only SIGTERMs
+  after 6 h; its clock is persisted in superseded.json so a roller restart
+  (every core update) no longer resets it.
+
+B2: Proxy._pipe closed its writer right after write_eof, so a client that
+half-closed after its request got an empty response. _pipe now only
+half-closes; handle closes both sockets once both directions finish (or one
+breaks).
+
+Nits: pick_port adopts a still-booting backend the previous roll left warming;
+the roll re-checks unit + health before switching; supervise survives a bad
+poll; _http_get catches http.client.HTTPException; malformed hour_epoch is
+skipped; Proxy.target keys its cache on (st_ino, st_mtime_ns); replay_paths
+docstring says two hours; the dashboard_procs test patches _on_linux and
+route_always_on_backends instead of sys.platform/__kwdefaults__.
+---
+ hermes_cli/always_on_rollover.py              | 190 ++++++++++++++----
+ hermes_cli/web_server_skew_exit.py            |  51 ++++-
+ tests/hermes_cli/test_always_on_rollover.py   | 179 ++++++++++++++++-
+ .../tui_gateway/test_update_pause_recovery.py |  34 ++++
+ tui_gateway/update_pause.py                   |  31 ++-
+ 5 files changed, 414 insertions(+), 71 deletions(-)
+
+diff --git a/hermes_cli/always_on_rollover.py b/hermes_cli/always_on_rollover.py
+index de987ae7d2..7f40d34a9b 100644
+--- a/hermes_cli/always_on_rollover.py
++++ b/hermes_cli/always_on_rollover.py
+@@ -32,6 +32,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import contextlib
++import http.client
+ import json
+ import os
+ import re
+@@ -40,6 +41,7 @@ import socket
+ import subprocess
+ import sys
+ import time
++import traceback
+ import urllib.error
+ import urllib.parse
+ import urllib.request
+@@ -71,7 +73,9 @@ WARM_MAX_REPLAYS = 40
+ SUPERVISE_POLL_S = 15.0
+ DRIFT_CONFIRMATIONS = 2      # consecutive polls a commit/runtime drift must persist before it rolls
+ FAILED_ROLL_BACKOFF_S = 300.0
+-SUPERSEDED_GRACE_S = 900.0   # a superseded backend that has not retired itself by then is stopped (SIGTERM)
++SUPERSEDED_GRACE_S = 900.0   # a superseded backend not retired by then is retired by the roller through its idle fence
++SUPERSEDED_HARD_S = 6 * 3600.0  # ... and stopped (SIGTERM, turns checkpoint) once this old, busy or not
++SUPERSEDED_NAME = "superseded.json"
+ LOOP_WATCH_TAIL_BYTES = 4 * 1024 * 1024
+ 
+ # Read-only GETs safe to replay into a warming backend. Anything else Desktop polls (a courier outbox
+@@ -132,6 +136,17 @@ def is_superseded(port: int, home: Optional[Path] = None) -> bool:
+     return record is not None and port != record["port"] and port not in record["warming"]
+ 
+ 
++def successor_pending(port: int, home: Optional[Path] = None) -> bool:
++    """In backend *port*: True while a successor is on its way, i.e. ``active.json`` names another port as
++    warming (a roll is booting or warming it) or has already switched away from this port. A turn paused for
++    a core update keeps waiting for that successor (``tui_gateway.update_pause``) instead of continuing here
++    on stale code. A missing record proves nothing."""
++    record = read_active(home)
++    if record is None or port in record["warming"]:
++        return False  # no proof, or this backend is itself the one warming
++    return port != record["port"] or bool(record["warming"])
++
++
+ def backend_port_for_pid(pid: int, proc: Path = Path("/proc")) -> Optional[int]:
+     """The port of the ``hermes-always-on-backend@<port>.service`` unit whose cgroup holds *pid*, else None.
+     By cgroup, not environment: an agent child of a backend inherits its environment, not its unit."""
+@@ -176,11 +191,15 @@ def route_always_on_backends(pids: Iterable[int], *, roll: Callable[[], bool] =
+ def route_update_pids(pids: list[int], *, restart_managed: bool) -> list[int]:
+     """``_kill_stale_dashboard_processes``'s hook: only an update refresh on Linux (where the units exist)
+     routes always-on backends to a warm roll; ``dashboard --stop`` and other platforms keep every pid."""
+-    if not (pids and restart_managed and sys.platform.startswith("linux")):
++    if not (pids and restart_managed and _on_linux()):
+         return pids
+     return route_always_on_backends(pids)
+ 
+ 
++def _on_linux() -> bool:
++    return sys.platform.startswith("linux")
++
++
+ # ── the proxy ────────────────────────────────────────────────────────────────────────────────────────
+ 
+ 
+@@ -191,17 +210,18 @@ class Proxy:
+     def __init__(self, *, home: Optional[Path] = None, hold_s: float = PROXY_HOLD_S,
+                  clock: Callable[[], float] = time.monotonic):
+         self.home, self.hold_s, self.clock = home, hold_s, clock
+-        self._cached: tuple[Optional[int], Optional[int]] = (None, None)  # (mtime_ns, port)
++        self._cached: tuple[Optional[tuple[int, int]], Optional[int]] = (None, None)  # ((ino, mtime_ns), port)
+         self.last_port: Optional[int] = None
+ 
+     def target(self) -> Optional[int]:
+         try:
+-            mtime = active_path(self.home).stat().st_mtime_ns
++            st = active_path(self.home).stat()
+         except OSError:
+             return None
+-        if self._cached[0] != mtime:
++        key = (st.st_ino, st.st_mtime_ns)  # each atomic replace is a new inode, even inside one mtime tick
++        if self._cached[0] != key:
+             record = read_active(self.home)
+-            self._cached = (mtime, record["port"] if record else None)
++            self._cached = (key, record["port"] if record else None)
+             if record and record["port"] != self.last_port:
+                 log(f"proxy: routing new connections to :{record['port']}")
+                 self.last_port = record["port"]
+@@ -226,10 +246,28 @@ class Proxy:
+             client_writer.close()
+             return
+         up_reader, up_writer = upstream
+-        await asyncio.gather(_pipe(client_reader, up_writer), _pipe(up_reader, client_writer))
+-
+-
+-async def _pipe(reader, writer) -> None:
++        # Each direction half-closes its destination on EOF; both sockets close only once both directions
++        # are done, so a client that shuts down its write side after the request still gets the response.
++        # A direction that breaks (a reset) ends the other: nothing more can flow through this splice.
++        tasks = {asyncio.ensure_future(_pipe(client_reader, up_writer)),
++                 asyncio.ensure_future(_pipe(up_reader, client_writer))}
++        try:
++            while tasks:
++                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
++                if any(task.result() is False for task in done):
++                    break
++        finally:
++            for task in tasks:
++                task.cancel()
++            await asyncio.gather(*tasks, return_exceptions=True)
++            for writer in (up_writer, client_writer):
++                with contextlib.suppress(OSError, RuntimeError):
++                    writer.close()
++
++
++async def _pipe(reader, writer) -> bool:
++    """Copy until EOF, then half-close *writer*. True on a clean EOF, False when either side broke. It never
++    closes *writer*: ``Proxy.handle`` closes both sockets once both directions are done."""
+     try:
+         while True:
+             data = await reader.read(65536)
+@@ -240,11 +278,9 @@ async def _pipe(reader, writer) -> None:
+         with contextlib.suppress(OSError, RuntimeError):
+             if writer.can_write_eof():
+                 writer.write_eof()
++        return True
+     except (ConnectionError, OSError):
+-        pass
+-    finally:
+-        with contextlib.suppress(OSError, RuntimeError):
+-            writer.close()
++        return False
+ 
+ 
+ def bind_listener(port: int, *, wait_s: float = 60.0, sleep: Callable[[float], None] = time.sleep) -> socket.socket:
+@@ -321,16 +357,18 @@ class Roller:
+ 
+     def __init__(self, *, token: str, checkout: Optional[Path], marker: Path, home: Optional[Path] = None,
+                  systemctl: Callable[..., subprocess.CompletedProcess] = _systemctl,
+-                 get: Optional[Callable] = None, clock: Callable[[], float] = time.monotonic,
++                 get: Optional[Callable] = None, post: Optional[Callable] = None,
++                 clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time,
+                  sleep: Callable[[float], None] = time.sleep, loop_watch: Optional[Path] = None,
+                  ports: tuple[int, ...] = BACKEND_PORTS, boot_timeout_s: float = BOOT_TIMEOUT_S,
+                  warm_cap_s: float = WARM_CAP_S):
+         self.token, self.checkout, self.marker, self.home = token, checkout, marker, home
+         self.systemctl, self.clock, self.sleep, self.ports = systemctl, clock, sleep, ports
+         self.get = get or self._http_get
++        self.post = post or self._http_post
++        self.wall = wall
+         self.loop_watch = loop_watch
+         self.boot_timeout_s, self.warm_cap_s = boot_timeout_s, warm_cap_s
+-        self.superseded_since: dict[int, float] = {}
+ 
+     # -- probes --
+     def _http_get(self, port: int, path: str, timeout: float) -> tuple[Optional[int], float, Optional[dict]]:
+@@ -343,13 +381,25 @@ class Roller:
+                 status = response.status
+         except urllib.error.HTTPError as exc:
+             return exc.code, time.monotonic() - started, None
+-        except (OSError, ValueError):
++        except (OSError, ValueError, http.client.HTTPException):
+             return None, time.monotonic() - started, None
+         parsed = None
+         with contextlib.suppress(ValueError):
+             parsed = json.loads(body) if body[:1] in (b"{", b"[") else None
+         return status, time.monotonic() - started, parsed if isinstance(parsed, dict) else None
+ 
++    def _http_post(self, port: int, path: str, payload: dict) -> Optional[dict]:
++        request = urllib.request.Request(f"http://127.0.0.1:{int(port)}{path}", method="POST",
++                                         data=json.dumps(payload).encode(),
++                                         headers={"X-Hermes-Session-Token": self.token,
++                                                  "Content-Type": "application/json"})
++        try:
++            with urllib.request.urlopen(request, timeout=30.0) as response:
++                parsed = json.loads(response.read(65536))
++        except (OSError, ValueError, http.client.HTTPException):
++            return None
++        return parsed if isinstance(parsed, dict) else None
++
+     def unit_active(self, port: int) -> bool:
+         try:
+             state = (self.systemctl("is-active", backend_unit(port), timeout=15).stdout or "").strip()
+@@ -394,15 +444,20 @@ class Roller:
+         return self.marker.exists()
+ 
+     # -- the roll --
+-    def pick_port(self, active_port: Optional[int], head: Optional[str]) -> tuple[Optional[int], bool]:
+-        """(port, adopted). Adopt a non-active backend already answering on HEAD (a roll a restart cut
+-        short); else the first port with no unit; else None."""
++    def pick_port(self, active_port: Optional[int], head: Optional[str],
++                  warming: Iterable[int] = ()) -> tuple[Optional[int], bool]:
++        """(port, adopted). Adopt a non-active backend a restart cut short: one already answering on HEAD,
++        or one the previous roll recorded as warming that is still booting, so restarts close together never
++        stack cold boots onto the pool. Else the first port with no unit; else None."""
++        warming = set(warming)
+         others = [p for p in self.ports if p != active_port]
+         running = [p for p in others if self.unit_active(p)]
+         for port in running:
+             body = self.health(port)
+             if body and self.same_commit(body.get("commit"), head):
+                 return port, True
++            if body is None and port in warming:
++                return port, True  # still booting for the roll this restart cut short
+         for port in others:
+             if port not in running and not _port_listening(port):
+                 return port, False
+@@ -414,7 +469,7 @@ class Roller:
+         record = read_active(self.home)
+         active_port = record["port"] if record and self.unit_active(record["port"]) else None
+         head = self.head()
+-        port, adopted = self.pick_port(active_port, head)
++        port, adopted = self.pick_port(active_port, head, record["warming"] if record else ())
+         if port is None:
+             log(f"roll ({reason}) skipped: every backend port {self.ports} is busy; retiring backends hold them")
+             return False
+@@ -439,6 +494,11 @@ class Roller:
+             self._abandon(port, active_port)
+             return False
+         warm = self.warm(port, self.replay_paths(record.get("pid") if record else None))
++        body = self.health(port) if self.unit_active(port) else None  # it may have died while it warmed
++        if body is None:
++            log(f"roll: backend :{port} stopped answering while it warmed; keeping :{active_port or '-'}")
++            self._abandon(port, active_port)
++            return False
+         write_active(port, home=self.home, pid=self.unit_pid(port), commit=body.get("commit") or "",
+                      reason=reason, warm=warm)
+         log(f"roll: switched to :{port} (commit {str(body.get('commit') or '?')[:10]}); warm {warm};"
+@@ -463,13 +523,16 @@ class Roller:
+     # -- warming --
+     def replay_paths(self, old_pid: object) -> list[str]:
+         """The default reads plus the allowlisted GETs (with their queries) the old backend served in the
+-        last hour, from loop-watch's request_stats. Best effort: no log, no replays."""
++        last two hours, from loop-watch's request_stats. Best effort: no log, no replays."""
+         paths: list[str] = list(DEFAULT_WARM)
+         counts: dict[str, int] = {}
+         for row in _tail_jsonl(self.loop_watch, LOOP_WATCH_TAIL_BYTES):
+             if row.get("kind") != "request_stats" or (old_pid and row.get("pid") != old_pid):
+                 continue
+-            if time.time() - float(row.get("hour_epoch") or 0) > 7200:
++            try:
++                if time.time() - float(row.get("hour_epoch") or 0) > 7200:
++                    continue
++            except (TypeError, ValueError):
+                 continue
+             for path, stats in (row.get("paths") or {}).items():
+                 if path not in REPLAY_PATHS or not isinstance(stats, dict):
+@@ -524,41 +587,79 @@ class Roller:
+             return f"active backend :{port} lost its runtime (runtimeIntact false)"
+         return None
+ 
+-    def reap_superseded(self, grace_s: float = SUPERSEDED_GRACE_S) -> list[int]:
+-        """Stop backends that are neither active nor warming once they have outlived *grace_s* since this roller
+-        first saw them superseded. They normally retire themselves when idle (the superseded watchdog); this is
+-        the backstop for one that never goes idle, or a core without that watchdog. SIGTERM checkpoints turns
+-        exactly as the old in-place restart did, only later."""
++    def _superseded_path(self) -> Path:
++        return aod.state_dir(self.home) / SUPERSEDED_NAME
++
++    def _load_superseded(self) -> dict[int, float]:
++        """{port: wall time first seen superseded}. Persisted, because the roller itself restarts on every
++        core update and an in-memory clock would never reach the grace."""
++        with contextlib.suppress(OSError, ValueError, TypeError):
++            data = json.loads(self._superseded_path().read_text(encoding="utf-8-sig"))
++            return {int(k): float(v) for k, v in data.items()}
++        return {}
++
++    def _save_superseded(self, since: dict[int, float]) -> None:
++        with contextlib.suppress(OSError):
++            aod._write_private(self._superseded_path(), json.dumps({str(k): v for k, v in since.items()}))
++
++    def _retire_fenced(self, port: int) -> bool:
++        """Retire *port* through its own idle fence (``/api/health/retirement``), as its watchdog would: only
++        a backend proven idle is committed and then stopped. A live turn refuses the prepare."""
++        permit = self.post(port, "/api/health/retirement", {"action": "prepare"}) or {}
++        if permit.get("ok") is not True or not isinstance(permit.get("token"), str):
++            return False
++        commit = self.post(port, "/api/health/retirement", {"action": "commit", "token": permit["token"]}) or {}
++        if commit.get("ok") is not True:
++            return False
++        with contextlib.suppress(OSError, subprocess.SubprocessError):
++            self.systemctl("stop", "--no-block", backend_unit(port), timeout=15)
++        return True
++
++    def reap_superseded(self, grace_s: float = SUPERSEDED_GRACE_S, hard_s: float = SUPERSEDED_HARD_S) -> list[int]:
++        """Backstop for backends that are neither active nor warming and have not retired themselves (a core
++        without the superseded watchdog, a lost watchdog thread). After *grace_s* the roller retires one
++        through its idle fence, so a live turn is never cut. Only after *hard_s*, a backend that has stayed
++        busy that long is stopped (SIGTERM checkpoints its turns) so the port pool cannot leak forever."""
+         record = read_active(self.home)
+         if record is None:
+             return []
+         live = {record["port"], *record["warming"]}
+-        now, stopped = self.clock(), []
++        since = self._load_superseded()
++        now, stopped = self.wall(), []
+         for port in self.ports:
+             if port in live or not self.unit_active(port):
+-                self.superseded_since.pop(port, None)
++                since.pop(port, None)
+                 continue
+-            first = self.superseded_since.setdefault(port, now)
+-            if now - first >= grace_s:
+-                log(f"backend :{port} still running {now - first:.0f}s after it was superseded; stopping it")
++            age = now - since.setdefault(port, now)
++            if age >= hard_s:
++                log(f"backend :{port} still busy {age:.0f}s after it was superseded; stopping it")
+                 with contextlib.suppress(OSError, subprocess.SubprocessError):
+                     self.systemctl("stop", "--no-block", backend_unit(port), timeout=15)
+-                self.superseded_since.pop(port, None)
+-                stopped.append(port)
++            elif age >= grace_s and self._retire_fenced(port):
++                log(f"backend :{port} superseded {age:.0f}s ago and idle; retired it through its fence")
++            else:
++                continue
++            since.pop(port, None)
++            stopped.append(port)
++        self._save_superseded(since)
+         return stopped
+ 
+     def supervise(self, *, max_polls: Optional[int] = None) -> None:
+         seen, polls, retry_at = 0, 0, 0.0
+         while max_polls is None or polls < max_polls:
+             polls += 1
+-            self.reap_superseded()
+-            reason = self.drift()
+-            dead = bool(reason) and "not running" in reason or reason == "no active backend recorded"
+-            seen = seen + 1 if reason else 0
+-            if reason and (dead or seen >= DRIFT_CONFIRMATIONS) and self.clock() >= retry_at:
+-                seen = 0
+-                if not self.roll(reason):
+-                    retry_at = self.clock() + FAILED_ROLL_BACKOFF_S
++            try:
++                self.reap_superseded()
++                reason = self.drift()
++                dead = bool(reason) and "not running" in reason or reason == "no active backend recorded"
++                seen = seen + 1 if reason else 0
++                if reason and (dead or seen >= DRIFT_CONFIRMATIONS) and self.clock() >= retry_at:
++                    seen = 0
++                    if not self.roll(reason):
++                        retry_at = self.clock() + FAILED_ROLL_BACKOFF_S
++            # One bad poll (a malformed answer, a systemctl hiccup) must not end supervision.
++            except Exception:  # health: allow BLE001 -- supervisor loop boundary; traceback logged
++                log(f"supervise: poll failed:\n{traceback.format_exc()}")
+             self.sleep(SUPERVISE_POLL_S)
+ 
+ 
+@@ -662,5 +763,6 @@ def stop_all(run: Callable = aod._run) -> None:
+ __all__ = [
+     "BACKEND_PORTS", "ENV_BACKEND", "PROXY_UNIT", "Proxy", "Roller", "backend_port_for_pid", "bind_listener",
+     "cmd_backend", "cmd_proxy", "cmd_roll", "install_units", "is_superseded", "pop_backend_port",
+-    "read_active", "render_units", "request_roll", "route_always_on_backends", "stop_all", "write_active",
++    "read_active", "render_units", "request_roll", "route_always_on_backends", "stop_all", "successor_pending",
++    "write_active",
+ ]
+diff --git a/hermes_cli/web_server_skew_exit.py b/hermes_cli/web_server_skew_exit.py
+index dbb79c26d4..d08d59b5b1 100644
+--- a/hermes_cli/web_server_skew_exit.py
++++ b/hermes_cli/web_server_skew_exit.py
+@@ -29,6 +29,11 @@ from typing import Callable, Optional
+ _log = logging.getLogger(__name__)
+ 
+ DEFAULT_SKEW_POLL_S = 30.0
++# [daveey] The superseded watchdog reads one small file per poll, so it polls fast: an idle superseded
++# always-on backend retires within two polls of the switch and its paused turns move to the successor.
++SUPERSEDED_POLL_S = 2.0
++# ... but a superseded backend that is busy (a live turn refused the fence) re-tries the fence only this often.
++SUPERSEDED_BUSY_POLL_S = 10.0
+ # Two consecutive observations: a checkout mid-rewrite (ref file replaced, packed-refs repacked) can
+ # briefly read differently; a real update reads the new revision on every poll after it finishes.
+ _CONFIRMATIONS = 2
+@@ -126,10 +131,12 @@ def _runtime_key() -> str:
+ 
+ def _run_retirement_watchdog(server, *, observe: Callable[[], Optional[str]], fence, poll_s: float,
+                              max_polls: Optional[int], thread_name: str,
+-                             on_retire: Optional[Callable[[str], None]] = None) -> threading.Thread:
++                             on_retire: Optional[Callable[[str], None]] = None,
++                             busy_poll_s: Optional[float] = None) -> threading.Thread:
+     """Daemon thread shared by the SSH-isolated retirement watchdogs: ``observe`` returns the log
+     reason while retirement is warranted (else None); after ``_CONFIRMATIONS`` consecutive reasons
+-    the backend exits only through the retirement fence (proven idle, admission closed first)."""
++    the backend exits only through the retirement fence (proven idle, admission closed first). After a
++    refused prepare the next poll waits ``busy_poll_s`` (default ``poll_s``)."""
+     if fence is None:
+         from hermes_cli.backend_retirement import retirement
+ 
+@@ -141,6 +148,7 @@ def _run_retirement_watchdog(server, *, observe: Callable[[], Optional[str]], fe
+             polls += 1
+             reason = observe()
+             seen = seen + 1 if reason else 0
++            wait = poll_s
+             if reason and seen >= _CONFIRMATIONS:
+                 permit = fence.prepare()
+                 if permit.get("ok") and fence.commit(permit.get("token")).get("ok"):
+@@ -149,7 +157,8 @@ def _run_retirement_watchdog(server, *, observe: Callable[[], Optional[str]], fe
+                         on_retire(reason)
+                     server.should_exit = True
+                     return
+-            time.sleep(poll_s)
++                wait = poll_s if busy_poll_s is None else busy_poll_s
++            time.sleep(wait)
+ 
+     thread = threading.Thread(target=_loop, daemon=True, name=thread_name)
+     thread.start()
+@@ -236,18 +245,20 @@ def start_code_skew_watchdog(server, *, skew_fn: Optional[Callable[[], Skew]] =
+ 
+ 
+ def start_superseded_watchdog(server, *, port: int, superseded: Optional[Callable[[int], bool]] = None,
+-                              fence=None, poll_s: float = DEFAULT_SKEW_POLL_S,
++                              pending: Optional[Callable[[int], bool]] = None,
++                              fence=None, poll_s: float = SUPERSEDED_POLL_S,
+                               max_polls: Optional[int] = None) -> threading.Thread:
+     """[daveey] An always-on blue/green backend (``hermes_cli/always_on_rollover``) runs this INSTEAD of the
+     code-skew watchdog: the roller replaces it with a warmed successor, so it must not exit on skew before
+     that successor serves. It retires (through the same idle fence) once ``active.json`` names neither its
+     port as active nor as warming. Registered as a skew watchdog: a core-update-paused turn still learns
+-    that this process will be replaced (``tui_gateway.update_pause``)."""
+-    if superseded is None:
+-        from hermes_cli.always_on_rollover import is_superseded
++    that this process will be replaced (``tui_gateway.update_pause``), and ``successor_pending`` tells it the
++    successor is still booting or warming, which takes longer than a plain skew retirement. The poll is
++    fast (a file read), so an idle superseded backend hands its paused turns over seconds after the switch."""
++    from hermes_cli import always_on_rollover
+ 
+-        superseded = is_superseded
+-    check: Callable[[int], bool] = superseded
++    check: Callable[[int], bool] = superseded or always_on_rollover.is_superseded
++    on_the_way: Callable[[int], bool] = pending or always_on_rollover.successor_pending
+ 
+     def _observe() -> Optional[str]:
+         if not check(port):
+@@ -256,6 +267,26 @@ def start_superseded_watchdog(server, *, port: int, superseded: Optional[Callabl
+                 "retiring now that it is idle.")
+ 
+     thread = _run_retirement_watchdog(server, observe=_observe, fence=fence, poll_s=poll_s,
+-                                      max_polls=max_polls, thread_name="always-on-superseded-watchdog")
++                                      max_polls=max_polls, thread_name="always-on-superseded-watchdog",
++                                      busy_poll_s=max(poll_s, SUPERSEDED_BUSY_POLL_S))
+     _SKEW_WATCHDOGS[:] = [t for t in _SKEW_WATCHDOGS if t.is_alive()] + [thread]
++    _SUCCESSOR_PROBES[:] = [(t, p) for t, p in _SUCCESSOR_PROBES if t.is_alive()]
++    _SUCCESSOR_PROBES.append((thread, lambda: on_the_way(port)))
+     return thread
++
++
++# [daveey] Live superseded watchdogs with their "successor on the way" probe (``successor_pending``).
++_SUCCESSOR_PROBES: list[tuple[threading.Thread, Callable[[], bool]]] = []
++
++
++def successor_pending() -> bool:
++    """Whether a live superseded watchdog in this process says its warmed successor is being prepared (or
++    already serves): a paused turn then waits past ``update_pause.HANDOFF_WAIT_S`` for it. Errors read False."""
++    for thread, probe in _SUCCESSOR_PROBES.copy():
++        if thread.is_alive():
++            try:
++                if probe():
++                    return True
++            except (OSError, ValueError, TypeError, KeyError):
++                _log.debug("successor probe failed", exc_info=True)
++    return False
+diff --git a/tests/hermes_cli/test_always_on_rollover.py b/tests/hermes_cli/test_always_on_rollover.py
+index 4daae8bb2b..071838c9a8 100644
+--- a/tests/hermes_cli/test_always_on_rollover.py
++++ b/tests/hermes_cli/test_always_on_rollover.py
+@@ -10,8 +10,10 @@ from __future__ import annotations
+ 
+ import asyncio
+ import json
++import os
+ import subprocess
+ import time
++import types
+ from pathlib import Path
+ 
+ import pytest
+@@ -78,13 +80,14 @@ def test_kill_stale_dashboard_processes_never_kills_an_always_on_backend(monkeyp
+     from hermes_cli import dashboard_procs as dp
+     from hermes_cli import main_dashboard as dash
+ 
+-    monkeypatch.setattr(dp.sys, "platform", "linux")
++    monkeypatch.setattr(ro, "_on_linux", lambda: True)
+     monkeypatch.setattr(dash, "_restart_managed_dashboard_service", lambda reason: False)
+     monkeypatch.setattr(dp, "_lock_owned_serve_pids", set)
+     monkeypatch.setattr(dash, "_find_stale_dashboard_pids", lambda **kw: [4242])
+     rolls = []
+-    monkeypatch.setattr(ro.route_always_on_backends, "__kwdefaults__",
+-                        {"roll": lambda: rolls.append(1) or True, "port_for_pid": lambda pid: 9148})
++    real_route = ro.route_always_on_backends
++    monkeypatch.setattr(ro, "route_always_on_backends", lambda pids: real_route(
++        pids, roll=lambda: rolls.append(1) or True, port_for_pid=lambda pid: 9148))
+     killed = []
+     monkeypatch.setattr(dp, "_kill_pids_posix", lambda pids, k, f: killed.extend(pids))
+     result = dp._kill_stale_dashboard_processes(restart_managed=True)
+@@ -137,6 +140,43 @@ def test_proxy_closes_a_client_only_after_the_hold(home):
+     assert data == b"" and elapsed >= 0.4
+ 
+ 
++def test_proxy_delivers_the_response_to_a_client_that_half_closed_after_its_request(home):
++    # Review B2 of #1611: _pipe closed the upstream socket right after the client's EOF, so a client that
++    # shuts down its write side after sending its request got b"" instead of the response.
++    async def scenario():
++        async def respond_after_eof(reader, writer):
++            request = await reader.read()  # until the client's EOF
++            await asyncio.sleep(0.2)  # health: allow HX013 -- the response is produced after the half-close
++            writer.write(b"RESPONSE:" + request)
++            await writer.drain()
++            writer.close()
++
++        backend = await asyncio.start_server(respond_after_eof, "127.0.0.1", 0)
++        ro.write_active(backend.sockets[0].getsockname()[1])
++        front = await asyncio.start_server(ro.Proxy(hold_s=5).handle, "127.0.0.1", 0)
++        reader, writer = await asyncio.open_connection("127.0.0.1", front.sockets[0].getsockname()[1])
++        writer.write(b"hello")
++        writer.write_eof()
++        data = await asyncio.wait_for(reader.read(), 5)
++        writer.close()
++        front.close()
++        backend.close()
++        return data
++
++    assert asyncio.run(scenario()) == b"RESPONSE:hello"
++
++
++def test_proxy_target_follows_every_atomic_replace(home):
++    proxy = ro.Proxy()
++    ro.write_active(9148)
++    assert proxy.target() == 9148
++    path = ro.active_path()
++    stamp = path.stat().st_mtime_ns
++    ro.write_active(9149)
++    os.utime(path, ns=(stamp, stamp))  # the replace landed inside the same mtime tick
++    assert proxy.target() == 9149
++
++
+ def socket_free_port() -> int:
+     import socket
+ 
+@@ -262,19 +302,109 @@ def test_supervisor_rolls_on_a_dead_backend_and_on_confirmed_commit_drift(home):
+     assert rolls and "not running" in rolls[0]
+ 
+ 
+-def test_superseded_backend_that_never_retires_is_stopped_after_the_grace(home):
+-    host = FakeHost(running={9148, 9149})
+-    ro.write_active(9149)
++class FakeFence:
++    """``/api/health/retirement`` of each backend: prepare refuses while the port is busy (a live turn)."""
++
++    def __init__(self, busy=()):
++        self.busy, self.posts = set(busy), []
++
++    def post(self, port, path, payload):
++        self.posts.append((port, payload["action"]))
++        if payload["action"] == "prepare":
++            return {"ok": False, "reason": "busy"} if port in self.busy else {"ok": True, "token": f"tok{port}"}
++        return {"ok": payload.get("token") == f"tok{port}"}
++
++
++def make_reaper(home, host, fence, wall):
+     roller = make_roller(home, host)
+-    assert roller.reap_superseded(grace_s=600) == []  # first sighting starts its clock
+-    roller.sleep(599)
+-    assert roller.reap_superseded(grace_s=600) == []
+-    roller.sleep(2)
+-    assert roller.reap_superseded(grace_s=600) == [9148]
++    roller.post, roller.wall = fence.post, lambda: wall[0]
++    return roller
++
++
++def test_superseded_backend_is_retired_through_its_fence_never_mid_turn(home):
++    # Review B1 of #1611: the backstop used to SIGTERM a superseded backend 900 s in, even mid-turn.
++    host, fence, wall = FakeHost(running={9148, 9149}), FakeFence(busy={9148}), [1000.0]
++    ro.write_active(9149)
++    assert make_reaper(home, host, fence, wall).reap_superseded(grace_s=600, hard_s=7200) == []
++    wall[0] += 601
++    # A fresh roller (each core update restarts it) still knows when 9148 was superseded.
++    assert make_reaper(home, host, fence, wall).reap_superseded(grace_s=600, hard_s=7200) == []
++    assert (9148, "prepare") in fence.posts and not any(c[0] == "stop" for c in host.calls)  # busy: kept
++    fence.busy.clear()  # the turn ended
++    assert make_reaper(home, host, fence, wall).reap_superseded(grace_s=600, hard_s=7200) == [9148]
++    assert (9148, "commit") in fence.posts
+     assert ("stop", "--no-block", ro.backend_unit(9148)) in host.calls
+     assert not any(c[0] == "stop" and ro.backend_unit(9149) in c for c in host.calls)
+ 
+ 
++def test_superseded_backend_busy_past_the_hard_bound_is_stopped(home):
++    host, fence, wall = FakeHost(running={9148, 9149}), FakeFence(busy={9148}), [1000.0]
++    ro.write_active(9149)
++    roller = make_reaper(home, host, fence, wall)
++    assert roller.reap_superseded(grace_s=600, hard_s=7200) == []
++    wall[0] += 7200
++    assert roller.reap_superseded(grace_s=600, hard_s=7200) == [9148]
++    assert ("stop", "--no-block", ro.backend_unit(9148)) in host.calls
++    host.running.discard(9148)
++    roller.reap_superseded(grace_s=600, hard_s=7200)
++    assert json.loads((ao.state_dir() / ro.SUPERSEDED_NAME).read_text()) == {}  # forgotten once gone
++
++
++def test_roll_adopts_a_still_booting_backend_the_previous_roll_left_warming(home):
++    # Nit of review 5878814630: restarts close together must not stack cold boots onto the 4-port pool.
++    host = FakeHost(running={9148, 9149}, commits={9148: "a" * 40, 9149: "c" * 40})
++    ro.write_active(9148, warming=[9149])
++    booting = [3]
++    real_get = host.get
++
++    def get(port, path, timeout):
++        if port == 9149 and booting[0] > 0:
++            booting[0] -= 1
++            return None, 0.0, None
++        return real_get(port, path, timeout)
++
++    roller = make_roller(home, host)
++    roller.get = get
++    assert roller.roll("restart mid-boot") is True
++    assert ro.read_active()["port"] == 9149
++    assert not any(c[0] == "start" for c in host.calls)
++
++
++def test_roll_never_switches_to_a_backend_that_died_while_it_warmed(home):
++    host = FakeHost(running={9148}, commits={9148: "a" * 40})
++    ro.write_active(9148)
++    roller = make_roller(home, host)
++    real_warm = roller.warm
++
++    def warm(port, paths):
++        summary = real_warm(port, paths)
++        host.running.discard(port)  # e.g. OOM-killed during the warm rounds
++        return summary
++
++    roller.warm = warm
++    assert roller.roll("test") is False
++    assert ro.read_active()["port"] == 9148 and ro.read_active()["warming"] == []
++
++
++def test_supervisor_survives_a_poll_that_raises(home, capsys):
++    host = FakeHost(running={9148})
++    ro.write_active(9148)
++    roller = make_roller(home, host)
++    roller.drift = lambda: (_ for _ in ()).throw(ValueError("bad hour_epoch"))  # type: ignore[method-assign]
++    roller.supervise(max_polls=3)
++    assert capsys.readouterr().err.count("poll failed") == 3
++
++
++def test_successor_pending_while_another_port_warms_or_after_the_switch(home):
++    assert ro.successor_pending(9148) is False  # no record proves nothing
++    ro.write_active(9148)
++    assert ro.successor_pending(9148) is False
++    ro.write_active(9148, warming=[9149])
++    assert ro.successor_pending(9148) is True and ro.successor_pending(9149) is False
++    ro.write_active(9149)
++    assert ro.successor_pending(9148) is True
++
++
+ def test_replay_paths_take_only_allowlisted_reads_the_old_backend_served(home, tmp_path):
+     log = tmp_path / "loop-watch.jsonl"
+     now = time.time()
+@@ -366,6 +496,33 @@ def test_active_or_busy_backend_stays_up():
+     assert server.should_exit is False  # a live turn holds it
+ 
+ 
++def test_superseded_watchdog_polls_fast_and_reports_its_successor(monkeypatch):
++    # Review B1 of #1611: a paused turn must learn that the successor is still warming (so it waits past
++    # HANDOFF_WAIT_S), and the old backend must retire within seconds of the switch, not 30-60 s.
++    assert skew.SUPERSEDED_POLL_S <= 2.0
++    sleeps = []
++    monkeypatch.setattr(skew, "time", types.SimpleNamespace(sleep=sleeps.append))
++    monkeypatch.setattr(skew, "_SUCCESSOR_PROBES", [])
++    state = {"pending": True}
++    busy = skew.start_superseded_watchdog(_Server(), port=9148, superseded=lambda p: True,
++                                          pending=lambda p: state["pending"], fence=_Fence(idle=False),
++                                          max_polls=4)
++    busy.join(5)
++    # a busy superseded backend re-tries the fence at the slower busy cadence, not every 2 s
++    assert sleeps == [skew.SUPERSEDED_POLL_S, skew.SUPERSEDED_BUSY_POLL_S, skew.SUPERSEDED_BUSY_POLL_S,
++                      skew.SUPERSEDED_BUSY_POLL_S]
++    assert skew.successor_pending() is False  # the thread ended: its probe no longer counts
++    skew._SUCCESSOR_PROBES.append((_alive(), lambda: state["pending"]))  # type: ignore[arg-type]
++    assert skew.successor_pending() is True
++    state["pending"] = False
++    assert skew.successor_pending() is False
++
++
++class _alive:
++    def is_alive(self):
++        return True
++
++
+ def test_always_on_backend_arms_the_superseded_watchdog_not_code_skew(monkeypatch):
+     import hermes_cli.process_identity as pi
+     import hermes_cli.web_server as ws
+diff --git a/tests/tui_gateway/test_update_pause_recovery.py b/tests/tui_gateway/test_update_pause_recovery.py
+index 19f5c0cd44..135180285e 100644
+--- a/tests/tui_gateway/test_update_pause_recovery.py
++++ b/tests/tui_gateway/test_update_pause_recovery.py
+@@ -494,6 +494,40 @@ def test_replacement_outlook_that_never_retires_continues_within_the_hand_off_bo
+     assert up.HANDOFF_WAIT_S <= clock.now <= up.WATCH_POLL_S + up.HANDOFF_WAIT_S + up.WATCH_POLL_S
+ 
+ 
++def test_always_on_successor_still_warming_keeps_the_turn_for_it_past_the_hand_off_bound(recovery, skewed,
++                                                                                         monkeypatch):
++    # Review B1 of #1611 (t_01a1d09123dbb9c4): an always-on blue/green backend's successor boots and warms
++    # before the old backend can retire (live: ~60-150 s), so HANDOFF_WAIT_S used to continue the paused turn
++    # here on stale code. While the superseded watchdog reports the successor on its way, the turn waits.
++    from hermes_cli import web_server_skew_exit
++    monkeypatch.setattr(web_server_skew_exit, "successor_pending", lambda: True)
++    clock = _VirtualClock()
++    _watch(monkeypatch, recovery, clock, max_s=up.SUCCESSOR_WARMING_GRACE_S - up.WATCH_POLL_S)
++    assert clock.now > up.HANDOFF_WAIT_S + up.WATCH_POLL_S
++    assert recovery.calls == [] and not recovery.done.is_set()
++
++
++def test_always_on_successor_that_never_switches_in_is_bounded(recovery, skewed, monkeypatch):
++    from hermes_cli import web_server_skew_exit
++    monkeypatch.setattr(web_server_skew_exit, "successor_pending", lambda: True)
++    clock = _VirtualClock()
++    _watch(monkeypatch, recovery, clock)
++    assert_continued(recovery)
++    assert up.SUCCESSOR_WARMING_GRACE_S <= clock.now <= up.SUCCESSOR_WARMING_GRACE_S + 2 * up.WATCH_POLL_S
++
++
++def test_always_on_successor_does_not_hold_a_busy_backend(recovery, skewed, monkeypatch):
++    # Other work keeps the old backend busy, so it cannot retire even once the successor serves: as before,
++    # the turn continues here after NO_REPLACEMENT_S.
++    from hermes_cli import web_server_skew_exit
++    monkeypatch.setattr(web_server_skew_exit, "successor_pending", lambda: True)
++    skewed.idle = False
++    clock = _VirtualClock()
++    _watch(monkeypatch, recovery, clock)
++    assert_continued(recovery)
++    assert clock.now <= up.WATCH_POLL_S + up.NO_REPLACEMENT_S + up.WATCH_POLL_S
++
++
+ def test_fluctuating_outlook_counts_from_the_move_not_from_the_last_flip(recovery, skewed, monkeypatch):
+     # The outlook flips between coming and blocked every poll: the bound still counts from the move.
+     def flip(now):
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 5d69a40545..9a9facedc2 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -77,6 +77,12 @@ NO_REPLACEMENT_S = 60.0
+ # polls (_CONFIRMATIONS x DEFAULT_SKEW_POLL_S = 60 s) of the move being visible. One that has not even begun
+ # retiring after this long is not going to: continue here instead of trusting the outlook up to the backstop.
+ HANDOFF_WAIT_S = 90.0
++# [daveey] t_01a1d09123dbb9c4: an always-on blue/green backend is replaced by a successor the roller boots and
++# warms first (always_on_rollover: boot up to 180 s, warm up to 75 s), so its hand-off routinely takes longer
++# than HANDOFF_WAIT_S. While its superseded watchdog reports that successor on the way
++# (web_server_skew_exit.successor_pending), the paused turn waits for it up to this bound instead of
++# continuing on stale code; the old backend retires within seconds of the switch once idle.
++SUCCESSOR_WARMING_GRACE_S = 420.0
+ # Automatic turns hold off at most this long past the watcher's last poll, so a dead watcher or a failed
+ # continuation kickoff never holds them for good.
+ DUE_HOLD_S = 2 * WATCH_POLL_S + 5.0
+@@ -784,15 +790,26 @@ def _release_automatic_turns(session: dict, *, watching: bool = False) -> None:
+             session.pop("_update_pause_due_until", None)
+ 
+ 
+-def _leave_decision(waited: float, outlook: str) -> str | None:
+-    """Why to continue a paused turn here now that the checkout moved (``waited`` s ago), else None."""
++def _successor_pending() -> bool:
++    """[daveey] Whether a warmed successor is being prepared for this always-on backend (False elsewhere)."""
++    try:
++        from hermes_cli.web_server_skew_exit import successor_pending
++    except ImportError:
++        return False
++    return successor_pending()
++
++
++def _leave_decision(waited: float, outlook: str, *, successor_pending: bool = False) -> str | None:
++    """Why to continue a paused turn here now that the checkout moved (``waited`` s ago), else None.
++    ``successor_pending``: a warmed successor is on its way, so ``HANDOFF_WAIT_S`` does not apply (the
++    caller's ``SUCCESSOR_WARMING_GRACE_S`` backstop does)."""
+     if outlook == "retiring":
+         return None  # the fence refuses in-place work from here on; only the backstop retries
+     if outlook == "none":
+         return "no retirement watchdog"
+     if outlook == "blocked" and waited >= NO_REPLACEMENT_S:
+         return f"backend kept busy, {waited:.0f}s since the checkout moved"
+-    if waited >= HANDOFF_WAIT_S:
++    if waited >= HANDOFF_WAIT_S and not successor_pending:
+         return f"no retirement began within {waited:.0f}s of the checkout moving"
+     return None
+ 
+@@ -854,13 +871,15 @@ def start_in_place_watcher(sid: str, session: dict, marker_key: str) -> threadin
+                             logger.info("core-update pause: replacement outlook for session %s is %s (%.0fs since "
+                                         "the checkout moved)", marker_key, outlook, now - left_at)
+                             last_outlook = outlook
+-                        why = _leave_decision(now - left_at, outlook)
++                        pending = _successor_pending()
++                        why = _leave_decision(now - left_at, outlook, successor_pending=pending)
++                        grace = SUCCESSOR_WARMING_GRACE_S if pending else LEAVE_GRACE_S
+                         if why is not None:
+                             logger.info("core-update pause: no backend replacement is coming (%s); continuing "
+                                         "session %s here", why, marker_key)
+-                        elif now - left_at >= LEAVE_GRACE_S:
++                        elif now - left_at >= grace:
+                             logger.info("core-update pause: backend still not replaced after %.0fs; continuing "
+-                                        "session %s here", LEAVE_GRACE_S, marker_key)
++                                        "session %s here", grace, marker_key)
+                         else:
+                             continue
+                         action = "resume"
+-- 
+2.43.0
+

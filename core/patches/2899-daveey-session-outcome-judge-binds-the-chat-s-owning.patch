@@ -1,0 +1,245 @@
+From 6b6254a7e59eebb6736abb29fb816b8552cc9e14 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:56:56 +0000
+Subject: [PATCH] [daveey] session outcome judge binds the chat's owning
+ profile scope when its caller bound none
+
+Notice writers (kanban_unloaded / kanban_remote_notices), orphan reap, completion notes and the web
+refresh call refresh_outcome[s_quietly] from sweeper threads or handlers whose context has no profile
+secret scope. On the multiplexed hub gateway the session-outcome judge's provider read then failed at
+0.0 s with UnscopedSecretError (ANTHROPIC_TOKEN), e.g. agent.log 2026-11-12 16:23:34 right before
+'kanban sweep wake ... busy, notice row written', and 17:00:44/51. cff30b6592 only scoped the post-turn
+refresh.
+
+_judge_summary now runs the judge inside _owner_scope(db): under multiplexing with no secret scope
+bound, it binds the owner of <home>/state.db (home override + owner_secret_scope(home), as routed turns
+do) and restores the caller's context after. A caller that already bound a scope keeps it; a
+single-profile process binds nothing.
+
+Proof: tests/hermes_state/test_outcome_judge_owner_scope.py is RED on origin/main (5 failed, the
+refresh/derive cases with the production UnscopedSecretError) and GREEN with the fix (7 passed). The
+19 test files importing hermes_state_outcome + test_split_module_imports: 410 passed. Each of the three
+guard conditions mutated away fails one test. Task t_01a1d0d08799272e.
+---
+ hermes_state_outcome.py                       |  35 +++-
+ .../test_outcome_judge_owner_scope.py         | 150 ++++++++++++++++++
+ 2 files changed, 182 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_state/test_outcome_judge_owner_scope.py
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 71f32fed58..a54c051ea3 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -563,13 +563,42 @@ def _call_judge(judge: JudgeFn, sid: str, text: str, source: Optional[str]) -> O
+         return judge(sid, text)
+ 
+ 
+-def _judge_summary(sid: str, text: str, source: Optional[str]) -> Optional[bool]:
++@contextlib.contextmanager
++def _owner_scope(db: Any) -> Iterator[None]:
++    """[daveey] Bind the chat's owning profile (``<home>/state.db`` -> home override + ``owner_secret_scope``)
++    around the judge when multiplexing is on and the caller bound no secret scope. Notice writers, orphan reap,
++    completion notes and the web refresh run in sweeper threads or handlers with an empty context, so the
++    judge's provider read died with ``UnscopedSecretError`` at 0.0 s (t_01a1d0d08799272e). A caller that already
++    bound a scope (the post-turn refresh) keeps it; a single-profile process keeps process-env semantics."""
++    from agent.secret_scope import current_secret_scope, is_multiplex_active, reset_secret_scope, set_secret_scope
++
++    path = getattr(db, "db_path", None)
++    if path is None or not is_multiplex_active() or current_secret_scope() is not None:
++        yield
++        return
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++    from tui_gateway.launch_profile_policy import owner_secret_scope
++
++    home = Path(path).parent
++    home_token = set_hermes_home_override(str(home))  # home and secrets name the same owner
++    try:
++        scope_token = set_secret_scope(owner_secret_scope(home), profile_home=str(home))
++        try:
++            yield
++        finally:
++            reset_secret_scope(scope_token)
++    finally:
++        reset_hermes_home_override(home_token)
++
++
++def _judge_summary(sid: str, text: str, source: Optional[str], db: Any = None) -> Optional[bool]:
+     """The registered judge's verdict, or None when there is none or it can't tell."""
+     judge = _judge[0]
+     if judge is None:
+         return None
+     try:
+-        verdict = _call_judge(judge, sid, text, source)
++        with _owner_scope(db):
++            verdict = _call_judge(judge, sid, text, source)
+     except Exception:
+         logger.warning("session outcome judge failed for %s; using the heuristic", sid, exc_info=True)
+         return None
+@@ -716,7 +745,7 @@ def _derive_current(db: Any, sid: str, *, ignore_live_turn: bool = False,
+         if is_intentional_silence_response(text):
+             return _outcome("done", now, summary="Scheduled run completed with nothing to report.", **named, **carry)
+     msg_id = tail[0].get("id")
+-    verdict = _judge_summary(sid, text, row.get("source"))
++    verdict = _judge_summary(sid, text, row.get("source"), db)
+     if verdict is None:
+         verdict = _prior_verdict(stored, msg_id)
+     judged = {"judged": True, "judged_msg": msg_id} if verdict is not None and msg_id is not None else {}
+diff --git a/tests/hermes_state/test_outcome_judge_owner_scope.py b/tests/hermes_state/test_outcome_judge_owner_scope.py
+new file mode 100644
+index 0000000000..9f7a30d766
+--- /dev/null
++++ b/tests/hermes_state/test_outcome_judge_owner_scope.py
+@@ -0,0 +1,150 @@
++"""The outcome judge runs under the owning profile's secret scope even when its caller bound none.
++
++Notice writers (``tui_gateway.kanban_unloaded`` / ``kanban_remote_notices``), orphan reap, completion notes
++and the web refresh all call ``refresh_outcome[s_quietly]`` from sweeper threads or request handlers whose
++context carries no profile scope. On a multiplexed gateway the judge's provider read then failed with
++``UnscopedSecretError`` at 0.0 s (hub agent.log, 2026-11-12 16:23 / 17:00, t_01a1d0d08799272e)."""
++from __future__ import annotations
++
++import contextvars
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++import hermes_state_outcome as so
++from agent import secret_scope
++from hermes_constants import get_hermes_home, get_hermes_home_override
++from hermes_state import SessionDB
++
++SUMMARY = "Fixed the flaky test by waiting on the event instead of sleeping; all 12 tests pass now."
++
++
++@pytest.fixture
++def owner(tmp_path, monkeypatch):
++    """A profile home that owns the chat: its own ``.env`` and ``state.db``; the process env holds another value."""
++    so._reset_hooks_for_tests()
++    home = tmp_path / "profiles" / "owner"
++    home.mkdir(parents=True)
++    (home / ".env").write_text("ANTHROPIC_TOKEN=fixture-owner\n", encoding="utf-8")
++    monkeypatch.setenv("ANTHROPIC_TOKEN", "fixture-wrong-process")
++    monkeypatch.setattr(so, "_card_items", lambda ids: ([], []))  # no board in this fixture
++    db = SessionDB(db_path=home / "state.db")
++    db.create_session("chat", source="desktop")
++    db.append_message("chat", role="user", content="please fix the flaky test")
++    db.append_message("chat", role="assistant", content=SUMMARY)
++    yield home, db
++    db.close()
++    so._reset_hooks_for_tests()
++
++
++def _register_reading_judge(seen: list, *, fail: bool = False) -> None:
++    def read():
++        seen.append((secret_scope.get_secret("ANTHROPIC_TOKEN"), get_hermes_home()))
++        if fail:
++            raise RuntimeError("controlled judge failure")
++        return True
++
++    def judge(sid, text, **kwargs):
++        # The plugin's _with_budget boundary: a copy of the caller's context on another thread.
++        ctx = contextvars.copy_context()
++        with ThreadPoolExecutor(max_workers=1) as pool:
++            return pool.submit(ctx.run, read).result()
++
++    so.register_outcome_judge(judge)
++
++
++@pytest.mark.parametrize("judge_fails", [False, True])
++def test_unscoped_refresh_binds_owner_scope_for_judge(owner, monkeypatch, judge_fails):
++    home, db = owner
++    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
++    seen: list = []
++    _register_reading_judge(seen, fail=judge_fails)
++
++    def notice_path():  # what a sweeper thread does after writing a passive notice row
++        so.refresh_outcomes_quietly(["chat"], "notice", db=db)
++        return secret_scope.current_secret_scope(), get_hermes_home_override()
++
++    after = contextvars.Context().run(notice_path)  # an empty context: no scope, no home override
++    assert seen == [("fixture-owner", home)]
++    assert after == (None, None)  # nothing leaks back into the caller's context
++    stored = so.get_outcome("chat", db=db)
++    assert bool(stored.get("judged")) is not judge_fails
++
++
++def test_derive_outcome_binds_owner_scope_for_judge(owner, monkeypatch):
++    home, db = owner
++    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
++    seen: list = []
++    _register_reading_judge(seen)
++    out = contextvars.Context().run(lambda: so.derive_outcome("chat", db=db))
++    assert out["kind"] == "done" and out.get("judged")
++    assert seen == [("fixture-owner", home)]
++
++
++def test_bound_caller_scope_is_kept(owner, monkeypatch):
++    """A caller that already bound a scope (the post-turn refresh) keeps it: no rebinding over it."""
++    home, db = owner
++    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
++    seen: list = []
++    _register_reading_judge(seen)
++
++    def bound():
++        token = secret_scope.set_secret_scope({"ANTHROPIC_TOKEN": "fixture-caller"}, profile_home=str(home))
++        try:
++            so.refresh_outcome("chat", "turn_end", db=db)
++            return secret_scope.current_secret_scope()
++        finally:
++            secret_scope.reset_secret_scope(token)
++
++    assert contextvars.Context().run(bound) == {"ANTHROPIC_TOKEN": "fixture-caller"}
++    assert [value for value, _home in seen] == ["fixture-caller"]
++
++
++def test_caller_home_override_is_restored(owner, monkeypatch, tmp_path):
++    """The post-turn shape (home override still bound, secret already reset): the judge runs as the chat's owner
++    and the caller's own override comes back afterwards."""
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++
++    home, db = owner
++    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
++    seen: list = []
++    _register_reading_judge(seen)
++    other = tmp_path / "caller"
++
++    def caller():
++        token = set_hermes_home_override(str(other))
++        try:
++            so.refresh_outcome("chat", "turn_end", db=db)
++            return get_hermes_home_override(), secret_scope.current_secret_scope()
++        finally:
++            reset_hermes_home_override(token)
++
++    assert contextvars.Context().run(caller) == (str(other), None)
++    assert seen == [("fixture-owner", home)]
++
++
++def test_handle_without_a_path_binds_nothing(monkeypatch):
++    """A store handle with no ``db_path`` names no owner: the judge runs in the caller's context unchanged."""
++    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
++
++    def probe():
++        with so._owner_scope(object()):
++            return secret_scope.current_secret_scope(), get_hermes_home_override()
++
++    assert contextvars.Context().run(probe) == (None, None)
++
++
++def test_single_profile_process_binds_nothing(owner, monkeypatch):
++    """Without multiplexing an unscoped read keeps process-env semantics; the judge sees no new scope."""
++    _home, db = owner
++    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", False)
++    scopes: list = []
++
++    def judge(sid, text, **kwargs):
++        scopes.append((secret_scope.current_secret_scope(), get_hermes_home_override()))
++        return secret_scope.get_secret("ANTHROPIC_TOKEN") == "fixture-wrong-process"
++
++    so.register_outcome_judge(judge)
++    out = contextvars.Context().run(lambda: so.refresh_outcome("chat", "manual", db=db))
++    assert scopes == [(None, None)]
++    assert out["kind"] == "done" and out.get("judged")
+-- 
+2.43.0
+

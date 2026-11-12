@@ -1,0 +1,124 @@
+From 5b05ae7a1a16bfd97c53d177d677c053ec36280e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:07:11 +0000
+Subject: [PATCH] test(kanban): exercise producer intent and approval recovery
+ ingress [daveey]
+
+---
+ .../test_kanban_recovery_ingress.py           | 104 ++++++++++++++++++
+ 1 file changed, 104 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_recovery_ingress.py
+
+diff --git a/tests/hermes_cli/test_kanban_recovery_ingress.py b/tests/hermes_cli/test_kanban_recovery_ingress.py
+new file mode 100644
+index 0000000000..49f362d89a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_recovery_ingress.py
+@@ -0,0 +1,104 @@
++"""Real producer intent and approval lifecycle survive recovery selection."""
++import argparse
++import json
++
++import pytest
++
++from hermes_cli import kanban as cli
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_placement as placement
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_placement_recovery as recovery
++from tests.hermes_cli import test_kanban_worker_policy_db as fixtures
++from tests.hermes_cli.test_kanban_origin_creation import intent
++from tools import kanban_tools as tools
++
++conn = fixtures.conn
++REQUEST = {
++    "action": "Reply approve or decline. Unblock = build the plan; archive = drop it.",
++    "why_human": "The owner must select the plan.", "interaction": "approval",
++    "scope": "Public analysis plan", "evidence": "Two mutually exclusive designs.",
++}
++
++
++@pytest.fixture
++def ingress(conn, monkeypatch):
++    monkeypatch.setattr(placement, "config", dict)
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
++    monkeypatch.setattr(tools, "_persisted_identity", lambda: "default")
++    return conn
++
++
++def create(conn, entry, **options):
++    if entry == "tool":
++        result = json.loads(tools._handle_create({"title": "Analyze public data", "requires": [], **options}))
++        assert result.get("ok"), result
++        return result["task_id"]
++    parser = argparse.ArgumentParser()
++    cli.build_parser(parser.add_subparsers())
++    argv = ["kanban", "create", "Analyze public data", "--assignee", "default"]
++    for key, value in options.items():
++        argv += ["--" + key.replace("_", "-"), json.dumps(value) if isinstance(value, dict) else value]
++    assert cli._cmd_create(parser.parse_args(argv)) == 0
++    tasks = kb.list_tasks(conn)
++    assert len(tasks) == 1
++    return tasks[0].id
++
++
++def acknowledge(conn, tid):
++    # Transport ACK only: retain the real producer event, options and lifecycle.
++    conn.execute("UPDATE tasks SET sync_version=4,created_on='hub' WHERE id=?", (tid,))
++    conn.execute("DELETE FROM kanban_sync_outbox")
++    conn.commit()
++
++
++def offer(conn, monkeypatch):
++    monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": ["worker-2"]}})
++    monkeypatch.setattr(client, "pull", lambda *a, **kw: None)
++    hub = recovery.Hub()
++    wp.reevaluate(conn, hub, "default", "hub")
++    return hub.calls
++
++
++@pytest.mark.parametrize("entry", ["cli", "tool"])
++@pytest.mark.parametrize("pinned", [False, True])
++def test_real_create_intent_survives_pool_enrollment(ingress, monkeypatch, entry, pinned):
++    options = ({"placement": "local"} if entry == "tool" else {"runs_on": "linux"}) if pinned else {}
++    tid = create(ingress, entry, **options)
++    event = next(e for e in kb.list_events(ingress, tid) if e.kind == "created")
++    assert event.payload["placement_intent"] == ("explicit" if pinned else "auto")
++    assert kb.get_task(ingress, tid).placement_policy is None
++    acknowledge(ingress, tid)
++    calls = offer(ingress, monkeypatch)
++    assert bool(calls) is not pinned
++    if calls:
++        assert calls[0][1]["task_id"] == tid
++        assert calls[0][1]["mode"] == "promote"
++
++
++@pytest.mark.parametrize("entry", ["cli", "tool"])
++def test_approval_unblock_recomputes_uncarried_creation_option(ingress, monkeypatch, entry):
++    tid = create(ingress, entry, initial_status="blocked", human_request=REQUEST)
++    event = next(e for e in kb.list_events(ingress, tid) if e.kind == "created")
++    assert event.payload["portable_reason"] == "uncarried option"
++    acknowledge(ingress, tid)
++    assert offer(ingress, monkeypatch) == []
++    assert kb.unblock_task(ingress, tid)
++    task = kb.get_task(ingress, tid)
++    assert task.status == "ready" and task.human_request is None
++    acknowledge(ingress, tid)
++    calls = offer(ingress, monkeypatch)
++    assert len(calls) == 1
++    assert calls[0][1] == {"task_id": tid, "expected_revision": 4,
++                           "mode": "promote", "candidates": ["worker-2"]}
++
++
++def test_real_courier_creation_preserves_immutable_custody(ingress, monkeypatch):
++    tid = kb.create_task(ingress, title="Analyze public data", assignee="default", origin_intent=intent())
++    ledger = ingress.execute("SELECT task_id,binding_json FROM origin_creation_intents").fetchone()
++    assert ledger["task_id"] == tid
++    assert json.loads(ledger["binding_json"])["owner"]["task_id"] == tid
++    acknowledge(ingress, tid)
++    assert offer(ingress, monkeypatch) == []
++    assert kb.get_task(ingress, tid).placement_policy is None
+-- 
+2.43.0
+

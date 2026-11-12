@@ -1,0 +1,116 @@
+From 5da8cddc23a164a2f2dd6f8c4449ac2b16f4425a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 23:57:34 +0000
+Subject: [PATCH] fix(kanban): isolate recovery scans from reservation renewal
+ budget [daveey]
+
+---
+ hermes_cli/kanban_placement_recovery.py       | 25 +++++++++++++++++
+ hermes_cli/kanban_worker_placement.py         | 12 +++-----
+ .../test_kanban_recovery_fairness.py          | 28 +++++++++++++++++++
+ 3 files changed, 57 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_recovery_fairness.py
+
+diff --git a/hermes_cli/kanban_placement_recovery.py b/hermes_cli/kanban_placement_recovery.py
+index 0ddf574480..9453a10d3b 100644
+--- a/hermes_cli/kanban_placement_recovery.py
++++ b/hermes_cli/kanban_placement_recovery.py
+@@ -7,6 +7,31 @@ import time
+ 
+ RECOVERY_RETRY_S = 600.0
+ _unsupported: dict[tuple, float] = {}
++_scan_cursor: dict[tuple, str] = {}
++
++
++def select_rows(conn, board, gateway, cursor, limit):
++    """Give recovery its own bounded scan; legacy exclusions cannot starve renewals.
++
++    Reservation priority and its durable cursor remain unchanged. The extra recovery
++    lane shares the caller's network deadline and rotates within this process.
++    """
++    from hermes_cli.kanban_db_connect import _main_db_file
++    from hermes_cli.kanban_worker_placement import POLICY
++
++    query = (
++        "SELECT * FROM tasks WHERE placement_policy IS ? AND status='ready' "
++        "AND created_on=? AND claim_lock IS NULL AND lease_holder IS NULL AND sync_version IS NOT NULL "
++        "AND NOT EXISTS (SELECT 1 FROM kanban_sync_outbox o WHERE o.table_name='tasks' "
++        "AND o.row_uid=tasks.id AND o.state IN ('pending','rejected')) ORDER BY (id <= ?), id LIMIT ?")
++    policy = conn.execute(query, (POLICY, gateway, cursor, limit)).fetchall()
++    key = (_main_db_file(conn), board, gateway)
++    legacy = conn.execute(query, (None, gateway, _scan_cursor.get(key, ""), limit)).fetchall()
++    if legacy:
++        _scan_cursor[key] = legacy[-1]["id"]
++        if len(_scan_cursor) > 1024:
++            del _scan_cursor[next(iter(_scan_cursor))]
++    return policy + legacy
+ 
+ 
+ def endpoint_key(hub, board, gateway):
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index bbbfd1baff..3bf0a466db 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -280,12 +280,8 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+             or not all(isinstance(name, str) and name for name in candidates)):
+         return 0
+     cursor = (sync.sync_state(conn) or {}).get("worker_reserve_cursor") or ""
+-    rows = conn.execute(
+-        "SELECT * FROM tasks WHERE (placement_policy=? OR placement_policy IS NULL) AND status='ready' "
+-        "AND created_on=? AND claim_lock IS NULL AND lease_holder IS NULL AND sync_version IS NOT NULL "
+-        "AND NOT EXISTS (SELECT 1 FROM kanban_sync_outbox o WHERE o.table_name='tasks' "
+-        "AND o.row_uid=tasks.id AND o.state='pending') ORDER BY (id <= ?), id LIMIT ?",
+-        (POLICY, gateway, cursor, MAX_RESERVES_PER_TICK)).fetchall()
++    from hermes_cli import kanban_placement_recovery as recovery
++    rows = recovery.select_rows(conn, board, gateway, cursor, MAX_RESERVES_PER_TICK)
+     from hermes_cli import kanban_queue_reason as queue
+ 
+     attempted = 0
+@@ -297,8 +293,8 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+     now = time.monotonic()
+     try:
+         for row in rows:
+-            last = row["id"]
+-            from hermes_cli import kanban_placement_recovery as recovery
++            if row["placement_policy"] is not None:
++                last = row["id"]
+             if not recovery.unchanged_ready(conn, row):
+                 continue
+             mode = recovery.available_mode(conn, dict(row), cfg, hub, board, gateway)
+diff --git a/tests/hermes_cli/test_kanban_recovery_fairness.py b/tests/hermes_cli/test_kanban_recovery_fairness.py
+new file mode 100644
+index 0000000000..b51c639516
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_recovery_fairness.py
+@@ -0,0 +1,28 @@
++"""A backlog of legacy ineligible cards must not consume the reservation lane."""
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_placement_recovery as fixtures
++from tests.hermes_cli import test_kanban_worker_reserve_client as reserve
++
++conn = fixtures.conn
++setup = fixtures.setup
++
++
++def test_legacy_scan_does_not_starve_policy_renewal(setup):
++    db, hub = setup
++    for _ in range(wp.MAX_RESERVES_PER_TICK):
++        fixtures.make(db, requires='["host_repo"]')
++    tid = reserve.acknowledged(db)
++    calls = []
++    hub.reserve = lambda board, **body: calls.append(body) or {"state": "assigned", "machine": "worker-2"}
++    wp.reevaluate(db, hub, "default", "hub")
++    assert [call["task_id"] for call in calls] == [tid]
++
++
++def test_legacy_scan_rotates_past_ineligible_rows(setup):
++    db, hub = setup
++    for _ in range(wp.MAX_RESERVES_PER_TICK):
++        fixtures.make(db, requires='["host_repo"]')
++    tid = fixtures.make(db)
++    for _ in range(3):
++        wp.reevaluate(db, hub, "default", "hub")
++    assert tid in [call[1]["task_id"] for call in hub.calls]
+-- 
+2.43.0
+

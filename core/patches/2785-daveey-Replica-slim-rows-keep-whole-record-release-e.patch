@@ -1,0 +1,184 @@
+From 14aa48d2c4c792939cd6ea557ddfefd20de41ffb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:56:43 -0800
+Subject: [PATCH] [daveey] Replica slim rows keep whole-record release
+ evidence; small deltas read in one seq-indexed query; real memory bounds
+ (review of #1452)
+
+---
+ hermes_cli/kanban_replica_projection.py       | 15 +++--
+ hermes_cli/kanban_replica_rows.py             | 11 +++-
+ .../test_kanban_replica_rows_memory.py        | 63 ++++++++++++++++---
+ 3 files changed, 73 insertions(+), 16 deletions(-)
+
+diff --git a/hermes_cli/kanban_replica_projection.py b/hermes_cli/kanban_replica_projection.py
+index 550a10eaf1..a7fb3fe7b9 100644
+--- a/hermes_cli/kanban_replica_projection.py
++++ b/hermes_cli/kanban_replica_projection.py
+@@ -26,7 +26,8 @@ from hermes_cli.kanban_session_activity_release import record_attests_terminal
+ 
+ LINK_RELS = ('shepherd', 'cross_task', 'create-task', 'adopt-task')
+ # Every field a kept record without links to this origin is read for after ``_stage``: the unknown-status copy and
+-# ``_fold_legacy_aliases`` (status, sessions, created_at, created_by), and the record's own identity.
++# ``_fold_legacy_aliases`` (status, sessions, created_at, created_by), and the record's own identity. Release
++# evidence (``record_attests_terminal``) is computed in ``_stage`` from the whole record before it is slimmed.
+ SLIM_FIELDS = ('id', 'status', 'profile', 'board', 'gateway', 'created_at', 'created_by', 'sessions')
+ _REMOTE_FIELDS = ("title", "status", "block_kind", "human_request", "assignee", "created_at", "started_at", "priority")
+ 
+@@ -128,17 +129,19 @@ def _stage(row: tuple, me: str, origin_profile: str) -> _Stage:
+     gw = str(gw)
+     st.tkey = (gw, owner_profile, board, tid)
+     st.sids = linked_sessions(t, me, origin_profile)
++    # [daveey] Release evidence reads the whole record (``record_attests_terminal`` reads origin_bindings and
++    # more), so it is computed before the record is slimmed.
++    st.attest = ((gw, owner_profile, board) if record_attests_terminal(t, gw, owner_profile, board, evidence)
++                 else None)
++    # [daveey] Verified completion (``kanban_origin_ledger._verified_terminal``): only such a record expires a
++    # retained link it no longer carries (``_legacy_remote_links``).
++    st.verified = st.attest is not None and evidence.get('verified') is True
+     if not st.sids:
+         st.slim = True
+         t = {f: t[f] for f in SLIM_FIELDS if f in t}
+     st.t = t
+     st.legacy = {'key': record_key, 'version': version, 'digest': digest} if owner_profile is None else None
+     st.seen = (updated or 0) / 1000.0
+-    st.attest = ((gw, owner_profile, board) if record_attests_terminal(t, gw, owner_profile, board, evidence)
+-                 else None)
+-    # [daveey] Verified completion (``kanban_origin_ledger._verified_terminal``): only such a record expires a
+-    # retained link it no longer carries (``_legacy_remote_links``).
+-    st.verified = st.attest is not None and evidence.get('verified') is True
+     st.unknown = ({**t, 'reported_status': t.get('status'), 'status': 'unknown', 'unfinished': True}
+                   if owner_profile is None or t.get('status') not in LISTED_STATUSES else None)
+     created = t.get('created_at')
+diff --git a/hermes_cli/kanban_replica_rows.py b/hermes_cli/kanban_replica_rows.py
+index bd59d9b528..2be0fff842 100644
+--- a/hermes_cli/kanban_replica_rows.py
++++ b/hermes_cli/kanban_replica_rows.py
+@@ -33,6 +33,11 @@ _PAGE_SQL = (f"SELECT json_group_array(json_array({_COLUMNS})), max(rowid) FROM
+              " WHERE coll = 'tasks' AND rowid > ? {where} ORDER BY rowid LIMIT ?)")
+ _FULL_SQL = _PAGE_SQL.format(version="{version}", where="")
+ _DELTA_SQL = _PAGE_SQL.format(version="{version}", where="AND seq > ?")
++# A delta is usually a few rows: read them in one query planned on the seq index (the rowid-paged form scans
++# ``replica_coll`` and filters seq row by row, ~22 ms vs ~3 ms on a 14k-row hub). Only a delta bigger than a page
++# (a resync rewrote many rows) is paged.
++_DELTA_SIZE_SQL = "SELECT count(*), total(octet_length(data)) FROM replica WHERE coll = 'tasks' AND seq > ?"
++_DELTA_ONE_SQL = f"SELECT json_group_array(json_array({_COLUMNS})) FROM replica WHERE coll = 'tasks' AND seq > ?"
+ _IDENTITY_SQL = "SELECT json_group_array(json_array(gw, key, seq)) FROM replica WHERE coll = 'tasks'"
+ 
+ 
+@@ -148,7 +153,11 @@ def _delta(conn: sqlite3.Connection, base: Rows, probe) -> Rows | None:
+     """``base`` advanced to the snapshot ``probe`` describes, or None when only a full read can tell."""
+     last = base.last_seq
+     stats["delta"] += 1
+-    fresh = list(_paged(conn, _DELTA_SQL.format(version=base.version_column), probe, (last,)))
++    count, octets = conn.execute(_DELTA_SIZE_SQL, (last,)).fetchone()
++    if count <= _PAGE and octets <= _PAGE_BYTES:
++        fresh = _decode(conn.execute(_DELTA_ONE_SQL.format(version=base.version_column), (last,)).fetchone()[0])
++    else:
++        fresh = list(_paged(conn, _DELTA_SQL.format(version=base.version_column), probe, (last,)))
+     stats["delta_rows"] += len(fresh)
+     by_key, meta, sums = dict(base.by_key), dict(base.meta), base.sums
+     changed = set()
+diff --git a/tests/hermes_cli/test_kanban_replica_rows_memory.py b/tests/hermes_cli/test_kanban_replica_rows_memory.py
+index 7ab23e7ee4..139d8a9181 100644
+--- a/tests/hermes_cli/test_kanban_replica_rows_memory.py
++++ b/tests/hermes_cli/test_kanban_replica_rows_memory.py
+@@ -3,9 +3,10 @@
+ hermes-hub's replica held ~13.5k task rows (~60 MB of JSON, mostly bodies, comments and run logs) of which 54 linked a
+ session of the mini. Each gateway, dashboard and Desktop serve kept the whole decoded replica plus its text (~300 MB)
+ and built a 256 MB string (UCS-4: one emoji anywhere widens it) on every full read, which put 1-2 GB heaps on the
+-mini (t_01a1cf67a93c05b6). Here 2,000 rows with 20 KB bodies, 1 in 100 linking this origin, must keep under
+-75% of their text (the old code kept over twice the text) (zlib-packed rows, slim records) with a peak well under the text itself, decode only the linked
+-records whole, and still answer exactly what the explicit full read answers.
++mini (t_01a1cf67a93c05b6). Here 2,000 rows with 20 KB bodies, 1 in 100 linking this origin, must keep under their
++text (zlib-packed rows, slim records; the old code kept over twice the text) with a peak under 1.25x the text (the old
++code peaked over twice it), decode only the linked records whole, and still answer exactly what the explicit full read
++answers.
+ """
+ import gc
+ import json
+@@ -39,7 +40,7 @@ def _task(i):
+ 
+ 
+ def _fill(path):
+-    rows = [('owner', f'work/build/t_{i}', i + 1, json.dumps(_task(i))) for i in range(N)]
++    rows = [('owner', f'work/build/t_{i}', i + 1, json.dumps(_task(i), ensure_ascii=False)) for i in range(N)]
+     with sqlite3.connect(path) as db:
+         db.executemany("INSERT INTO replica VALUES (?,'tasks',?,1,?,?,1000000)", rows)
+     _scopes(path, [_ok(1000.0)], seq=N + 50)  # the owner scope is fresh: a done card is released
+@@ -61,12 +62,12 @@ def test_a_live_read_keeps_packed_slim_rows_and_peaks_below_the_text(hub):
+         current, peak = tracemalloc.get_traced_memory()
+     finally:
+         tracemalloc.stop()
+-    retained, transient = current - base, peak - current
++    retained, peak = current - base, peak - base
+     assert len(live) == N // LINKED_EVERY
+-    assert retained < 0.75 * text_bytes, (retained, text_bytes)
+-    # Above what it keeps, a read allocates at most a page at a time: the old whole-replica string alone was 1x
+-    # the text, 4x here (the emoji row made it UCS-4).
+-    assert transient < 0.4 * text_bytes, (transient, text_bytes)
++    assert retained < 1.0 * text_bytes, (retained, text_bytes)
++    # A read allocates at most a page of text on top of what it keeps: the old whole-replica string alone was 4x the
++    # text here (the raw emoji row made it UCS-4), the old peak over 2x.
++    assert peak < 1.25 * text_bytes, (peak, text_bytes)
+     (state,) = projection._states.values()
+     whole = [st for st in state.stages.values() if not st.slim]
+     assert len(whole) == N // LINKED_EVERY  # only the linked records are kept whole
+@@ -91,6 +92,24 @@ def test_a_full_read_pages_the_rows(hub):
+     assert len(replica_rows._views[str(path)].by_key) == N
+ 
+ 
++def test_a_small_delta_is_one_query_and_a_big_one_pages(hub):
++    path, _, statements, clock = hub
++    _fill(path)
++    w = World(path, clock)
++    w.seq = N + 100
++    w.same()
++    del statements[:]
++    w.put('work/build/t_3', json.dumps({**_task(3), 'status': 'running'}))
++    w.same()
++    assert not [s for s in statements if 'max(rowid)' in s and 'seq >' in s]
++    assert [s for s in statements if 'seq >' in s and 'json_group_array' in s]
++    del statements[:]
++    for i in range(400):  # ~8 MB of rewritten rows: more than a page
++        w.put(f'work/build/t_{i}', json.dumps({**_task(i), 'priority': 2}))
++    w.same()
++    assert len([s for s in statements if 'max(rowid)' in s and 'seq >' in s]) >= 2
++
++
+ def test_a_slim_row_a_legacy_alias_links_decodes_whole_again(hub):
+     """An unlinked qualified row kept slim gets this origin's link from its frozen ``board/id`` twin: the card is
+     built from the whole record, decoded again from the packed text."""
+@@ -108,3 +127,29 @@ def test_a_slim_row_a_legacy_alias_links_decodes_whole_again(hub):
+     t5 = [r for r in rows if r['id'] == 't_5']
+     assert t5 and t5[0]['legacy_key'] == 'owner/build/t_5'
+     assert projection.stats['rehydrated'] >= 1
++
++
++def _unlinked(i, **extra):
++    t = card(f't_{i}', **extra)
++    t['sessions'] = [{'gw': 'elsewhere', 'profile': 'default', 'session': 's9', 'rel': 'shepherd'}]
++    return t
++
++
++def test_a_slim_twin_keeps_the_release_evidence_of_its_whole_record(hub):
++    """An unlinked, terminal, origin-bound, unverified twin is not released (``record_attests_terminal`` reads
++    ``origin_bindings``, which a slim record drops), so a legacy alias folding this origin's link into it emits no
++    released card, exactly as the explicit full read."""
++    path, _, _, clock = hub
++    with sqlite3.connect(path) as db:
++        db.executemany("INSERT INTO replica VALUES (?,'tasks',?,1,?,?,1000000)",
++                       [('owner', f'work/build/t_{i}', i + 1, json.dumps(_unlinked(i))) for i in range(10)])
++    _scopes(path, [_ok(1000.0)], seq=60)
++    w = World(path, clock)
++    w.seq = 100
++    w.same()
++    same_card = {'created_at': 500, 'created_by': 'u'}
++    w.put('work/build/t_5', json.dumps(observed({**_unlinked(5), 'status': 'done', 'origin_bindings': [{'b': 1}],
++                                                 **same_card})))  # owner evidence: verified False
++    w.put('build/t_5', json.dumps({**card('t_5'), 'profile': None, **same_card}))
++    w.tick(1005.0)
++    w.same()
+-- 
+2.43.0
+

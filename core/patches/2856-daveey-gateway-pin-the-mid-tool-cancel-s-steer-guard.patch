@@ -1,0 +1,202 @@
+From 287059d55068839414f27bd5d9809889a99bad9e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:42:56 +0000
+Subject: [PATCH] [daveey] gateway: pin the mid-tool cancel's steer guard and
+ watcher stop; one-shot redial retries handshake rejections
+
+Follow-up of PR #1563's review (5878191638):
+- tests/gateway/test_update_pause_hook_mid_tool.py kills both mutants the gateway
+  suite let through: dropping stop_or_steer_pending from mid_tool_cancel_step, and
+  skipping stop_watcher() when installed() exits (normal and raising turn).
+- GatewayChatView._redial also retries websockets InvalidHandshake (InvalidStatus,
+  InvalidMessage...): connect_gateway passes them through raw, so a half-started
+  replacement owner rejecting the upgrade no longer ends the one-shot early.
+- The up-to-600 s wait for a gateway that never returns is kept (the turn may
+  still continue on the next owner), documented at REDIAL_WINDOW_S and announced
+  once on stderr so a quiet one-shot's silence has a reason.
+---
+ hermes_cli/gateway_chat_view.py               | 12 ++-
+ .../test_update_pause_hook_mid_tool.py        | 86 +++++++++++++++++++
+ .../test_gateway_chat_view_redial.py          | 36 ++++++++
+ 3 files changed, 132 insertions(+), 2 deletions(-)
+ create mode 100644 tests/gateway/test_update_pause_hook_mid_tool.py
+
+diff --git a/hermes_cli/gateway_chat_view.py b/hermes_cli/gateway_chat_view.py
+index 89d1f95a1f..fb3f129e48 100644
+--- a/hermes_cli/gateway_chat_view.py
++++ b/hermes_cli/gateway_chat_view.py
+@@ -13,7 +13,9 @@ logger = logging.getLogger(__name__)
+ 
+ _PREVIEW_CHARS = 80
+ # [daveey] ``_redial``: a core update restarts the hub gateway in ~90-110 s; a finite run waits this long
+-# per hang-up for the replacement owner, polling every REDIAL_RETRY_S, at most REDIAL_LIMIT hang-ups.
++# per hang-up for the replacement owner, polling every REDIAL_RETRY_S, at most REDIAL_LIMIT hang-ups. So a
++# one-shot whose gateway never comes back exits (turn outcome unknown) only after this window, not at once:
++# its turn may still be running on the next owner, and a stderr notice says what it waits for.
+ REDIAL_WINDOW_S = 600.0
+ REDIAL_RETRY_S = 2.0
+ REDIAL_LIMIT = 5
+@@ -224,14 +226,20 @@ class GatewayChatView:
+         if (self.reconnect is None or self.redials >= REDIAL_LIMIT
+                 or not isinstance(self.failure, GatewayClientError) or str(self.failure) != DISCONNECTED):
+             return False
++        from websockets.exceptions import InvalidHandshake
+         self.redials += 1
++        if self.emitter is None:  # stderr, even for a quiet one-shot: its 10-minute silence needs a reason
++            print(f"Gateway connection lost; waiting up to {REDIAL_WINDOW_S / 60:.0f} min for the restarted "
++                  "gateway to continue this turn.", file=sys.stderr, flush=True)
+         loop = asyncio.get_running_loop()
+         deadline = loop.time() + REDIAL_WINDOW_S
+         while True:
+             try:
+                 client = await self.reconnect()
+                 break
+-            except (GatewayClientError, OSError, TimeoutError) as exc:  # restarting: not ready yet
++            # Restarting, not ready yet: refused, timed out, or a half-started owner rejecting the WebSocket
++            # handshake (``connect_gateway`` passes websockets' ``InvalidHandshake``/``InvalidStatus`` through).
++            except (GatewayClientError, OSError, TimeoutError, InvalidHandshake) as exc:
+                 if loop.time() >= deadline:
+                     logger.debug("gateway redial gave up: %s", exc)
+                     return False
+diff --git a/tests/gateway/test_update_pause_hook_mid_tool.py b/tests/gateway/test_update_pause_hook_mid_tool.py
+new file mode 100644
+index 0000000000..b7b0b1d7d4
+--- /dev/null
++++ b/tests/gateway/test_update_pause_hook_mid_tool.py
+@@ -0,0 +1,86 @@
++"""[daveey] The gateway hook's mid-tool cancel watcher (``gateway.session_update_pause_hook``), unit by unit.
++
++Two rules the composed test does not pin: a pending Stop or steer beats the cancel (the boundary would not
++pause then, so a cut call's stamped result would only mislead the turn that goes on), and leaving
++``installed()`` stops the turn's watcher, so a later pause request never cancels a later turn's call.
++"""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from agent import update_pause_cancel
++from gateway import session_update_pause_hook as hook
++from hermes_cli import admission_fence as af
++from tests.waiting import wait_until
++from tui_gateway import update_pause as up
++
++
++class _Agent:
++    def __init__(self):
++        self._interrupt_requested = False
++        self._pending_steer: str | None = None
++        self.interrupts = []
++
++    def interrupt(self, message=None, *, tool_reason=None, **_kw):
++        self.interrupts.append(tool_reason)
++        self._interrupt_requested = True
++
++
++@pytest.fixture()
++def root(tmp_path, monkeypatch):
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 0.0)
++    monkeypatch.setattr(up, "MID_TOOL_POLL_S", 0.02)
++    root = hook.fence_root(tmp_path)
++    yield root
++    af.clear_hold(root)
++    af.clear_pause_request(root)
++
++
++def _request_pause(root):
++    af.set_hold(root)
++    af.request_pause(root, expires_at=time.time() + 60)
++
++
++def _running(agent):
++    update_pause_cancel.started(agent, "c1")
++    return agent
++
++
++def test_a_pending_steer_or_stop_is_never_cut_by_the_cancel(root):
++    _request_pause(root)
++    steered = _running(_Agent())
++    steered._pending_steer = "also check the docs"  # the turn goes on with it: no pause at the boundary
++    assert hook.mid_tool_cancel_step(steered, root, {}) is None
++    assert steered.interrupts == [] and "_update_pause_cancel" not in vars(steered)
++
++    stopped = _running(_Agent())
++    stopped._interrupt_requested = True  # a user Stop is already pending: it wins
++    assert hook.mid_tool_cancel_step(stopped, root, {}) is None and stopped.interrupts == []
++
++    plain = _running(_Agent())  # control: the same request and running call are cancelled
++    assert hook.mid_tool_cancel_step(plain, root, {}) == ["c1"]
++    assert plain.interrupts == [update_pause_cancel.CANCEL_TOOL_REASON]
++
++
++@pytest.mark.parametrize("raises", [False, True], ids=["turn-ended", "turn-raised"])
++def test_leaving_installed_stops_the_turns_watcher(root, tmp_path, raises):
++    live = _running(_Agent())
++    with hook.bind_scope(tmp_path, eligible=True), hook.installed(live) as on:
++        assert on
++        _request_pause(root)
++        wait_until(lambda: live.interrupts, timeout=5)  # control: the watcher runs while installed
++    assert live.interrupts == [update_pause_cancel.CANCEL_TOOL_REASON]
++    af.clear_pause_request(root)
++
++    ended = _running(_Agent())
++    try:
++        with hook.bind_scope(tmp_path, eligible=True), hook.installed(ended):
++            if raises:
++                raise RuntimeError("turn failed")
++    except RuntimeError:
++        pass
++    _request_pause(root)  # requested after the turn left the hook, its call still looking in flight
++    time.sleep(0.3)  # health: allow HX013 -- a stopped watcher must stay silent for many polls past its grace
++    assert ended.interrupts == []
+diff --git a/tests/hermes_cli/test_gateway_chat_view_redial.py b/tests/hermes_cli/test_gateway_chat_view_redial.py
+index d077b4713d..8e87bfc2a8 100644
+--- a/tests/hermes_cli/test_gateway_chat_view_redial.py
++++ b/tests/hermes_cli/test_gateway_chat_view_redial.py
+@@ -88,6 +88,42 @@ async def test_oneshot_without_a_dialer_or_past_the_window_keeps_the_unknown_exi
+     assert never.redials == 1
+ 
+ 
++@pytest.mark.asyncio
++async def test_a_half_started_owner_rejecting_the_handshake_is_retried(capsys, monkeypatch):
++    """``connect_gateway`` passes websockets' handshake rejections through raw: a replacement owner that is
++    listening but not ready (HTTP 503 on the upgrade, a socket closed mid-handshake) is retried like a refused
++    connect, not an exit with the turn still running. The wait is announced on stderr."""
++    from websockets.datastructures import Headers
++    from websockets.exceptions import InvalidMessage, InvalidStatus
++    from websockets.http11 import Response
++    monkeypatch.setattr(gcv, "REDIAL_RETRY_S", 0.01)
++
++    async def second(life, method, params):
++        if method == "session.resume":
++            return {"pending": [], "prompts": []}
++        if method == "prompt.receipt":
++            return {"admission_id": "a", "status": "terminal", "outcome": "completed",
++                    "result": {"final_response": "Work done", "completed": True}}
++        raise AssertionError(method)
++
++    replacement = Life(second)
++    dials = [InvalidStatus(Response(503, "Service Unavailable", Headers(), b"starting")),
++             InvalidMessage("did not receive a valid HTTP response"), replacement]
++    view = gcv.GatewayChatView(Life(_first), {"stored_session_id": "s"}, quiet=True)
++
++    async def reconnect():
++        nxt = dials.pop(0)
++        if isinstance(nxt, Exception):
++            raise nxt
++        return nxt
++    view.reconnect = reconnect
++    assert await asyncio.wait_for(view.run("review the PR", oneshot=True), 10) == 0
++    assert view.redials == 1 and dials == [] and "session.resume" in replacement.calls
++    captured = capsys.readouterr()
++    assert "Work done" in captured.out
++    assert "waiting up to 10 min for the restarted gateway" in captured.err
++
++
+ @pytest.mark.asyncio
+ async def test_a_refusal_that_is_not_a_hang_up_never_redials():
+     async def refused(life, method, params):
+-- 
+2.43.0
+

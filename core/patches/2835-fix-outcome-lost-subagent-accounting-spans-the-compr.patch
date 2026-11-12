@@ -1,0 +1,82 @@
+From 7bc6ceba39e1fcc9358f183a09d75dafbcf2f8bf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 13:18:21 +0000
+Subject: [PATCH] fix(outcome): lost-subagent accounting spans the compression
+ lineage [daveey]
+
+Review 5874991436: _accounted_at read only the tip's outcome_json while
+_lost_subagent_items scans every ancestor's children, so compressing a chat
+that had already accounted for a lost child flipped it to
+unresolved/subagent_lost. Take the latest accounting over the lineage, and
+carry it as last_declared_at on the new tip's derived outcome.
+---
+ hermes_state_outcome.py                         | 17 ++++++++++++++---
+ .../test_session_outcome_subagent_lost.py       | 16 ++++++++++++++++
+ 2 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 04a1f6ad28..71f32fed58 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -616,12 +616,23 @@ def _accounted_at(stored: Optional[dict]) -> Optional[float]:
+     return max(times) if times else None
+ 
+ 
++def _lineage_accounted_at(db: Any, ids: list[str]) -> Optional[float]:
++    """The latest ``_accounted_at`` over the whole compression lineage: a new tip starts with no outcome of its
++    own while ``_lost_subagent_items`` scans every ancestor's children, so the accounting spans it too."""
++    marks = ",".join("?" * len(ids))
++    rows = db._read_all(f"SELECT outcome_json FROM sessions WHERE id IN ({marks})", tuple(ids))
++    times = [t for t in (_accounted_at(_parse(r["outcome_json"])) for r in rows) if t is not None]
++    return max(times) if times else None
++
++
+ def _derive(db: Any, sid: str, *, ignore_live_turn: bool = False,
+             pending_reply: Optional[str] = None) -> dict[str, Any]:
+     stored = _parse((_row(db, sid) or {}).get("outcome_json"))
+     current = _derive_kept_receipt(db, sid, stored, ignore_live_turn=ignore_live_turn, pending_reply=pending_reply)
+-    accounted = _accounted_at(stored)
+-    if accounted is None or current.get("source") == "declared":
++    if current.get("source") == "declared":
++        return current
++    accounted = _lineage_accounted_at(db, _lineage_ids(db, sid))
++    if accounted is None:
+         return current
+     # A newer user row drops a lapsed declaration from the stored outcome; keep when it was made, so a lost
+     # subagent it accounted for stays accounted for (``_lost_subagent_items``).
+@@ -675,7 +686,7 @@ def _derive_current(db: Any, sid: str, *, ignore_live_turn: bool = False,
+     # declaration made before it went silent (``_lost_subagent_items`` drops those made after). A notice that
+     # already names the stopped subagent keeps its own reason.
+     lost_subagents = [] if tail and _tail_reason(tail) == "subagent_killed" else _guarded(
+-        "lost subagents", sid, lambda: _lost_subagent_items(db, ids, _accounted_at(stored)), [])
++        "lost subagents", sid, lambda: _lost_subagent_items(db, ids, _lineage_accounted_at(db, ids)), [])
+     if lost_subagents:
+         return _outcome("unresolved", now, reason="subagent_lost", on=lost_subagents, **carry)
+     crons = _guarded("cron", sid, lambda: _cron_items(ids), [])
+diff --git a/tests/hermes_state/test_session_outcome_subagent_lost.py b/tests/hermes_state/test_session_outcome_subagent_lost.py
+index 6cfc81d516..a7e686911c 100644
+--- a/tests/hermes_state/test_session_outcome_subagent_lost.py
++++ b/tests/hermes_state/test_session_outcome_subagent_lost.py
+@@ -185,3 +185,19 @@ def test_a_lost_subagent_of_a_compressed_ancestor_counts(db):
+     db.append_message("tip", role="user", content="and now?")
+     db.append_message("tip", role="assistant", content=CLOSING)
+     assert so.derive_outcome("tip", db=db)["reason"] == "subagent_lost"
++
++
++def test_compression_keeps_the_accounting_of_an_ancestor(db):
++    """A declaration on the pre-compression row accounted for the lost child; the new tip must not forget it."""
++    child(db, started_ago=8 * HOUR, active_ago=7 * HOUR)
++    declare(db, {"kind": "done", "summary": "Gate F verified; the stuck subagent was replaced."}, ago=HOUR)
++    so.refresh_outcome("chat", "turn_end", db=db)
++    db.create_session("tip", source="desktop", parent_session_id="chat")
++    db._write_rowcount("UPDATE sessions SET end_reason = 'compression', ended_at = ? WHERE id = 'chat'",
++                       (time.time(),))
++    db.append_message("tip", role="user", content="and now?")
++    db.append_message("tip", role="assistant", content=CLOSING)
++    out = so.refresh_outcome("tip", "turn_end", db=db)
++    assert (out["kind"], out["summary"]) == ("done", CLOSING)
++    assert out["last_declared_at"] == pytest.approx(time.time() - HOUR, abs=60)
++    assert so.refresh_outcome("tip", "turn_end", db=db)["kind"] == "done"
+-- 
+2.43.0
+

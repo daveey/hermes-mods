@@ -1,0 +1,172 @@
+From 5ca75812bc67fd8f0709e4f6cff6cc0ddbbcf739 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:48:14 +0000
+Subject: [PATCH] [daveey] fix(update): a checkpoint ACK from a wrapper unit's
+ gateway child is the unit's gateway
+
+hermes-worker-5 2026-11-12 15:15-15:18Z: four instant applies in a row exited 1 with "hermes-gateway
+is busy or cannot acknowledge an idle pause", each after the gateway had accepted the checkpoint,
+cut its Kanban workers ("Core update Kanban-only wait capped at 15s with 3 managed card(s)") and
+exited 75; every rollback then restarted it on the old code. The checkout moved only on the next
+idle tick (15:34Z), which uses the idle-only verb and never checks the ACK's pid.
+
+hermes-gateway.service on worker nodes runs hermes-gateway-broker (github_quota.py ... --
+token-broker exec ... -- hermes gateway run), so the unit's MainPID, which pre-swap discovery puts
+in the pause entry, is the wrapper; the gateway answers checkpoint-for-update with its own
+os.getpid(), a child of that wrapper. _valid_checkpoint_ack required ack["pid"] == entry["pid"],
+so _ask_to_drain called a real ACK "unbelievable" (None), settled the exit, then refused.
+
+_valid_checkpoint_ack now also believes a `gateway run` process below the entry's PID
+(gateway_service_members.gateway_descendant_pids, the helper 30343a2ff9 added for the same
+wrapper). A non-gateway child (a card worker) or a gateway outside the entry's tree is still refused.
+
+Tests: tests/hermes_cli/test_update_checkpoint_wrapper_pid.py (real wrapper process tree; the
+gateway-child test is RED without the fix, GREEN with it); all 22 test files importing
+update_cmd_posix_pause pass (359 passed, 7 skipped).
+---
+ hermes_cli/update_cmd_posix_pause.py          |  15 ++-
+ .../test_update_checkpoint_wrapper_pid.py     | 102 ++++++++++++++++++
+ 2 files changed, 116 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_update_checkpoint_wrapper_pid.py
+
+diff --git a/hermes_cli/update_cmd_posix_pause.py b/hermes_cli/update_cmd_posix_pause.py
+index 1aaf5e486c..4b3af66128 100644
+--- a/hermes_cli/update_cmd_posix_pause.py
++++ b/hermes_cli/update_cmd_posix_pause.py
+@@ -551,11 +551,24 @@ def _valid_checkpoint_ack(ack: dict, entry: dict, nonce: str) -> bool:
+     """A checkpoint ACK is believed only when it is from the gateway we asked (pid), for this
+     episode (required nonce echo), names the checkpoint, and states a sane bounded drain."""
+     drain = ack.get("drain_timeout")
+-    return (ack.get("checkpoint") is True and type(ack.get("pid")) is int and ack["pid"] == entry.get("pid")
++    return (ack.get("checkpoint") is True and type(ack.get("pid")) is int and _is_entry_gateway(ack["pid"], entry)
+             and ack.get("nonce") == nonce
+             and isinstance(drain, (int, float)) and not isinstance(drain, bool) and 0 < drain)
+ 
+ 
++def _is_entry_gateway(pid: int, entry: dict) -> bool:
++    """*pid* is the gateway behind *entry*: its own PID, or (a unit whose ``ExecStart`` is a non-exec
++    wrapper, e.g. a worker node's ``hermes-gateway-broker``) a ``gateway run`` process below it. Such a
++    unit's MainPID is the wrapper, while the gateway answers with its own PID; requiring equality refused
++    every accepted checkpoint as "unbelievable" after the gateway had already drained its Kanban workers
++    (hermes-worker-5 2026-11-12 15:15-15:18Z: four instant applies, four restarts on the old code)."""
++    if pid == entry.get("pid"):
++        return True
++    from hermes_cli.gateway_service_members import gateway_descendant_pids
++    owner = entry.get("pid")
++    return type(owner) is int and pid in gateway_descendant_pids(owner)
++
++
+ def _ask_to_drain(entry: dict) -> bool | None:
+     """Ask the gateway to exit only if idle; True on its ACK. Busy/old gateways refuse rather
+     than starting an uncancellable pre-swap drain. SIGTERM,
+diff --git a/tests/hermes_cli/test_update_checkpoint_wrapper_pid.py b/tests/hermes_cli/test_update_checkpoint_wrapper_pid.py
+new file mode 100644
+index 0000000000..6f21b69266
+--- /dev/null
++++ b/tests/hermes_cli/test_update_checkpoint_wrapper_pid.py
+@@ -0,0 +1,102 @@
++"""A checkpoint ACK from the gateway child of a wrapper ``ExecStart`` is the unit's gateway.
++
++hermes-worker-5, 2026-11-12 15:15-15:18Z: ``hermes-gateway.service`` runs ``hermes-gateway-broker``
++(``github_quota.py … -- token-broker exec … -- hermes gateway run``), so the unit's ``MainPID`` (the pause
++entry's pid) is the wrapper and the gateway, which answers ``checkpoint-for-update`` with its own
++``os.getpid()``, is its child. ``_valid_checkpoint_ack`` required ``ack["pid"] == entry["pid"]``: the gateway
++accepted the checkpoint and drained its Kanban workers, the updater called the ACK unbelievable, deferred
++("busy or cannot acknowledge an idle pause") and restarted the gateway on the old code, four times in a row.
++These tests use a real process tree for the wrapper and its children.
++"""
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++import textwrap
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import admission_fence
++from hermes_cli import update_cmd_posix_pause as pause
++from tests.waiting import wait_until
++
++pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc process tree")
++
++psutil = pytest.importorskip("psutil")
++
++NONCE = "episode-wrapper"
++
++
++@pytest.fixture()
++def wrapper_tree(tmp_path):
++    """``wrapper`` (the unit's MainPID) -> [a ``gateway run`` child, a non-gateway card worker child]."""
++    main_py = tmp_path / "hermes_cli" / "main.py"
++    main_py.parent.mkdir()
++    main_py.write_text("import time\ntime.sleep(60)\n")
++    worker_py = tmp_path / "card_worker.py"
++    worker_py.write_text("import time\ntime.sleep(60)\n")
++    wrapper_py = tmp_path / "broker_wrapper.py"
++    wrapper_py.write_text(textwrap.dedent(f"""
++        import subprocess, sys, time
++        subprocess.Popen([sys.executable, {str(main_py)!r}, "gateway", "run"])
++        subprocess.Popen([sys.executable, {str(worker_py)!r}])
++        time.sleep(60)
++    """))
++    wrapper = subprocess.Popen([sys.executable, str(wrapper_py)])
++    try:
++        def started():
++            children = psutil.Process(wrapper.pid).children()
++            names = {Path(c.cmdline()[1]).name: c.pid for c in children if len(c.cmdline()) >= 2}
++            return names if set(names) == {"main.py", "card_worker.py"} else None
++        by_script = wait_until(started, timeout=10, what="the wrapper's two children")
++        yield wrapper.pid, by_script["main.py"], by_script["card_worker.py"]
++    finally:
++        for child in psutil.Process(wrapper.pid).children(recursive=True):
++            child.kill()
++        wrapper.kill()
++        wrapper.wait(timeout=10)
++
++
++@pytest.fixture()
++def episode(tmp_path, monkeypatch):
++    """A live explicit checkpoint intent under a held admission fence (what hermes-sync publishes)."""
++    home = tmp_path / ".hermes"
++    (home / "core-update").mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    now = time.time()
++    (home / "core-update/intent").write_text(json.dumps({
++        "pid": os.getpid(), "kind": "unfenced", "checkpoint": True, "cron_cut": True,
++        "created_at": now, "expires_at": now + 120, "nonce": NONCE}))
++    admission_fence.set_hold(home)
++    return home
++
++
++def ask_with_ack(monkeypatch, home, main_pid, ack_pid):
++    from gateway import control_socket
++    ack = {"pausing": True, "checkpoint": True, "pid": ack_pid, "drain_timeout": 70.0, "nonce": NONCE}
++    monkeypatch.setattr(control_socket, "query_gateway_control", lambda *a, **k: dict(ack))
++    entry = {"pid": main_pid, "home": str(home), "kind": "systemd", "unit": "hermes-gateway.service"}
++    return pause._ask_to_drain(entry), entry
++
++
++def test_an_ack_from_the_gateway_child_of_the_wrapper_main_pid_is_believed(wrapper_tree, episode, monkeypatch):
++    main_pid, gateway_pid, _ = wrapper_tree
++    result, entry = ask_with_ack(monkeypatch, episode, main_pid, gateway_pid)
++    assert result is True and entry["checkpoint_drain_timeout"] == 70.0
++
++
++def test_an_ack_from_a_non_gateway_child_of_the_wrapper_is_not(wrapper_tree, episode, monkeypatch):
++    main_pid, _, worker_pid = wrapper_tree
++    result, entry = ask_with_ack(monkeypatch, episode, main_pid, worker_pid)
++    assert result is None and "checkpoint_drain_timeout" not in entry
++
++
++def test_an_ack_from_a_gateway_outside_the_entrys_tree_is_not(wrapper_tree, episode, monkeypatch):
++    _, gateway_pid, worker_pid = wrapper_tree
++    # The card worker is not the gateway's ancestor: the wrapper's gateway child is not *its* gateway.
++    result, entry = ask_with_ack(monkeypatch, episode, worker_pid, gateway_pid)
++    assert result is None and "checkpoint_drain_timeout" not in entry
+-- 
+2.43.0
+

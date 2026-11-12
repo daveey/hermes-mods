@@ -1,0 +1,404 @@
+From 3a1d75f3494a0233aad52302d43ba2c277c13550 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:12:35 +0000
+Subject: [PATCH] [daveey] execution observations: date a remote running card
+ by its executor's heartbeat events
+
+Under links_reader=replica (every host), a card on another gateway came from the Board
+replica with no run identity, so every remote card projected unknown /
+missing_qualified_identity in /api/session-kanban-tasks, the sidebar counts and
+session-idle-check (Mac readback t_01a1cfc6ea23e588 on hub card t_01a1c7a649c59bec).
+
+The replica already carries source-owned liveness: the executor writes heartbeat
+(and claimed/spawned) task events with its own created_at and a portable uid, and
+they sync everywhere. For a running replica card whose current run is running and
+unended, the newest such event of THAT run dates a v1 card observation:
+identity gateway/profile/board/work_id + run_id = the run's portable uid,
+observed_at = event created_at, valid_until +180 s, revision event:<uid>.
+
+- Never the pull clock: a fresh pull of an old heartbeat expires on time alone.
+- Old-run, ended/released runs, parked cards, future clocks and a profile the
+  origin ledger does not name (the 'default' label) stay explicit unknown.
+- Stale replica: unknown/source_unavailable with last_known_state running.
+- The counts (sidebar) evidence sink gets the same raw record as session_tasks.
+- Two correlated subqueries evaluated only for running rows (task_runs PK,
+  task_events(run_id,id) index): ~20 ms for 92 real links, unchanged from base.
+
+Parked replica cards keep their explicit unknown: the replica has no executor
+clock for them.
+---
+ hermes_cli/kanban_chat_links.py               |  17 +-
+ hermes_cli/kanban_execution_observations.py   |   6 +
+ hermes_cli/kanban_replica_execution.py        |  86 ++++++++++
+ hermes_cli/kanban_session_activity.py         |   3 +-
+ .../test_kanban_replica_execution.py          | 157 ++++++++++++++++++
+ 5 files changed, 263 insertions(+), 6 deletions(-)
+ create mode 100644 hermes_cli/kanban_replica_execution.py
+ create mode 100644 tests/hermes_cli/test_kanban_replica_execution.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 49c55a9a8b..59ce079291 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -24,6 +24,7 @@ import time
+ from pathlib import Path
+ from typing import Any, Iterable, Optional
+ 
++from hermes_cli.kanban_replica_execution import run_evidence, select_terms as run_select
+ from hermes_cli.kanban_run_machine import placement_select, run_machine
+ 
+ _log = logging.getLogger(__name__)
+@@ -341,6 +342,7 @@ def _read_replica_links(conn: sqlite3.Connection, gateway: str, profile: str) ->
+     return [dict(r) for r in conn.execute(
+         "SELECT l.task_id AS id, t.id AS task_row, t.title, t.status, t.assignee, t.created_at, t.started_at, "
+         f"t.priority, t.block_kind, t.human_request, t.created_on, {placement_select(conn, 't')}, "
++        f"{run_select(conn, 't')}, "
+         "l.chat_session, l.chat_profile, l.kind, "
+         "EXISTS (SELECT 1 FROM task_chat_links r WHERE r.task_id = l.task_id AND r.chat_gateway = l.chat_gateway "
+         "AND r.chat_profile IS l.chat_profile AND r.chat_session = l.chat_session AND r.released = 1) "
+@@ -383,17 +385,18 @@ _owners_memo: tuple[list[dict[str, Any]], dict[tuple[str, str], list[tuple[str,
+ 
+ 
+ def _owner_of(known: list[tuple[str, str, str, bool]], owner: Optional[str],
+-              session: str) -> tuple[Optional[str], str]:
++              session: str) -> tuple[Optional[str], str, bool]:
+     """The ONE (owner gateway, owner profile) for a replica card: the profile this chat's own unreleased ledger row
+-    names, else the only one any unreleased row names, else ``default`` (never several rows for one card)."""
++    names, else the only one any unreleased row names, else ``default`` (never several rows for one card). The third
++    value says whether a ledger row named that profile; the ``default`` fallback is a label, not owner evidence."""
+     if owner is not None:
+         known = [k for k in known if k[0] == owner]
+     for pick in ([k for k in known if k[2] == session and not k[3]], [k for k in known if not k[3]]):
+         pairs = sorted({(k[0], k[1]) for k in pick})
+         if len(pairs) == 1:
+-            return pairs[0]
++            return (*pairs[0], True)
+     gateways = sorted({k[0] for k in known})
+-    return (owner if owner is not None else gateways[0] if len(gateways) == 1 else None), "default"
++    return (owner if owner is not None else gateways[0] if len(gateways) == 1 else None), "default", False
+ 
+ 
+ def _ledger_fallback(board: str, gateway: str, profile: str, statuses: tuple[str, ...], *,
+@@ -482,7 +485,8 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+             if status in TERMINAL_STATUSES and r.get("chat_released"):
+                 continue
+             tid = str(r["id"])
+-            owner, owner_profile = _owner_of((owners or {}).get((board, tid), []), r["created_on"], r["chat_session"])
++            owner, owner_profile, named = _owner_of((owners or {}).get((board, tid), []), r["created_on"],
++                                                    r["chat_session"])
+             if missing and owner == gateway:  # the ledger places the missing row on this gateway: a local card
+                 continue
+             key = f"{owner or '?'}/{owner_profile}/{board}/{tid}"
+@@ -504,6 +508,9 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+             }
+             if machine := run_machine(r):
+                 out[pair]["run_machine"] = machine
++            # Executor-stamped liveness of the current run (kanban_replica_execution), never the pull clock.
++            if named and owner is not None and not unknown and (run := run_evidence(r)) is not None:
++                out[pair]["_replica_run"] = run
+     return list(out.values())
+ 
+ 
+diff --git a/hermes_cli/kanban_execution_observations.py b/hermes_cli/kanban_execution_observations.py
+index 06bc7de14a..ec632d25a4 100644
+--- a/hermes_cli/kanban_execution_observations.py
++++ b/hermes_cli/kanban_execution_observations.py
+@@ -137,6 +137,11 @@ def card(row, *, gateway=None, profile=None, now=None):
+             value.update(state="unknown", unknown_reason="source_unavailable")
+         return project(value, now=now, source_class="sidebar")
+     remote = bool(row.get("remote"))
++    if remote and isinstance(row.get("_replica_run"), dict):
++        from hermes_cli.kanban_replica_execution import raw as replica_raw
++        value = replica_raw(row)
++        if value is not None:
++            return project(value, now=now, source_class="sidebar")
+     gateway = row.get("gateway") if remote else gateway
+     profile = row.get("owner_profile", row.get("profile")) if remote else profile
+     identity = {"kind": "card", "work_id": row.get("id")}
+@@ -212,6 +217,7 @@ def add_cards(rows, *, now=None):
+         row.pop("_execution_done", None)
+         row.pop("_execution_error", None)
+         row.pop("_execution_scope", None)
++        row.pop("_replica_run", None)
+     return rows
+ 
+ 
+diff --git a/hermes_cli/kanban_replica_execution.py b/hermes_cli/kanban_replica_execution.py
+new file mode 100644
+index 0000000000..e3c1e06d69
+--- /dev/null
++++ b/hermes_cli/kanban_replica_execution.py
+@@ -0,0 +1,86 @@
++"""Execution evidence for a running card on ANOTHER gateway, read from its synced Board replica.
++
++A replica's own clocks (``pulled_at``, fetch time, file mtime) never attest the owner. The executor does: every
++running attempt writes ``heartbeat`` (and ``claimed``/``spawned``) task events stamped with its own ``created_at``
++and a portable ``uid``, and those events sync to every replica. The newest such event of the card's CURRENT run
++dates the run exactly like the owner's ``task_runs.last_heartbeat_at`` dates it locally (180 s validity), so a
++dead or partitioned executor expires to unknown on time alone. A replica row with no portable run identity, no
++such event, a run that is not current/running, or a guessed owner profile yields no observation (the caller keeps
++its explicit unknown). Only ``running`` is projected: a parked replica card has no executor clock.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++from hermes_cli.execution_observations import epoch, ident
++
++# Executor-written lifecycle events of an attempt; liveness only, never progress.
++LIVENESS_KINDS = ("heartbeat", "claimed", "spawned")
++_TERMS = ("run_uid", "run_beat")
++
++
++def select_terms(conn: sqlite3.Connection, alias: str = "t") -> str:
++    """SELECT terms for the current run's identity and newest liveness event; NULL on boards lacking the columns.
++
++    Correlated, evaluated only for ``running`` rows, through the ``task_runs`` primary key and the
++    ``task_events(run_id, id)`` index: bounded by the open running cards, not the link count."""
++    tasks = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    runs = {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
++    events = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
++    if not ({"current_run_id", "status"} <= tasks and {"id", "task_id", "uid", "status", "ended_at"} <= runs
++            and {"task_id", "run_id", "kind", "created_at", "uid"} <= events):
++        return ", ".join(f"NULL AS {name}" for name in _TERMS)
++    kinds = ",".join(f"'{k}'" for k in LIVENESS_KINDS)
++    return (f"CASE WHEN {alias}.status = 'running' THEN (SELECT r.uid FROM task_runs r WHERE r.id = {alias}.current_run_id "
++            f"AND r.task_id = {alias}.id AND r.status = 'running' AND r.ended_at IS NULL) END AS run_uid, "
++            f"CASE WHEN {alias}.status = 'running' THEN (SELECT json_array(e.created_at, e.uid) FROM task_events e "
++            f"WHERE e.run_id = {alias}.current_run_id AND e.task_id = {alias}.id AND e.kind IN ({kinds}) "
++            f"ORDER BY e.created_at DESC, e.uid DESC LIMIT 1) END AS run_beat")
++
++
++def run_evidence(row: dict) -> dict | None:
++    """``{'run_id', 'at', 'ref'}`` from a replica link row, or None when anything is missing or malformed."""
++    uid, beat = row.get("run_uid"), row.get("run_beat")
++    if row.get("status") != "running" or not ident(uid) or not isinstance(beat, str):
++        return None
++    try:
++        at, event_uid = json.loads(beat)
++    except (ValueError, TypeError):
++        return None
++    if not epoch(at) or not ident(event_uid):
++        return None
++    return {"run_id": uid, "at": at, "ref": "event:" + event_uid}
++
++
++def raw(row: dict) -> dict | None:
++    """v1 running observation for a qualified replica card row (``_replica_run`` set by ``replica_cards``)."""
++    run = row.get("_replica_run")
++    if not isinstance(run, dict) or row.get("status") != "running":
++        return None
++    gateway, profile = row.get("gateway"), row.get("owner_profile")
++    identity = {"gateway": gateway, "profile": profile, "board": row.get("board"), "kind": "card",
++                "work_id": row.get("id"), "run_id": run["run_id"]}
++    owner = {"gateway": gateway, "profile": profile}
++    if row.get("assignee"):
++        owner["assignee"] = row["assignee"]
++    at = run["at"]
++    value = {"version": 1, "identity": identity, "owner": owner, "state": "running",
++             "source": "kanban.replica_run", "source_revision": run["ref"], "evidence_refs": [run["ref"]],
++             "observed_at": at, "valid_until": at + 180, "generation_portable": True,
++             "last_activity": row.get("activity_at"), "last_activity_kind": row.get("activity_kind"),
++             "last_progress": None, "last_progress_kind": None, "last_progress_ref": None, "wait": None}
++    request = row.get("human_request")
++    if isinstance(request, dict):
++        value["human_request"] = {k: v for k, v in request.items() if k not in ("resolved_check", "resolved_check_every")}
++    if row.get("stale"):  # an unreadable or long-unpulled replica: its last rows are not a current read
++        value.update(state="unknown", last_known_state="running", unknown_reason="source_unavailable")
++    return value
++
++
++def collect(card: dict, evidence: dict) -> None:
++    """Add a replica card's running evidence to the counts' per-session evidence sink, keyed like its count key, so
++    the sidebar counts and ``session_tasks`` project the same record. Never mutates ``card`` (shared, read-only)."""
++    value = raw(card)
++    if value is not None:
++        evidence.setdefault(card["session"], {})[str(card.get("key"))] = value
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index e62fad78e0..b6f432a348 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -29,7 +29,7 @@ from hermes_cli import kanban_execution_receipt as _receipts
+ from hermes_cli.kanban_session_activity_origin_snapshot import remote_snapshot as _remote_snapshot
+ from hermes_cli.kanban_session_activity_hub import _hub_content_signature
+ from hermes_cli import kanban_scope_heartbeat as _scope_hb
+-from hermes_cli import kanban_replica_projection as _replica_projection
++from hermes_cli import kanban_replica_projection as _replica_projection, kanban_replica_execution as _replica_exec
+ from hermes_cli import kanban_replica_rows as _replica_rows
+ from hermes_cli.kanban_session_activity_release import TERMINAL_STATUSES
+ from hermes_cli.kanban_session_activity_release import owner_attests_terminal as _owner_attests_terminal
+@@ -1217,6 +1217,7 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+         if is_parked:
+             parked[sid] = parked.get(sid, 0) + 1
+         remote_keys.setdefault(sid, set()).add((str(card.get("key")), str(bucket), is_parked))
++        _replica_exec.collect(card, execution)
+         # Same status test as parked/blocked above: a legacy row whose live status is unknown (reported_status is
+         # only its last report) is never counted stalled, so stalled can't exceed what the row shows parked.
+         if card.get("status") != "unknown" and (_remote_wait(card) or {}).get("wait_state") == "stalled":
+diff --git a/tests/hermes_cli/test_kanban_replica_execution.py b/tests/hermes_cli/test_kanban_replica_execution.py
+new file mode 100644
+index 0000000000..f731dc7ecb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_execution.py
+@@ -0,0 +1,157 @@
++"""A running card on another gateway, read from its synced Board replica, is dated by its executor's own
++heartbeat events for the CURRENT run, never by the replica's pull clock; anything less stays explicit unknown."""
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli.kanban_execution_observations import add_cards, count_snapshot
++
++ME, OWNER = "macbook", "hub"
++NOW = 10_000.0
++RUN_UID, OLD_UID = "01run-current", "01run-old"
++
++
++def _replica(path, *, pulled=NOW, status="running", run_status="running", ended=None, beats=((NOW - 30, "e2"),),
++             old_beats=((NOW - 5, "e-old"),)):
++    conn = sqlite3.connect(path)
++    conn.executescript(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, created_at INTEGER, "
++        "started_at INTEGER, priority INTEGER, block_kind TEXT, human_request TEXT, created_on TEXT, "
++        "current_run_id INTEGER);"
++        "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, uid TEXT, status TEXT, ended_at INTEGER);"
++        "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, payload TEXT, "
++        "created_at INTEGER, uid TEXT);"
++        "CREATE INDEX idx_events_run ON task_events(run_id, id);"
++        "CREATE TABLE task_chat_links (uid TEXT, task_id TEXT, chat_gateway TEXT, chat_profile TEXT, "
++        "chat_session TEXT, kind TEXT, released INTEGER, created_at INTEGER);"
++        "CREATE TABLE kanban_sync_state (pulled_at REAL);")
++    conn.execute("INSERT INTO tasks VALUES ('t_run', 'work', ?, 'worker', 1, 1, 0, NULL, NULL, ?, 2)", (status, OWNER))
++    conn.execute("INSERT INTO task_runs VALUES (1, 't_run', ?, 'released', 50)", (OLD_UID,))
++    conn.execute("INSERT INTO task_runs VALUES (2, 't_run', ?, ?, ?)", (RUN_UID, run_status, ended))
++    for at, uid in old_beats:  # a previous attempt's late-arriving heartbeat: never this run's clock
++        conn.execute("INSERT INTO task_events (task_id, run_id, kind, created_at, uid) VALUES ('t_run', 1, 'heartbeat', ?, ?)",
++                     (at, uid))
++    for at, uid in beats:
++        conn.execute("INSERT INTO task_events (task_id, run_id, kind, created_at, uid) VALUES ('t_run', 2, 'heartbeat', ?, ?)",
++                     (at, uid))
++    # An ordinary comment of the run is activity, not a liveness clock.
++    conn.execute("INSERT INTO task_events (task_id, run_id, kind, created_at, uid) VALUES ('t_run', 2, 'commented', ?, 'c1')",
++                 (NOW - 1,))
++    conn.execute("INSERT INTO task_chat_links VALUES (?, 't_run', ?, 'default', 's1', 'created', 0, 1)",
++                 (links.link_uid("t_run", ME, "default", "s1", "created"), ME))
++    conn.execute("INSERT INTO kanban_sync_state VALUES (?)", (pulled,))
++    conn.commit()
++    conn.close()
++
++
++@pytest.fixture
++def world(tmp_path, monkeypatch):
++    from hermes_cli import profiles
++    links._reset_for_tests()
++    named = [{"id": "t_run", "board": "default", "gateway": OWNER, "profile": "work", "session": "s1",
++              "released": False}]
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: list(named))
++    yield tmp_path / "default.db", named
++    links._reset_for_tests()
++
++
++def _rows(path, now=NOW):
++    return links.replica_cards(["s1"], ME, replicas=[("default", path)], now=now)
++
++
++def _observe(path, *, now=NOW, read_at=NOW):
++    rows = [{**card, "session_id": card["session"]} for card in _rows(path, now=read_at)]
++    return add_cards(rows, now=now)[0]["execution_observations"][0]
++
++
++def test_current_run_heartbeat_dates_a_remote_running_card(world):
++    path, _ = world
++    _replica(path, beats=((NOW - 90, "e1"), (NOW - 30, "e2"), (NOW - 60, "e3")))  # arrival order != clock order
++    obs = _observe(path)
++    assert obs["state"] == "running" and obs["freshness"] == "current"
++    assert obs["identity"] == {"gateway": OWNER, "profile": "work", "board": "default", "kind": "card",
++                               "work_id": "t_run", "run_id": RUN_UID}
++    assert obs["observed_at"] == NOW - 30 and obs["valid_until"] == NOW + 150
++    assert obs["source_revision"] == "event:e2" and obs["evidence_refs"] == ["event:e2"]
++    assert obs["last_progress"] is None  # a heartbeat is liveness, never progress
++
++
++def test_time_alone_expires_the_cached_running_record(world):
++    path, _ = world
++    _replica(path)
++    obs = _observe(path, now=NOW + 150, read_at=NOW)  # same read, later render: no refetch renews it
++    assert obs["state"] == "unknown" and obs["unknown_reason"] == "source_expired"
++    assert obs["last_known_state"] == "running"
++
++
++def test_pull_clock_never_rejuvenates_an_old_heartbeat(world):
++    path, _ = world
++    _replica(path, pulled=NOW, beats=((NOW - 400, "e1"),), old_beats=())
++    obs = _observe(path)
++    assert obs["state"] == "unknown" and obs["unknown_reason"] == "source_expired"
++
++
++@pytest.mark.parametrize("change", ["old_run_only", "run_ended", "run_released", "parked", "unnamed_profile",
++                                    "future_clock"])
++def test_missing_or_foreign_run_evidence_stays_unknown(world, change):
++    path, named = world
++    options = {"old_run_only": dict(beats=()), "run_ended": dict(ended=NOW - 10),
++               "run_released": dict(run_status="released"), "parked": dict(status="scheduled"),
++               "future_clock": dict(beats=((NOW + 60, "e9"),))}.get(change, {})
++    if change == "unnamed_profile":
++        named.clear()  # the replica row names no owner profile; ``default`` is only a label
++    _replica(path, **options)
++    obs = _observe(path)
++    assert obs["state"] == "unknown"
++    if change == "future_clock":
++        assert obs["unknown_reason"] == "clock_inconsistent"
++    else:
++        assert obs["identity"].get("run_id") is None
++        assert obs["source"] == "kanban.card"
++
++
++def test_stale_replica_keeps_identity_but_is_unknown(world):
++    path, _ = world
++    _replica(path, pulled=NOW - 10_000)
++    obs = _observe(path)
++    assert obs["state"] == "unknown" and obs["unknown_reason"] == "source_unavailable"
++    assert obs["identity"]["run_id"] == RUN_UID and obs["last_known_state"] == "running"
++
++
++def test_counts_and_task_list_project_the_same_record(world):
++    path, _ = world
++    _replica(path)
++    (card,) = _rows(path)
++    evidence = {}
++    links_mod = __import__("hermes_cli.kanban_replica_execution", fromlist=["collect"])
++    links_mod.collect(card, evidence)
++    row = {"kanban_active": 1}
++    count_snapshot(row, [(card["key"], "active", False)], now=NOW, evidence=evidence["s1"])
++    listed = _observe(path)
++    assert row["execution_observations"] == [listed]
++    assert "_replica_run" not in add_cards([{**card, "session_id": "s1"}], now=NOW)[0]
++
++
++def test_older_replica_schema_reads_no_run_columns(world, tmp_path):
++    path, _ = world
++    conn = sqlite3.connect(path)
++    conn.executescript(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, created_at INTEGER, "
++        "started_at INTEGER, priority INTEGER, block_kind TEXT, human_request TEXT, created_on TEXT);"
++        "CREATE TABLE task_chat_links (uid TEXT, task_id TEXT, chat_gateway TEXT, chat_profile TEXT, "
++        "chat_session TEXT, kind TEXT, released INTEGER, created_at INTEGER);"
++        "CREATE TABLE kanban_sync_state (pulled_at REAL);")
++    conn.execute("INSERT INTO tasks VALUES ('t_run', 'work', 'running', 'worker', 1, 1, 0, NULL, NULL, ?)", (OWNER,))
++    conn.execute("INSERT INTO task_chat_links VALUES (?, 't_run', ?, 'default', 's1', 'created', 0, 1)",
++                 (links.link_uid("t_run", ME, "default", "s1", "created"), ME))
++    conn.execute("INSERT INTO kanban_sync_state VALUES (?)", (NOW,))
++    conn.commit()
++    conn.close()
++    (card,) = _rows(path)
++    assert "_replica_run" not in card
++    assert _observe(path)["unknown_reason"] == "missing_qualified_identity"
+-- 
+2.43.0
+

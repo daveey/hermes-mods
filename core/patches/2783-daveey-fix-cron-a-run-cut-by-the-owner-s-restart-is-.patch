@@ -1,0 +1,800 @@
+From 59acb8fc0ff6ae7c72b4fe21239dabbc2f88ec24 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 14:26:05 +0000
+Subject: [PATCH] [daveey] fix(cron): a run cut by the owner's restart is rerun
+ once, never booked failed
+
+An instant hub core update cut agent cron runs and booked them failed with no rerun
+(t_01a1d009633f359e, three live samples on hermes-hub):
+
+1. direct `cron run` in flight: the owner's drain cleared the claim, the run failed
+   "cron fire ownership was lost", and restart_rerun skipped it because an admission
+   journal existed ("its admission journal owns recovery") - but journal recovery only
+   books results, it never reruns.
+2. a fire submitted while the owner drained: refused runtime_draining, then booked
+   "Cron admission missing" (or paused on an unverified admission).
+3. a builtin fire on a restart-safe worker: the worker lost the owner, the next owner's
+   boot settled the lost turn `interrupted`, and journal recovery booked "failed -
+   interrupted", streak +1, next run a year out.
+
+Now:
+- The owner (gateway/session_cron.py) flags `_restart_cut` on a failed cron result when
+  its own drain stopped the run (interrupt phase, or a non-operator cancel while
+  draining), and on a status read of an admission lost across the restart (terminal
+  `interrupted` with no result). A run that finished anyway keeps its verdict.
+- Whoever books that result - the firer's tail or the next gateway's journal recovery -
+  settles it via cron/restart_cut.py: shutdown-interrupted bookkeeping (no streak tick,
+  no failure notice, suppressed delivery), the uncertainty pause lifted, and one rerun
+  through restart_rerun (extra fire that restores the far-future slot; one-shots
+  re-armed). A rerun cut again is not rerun a second time.
+- A manual fire the owner refused while draining is deferred to the next gateway the
+  same way; the refusal is journaled first so recovery can defer it too when the
+  absence check was lost with the owner.
+
+Tests: tests/cron/test_restart_cut.py (8 RED on origin/main, 12 GREEN).
+---
+ cron/restart_cut.py            | 154 +++++++++++++++
+ cron/restart_rerun.py          |  27 ++-
+ cron/scheduler.py              |   6 +-
+ cron/scheduler_authority.py    |  37 +++-
+ gateway/run_shutdown.py        |   8 +-
+ gateway/session_cron.py        |  36 +++-
+ tests/cron/test_restart_cut.py | 334 +++++++++++++++++++++++++++++++++
+ 7 files changed, 583 insertions(+), 19 deletions(-)
+ create mode 100644 cron/restart_cut.py
+ create mode 100644 tests/cron/test_restart_cut.py
+
+diff --git a/cron/restart_cut.py b/cron/restart_cut.py
+new file mode 100644
+index 0000000000..421d117c29
+--- /dev/null
++++ b/cron/restart_cut.py
+@@ -0,0 +1,154 @@
++"""[daveey] A cron attempt its owner gateway's restart cut short is an interruption, never a job failure.
++
++The owner (``gateway/session_cron.py``) stamps ``RESTART_CUT_FLAG`` on the canonical result when
++its own shutdown stopped the run, and when the run's admission was settled ``interrupted`` across
++the restart (a lost automation turn, ``gateway/session_unattended_unknown.py``). Whichever process
++books that result settles it here: the attempt's firer (its run tail) or, when the firer is gone,
++the admission journal's recovery in the new gateway (``scheduler_authority.reconcile_pending``).
++The job keeps its failure streak, no failure notice is sent, and the job runs again once
++(``cron/restart_rerun.py``: an extra fire that keeps the next slot, a one-shot re-armed with its
++repeat budget given back). A rerun cut again is not rerun a second time.
++
++A fire the owner refused because it was draining for a restart was never admitted: it is deferred
++to the next gateway (``defer_unadmitted``), not failed.
++"""
++from __future__ import annotations
++
++import logging
++from typing import Any, Optional
++
++logger = logging.getLogger("cron.jobs")
++
++RESTART_CUT_FLAG = "_restart_cut"
++RESTART_CUT_REASON = "Interrupted by a gateway restart before the run finished"
++# Owner refusals that mean "not ready yet, retry on the next gateway", never "this job is refused".
++NOT_READY_REFUSALS = frozenset({"runtime_draining"})
++
++
++def not_ready_refusal(exc: BaseException) -> Optional[str]:
++    """The not-ready reason of an owner's refusal of ``cron.submit`` (in-process ``RuntimeStoreError``
++    or a forwarded ``GatewayRPCError``, whose ``str`` is the reason code), else None."""
++    reason = getattr(exc, "reason", None) or str(exc)
++    return reason if reason in NOT_READY_REFUSALS else None
++
++
++def _detail(error: Any) -> str:
++    error = str(error or "").strip()
++    return RESTART_CUT_REASON if not error or error == RESTART_CUT_REASON else f"{RESTART_CUT_REASON} ({error})"
++
++
++def _reschedule(job_id: str, execution_id: str) -> bool:
++    from cron.executions import get_execution
++    from cron.restart_rerun import reschedule_interrupted
++
++    record = get_execution(execution_id)
++    if record is None or record.get("job_id") != job_id:
++        return False
++    try:
++        return reschedule_interrupted(record, restart_cut=True)
++    except Exception:  # health: allow BLE001 -- the attempt is already booked; a missed rerun is logged
++        logger.warning("cron: rescheduling %s after its restart cut failed", job_id, exc_info=True)
++        return False
++
++
++def _retire_journal(job_id: str, execution_id: str) -> None:
++    from cron.scheduler_authority import retire_terminal_journal
++
++    try:
++        # Lifts this fire's own uncertainty pause (an observer that lost the draining owner) first,
++        # so the rerun below is not refused as "paused".
++        retire_terminal_journal(job_id, execution_id)
++    except (OSError, ValueError, KeyError, TypeError):
++        logger.warning("Cron terminal pause retirement deferred: %s", execution_id, exc_info=True)
++
++
++def settle_restart_cut(job: dict[str, Any], execution_id: str, error: Any, fire_owner: Optional[str],
++                       *, recovered: bool = False) -> bool:
++    """Book ``execution_id`` as cut by its owner's restart and rerun the job once; True when rerun.
++
++    ``recovered``: booked by journal recovery for a firer that is gone (its ledger row may be
++    ``unknown``); otherwise by the firer itself, fenced on its ``fire_owner`` claim. A claim the
++    cutting gateway's shutdown already booked (``mark_running_jobs_interrupted``) is not booked again."""
++    from cron import scheduler  # the facade tests and the ordinary tail patch
++    from cron.executions import recover_receipted_execution
++
++    job_id = job["id"]
++    detail = _detail(error)
++    mark_kwargs: dict[str, Any] = {"shutdown_interrupted": True}
++    if not job.get("no_agent"):
++        mark_kwargs["execution_id"] = execution_id
++    if fire_owner is not None:
++        mark_kwargs["expected_fire_owner"] = fire_owner
++    scheduler.mark_job_run(job_id, False, detail, **mark_kwargs)
++    if recovered:
++        recover_receipted_execution(execution_id, job_id, success=False, error=detail,
++                                    delivery_outcome="suppressed")
++    else:
++        scheduler.finish_execution(execution_id, success=False, error=detail, delivery_outcome="suppressed")
++    _retire_journal(job_id, execution_id)
++    rerun = _reschedule(job_id, execution_id)
++    logger.warning("Job '%s': %s; %s", job_id, detail,
++                   "rerunning it once on the current gateway" if rerun else "not rerun")
++    return rerun
++
++
++def settle_cut_or_lost(job: dict[str, Any], success: bool, error: Any, execution_id: str,
++                       fire_owner: Optional[str], execution_token: Any, teardown, ownership_lost) -> bool:
++    """The firer's run tail right after ``run_job``: True when the attempt is already settled.
++
++    A run the owner's restart cut is booked as that cut and rerun once, checked before the claim
++    because the cutting gateway's shutdown may have cleared it. Otherwise a lost fire claim books
++    the lost ownership, as before."""
++    from cron import scheduler
++
++    if not success and job.pop(RESTART_CUT_FLAG, False):
++        teardown()
++        scheduler._consume_interrupted_flag(job["id"], execution_token)  # this books the shutdown cut
++        settle_restart_cut(job, execution_id, error, fire_owner)
++        return True
++    if ownership_lost():
++        teardown()
++        scheduler._record_fire_ownership_lost(job, fire_owner, execution_id)
++        return True
++    return False
++
++
++def _release_own_claim(job_id: str, fire_owner: Optional[str], detail: str) -> None:
++    from cron.jobs import _hermes_now, _under_fire_fence, _with_job, save_jobs
++
++    def apply(jobs, _i, job):
++        claim = job.get("fire_claim")
++        if not isinstance(claim, dict) or claim.get("by") != fire_owner:
++            return False
++        job["fire_claim"] = None
++        job.pop("pending_slot", None)
++        if job.get("run_claim") is not None:
++            job["run_claim"] = None
++        job["last_fire_error"] = {"at": _hermes_now().isoformat(), "detail": detail[:500]}
++        save_jobs(jobs)
++        return True
++
++    _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
++
++
++def defer_unadmitted(job: dict[str, Any], execution_id: str, detail: str, fire_owner: Optional[str],
++                     *, recovered: bool = False) -> bool:
++    """A manual fire (or a journaled fire whose owner proved it never admitted it) the owner refused
++    while draining: re-arm it for the next gateway's first tick instead of booking a failure.
++    Nothing ran, so the streak and last verdict stay. True when it was re-armed."""
++    from cron import scheduler
++    from cron.executions import recover_receipted_execution
++
++    job_id = job["id"]
++    note = f"Not admitted (the gateway was draining for a restart); deferred to the next gateway: {detail}"
++    if recovered:
++        recover_receipted_execution(execution_id, job_id, success=False, error=note,
++                                    delivery_outcome="suppressed")
++        _retire_journal(job_id, execution_id)
++    else:
++        scheduler.finish_execution(execution_id, success=False, error=note, delivery_outcome="suppressed")
++    rearmed = _reschedule(job_id, execution_id)
++    if not recovered and fire_owner:  # a gone firer's claim names a dead process: the next claim reclaims it
++        _release_own_claim(job_id, fire_owner, note)
++    logger.warning("Cron %s %s: %s", job_id, "deferred" if rearmed else "not re-armed", note)
++    return rearmed
+diff --git a/cron/restart_rerun.py b/cron/restart_rerun.py
+index b4713a75e5..03195b7bc5 100644
+--- a/cron/restart_rerun.py
++++ b/cron/restart_rerun.py
+@@ -45,6 +45,7 @@ def _at_or_after(value: Any, claimed: datetime) -> bool:
+ 
+ def _skip_reason(
+     job: dict[str, Any], record: dict[str, Any], claimed: datetime, now: datetime,
++    restart_cut: bool = False,
+ ) -> Optional[str]:
+     from cron.jobs import _is_recoverable_error_job, is_job_runnable, is_terminal_job
+     from cron.scheduler_ownership import _claim_owner_is_dead
+@@ -57,10 +58,13 @@ def _skip_reason(
+         if rescheduled_at is not None and claimed >= rescheduled_at:
+             # Claimed after a reschedule that no real outcome has settled: the rerun itself.
+             return "the interrupted attempt was itself a restart rerun"
+-    if _at_or_after(job.get("edited_at"), claimed):
++    # A verified restart cut (the owner's own verdict) is settled by its firer or journal recovery,
++    # whose uncertainty pause/resume stamps ``edited_at`` and whose claim may still be its own:
++    # neither says an operator changed the job or another process will settle it.
++    if not restart_cut and _at_or_after(job.get("edited_at"), claimed):
+         return "edited since the attempt started"  # pause, resume and run-now included
+     claim = job.get("fire_claim")
+-    if isinstance(claim, dict) and not _claim_owner_is_dead(claim):
++    if not restart_cut and isinstance(claim, dict) and not _claim_owner_is_dead(claim):
+         # Only the attempt's executor died (an external cron worker); the scheduler process
+         # that claimed the fire is alive (or unprovable) and settles the outcome itself.
+         return "the claiming scheduler is still alive"
+@@ -121,8 +125,12 @@ def _newest_attempt_id(job_id: str) -> Optional[str]:
+     return None
+ 
+ 
+-def reschedule_interrupted(record: dict[str, Any]) -> bool:
+-    """Put ``record``'s job back on the schedule for now; True when it was rescheduled."""
++def reschedule_interrupted(record: dict[str, Any], *, restart_cut: bool = False) -> bool:
++    """Put ``record``'s job back on the schedule for now; True when it was rescheduled.
++
++    ``restart_cut``: the owner itself reported that its restart cut this attempt (``RESTART_CUT_FLAG``
++    on the canonical result), and the caller (the attempt's firer or its journal recovery) is the
++    one settling it, so the journal and a live claim are no reason to defer."""
+     from cron.jobs import _MISSING, _hermes_now, _under_fire_fence, _with_job, save_jobs
+ 
+     job_id = str(record.get("job_id") or "")
+@@ -131,11 +139,12 @@ def reschedule_interrupted(record: dict[str, Any]) -> bool:
+         return False
+     from cron.scheduler_authority import journal_path
+ 
+-    if journal_path(job_id, record["id"]).exists():
++    if not restart_cut and journal_path(job_id, record["id"]).exists():
+         # An admitted canonical fire: its journal recovery observes the owner's receipt and
+-        # must never be raced by a second submit (cron/observer_reconnect.py).
+-        logger.info("cron: not rescheduling %s (execution %s): its admission journal owns recovery",
+-                    job_id, record["id"])
++        # reschedules it there when the owner says a restart cut it (settle_restart_cut); it must
++        # never be raced by a second submit (cron/observer_reconnect.py).
++        logger.info("cron: not rescheduling %s (execution %s) here: its admission journal recovery "
++                    "settles it", job_id, record["id"])
+         return False
+     if _newest_attempt_id(job_id) != record.get("id"):
+         logger.info("cron: not rescheduling %s (execution %s): a newer attempt exists",
+@@ -147,7 +156,7 @@ def reschedule_interrupted(record: dict[str, Any]) -> bool:
+     def apply(jobs, _i, job):
+         _fence_reported[0] = True
+         now = _hermes_now()
+-        reason = _skip_reason(job, record, claimed, now)
++        reason = _skip_reason(job, record, claimed, now, restart_cut)
+         if reason is not None:
+             logger.info("cron: not rescheduling %s (execution %s) after restart interruption: %s",
+                         job_id, record["id"], reason)
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 581234e93c..968330f1fc 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -3627,9 +3627,9 @@ def _run_one_job_body(
+             return True
+         success, output, final_response, error = outcome
+ 
+-        if _fire_claim_ownership_lost():
+-            _teardown_deferred()
+-            _record_fire_ownership_lost(job, fire_owner, execution_id)
++        from cron.restart_cut import settle_cut_or_lost
++        if settle_cut_or_lost(job, success, error, execution_id, fire_owner, execution_token,
++                              _teardown_deferred, _fire_claim_ownership_lost):
+             return True
+ 
+         success, error, agent_declared = _apply_agent_failure_marker(job, success, error, final_response)
+diff --git a/cron/scheduler_authority.py b/cron/scheduler_authority.py
+index 2f8e6f3cc0..98669e3ba7 100644
+--- a/cron/scheduler_authority.py
++++ b/cron/scheduler_authority.py
+@@ -28,11 +28,17 @@ def settle_unbooked_fire(job, exc, fire_owner, execution_id):
+ 
+     - CronFireNotAdmitted on a scheduled fire: the gateway was not ready (an update's restart gap)
+       and nothing was submitted. The slot goes back on the schedule, the streak and last verdict
+-      stay, and the ledger row records the non-admission. Manual fires still fail loudly.
++      stay, and the ledger row records the non-admission. A manual fire the gateway refused while
++      draining is deferred to the next gateway's first tick the same way (cron/restart_cut.py);
++      one refused for any other not-ready state still fails loudly.
+     - CronExecutionUnknown: the owner may have accepted it, so the job pauses for reconciliation.
+     Every other error returns False and takes the failed-run path."""
+     import logging
+     log = logging.getLogger('cron.scheduler')
++    if isinstance(exc, CronFireNotAdmitted) and not job.get('_scheduled_instant') and exc.state == 'draining':
++        from cron.restart_cut import defer_unadmitted
++        defer_unadmitted(job, execution_id, str(exc), fire_owner or None)
++        return True
+     if isinstance(exc, CronFireNotAdmitted) and job.get('_scheduled_instant'):
+         from cron.executions import finish_execution
+         from cron.jobs import release_unadmitted_fire
+@@ -183,7 +189,22 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
+             if recovering:
+                 raise
+             if owner is not None or isinstance(exc, GatewayRPCError):
++                from cron.restart_cut import not_ready_refusal
++                refused = not_ready_refusal(exc)
++                if refused:
++                    # Durable before the absence check: if that check is lost too, journal
++                    # recovery still knows the owner refused this fire as not ready.
++                    record['submit_refused'] = refused
++                    save()
+                 state = await call('recover', params)
++                if state['status'] == 'missing' and refused:
++                    # [daveey] Refused while draining for a restart and proven never admitted:
++                    # nothing ran, so the fire is deferred to the next gateway, not failed.
++                    journal.unlink(missing_ok=True)
++                    attempted = False
++                    raise CronFireNotAdmitted(
++                        f'Not admitted: the gateway is draining ({refused}); the fire is deferred',
++                        'draining', refused) from exc
+                 if state['status'] == 'missing':
+                     error = f'{type(exc).__name__}: {exc}'
+                     result = [False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error]
+@@ -237,6 +258,8 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
+                 observe(lambda op, data: operation(authority, op, data)), loop).result()
+         return asyncio.run(remote())
+     except Exception as exc:
++        if isinstance(exc, CronFireNotAdmitted):
++            raise
+         if attempted:
+             raise CronExecutionUnknown(f'Cron execution unverified; reconcile {journal}: {exc}') from exc
+         from hermes_cli.gateway_client import GatewayUnavailableError
+@@ -306,6 +329,13 @@ def reconcile_pending(*, allow_connect=True):
+                 if current is None:
+                     journal.unlink(missing_ok=True)
+                     continue
++                from cron.restart_cut import NOT_READY_REFUSALS, defer_unadmitted
++                if record.get('submit_refused') in NOT_READY_REFUSALS:
++                    # [daveey] Refused while the owner drained for a restart: nothing ran, so the
++                    # fire is deferred to this (the next) gateway instead of failed.
++                    defer_unadmitted(current, params['request_id'], record['submit_refused'], None,
++                                     recovered=True)
++                    continue
+                 error = 'Cron admission missing: the owner never admitted this fire'
+                 state = {'status': 'terminal', 'job': current, 'job_flags': {'_fire_error': True},
+                          'result': [False, f'# Cron Job: {params["job_id"]} (FAILED)\n\n{error}\n', '', error]}
+@@ -317,6 +347,11 @@ def reconcile_pending(*, allow_connect=True):
+             success, output, answer, error = state['result']
+             job = dict(state['job'], **(state.get('job_flags') or {}))
+             job['execution_id'] = params['request_id']
++            from cron.restart_cut import RESTART_CUT_FLAG, settle_restart_cut
++            if not success and job.pop(RESTART_CUT_FLAG, False):
++                # [daveey] The owner's restart cut this run: an interruption rerun once, not a failure.
++                settle_restart_cut(job, params['request_id'], error, None, recovered=True)
++                continue
+             # The same result verdicts as the ordinary tail: an agent-declared [CRON_FAILURE] and a
+             # blank answer are failures, whichever process books them.
+             success, error, declared = _apply_agent_failure_marker(job, success, error, answer)
+diff --git a/gateway/run_shutdown.py b/gateway/run_shutdown.py
+index 38d4c29d81..d952331bac 100644
+--- a/gateway/run_shutdown.py
++++ b/gateway/run_shutdown.py
+@@ -1864,11 +1864,11 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+     async def _stop_interrupt_remaining_work(self, ctx: GatewayShutdownMixin._StopContext) -> None:
+         """Drain timed out: mark resume_pending, interrupt, settle, kill tool subprocesses, notify cron."""
+         from gateway.run import GatewayRunner
++        self._interrupting_remaining_work = True  # [daveey] an owned cron run is now a restart cut (cron/restart_cut.py)
+         logger.warning(
+-            "Gateway drain timed out after %.1fs with %d active agent(s), "
+-            "%d in-flight cron job(s), %d api_server run(s), and %d deferred agent worker(s); "
+-            "interrupting remaining work.", ctx.drain_elapsed, self._running_agent_count(),
+-            self._active_cron_job_count(), self._active_api_run_count(), ctx.deferred_count(),
++            "Gateway drain timed out after %.1fs with %d active agent(s), %d in-flight cron job(s), "
++            "%d api_server run(s), and %d deferred agent worker(s); interrupting remaining work.", ctx.drain_elapsed,
++            self._running_agent_count(), self._active_cron_job_count(), self._active_api_run_count(), ctx.deferred_count(),
+         )
+         # Mark resume_pending BEFORE interrupting so the next message auto-resumes (stuck sessions
+         # still escalate via .restart_failure_counts). CURRENT _running_agents, not the drain snapshot.
+diff --git a/gateway/session_cron.py b/gateway/session_cron.py
+index 58c6e58ea5..56b1f9def6 100644
+--- a/gateway/session_cron.py
++++ b/gateway/session_cron.py
+@@ -240,6 +240,12 @@ async def operation(authority, name, params, actor=None):
+         flags = (saved['result'].get('cron_job_flags') or {}) if saved else {}
+         if result is None:
+             result = [False, '', '', row.get('outcome') or 'unknown_execution']
++            if row.get('outcome') == 'interrupted' and saved is None:
++                # [daveey] The run's turn was lost across this owner's restart (boot recovery
++                # settles an unattended ``unknown`` admission interrupted, with no result): a
++                # restart cut, rerun once by whoever books it (cron/restart_cut.py), not a failure.
++                from cron.restart_cut import RESTART_CUT_FLAG
++                flags = dict(flags, **{RESTART_CUT_FLAG: True})
+     from cron.scheduler_liveness import owner_progress
+     return {'status': row['status'], 'result': result, 'job_flags': flags,
+             'progress_at': owner_progress.get(row['request_id'].rsplit(':', 1)[-1])}
+@@ -252,6 +258,20 @@ def _cancellations(authority):
+     return cancellations
+ 
+ 
++def _restart_cut(authority, stop, execution_id):
++    """[daveey] Whether this owner's own restart stopped the run: it is draining for a stop or an
++    update and has either begun interrupting remaining work (tools killed, agents interrupted) or
++    the run was torn down by something other than an operator's cancel (the shutdown cleared the
++    fire claim, so the firer forwarded a "lost ownership" cancel)."""
++    from cron.cancellation import cancel_requested
++    runner = getattr(authority, 'runner', None)
++    if not getattr(runner, '_draining', False):
++        return False
++    if getattr(runner, '_interrupting_remaining_work', False):
++        return True
++    return bool(stop is not None and stop.is_set() and not cancel_requested(execution_id))
++
++
+ async def rpc(connection, name, params):
+     return await operation(connection.authority, name, params, connection.actor)
+ 
+@@ -313,11 +333,23 @@ async def execute(authority, ref, row, policy):
+             stop = _CombinedCancelEvent(
+                 CancelRequest(execution_id),
+                 ShutdownAwareCancel(cancel, lambda: fire_interrupted_by_shutdown(job_id)))
+-            result = await asyncio.to_thread(_run_identified, run_job, job, execution_id,
+-                                             extra_prompt=data['extra_prompt'], cancel_event=stop)
++            try:
++                result = await asyncio.to_thread(_run_identified, run_job, job, execution_id,
++                                                 extra_prompt=data['extra_prompt'], cancel_event=stop)
++            except Exception as exc:
++                if not _restart_cut(authority, stop, execution_id):
++                    raise
++                result = (False, '', '', f'{type(exc).__name__}: {exc}')
+         # run_job stamps run-side verdicts on ITS job copy (quota hold, unreachable model); the
+         # firing scheduler's bookkeeping reads them off its own dict, so they ride the result.
+         flags = {key: job[key] for key in RUN_JOB_FLAGS if key in job}
++        if not result[0] and _restart_cut(authority, stop, execution_id):
++            # [daveey] This owner's restart stopped the run (killed its tools, interrupted its agent,
++            # or cleared its claim): whatever it returned is not the job's verdict. The firer books
++            # an interruption and reruns it once (cron/restart_cut.py), never a failure.
++            from cron.restart_cut import RESTART_CUT_FLAG, RESTART_CUT_REASON
++            flags[RESTART_CUT_FLAG] = True
++            result = (False, result[1], '', result[3] or RESTART_CUT_REASON)
+         authority.pending_results[row['admission_id']] = {
+             'result': {'final_response': result[2], 'cron_result': list(result), 'cron_job_flags': flags,
+                        'failed': not result[0], 'completed': result[0]}, 'usage': {}}
+diff --git a/tests/cron/test_restart_cut.py b/tests/cron/test_restart_cut.py
+new file mode 100644
+index 0000000000..e694ee96d8
+--- /dev/null
++++ b/tests/cron/test_restart_cut.py
+@@ -0,0 +1,334 @@
++"""[daveey] A cron run its owner gateway's restart cut short is rerun once, never booked a failure.
++
++The three live shapes from an instant hub core update (t_01a1d009633f359e):
++
++1. A run in flight when the owner drains (``hermes cron run`` or a ticker fire whose firer survives):
++   the owner reports the cut (``_restart_cut``) and the firer books an interruption + one rerun.
++2. A fire the owner refused because it was draining: deferred to the next gateway, not failed.
++3. A restart-safe worker that lost the owner mid-run: the new gateway's journal recovery reads the
++   lost (``interrupted``) admission and reruns the job once instead of booking ``failed``.
++"""
++import asyncio
++from contextlib import nullcontext
++import json
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from cron import executions, jobs, scheduler, scheduler_authority
++
++FAR_FUTURE = "0 0 1 1 *"
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr("cron.executions._end_interrupted_sessions", lambda _records: None)
++    scheduler._running_job_ids.clear()
++    scheduler._running_fire_owners.clear()
++    scheduler._interrupted_job_ids.clear()
++    yield tmp_path
++    scheduler._running_job_ids.clear()
++    scheduler._running_fire_owners.clear()
++    scheduler._interrupted_job_ids.clear()
++
++
++def _due(job_id):
++    return job_id in [job["id"] for job in jobs.get_due_jobs()]
++
++
++def _assert_rerun_once(job_id, execution_id, *, natural_next):
++    job = jobs.get_job(job_id)
++    assert job["restart_rerun"]["execution_id"] == execution_id
++    assert int(job.get("failure_streak") or 0) == 0
++    assert job.get("last_error_kind") is None
++    assert _due(job_id), "the cut run must be due again at once"
++    # The rerun claims, runs and settles; the far-future slot is restored.
++    claimed = jobs.claim_job_for_fire(job_id, return_job=True)
++    assert isinstance(claimed, dict)
++    assert jobs.mark_job_run(job_id, True, expected_fire_owner=claimed["fire_claim"]["by"])
++    done = jobs.get_job(job_id)
++    assert done["last_status"] == "ok" and done.get("restart_rerun") is None
++    assert done["next_run_at"] == natural_next
++    assert not _due(job_id)
++
++
++# --- shape 1: the firer books the owner-reported cut ------------------------------------------
++
++def test_direct_run_cut_by_owner_restart_reruns_once_without_a_failure(home, monkeypatch):
++    job = jobs.create_job(prompt="probe", schedule=FAR_FUTURE, name="probe", deliver="local")
++    natural_next = job["next_run_at"]
++    claimed = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
++    assert isinstance(claimed, dict)
++    delivered = []
++
++    def run_job(job, **_kwargs):
++        # The owner's drain stopped the run and said so on the canonical result
++        # (gateway/session_cron.py); run_canonical_job merges its job flags into the firer's job.
++        job["_restart_cut"] = True
++        return (False, "partial", "", "RuntimeError: Cron job was stopped: cron fire ownership was lost")
++
++    monkeypatch.setattr(scheduler, "run_job", run_job)
++    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: delivered.append(a))
++    assert scheduler.run_one_job(claimed) is True
++    execution_id = claimed["execution_id"]
++    row = executions.get_execution(execution_id)
++    assert row["status"] == "failed" and "gateway restart" in row["error"]
++    assert row["delivery_outcome"] == "suppressed"
++    assert delivered == [] and scheduler.drain_delivery_queue({}, None) == 0, "no failure notice"
++    _assert_rerun_once(job["id"], execution_id, natural_next=natural_next)
++
++
++def test_rerun_cut_again_is_not_rerun_a_second_time(home, monkeypatch):
++    job = jobs.create_job(prompt="probe", schedule=FAR_FUTURE, name="probe", deliver="local")
++
++    def run_job(job, **_kwargs):
++        job["_restart_cut"] = True
++        return (False, "", "", "interrupted")
++
++    monkeypatch.setattr(scheduler, "run_job", run_job)
++    first = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
++    assert scheduler.run_one_job(first) is True
++    assert _due(job["id"])
++    rerun = jobs.claim_job_for_fire(job["id"], return_job=True)
++    assert isinstance(rerun, dict)
++    assert scheduler.run_one_job(rerun) is True
++    saved = jobs.get_job(job["id"])
++    assert saved["restart_rerun"]["execution_id"] == first["execution_id"]
++    assert not _due(job["id"]), "a rerun cut again waits for its schedule"
++    assert int(saved.get("failure_streak") or 0) == 0
++
++
++def test_an_ordinary_failure_still_counts(home, monkeypatch):
++    job = jobs.create_job(prompt="probe", schedule=FAR_FUTURE, name="probe", deliver="local")
++    monkeypatch.setattr(scheduler, "run_job", lambda job, **_k: (False, "", "", "agent broke"))
++    claimed = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
++    assert scheduler.run_one_job(claimed) is True
++    saved = jobs.get_job(job["id"])
++    assert saved["failure_streak"] == 1 and saved.get("restart_rerun") is None
++    assert not _due(job["id"])
++
++
++# --- the owner reports the cut ----------------------------------------------------------------
++
++def _owner(tmp_path, *, draining=False):
++    from gateway.session_authority import LiveSession, SessionAuthority
++    from hermes_state import SessionDB
++    from hermes_state_runtime import begin_runtime_epoch
++
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("s", source="cron")
++    runner = SimpleNamespace(_draining=draining)
++    authority = SessionAuthority(runner, profile_id="p", instance_id="test", db=db,
++                                 epoch=begin_runtime_epoch(db, instance_id="test"))
++    authority.sessions["s"] = LiveSession(SimpleNamespace(platform=None, user_id="cron-owner"), "route")
++    return authority, db
++
++
++@pytest.mark.parametrize("case", ["interrupting", "claim_cleared", "operator_cancel", "not_draining",
++                                  "finished_anyway"])
++def test_owner_marks_only_its_own_restart_cut(home, monkeypatch, case):
++    from cron.cancellation import request_cancel
++    from gateway import run, session_cron
++    from gateway.session_contract import SessionRef
++    from hermes_state_runtime import admit_session_input, claim_session_input
++
++    authority, db = _owner(home, draining=case != "not_draining")
++    monkeypatch.setattr(run, "_profile_runtime_scope", lambda home: nullcontext())
++    execution = executions.create_execution("job", source="direct")
++    request_id = "cron:job:" + execution["id"]
++
++    def run_job(job, *, extra_prompt, execution_id, cancel_event):
++        if case == "interrupting":
++            authority.runner._interrupting_remaining_work = True
++        elif case == "operator_cancel":
++            request_cancel(execution_id, reason="stop it")
++            authority._cron_cancellations[row["admission_id"]].set()
++        else:
++            authority._cron_cancellations[row["admission_id"]].set()  # the firer forwarded a cancel
++        if case == "finished_anyway":
++            return (True, "doc", "answer", None)
++        return (False, "", "", "interrupted")
++
++    monkeypatch.setattr(scheduler, "run_job", run_job)
++
++    async def probe():
++        with db:
++            admit_session_input(db, epoch=authority.epoch, principal_id="cron-owner", session_id="s",
++                                request_id=request_id, payload={"text": ""})
++            nonlocal row
++            row = claim_session_input(db, epoch=authority.epoch, session_id="s")
++            policy = SimpleNamespace(request_json=json.dumps(
++                {"extra_prompt": None, "request_id": request_id, "cron_job": {"id": "job"}}))
++            try:
++                await session_cron.execute(authority, SessionRef("p", "s"), row, policy)
++            except RuntimeError:
++                pass
++        return authority.pending_results[row["admission_id"]]["result"]
++
++    row = None
++    try:
++        result = asyncio.run(probe())
++    finally:
++        db.close()
++    cut = result["cron_job_flags"].get("_restart_cut", False)
++    assert cut is (case in {"interrupting", "claim_cleared"})
++    if cut:
++        assert result["cron_result"][0] is False
++
++
++def test_status_of_an_admission_lost_across_the_restart_reports_the_cut(home):
++    from gateway import session_cron
++    from gateway.session_contract import SessionActor
++    from hermes_state_keys import CRON_PRINCIPAL_ID
++    from hermes_state_runtime import (admit_session_input, claim_session_input, recover_session_inputs,
++                                      begin_runtime_epoch)
++    from gateway.session_unattended_unknown import settle_recovered_unattended
++
++    authority, db = _owner(home)
++    actor = SessionActor(CRON_PRINCIPAL_ID, "p",
++                         frozenset({"session:create", "session:submit", "session:control"}), "ticker")
++    authority.sessions["s"].source.user_id = CRON_PRINCIPAL_ID
++    try:
++        with db:
++            receipt = admit_session_input(db, epoch=authority.epoch, principal_id=CRON_PRINCIPAL_ID,
++                                          session_id="s", request_id="cron:job:fire", payload={"text": ""})
++            claim_session_input(db, epoch=authority.epoch, session_id="s")
++        # The owner process dies mid-run; the next one fences the lost turn and settles it.
++        epoch = begin_runtime_epoch(db, instance_id="next")
++        recover_session_inputs(db, epoch=epoch)
++        assert settle_recovered_unattended(db, epoch) == 1
++        authority.epoch = epoch
++        state = asyncio.run(session_cron.operation(
++            authority, "status", {"session_id": "s", "admission_id": receipt["admission_id"]}, actor))
++    finally:
++        db.close()
++    assert state["status"] == "terminal"
++    assert state["result"][0] is False
++    assert state["job_flags"].get("_restart_cut") is True
++
++
++# --- shapes 2 and 3: journal recovery in the new gateway --------------------------------------
++
++@pytest.fixture
++def owner_ops(monkeypatch):
++    from gateway import session_cron
++
++    loop = asyncio.new_event_loop()
++    thread = threading.Thread(target=loop.run_forever, daemon=True)
++    thread.start()
++    handlers = {}
++    monkeypatch.setattr(session_cron, "owner_for_home", lambda home: (object(), loop))
++
++    async def operation(authority, op, params, actor=None):
++        return handlers[op](params)
++
++    monkeypatch.setattr(session_cron, "operation", operation)
++    try:
++        yield handlers
++    finally:
++        loop.call_soon_threadsafe(loop.stop)
++        thread.join(timeout=5)
++        loop.close()
++
++
++def _dead_firer(monkeypatch):
++    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement")
++    monkeypatch.setattr(executions, "_owner_is_live", lambda _pid, _started: False)
++    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
++
++
++def test_restart_safe_worker_cut_is_rerun_by_journal_recovery(home, monkeypatch, owner_ops):
++    """Hub sample 3: a builtin fire on a far-future schedule, its restart-safe worker lost the owner
++    (paused, ``unknown``); the new owner reports the lost turn as a restart cut."""
++    job = jobs.create_job(prompt="probe", schedule="45 13 12 11 *", name="probe", deliver="local")
++    claimed = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
++    assert jobs.claim_dispatch(job["id"])
++    fire = executions.create_execution(job["id"], source="builtin",
++                                       scheduled_instant=claimed["next_run_at"])["id"]
++    executions.mark_execution_running(fire)
++    journal = scheduler_authority.journal_path(job["id"], fire)
++    journal.parent.mkdir(parents=True, exist_ok=True)
++    journal.write_text(json.dumps({"params": {"job_id": job["id"], "request_id": fire, "extra_prompt": None},
++                                   "receipt": {"session_id": "s", "admission_id": "a"}}))
++    scheduler_authority.pause_for_unknown(job["id"], fire, "Cron execution unverified: runtime_draining")
++    executions.give_up_execution(fire, reason="Restart-safe cron worker exited with status 1")
++    _dead_firer(monkeypatch)
++    natural_next = jobs.get_job(job["id"])["next_run_at"]
++    owner_ops["recover"] = lambda params: {
++        "status": "terminal", "result": [False, "", "", "interrupted"], "job": jobs.get_job(job["id"]),
++        "job_flags": {"_restart_cut": True}}
++    monkeypatch.setattr(scheduler, "_save_compose_deliver",
++                        lambda *a, **k: pytest.fail("a cut run sends no failure notice"))
++
++    scheduler_authority.reconcile_pending()
++
++    assert not journal.exists()
++    row = executions.get_execution(fire)
++    assert row["status"] == "failed" and "gateway restart" in row["error"]
++    saved = jobs.get_job(job["id"])
++    assert saved["enabled"] is True, "its uncertainty pause is lifted"
++    assert saved["last_error"] != "interrupted"
++    scheduler_authority.reconcile_pending()  # a second pass changes nothing
++    assert jobs.get_job(job["id"])["restart_rerun"]["execution_id"] == fire
++    _assert_rerun_once(job["id"], fire, natural_next=natural_next)
++
++
++def test_manual_fire_refused_while_draining_is_deferred_not_failed(home, monkeypatch, owner_ops):
++    """Hub sample 2: ``hermes cron run`` while the owner drains: refused, never admitted."""
++    from hermes_state_runtime import RuntimeStoreError
++
++    job = jobs.create_job(prompt="probe", schedule=FAR_FUTURE, name="probe", deliver="local")
++    natural_next = job["next_run_at"]
++
++    def refuse(_params):
++        raise RuntimeStoreError("runtime_draining")
++
++    owner_ops["submit"] = refuse
++    owner_ops["recover"] = lambda params: {"status": "missing"}
++    claimed = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
++    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: pytest.fail("no failure notice"))
++    scheduler.run_one_job(claimed)
++
++    row = executions.get_execution(claimed["execution_id"])
++    assert row["status"] == "failed" and "deferred" in row["error"]
++    saved = jobs.get_job(job["id"])
++    assert saved.get("last_status") is None and int(saved.get("failure_streak") or 0) == 0
++    assert saved["fire_claim"] is None
++    assert not scheduler_authority.journal_path(job["id"], claimed["execution_id"]).exists()
++    _assert_rerun_once(job["id"], claimed["execution_id"], natural_next=natural_next)
++
++
++def test_draining_refusal_whose_absence_check_was_lost_is_deferred_by_recovery(home, monkeypatch, owner_ops):
++    """Hub sample 2 as logged: the absence check died with the owner too, so the job paused on an
++    unverified admission; the next owner proves the fire missing and recovery defers it."""
++    from hermes_state_runtime import RuntimeStoreError
++
++    job = jobs.create_job(prompt="probe", schedule=FAR_FUTURE, name="probe", deliver="local")
++    natural_next = job["next_run_at"]
++
++    def refuse(_params):
++        raise RuntimeStoreError("runtime_draining")
++
++    def gone(_params):
++        raise ConnectionError("owner went away")
++
++    owner_ops["submit"] = refuse
++    owner_ops["recover"] = gone
++    claimed = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
++    scheduler.run_one_job(claimed)
++    fire = claimed["execution_id"]
++    assert not jobs.get_job(job["id"])["enabled"], "paused with unverified admission"
++    assert json.loads(scheduler_authority.journal_path(job["id"], fire).read_text())["submit_refused"] == \
++        "runtime_draining"
++
++    _dead_firer(monkeypatch)
++    owner_ops["recover"] = lambda params: {"status": "missing"}
++    scheduler_authority.reconcile_pending()
++
++    saved = jobs.get_job(job["id"])
++    assert saved["enabled"] is True
++    assert saved.get("last_status") is None and int(saved.get("failure_streak") or 0) == 0
++    assert not scheduler_authority.journal_path(job["id"], fire).exists()
++    _assert_rerun_once(job["id"], fire, natural_next=natural_next)
+-- 
+2.43.0
+

@@ -1,0 +1,148 @@
+From e6820727b0ea6e246a6421bc14bf4852dae5574b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 13:02:42 +0000
+Subject: [PATCH] [daveey] pool auth wall: bench_token_fp counts only for the
+ bench it was stamped with
+
+_mark_exhausted records bench_status_at with bench_token_fp. A row exhausted on T1,
+refreshed to T2 (OK), then DEAD from a rejected refresh grant kept fp(T1), so
+_bench_predates_token read True and auth_wall_is_transient called an all-dead pool
+transient: the worker exited 75 every run instead of 78. Any later status write now
+supersedes the fingerprint. Follow-up to #1412 (review t_01a1cfcac22ae8ca).
+---
+ agent/credential_pool.py                      | 10 ++--
+ agent/credential_pool_pushed.py               | 14 ++++--
+ .../hermes_cli/test_kanban_pool_auth_wall.py  | 49 ++++++++++++++++++-
+ 3 files changed, 63 insertions(+), 10 deletions(-)
+
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index acfeb0c6cd..1f3ee57bd4 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -1165,18 +1165,18 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+         # fails immediately until the user removes it (#32849); a row whose
+         # refresh grant just went DEAD stays DEAD on the 401 that follows.
+         terminal = entry.last_status == STATUS_DEAD or self._is_terminal_auth_failure(status_code, normalized_error)
+-        # Carry the classifier's verdict so the cooldown is sized by what
+-        # actually failed (a billing 403 must not get the sole-credential
+-        # transient cooldown); absent a classification, clear a stale one.
++        # Carry the classifier's verdict so the cooldown is sized by what actually failed (a billing
++        # 403 must not get the sole-credential transient cooldown); absent one, clear a stale one.
+         updated_extra = {k: v for k, v in entry.extra.items() if k != "failure_reason"}
+         updated_extra.update({"failure_reason": failure_reason} if failure_reason else {})
+-        # The generation this failure was seen on: a later token for the row is not under the bench. [daveey]
++        # This bench's token generation and stamp; a later status write supersedes both. [daveey]
+         updated_extra["bench_token_fp"] = fingerprint_secret_value(entry.access_token) if entry.access_token else None
++        updated_extra["bench_status_at"] = now = time.time()
+         return self._adopt(
+             entry,
+             persist=persist,
+             last_status=STATUS_DEAD if terminal else STATUS_EXHAUSTED,
+-            last_status_at=time.time(),
++            last_status_at=now,
+             last_error_code=status_code,
+             last_error_reason=normalized_error.get("reason"),
+             last_error_message=normalized_error.get("message"),
+diff --git a/agent/credential_pool_pushed.py b/agent/credential_pool_pushed.py
+index 729be574fb..bbd18817db 100644
+--- a/agent/credential_pool_pushed.py
++++ b/agent/credential_pool_pushed.py
+@@ -32,10 +32,18 @@ def _auth_benched(entry) -> bool:
+ def _bench_predates_token(entry) -> bool:
+     """The row's 401/403 was seen on an earlier token generation (``bench_token_fp``) than it holds now.
+ 
+-    A peer's newer pair can reach the row through the pool's own persist merge, which keeps the bench."""
++    A peer's newer pair can reach the row through the pool's own persist merge, which keeps the bench.
++    The fingerprint only describes the bench ``_mark_exhausted`` stamped with it (``bench_status_at``):
++    a row recovered and later marked DEAD another way (a rejected refresh grant) keeps the old extra,
++    and reading it would call an all-dead pool transient (exit 75 forever instead of 78)."""
+     from agent.credential_pool import fingerprint_secret_value
+-    seen = (entry.extra or {}).get("bench_token_fp")
+-    return bool(seen and entry.access_token and fingerprint_secret_value(entry.access_token) != seen)
++    extra = entry.extra or {}
++    seen, stamped = extra.get("bench_token_fp"), extra.get("bench_status_at")
++    if not (seen and entry.access_token and isinstance(stamped, (int, float)) and entry.last_status_at):
++        return False
++    if abs(float(entry.last_status_at) - float(stamped)) > 1e-3:
++        return False
++    return fingerprint_secret_value(entry.access_token) != seen
+ 
+ 
+ def adopt_pushed_replacements(pool: Any, model: Optional[str] = None):
+diff --git a/tests/hermes_cli/test_kanban_pool_auth_wall.py b/tests/hermes_cli/test_kanban_pool_auth_wall.py
+index 28c3fbeaee..78d9984424 100644
+--- a/tests/hermes_cli/test_kanban_pool_auth_wall.py
++++ b/tests/hermes_cli/test_kanban_pool_auth_wall.py
+@@ -16,6 +16,7 @@ from __future__ import annotations
+ 
+ import json
+ import time
++from types import SimpleNamespace
+ from unittest.mock import patch
+ 
+ import pytest
+@@ -59,8 +60,9 @@ def _quota_benched(id_, token, priority):
+ def _revoked(id_, token, priority):
+     """A row benched on a 401 for ``token`` (by this or a peer process: the bench is persisted)."""
+     from agent.credential_pool import fingerprint_secret_value
+-    return _pushed(id_, token, priority, last_status="exhausted", last_status_at=time.time(),
+-                   last_error_code=401, last_error_reason="auth", bench_token_fp=fingerprint_secret_value(token))
++    now = time.time()
++    return _pushed(id_, token, priority, last_status="exhausted", last_status_at=now, last_error_code=401,
++                   last_error_reason="auth", bench_token_fp=fingerprint_secret_value(token), bench_status_at=now)
+ 
+ 
+ @pytest.fixture
+@@ -195,6 +197,49 @@ def test_revoked_sibling_whose_replacement_was_pushed_meanwhile_recovers_in_the_
+     assert agent._anthropic_api_key == "sk-ant-oat01-b-new"
+ 
+ 
++def _refresh_row(id_, token, priority):
++    return {**_pushed(id_, token, priority), "source": "manual:device_code", "refresh_token": f"rt-{id_}"}
++
++
++def test_refresh_dead_rows_with_a_stale_bench_fingerprint_stay_terminal(home):
++    """The bench fingerprint belongs to the bench it was recorded with, not to the row.
++
++    Each row was exhausted on T1 (records fp(T1)), refreshed to T2 and marked OK, then a proactive
++    refresh was rejected with invalid_grant: DEAD on T2 without a new fingerprint. fp(T1) != fp(T2)
++    must not read as "benched on an older token" (exit 75 forever); the pool is all-dead (78)."""
++    from agent.credential_pool import _MARK_OK, load_pool
++    from agent.credential_pool_pushed import auth_wall_is_transient
++
++    _write_pool(home, [_refresh_row("acct-A", "tok-A-old", 0), _refresh_row("acct-B", "tok-B-old", 1)])
++    pool = load_pool("anthropic")
++    for entry in list(pool.entries()):
++        benched = pool._mark_exhausted(entry, 401, {"reason": "auth", "message": "expired"})
++        refreshed = pool._adopt(benched, access_token=entry.access_token.replace("old", "new"), **_MARK_OK)
++        pool._mark_dead_refresh_grant(refreshed, RuntimeError("invalid_grant"))
++
++    pool = load_pool("anthropic")
++    rows = {e.id: e for e in pool.entries()}
++    assert {e.last_status for e in rows.values()} == {"dead"}
++    assert rows["acct-A"].access_token == "tok-A-new"
++    assert auth_wall_is_transient(pool) is False
++
++    code = _worker_exit_code(SimpleNamespace(_credential_pool=pool))
++    assert code == kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE, code
++
++
++def test_bench_kept_across_a_newer_token_still_reads_transient(home):
++    """Control: the bench a peer's newer token reaches intact (same bench stamp) still predates it."""
++    from agent.credential_pool import load_pool
++    from agent.credential_pool_pushed import auth_wall_is_transient
++
++    _write_pool(home, [_refresh_row("acct-A", "tok-A-old", 0), _refresh_row("acct-B", "tok-B-old", 1)])
++    pool = load_pool("anthropic")
++    for entry in list(pool.entries()):
++        benched = pool._mark_exhausted(entry, 401, {"reason": "auth", "message": "expired"})
++        pool._adopt(benched, access_token=entry.access_token.replace("old", "new"))
++    assert auth_wall_is_transient(load_pool("anthropic")) is True
++
++
+ def test_every_account_revoked_after_a_reread_stays_terminal(home):
+     _write_pool(home, [_pushed("acct-A", "sk-ant-oat01-revoked", 0), _revoked("acct-B", "sk-ant-oat01-b-old", 1)])
+     agent = _agent_on("acct-A")
+-- 
+2.43.0
+
