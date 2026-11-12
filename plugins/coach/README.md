@@ -1272,6 +1272,7 @@ Each panel has one primary button and Dismiss. No menus.
 
 ### Guardrails (one gate, server side)
 
+- `hermes_bug` excludes plain, structured `kanban_create` assignment-capability denials when the assignee, known missing-capability list and exact error agree. Assignment enforcement and repeat-failure coaching remain intact; policy-unavailable reason suffixes, unknown/malformed fields, explicit exceptions and Hermes tracebacks remain reportable. `tests/test_bug_capability_refusal.py` covers dict/JSON/hinted envelopes, negative cases and the observer boundary.
 - `hermes_bug` excludes typed `kanban_block` missing-wake-check validation refusals: they are retry guidance, not infrastructure defects. This does not weaken the park guard or suppress explicit exceptions, Hermes tracebacks, untyped refusals, or unrelated errors. `tests/test_bug_wake_refusal.py` covers dict/JSON/hinted envelopes and the observer's recording boundary.
 
 - At most 1 nudge per session per 15 user turns.

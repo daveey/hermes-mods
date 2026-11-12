@@ -1259,6 +1259,17 @@ def _guided_refusal(tool: str, d: dict) -> bool:
     # Core's shared wake guard intentionally rejects long parks without a probe.
     # Exception/traceback detection in bug_signature runs before this exemption.
     if tool == "kanban_create":
+        if d.get("code") == "assignee_capability_mismatch":
+            assignee, missing = d.get("assignee"), d.get("missing")
+            # Only the plain policy denial is expected. The same code wraps
+            # unreadable policy/remote admission failures with a reason suffix;
+            # keep those visible, as well as malformed or future schemas.
+            return (isinstance(assignee, str) and bool(assignee)
+                    and isinstance(missing, list) and bool(missing)
+                    and all(isinstance(c, str) and c in
+                            {"terminal", "file", "git", "host_repo", "kanban"} for c in missing)
+                    and d.get("error") ==
+                    f"Assignee {assignee!r} lacks required capabilities: {', '.join(missing)}")
         pin = d.get("placement")
         # A stale/unknown explicit pin must be refused, not silently rerouted.
         # Do not exempt other placement_unavailable causes (transport, storage,
