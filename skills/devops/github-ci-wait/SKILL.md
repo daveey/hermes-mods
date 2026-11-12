@@ -27,6 +27,9 @@ and record both `created_at`→completed (wall, queue included) and `run_started
 N min" target is judged on wall time unless the card says otherwise; exec time alone never closes it. A
 `workflow_dispatch` on that branch joins the same group, so dispatching doesn't help.
 
+Telling the user when a PR merges: green CI is one step of several; list them all from a check made that turn
+(pr-blocker-check, "Telling the user when it merges").
+
 Status of a finite LIST of runs: read `references/bulk-run-status.md` (bounded App-token inspector, never a `gh api` loop).
 
 ## Fixing the CI you wait on: use a worktree

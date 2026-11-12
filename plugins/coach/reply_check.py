@@ -1310,6 +1310,50 @@ def skipped_live(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
     return s.strip(" -*\t")
 
 
+# ---- merge_forecast: the reply says when a PR will merge, but this turn never checked that PR ----------------------------
+# (self-heal agent-84aa7db32f: a chat said a PR "merges once CI is green", taking that from the owner card's plan. Other
+# steps were still open: failures already on main, a fresh review after a rebase, the hub merge queue. CI went green and
+# the PR was still open 7 hours later.) Deterministic, before the judge: a sentence (outside code and quotes) forecasting
+# a future merge/landing/deploy, in a reply that names a PR, while the turn's tool log has no PR-state check.
+# Backtest (worker-6, 14 days, tool log ignored): "the installer only deploys when ...", "Z lands after our write",
+# "will deploy-check it" and "I'll merge into the branch" describe mechanisms or git steps, not a PR's merge time, so
+# present-tense "lands" needs a time/condition word, deploy/ship are not forecasts here, and "merge into" is excluded.
+_MF_WHEN = r"(?:once|as\s+soon\s+as|by|at|around|within|tonight|today|tomorrow|in\s+(?:about\s+)?(?:an?|\d+|a\s+few)\b)"
+_MF_FORECAST_RE = re.compile(
+    r"\bmerges\s+(?:(?:when|after)\b|" + _MF_WHEN + r")|\blands\s+" + _MF_WHEN
+    + r"|\b(?:will|(?:I|it|we|that|this|they)[\u2019']ll|should|is\s+(?:expected|going|due)\s+to|is\s+set\s+to)\s+"
+    r"(?:auto-?)?(?:merge|land|be\s+(?:auto-?)?(?:merged|landed))\b(?![-\w])(?!\s+(?:[\w/.-]+\s+){0,2}into\b)",
+    re.I)
+_MF_PR_RE = re.compile(r"\bPR\s*#?\d+|\bPRs?\b|\bpull\s+requests?\b|/pull/\d+|\B#\d{2,}\b", re.I)
+# A PR-state read this turn: gh pr view/checks/status, gh api pulls|check-runs|status, the pr-blocker-check skill or
+# helper, hermes-core-wt check, or a browser on a GitHub PR page.
+_MF_CHECK_RE = re.compile(
+    r"\bgh\s+pr\s+(?:view|checks|status)\b|\bgh\s+api\b[^\n]*(?:/pulls\b|check-runs|check-suites|/status\b|pullRequest)"
+    r"|\bpr-blocker-check\b|\bhermes-core-wt\s+(?:check|status)\b|github\.com/[^\s\"']+/pull/\d+", re.I)
+_MF_META_RE = re.compile(r"\bmerge_forecast\b", re.I)
+MERGE_FORECAST_NUDGE = (
+    "[coach] merge_forecast: your reply tells the user when a PR will merge or land (\"{evidence}\"), but this turn "
+    "never checked that PR. Forecasts taken from a card's plan go stale: CI is rarely the only open step. Check it now "
+    "(`gh pr view <n> --json state,mergeStateStatus,reviewDecision` and `gh pr checks <n>`, or the pr-blocker-check "
+    "skill) and list every open step: failing or pending checks (and whether main fails the same ones), whether the "
+    "review still holds after a rebase, merge queue or slot position, and the owner card's real state. Give no clock "
+    "time and no \"merges once X\" unless X is the only open step.")
+
+
+def merge_forecast(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """The sentence forecasting a PR merge/landing when this turn checked no PR state, else None (code spans, quotes,
+    `>` lines, questions and replies naming merge_forecast are ignored; a reply naming no PR passes)."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    text = _QUOTED_RE.sub(" ", text)
+    if _MF_META_RE.search(text) or not _MF_PR_RE.search(text):
+        return None
+    s = next((s for s in _SENTENCE_END.split(text) if _MF_FORECAST_RE.search(s) and not s.rstrip(" *_").endswith("?")),
+             None)
+    if not s or any(_MF_CHECK_RE.search(l or "") for l in (tool_log or [])):
+        return None
+    return s.strip(" -*\t")
+
+
 # ---- consent_relay: a macOS permission click paired with a second "unblock / reply done" step ------------------------
 # (self-heal agent-2469206a31: the password window's osascript hung on "Hermes Python wants access to control
 # Terminal"; the reply asked David to click OK AND to unblock a card / reply "done" so an agent re-ran the installer.
@@ -1404,9 +1448,9 @@ def command_copy_nudge(evidence: str, user_ask: str = "") -> str:
 
 
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
-         "laptop_job", "skipped_live")
+         "laptop_job", "skipped_live", "merge_forecast")
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
-                 "laptop_job", "skipped_live")
+                 "laptop_job", "skipped_live", "merge_forecast")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
 # report_only_capped: the screen alone when a second opinion was due but unavailable (daily cap hit, error); confirms
@@ -3017,6 +3061,12 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "skipped_live", "p": 1.0, "evidence": phrase, "reason": "skipped_live",
                     "verdict": {"skipped_live": 1.0, "evidence": phrase},
                     "nudge": SKIPPED_LIVE_NUDGE.format(evidence=phrase[:160])}
+    if not only or "merge_forecast" in only:
+        phrase = merge_forecast(reply, tool_log)
+        if phrase:  # deterministic: a merge/landing forecast with no PR-state check this turn (agent-84aa7db32f)
+            return {"rule": "merge_forecast", "p": 1.0, "evidence": phrase, "reason": "merge_forecast",
+                    "verdict": {"merge_forecast": 1.0, "evidence": phrase},
+                    "nudge": MERGE_FORECAST_NUDGE.format(evidence=phrase[:160])}
     if (not only or "report_only" in only) and not scoped:
         closed = card_closed(tool_log)
         tail = CARD_CLOSED_TAIL if closed else ""
@@ -3274,6 +3324,7 @@ def block_handoff(text: str, user_ask: str, tool_log: list[str], llm: Callable[[
 # strings (self-heal agent-ddabb16633: three credit_ask false-positive repairs in 3 days, each fixing one phrase).
 BACKTEST_RULES: dict = {"credit_ask": lambda r: credit_ask(r, []), "laptop_job": laptop_job,
                         "skipped_live": lambda r: skipped_live(r, []),
+                        "merge_forecast": lambda r: merge_forecast(r, []),
                         "recommend_stall": lambda r: recommend_stall(r)}
 
 
