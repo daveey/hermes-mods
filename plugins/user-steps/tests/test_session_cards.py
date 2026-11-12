@@ -43,3 +43,55 @@ def test_default_reader_asks_core_for_listed_plus_done(tmp_path, monkeypatch):
     c = client(tmp_path, None)
     assert c.get('/session-cards', params={'ids': 's1'}).json() == {'tasks': [], 'includes': ['done', 'archived']}
     assert calls == [(['s1'], ('todo', 'running', 'blocked', 'done', 'archived'), True)]
+
+
+def test_default_reader_unions_released_terminal_history_without_hiding_live(tmp_path, monkeypatch):
+    import sys
+    import types
+    from copy import deepcopy
+    row = dict(id='t_1', gateway='owner-a', profile='default', board='work',
+               origin_gateway='origin', origin_profile='default', session='tip', origin_session='s1',
+               status='done', unfinished=False, stale=False)
+    unknown = dict(row, status='unknown', reported_status='done', unfinished=True)
+    history = [row, dict(row), dict(row, gateway='owner-b'),
+               dict(row, id='released-done'), dict(row, id='released-done'),
+               dict(row, profile='other-profile'),
+               dict(row, id='archived', status='archived'),
+               dict(row, id='other-lineage', session='elsewhere', origin_session='elsewhere'),
+               dict(row, id='unverified', unfinished=True),
+               dict(row, id='stale', status='unknown', reported_status='done', unfinished=True),
+               dict(row, id='unqualified', gateway=None)]
+    before = deepcopy(history)
+    fake = types.ModuleType('hermes_cli.kanban_session_activity')
+    fake.LISTED_STATUSES = ('running',)
+    fake.session_tasks = lambda *a, **kw: [unknown]
+    fake.remote_links_and_origin_rows = lambda: ([], history)
+    pkg = sys.modules.get('hermes_cli') or types.ModuleType('hermes_cli')
+    monkeypatch.setitem(sys.modules, 'hermes_cli', pkg)
+    monkeypatch.setattr(pkg, 'kanban_session_activity', fake, raising=False)
+    monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_session_activity', fake)
+    result = client(tmp_path, None).get('/session-cards', params={'ids': 's1'}).json()
+    tasks = result['tasks']
+    assert tasks[0] == unknown  # terminal history never replaces a live unknown obligation
+    assert [(r['gateway'], r['id'], r['status']) for r in tasks] == [
+        ('owner-a', 't_1', 'unknown'), ('owner-b', 't_1', 'done'),
+        ('owner-a', 'released-done', 'done'), ('owner-a', 't_1', 'done'), ('owner-a', 'archived', 'archived')]
+    assert tasks[1]['session_id'] == 'tip'
+    assert history == before
+
+
+def test_history_failure_preserves_live_feed(tmp_path, monkeypatch):
+    import sys
+    import types
+    fake = types.ModuleType('hermes_cli.kanban_session_activity')
+    fake.LISTED_STATUSES = ('running',)
+    live = [{'id': 't_live', 'status': 'unknown', 'unfinished': True}]
+    fake.session_tasks = lambda *a, **kw: live
+    def fail():
+        raise OSError('ledger unavailable')
+    fake.remote_links_and_origin_rows = fail
+    pkg = sys.modules.get('hermes_cli') or types.ModuleType('hermes_cli')
+    monkeypatch.setitem(sys.modules, 'hermes_cli', pkg)
+    monkeypatch.setattr(pkg, 'kanban_session_activity', fake, raising=False)
+    monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_session_activity', fake)
+    assert client(tmp_path, None).get('/session-cards', params={'ids': 's1'}).json()['tasks'] == live

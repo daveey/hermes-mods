@@ -140,7 +140,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
 }
 
 /** True when the chat has anything not finished: an ask, a card/sub-agent/process that is open, an open ledger
- *  step or an agent issue. Done/archived cards (and a done list) never count: all green = no panel. */
+ *  step or an agent issue. Done/archived cards never count as open work; history has its own disclosure. */
 export function hasOpenWork(sorted, { asks = 0, steps = [], issues = [] } = {}) {
   const open = list => (list || []).some(i => !(i.kind === 'kanban' && TERMINAL.has(str(i.chip?.state))))
   return !!(asks || sorted.unasked.length || open(sorted.active) || open(sorted.stuck) || open(sorted.waiting) || open(sorted.ready) || open(sorted.queued) ||

@@ -73,6 +73,36 @@ class WithdrawBody(BaseModel):
     reason: Optional[StrictStr] = None
 
 
+def _with_terminal_history(tasks, history, ids):
+    """Display-only union with the core's gateway/profile-scoped receipt projection.
+
+    Do not reinterpret terminal reported_status, suppress live rows, mutate shared
+    projection dictionaries, or infer an owner from a bare task id.
+    """
+    def identity(row):
+        if all(row.get(k) for k in ('gateway', 'profile', 'board', 'id')):
+            return '/'.join(str(row[k]) for k in ('gateway', 'profile', 'board', 'id'))
+        return row.get('key') or None
+
+    out = list(tasks)
+    seen = {identity(row) for row in tasks} - {None}
+    wanted = set(ids)
+    for row in history:
+        if row.get('status') not in ('done', 'archived') or row.get('unfinished') is not False:
+            continue
+        if not wanted.intersection((row.get('session'), row.get('origin_session'))):
+            continue
+        # Require the owner and origin qualification guaranteed by the public helper.
+        if not all(row.get(k) for k in ('gateway', 'profile', 'board', 'id', 'origin_gateway', 'origin_profile')):
+            continue
+        key = identity(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(row, session_id=row['session'], source='origin-history'))
+    return out
+
+
 def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = None,
                   cards=None, *, action_store=None, owner_resolver=None, receiver=None, kanban_boards=None,
                   session_tasks=None, kanban_mirror=None):
@@ -336,7 +366,20 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
                 from hermes_cli import kanban_session_activity as ksa
             except ImportError:
                 raise HTTPException(501, 'This backend has no kanban session reader')
-            read = lambda ids: ksa.session_tasks(ids, tuple(ksa.LISTED_STATUSES) + ('done', 'archived'), stale_ok=True)
+            def read(ids):
+                tasks = ksa.session_tasks(ids, tuple(ksa.LISTED_STATUSES) + ('done', 'archived'), stale_ok=True)
+                # The public ledger projection is already scoped to the mounted gateway/profile.
+                # Unlike replica_cards it retains released receipts. Only settled terminal rows
+                # are history: reported_status alone must NEVER retire an unknown obligation.
+                history_reader = getattr(ksa, 'remote_links_and_origin_rows', None)
+                if history_reader is None:
+                    return tasks
+                try:
+                    _, history = history_reader()
+                except Exception:
+                    logging.getLogger('user-steps').warning('Session card history unavailable', exc_info=True)
+                    return tasks
+                return _with_terminal_history(tasks, history, ids)
         return {'tasks': read(wanted), 'includes': ['done', 'archived']}
 
     @router.post('/resolve')
