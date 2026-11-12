@@ -16,12 +16,11 @@
  *                "status unknown", since the card may have been answered or archived since
  *   In progress  running and in-review cards, sub-agents, background processes, rented machines
  *   Waiting      parked cards and what they wait on
- *   footer       finished and not-yet-started cards, folded
+ *   footer       open ready/not-yet-started cards, then a per-chat finished-history disclosure
  * collapsed    the header line alone (caret + counts, needs-you in red) plus one line per waiting card (up to 3);
  *                the header is the composer status stack's own disclosure row (caret, icon, label), so this panel
  *                folds the same way the task list above it does
- *   hidden       when nothing is open (no ask, open card, sub-agent, process, step or issue): finished cards alone
- *                never show the panel
+ *   hidden       when there is neither open work nor finished history
  *
  * Data: session-tasks' snapshot (window.__sessionTasks: cards, sub-agents, processes, machines; it keeps polling),
  * user-steps' asks (window.__userSteps), and finished cards from user-steps' /session-cards (every 30 s; core's
@@ -230,9 +229,9 @@ export function doneRows(tasks) {
   const seen = new Set(), out = []
   for (const t of Array.isArray(tasks) ? tasks : []) {
     const key = `${str(t?.gateway)}:${str(t?.profile)}:${str(t?.board) || 'default'}:${str(t?.id)}`
-    if (!t?.id || str(t.status) !== 'done' || seen.has(key)) continue
+    if (!t?.id || !['done', 'archived'].includes(str(t.status)) || seen.has(key)) continue
     seen.add(key)
-    out.push({ key, id: t.id, label: str(t.title) || t.id, at: Number(t.activity_at) || 0 })
+    out.push({ key, id: t.id, label: str(t.title) || t.id, at: Number(t.activity_at) || 0, ...(t.status === 'archived' ? { archived: true } : {}) })
   }
   return out.sort((a, b) => b.at - a.at)
 }
@@ -486,7 +485,7 @@ function StuckCard({ i, session, now }) {
 
 function Fold({ label, items, k }) {
   if (!items.length) return null
-  return jsxs('details', { 'data-fold': label, children: [
+  return jsxs('details', { open: true, 'data-fold': label, children: [
     jsx('summary', { style: { cursor: 'pointer', minHeight: 28, display: 'flex', alignItems: 'center', ...muted }, children: label }),
     ...items.map(i => jsx(Row, { i, k }, i.key))
   ] })
@@ -497,6 +496,7 @@ export function Panel() {
   const [doneState, setDone] = useState(done)
   const [, setTick] = useState(0)
   const [collapsedKeys, setCollapsedState] = useState(readCollapsed)
+  const [finishedScopes, setFinishedScopes] = useState(() => new Set())
   const focused = useValue(host.state.focusedSessionId)
   const stored = useValue(host.state.focusedStoredSessionId)
   const busy = useValue(host.state.busy)
@@ -530,12 +530,19 @@ export function Panel() {
   const sorted = classify(chips, { nowMs: now, silence, isAsked, presentationFor })
   const asks = typeof US?.openAskCount === 'function' ? US.openAskCount() : 0
   const finished = doneState.scope === scope ? doneState.rows : cachedDone(scope)
-  const n = counts(sorted, { asks, done: finished ? finished.length : null })
+  const n = counts(sorted, { asks, done: finished ? finished.filter(d => !d.archived).length : null })
+  const finishedOpen = finishedScopes.has(scope)
+  const toggleFinished = () => setFinishedScopes(previous => {
+    const next = new Set(previous)
+    if (next.has(scope)) next.delete(scope)
+    else next.add(scope)
+    return next
+  })
   // A legacy card listed above as an unasked row is the same exact qualified card the strip's "Earlier asks"
   // would show again: hand those identities to the strip so each card renders once. Exact identity only.
   const legacy = US?.Strip ? jsx(US.Strip, { hideCards: sorted.unasked.map(i => i.chip) }, 'legacy') : null
-  // Finished cards alone are no reason to take space above the composer: an all-green chat shows nothing.
-  if (!US?.hasQueuePresentation?.() && !hasOpenWork(sorted, { asks, steps: US?.snapshot?.ledger?.steps, issues: US?.snapshot?.issues })) return null
+  // Keep finished history reachable even after the final open card closes.
+  if (!finished?.length && !US?.hasQueuePresentation?.() && !hasOpenWork(sorted, { asks, steps: US?.snapshot?.ledger?.steps, issues: US?.snapshot?.issues })) return null
   const attention = attentionKeys(asks, sorted)
   const collapsed = !!collapsedKeys && attention.every(k => collapsedKeys.includes(k))
   const toggle = () => { const next = collapsed ? null : attention; writeCollapsed(next); setCollapsedState(next) }
@@ -581,7 +588,10 @@ export function Panel() {
       (finished?.length || sorted.ready.length || sorted.queued.length) ? jsxs('div', { style: { borderTop: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', marginTop: 10, paddingTop: 4 }, children: [
         jsx(Fold, { label: `Ready · ${sorted.ready.length}`, items: sorted.ready, k: 'ready' }),
         jsx(Fold, { label: `Not started · ${sorted.queued.length}`, items: sorted.queued, k: 'queued' }),
-        jsx(Fold, { label: `Done · ${finished?.length || 0}`, items: (finished || []).map(d => ({ key: d.key, label: d.label, detail: d.at ? `finished ${ago(d.at, now)}` : '' })), k: 'done' })
+        finished?.length > 0 && jsxs('div', { 'data-finished-cards': '', children: [
+          jsx('button', { type: 'button', 'data-finished-toggle': '', 'aria-expanded': finishedOpen, onClick: toggleFinished, style: { ...btn, ...muted }, children: `${finished.length} finished` }),
+          finishedOpen && finished.map(d => jsx(Row, { i: { key: d.key, label: d.label, detail: d.archived ? 'archived' : d.at ? `finished ${ago(d.at, now)}` : '' }, k: 'done' }, d.key))
+        ] })
       ] }) : null
     ] })
   ] })

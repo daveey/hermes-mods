@@ -329,15 +329,15 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         wanted = [s.strip() for s in ids.split(',') if s.strip()][:50]
         # 'includes' tells the client this list has finished cards (core's list never does).
         if not wanted:
-            return {'tasks': [], 'includes': ['done']}
+            return {'tasks': [], 'includes': ['done', 'archived']}
         read = session_tasks
         if read is None:
             try:
                 from hermes_cli import kanban_session_activity as ksa
             except ImportError:
                 raise HTTPException(501, 'This backend has no kanban session reader')
-            read = lambda ids: ksa.session_tasks(ids, tuple(ksa.LISTED_STATUSES) + ('done',), stale_ok=True)
-        return {'tasks': read(wanted), 'includes': ['done']}
+            read = lambda ids: ksa.session_tasks(ids, tuple(ksa.LISTED_STATUSES) + ('done', 'archived'), stale_ok=True)
+        return {'tasks': read(wanted), 'includes': ['done', 'archived']}
 
     @router.post('/resolve')
     def resolve():

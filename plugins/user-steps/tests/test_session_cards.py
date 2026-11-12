@@ -20,13 +20,13 @@ def test_session_cards_passes_the_lineage_and_returns_done_cards(tmp_path):
     rows = [{'id': 't_1', 'status': 'done'}, {'id': 't_2', 'status': 'running'}]
     c = client(tmp_path, lambda ids: seen.append(ids) or rows)
     r = c.get('/session-cards', params={'ids': 's1, s0,,'})
-    assert r.status_code == 200 and r.json() == {'tasks': rows, 'includes': ['done']}
+    assert r.status_code == 200 and r.json() == {'tasks': rows, 'includes': ['done', 'archived']}
     assert seen == [['s1', 's0']]
 
 
 def test_session_cards_empty_ids_reads_nothing(tmp_path):
     c = client(tmp_path, lambda ids: (_ for _ in ()).throw(AssertionError('read')))
-    assert c.get('/session-cards', params={'ids': ' , '}).json() == {'tasks': [], 'includes': ['done']}
+    assert c.get('/session-cards', params={'ids': ' , '}).json() == {'tasks': [], 'includes': ['done', 'archived']}
 
 
 def test_default_reader_asks_core_for_listed_plus_done(tmp_path, monkeypatch):
@@ -41,5 +41,5 @@ def test_default_reader_asks_core_for_listed_plus_done(tmp_path, monkeypatch):
     monkeypatch.setattr(pkg, 'kanban_session_activity', fake, raising=False)
     monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_session_activity', fake)
     c = client(tmp_path, None)
-    assert c.get('/session-cards', params={'ids': 's1'}).json() == {'tasks': [], 'includes': ['done']}
-    assert calls == [(['s1'], ('todo', 'running', 'blocked', 'done'), True)]
+    assert c.get('/session-cards', params={'ids': 's1'}).json() == {'tasks': [], 'includes': ['done', 'archived']}
+    assert calls == [(['s1'], ('todo', 'running', 'blocked', 'done', 'archived'), True)]
