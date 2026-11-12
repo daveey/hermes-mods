@@ -108,8 +108,12 @@ For recurrence evidence, inspect the private red-sweep log for slug `owner-recom
   `hermes kanban edit <id> --priority <above the head of that list>` in the same turn, for every card you
   unblock (guessed decisions too). A bump below the head (e.g. 11000 under a 20000+ head) leaves the card
   unstarted and the board flags it to the chat after 30 min. If the hub is full, move portable cards to a pool worker:
-  `hermes kanban move <id> --runs-on machine:<worker> --reason "..."` (keep cards needing hub-only access,
-  the Macs or another profile on the hub). `no_machine` for a worker usually means a Board hold; read its owner
+  `hermes kanban move <id> --runs-on machine:<worker> --reason "..."`. Don't keep a card on the hub on an
+  unchecked "only the hub can": pool workers carry Mac reach (`--runs-on capability:tailnet-exec`), hub reads and
+  hub writes, so Mac-only work is portable. An assignee profile the pool doesn't run (e.g. `mac-ops`) pins the
+  card to the hub and the move fails `capability_mismatch`: `hermes kanban assign <id> default` first, then move.
+  If you do a queued card's work in the chat instead, comment the evidence and archive the card the same turn,
+  or a worker repeats it. `no_machine` for a worker usually means a Board hold; read its owner
   card before filing a fault. Free slots but nothing starting: check `~/.hermes/core-update/drain-hold` (a
   core-update drain pauses hub dispatch; `max_s` is not the end: `grep core-drain ~/.hermes/logs/hermes-sync.log`
   shows "claim hold kept past its bound" while workers run, up to a 2 h hard max, and no priority beats it, so
@@ -132,6 +136,8 @@ For recurrence evidence, inspect the private red-sweep log for slug `owner-recom
   `distinct_from=[<id>]`, `distinct_reason` = it cannot import and is archived this turn, body = run the
   original's body with all its limits, first step = stop if the original started), then comment and
   `hermes kanban archive <id>` on the origin box and read back `archived`, so one owner remains.
+  A hub card parented on such an unimported card sits `todo` forever (`parent_missing` in its events, parent
+  absent from the hub's `tasks`): `kanban_unlink` it once its own acceptance is met or the twin exists.
 - A `ready` card that already ran and has an open PR: before bumping it, read `hermes kanban show <id>`
   Diagnostics and the PR (`gh pr view <N> --json state,mergeStateStatus,statusCheckRollup`). A hold of
   `respawn_guarded: active_pr` keeps the card from restarting until its PR merges or closes, so no priority
@@ -218,6 +224,8 @@ there, which execs the skill script.
 - The Desktop "For you" panel lists asks from every gateway. Cards that live on another gateway's board are read
   with `cross_task`, not this host's sqlite.
 - Don't publish the "may I sweep?" question as an approval tile first: this skill is the approval.
+- Write the sweep report as plain markdown. A `::user-step{...}` directive in a reply publishes its text as a
+  For-you request, so a status table inside one becomes a fake ask that has to be withdrawn.
 - "No red cards" from the hub's sqlite is not "no red chats". The sidebar paints a chat red from
   `sessions.outcome_json` kind `decision` (hub `state.db`), fed by blocked cards on any gateway (the MacBook board
   alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards. `red_cards.py list`
