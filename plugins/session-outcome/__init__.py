@@ -419,7 +419,10 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
                 linked, not_linked = _link_cards(session_id, cards)
                 result["linked"] = linked
                 if not_linked:
-                    result["not_linked"] = not_linked
+                    result["link_notes"] = [n for n in not_linked if "(origin-bound to this chat)" in n]
+                    failures = [n for n in not_linked if "(origin-bound to this chat)" not in n]
+                    if failures:
+                        result["not_linked"] = failures
         return json.dumps(result)
     except Exception as exc:  # never crash the agent loop
         log.exception("session_outcome failed")
@@ -444,6 +447,21 @@ def _adopt_hint(card: str, board: str = "default") -> str:
         return str(adopt_next_step(card, board).get("next_step") or "")
     except Exception:
         return ""
+
+
+def _remote_wait_bindings(session_id: str) -> dict[str, str]:
+    """Read accepted origin bindings, including released cards, in this profile only."""
+    from hermes_constants import get_hermes_home
+    from hermes_cli.kanban_origin_adapter import _gateway
+    from hermes_cli.kanban_origin_ledger import obligations
+    from hermes_cli.profiles import get_active_profile_name
+
+    ledger = get_hermes_home() / "kanban" / "origin-ledger.db"
+    if not ledger.exists():
+        return {}
+    replica = Path(os.environ.get("HERMES_HUB_STATE") or Path.home() / ".local/state/hermes-hub") / "hub.db"
+    rows = obligations(ledger, gateway=_gateway(replica), profile=get_active_profile_name(), sessions=[session_id])
+    return {row["owner"]["task_id"]: row["owner"]["gateway"] for row in rows}
 
 
 def _link_wait_cards(session_id: str, cards: list[str]) -> tuple[list[str], list[str]]:
@@ -496,6 +514,15 @@ def _link_wait_cards(session_id: str, cards: list[str]) -> tuple[list[str], list
                 done = True
                 break
         if not done:
+            try:
+                remote = _remote_wait_bindings(session_id)
+            except Exception as exc:
+                notes.append(f"{card}: linkage unknown (origin ledger unavailable: {type(exc).__name__})")
+                continue
+            if card in remote:
+                linked.append(card)
+                notes.append(f"{card}: linked on {remote[card]} (origin-bound to this chat)")
+                continue
             hint = _adopt_hint(card)
             notes.append(f"{card}: not on this gateway's boards, so the chat does not show it yet"
                          + (f"; link it with: {hint}" if hint else ""))

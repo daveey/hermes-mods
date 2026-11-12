@@ -46,7 +46,10 @@ not claimed by this plugin section.
     "eta"?}]}` declares `{"kind": "waiting", "on": [...]}`. Each `card` found on this gateway's boards also gets a
     `tui` shepherd subscription for the chat (`delivery_metadata.via = "outcome-wait"`), so the chat's task list and
     sidebar show what it waits on; the result lists `linked` and, for cards it could not find, `not_linked` with the
-    `kanban_origin_adopt` command. An owning (create/shepherd/origin) sub the chat already has is left as is.
+    `kanban_origin_adopt` command. Accepted remote bindings in the current gateway/profile's origin ledger
+    also count as `linked`; `link_notes` identifies the owner gateway. Another chat/profile/gateway's binding
+    never counts, and an unreadable ledger reports unknown linkage rather than suggesting a new adoption.
+    An owning (create/shepherd/origin) sub the chat already has is left as is.
 - **Provider** `user-steps`: user-steps `open_steps(sid)` → `{"decision_items": [...], "waiting_on": []}`, or None
   when the chat has no open steps.
 - **Judge**: is the last assistant message a closing summary? Desktop, tui and cli chats only: any other
