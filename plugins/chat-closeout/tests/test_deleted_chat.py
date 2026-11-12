@@ -76,3 +76,18 @@ def test_no_stores_or_non_hermes_ids_never_gone(tmp_path, monkeypatch):
     for sid in ('chat', 'default/' + SID, 'hub:' + SID, ''):
         assert plugin._session_gone(sid) is False
     assert plugin._session_gone(SID) is True
+
+
+LOCAL_SID = 'local-' + 'b' * 64
+
+
+def test_deleted_desktop_local_chat_is_gone(tmp_path, monkeypatch):
+    """Desktop chats carry runtime-minted local-<sha256> ids; a deleted one must count as gone."""
+    db = state_db(tmp_path / 'state.db', [SID])
+    monkeypatch.setattr(plugin, 'state_dbs', lambda: [db])
+    assert plugin._session_gone(LOCAL_SID) is True
+    db2 = state_db(tmp_path / 'b.db', [LOCAL_SID])
+    monkeypatch.setattr(plugin, 'state_dbs', lambda: [db, db2])
+    assert plugin._session_gone(LOCAL_SID) is False
+    for sid in ('local-' + 'b' * 16, 'local-xyz', 'hub:' + LOCAL_SID):
+        assert plugin._session_gone(sid) is False
