@@ -115,6 +115,8 @@ def resolved_target(target):
 
 
 def workload_reason(command):
+    # Sibling classifier plugins/mac-heavy-guard/guard.py: naming its path here makes
+    # scripts/ci-plugin-suites run this suite when that guard changes.
     try:
         path = Path(__file__).resolve().parent.parent / "mac-heavy-guard" / "guard.py"
         spec = importlib.util.spec_from_file_location("tailnet_heavy_classifier", path)
@@ -131,6 +133,16 @@ def workload_reason(command):
             return tokens
 
         setattr(guard, "_tokens", strict_tokens)
+        if hasattr(guard, "_lexable"):
+            def strict_lexable(text, lex, dropped=None):
+                # The guard drops lines whose quotes never close; a remote job must not run unclassified text.
+                try:
+                    lex(text)
+                except ValueError:
+                    raise ValueError("tailnet workload policy: cannot classify malformed shell command")
+                return text
+
+            setattr(guard, "_lexable", strict_lexable)
         # Do not call check_shell: that follows gateway-local scripts and honors opt-outs.
         commands = list(guard.commands(command))
         for argv, _assignments in commands:
