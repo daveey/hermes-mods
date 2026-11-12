@@ -137,3 +137,15 @@ def test_refusal_is_logged(env):
     log = env["home"] / "logs" / "evidence-clobber-guard.log"
     rows = [json.loads(line) for line in log.read_text().splitlines()]
     assert rows[-1]["target"] == str(f) and rows[-1]["tool"] == "terminal"
+
+
+# The fd of a redirect is read from the raw text (shlex drops whitespace): `2>x` is a redirect of fd 2, while a
+# spaced `tee 2 > x` names the file `2`. The old `argv[-1].isdigit()` pop dropped that tee operand.
+def test_fd_prefix_versus_spaced_digit_operand(env):
+    (env["ev"] / "2").write_text("run1\n")
+    for cmd in ("python3 mutate.py 2>/dev/null", "python3 mutate.py 2>&1 | tee -a mutation-v2.log",
+                "( python3 mutate.py 2>&1 ) >> mutation-v2.log", "tee -a 2 2>/dev/null"):
+        assert run(env, cmd, env["ev"]) is None, cmd
+    for cmd in ("echo x | tee 2 > /dev/null", "python3 mutate.py 2>mutation-v2.log",
+                "( python3 mutate.py 2>&1 ) > mutation-v2.log", "echo x | tee mutation-v2.log 2>/dev/null"):
+        assert_blocked(run(env, cmd, env["ev"]), cmd)

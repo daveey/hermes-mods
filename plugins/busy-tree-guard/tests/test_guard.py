@@ -187,6 +187,19 @@ def test_real_file_redirections_still_block(env, redirect):
     }, task_id=TASK)
 
 
+# The fd of a redirect is read from the raw text (shlex drops whitespace): a digit glued to `>` is the fd, a spaced
+# digit is an operand. The old `argv[-1].isdigit()` pop also dropped the operand of `rm 2 > /dev/null`.
+def test_fd_prefix_versus_spaced_digit_operand(env):
+    env["reg"].add("python -m pytest", env["fix2"])
+    for cmd in ("rm -f /tmp/x 2>/dev/null", "rm -f /tmp/x 2>&1", "( rm -f /tmp/x 2>/dev/null )",
+                "touch /tmp/x 1>/dev/null 2>|/dev/null", "rm -f /tmp/x &>/dev/null"):
+        assert env["hook"](tool_name="terminal", args={"workdir": str(env["fix2"]), "command": cmd},
+                           task_id=TASK) is None, cmd
+    for cmd in ("rm -f 2 > /dev/null", "rm -f /tmp/x 2>errors", "( rm -f retention_policy.py 2>/dev/null )"):
+        assert env["hook"](tool_name="terminal", args={"workdir": str(env["fix2"]), "command": cmd},
+                           task_id=TASK), cmd
+
+
 def test_cd_resolves_pwd_test_argument(env):
     child = _repo(env["other"] / "nested")
     env["reg"].add(f"cd {env['other']} && bash t.sh $PWD/nested", env["fix2"])

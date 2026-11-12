@@ -151,9 +151,48 @@ def check_file_tool(tool: str, args: dict, cwd: Optional[str] = None) -> Optiona
 
 # ---- shell -------------------------------------------------------------------------------------
 
+_FD_PREFIX = re.compile(r"\d+(?=[<>])")
+
+
+def _drop_fd_prefixes(cmd: str) -> str:
+    """Remove the file-descriptor number of each unquoted redirect (`2>x`, `2>>x`, `2>&1`, `1>|x`, `0<x`).
+
+    shlex with punctuation_chars splits `2>/dev/null` into `2`, `>`, `/dev/null` and drops whitespace, so the
+    `2` would read as an operand (`rm -r "$X" 2>/dev/null` was refused as "rm on 2"). Only a digit run that
+    starts a word and directly touches `<`/`>` is an fd; a spaced `2 > x` keeps `2` as an operand, as in bash."""
+    out, quote, i, n = [], "", 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(cmd[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append(cmd[i:i + 2])
+            i += 2
+            continue
+        if c in "'\"":
+            quote = c
+        elif c.isdigit() and (i == 0 or cmd[i - 1].isspace() or cmd[i - 1] in ";&|()"):
+            m = _FD_PREFIX.match(cmd, i)
+            if m:
+                i = m.end()
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _tokens(cmd: str) -> list[str]:
     cmd = cmd.replace("\r", "")
     cmd = re.sub(r"\n", " ; ", cmd)  # heredoc bodies get scanned as commands too (documented over-approximation)
+    cmd = _drop_fd_prefixes(cmd)
     try:
         lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
         lex.whitespace_split = True

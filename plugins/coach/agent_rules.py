@@ -1076,18 +1076,68 @@ def _heredoc_python_bodies(raw: str):
         pos = end.end() if end else len(raw)
 
 
+_FD_PREFIX_RE = re.compile(r"\d+(?=[<>])")
+
+
+def _drop_fd_prefixes(seg: str) -> str:
+    """`seg` without the file-descriptor number of each unquoted redirect (`2>x`, `2>>x`, `2>&1`, `1>|x`, `0<x`).
+    Only a digit run that starts a word and directly touches `<`/`>` is an fd: a spaced `2 > x` keeps `2` as an
+    operand, as in bash."""
+    out, quote, i, n = [], "", 0, len(seg)
+    while i < n:
+        c = seg[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(seg[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append(seg[i:i + 2])
+            i += 2
+            continue
+        if c in "'\"":
+            quote = c
+        elif c.isdigit() and (i == 0 or seg[i - 1].isspace() or seg[i - 1] in ";&|()"):
+            m = _FD_PREFIX_RE.match(seg, i)
+            if m:
+                i = m.end()
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _seg_words(seg: str) -> list:
     """Shell words of one simple command. Subshell parens are shell syntax, not arguments: `( cd X; rm -f a )`
     and `(cd X && rm -f a)` must yield `a`, never `)` or `a)` (the closing paren resolved inside a cd'd live
-    tree read as an rm/tee/sed -i target). Every word-scanning loop in `_terminal_live_write` reads through here."""
+    tree read as an rm/tee/sed -i target). Redirects are not arguments either: `rm -r "$X" 2>/dev/null` must not
+    yield `2>/dev/null` or `2`; an operator and its target are dropped here (REDIRECT_RE checks the targets).
+    Every word-scanning loop in `_terminal_live_write` reads through here."""
     import shlex
+    seg = _drop_fd_prefixes(seg)
     try:
-        lex = shlex.shlex(seg, posix=True, punctuation_chars="()")
+        lex = shlex.shlex(seg, posix=True, punctuation_chars="()<>&|")
         lex.whitespace_split = True
-        words = list(lex)
+        toks = list(lex)
     except Exception:
-        words = re.sub(r"[()]", " ", seg).split()
-    return [w for w in words if w.strip("()")]
+        toks = re.sub(r"[()]", " ", seg).split()
+    words, skip = [], False
+    for w in toks:
+        if skip:
+            skip = False
+            continue
+        if w and set(w) <= set("()<>&|"):
+            # `>`, `>>`, `>&`, `&>`, `>|`, `<`, `<<`, `<<<`: the next word is the target / fd / heredoc tag
+            skip = bool(set(w) & set("<>")) and not set(w) & set("()")
+            continue
+        if w.strip("()"):
+            words.append(w)
+    return words
 
 
 def _sed_edit_files(args: list) -> list:

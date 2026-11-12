@@ -137,8 +137,44 @@ def is_live(path: str, in_home: bool = False) -> bool:
     return not (board and not _BOARD_SLUG.match(board.group(1)))
 
 
+_FD_PREFIX = re.compile(r"\d+(?=[<>])")
+
+
+def _drop_fd_prefixes(text: str) -> str:
+    """`text` without the file-descriptor number of each unquoted redirect (`2>x`, `2>>x`, `2>&1`, `1>|x`, `0<x`).
+    shlex drops whitespace, so this is decided on the raw text: only a digit run that starts a word and directly
+    touches `<`/`>` is an fd; a spaced `2 > x` keeps `2` as an operand, as in bash."""
+    out, quote, i, n = [], "", 0, len(text)
+    while i < n:
+        c = text[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if c in "'\"":
+            quote = c
+        elif c.isdigit() and (i == 0 or text[i - 1].isspace() or text[i - 1] in ";&|()"):
+            m = _FD_PREFIX.match(text, i)
+            if m:
+                i = m.end()
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _tokens(cmd: str) -> list[str]:
-    lexer = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=";&|()<>")
+    lexer = shlex.shlex(_drop_fd_prefixes(cmd.replace("\n", " ; ")), posix=True, punctuation_chars=";&|()<>")
     lexer.whitespace_split = True
     lexer.commenters = ""
     try:
@@ -178,6 +214,20 @@ def _strip_wrappers(seg: list[str]) -> list[str]:
         else:
             break
     return seg[i:]
+
+
+def _without_redirects(args: list[str]) -> list[str]:
+    """`args` without redirect operators and their targets: in `cp a ~/.hermes/state.db 2>/dev/null` the
+    destination is `~/.hermes/state.db`, not `/dev/null` (`_check_redirects` judges redirect targets)."""
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif a and set(a) <= set("<>&|") and set(a) & set("<>"):
+            skip = True
+        else:
+            out.append(a)
+    return out
 
 
 def _operands(args: list[str]) -> list[str]:
@@ -363,7 +413,7 @@ def check_shell(cmd: str, cwd: str = "") -> Optional[str]:
             target = (_operands(args) or ["~"])[0]
             in_home = os.path.realpath(_expand(target)) == _home()
             continue
-        ops = _operands([a for a in args if a not in ("<", ">", ">>", "<<", "<<<")])
+        ops = _operands(_without_redirects(args))
         if word in ("rm", "unlink", "shred", "truncate", "mv"):
             hit = next((o for o in ops if is_live(o, in_home)), None)
             if hit:

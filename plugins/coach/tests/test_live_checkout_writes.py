@@ -138,6 +138,40 @@ def test_seg_words_drops_unquoted_parens_only():
     assert rules._seg_words("rm -f 'q(1).txt' \"a b).txt\"") == ["rm", "-f", "q(1).txt", "a b).txt"]
 
 
+# A redirect is not a file operand: `_seg_words` kept `2>/dev/null` as one word, which resolved inside the cd'd
+# live tree, and `cd <live>; rm -r "$X" 2>/dev/null` was refused as "`rm` of `2>/dev/null`" (2026-11-12).
+def test_fd_redirects_are_not_write_targets(live, tmp_path):
+    scratch = tmp_path / "scratch"
+    for cmd in (f'cd {live}; rm -r "$X" 2>/dev/null',
+                f'( cd {live}; rm -r "$X" 2>/dev/null )',
+                f"cd {live}; mkdir -p /tmp/x 2>&1",
+                f"cd {live}; touch /tmp/x 2>>/tmp/err.log",
+                f"cd {live}; touch /tmp/x 2>&1",
+                f"cd {live}; rm -f /tmp/x >/dev/null",
+                f"cd {live}; rm -f /tmp/x &>/dev/null",
+                f"cd {live}; rm -f /tmp/x 1>/dev/null 2>|/tmp/e",
+                f"cd {live}; rm -f /tmp/x 0</dev/null",
+                f"cd {live}; cp run_agent.py {scratch}/copy.py 2>/dev/null",
+                f"cd {live}; echo x | tee {scratch}/out.txt 2>/dev/null"):
+        assert not blk("terminal", {"command": cmd}, live), cmd
+    for cmd, what in ((f"cd {live}; rm -f hermes_cli/kanban_wake_check.py 2>/dev/null",
+                       "`rm` of `hermes_cli/kanban_wake_check.py`"),
+                      (f"cd {live}; echo hi 2>run_agent.py", "a write to `run_agent.py`"),
+                      (f"cd {live}; echo hi 2>>run_agent.py", "a write to `run_agent.py`"),
+                      (f"( cd {live}; rm -f run_agent.py 2>&1 )", "`rm` of `run_agent.py`"),
+                      (f"cd {scratch}; cp a.py {live}/run_agent.py 2>/dev/null", "`cp` of `run_agent.py`")):
+        assert blk("terminal", {"command": cmd}, live) == what, cmd
+
+
+def test_seg_words_drops_redirects_keeps_spaced_digit():
+    assert rules._seg_words('rm -r __ 2>/dev/null') == ["rm", "-r", "__"]
+    assert rules._seg_words("rm -r /tmp/x 2>&1") == ["rm", "-r", "/tmp/x"]
+    assert rules._seg_words("rm -r /tmp/x 2>") == ["rm", "-r", "/tmp/x"]
+    assert rules._seg_words("touch a 2>>/tmp/e &>/dev/null 1>|x 0<y") == ["touch", "a"]
+    assert rules._seg_words("rm -r /tmp/x 2 > /dev/null") == ["rm", "-r", "/tmp/x", "2"]
+    assert rules._seg_words("rm -f a2>/dev/null") == ["rm", "-f", "a2"]
+
+
 # The sed/perl script is data, not a file operand: a one-word script (`sed -i s/a/b/ /tmp/x`) resolved inside a
 # cd'd live tree was refused as "`sed -i` of `s/a/b`" even though only /tmp/x is written (2026-11-12 false refusal).
 def test_inplace_edit_script_word_is_not_a_write_target(live, tmp_path):

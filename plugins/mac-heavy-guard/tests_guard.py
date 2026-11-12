@@ -647,3 +647,18 @@ def test_hermes_plugin_allows_ssh_heredoc():
 def test_claude_hook_allows_ssh_heredoc():
     r = _hook(SSH_HEREDOC)
     assert r.returncode == 0 and r.stderr == "", r.stderr
+
+
+# A redirect is not a test path: `pytest 2>&1 | tail` read `2>` as a path and passed as a targeted run.
+@pytest.mark.parametrize("cmd", ["pytest 2>&1 | tail", "pytest 2>/dev/null", "( pytest 2>/dev/null )",
+                                 "pytest -q &>/tmp/log", "pytest >/tmp/log 2>&1", "npm install 2>&1",
+                                 "cd /tmp && pytest 2>&1 | tail -5"])
+def test_redirect_is_not_a_test_path(cmd):
+    assert blocked("terminal", command=cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", ["pytest tests/test_x.py 2>&1 | tail", "pytest -q tests/test_x.py 2>/dev/null",
+                                 "( pytest tests/test_x.py 2>&1 )", "npm install left-pad 2>&1",
+                                 "pytest tests/test_x.py < /dev/null"])
+def test_redirect_targeted_runs_allowed(cmd):
+    assert not blocked("terminal", command=cmd), cmd

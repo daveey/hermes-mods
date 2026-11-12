@@ -205,6 +205,33 @@ def test_shell_writes_outside_allowed(env):
     assert not term("echo hi 2>/dev/null", env.live)
 
 
+# The fd of an unquoted redirect is not a file operand: shlex splits `2>/dev/null` into `2`, `>`, `/dev/null`, and
+# `rm -r "$BT" 2>/dev/null` run in the live checkout was refused as "rm on 2" (2026-11-12 false refusal).
+@pytest.mark.parametrize("cmd", ['rm -r "$BT" 2>/dev/null', "rm -r /tmp/x 2>/dev/null", "mkdir -p /tmp/x 2>&1",
+                                 "touch /tmp/x 2>>/tmp/err.log", "rm -r /tmp/x &>/dev/null", "rm -r /tmp/x 1>/dev/null",
+                                 "rm -r /tmp/x 2>|/tmp/err.log", "rm -r /tmp/x 2>&1 >/dev/null", "rm -r /tmp/x 0</dev/null",
+                                 "rm -r /tmp/x 10>/tmp/e", "ls a.txt 2>/dev/null", "( rm -r /tmp/x 2>/dev/null )",
+                                 "true; rm -r /tmp/x 2>/dev/null; true", "bash -c 'rm -r /tmp/x 2>/dev/null'"])
+def test_fd_redirect_prefix_is_not_an_operand(env, cmd):
+    assert guard.check_shell(cmd, str(env.live)) is None, cmd
+    assert not term(cmd, env.live), cmd
+
+
+def test_fd_redirect_controls_still_refuse(env):
+    live = str(env.live)
+    # a spaced `2` is an operand in shell: `rm 2 > x` removes the file `2`
+    assert guard.check_shell("rm -r /tmp/x 2 > /dev/null", live) == "rm on 2, inside the live checkout"
+    assert guard.check_shell("rm -f a.txt 2>/dev/null", live) == "rm on a.txt, inside the live checkout"
+    assert guard.check_shell("echo hi 2>a.txt", live) == "output redirection to a.txt, inside the live checkout"
+    assert guard.check_shell("echo hi 2>>a.txt", live) == "output redirection to a.txt, inside the live checkout"
+    assert guard.check_shell("echo hi &>a.txt", live) == "output redirection to a.txt, inside the live checkout"
+    # digits glued to a word or quoted are not an fd
+    assert guard.check_shell("rm -f a2>/dev/null", live) == "rm on a2, inside the live checkout"
+    assert guard.check_shell("rm -f '2'>/dev/null", live) == "rm on 2, inside the live checkout"
+    for c in ["rm -r /tmp/x 2 > /dev/null", "rm -f a.txt 2>/dev/null", "echo hi 2>a.txt", "( rm -f a.txt 2>&1 )"]:
+        assert blocked(term(c, env.live)), c
+
+
 # ---- execute_code ------------------------------------------------------------------------------
 
 def code(src):

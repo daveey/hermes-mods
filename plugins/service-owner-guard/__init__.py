@@ -129,13 +129,76 @@ def local_lookup(spec: dict) -> dict:
 
 
 # ───────────── shell parsing (vendored from backend-restart-guard) ─────────────
+_FD_PREFIX = re.compile(r"\d+(?=[<>])")
+_REDIR_PART = re.compile(r"[<>]\(|&>>?|>>|>&|>\||<<<|<<|<>|<&|[<>]|[^<>]+")
+
+
+def _drop_fd_prefixes(text: str) -> str:
+    """`text` without the file-descriptor number of each unquoted redirect (`2>x`, `2>>x`, `2>&1`, `1>|x`, `0<x`).
+    Only a digit run that starts a word and directly touches `<`/`>` is an fd: a spaced `2 > x` keeps `2` as an
+    operand, as in bash."""
+    out, quote, i, n = [], "", 0, len(text)
+    while i < n:
+        c = text[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if c in "'\"":
+            quote = c
+        elif c.isdigit() and (i == 0 or text[i - 1].isspace() or text[i - 1] in ";&|()"):
+            m = _FD_PREFIX.match(text, i)
+            if m:
+                i = m.end()
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _drop_redirects(tokens: list) -> list:
+    """Drop each redirect operator and the word after it (target, fd or heredoc tag) from tokens lexed with `<>` as
+    punctuation. `<(`/`>(` (process substitution) stays a command boundary."""
+    out, skip = [], False
+    for t in tokens:
+        if t and set(t) <= set(";&|()<>\n") and set(t) & set("<>"):
+            for part in _REDIR_PART.findall(t):
+                if part.endswith("("):
+                    out.append("(")
+                    skip = False
+                elif set(part) & set("<>"):
+                    skip = True
+                else:
+                    out.append(part)
+                    skip = False
+            continue
+        if skip:
+            skip = False
+            if not (t and set(t) <= set(";&|()\n")):
+                continue
+        out.append(t)
+    return out
+
+
 def _segments(text: str) -> list:
+    """argv per simple command, redirects dropped: `systemctl stop foo 2>/dev/null` stops `foo` only, never a unit
+    named `2>/dev/null` (or `2>` from `2>&1`)."""
     try:
-        lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()\n")
+        lex = shlex.shlex(_drop_fd_prefixes(text), posix=True, punctuation_chars=";&|()<>\n")
         lex.whitespace = " \t\r"
         lex.whitespace_split = True
         lex.commenters = ""
-        tokens = list(lex)
+        tokens = _drop_redirects(list(lex))
     except ValueError:
         tokens = text.split()
     out, cur, skipping = [], [], False

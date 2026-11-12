@@ -152,8 +152,44 @@ def running_tests(task_id: str) -> List[dict]:
 
 # ---------------------------------------------------------------- edit targets
 
+_FD_PREFIX = re.compile(r"\d+(?=[<>])")
+
+
+def _drop_fd_prefixes(text: str) -> str:
+    """`text` without the file-descriptor number of each unquoted redirect (`2>x`, `2>>x`, `2>&1`, `1>|x`, `0<x`).
+    shlex drops whitespace, so this is decided on the raw text: only a digit run that starts a word and directly
+    touches `<`/`>` is an fd; a spaced `rm 2 > x` keeps `2` as an operand, as in bash."""
+    out, quote, i, n = [], "", 0, len(text)
+    while i < n:
+        c = text[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if c in "'\"":
+            quote = c
+        elif c.isdigit() and (i == 0 or text[i - 1].isspace() or text[i - 1] in ";&|()"):
+            m = _FD_PREFIX.match(text, i)
+            if m:
+                i = m.end()
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _tokens(text: str) -> List[str]:
-    lex = shlex.shlex(text.replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lex = shlex.shlex(_drop_fd_prefixes(text.replace("\n", " ; ")), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = ""
     try:
@@ -189,8 +225,6 @@ def _segments(tokens: List[str]) -> Iterator[Tuple[List[str], List[Tuple[str, st
             continue
         if set(tok) <= set("<>&|") and (">" in tok or "<" in tok):
             target = tokens[i + 1] if i + 1 < len(tokens) else ""
-            if argv and argv[-1].isdigit():
-                argv.pop()
             redirs.append((tok, target))
             i += 2
             continue

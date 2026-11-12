@@ -243,6 +243,28 @@ class Systemd(Base):
         self.assertIsNone(self.verdict(f"systemctl --user stop my-collector.service # owner-approved={CARD}"))
         self.assertIsNone(self.verdict("systemctl --user start my-collector.service"))
 
+    # A redirect is not a unit: `2>/dev/null` (and the `2>` left of `2>&1`) were looked up as extra units.
+    def test_redirects_are_not_units(self):
+        seen = []
+
+        def run(argv, timeout=5):
+            seen.append(argv)
+            if argv[:2] == ["systemctl", "--user"] and "show" in argv:
+                return 0, f"Environment=FOO=1 HERMES_OWNER_CARD={OWNER}\nWorkingDirectory=/nonexistent\nExecStart=\n"
+            return (1, "") if argv[0] in ("launchctl", "systemctl") else real(argv, timeout)
+        real = self.g.run_cmd
+        self.g.run_cmd = run
+        for cmd in ("systemctl --user stop my-collector.service 2>/dev/null",
+                    "systemctl --user stop my-collector.service 2>&1",
+                    "( systemctl --user stop my-collector.service &>/dev/null )"):
+            acts = self.g.extract_actions(cmd)
+            self.assertEqual([a.get("unit") for a in acts], ["my-collector.service"], cmd)
+            self.assertIn(f"card {OWNER}", self.verdict(cmd))
+        self.assertFalse(any("2>" in " ".join(a) for a in seen), seen)
+        self.assertEqual([a.get("pid") for a in self.g.extract_actions("kill 4242 2>/dev/null")], [4242])
+        # a spaced digit stays an argument, as in the shell
+        self.assertEqual([a.get("unit") for a in self.g.extract_actions("systemctl stop a 2 > /dev/null")], ["a", "2"])
+
 
 class ExecuteCode(Base):
     def test_python_subprocess_bootout_refused(self):

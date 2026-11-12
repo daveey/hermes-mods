@@ -586,3 +586,21 @@ def test_check_replacement_falls_back_to_query_only_when_ro_open_fails(tmp_path,
     with pytest.raises(sqlite3.OperationalError):
         swap_db._ro_connect(tmp_path / "missing.db")
     assert not (tmp_path / "missing.db").exists()
+
+
+# A redirect is not an operand: `cp x ~/.hermes/state.db 2>/dev/null` took `/dev/null` as cp's destination and
+# passed; `2>&1` left `1` there.
+@pytest.mark.parametrize("cmd", ["cp recovered.db ~/.hermes/state.db 2>/dev/null",
+                                 "cp recovered.db ~/.hermes/kanban.db 2>&1",
+                                 "cp recovered.db ~/.hermes/kanban.db 2>>/tmp/e.log",
+                                 "( cp recovered.db ~/.hermes/state.db 2>/dev/null )",
+                                 "mv /tmp/k.db ~/.hermes/kanban.db &>/dev/null",
+                                 "rm -f ~/.hermes/kanban.db-shm 2>/dev/null"])
+def test_redirect_is_not_an_operand(cmd):
+    assert blocked("terminal", command=cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", ["cp ~/.hermes/state.db /tmp/b.db 2>/dev/null", "cp ~/.hermes/state.db /tmp/b.db 2>&1",
+                                 "rm -f /tmp/x.db 2>/dev/null", "sqlite3 ~/.hermes/state.db 'select 1' 2>/dev/null"])
+def test_redirect_controls_allowed(cmd):
+    assert not blocked("terminal", command=cmd), cmd
