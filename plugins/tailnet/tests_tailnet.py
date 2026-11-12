@@ -717,7 +717,9 @@ def test_unprotected_does_not_need_classifier(workload, tmp_path):
 
 @pytest.mark.parametrize("command", [
     "rsync -a source/ dest/", "rsync --max-size=1m source/ dest/", "scp file elsewhere:file",
-    "cp small.txt other.txt", "ditto source dest", "tar -xf archive.tar", "tar xzf archive.tgz",
+    "cp -R src dst", "cp -r src dst", "cp -a src dst", "cp -pR src dst", "cp --recursive src dst",
+    "cp --archive src dst", "cp *.log dst/", "cp src/{a,b} dst/", "ditto source dest",
+    "tar -xf archive.tar", "tar xzf archive.tgz",
     "tar --extract --file archive.tar", "bash -lc 'env MAC_HEAVY_OK=1 cp -R src dst'",
     "unzip archive.zip", "dd if=/dev/zero of=large bs=1m count=4096",
     "curl -o large https://example.com/large", "wget https://example.com/large",
@@ -725,6 +727,18 @@ def test_unprotected_does_not_need_classifier(workload, tmp_path):
 ])
 def test_unbounded_exec_transfers_redirect(workload, command):
     assert_refused(workload, direct_runner(workload, runner_job(workload, command=command)), "tailnet_copy")
+
+
+@pytest.mark.parametrize("command", [
+    "cp a b", "cp small.txt other.txt", "cp -p ~/.ssh/authorized_keys ~/.ssh/authorized_keys.bak",
+    "cp ~/.ssh/authorized_keys ~/.ssh/authorized_keys.bak-$(date +%s) && grep -c key ~/.ssh/authorized_keys",
+    "cp -- a b", "cp -f a b c dir/",
+])
+def test_protected_bounded_cp_passes(workload, command):
+    # A one-file backup before an edit has a sanctioned route, so nobody needs another path to the machine.
+    result = direct_runner(workload, runner_job(workload, command=command))
+    assert result["rc"] == 0, result
+    assert len(workload.ssh_log()) == 1
 
 
 @pytest.mark.parametrize("size,limit,allowed", [(2, 2, True), (3, 2, False),

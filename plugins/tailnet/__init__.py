@@ -688,7 +688,58 @@ def enabled() -> bool:
     return bool(settings().get("enabled", True))
 
 
+# ---------------------------------------------------------------- terminal guard
+
+SHELL_TOOLS = {"terminal"}
+
+
+def _terminal_guard():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tailnet_terminal_guard", HERE / "terminal_guard.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("missing terminal_guard.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _terminal_refusal(tool_name: str, args: Any) -> Optional[str]:
+    args = args if isinstance(args, dict) else {}
+    if tool_name in SHELL_TOOLS:
+        command = str(args.get("command") or "")
+        if not re.search(r"ssh|scp|sftp|rsync", command):
+            return None
+        try:
+            return _terminal_guard().check_command(command)
+        except Exception as exc:  # the policy file may exist: never let a broken guard wave a command through
+            logger.warning("tailnet terminal guard failed: %s", exc, exc_info=True)
+            policy = Path.home() / ".hermes" / "tailnet" / "workload-policy.json"
+            if not (policy.exists() or policy.is_symlink()):
+                return None
+            return "tailnet workload policy: terminal guard unavailable; use tailnet_exec/tailnet_copy instead"
+    if tool_name in {"tool_call", "mcp__tool_call"}:
+        for call in args.get("calls") or []:
+            if isinstance(call, dict):
+                msg = _terminal_refusal(str(call.get("name") or ""), call.get("arguments"))
+                if msg:
+                    return msg
+    return None
+
+
+def pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> Optional[dict]:
+    """Apply the machine-wide workload policy to ssh/scp/sftp/rsync run through the terminal tool: the same
+    protected machines the tailnet runner guards, reached by another path."""
+    msg = _terminal_refusal(tool_name, args)
+    if not msg:
+        return None
+    logger.info("tailnet workload policy blocked %s", tool_name)
+    return {"action": "block", "message": msg}
+
+
 def register(ctx) -> None:
+    # The workload policy is machine-wide: guard the terminal path even where the tailnet tools are off.
+    if hasattr(ctx, "register_hook"):
+        ctx.register_hook("pre_tool_call", pre_tool_call)
     if not enabled():
         return
     for name, (desc, props, required, fn) in SCHEMAS.items():

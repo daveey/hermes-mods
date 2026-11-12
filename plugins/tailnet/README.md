@@ -38,7 +38,18 @@ Additional tailnet restrictions:
 - `xcodebuild build`, `test`, `build-for-testing`, `test-without-building`, `archive`, and implicit/default builds, including through `xcrun`.
 - `xcrun simctl boot`, `create`, `install`, and `bootstatus`.
 - `swift build/test` and `cargo build/test` (including debug builds and Cargo `b`/`t`).
-- Unbounded transfer/archive commands: `rsync`, `scp`, `cp`, `ditto`, `tar`, `bsdtar`, `unzip`, `dd`, `curl`, `wget`, `rclone`, `sftp`, and `install`. These conservatively redirect to bounded `tailnet_copy`; even a purported small-file command or `rsync --max-size` is refused, since it does not bound aggregate work.
+- Unbounded transfer/archive commands: `rsync`, `scp`, recursive `cp` (`-r`, `-R`, `-a`, `--recursive`, `--archive`) or `cp` with glob/brace operands, `ditto`, `tar`, `bsdtar`, `unzip`, `dd`, `curl`, `wget`, `rclone`, `sftp`, and `install`. These conservatively redirect to bounded `tailnet_copy`; even a purported small-file command or `rsync --max-size` is refused, since it does not bound aggregate work. A non-recursive `cp` of named files (`cp ~/.ssh/authorized_keys ~/.ssh/authorized_keys.bak`) is bounded and allowed, so a backup before a small edit has a sanctioned route.
+
+## Terminal path (`ssh`/`scp`/`sftp`/`rsync`)
+
+The policy is per destination, not per tool: the plugin also registers a `pre_tool_call` hook (`terminal_guard.py`) for the `terminal` tool (and `terminal` calls batched through `tool_call`). It is registered even when `tailnet.enabled` is false, and does nothing without the policy file. For every `ssh`, `scp`, `sftp` or `rsync` in the command (compound commands, `bash -c` payloads, wrappers such as `env`/`timeout`/`nice`, command substitutions and heredocs included):
+
+- The destination is protected when its host part (after `user@`, or in an `ssh://` URL), or the `hostname` that `ssh -G <the command's own options> <dest>` prints (3 s timeout; so SSH-config aliases and `-o HostName=` count), is a protected alias or address, or resolves to a protected address. A name that does not resolve here is treated as unprotected.
+- `ssh` to a protected machine: the remote command goes through the same classifier as `tailnet_exec`. A heredoc body read by the remote login shell or by `bash -s`/`sh` is classified with it. An interactive session (no command), a remote shell reading a script from unknown stdin (`cat x | ssh host bash -s`, `ssh host < x`), an `-s` subsystem, or text that cannot be lexed is refused (fail closed). Forwarding-only (`-N`, `-W`), `-G` and `-V` are allowed.
+- `scp`/`sftp`/`rsync` with a protected end: refused; use bounded `tailnet_copy`.
+- Refusals read `tailnet workload policy: <reason>; <routing_message>`, the runner's wording. A malformed policy refuses any command that names one of these tools.
+
+`plugins/mac-heavy-guard` still skips `ssh` (it guards the local machine); this hook is the remote half.
 
 Ordinary read/cleanup commands remain available, including `hostname`, `df`, `du`, `rm`, `xcodebuild -version/-list/-show*`, `xcodebuild clean`, and `simctl list/delete/shutdown`. Targeted pytest files and `docker ps` remain available. Heavy actions in a compound command still cause refusal; `bash -lc`, `env`, and common wrappers are inspected. Malformed quoted shell payloads fail closed.
 
@@ -55,7 +66,9 @@ This is a workload-placement guard, not a shell sandbox or a resource quota. It 
 ## Tests
 
 ```sh
-uv run --with pytest --with pyyaml python -m pytest -q -p no:cacheprovider plugins/tailnet/tests_tailnet.py
+uv run --with pytest --with pyyaml python -m pytest -q -p no:cacheprovider plugins/tailnet/tests_tailnet.py plugins/tailnet/tests_terminal_guard.py
 ```
+
+`tests_terminal_guard.py` calls the hook in-process with a fake `ssh` that only answers `-G` and in-process fake DNS; it asserts the guard never starts a real ssh.
 
 `tests_tailnet.py` drives the real runner subprocess through a fake broker and fake SSH/SCP. DNS is replaced in child processes; no target network is contacted. Tests assert that syntax refusals create no key directory and invoke no SSH, cover both direct and plugin entry paths, policy failures, address aliases/resolution, classifier failure, wrappers/opt-outs, safe commands and unprotected CI, plus sparse-file upload cap boundaries. Download tests cover a small protected copy, failed/malformed/oversized metadata, unsafe paths, unbounded limits and growth after stat. The generated stat command also runs through a real local shell against regular files, directories, FIFOs, symlinks and missing paths.

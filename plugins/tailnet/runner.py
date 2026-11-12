@@ -114,6 +114,28 @@ def resolved_target(target):
     return addr, addresses
 
 
+CP_RECURSIVE_LONG = {"--recursive", "--archive"}
+GLOB = re.compile(r"[*?\[\]]|\{[^{}]*,[^{}]*\}")
+
+
+def bounded_cp(args):
+    """A non-recursive `cp` of named files (no -r/-R/-a/--recursive/--archive, no glob or brace operands) copies
+    a bounded set of files: a one-file backup before an edit must not need a detour."""
+    options = True
+    for a in args:
+        if options and a == "--":
+            options = False
+        elif options and a.startswith("--"):
+            if a.split("=", 1)[0] in CP_RECURSIVE_LONG:
+                return False
+        elif options and a.startswith("-") and a != "-":
+            if set(a[1:]) & set("rRa"):
+                return False
+        elif GLOB.search(a):
+            return False
+    return True
+
+
 def workload_reason(command):
     # Sibling classifier plugins/mac-heavy-guard/guard.py: naming its path here makes
     # scripts/ci-plugin-suites run this suite when that guard changes.
@@ -150,6 +172,8 @@ def workload_reason(command):
             if reason:
                 return reason
             name, args = os.path.basename(argv[0]), argv[1:]
+            if name == "cp" and bounded_cp(args):
+                continue
             if name in {"rsync", "scp", "cp", "ditto", "tar", "bsdtar", "unzip", "dd",
                         "curl", "wget", "rclone", "sftp", "install"}:
                 return "unbounded transfer/archive operation; use bounded tailnet_copy instead"
