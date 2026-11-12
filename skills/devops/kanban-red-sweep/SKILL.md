@@ -98,15 +98,24 @@ sign-in steps and protected-file Allows are never guessed. A rejected guard is n
   worktree, and comment cause, worktree path and a capped first command for the next run, then bump.
 - `no such task ... not imported here; last pickup skip: ...` on the hub means the card lives on the gateway that
   created it (a worker's run filed it pinned to the hub). `hermes kanban edit` here fails with "unknown id" and a
-  twin `kanban_create` is refused `create_overlap`; set its priority on the origin box instead (`cross_task` read
-  names the gateway; `aws ssm send-command` with `sudo -u ubuntu -i bash -lc "hermes kanban edit <id> --priority N"`,
-  instance role, us-west-2). It still imports only when a hub slot frees.
+  plain twin `kanban_create` is refused `create_overlap`. Reach the origin box (`cross_task` read names the
+  gateway; `aws ssm send-command` with `sudo -u ubuntu -i bash -lc "hermes kanban ..."`, instance role,
+  us-west-2). A priority raise there is not enough when the skip count keeps climbing (top priority still sat
+  unimported for an hour): replace the card. Create a hub-local twin (`placement='local'`,
+  `distinct_from=[<id>]`, `distinct_reason` = it cannot import and is archived this turn, body = run the
+  original's body with all its limits, first step = stop if the original started), then comment and
+  `hermes kanban archive <id>` on the origin box and read back `archived`, so one owner remains.
 - A `ready` card that already ran and has an open PR: before bumping it, read `hermes kanban show <id>`
   Diagnostics and the PR (`gh pr view <N> --json state,mergeStateStatus,statusCheckRollup`). A hold of
   `respawn_guarded: active_pr` keeps the card from restarting until its PR merges or closes, so no priority
   starts it; when the PR in turn waits for the card to land it, do the card's stated next step here (verify
   reviewed head = PR head and checks green, then submit it to that repo's landing path) and comment what you
   did and what is left. A red PR check: read the failed step's log and comment the exact failure on the card.
+- After each completion notice, read what the chain's other cards wait on (`task_events` kind
+  `scheduled`/`continued`/`dependency_wait`, payload `awaiting`/`reason`). A card on a timed park stays parked
+  until `wake_at` even when the thing it awaits is over: the sibling card it named is done, or its CI run
+  finished red (`gh run view <id> --json status,conclusion`). Comment the outcome (for red CI: failed jobs and
+  test names from `--log-failed`) and `hermes kanban unblock <id>`, or its dependents wait on a dead timer.
 - A worker can't archive cards outside its own task; when its handoff names an exact archive/unblock command for
   sibling cards that follows the user's recorded answer, run it here, read back the status, and re-queue the worker.
 - Link every card still waiting on the user to this chat, so its wake lands here:
@@ -172,6 +181,8 @@ there, which execs the skill script.
 ## Pitfalls
 
 - `gh` on the hub default profile is not logged in. Use `token-broker exec --scope user/github -- gh ...`.
+- `gh pr edit` can fail on a deprecated-Projects GraphQL error and change nothing. Use REST and read it back:
+  `gh api -X PATCH repos/<o>/<r>/pulls/<N> --input body.json`, `gh api -X POST repos/<o>/<r>/issues/<N>/labels -f 'labels[]=<l>'`.
 - Released links (`released=1`) look linked in a raw join. Filter `released=0`.
 - A session ended by `startup_orphan_reap` still shows as unarchived but will never act. Treat it as no owner.
 - The Desktop "For you" panel lists asks from every gateway. Cards that live on another gateway's board are read
