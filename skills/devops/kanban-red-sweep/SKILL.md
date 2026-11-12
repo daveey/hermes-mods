@@ -90,6 +90,12 @@ sign-in steps and protected-file Allows are never guessed. A rejected guard is n
   above `kanban.admission.cpu_busy_below_pct`; `ps --sort=-pcpu` names the job). A `ping_pong` move refusal means
   the card already left that machine: read its `moved` event reason (e.g. the worker lacks a hub-only tool) before
   forcing it back.
+- A `ready` card that already ran and has an open PR: before bumping it, read `hermes kanban show <id>`
+  Diagnostics and the PR (`gh pr view <N> --json state,mergeStateStatus,statusCheckRollup`). A hold of
+  `respawn_guarded: active_pr` keeps the card from restarting until its PR merges or closes, so no priority
+  starts it; when the PR in turn waits for the card to land it, do the card's stated next step here (verify
+  reviewed head = PR head and checks green, then submit it to that repo's landing path) and comment what you
+  did and what is left. A red PR check: read the failed step's log and comment the exact failure on the card.
 - A worker can't archive cards outside its own task; when its handoff names an exact archive/unblock command for
   sibling cards that follows the user's recorded answer, run it here, read back the status, and re-queue the worker.
 - Link every card still waiting on the user to this chat, so its wake lands here:
