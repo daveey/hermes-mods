@@ -795,6 +795,72 @@ def test_kanban_db_write_hint_lands_on_the_same_call_via_transform(tmp_path, mon
     assert "contract_waiver" in (c.take("s1") or "")
 
 
+# agent-24dac018a6: Mac subagents ran a review's tests and its CI waiter on hermes-hub over raw ssh (msg 864779:
+# `ssh ubuntu@<hub ip> ... wait_for_ci.py`) while the hub refused Kanban claims at ~85% CPU against its 50% gate.
+# Raw ssh skips that gate. A non-hub session that runs a test suite or CI wait over ssh on the hub gets a hint naming
+# the pool-worker card route; a hub-local reproduction (or the same command run on the hub itself) does not.
+_HUB_IP = "192.0.2.9"  # TEST-NET stand-in for the hub's tailnet address (resolved from the hub names at run time)
+_MSG_864779 = (f"ssh -o BatchMode=yes ubuntu@{_HUB_IP} 'cd ~/code/_wt/review-pr1136 && "
+               "python3 ~/.hermes/skills/devops/github-ci-wait/scripts/wait_for_ci.py 1732528e --timeout 3600'")
+
+
+@pytest.fixture
+def hub_resolver(monkeypatch):
+    monkeypatch.setattr(rules, "_self_host", lambda: "laptop-1")
+    monkeypatch.setattr(rules, "_resolve_host", lambda name: _HUB_IP if name == "hermes-hub" else None)
+    rules._HUB_ADDRS.clear()
+    yield
+    rules._HUB_ADDRS.clear()
+
+
+@pytest.mark.parametrize("cmd", [
+    _MSG_864779,
+    "ssh ubuntu@hermes-hub 'cd ~/code/_wt/pr1136 && scripts/run_tests.sh tests/hermes_cli -q'",
+    "ssh hermes-hub \"cd ~/code/hermes-mods && python3 -m pytest plugins/coach -q\"",
+    "ssh -i ~/.ssh/id_ed25519 ubuntu@hermes-hub 'cd app && npx vitest run'",
+    "hub-admin 'cd ~/.hermes/hermes-agent && pytest tests/hermes_cli/test_kanban_db.py'",
+    "ssh ubuntu@hermes-hub \"bash -lc 'cd ~/x && FOO=1 timeout 600 python3 -m unittest discover -s tests'\"",
+])
+def test_hub_ssh_heavy_fires_on_suites_and_ci_waits_over_ssh(tmp_path, hub_resolver, cmd):
+    c = coach(tmp_path)
+    term(c, cmd)
+    hint = c.take("s1") or ""
+    assert "pool-worker card" in hint and "runs_on" in hint, hint
+    assert "admission gate" in hint
+    term(c, cmd)
+    assert c.take("s1") is None  # once per session
+
+
+@pytest.mark.parametrize("cmd", [
+    "ssh ubuntu@hermes-hub 'cd ~/.hermes && python3 ~/code/_wt/repro_board_lock.py --db kanban.db'",
+    "ssh ubuntu@hermes-hub 'tail -50 ~/.hermes/logs/gateway.log'",
+    "ssh ubuntu@hermes-worker-1 'cd x && pytest -q'",
+    "pytest tests/test_a.py && ssh ubuntu@hermes-hub uptime",
+    "cd ~/code/x && scripts/run_tests.sh -q",
+    # real non-run shapes from a state.db replay: a reader naming the runner, a search pattern mentioning pytest
+    "hub-admin 'sed -n \"1,90p\" /home/ubuntu/.hermes/hermes-agent/scripts/run_tests.sh; rg -n \"activation\" x'",
+    "hub-admin 'rg -n \"def test|monkeypatch|pytest\" /home/ubuntu/.hermes/hermes-agent/tests | head'",
+    "hub-admin 'python3 -c \"import sqlite3; print(1)  # wait_for_ci.py audit\"'",
+])
+def test_hub_ssh_heavy_quiet_on_hub_runtime_and_local_work(tmp_path, hub_resolver, cmd):
+    c = coach(tmp_path)
+    term(c, cmd)
+    assert c.take("s1") is None
+
+
+def test_hub_ssh_heavy_quiet_in_a_session_on_the_hub(tmp_path, hub_resolver, monkeypatch):
+    monkeypatch.setattr(rules, "_self_host", lambda: "hermes-hub")
+    c = coach(tmp_path)
+    term(c, _MSG_864779)
+    assert c.take("s1") is None
+
+
+def test_hub_ssh_heavy_lands_on_the_same_call_via_transform(tmp_path, hub_resolver):
+    c = coach(tmp_path)
+    c.check_hub_ssh_heavy("s1", "terminal", {"command": _MSG_864779})
+    assert "pool-worker card" in (c.take("s1") or "")
+
+
 # desktop-13785ebc41: an inline rating page sent 333 ratings in one hermes.send (over the 500-char cap), ignored the
 # {ok:false} ack, and promised localStorage saving the sandboxed frame blocks; every rating was lost. Writing such a
 # widget gets the widget rules once per file, on the write_file/patch result itself.

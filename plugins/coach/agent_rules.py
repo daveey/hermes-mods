@@ -68,6 +68,11 @@ HINTS = {
                         "`hermes kanban` instead. A card whose PR contract can't pass because the repo has no "
                         "required checks completes with kanban_complete metadata.contract_waiver={{\"reason\": "
                         "\"...\"}}; a damaged board is repaired with `hermes kanban recover`."),
+    "hub_ssh_heavy": ("You just ran `{what}` on {host} over ssh. Raw ssh skips the hub's CPU admission gate that "
+                      "every Kanban claim obeys, so a busy hub gets busier. Suites, reviews and CI waits of a "
+                      "published branch go on a pool-worker card (kanban_create with runs_on=[\"pool:worker\"]) or "
+                      "`hermes-core-wt test` (it moves to a worker when the hub is over its gate). Keep the hub for "
+                      "hub-runtime work: its live board, services or state."),
     "plan_first": ("Plan Before You Build: this is a new build request and the user has not seen a plan yet. Stop "
                    "editing, post the plan (approach, files, how it gets tested) as your reply and end the turn for "
                    "the user's go. Someone else's approval (a reviewer, a cut PR) does not replace it."),
@@ -1203,6 +1208,140 @@ def writes_kanban_db(tool: str, args: dict) -> bool:
     else:
         return False
     return bool(KANBAN_DB_RE.search(text) and KANBAN_SQL_WRITE_RE.search(text))
+
+
+# ---- hub_ssh_heavy (agent-24dac018a6) --------------------------------------------------------------------------------
+# A non-hub session running a test suite or CI wait on the hub over raw ssh (or hub-admin): that skips the hub's CPU
+# admission gate. Hub names: hermes-hub, hub, plus COACH_HUB_HOSTS (space/comma separated); a bare IP counts when one
+# of those names resolves to it (resolved lazily, once per process, only for ssh targets that look like an IPv4).
+HUB_HEAVY_RE = re.compile(r"(?<![\w.-])(?:py\.?test|run_tests\.sh|wait_for_ci\.py|vitest|test-all|unittest|"
+                          r"npm\s+(?:run\s+)?test|hermes-core-wt\s+test)(?![\w-])")
+_SSH_ARG_OPTS = set("bcDEeFIiJLlmOoPpQRSWw")
+_SHELL_OPS = {"&&", "||", ";", "|", "&", ";;", "(", ")"}
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_HUB_ADDRS: set = set()
+
+
+def _self_host() -> str:
+    import socket
+    return socket.gethostname().split(".")[0].lower()
+
+
+def _resolve_host(name: str) -> Optional[str]:
+    import socket
+    try:
+        return socket.gethostbyname(name)
+    except OSError:
+        return None
+
+
+def _hub_names() -> set:
+    extra = re.split(r"[\s,]+", os.environ.get("COACH_HUB_HOSTS", ""))
+    return {"hermes-hub", "hub"} | {h.strip().lower() for h in extra if h.strip()}
+
+
+def _is_hub_host(host: str) -> bool:
+    h = host.rsplit("@", 1)[-1].lower()
+    names = _hub_names()
+    if h in names or h.split(".")[0] in names:
+        return True
+    if _IPV4_RE.match(h):
+        if not _HUB_ADDRS:
+            _HUB_ADDRS.update(a for a in (_resolve_host(n) for n in sorted(names)) if a)
+            _HUB_ADDRS.add("")  # resolved (possibly to nothing): don't retry every call
+        return h in _HUB_ADDRS
+    return False
+
+
+def _shell_words(text: str) -> list:
+    import shlex
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return list(lex)
+    except ValueError:
+        return text.split()
+
+
+def hub_ssh_heavy(tool: str, args: dict) -> Optional[tuple]:
+    """(host, matched command word) when a terminal command runs a suite or CI wait on the hub over ssh/hub-admin
+    from a session that is not on the hub; None otherwise. Only the remote command of that one ssh counts."""
+    if tool != "terminal":
+        return None
+    cmd = str(args.get("command") or "")
+    if not re.search(r"\b(?:ssh|hub-admin)\b", cmd) or not HUB_HEAVY_RE.search(cmd):
+        return None
+    if _self_host() in _hub_names():
+        return None
+    words = _shell_words(cmd)
+    for i, w in enumerate(words):
+        base = w.rsplit("/", 1)[-1]
+        if base == "hub-admin":
+            host, j = "hub-admin", i + 1
+        elif base == "ssh":
+            j = i + 1
+            while j < len(words) and words[j].startswith("-") and words[j] not in _SHELL_OPS:
+                opt = words[j]
+                j += 2 if len(opt) == 2 and opt[1] in _SSH_ARG_OPTS else 1
+            if j >= len(words) or words[j] in _SHELL_OPS:
+                continue
+            host, j = words[j], j + 1
+            if not _is_hub_host(host):
+                continue
+        else:
+            continue
+        remote = []
+        while j < len(words) and words[j] not in _SHELL_OPS:
+            remote.append(words[j]); j += 1
+        what = _heavy_run(" ".join(remote))  # ssh/hub-admin hand the joined words to the remote shell
+        if what:
+            return host, what
+    return None
+
+
+_HEAVY_EXEC = {"pytest", "py.test", "run_tests.sh", "test-all", "vitest", "wait_for_ci.py"}
+# A command whose program only reads or edits text: `sed -n 1,90p scripts/run_tests.sh`, `rg -n "pytest"`.
+_READERS = {"sed", "cat", "rg", "grep", "egrep", "head", "tail", "less", "wc", "git", "ls", "echo", "printf", "cmp",
+            "diff", "find", "stat", "file", "awk", "jq", "sqlite3", "tee", "touch", "rm", "cp", "mv", "chmod", "test",
+            "["}
+_SHELLS = {"bash", "sh", "zsh", "dash"}
+
+
+def _heavy_run(text: str, depth: int = 0) -> Optional[str]:
+    """The suite/CI-wait program `text` runs as a command (not as a mere argument of a reader), or None."""
+    words = _shell_words(text)
+    cmds, cur = [], []
+    for w in words:
+        if w in _SHELL_OPS:
+            cmds.append(cur); cur = []
+        else:
+            cur.append(w)
+    cmds.append(cur)
+    for cmd in cmds:
+        k = 0
+        while k < len(cmd) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", cmd[k]):
+            k += 1
+        if k >= len(cmd) or cmd[k].rsplit("/", 1)[-1] in _READERS:
+            continue
+        for i in range(k, len(cmd)):
+            b = cmd[i].rsplit("/", 1)[-1]
+            nxt = cmd[i + 1] if i + 1 < len(cmd) else ""
+            if b in _HEAVY_EXEC:
+                return b
+            if cmd[i] == "-m" and nxt in ("pytest", "unittest"):
+                return f"python -m {nxt}"
+            if b in ("npm", "pnpm", "yarn") and (nxt == "test" or (nxt == "run" and i + 2 < len(cmd)
+                                                                     and cmd[i + 2].startswith("test"))):
+                return f"{b} test"
+            if b == "npx" and nxt == "vitest":
+                return "npx vitest"
+            if b == "hermes-core-wt" and nxt == "test":
+                return "hermes-core-wt test"
+            if depth < 2 and b in _SHELLS and nxt in ("-c", "-lc", "-ic") and i + 2 < len(cmd):
+                inner = _heavy_run(cmd[i + 2], depth + 1)
+                if inner:
+                    return inner
+    return None
 
 
 def touches_live_checkout(tool: str, args: dict, checkout: Optional[Path]) -> Optional[str]:
@@ -3175,6 +3314,15 @@ class AgentCoach:
         if sid and writes_kanban_db(tool, args if isinstance(args, dict) else {}):
             self._fire(self._s(sid), sid, "kanban_db_write", "session")
 
+    def check_hub_ssh_heavy(self, sid: str, tool: str, args: Any) -> None:
+        """hub_ssh_heavy rule (once per session): a suite or CI wait run on the hub over raw ssh from another host.
+        Also run from transform_tool_result so the hint lands on this very call."""
+        if not sid:
+            return
+        hit = hub_ssh_heavy(tool, args if isinstance(args, dict) else {})
+        if hit:
+            self._fire(self._s(sid), sid, "hub_ssh_heavy", "session", host=hit[0], what=hit[1])
+
     def check_widget_send(self, sid: str, tool: str, args: Any) -> None:
         """widget_send rule (once per widget file): a chat widget that ignores hermes.send's ack or relies on browser
         storage. Also run from transform_tool_result so the hint lands on the write itself."""
@@ -3262,6 +3410,7 @@ class AgentCoach:
         # live_checkout (once per session)
         self.check_live(sid, tool, args)
         self.check_kanban_db_write(sid, tool, args)
+        self.check_hub_ssh_heavy(sid, tool, args)
         self.check_widget_send(sid, tool, args)
         self.check_empty_wait(sid, tool, args, result)
         # plan_first (once per session). A clarify the user answered showed them the plan: that counts as a reply.
