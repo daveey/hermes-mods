@@ -13,6 +13,7 @@ an injected ``create``: no card is ever created), parse what it emitted, and ass
 Titles never carry the fixture host. Fixtures hold no real host, person or path.
 """
 import importlib.util
+import inspect
 import json
 import re
 import sys
@@ -99,7 +100,10 @@ class Recorder:
         if "create" in argv:
             args = self.root.parse_args(list(argv[1:]))
             body = args.body if args.body is not None else (input or "")
-            fields = self.core.wp._cli_fields(args, body, "scratch", None, args.board)
+            cli_fields = self.core.wp._cli_fields
+            # Newer core judges the resolved assignee too (keyword-only); older core has no such parameter.
+            extra = {"assignee": args.assignee} if "assignee" in inspect.signature(cli_fields).parameters else {}
+            fields = cli_fields(args, body, "scratch", None, args.board, **extra)
             fields["title"] = args.title
             self.payloads.append({"kind": "cli", "fields": fields, "argv": list(argv)})
             return SimpleNamespace(returncode=0, stdout=json.dumps({"id": f"t_{len(self.payloads):08x}"}), stderr="")
@@ -408,8 +412,10 @@ def test_installed_core_missing_identity_module_fails_closed(monkeypatch):
     stub = types.ModuleType("hermes_cli")
     stub.__path__ = []  # a package, but without kanban_db_sync / kanban_sync_client
     monkeypatch.setitem(sys.modules, "hermes_cli", stub)
-    monkeypatch.delitem(sys.modules, "hermes_cli.kanban_db_sync", raising=False)
-    monkeypatch.delitem(sys.modules, "hermes_cli.kanban_sync_client", raising=False)
+    # None blocks the submodule imports outright. Deleting them is not enough when core is an editable install: its
+    # meta-path finder resolves `hermes_cli.<child>` from its own mapping and ignores the stub's empty __path__.
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_db_sync", None)
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_sync_client", None)
     with pytest.raises(pe.HomePinUnresolved):
         pe.home_machine()
 
