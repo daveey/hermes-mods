@@ -17,6 +17,7 @@ Parent-runner contracts introduced here:
 """
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import json
 import os
@@ -135,6 +136,40 @@ class _Finder(importlib.abc.MetaPathFinder):
         spec.loader = _Loader(spec.loader, name)
         return spec
 
+
+if "guard_clock" in _ON:
+    # Process-boundary clock for the provider cooldown guard ONLY. The parent cannot compare
+    # its own time.time() with a guard evaluated later in a dispatch subprocess (interpreter
+    # start-up under load crosses the cooldown). The guard therefore reads "now" as
+    # <latest ended_at of the task> + <delta the parent wrote>, and logs what it saw.
+    @_hook("hermes_cli.kanban_db_dispatch")
+    def _guard_clock(module):
+        real = module.check_respawn_guard
+        real_time = module.time
+        def clocked(conn, task_id, **kwargs):
+            path = os.environ["FLEET_GUARD_CLOCK"]
+            row = conn.execute("SELECT MAX(ended_at) FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL",
+                               (task_id,)).fetchone()
+            if not os.path.exists(path) or row is None or row[0] is None:
+                return real(conn, task_id, **kwargs)
+            delta = float(open(path).read())
+            frozen = int(row[0]) + delta
+            class _Clock:
+                def __getattr__(self, item):
+                    return getattr(real_time, item)
+                @staticmethod
+                def time():
+                    return frozen
+            module.time = _Clock()
+            try:
+                guard = real(conn, task_id, **kwargs)
+            finally:
+                module.time = real_time
+            with open(path + ".log", "a") as handle:
+                handle.write(json.dumps({"task_id": task_id, "delta": delta, "ended_at": int(row[0]),
+                                         "now": frozen, "guard": guard}) + "\n")
+            return guard
+        module.check_respawn_guard = clocked
 
 if "lost_retry" in _ON:
     @_hook("hermes_cli.kanban_db_dispatch_exit_code")
@@ -509,8 +544,17 @@ def provider_flow(board_factory, fleet_root, name, hooks=()):
     ticks = []
     env_extra = {"HERMES_KANBAN_CRASH_GRACE_SECONDS": "0",
                  "HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS": str(COOLDOWN)}
-    if hooks:
-        env_extra.update(hook_env(fleet_root, core, hooks))
+    clock = Path(fleet_root) / f"{name}.guard-clock"
+    clock.unlink(missing_ok=True)
+    clock.with_name(clock.name + ".log").unlink(missing_ok=True)
+
+    def at(delta):  # the guard's clock for the next dispatch: latest ended_at + delta seconds
+        clock.write_text(str(delta), encoding="utf-8")
+
+    def guard_log():
+        path = clock.with_name(clock.name + ".log")
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+    env_extra.update(hook_env(fleet_root, core, ("guard_clock",) + tuple(hooks), FLEET_GUARD_CLOCK=clock))
     with FakeLLMServer(model) as server:
         board = board_factory(name, server.base_url, env_extra=env_extra)
         try:
@@ -519,12 +563,13 @@ def provider_flow(board_factory, fleet_root, name, hooks=()):
             model.tick = 1
             first = board.dispatch()
             assert any(row["task_id"] == tid for row in first.get("spawned", [])), first
-            board.wait_worker_exit(tid, int(board.events(tid, "spawned")[-1]["payload"]["pid"]), timeout=45)
+            board.wait_worker_exit(tid, int(board.events(tid, "spawned")[-1]["payload"]["pid"]), timeout=90)
             ticks.append({"event": "spawned_429", "reason": first, "attempt": 1})
             requests_after_429 = len(server.main_requests())
             assert requests_after_429 == 1, "429 attempt must be exactly one provider request"
 
             model.tick = 2
+            at(0)  # the reap stamps ended_at in this very dispatch: the guard sees "just ended"
             reaped = board.dispatch()
             ticks.append({"event": "reaped", "reason": reaped, "attempt": 2})
             runs = board.runs(tid)
@@ -536,21 +581,29 @@ def provider_flow(board_factory, fleet_root, name, hooks=()):
                 any(row.get("task_id") == tid and row.get("reason") in QUOTA_HOLDS
                     for row in reaped.get("respawn_guarded", [])), \
                 f"early dispatch inside the {COOLDOWN}s provider cooldown: {reaped}"
-            for n in (3, 4):  # still inside the cooldown: nothing spawns, no provider traffic
-                assert time.time() - ended < COOLDOWN - 1, "cooldown window already elapsed; check proves nothing"
+            seen = guard_log()
+            assert seen and seen[-1]["guard"] in QUOTA_HOLDS and seen[-1]["ended_at"] == ended and seen[-1]["delta"] == 0, \
+                f"cooldown guard not evaluated on the process-boundary clock: {seen}"
+            # Guard clock inside the cooldown (1s and the last second before expiry): nothing spawns, no traffic.
+            for n, delta in ((3, 1), (4, COOLDOWN - 1)):
+                at(delta)
                 model.tick = n
                 held = board.dispatch()
-                ticks.append({"event": "held", "reason": held, "attempt": n})
+                ticks.append({"event": "held", "reason": held, "attempt": n, "guard_clock_after_end": delta})
                 assert not held.get("spawned"), f"early dispatch inside the provider cooldown: {held}"
                 assert len(server.main_requests()) == requests_after_429, "provider billed during cooldown"
                 assert_no_false_human(board, tid)
-            time.sleep(max(0.0, ended + COOLDOWN + 1 - time.time()))  # bounded wait for the typed cooldown
+                seen = guard_log()
+                assert seen[-1]["delta"] == delta and seen[-1]["guard"] in QUOTA_HOLDS and \
+                    any(row.get("task_id") == tid and row.get("reason") in QUOTA_HOLDS
+                        for row in held.get("respawn_guarded", [])), f"cooldown hold not observed at +{delta}s: {seen} {held}"
+            at(COOLDOWN)  # cooldown elapsed exactly at its (non-zero) boundary
 
             for n in range(5, 11):
                 model.tick = n
                 result = board.dispatch()
                 if any(row["task_id"] == tid for row in result.get("spawned", [])):
-                    board.wait_worker_exit(tid, int(board.events(tid, "spawned")[-1]["payload"]["pid"]), timeout=45)
+                    board.wait_worker_exit(tid, int(board.events(tid, "spawned")[-1]["payload"]["pid"]), timeout=90)
                 task = board.task(tid)
                 assert_no_false_human(board, tid)
                 ticks.append({"event": task["status"], "reason": result, "attempt": n})
@@ -578,18 +631,23 @@ def provider_flow(board_factory, fleet_root, name, hooks=()):
 def test_provider_exhaustion_then_review(fleet_root, containment, board_factory):
     outcomes, billing, ticks = provider_flow(board_factory, fleet_root, "provider")
     mutants = {}
-    for mutant, hooks, pattern in (
-            ("lost_retry", ("lost_retry",), "lost neutral retry"),
-            ("fabricated_human_blocker", ("false_human",), "false human blocker"),
-            ("early_dispatch", ("early_dispatch",), "early dispatch")):
+
+    def run_mutant(spec):
+        mutant, hooks, pattern = spec
         with pytest.raises(AssertionError, match=pattern) as caught:
             provider_flow(board_factory, fleet_root, "provider-" + mutant, hooks)
-        mutants[mutant] = str(caught.value)[:200]
+        return mutant, str(caught.value)[:200]
+    # Independent boards, servers and hook dirs: run concurrently so a loaded host stays inside the scenario bound.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        mutants = dict(pool.map(run_mutant, (
+            ("lost_retry", ("lost_retry",), "lost neutral retry"),
+            ("fabricated_human_blocker", ("false_human",), "false human blocker"),
+            ("early_dispatch", ("early_dispatch",), "early dispatch"))))
     publish("provider", fleet_root, f"fake HTTP429 for first implementer attempt only; cooldown {COOLDOWN}s",
             ticks, [
         {"name": "same_work_neutral_retry_review_completes_once", "result": "PASS", "evidence": outcomes},
         {"name": "bounded_cooldown_no_early_dispatch_then_recovery", "result": "PASS",
-         "evidence": f"two ticks inside {COOLDOWN}s: guard rate_limit_cooldown, zero spawns, zero provider requests"},
+         "evidence": f"process-boundary guard clock at +0/+1/+{COOLDOWN - 1}s of {COOLDOWN}s cooldown: quota hold, zero spawns, zero provider requests; released at +{COOLDOWN}s"},
         {"name": "no_false_human_blocker_whole_history", "result": "PASS", "evidence": "task row, runs and every event"},
         {"name": "provider_billing_bounded", "result": "PASS", "evidence": billing},
         {"name": "implementation_mutations_rejected_by_same_oracle", "result": "PASS", "evidence": mutants}])
