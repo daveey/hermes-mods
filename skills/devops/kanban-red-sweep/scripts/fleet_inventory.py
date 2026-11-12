@@ -98,15 +98,29 @@ def inventory(home, connect, run=subprocess.run):
             remote = json.loads(proc.stdout)
             if not all(isinstance(remote[k], list) for k in ('cards', 'sessions', 'errors')):
                 raise ValueError('invalid snapshot')
+            for r in remote['cards']:
+                if not isinstance(r, dict) or not all(isinstance(r.get(k), str) for k in
+                        ('id', 'board', 'owner', 'status', 'kind', 'title', 'source')):
+                    raise ValueError('invalid card')
+            for s in remote['sessions']:
+                if not isinstance(s, dict) or not isinstance(s.get('id'), str) or not isinstance(s.get('items'), list):
+                    raise ValueError('invalid session')
+                if not all(isinstance(i, dict) for i in s['items']):
+                    raise ValueError('invalid items')
+            if not all(isinstance(e, str) for e in remote['errors']):
+                raise ValueError('invalid errors')
+            # Validate the entire response before changing any fallback rows.
             # A successful gateway snapshot supersedes that owner's replica rows.
             if not remote['errors']:
                 result['cards'] = [r for r in result['cards'] if not
                                    (r['source'] == 'replica' and r['owner'] == gateway)]
             for r in remote['cards']:
-                result['cards'].append(dict(r, owner=gateway, source='remote'))
+                result['cards'].append(dict(r, owner=gateway if r['owner'] == 'local' else r['owner'],
+                                            source='remote', reader=gateway))
             for s in remote['sessions']:
                 result['sessions'].append(dict(s, gateway=gateway))
-            result['errors'] += [f'unreachable {gateway} {e}' for e in remote['errors']]
+            if remote['errors']:
+                result['errors'].append(f'unreachable {gateway} partial-snapshot')
         except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
             result['errors'].append(f'unreachable {gateway}')
     return result

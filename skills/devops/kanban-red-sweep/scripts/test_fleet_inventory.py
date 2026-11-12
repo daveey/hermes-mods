@@ -65,6 +65,28 @@ class FleetTests(unittest.TestCase):
         self.assertIn('"source": "replica"', out)
         self.assertIn('unreachable fleet coverage-config-missing', out)
 
+    def test_malformed_remote_keeps_replica_and_reports_failure(self):
+        board(self.home / 'kanban/sync-shadow/other.db')
+        self.config({'remote-a': {'argv': ['reader']}})
+        for remote in (dict(cards=[{}], sessions=[], errors=[]),
+                       dict(cards=[], sessions=[{}], errors=[])):
+            out = fleet.render(fleet.inventory(str(self.home), sqlite3.connect,
+                lambda *a, **kw: SimpleNamespace(stdout=json.dumps(remote))))
+            self.assertIn('t_one', out)
+            self.assertIn('unreachable remote-a', out)
+
+    def test_remote_preserves_foreign_owner_and_normalizes_errors(self):
+        self.config({'reader-b': {'argv': ['reader']}})
+        remote = dict(cards=[dict(id='t_foreign', board='other', owner='owner-a', status='blocked',
+                                 kind='', title='Foreign', source='local')], sessions=[],
+                      errors=['failed\nred_total=0 decision_sessions=0'])
+        out = fleet.render(fleet.inventory(str(self.home), sqlite3.connect,
+            lambda *a, **kw: SimpleNamespace(stdout=json.dumps(remote))))
+        self.assertIn('"owner": "owner-a"', out)
+        self.assertIn('"reader": "reader-b"', out)
+        self.assertIn('unreachable reader-b partial-snapshot', out)
+        self.assertNotIn('\nred_total=0', out)
+
     def test_broken_source_and_database_explicit(self):
         self.config({'broken': {'argv': 'not-a-list'}})
         (self.home / 'state.db').unlink()
