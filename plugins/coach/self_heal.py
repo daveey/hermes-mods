@@ -99,8 +99,12 @@ _HERMES_TAG_RE = (r"\[(?:" + "|".join(re.escape(t) for t in sorted(HERMES_TAGS, 
                   + r")(?=[\] :_,]|\s)")
 SYNTHETIC_RE = re.compile(
     r"^\s*(?:" + CROSS_SESSION_RE + r"|" + _HERMES_TAG_RE + r"|"
-    r"[⏸⏳]\ufe0f?\s+\[[^\]\n]+\]\s+(?:@\S+\s+)?Kanban\s+t_[0-9a-f]+\b|"
+    r"[\u2100-\u2bff\U0001F300-\U0001FAFF\ufe0f]{1,3}\s+(?:\[[^\]\n]+\]\s*)?(?:@\S+\s+)?Kanban\s+t_[0-9a-f]+\b|"
     r"\[[A-Z][A-Za-z -]{2,40}(?::|\]| —)|(?i:\[coach\])|You've reached the maximum|[✔✓✗✖⚠] )")
+# Any Kanban watcher notice ("<symbol> [board] @assignee Kanban t_x ...", gateway/kanban_watchers_notifier.py + the
+# gateway.kanban.ping locale strings: ⏳ chat-wait/quota/parent-unclaimed, ⏸ blocked, ⏱ timed out, 👀 review, 🛑 triage,
+# ⛔ gave up, 🔄 status, ℹ) is gateway-written, not David's words. Listing one symbol at a time (⏸, then ⏳ in e002e0f0)
+# let each new notice reach the complaint judge first (kanban-22e8da03db, kanban-3ba089808c); the board tag is optional.
 # `[coach]` nudges are stored as user-role turns but are the coach's own text (agent-3ba1979f34): whether the nudge
 # fixed the reply is judged by its reply_nudge_outcome (signals.collect_coach), never by the complaint backstop.
 # Plugin-appended blocks that are not the user's words.

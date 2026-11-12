@@ -79,6 +79,15 @@ def test_complaint_prefilter_skips(text):
     '⏳ [default] @default Kanban t_01a1cc08f1eab72f: t_01a1cc08f1eab72f (Kanban: a failed worker_result), which this '
     'chat waits on, has been ready 30 min with no worker (waiting for a pool worker (admission_limits))',
     '[chat-closeout] Every kanban card this chat handed work to has settled.\nblocked: needs approval',
+    # kanban-22e8da03db (same ⏳ notice), then every other watcher-notice symbol
+    "⏳ [default] @default Kanban t_01a1ca3c42501a9a: t_01a1ca3c42501a9a (GitHub user quota brake tripped), which "
+    "this chat waits on, has been ready 30 min with no worker (32 card(s) ahead of it, 6/7 worker slots busy).",
+    "⏱ [default] @default Kanban t_12345678 ran past 60 minutes and was stopped; it will be retried automatically.",
+    "⛔ [default] @default Kanban t_12345678 is now blocked: 3 failures. Fix the cause, then unblock it.",
+    "🛑 [default] @default Kanban t_12345678 routed to TRIAGE — needs attention",
+    "👀 [default] @default Kanban t_12345678 ready for review — Fix the bug",
+    "🔄 @default Kanban t_12345678 → running",
+    "ℹ [default] Kanban t_12345678: note",
 ])
 def test_synthetic_coordination_never_calls_complaint_judge(text):
     llm, calls = judge(1.0, kind="hermes_bug")
@@ -91,6 +100,9 @@ def test_synthetic_coordination_never_calls_complaint_judge(text):
     'Why is this blocked? [chat-closeout] Every kanban card has settled.',
     'The message from another Hermes session is wrong; fix the routing.',
     '[OUT-OF-BAND USER MESSAGE — a direct message]\nWhy is this blocked?\n[/OUT-OF-BAND USER MESSAGE]',
+    "Kanban t_12345678 has been ready 30 min with no worker, fix the dispatcher",
+    "why is Kanban t_12345678 still unclaimed?",
+    "?? Kanban t_12345678 is stuck again",
 ])
 def test_real_complaints_survive_coordination_filter(text):
     assert sh.prefilter(text)
