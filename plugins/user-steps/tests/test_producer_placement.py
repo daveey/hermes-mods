@@ -26,7 +26,10 @@ def load(name, path):
 
 
 sw = load('up_stale_watch_producer', ROOT / 'stale_watch.py')
-pe = sw.placement_evidence
+# Load independently so negative controls on pre-helper producers reach assertions.
+pe = load('up_placement_evidence_producer', ROOT.parent / 'coach' / 'placement_evidence.py')
+if hasattr(sw, 'placement_evidence'):
+    pe = sw.placement_evidence
 
 
 @pytest.fixture
