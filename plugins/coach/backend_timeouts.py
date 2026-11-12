@@ -403,12 +403,31 @@ def _card_status(runner: Callable, tid: str) -> Optional[str]:
         return None
 
 
+def _open_earlier_card(st: dict, host: str, daily_key: str, runner: Callable) -> Optional[tuple[str, dict]]:
+    """Newest earlier-day state entry for this host whose card is still open (readable, not done/archived)."""
+    prefix = f"backend-timeouts:{host}:"
+    for key in sorted((k for k in st if k.startswith(prefix) and k < daily_key), reverse=True):
+        tid = (st.get(key) or {}).get("task_id")
+        if not tid:
+            continue
+        status = _card_status(runner, tid)
+        if status is not None and status not in {"done", "archived"}:
+            return key, st[key]
+    return None
+
+
 def file_card(home: Path, host: str, now: datetime, rep: dict, probe: dict, threshold: int, window_min: int,
               runner: Callable) -> dict:
     """Reuse only an open destination; closed/unreadable cards start a numbered recurrence."""
     daily_key = card_key(host, now)
     st = load_state(home)
     ent = st.get(daily_key) or {}
+    if not ent:
+        # One card per incident, not per calendar day: a burst after midnight while an earlier
+        # day's card is still open is that incident recurring, so it comments there.
+        carried = _open_earlier_card(st, host, daily_key, runner)
+        if carried is not None:
+            daily_key, ent = carried
     sequence = int(ent.get("sequence") or 1)
     key = daily_key if sequence == 1 else f"{daily_key}:{sequence}"
     now_s = now.timestamp()
