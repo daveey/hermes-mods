@@ -179,11 +179,25 @@ def _post_tool_call(tool_name: str = "", args: Any = None, result: Any = None,
         root = _Path(guard.root())
         paths = module.written_paths(args if isinstance(args, dict) else {}, result, root)
         if not paths:
+            module.kick()
             return
-        outcome = module.publish(root, paths, session_id=session_id, task_id=task_id)
+        try:
+            outcome = module.publish(root, paths, session_id=session_id, task_id=task_id)
+        except module.Deferred as exc:
+            outcome = {'status': 'skipped', 'reason': str(exc)}
+            deferred = True
+        else:
+            deferred = module.deferrable(outcome)
+        if deferred:
+            # Only a still-running main CI (or a busy lock) defers; red/unknown stay final.
+            outcome = dict(outcome, deferred=module.defer(
+                root, paths, session_id=session_id, task_id=task_id)['record'])
+        else:
+            module.kick()
         logger.info("live-checkout-guard: skill publication %s", outcome)
     except Exception as exc:
-        # One record per call, including CI skips; never retry from the observer.
+        # One record per call. Red/unknown CI and errors are final here; a pending-CI
+        # skip is retried by skill_publish's detached worker, never by this observer.
         logger.warning("live-checkout-guard: skill publication preserved edits: %s", exc)
 
 

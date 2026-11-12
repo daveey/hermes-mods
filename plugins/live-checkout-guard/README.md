@@ -73,9 +73,17 @@ Maximum: 16 selected files, 1 MiB per file. A mixed unsafe/safe selected batch i
 Private skills outside the root are ignored; unrelated live dirt is neither staged nor published.
 
 Publication fetches origin/main, then queries `gh run list` for push runs at that exact tip.
-Every latest workflow run must be completed/successful. Red, pending, missing, malformed,
+Every latest workflow run must be completed/successful. Red, missing, malformed,
 unreadable, or truncated CI evidence skips publication with one log record; unknown fails closed.
-It does not wait for CI. A clean detached worktree starts at fetched origin/main and receives a
+The observer never waits for CI. A tip whose runs are only still queued/in progress (`pending`), or a
+busy publication lock, is **deferred** instead of dropped: a record goes to
+`$HERMES_HOME/cache/skill-publish-pending/<key>.json` (root, paths, session/card, 30 min window) and a
+detached `skill_publish.py --retry-pending` worker (one per home, flock) retries every 20 s. Each retry
+is a full `publish()` from a fresh snapshot: the tip's CI must be green, and every scope, race,
+gitleaks and reconcile rule below applies unchanged. Red CI or any publication error drops the
+record (edits stay in place, as for a direct skip); a still-pending or unknown tip keeps it until
+the window ends. Log: `$HERMES_HOME/logs/skill-publish-retry.log`. A later `skill_manage` call
+restarts the worker if records exist but none is running. A clean detached worktree starts at fetched origin/main and receives a
 `git apply --3way --index` patch constructed from captured bytes using a separate temporary index.
 Commits use the inherited repository author identity, explicitly select `.githooks`, and include
 skill/session/card in their subject. Cross-skill batches use separate scope-checked commits in
@@ -106,7 +114,9 @@ also disables this observer. Sync fallback is separate and not implemented here.
 Tests: `tests_skill_publish.py` uses real bare origins, real `.githooks`/gitleaks/fixture denylist,
 and only injects the external CI service. It covers publication/clean source/later fast-forward,
 inherited identity, selected multi-file and cross-skill batches, unrelated dirt, scope and alias
-rejections, red/unknown CI one-log skips, actual pre-push races and retry exhaustion, real hook
+rejections, red/unknown CI one-log skips, in-progress-then-green deferred publication through the
+real hook and detached worker (no second `skill_manage` call), pending-then-red drop and window
+expiry, actual pre-push races and retry exhaustion, real hook
 refusal, staged changes, and a concurrent writer. `_skill_publish_probe.py` exercises real-core
 resolution of compact batch rows (skipped when core is absent); it does not mutate core.
 Run: `python3 -m unittest discover -s plugins/live-checkout-guard -p tests_skill_publish.py -v`.
