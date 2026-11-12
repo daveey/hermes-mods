@@ -162,5 +162,31 @@ def _pre_tool_call(tool_name: str = "", args: Any = None, task_id: str = "", **_
     return {"action": "block", "message": guard.message(why)}
 
 
+def _post_tool_call(tool_name: str = "", args: Any = None, result: Any = None,
+                    task_id: str = "", session_id: str = "", status: str = "", **_: Any) -> None:
+    """Observe successful skill writes only; never change the tool's result."""
+    if tool_name.removeprefix("mcp__") != "skill_manage" or status not in {"", "ok", "success"}:
+        return
+    try:
+        if not guard.enabled():
+            return
+        path = _Path(__file__).with_name("skill_publish.py")
+        loader = _DecisionSourceLoader(__name__ + ".skill_publish", str(path))
+        spec = _import_util.spec_from_file_location(loader.name, path, loader=loader)
+        assert spec is not None and spec.loader is not None
+        module = _import_util.module_from_spec(spec)
+        loader.exec_module(module)
+        root = _Path(guard.root())
+        paths = module.written_paths(args if isinstance(args, dict) else {}, result, root)
+        if not paths:
+            return
+        outcome = module.publish(root, paths, session_id=session_id, task_id=task_id)
+        logger.info("live-checkout-guard: skill publication %s", outcome)
+    except Exception as exc:
+        # One record per call, including CI skips; never retry from the observer.
+        logger.warning("live-checkout-guard: skill publication preserved edits: %s", exc)
+
+
 def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _pre_tool_call)
+    ctx.register_hook("post_tool_call", _post_tool_call)

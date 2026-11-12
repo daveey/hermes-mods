@@ -45,10 +45,72 @@ Kill switch: `LIVE_CHECKOUT_GUARD=0`. Paths are compared after `realpath`, so sy
   even when built dynamically. Plain Python (`subprocess`, `open`, `os.*`) with non-literal arguments is not: this
   guard is not a sandbox for arbitrary code.
 - `tool_call` / `mcp__tool_call` batches are unwrapped and each call checked.
-- `skill_manage` is not touched (it is the sanctioned way to patch skills in place).
+- `skill_manage` remains allowed by the pre-call guard. Its successful documentation writes are
+  published by the post-call observer described below; failures never turn a successful tool result into an error.
 - Claude Code: `claude_hook.py` is a PreToolUse hook for `Bash` and `Write|Edit|MultiEdit|NotebookEdit`.
   Install: `python3 plugins/live-checkout-guard/claude_hook.py --install [--settings PATH]` (idempotent; default
   `~/.claude/settings.json`). Exit 2 blocks; bad input fails open.
+
+## Bounded skill documentation publication
+
+`post_tool_call(tool_name, args, result, task_id, session_id, status, **kwargs)` observes
+successful `skill_manage` / `mcp__skill_manage` calls. Flat create/edit results carry a directory
+`path`, supporting writes carry a file `path`, flat patches have no path, and successful atomic
+batches return compact `results` rows (`name`, `action`, `file_path`, `success`) without paths.
+For the latter cases the helper uses core's `_find_skill` and its configured lookup precedence,
+not its own basename search. Failed/rolled-back batches and approval-staged results are ignored.
+Only create/edit/patch/write_file are eligible; delete/remove_file are deliberately not published.
+Repeated paths in a batch are deduplicated and their final on-disk snapshot is published once.
+
+`skill_publish.py` permits `skills/.../SKILL.md` and non-executable supporting files below
+`references/`, `templates/`, or `assets/` with these explicit extensions:
+`.md .txt .rst .csv .json .yaml .yml .png .jpg .jpeg .gif .webp .pdf`.
+Scripts, plugins, other code extensions, dot components, traversal, symlinks within the live
+root, non-regular files, executable modes, and shebang content are refused. External aliases
+into the root are supported without hiding internal symlinks. This is a conservative file-scope
+policy, not a content-classification sandbox (code examples inside documentation are normal).
+Maximum: 16 selected files, 1 MiB per file. A mixed unsafe/safe selected batch is refused whole.
+Private skills outside the root are ignored; unrelated live dirt is neither staged nor published.
+
+Publication fetches origin/main, then queries `gh run list` for push runs at that exact tip.
+Every latest workflow run must be completed/successful. Red, pending, missing, malformed,
+unreadable, or truncated CI evidence skips publication with one log record; unknown fails closed.
+It does not wait for CI. A clean detached worktree starts at fetched origin/main and receives a
+`git apply --3way --index` patch constructed from captured bytes using a separate temporary index.
+Commits use the inherited repository author identity, explicitly select `.githooks`, and include
+skill/session/card in their subject. Cross-skill batches use separate scope-checked commits in
+the same detached worktree. Privacy/scope bypass environment flags are stripped for commits.
+A non-fast-forward push may fetch/rebase/retry at most **three** times (four pushes total),
+rechecking CI at every new tip. A refusal without a changed tip stops immediately. No force push.
+
+Archives persist under `$HERMES_HOME/kanban/evidence/mods-reconcile/` (default `~/.hermes`)
+as `skill-publish-*` with `manifest.json`,
+`changes.patch`, `untracked.tar.gz`, and `publish.patch`. After remote ancestry readback,
+the helper invokes the existing `reconcile.py` with the exact archive and selected paths.
+It restores only unchanged archived leftovers to live HEAD bytes, leaving live HEAD and index
+untouched for a **later** clean `merge --ff-only origin/main`; the observer never deploys itself.
+Detached worktrees are removed on success or failure; archives remain for recovery. Errors
+leave source edits untouched or recoverable in that archive. No stash/reset/commit in live.
+A later filesystem failure can leave a partially reconciled multi-file selection; its original
+bytes are still archived; completed reconciliations append an audit record.
+
+An exclusive per-checkout publisher lock prevents overlapping helpers; selected staged changes
+are refused. Captured file identities/bytes and live HEAD are checked again after publication;
+`reconcile.py` performs its own last-moment checks and cooperating-helper lock. Observed concurrent
+writers are never overwritten. As with reconciliation itself, arbitrary noncooperating writes
+cannot be portably excluded in the final check/replace window. This is not an OS lock on skills.
+Git subprocesses have 30-second limits, external CI has 20 seconds, reconciliation has 90 seconds;
+there is no observer retry loop beyond the bounded push race retries. The guard kill switch
+also disables this observer. Sync fallback is separate and not implemented here.
+
+Tests: `tests_skill_publish.py` uses real bare origins, real `.githooks`/gitleaks/fixture denylist,
+and only injects the external CI service. It covers publication/clean source/later fast-forward,
+inherited identity, selected multi-file and cross-skill batches, unrelated dirt, scope and alias
+rejections, red/unknown CI one-log skips, actual pre-push races and retry exhaustion, real hook
+refusal, staged changes, and a concurrent writer. `_skill_publish_probe.py` exercises real-core
+resolution of compact batch rows (skipped when core is absent); it does not mutate core.
+Run: `python3 -m unittest discover -s plugins/live-checkout-guard -p tests_skill_publish.py -v`.
+The real publication fixtures require gitleaks; without it they skip, never bypass privacy hooks.
 
 ## Throwaway HERMES_HOME in the terminal session
 
