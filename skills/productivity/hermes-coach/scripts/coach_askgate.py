@@ -166,7 +166,10 @@ def _tool_call_hit(prefix, db, lo_ts, hi_ts):
     try:
         deadline = time.monotonic() + 15  # backstop only: the rowid window keeps the scan small
         con.set_progress_handler(lambda: time.monotonic() > deadline, 100000)
-        first, last = con.execute("SELECT MIN(id), MAX(id) FROM messages").fetchone()
+        # Two statements, never "SELECT MIN(id), MAX(id)": SQLite's min/max shortcut takes one aggregate only, and
+        # the pair scans a whole index (93 MB, 13 s cold on the hub's 11 GB state.db, t_01a1cf40f3fd3701).
+        first = con.execute("SELECT MIN(id) FROM messages").fetchone()[0]
+        last = con.execute("SELECT MAX(id) FROM messages").fetchone()[0]
         if first is None:
             return False
         lo = _first_id_at(con, lo_ts, first, last)

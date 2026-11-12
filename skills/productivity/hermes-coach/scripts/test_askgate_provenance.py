@@ -401,6 +401,27 @@ class LegacyNoteToolCallProvenance(unittest.TestCase):
             con.close()
             self.assertIn("INTEGER PRIMARY KEY (rowid>? AND rowid<?)", plan)
 
+    # t_01a1cf40f3fd3701: "SELECT MIN(id), MAX(id)" skips SQLite's min/max shortcut and scans a whole index, 13 s
+    # cold on the hub (93 MB read) against the 15 s deadline. Every statement must be an index SEARCH, and their
+    # number must grow with log2(rows) only.
+    def test_every_statement_is_a_bounded_search(self):
+        import math, sqlite3, tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._home(directory, self.AGENT_BODY, filler=5000)
+            con = sqlite3.connect(home / "state.db")
+            con.execute("CREATE INDEX idx_messages_session ON messages(session_id, timestamp)")  # the hub's index
+            con.commit()
+            seen, patch = self._traced()
+            with self._env(home), patch:
+                self.assertEqual(g.clean(self.NOTE, t=self.T), "")
+            self.assertTrue(seen)
+            self.assertLessEqual(len(seen), 2 * (math.ceil(math.log2(5001)) + 2) + 3, seen)
+            for q in [q for q in seen if "messages" in q]:  # not _ro_connect's one-row sqlite_master probe
+                plan = [r[-1] for r in con.execute("EXPLAIN QUERY PLAN " + q)]
+                with self.subTest(q=q):
+                    self.assertTrue(plan and all(p.startswith("SEARCH") for p in plan), plan)
+            con.close()
+
     def test_matching_call_outside_the_window_keeps_the_line(self):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:
