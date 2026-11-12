@@ -82,8 +82,11 @@ say what's running, never what needs the user.
   skip: budget_exhausted"). Pickup imports only one foreign card per free slot, in effective-priority order, and
   waiters donate their priority. So first raise its local waiting child, and once the card is imported, set the
   card itself, because older cards boosted by their own waiters can still spawn ahead of it. When the hub is
-  full and the work is portable (code, tests, PR, CI), skip the bump and re-place it:
-  `hermes kanban move <id> --runs-on machine:worker-N --reason "..."`, plus a comment that a hub-only readback
+  full and the work is portable (code, tests, PR, CI), skip the bump and re-place it onto the whole pool:
+  `hermes kanban move <id> --runs-on <a label every worker carries and the hub/Macs don't, e.g.
+  capability:token-broker> --reason "..."` (`--pool` once the pool:worker queue ships). Never `machine:worker-N`,
+  which waits again when that worker fills or is held, unless the card holds unpushed state or its ship's review
+  card on that worker. Add a comment that a hub-only readback
   becomes a small hub-pinned card, never a move back. Verify a claimed run and
   attributable worker activity; `~0 ahead` is queue position, not execution. If a repeat notice arrives
   without execution, dispatch an independent reviewer directly or re-place the existing work rather than
