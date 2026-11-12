@@ -285,6 +285,17 @@ def test_core_cache_reset_resets_gate(gate):
     assert len(gate['projections']) == 2
 
 
+def test_core_cache_hit_is_not_stored(gate, monkeypatch):
+    # Core's links cache is keyed by origin scope: a pass core serves from that cache is never stored by the gate.
+    monkeypatch.setattr(gate['ksa'], '_LINKS_MAX_AGE_S', 3600.0)
+    _passes(gate, 1, step=5.0)
+    plugin._gate_reset()
+    _passes(gate, 1, step=5.0)
+    assert len(gate['projections']) == 1
+    with plugin._gate_lock:
+        assert plugin._gate.get('memo') is None
+
+
 def test_alias_tip_change_reprojects(gate, monkeypatch):
     # Unit test of _gate_hit's tip guard: the input-key shortcut (_gate_fast) is pinned off, because it learns of a
     # tip change only through state.db itself (tests/test_idle_tick_reuse.py), which this mock does not touch.

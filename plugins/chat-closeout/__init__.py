@@ -103,6 +103,13 @@ def _gate_reset() -> None:
         _gate.clear()
 
 
+def _core_links(ksa, scope):
+    """Core's published links entry for ``scope`` (None: none, e.g. after ``_reset_cache_for_tests``). Core keeps
+    one entry (older) or a dict of entries keyed by origin scope (711eeb253e)."""
+    cache = ksa._links_cache
+    return cache.get(scope) if isinstance(cache, dict) else cache
+
+
 def _gate_ready(ksa) -> bool:
     """Core has everything the gate keys on, and no outer ``one_annotation_snapshot`` pins a projection here."""
     return (all(hasattr(ksa, n) for n in _GATE_NEEDS)
@@ -296,7 +303,7 @@ def _gate_hit(ksa, ledger: Path, now: float):
     """``(cards, rows, core entry)`` when the stored projection is still exactly what core would project now."""
     with _gate_lock:
         memo = _gate.get("memo")
-    if memo is None or ksa._links_cache is None:  # core reset its caches: so does the gate
+    if memo is None or _core_links(ksa, memo["scope"]) is None:  # core reset its caches: so does the gate
         return None
     if now < memo["t0"]:
         return None
@@ -329,7 +336,7 @@ def _gate_project(ksa, ledger: Path, now: float):
     # Holding core's projection lock while reading the inputs: no projection is running, so any entry published
     # after this block was projected from inputs at least this new.
     with ksa._links_lock:
-        before = ksa._links_cache
+        before = _core_links(ksa, scope)
         with ksa._cache_lock:
             legacy_before = ksa._remote_last
         clock = _replica_clock(ksa, now)
@@ -359,7 +366,7 @@ def _gate_project(ksa, ledger: Path, now: float):
     cutoffs = _clock_cutoffs(ksa._hub_db_path(), ledger)
     if tips is None or cutoffs is None:
         return cards, rows
-    memo = {"t0": now, "cutoffs": cutoffs, "verdict": verdict, "last_ok": last_ok, "lo": lo,
+    memo = {"t0": now, "scope": scope, "cutoffs": cutoffs, "verdict": verdict, "last_ok": last_ok, "lo": lo,
             "structure": structure, "sessions": sessions, "tips": tips,
             "cards": list(cards), "rows": list(rows), "entry": entry}
     with _gate_lock:
@@ -437,7 +444,7 @@ def _gate_fast(ksa, ledger: Path, now: float):
     verdicts are judged at ``now`` from the recorded meta (unchanged with the hub stat). None: full gate."""
     with _gate_lock:
         memo, fast = _gate.get("memo"), _gate.get("fast")
-    if memo is None or fast is None or fast["memo"] is not memo or ksa._links_cache is None:
+    if memo is None or fast is None or fast["memo"] is not memo or _core_links(ksa, memo["scope"]) is None:
         return None
     if now < memo["t0"]:
         return None

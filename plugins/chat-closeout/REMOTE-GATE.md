@@ -30,7 +30,8 @@ only while it is provably what core would project now. It has no age-based reuse
   not current (project() may have swallowed a replica error).
 - Anything when an outer `one_annotation_snapshot` is active (core pins its own projection there), or when core
   lacks any attribute the gate keys on (older cores: plain core call).
-- Core `_reset_cache_for_tests` / a cleared `_links_cache` drops reuse.
+- Core `_reset_cache_for_tests` / no `_links_cache` entry for the memo's origin scope drops reuse (core keeps one
+  entry, or a dict keyed by origin scope).
 
 Wait ages (`describe_replica`) stay outside: `parked_waits` computes them from the gated rows at call time.
 
