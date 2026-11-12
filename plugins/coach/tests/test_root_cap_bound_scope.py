@@ -84,9 +84,10 @@ class TestControls:
         "Not only for an hour, keep it.", "Don't restore it.", "This is not time-boxed.", "Not for 10 minutes.",
         "This is not temporary, keep it for this rollout.", "Keep it in place for this rollout.",
         "There are 10 minutes of load history in the queue notice."])
-    def test_unbounded_own_words_stay_permanent(self, w, surface, phrase):
+    def test_only_affirmative_permanence_is_unbounded(self, w, surface, phrase):
         w.register()
-        assert not w.blocked(surface, SET8, texts=[f"{BASE} {phrase}"])
+        # v12 intentionally refuses unresolved own scope, including negated bounds.
+        assert w.blocked(surface, SET8, texts=[f"{BASE} {phrase}"]) is (phrase != "This is permanent.")
 
     @pytest.mark.parametrize("wrap", [
         'The assistant wrote: "This change is for only 10 minutes."',

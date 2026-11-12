@@ -65,6 +65,16 @@ hardcoded: the freeze exists only as a registered record.
   Temporary: the same decision must also name an existing open owner card whose run/profile (if named) match the
   card's current run and assignee (an unverifiable gateway is rejected, never stored as verified), restore the original
   value and give a restore trigger (owner completion and/or a future UTC expiry).
+  Scope is positive, not a list of forbidden temporary synonyms: only an affirmative closed-form permanent
+  sentence (for example `I authorize changing root kanban.max_in_progress from 7 to 8 permanently for this rollout.`)
+  or a bare single authorization is unbounded. Unknown own scope demands temporary provenance; an unknown relevant
+  later restriction invalidates cached terms, including within the same message. Negating one bound alone is not
+  affirmative permanence. Owner/restore assignments use closed affirmative forms (`Owner card t_example, run 1,
+  this session.` / `Restore root kanban.max_in_progress to 7 on owner completion.`); unknown or withdrawn fields
+  replace, never reuse, the earlier field. Compound withdrawals invalidate every mentioned field. A later genuine
+  `Make that permanent.` or a fresh complete assignment remains possible. These deterministic English forms are
+  intentionally conservative: unsupported wording may refuse this frozen-cap write and require a clearer decision;
+  this is not natural-language equivalence or a general configuration-edit ban.
 - **Storage**: every read-modify-write holds an exclusive `flock` on `<store>/.root_cap.lock` (threads and processes),
   writes a unique temp file, fsyncs, replaces atomically and reads back; completion is matched on tool + args + call id.
 - **Recovery**: `root_cap.due_restores()` lists temporary exceptions whose trigger fired. `restore` only when the
