@@ -402,6 +402,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         if profiler.blocked(tool_name, args):
             store.log({"event": "agent_block", "rule": "profiler_safety", "tool": tool_name})
             return {"action": "block", "message": profiler.MESSAGE}
+        msg = _future_clock(session_id, tool_name, args)
+        if msg:
+            return {"action": "block", "message": msg}
         if tool_name in ("kanban_block", "kanban_create", "tool_call"):
             try:
                 ce = _load("compute_envelope")
@@ -430,6 +433,36 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         except Exception:
             pass
         return {"action": "block", "message": rules.block_message(what, coach.checkout)}
+
+    # (session_id, evidence) whose future-dated card stamp was refused once (agent-748d257889)
+    clock_held: set = shared.setdefault("clock_held", set())
+
+    def _future_clock(session_id, tool_name, args):
+        """A Kanban card text (comment, summary, block reason, new card) stamping a past-tense Pacific time later than
+        the real clock: refuse it ONCE per session and stamp with the real local time; the same call again goes
+        through (logged), so it can never loop. Fail-open."""
+        try:
+            if tool_name != "tool_call" and not str(tool_name).startswith("kanban_"):
+                return None
+            rc = _load("reply_check")
+            if "future_clock" not in rc.settings()["rules"]:
+                return None
+            text = rc.durable_text(tool_name, args)
+            ev = rc.future_clock(text) if text else None
+            if not ev:
+                return None
+            key = (session_id or "", ev)
+            if key in clock_held:
+                store.log({"event": "future_clock_repeat", "rule": "future_clock", "session_id": session_id,
+                           "tool": tool_name, "evidence": ev[:200]})
+                return None
+            clock_held.add(key)
+            store.log({"event": "agent_block", "rule": "future_clock", "session_id": session_id, "tool": tool_name,
+                       "evidence": ev[:200]})
+            return rc.future_clock_nudge(ev)
+        except Exception as exc:
+            log.debug("coach future_clock: %s", exc)
+            return None
 
     # (session_id, card) whose human-facing block was held once (agent-19492bff76)
     block_held: set = shared.setdefault("block_held", set())

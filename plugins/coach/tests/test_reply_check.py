@@ -112,7 +112,7 @@ def test_settings_defaults(monkeypatch):
     monkeypatch.delenv("COACH_REPLY_THRESHOLDS", raising=False)
     cfg = rc.settings()
     assert cfg["rules"] == ["handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask",
-                            "credit_ask", "laptop_job", "skipped_live", "merge_forecast"] and cfg["threshold"] == 0.7
+                            "credit_ask", "laptop_job", "skipped_live", "merge_forecast", "future_clock"] and cfg["threshold"] == 0.7
     assert cfg["thresholds"] == {"report_only": 0.5, "report_only_screen": 0.85, "report_only_capped": 0.92}
 
 
@@ -250,8 +250,13 @@ KDB_REPLY = ("Separately, since about 4:28pm PT the hub's task board database ha
              "500 MB so far, with 95 GB free. Several other hub sessions are already on it. I haven't touched it.")
 
 
-def test_report_only_nudge_when_kanban_db_is_down_asks_for_owner_or_restart():
+def test_report_only_nudge_when_kanban_db_is_down_asks_for_owner_or_restart(monkeypatch):
     assert rc.kanban_db_down(KDB_LOG)
+    # the reply's "since about 4:28pm PT" is past at 17:00 PT; pin the clock so future_clock can't see it ahead
+    import datetime
+    from zoneinfo import ZoneInfo
+    monkeypatch.setattr(rc, "_wall_now", lambda: datetime.datetime(
+        2026, 11, 11, 17, 0, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp())
     llm, _ = _judge({"report_only": 0.9, "evidence": "reports corrupt kanban DB, I haven't touched it"})
     hit = rc.check(KDB_REPLY, "follow emmett's instructions", KDB_LOG, llm, threshold=0.7,
                    thresholds=rc.settings()["thresholds"])

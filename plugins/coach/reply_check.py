@@ -1354,6 +1354,157 @@ def merge_forecast(reply: str, tool_log: Optional[list] = None) -> Optional[str]
     return s.strip(" -*\t")
 
 
+# ---- future_clock: a past-tense Pacific time stamp that has not happened yet -------------------------------------------
+# (self-heal agent-748d257889: at 20:59 PST a red-sweep report said "(Checked 21:05–21:40 PT.)" and card comments said
+# "Red sweep ~21:15 PST". The model subtracted 7 h from UTC tool stamps after DST had ended (UTC-8) and never read the
+# clock; it recurred twice that evening.) Deterministic, before the judge, and on durable card text in pre_tool_call:
+# an HH:MM (or HH:MM–HH:MM) tagged PT/PST/PDT/Pacific, or untagged right after checked/ran/finished/as of/since (read
+# in the host's zone), more than FC_GRACE_S and at most FC_AHEAD_MAX_S later than now on today's clock. A time further
+# ahead is taken as an earlier day's ("since 4:28pm PT" said at 05:30); the incident's slips were 6-41 min, and a wrong
+# DST offset is 1 h.
+# Forecast words before it in the sentence (by/until/ETA/will/from/between/before...), another day or date in the
+# sentence, code spans, quotes and `>` lines are ignored. A PDT label while PST is in force (and the reverse) is a hit.
+PACIFIC = "America/Los_Angeles"
+FC_GRACE_S = 180
+FC_AHEAD_MAX_S = 3 * 3600
+_FC_PT = r"(?:PT|PST|PDT|Pacific(?:\s+time)?)"
+_FC_TIME_RE = re.compile(
+    r"(?<![\d:.])(?P<h1>[01]?\d|2[0-3]):(?P<m1>[0-5]\d)(?::[0-5]\d)?(?:\s*(?P<ap1>[ap]\.?m\.?))?"
+    r"(?:\s*(?:[-\u2013\u2014]|to)\s*(?P<h2>[01]?\d|2[0-3]):(?P<m2>[0-5]\d)(?::[0-5]\d)?(?:\s*(?P<ap2>[ap]\.?m\.?))?)?"
+    r"(?![\d:])(?:\s*\(?(?P<tz>" + _FC_PT + r"|UTC|GMT|Z|[ECM][SD]?T|CES?T|BST|IST|JST|AEST)\b)?", re.I)
+_FC_PAST_RE = re.compile(r"\b(?:checked|ran|run\s+at|finished|completed|done|as\s+of|since|swept|verified|"
+                         r"confirmed|read|looked)\b[\s~:@]*(?:at\s+|around\s+|~\s*)?$", re.I)
+_FC_FORECAST_RE = re.compile(
+    r"\b(?:by|until|till|til|before|ETA|expected|expect|due|will|won't|going\s+to|scheduled|schedule|planned|next|"
+    r"from|between|wakes?|resumes?|retr(?:y|ies)|re-?check(?:s|ing)?|tonight|later|opens?|starts?|lifts?|resets?|"
+    r"after\s+(?:which|that)|SCHEDULED_UNTIL)\b|[\u2019']ll\b", re.I)
+_FC_OTHER_DAY_RE = re.compile(
+    r"\b(?:tomorrow|yesterday|last\s+night|(?:mon|tues|wednes|thurs|fri|satur|sun)day|"
+    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b)|"
+    r"\b\d{4}-\d{2}-\d{2}\b|(?<![\d:])\d{1,2}[-/]\d{1,2}(?![\d:])", re.I)
+_FC_META_RE = re.compile(r"\bfuture_clock\b", re.I)
+FUTURE_CLOCK_NUDGE = (
+    "[coach] future_clock: your text stamps a time that is wrong for now (\"{evidence}\"): it is {now_local} "
+    "({offset}) in {zone} now, so a past-tense \"checked/ran\" time later than that has not happened yet{label}. Do not "
+    "convert UTC by hand (the offset changes with DST): print local times with `TZ={zone} date` or convert a tool's "
+    "UTC stamp with `TZ={zone} date -d @<epoch>` (macOS: `date -r <epoch>`), then restate the time, or drop it.")
+
+
+def _wall_now() -> float:
+    """The real clock. COACH_CLOCK_EPOCH pins it (the coach test conftest sets it, so replies quoting real incident
+    times in other rules' tests can't turn into future_clock hits at some hour of the day)."""
+    pinned = os.environ.get("COACH_CLOCK_EPOCH")
+    if pinned:
+        try:
+            return float(pinned)
+        except ValueError:
+            pass
+    return time.time()
+
+
+def _fc_zone(name: str = PACIFIC):
+    from zoneinfo import ZoneInfo
+    return ZoneInfo(name)
+
+
+def _fc_offset(dt) -> str:
+    off = dt.utcoffset()
+    mins = int(off.total_seconds() // 60) if off is not None else 0
+    sign = "\u2212" if mins < 0 else "+"
+    h, m = divmod(abs(mins), 60)
+    return f"UTC{sign}{h}" + (f":{m:02d}" if m else "")
+
+
+def _fc_minutes(h: str, m: str, ap: Optional[str]) -> int:
+    hh = int(h)
+    a = (ap or "").lower().replace(".", "")
+    if a == "pm" and hh < 12:
+        hh += 12
+    elif a == "am" and hh == 12:
+        hh = 0
+    return hh * 60 + int(m)
+
+
+def future_clock(text: str, now: Optional[float] = None, local_tz=None) -> Optional[str]:
+    """The time stamp (with a little context) when `text` states a past-tense Pacific time later than now (beyond
+    FC_GRACE_S), or a PDT/PST label that DST contradicts; else None. `local_tz` (default: this host's zone) reads
+    untagged times after checked/ran/as of/since. Fail-open: any error returns None."""
+    try:
+        import datetime as _dt
+        t = _wall_now() if now is None else float(now)
+        pac = _fc_zone()
+        now_pac = _dt.datetime.fromtimestamp(t, pac)
+        loc = local_tz or _dt.datetime.now().astimezone().tzinfo
+        now_loc = _dt.datetime.fromtimestamp(t, loc)
+        dst = bool(now_pac.dst())
+        body = _CODE_QUOTE.sub(" ", text or "")
+        body = _QUOTED_RE.sub(" ", body)
+        body = re.sub(r"'[^'\n]{6,}'", " ", body)  # a quoted old stamp ('Checked 21:40 PT.')
+        if _FC_META_RE.search(body):
+            return None
+        for sent in _SENTENCE_END.split(body):
+            if not sent or ":" not in sent or _FC_OTHER_DAY_RE.search(sent):
+                continue
+            for m in _FC_TIME_RE.finditer(sent):
+                tz = (m.group("tz") or "").upper()
+                before = sent[:m.start()]
+                if tz and not re.match(_FC_PT, tz, re.I):
+                    continue  # another zone (UTC, ET, ...)
+                if not tz and not _FC_PAST_RE.search(before[-40:]):
+                    continue  # an untagged time not stated as when something happened
+                ev = " ".join(sent[max(0, m.start() - 30):m.end() + 10].split())
+                if tz in ("PDT", "PST") and (tz == "PDT") != dst:
+                    return ev
+                if _FC_FORECAST_RE.search(before):
+                    continue
+                cur = now_pac if tz else now_loc
+                cur_min = cur.hour * 60 + cur.minute + cur.second / 60.0
+                ends = [_fc_minutes(m.group("h1"), m.group("m1"), m.group("ap1"))]
+                if m.group("h2"):
+                    ends.append(_fc_minutes(m.group("h2"), m.group("m2"), m.group("ap2") or m.group("ap1")))
+                for e in ends:
+                    ahead = (e - cur_min) * 60
+                    if FC_GRACE_S < ahead <= FC_AHEAD_MAX_S:
+                        return ev
+    except Exception:
+        return None
+    return None
+
+
+def future_clock_nudge(evidence: str, now: Optional[float] = None) -> str:
+    import datetime as _dt
+    t = _wall_now() if now is None else float(now)
+    cur = _dt.datetime.fromtimestamp(t, _fc_zone())
+    tz = cur.strftime("%Z")
+    wrong = "PDT" if tz == "PST" else "PST"
+    label = (f", and {tz}, not {wrong}, is in force today" if re.search(r"\b" + wrong + r"\b", evidence or "")
+             else "")
+    return FUTURE_CLOCK_NUDGE.format(evidence=(evidence or "")[:160], now_local=cur.strftime("%H:%M ") + tz,
+                                     offset=_fc_offset(cur), zone=PACIFIC, label=label)
+
+
+# Card tools whose text outlives the turn: comments, summaries, block reasons, new card bodies.
+_FC_DURABLE_FIELDS = {"kanban_comment": ("body",), "kanban_complete": ("summary", "result"),
+                      "kanban_block": ("reason", "human_request"), "kanban_create": ("title", "body"),
+                      "kanban_request_review": ("summary",), "kanban_continue": ("checkpoint",)}
+
+
+def durable_text(tool_name: str, args: Any) -> str:
+    """The human-readable text a Kanban card tool would store (direct, or through the deferred `tool_call`)."""
+    a = args if isinstance(args, dict) else {}
+    if tool_name == "tool_call":
+        return " \n".join(p for p in (durable_text(str((c or {}).get("name") or ""), (c or {}).get("arguments"))
+                                      for c in (a.get("calls") or []) if isinstance(c, dict)) if p)
+    out = []
+    for f in _FC_DURABLE_FIELDS.get(tool_name, ()):
+        v = a.get(f)
+        if isinstance(v, dict):
+            out.extend(str(x) for x in v.values() if isinstance(x, str))
+        elif v:
+            out.append(str(v))
+    return " \n".join(out)
+
+
 # ---- consent_relay: a macOS permission click paired with a second "unblock / reply done" step ------------------------
 # (self-heal agent-2469206a31: the password window's osascript hung on "Hermes Python wants access to control
 # Terminal"; the reply asked David to click OK AND to unblock a card / reply "done" so an agent re-ran the installer.
@@ -1448,9 +1599,9 @@ def command_copy_nudge(evidence: str, user_ask: str = "") -> str:
 
 
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
-         "laptop_job", "skipped_live", "merge_forecast")
+         "laptop_job", "skipped_live", "merge_forecast", "future_clock")
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
-                 "laptop_job", "skipped_live", "merge_forecast")
+                 "laptop_job", "skipped_live", "merge_forecast", "future_clock")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
 # report_only_capped: the screen alone when a second opinion was due but unavailable (daily cap hit, error); confirms
@@ -3067,6 +3218,12 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "merge_forecast", "p": 1.0, "evidence": phrase, "reason": "merge_forecast",
                     "verdict": {"merge_forecast": 1.0, "evidence": phrase},
                     "nudge": MERGE_FORECAST_NUDGE.format(evidence=phrase[:160])}
+    if not only or "future_clock" in only:
+        phrase = future_clock(reply, now=now)
+        if phrase:  # deterministic: a past-tense Pacific stamp later than the real clock (agent-748d257889)
+            return {"rule": "future_clock", "p": 1.0, "evidence": phrase, "reason": "future_clock",
+                    "verdict": {"future_clock": 1.0, "evidence": phrase},
+                    "nudge": future_clock_nudge(phrase, now=now)}
     if (not only or "report_only" in only) and not scoped:
         closed = card_closed(tool_log)
         tail = CARD_CLOSED_TAIL if closed else ""
@@ -3325,7 +3482,10 @@ def block_handoff(text: str, user_ask: str, tool_log: list[str], llm: Callable[[
 BACKTEST_RULES: dict = {"credit_ask": lambda r: credit_ask(r, []), "laptop_job": laptop_job,
                         "skipped_live": lambda r: skipped_live(r, []),
                         "merge_forecast": lambda r: merge_forecast(r, []),
+                        "future_clock": lambda r, at=None: future_clock(r, now=at),
                         "recommend_stall": lambda r: recommend_stall(r)}
+# Rules that compare the reply with the clock: the backtest passes each reply's own timestamp as `at`.
+BACKTEST_AT_RULES = ("future_clock",)
 
 
 def backtest(rule: str, days: float, db=None, drafts=None) -> list:
@@ -3337,13 +3497,14 @@ def backtest(rule: str, days: float, db=None, drafts=None) -> list:
     db = Path(db) if db else home / "state.db"
     drafts = Path(drafts) if drafts else home / "coach" / "drafts.jsonl"
     hits = []
+    timed = rule in BACKTEST_AT_RULES  # judged at the reply's own time, not now
     if db.exists():
         conn = _ro_connect(db)
         try:
-            for mid, sid, content in conn.execute(
-                    "select id, session_id, content from messages where role='assistant' and timestamp > ? "
+            for mid, sid, content, ts in conn.execute(
+                    "select id, session_id, content, timestamp from messages where role='assistant' and timestamp > ? "
                     "and content is not null and content != '' order by id", (since,)):
-                ev = fn(content)
+                ev = fn(content, at=float(ts or 0)) if timed else fn(content)
                 if ev:
                     hits.append((f"msg:{mid}", sid, ev))
         finally:
@@ -3356,7 +3517,8 @@ def backtest(rule: str, days: float, db=None, drafts=None) -> list:
                 continue
             if not isinstance(d, dict) or float(d.get("ts") or 0) < since:
                 continue
-            ev = fn(str(d.get("draft") or ""))
+            text = str(d.get("draft") or "")
+            ev = fn(text, at=float(d.get("ts") or 0)) if timed else fn(text)
             if ev:
                 hits.append((f"draft:{d.get('draft_id')}", str(d.get("session_id") or ""), ev))
     return hits
