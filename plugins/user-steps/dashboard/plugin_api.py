@@ -6,7 +6,9 @@ integration seam for authenticated connection principals, not an HTTP parameter.
 Legacy reads remain passive; generic resolve is intentionally gone (410).
 """
 import contextvars
+import functools
 import importlib.util
+import inspect
 import os
 import sqlite3
 import sys
@@ -71,6 +73,16 @@ class WithdrawBody(BaseModel):
     session: StrictStr
     expectedRevision: StrictInt
     reason: Optional[StrictStr] = None
+
+
+@functools.lru_cache(maxsize=8)
+def _accepts_stale_ok(reader) -> bool:
+    """Whether the installed core's ``remote_links_and_origin_rows`` takes ``stale_ok`` (decided once per
+    function, never by retrying a TypeError per request). Older cores only have the strict call."""
+    try:
+        return 'stale_ok' in inspect.signature(reader).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def _with_terminal_history(tasks, history, ids):
@@ -375,7 +387,12 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
                 if history_reader is None:
                     return tasks
                 try:
-                    _, history = history_reader()
+                    # This route is stale-only (session_tasks above): the history read must not wait on the
+                    # global projection lock either. Cores before stale_ok keep their strict call.
+                    if _accepts_stale_ok(history_reader):
+                        _, history = history_reader(stale_ok=True)
+                    else:
+                        _, history = history_reader()
                 except Exception:
                     logging.getLogger('user-steps').warning('Session card history unavailable', exc_info=True)
                     return tasks

@@ -95,3 +95,52 @@ def test_history_failure_preserves_live_feed(tmp_path, monkeypatch):
     monkeypatch.setattr(pkg, 'kanban_session_activity', fake, raising=False)
     monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_session_activity', fake)
     assert client(tmp_path, None).get('/session-cards', params={'ids': 's1'}).json()['tasks'] == live
+
+
+def _fake_core(monkeypatch, history_reader):
+    import sys
+    import types
+    fake = types.ModuleType('hermes_cli.kanban_session_activity')
+    fake.LISTED_STATUSES = ('running',)
+    fake.session_tasks = lambda *a, **kw: []
+    fake.remote_links_and_origin_rows = history_reader
+    pkg = sys.modules.get('hermes_cli') or types.ModuleType('hermes_cli')
+    monkeypatch.setitem(sys.modules, 'hermes_cli', pkg)
+    monkeypatch.setattr(pkg, 'kanban_session_activity', fake, raising=False)
+    monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_session_activity', fake)
+
+
+def test_history_read_is_stale_ok_on_cores_that_accept_it(tmp_path, monkeypatch):
+    # The route is stale-only: a strict history read waits on core's global projection lock (bfe75689
+    # regression, 7 s session-cards on the hub). Cores with the kwarg must get stale_ok=True every request.
+    calls = []
+    _fake_core(monkeypatch, lambda stale_ok=False: calls.append(stale_ok) or ([], []))
+    c = client(tmp_path, None)
+    for _ in range(2):
+        assert c.get('/session-cards', params={'ids': 's1'}).status_code == 200
+    assert calls == [True, True]
+
+
+def test_history_read_stays_strict_on_older_cores(tmp_path, monkeypatch):
+    calls = []
+    _fake_core(monkeypatch, lambda: calls.append('strict') or ([], []))
+    c = client(tmp_path, None)
+    for _ in range(2):
+        assert c.get('/session-cards', params={'ids': 's1'}).status_code == 200
+    assert calls == ['strict', 'strict']
+
+
+def test_stale_history_failure_is_not_retried_strict(tmp_path, monkeypatch):
+    # A cold-miss failure under stale_ok keeps the live feed; it never falls back to a second, strict read.
+    calls = []
+    live = [{'id': 't_live', 'status': 'running'}]
+
+    def reader(stale_ok=False):
+        calls.append(stale_ok)
+        raise OSError('projection failed')
+
+    _fake_core(monkeypatch, reader)
+    import sys
+    sys.modules['hermes_cli.kanban_session_activity'].session_tasks = lambda *a, **kw: live
+    assert client(tmp_path, None).get('/session-cards', params={'ids': 's1'}).json()['tasks'] == live
+    assert calls == [True]
