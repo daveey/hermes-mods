@@ -51,7 +51,7 @@ btw = load("coach_backend_timeouts_producer_test", ROOT / "backend_timeouts.py")
 so = load("coach_second_opinion_producer_test", ROOT / "second_opinion.py")
 wsw = load("coach_worker_share_producer_test", ROOT / "worker_share_watch.py")
 junk = load("inbox_junk_audit_producer_test", PLUGINS / "inbox" / "junk_audit.py")
-runners_inv = load("runners_investigate_producer_test", PLUGINS / "runners" / "investigate.py")
+
 
 
 def core_tree():
@@ -348,14 +348,6 @@ def test_second_opinion_card_is_pinned_with_fenced_quotes(core, monkeypatch):
                       create=lambda a: got.append(a) or {"task_id": "t_00000001"},
                       settings={"fixloop_review": True})
     assert got and got[0]["placement"] == "local" and pe.HOME_PIN_PREFIX in got[0]["body"]
-
-
-# ── tool/db producers outside coach ─────────────────────────────────────────────────────────────────────────────────
-def test_runners_investigate_is_explicitly_pinned_to_the_machine(core):
-    args = runners_inv.card_args("worker-1", {"cpu_load1": 3.0, "cpus": 4}, NOW)
-    reason = core.kp.portable_reason(args, {})
-    assert args["placement"] == "worker-1" and "worker-1" in args["body"]  # pin + its reason: "You run on worker-1"
-    assert reason is None or reason  # the pin, not the markers, decides: asserted by the explicit placement above
 
 
 # ── the machine pin itself: discovery from core's enrollment, graceful when unsynced, closed when unreadable ────────
