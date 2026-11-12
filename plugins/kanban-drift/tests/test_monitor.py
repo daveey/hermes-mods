@@ -113,6 +113,11 @@ def test_native_tools_create_readback_and_restart_dedup(tmp_path, monkeypatch):
     (tmp_path / "config.yaml").write_text("platform_toolsets:\n  cli: [terminal, file, kanban]\nterminal:\n  backend: local\n")
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    # Gateway identity too: on the hub, placement='local' is a hub slot that needs a live admission
+    # judge, so the host's own hermes-mail/hub identity must not leak into this create path.
+    (tmp_path / "mail.json").write_text(json.dumps({"gateway": "fixture-gw"}))
+    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(tmp_path / "mail.json"))
+    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub"))
     path = kb.kanban_db_path()
     assert path.is_relative_to(tmp_path)
     from agent.delegation_context import kanban_path_is_fenced
