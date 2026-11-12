@@ -1827,6 +1827,8 @@ def file_card(title: str, body: str, key: str) -> str:
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
 
+    machine = owner_wake.placement_evidence.home_machine()  # discovery failure must not file unpinned
+    runs_on = [f"machine:{machine}"] if machine else None
     assignee = "default"
     try:
         from hermes_cli.config import load_config_readonly
@@ -1845,6 +1847,8 @@ def file_card(title: str, body: str, key: str) -> str:
             "<text>`, which the chat receives when your card completes. "
             "This is agent work: do not block on the user to resume a chat. Complete this card once the "
             "chat has reported its cards' results; the watchdog also closes it when its condition clears.")
+    text += "\n\n" + owner_wake.placement_evidence.home_pin_note(
+        "the stuck chat's delivery and watchdog state must be repaired and checked on this gateway")
     ref = _origin_ref(key)
     with connect_closing() as conn:
         # Core create_task deduplicates even DONE rows. Preserve their incident key
@@ -1856,7 +1860,7 @@ def file_card(title: str, body: str, key: str) -> str:
         existed = conn.execute("SELECT id FROM tasks WHERE idempotency_key=? AND status != 'archived'",
                                (key,)).fetchone()
         tid = kb.create_task(conn, title=f"chat-closeout: {title}"[:200], body=text, assignee=assignee,
-                             created_by="chat-closeout", idempotency_key=key, chat_origin=ref)
+                             created_by="chat-closeout", idempotency_key=key, chat_origin=ref, runs_on=runs_on)
         if existed and ref:
             _link_existing(conn, tid, ref)  # a reused pre-fix card gets the link it was filed without
         return tid

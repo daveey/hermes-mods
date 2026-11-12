@@ -6,8 +6,9 @@ an injected ``create``: no card is ever created), parse what it emitted, and ass
 
 * portable: ``portable_reason`` is None even though the fixture incident evidence is full of host words (a state path,
   ``kanban.db``, ssh, cron, "the hub") -- the evidence is inside the fence, the instructions outside it; or
-* explicitly pinned: a non-None reason plus the producer's pin (``--requires host_repo`` / ``placement`` / ``requires``)
-  and the one-sentence reason in the instructions (outside the fence).
+* explicitly pinned: the producer's real machine pin (CLI ``--runs-on machine:<configured Board gateway>`` / tool
+  ``placement="local"``), no ``host_repo`` capability standing in for it, and the one-sentence reason in the
+  instructions (outside the fence).
 
 Titles never carry the fixture host. Fixtures hold no real host, person or path.
 """
@@ -24,6 +25,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 PLUGINS = ROOT.parent
 HOST = "host-a"
+GW = "gw-board-a"  # the configured Board gateway the board_identity fixture reports (not the observed HOST)
 # Words that pin a card when they are in the work text; here they are incident evidence a producer pasted.
 HOSTILE = "~/.hermes/kanban.db was locked; ssh to the hub and the cron job failed"
 
@@ -70,8 +72,15 @@ def core_tree():
 
 
 @pytest.fixture
-def core():
-    return core_tree()
+def core(board_identity, monkeypatch):
+    result = core_tree()
+    import time
+    from hermes_cli import kanban_capability_registry, kanban_worker_node
+    monkeypatch.setattr(kanban_capability_registry, "self_gateway", lambda: GW)
+    monkeypatch.setattr(kanban_worker_node, "registry", lambda: {"machines": {
+        "worker-fixture": {"state": "active", "pickup": True, "last_seen": time.time() * 1000,
+                           "labels": ["capability:core-ship"]}}})
+    return result
 
 
 # ── the write boundary: a recorder that parses what a producer emitted ──────────────────────────────────────────────
@@ -107,28 +116,26 @@ def outside(core, body):
 def pin_of(payload):
     f = payload["fields"]
     if payload["kind"] == "cli":
-        return "host_repo" in (f.get("requires") or [])
+        return f.get("runs_on") == f"machine:{GW}"
     return f.get("placement") not in (None, "", "auto")  # tool path: core honours the pin before portable_reason
 
 
-def judge(core, payload, *, expect, attestation_ok=False):
+def judge(core, payload, *, expect):
     """expect 'portable': portable_reason is None; 'pinned': a reason AND the explicit pin AND the reason sentence."""
     f = payload["fields"]
-    reason = core.kp.portable_reason(f, {})
+    reason = core.kp.portable_reason(f, {"worker_pools": {GW: ["worker-fixture"]}})
     body = f.get("body") or ""
     inst = outside(core, body)
     # Titles never name where something was observed.
     assert HOST not in f["title"], f["title"]
     assert not re.search(r"\bon (the )?(host|hub)\b", f["title"], re.I), f["title"]
     if expect == "portable":
-        # A card that names a worker-attested tool (hermes-core-wt) is portable only to workers that advertise it:
-        # core answers REASON until the Board registry carries that label (operator attestation, not a producer bug).
-        allowed = (None, core.coord.REASON) if attestation_ok else (None,)
-        assert reason in allowed, (f["title"], reason)
+        assert reason is None, (f["title"], reason)
         assert pe.HOME_PIN_PREFIX not in body
     else:
-        if payload["kind"] == "cli":  # a CLI pin works by making the card non-portable
-            assert reason, f"{f['title']!r} is pinned but core still calls it portable"
+        if payload["kind"] == "cli":  # the pin is the machine label itself; host_repo is only a capability
+            assert f.get("runs_on") == f"machine:{GW}", (f["title"], f.get("runs_on"))
+            assert "host_repo" not in (f.get("requires") or []), f["title"]
         assert pin_of(payload), f"{f['title']!r} is home-bound without an explicit pin ({reason})"
         assert pe.HOME_PIN_PREFIX in inst, f"{f['title']!r}: no reason sentence outside the fence"
         sentence = next(s for s in inst.splitlines() if pe.HOME_PIN_PREFIX in s)
@@ -261,7 +268,7 @@ PROPOSAL = f"{HOSTILE}\n\n**Plan**\nChange plugins/coach/self_heal.py and add a 
 
 
 @pytest.fixture
-def store(tmp_path, monkeypatch):
+def store(tmp_path, monkeypatch, board_identity):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("COACH_SELFHEAL_NO_EXEC", "1")  # a stray real create raises instead of running
     monkeypatch.setattr(sh, "coach_root", lambda: tmp_path / "coach")
@@ -294,7 +301,7 @@ def test_selfheal_fix_verify_backport_deploy_lane_cards(core, store):
     r = sh.file_fix(FP, store=store, runner=rec, now=NOW, budget_fn=OPEN)
     assert r["action"] == "filed" and len(rec.payloads) == 2
     fix, verify = rec.payloads
-    judge(core, fix, expect="portable", attestation_ok=True)
+    judge(core, fix, expect="portable")
     judge(core, verify, expect="pinned")
     # backport / undeployed briefs and the non-split fix brief, as their filers write them
     dec = {"checkout": "~/some/checkout", "head": "abc", "sha": "d" * 40, "label": "host-label", "last_sync": NOW,
@@ -302,9 +309,11 @@ def test_selfheal_fix_verify_backport_deploy_lane_cards(core, store):
     for title, body in (("backport", sh.backport_brief(d, FP, st, dec)),
                         ("undeployed", sh.undeployed_brief(d, FP, st, dec)),
                         ("bb fix", sh.fix_brief(FP, st))):
-        payload = {"kind": "cli", "fields": {"title": title, "body": body, "assignee": "default",
-                                             "requires": list(sh.SELFHEAL_REQUIRES)}}
-        judge(core, payload, expect="pinned")
+        rec2 = Recorder(core)
+        rec2(sh.kanban_argv({"title": title, "body": body, "assignee": "default", "idempotency_key": "k",
+                             "max_runtime": 1, "created_by": "c", "requires": list(sh.SELFHEAL_REQUIRES),
+                             "home_pin": True}))
+        judge(core, rec2.payloads[0], expect="pinned")
 
 
 def test_selfheal_lane_cards_pin_home(core, store):
@@ -347,3 +356,188 @@ def test_runners_investigate_is_explicitly_pinned_to_the_machine(core):
     reason = core.kp.portable_reason(args, {})
     assert args["placement"] == "worker-1" and "worker-1" in args["body"]  # pin + its reason: "You run on worker-1"
     assert reason is None or reason  # the pin, not the markers, decides: asserted by the explicit placement above
+
+
+# ── the machine pin itself: discovery from core's enrollment, graceful when unsynced, closed when unreadable ────────
+def run_card(core, board_identity, **identity):
+    board_identity.set(**identity)
+    rec = Recorder(core)
+    a = {"profile": "default", "platform": "slack", "home_channel": "C1", "home_channel_name": "n", "home_source": "cfg",
+         "gateway_restart_notification": None, "config": "~/.hermes/config.yaml"}
+    out = rnw.file_cards([a], HOST, rec)
+    return rec, out
+
+
+def test_home_pin_is_the_configured_board_gateway_not_host_repo(core, board_identity):
+    rec, out = run_card(core, board_identity)
+    f = rec.payloads[0]["fields"]
+    assert f["runs_on"] == f"machine:{GW}"
+    assert f["requires"] == ["terminal", "file", "git"] and "host_repo" not in f["requires"]  # real capabilities only
+    assert pe.home_machine() == GW and pe.home_runs_on_argv() == ["--runs-on", f"machine:{GW}"]
+    assert pe.HOME_REQUIRES == ("terminal", "file", "git") and "host_repo" not in pe.HOME_PIN_PREFIX
+
+
+def test_home_pin_follows_a_renamed_gateway(core, board_identity):
+    rec, _ = run_card(core, board_identity, gateway="gw-board-b")
+    assert rec.payloads[0]["fields"]["runs_on"] == "machine:gw-board-b"
+
+
+def test_unsynced_board_files_without_a_machine_pin_but_keeps_capabilities_and_reason(core, board_identity):
+    rec, out = run_card(core, board_identity, synced=False)
+    f = rec.payloads[0]["fields"]
+    assert f.get("runs_on") is None and f["requires"] == ["terminal", "file", "git"]
+    assert pe.HOME_PIN_PREFIX in outside(core, f["body"])  # the reason sentence is still on the card
+    assert out[0]["rc"] == 0 and pe.home_machine() is None
+
+
+@pytest.mark.parametrize("identity", [{"error": "no hub key"}, {"gateway": ""}])
+def test_synced_identity_failure_never_files_a_portable_card(core, board_identity, identity):
+    rec, out = run_card(core, board_identity, **identity)
+    assert rec.payloads == [] and rec.calls == []  # nothing was filed
+    assert out[0]["rc"] is None and any(k in out[0]["out"] for k in ("Board identity", "gateway name"))
+    with pytest.raises(pe.HomePinUnresolved):
+        pe.home_runs_on_argv()
+
+
+def test_unimportable_core_fails_closed(core, board_identity, monkeypatch):
+    monkeypatch.setattr(pe, "_core_identity", lambda: (_ for _ in ()).throw(ImportError("no core")))
+    with pytest.raises(pe.HomePinUnresolved):
+        pe.home_machine()
+
+
+@pytest.mark.parametrize("which", ["backend", "withheld", "probe", "leftover", "stranded"])
+def test_every_producer_call_site_pins_or_refuses(core, board_identity, tmp_path, which):
+    """Each call site: pinned to the Board gateway when resolvable; files nothing when a synced board is unreadable."""
+    def fire(rec, tmp_path):
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        h = {"session": "sess1", "profile": "default", "source": "tui", "ts": 1794218000.0, "title": "t", "first": HOSTILE,
+             "host": HOST, "evidence": HOSTILE, "evidence_lines": [HOSTILE]}
+        if which == "backend":
+            rep = {"count": 12, "first": "t0", "last": "t1", "by_path": {"/api/x": 12}, "awake_count": 12}
+            return btw.file_card(tmp_path, HOST, datetime(2026, 11, 11), rep, {"loadavg": [1, 2, 3], "backend_ps": [HOSTILE]},
+                                 5, 30, rec)
+        if which == "withheld":
+            return wnw.file_card(tmp_path, HOST, datetime(2026, 11, 11),
+                                 [{"ts": 1794218000.0, "session": "s1", "id": 7, "text": HOSTILE}], rec)
+        if which == "probe":
+            return ptw.file_card(tmp_path, h, rec)
+        if which == "leftover":
+            return ptw.file_leftovers(tmp_path, [h], rec)
+        g = {"pid": 11, "starttime": 22, "cmdline": "python serve", "db": "~/.hermes/kanban.db", "sidecars": []}
+        return ssw.file_cards([g], HOST, rec)
+
+    rec = Recorder(core)
+    fire(rec, tmp_path / "ok")
+    assert [p["fields"]["runs_on"] for p in rec.payloads] == [f"machine:{GW}"]
+    board_identity.set(error="no hub key")
+    rec = Recorder(core)
+    out = fire(rec, tmp_path / "bad")
+    assert rec.payloads == [] and "create" not in [a for c in rec.calls for a in c]
+    assert "failed" in json.dumps(out) or "Board identity" in json.dumps(out)
+
+
+@pytest.mark.parametrize("symptom", [HOSTILE, "host-a: cron-deadbeef ~/.hermes/kanban.db",
+                                      "<!-- placement:<!-- placement:evidence -->evidence --> ssh the hub"])
+def test_hostile_symptoms_never_enter_emitted_titles(core, store, symptom, monkeypatch):
+    monkeypatch.setenv("COACH_FIXLOOP_REVIEW", "1")
+    # Real investigation, FIX and VERIFY CLI payloads, not hand-assembled approximations.
+    rec = Recorder(core)
+    args = sh.card_args({"fingerprint": FP, "component": "kanban", "symptom": symptom,
+                         "source": "detector", "at": NOW}, "hostile-investigation")
+    rec(sh.kanban_argv(args))
+    judge(core, rec.payloads[0], expect="pinned")
+    sh.LaneState(store.root).update(FP, symptom=symptom)
+    out = sh.file_fix(FP, store=store, runner=rec, now=NOW, budget_fn=OPEN)
+    assert out["action"] == "filed"
+    assert len(rec.payloads) == 3
+    for payload, expect in zip(rec.payloads[1:], ["portable", "pinned"]):
+        judge(core, payload, expect=expect)
+    got = []
+    state = {"fails": [1, 2], "fail_recs": [{"turn": 1, "ts": NOW, "issue": symptom}]}
+    so.fixloop_review(state, "sess1", 2, {"n": 2, "issue": symptom}, symptom,
+                      create=lambda args: got.append(args) or {"task_id": "t_review"},
+                      settings={"fixloop_review": True})
+    assert len(got) == 1
+    judge(core, {"kind": "tool", "fields": got[0]}, expect="pinned")
+    assert pe.strip_markers(symptom) in got[0]["body"]
+    for title in [p["fields"]["title"] for p in rec.payloads] + [got[0]["title"]]:
+        assert core.kp.portable_reason({"title": title, "body": ""}, {}) is None
+        assert re.fullmatch(r"[A-Za-z -]+(?:\(read-only\))?: incident [0-9a-f]{12}", title)
+
+
+@pytest.mark.parametrize("which", ["watchdog", "owner"])
+@pytest.mark.parametrize("identity, expected", [({}, GW), ({"gateway": "gw-board-b"}, "gw-board-b"),
+                                                ({"synced": False}, None), ({"error": "no hub key"}, "refused")])
+def test_chat_closeout_real_producers_pin_or_refuse(core, board_identity, monkeypatch, which, identity, expected):
+    from contextlib import contextmanager, nullcontext
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+    closeout = load("closeout_placement_producer_test", PLUGINS / "chat-closeout" / "__init__.py")
+    board_identity.set(**identity)
+    captured, opened = [], []
+
+    class Conn:
+        def execute(self, *args):
+            return SimpleNamespace(fetchone=lambda: None)
+
+    @contextmanager
+    def connect(**kwargs):
+        opened.append(True)
+        yield Conn()
+
+    monkeypatch.setattr(kbc, "connect_closing", connect)
+    monkeypatch.setattr(kb, "write_txn", lambda conn: nullcontext())
+    monkeypatch.setattr(kb, "create_task", lambda conn, **args: captured.append(args) or "t_recorded")
+    monkeypatch.setattr(closeout, "_origin_ref", lambda key: None)
+
+    def fire():
+        if which == "watchdog":
+            return closeout.file_card("results stuck", HOSTILE, "chat-closeout:unseen:sess1:sig")
+        return closeout.owner_wake.supervise_on_board(
+            [{"key": "default/t_123", "title": HOSTILE, "wait": {"premise": "p"}}], "sess1", "archived")
+
+    assert closeout.owner_wake.placement_evidence.home_machine.__code__.co_filename == str(ROOT / "placement_evidence.py")
+    if expected == "refused":
+        with pytest.raises(Exception, match="Board identity"):
+            fire()
+        assert captured == [] and opened == []
+        return
+    assert fire() == "t_recorded" and len(captured) == 1
+    args = captured[0]
+    assert args["runs_on"] == ([f"machine:{expected}"] if expected else None)
+    assert "host_repo" not in (args.get("requires") or [])
+    assert pe.HOME_PIN_PREFIX in core.kp.without_evidence(args["body"])
+    assert HOSTILE in args["body"]
+    core.kp.portable_reason(args, {})  # complete emitted payload; the explicit machine pin owns placement
+
+
+def test_worker_share_real_filer_uses_selected_worker_pin(core):
+    rec = Recorder(core)
+    s = {"reasons": {"home gateway marker": 3}, "room": {"worker-1": 2}, "waiting": 3,
+         "hub_runs": 7, "hub_cap": 7, "at": 1794218000000, "hub_pressure": ["cap"]}
+    assert wsw.file_card(s, 3, [{"id": "t_1", "assignee": "default", "title": HOSTILE, "reason": "r"}],
+                         runner=rec, day="2026-11-11")
+    assert len(rec.payloads) == 1
+    fields = rec.payloads[0]["fields"]
+    assert fields["runs_on"] == "machine:worker-1"
+    assert HOSTILE in fields["body"] and HOSTILE not in outside(core, fields["body"])
+    core.kp.portable_reason(fields, {})
+
+
+def test_kanban_drift_actual_create_is_explicitly_local(core, tmp_path):
+    monitor = load("drift_placement_producer_test", PLUGINS / "kanban-drift" / "monitor.py")
+    got = []
+
+    def tool(name, args):
+        if name == "kanban_create":
+            got.append(args)
+            return {"task_id": "t_drift"}
+        return {"task": {"id": "t_drift", "status": "ready"}}
+
+    instance = monitor.Monitor(tmp_path / "drift.json", tool)
+    report = {"clean": False, "details": HOSTILE}
+    instance.sample("target-a", report)
+    instance.sample("target-a", report)
+    assert len(got) == 1
+    assert got[0]["placement"] == "local" and got[0]["completion_contract"] == "local-only"
+    assert HOSTILE in got[0]["body"]
+    core.kp.portable_reason(got[0], {})

@@ -39,13 +39,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 try:
-    from .placement_evidence import HOME_REQUIRES_ARGV, fence_evidence, home_pin_note
+    from .placement_evidence import home_pin_argv, HomePinUnresolved, fence_evidence, home_pin_note
 except ImportError:  # run as a script, or loaded by path: take the sibling file
     import importlib.util as _ilu
     _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
     _pe = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_pe)
-    HOME_REQUIRES_ARGV, fence_evidence, home_pin_note = _pe.HOME_REQUIRES_ARGV, _pe.fence_evidence, _pe.home_pin_note
+    home_pin_argv, HomePinUnresolved, fence_evidence, home_pin_note = _pe.home_pin_argv, _pe.HomePinUnresolved, _pe.fence_evidence, _pe.home_pin_note
 
 NEEDLE = "Timed out connecting to Hermes backend"
 STAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.]\d{3} (?:([+-]\d{2}:\d{2}) )?")
@@ -423,9 +423,13 @@ def file_card(home: Path, host: str, now: datetime, rep: dict, probe: dict, thre
                         f"\nEarlier card `{tid}` has unreadable status; treating it as closed.\n")
             sequence += 1
             key = f"{daily_key}:{sequence}"
+        try:
+            pin = home_pin_argv()
+        except HomePinUnresolved as exc:  # a synced board with no readable identity: never file it portable
+            return {"key": key, "action": "create_failed", "rc": None, "out": str(exc)[-300:]}
         r = _run(runner, ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", key,
                           "--created-by", "backend-timeouts-watch", "--body-file", "-", "--json",
-                          *HOME_REQUIRES_ARGV, card_title(host, rep, window_min)],
+                          *pin, card_title(host, rep, window_min)],
                  card_body(host, rep, probe, threshold, window_min) + previous)
         if r.returncode != 0:
             return {"key": key, "action": "create_failed", "rc": r.returncode,

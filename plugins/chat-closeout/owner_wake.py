@@ -30,6 +30,7 @@ module's own SQLite file, so two backends never both wake for one premise.
 from __future__ import annotations
 
 import json
+import importlib.util
 import logging
 import re
 import sqlite3
@@ -37,6 +38,13 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
+
+# Use coach's single placement authority; do not infer Board identity from a hostname or duplicate discovery.
+_pe_spec = importlib.util.spec_from_file_location(
+    "_closeout_placement_evidence", Path(__file__).resolve().parents[1] / "coach" / "placement_evidence.py")
+assert _pe_spec and _pe_spec.loader
+placement_evidence = importlib.util.module_from_spec(_pe_spec)
+_pe_spec.loader.exec_module(placement_evidence)
 
 
 def _ro_connect(path, timeout: float = 2.0) -> sqlite3.Connection:
@@ -576,6 +584,8 @@ def supervise_on_board(cards: list[dict[str, Any]], session_id: str, why: str) -
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
 
+    machine = placement_evidence.home_machine()  # resolve before opening/writing the board; fail closed
+    runs_on = [f"machine:{machine}"] if machine else None
     assignee = "default"
     try:
         from hermes_cli.config import load_config_readonly
@@ -588,5 +598,7 @@ def supervise_on_board(cards: list[dict[str, Any]], session_id: str, why: str) -
     with connect_closing() as conn:
         return kb.create_task(
             conn, title=f"Owner wake: supervise {first}{more} (owning chat {why})"[:200],
-            body=supervisor_body(cards, session_id, why), assignee=assignee, created_by="owner-wake",
+            body=supervisor_body(cards, session_id, why) + "\n\n" + placement_evidence.home_pin_note(
+                "the orphaned chat's supervision needs this gateway's live ownership state and capabilities"),
+            runs_on=runs_on, assignee=assignee, created_by="owner-wake",
             idempotency_key=f"owner-wake:{session_id}:{hashlib.sha1(basis.encode()).hexdigest()[:16]}")

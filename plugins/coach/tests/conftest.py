@@ -306,3 +306,26 @@ def _no_system_one_network(monkeypatch, tmp_path):
     monkeypatch.setenv("COACH_FORK_REPO", str(tmp_path / "no-fork-repo"))
     # Same for hermes-mods (session_commit_fix and selfheal_late_adopt also read ~/code/hermes-mods).
     monkeypatch.setenv("COACH_MODS_REPO", str(tmp_path / "no-mods-repo"))
+
+
+BOARD_GATEWAY = "gw-board-a"
+
+
+@pytest.fixture
+def board_identity(monkeypatch):
+    """Core's own enrollment answers for the home machine pin: a synced board whose configured gateway is
+    ``BOARD_GATEWAY``. Replaced (not read from the real host config), so no test depends on where it runs.
+    ``board_identity.set(synced=..., gateway=..., error=...)`` re-points it; the default is synced + named."""
+    from types import SimpleNamespace
+    pytest.importorskip("hermes_cli.kanban_db_sync")
+    from hermes_cli import kanban_db_sync, kanban_sync_client
+    state = {"synced": True, "gateway": BOARD_GATEWAY, "error": None}
+
+    def load_identity(*_a, **_k):
+        if state["error"]:
+            raise kanban_sync_client.SyncUnavailable(state["error"])
+        return SimpleNamespace(url="https://example.com", key="k", gateway=state["gateway"])
+
+    monkeypatch.setattr(kanban_db_sync, "sync_enabled", lambda: state["synced"])
+    monkeypatch.setattr(kanban_sync_client, "load_identity", load_identity)
+    return SimpleNamespace(gateway=BOARD_GATEWAY, set=lambda **kw: state.update(kw), state=state)

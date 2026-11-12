@@ -24,13 +24,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 try:
-    from .placement_evidence import HOME_REQUIRES_ARGV, fence_evidence, home_pin_note
+    from .placement_evidence import home_pin_argv, HomePinUnresolved, fence_evidence, home_pin_note
 except ImportError:  # run as a script, or loaded by path: take the sibling file
     import importlib.util as _ilu
     _spec = _ilu.spec_from_file_location("_coach_placement_evidence", Path(__file__).with_name("placement_evidence.py"))
     _pe = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_pe)
-    HOME_REQUIRES_ARGV, fence_evidence, home_pin_note = _pe.HOME_REQUIRES_ARGV, _pe.fence_evidence, _pe.home_pin_note
+    home_pin_argv, HomePinUnresolved, fence_evidence, home_pin_note = _pe.home_pin_argv, _pe.HomePinUnresolved, _pe.fence_evidence, _pe.home_pin_note
 
 SIDECARS = ("kanban.db-wal", "kanban.db-shm", "state.db-wal", "state.db-shm")
 DELETED = " (deleted)"
@@ -147,7 +147,7 @@ lock loss. Entire absent profile homes are excluded as retired-reader cleanup; r
 
 def create_argv(host: str, f: dict) -> list:
     return ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", card_key(host, f),
-            "--created-by", "stranded-sqlite-watch", "--body-file", "-", "--json", *HOME_REQUIRES_ARGV,
+            "--created-by", "stranded-sqlite-watch", "--body-file", "-", "--json", *home_pin_argv(),
             f"Process {f['pid']} stranded on deleted {Path(f['db']).name} WAL/SHM"]
 
 
@@ -156,7 +156,12 @@ def file_cards(findings: list, host: str, runner: Optional[Callable] = None) -> 
     run = runner or subprocess.run
     out = []
     for f in findings:
-        r = run(create_argv(host, f), input=card_body(host, f), capture_output=True, text=True, timeout=120)
+        try:
+            argv = create_argv(host, f)
+        except HomePinUnresolved as exc:  # a synced board with no readable identity: never file it portable
+            out.append({"key": card_key(host, f), "rc": None, "out": str(exc)[-300:]})
+            continue
+        r = run(argv, input=card_body(host, f), capture_output=True, text=True, timeout=120)
         out.append({"key": card_key(host, f), "rc": r.returncode, "out": ((r.stdout or "") + (r.stderr or ""))[-300:]})
     return out
 
