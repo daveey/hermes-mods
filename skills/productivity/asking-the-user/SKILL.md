@@ -169,7 +169,11 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
 - A post without `ask` is refused (`ask_missing`), and the error shows the shape. Repost with `ask`, or use a Kanban
   card if an agent can do the work.
 - A Kanban worker whose card has a `human_request` gets `ask` filled in from it automatically.
-- Don't post status or finished work.
+- Don't post status or finished work. Exception: a recurring summary the user explicitly asked for. Give it its
+  own resolve-typed card type and a dedicated poster in `~/.hermes/inbox/posters.yaml` (JSON:
+  `{"<poster>": {"owner": "cron", "allowed_types": ["<that type>"]}}`), or it is refused `poster_unregistered`.
+  Keep status/defect words out of its title ("sent to", "failed", "stuck"): agent-owned titles are matched
+  against them and refused `content_status`. Dry-run with `ask_contract.reason(...)` from `~/.hermes/plugins/inbox`.
 - The noise breaker: the inbox refuses a poster whose last 3 cards the user archived untouched, and files a card to
   fix that poster.
 
