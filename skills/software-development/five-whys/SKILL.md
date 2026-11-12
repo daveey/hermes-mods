@@ -249,6 +249,10 @@ When fixtures depend on event chronology or expiry, read `references/clock-fixtu
 
 - For bounded readers that repeatedly return empty partial results, distinguish per-query exhaustion from shared quota exhaustion before raising any cap. Test eventual service across polls, including new arrivals and completed/disappearing cursor anchors: a fixed newest-first window can starve older active work forever. Preserve incomplete-coverage semantics and verify useful rows from the actual post-deploy collector, not just direct API probes; a concurrent maintenance stop makes that live check inconclusive.
 
+- For enrollment shell fixtures, explicitly model the remote login HOME/PATH in the fake sudo/transport instead of running the host's login profile. Refuse network Git operations in fixtures before testing policy: otherwise a failed fake-origin lookup can turn a local unit test into a real clone. A simulated HOME leak is not proof of the exact CI cause; retain that evidence boundary until CI confirms the repaired path.
+
+- Before exercising fork/timeout cleanup, validate exact integer PID ownership at the signal boundary and mock destructive signal/exit calls locally in unit tests. A bare fork mock can coerce to PID 1 and turn killpg into a broad user-process signal; a systemd scope alone does not contain that syscall. Use module-local process-control aliases rather than patching shared os functions, refuse external SIGCHLD reapers, and preserve unreaped-child identity through signalling. Test invalid/coercible IDs and lost-child ownership without real signals; real timeout integration must restrict signals to its own child.
+
 - Writing the chain after the fix is chosen, so the chain is built to justify it. Do the chain first; let it pick
   the fix.
 - Answers that restate the question ("it failed because it errored"). Each why must add new information.
