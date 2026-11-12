@@ -3191,9 +3191,49 @@ def literal_options(step: dict) -> list[str]:
         # A single-proposition ask ("Decide whether to X", "Should I X?") with no literal alternatives is a
         # yes/no question: Yes and No answer it without paraphrasing anything. Live repro (hermes-hub 2026-11-10,
         # "grow the hub disk further to 800 GB"): paraphrased model options left only the free-text button.
+        # A lettered menu ('- **(a) Head.** detail', one item per line): each item's head is a literal button.
+        # Live repro (hermes-hub 2026-11-12, D1/D2 energy asks): paraphrased 'D1 c (...)' options and no '?'
+        # left only the free-text button.
+        if len(out) < 2 and len(items := lettered_items(step.get('paragraph') or '')) >= 2:
+            out = [label for _, label in items]
         if len(out) < 2 and yes_no_question(step):
             out = ['Yes', 'No']
     return list(dict.fromkeys(out))[:4]
+
+
+_LETTERED_LINE = re.compile(r"^[ \t]*(?:[-*\u2022][ \t]+)?(\*\*|__)?\(([A-Za-z])\)[ \t]+(.+?)[ \t]*$", re.M)
+
+
+def lettered_items(paragraph: str) -> list[tuple[str, str]]:
+    """[(code, '(a) Head'), ...] for a top-level lettered list whose codes run a, b, c... from the first item.
+    The head is the bold span when the item opens bold, else its first clause; either way a literal slice of
+    the (unmarked) source. Fewer than 2 or more than 4 items, or a gap in the codes, is not a menu."""
+    items = []
+    for m in _LETTERED_LINE.finditer(paragraph or ''):
+        bold, code, rest = m.group(1), m.group(2).lower(), m.group(3)
+        if bold and bold in rest:
+            head = _unmarked(rest.split(bold, 1)[0]).rstrip(' .:;,')
+        else:
+            head = _option_head(_unmarked(rest))
+        if len(head.split()) < 2:
+            return []
+        items.append((code, f'({code}) {head}'))
+    codes = [c for c, _ in items]
+    if not 2 <= len(items) <= 4 or codes != [chr(ord('a') + i) for i in range(len(codes))]:
+        return []
+    return items
+
+
+_REC_CODE = re.compile(r"^(?:[A-Za-z]+\d+\s+)?\(?([A-Za-z])\)?(?=[\s.:)]|$)")
+
+
+def _lettered_recommendation(step: dict) -> Optional[str]:
+    """The code of the model option marked recommended ('D1 c (accept, recommended)' -> 'c'), if any."""
+    for o in step.get('options') or []:
+        o = _ws(o)
+        if re.search(r"\brecommend", o, re.I) and (m := _REC_CODE.match(o)):
+            return m.group(1).lower()
+    return None
 
 
 _WHETHER_ONE = re.compile(r"^(?:decide|choose|confirm|say|tell me)\s+whether\s+(?:or\s+not\s+)?(?:to\s+)?\S", re.I)
@@ -3336,6 +3376,12 @@ def explained_choices(labels: list[str], step: dict, *, boards=None) -> list[dic
             m = meanings[code]
             out.append({'id': f'answer-{i}', 'label': m['label'], 'effect': 'answer', 'explain': m['explain'],
                         **({'recommended': True} if m.get('recommended') else {})})
+    rec = _lettered_recommendation(step)
+    if rec and not any(c.get('recommended') for c in out):
+        for c in out:
+            if c['label'].startswith(f'({rec}) '):
+                c['recommended'] = True
+                break
     return out
 
 # Run/timing questions and imperative action questions ("Run X now?") have go answers.
