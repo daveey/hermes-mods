@@ -173,7 +173,7 @@ sign-in steps and protected-file Allows are never guessed. A rejected guard is n
 `R=~/.hermes/repos/hermes-mods/skills/devops/kanban-red-sweep/scripts/red_cards.py` (`~/code/hermes-mods/...` on the Macs).
 
 - One line per red card, every sweep, whatever you did with it:
-  `python3 $R log --card <id> --board <b> --title "<short>" --cls <class> --action <cleared|guessed|asked|left-to-owner|left-blocked> --avoidable <yes|partly|no> --slug <prevention-slug> --prevention "<what would have kept it from blocking>" --blocked-event <id from list> --run <chat or cron id>`.
+  `python3 $R log --card <id> --gateway <owner> --board <b> --title "<short>" --cls <class> --action <cleared|guessed|asked|left-to-owner|left-blocked> --avoidable <yes|partly|no> --slug <prevention-slug> --prevention "<what would have kept it from blocking>" --blocked-event <id from list> --run <chat or cron id>`.
   `--blocked-event` dedupes a card seen again in the same blocked state.
 - `avoidable=yes` means the worker or the card's author could have resolved it without the user (a standing
   rule covered it, the premise was checkable, the default was stated, an interactive session had the access).
@@ -213,7 +213,7 @@ there, which execs the skill script.
 - "No red cards" from the hub's sqlite is not "no red chats". The sidebar paints a chat red from
   `sessions.outcome_json` kind `decision` (hub `state.db`), fed by blocked cards on any gateway (the MacBook board
   alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards. Until `red_cards.py` covers
-  them, also list the red chats (`select id,title,outcome_json from sessions where coalesce(archived,0)=0 and
+  them on the installed revision, also list the red chats (`select id,title,outcome_json from sessions where coalesce(archived,0)=0 and
   json_extract(outcome_json,'$.kind')='decision'`), read their cards with `cross_task`, and run the inventory query
   on each other host with `tailnet_exec` (`mbp`, `mini`). Remote cards are commented and unblocked on their own
   host (`tailnet_exec ... hermes kanban comment/unblock`); `cross_task` only reads and comments.
