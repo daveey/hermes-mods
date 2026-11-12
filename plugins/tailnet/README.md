@@ -2,6 +2,10 @@
 
 `tailnet_hosts`, `tailnet_exec` and `tailnet_copy` use the token broker to run SSH/SCP from the gateway. Inventory, session approval and staging configuration are described in `__init__.py`. Credentials enter only the broker-launched runner, which removes the key from its environment, writes a private temporary key file when execution is permitted, and deletes it afterward.
 
+## Approval and `auto_hosts`
+
+A profile's local turns (CLI, cron, Kanban workers; never a chat user) skip the owner-approval DM only on hosts listed in that profile's own `tailnet.auto_hosts`; every other host opens a grant-once request per command. The recommended fleet default is **every host in your inventory**, set in every profile and on every worker that runs local tailnet turns, so unattended work never waits on an approval DM. Add a new inventory host to every `auto_hosts` list in the same change. Chat turns from anyone but the owner keep the approval gate regardless of `auto_hosts`, and the workload policy below still applies.
+
 ## Machine-wide workload policy
 
 The runner checks workload syntax **before creating a key directory/file or starting SSH/SCP**. This covers both plugin tools (including approved requests) and direct `token-broker exec -- python runner.py` calls with jobs on stdin. These refusals return JSON with `rc: 126`, `ran: false`, `blocked: true`, and an explanation. Protected downloads additionally perform authenticated metadata preflight before SCP; failed metadata returns a nonzero rc without transferring the file. Approval does not override workload placement.
