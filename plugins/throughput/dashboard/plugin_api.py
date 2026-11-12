@@ -1,7 +1,7 @@
-"""GET /api/plugins/throughput/v1/series?range=1h|6h|24h|7d (see ../series.py for the payload).
+"""GET /api/plugins/throughput/v1/series?range=1h|6h|24h|7d[&by=gateway|model] (see ../series.py for the payload).
 
 Loaded by path by the dashboard, outside its package: the plugin package is imported under a private name.
-Single-flight per range for 15 s; the slow work (sqlite reads, registry fetch) runs in a worker thread.
+Single-flight per (range, by) for 15 s; the slow work (sqlite reads, registry fetch) runs in a worker thread.
 Requesting the series also starts the sampler in this process if no other process on this Hermes root runs it
 (a file lock keeps it to one).
 """
@@ -69,7 +69,10 @@ def _known_machines():
     return names or None
 
 
-def build(range_key: str) -> Dict[str, Any]:
+BYS = ("gateway", "model")
+
+
+def build(range_key: str, by: str = "gateway") -> Dict[str, Any]:
     sampler, series = _services()
     try:
         sampler.start(_state["root"], replace_stale=False)  # no-op when a sampler thread already runs here
@@ -78,19 +81,22 @@ def build(range_key: str) -> Dict[str, Any]:
     reg = _registry()
     machines = list(((reg or {}).get("machines") or {}).keys())
     local = (reg or {}).get("me") or _state["store"].get_meta("me") or "local"
+    if by != "gateway":
+        return series.build(_state["store"], _state["cards"].events(), machines, local, range_key, by=by)
     return series.build(_state["store"], _state["cards"].events(), machines, local, range_key)
 
 
-def cached(range_key: str, now: float | None = None) -> Dict[str, Any]:
+def cached(range_key: str, by: str = "gateway", now: float | None = None) -> Dict[str, Any]:
+    key = range_key if by == "gateway" else f"{range_key}|{by}"  # the default keeps its plain range key
     with _lock:
-        rlock = _range_locks.setdefault(range_key, threading.Lock())
-    with rlock:  # single flight: concurrent requests for one range wait for the same build
+        rlock = _range_locks.setdefault(key, threading.Lock())
+    with rlock:  # single flight: concurrent requests for one (range, by) wait for the same build
         now = time.monotonic() if now is None else now
-        hit = _cache.get(range_key)
+        hit = _cache.get(key)
         if hit and now - hit[0] < CACHE_S:
             return hit[1]
-        payload = build(range_key)
-        _cache[range_key] = (time.monotonic(), payload)
+        payload = build(range_key) if by == "gateway" else build(range_key, by)
+        _cache[key] = (time.monotonic(), payload)
         return payload
 
 
@@ -100,7 +106,9 @@ async def ping() -> Dict[str, Any]:
 
 
 @router.get("/v1/series")
-async def get_series(range: str = Query("6h")) -> Dict[str, Any]:  # noqa: A002 - the public query name
+async def get_series(range: str = Query("6h"), by: str = Query("gateway")) -> Dict[str, Any]:  # noqa: A002
     if range not in ("1h", "6h", "24h", "7d"):
         raise HTTPException(status_code=400, detail="range must be 1h, 6h, 24h or 7d")
-    return await asyncio.to_thread(cached, range)
+    if by not in BYS:
+        raise HTTPException(status_code=400, detail="by must be gateway or model")
+    return await asyncio.to_thread(cached, range, by)

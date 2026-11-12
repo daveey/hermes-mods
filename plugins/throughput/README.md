@@ -16,6 +16,43 @@ Rules: a negative counter delta (reset, deleted rows) counts 0. A minute without
 reported a metric has no rows, and the API returns `null` for it. Retention: 8 days, in
 `<hermes root>/cache/throughput/series.sqlite`.
 
+### Model series (`by=model`)
+
+History starts at deployment: model rows are never backfilled, and the API never re-attributes earlier scalar
+history to `unreported`. Stored per gateway as `tokens_io:<model>` / `tokens_cache:<model>` plus
+`tokens_io:unreported` / `tokens_cache:unreported`, which is written for every sampled minute (0 included) and marks
+it as sampled. Decisions:
+
+- **Scalar is the authority.** Every sampled minute: sum of model rows + `unreported` == scalar delta. Models short
+  of the scalar leave the rest as `unreported`; models above it (cumulative per-model churn: deleting a session
+  lowers a model counter by more than the scalar, an aux-call ledger row `sessions` never counted) are scaled down
+  proportionally to the scalar, `unreported` 0 (`store.apportion`).
+- **Registry**: `metrics.tokens_by_model = {model: [io_cumulative, cache_cumulative]}`. A missing/non-map value
+  leaves the scalar delta in `unreported`; malformed entries or invalid numeric components are skipped independently.
+  At most the first 64 valid names per token kind are retained; omitted deltas become `unreported`. A model baseline
+  is used only if taken at the scalar's previous baseline minute, so a new model, one that came back after being
+  absent, and the first reading after a map was missing are baselines only (their tokens stay `unreported`, no spike).
+  On first deployment an existing persisted scalar baseline still supplies scalar history, but no model rows are
+  written until after the first model-aware reading. A negative delta (reset/deleted rows) is 0; gap spreading and
+  stale-report rules are the scalar's.
+- **Local**: `session_model_usage` (all rows of a session/model summed over provider/mode/task) snapshot per
+  `(db, session, model)`, diffed like the scalar (new session in full, vanished 0, lower 0). A db without the table,
+  with an unreadable table, a new profile, or one that just became model-capable is a baseline only. After an
+  unreadable model sample, the first successful read also establishes a fresh model baseline: both intervals stay
+  `unreported`, rather than assigning an outage's model growth to a later sampled interval. Scalar snapshots retain
+  unreadable db totals. If no scalar db is readable, no interval is sampled; normal short-gap spreading applies.
+  Scalar and model reads use separate connections, so concurrent writes can skew the model mix; proportional
+  normalization enforces total parity, not exact per-model attribution under such races or auxiliary ledger skew.
+- **Names**: names are trimmed/truncated to 128 characters (blank becomes `unknown`); colliding normalized registry
+  names are summed before differencing. Reserved wire names `other`/`unreported` remain reserved buckets, never
+  renamed or ranked as real models. A literal model with one of these reserved names is indistinguishable here.
+- **API** `?by=model` (default `gateway`, anything else 400): same payload plus `by: "model"` and `models`: the top 8
+  real models by combined io+cache window total (ties by name; reserved names never compete), then `other` (the rest,
+  only if any) and `unreported`; `[]` when no model rows exist in the window. `series`/`sampled`/`recent` of
+  `tokens_io`/`tokens_cache` are keyed by model, aggregated across gateways; sessions, cards and `gateways` are
+  unchanged. `sampled` is the union of minutes any gateway sampled (wall time, not machine-minutes); inside one, a
+  model without a row is 0, outside None. The 15 s cache is keyed by (range, by).
+
 Until every gateway's registry metrics carry the token/session counters, tokens and sessions cover the local
 gateway only; cards cover every gateway.
 
@@ -28,7 +65,7 @@ The REST API also starts one if the process has none.
 
 ## API
 
-`GET /api/plugins/throughput/v1/series?range=1h|6h|24h|7d` (buckets 1/5/15/60 min):
+`GET /api/plugins/throughput/v1/series?range=1h|6h|24h|7d[&by=gateway|model]` (buckets 1/5/15/60 min):
 
 ```json
 {"now": 1800000000, "since": 1799996400, "bucket_s": 60, "range": "1h", "local": "hub",

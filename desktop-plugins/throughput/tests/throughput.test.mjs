@@ -118,8 +118,10 @@ test('view persists in localStorage and rejects junk', () => {
   localStorage.clear()
   assert.deepEqual(P.loadView(), P.DEFAULT_VIEW)
   P.saveView({ unit: 'h', range: '7d', cache: true })
-  assert.deepEqual(P.loadView(), { unit: 'h', range: '7d', cache: true })
-  localStorage.setItem(P.STORE_KEY, JSON.stringify({ unit: 'x', range: '2d', cache: 'yes' }))
+  assert.deepEqual(P.loadView(), { unit: 'h', range: '7d', cache: true, by: 'gateway' })
+  P.saveView({ unit: 's', range: '24h', cache: false, by: 'model' })
+  assert.deepEqual(P.loadView(), { unit: 's', range: '24h', cache: false, by: 'model' })
+  localStorage.setItem(P.STORE_KEY, JSON.stringify({ unit: 'x', range: '2d', cache: 'yes', by: 'invalid' }))
   assert.deepEqual(P.loadView(), P.DEFAULT_VIEW)
   localStorage.setItem(P.STORE_KEY, '{broken')
   assert.deepEqual(P.loadView(), P.DEFAULT_VIEW)
@@ -297,6 +299,111 @@ test('backend error shows Unavailable, never zeros', async () => {
   } finally {
     await ui.close()
   }
+})
+
+function modelPayload(range = '1h') {
+  const p = forRange(`/v1/series?range=${range}`)
+  const n = range === '24h' ? 288 : 60
+  const bs = range === '24h' ? 300 : 60
+  const values = { 'model-a': 120, 'model-b': 240, other: 60, unreported: null }
+  const map = (scale, length) => Object.fromEntries(Object.entries(values).map(([m, v]) => [m, v == null ? null : Array(length).fill(v * scale)]))
+  return { ...p, by: 'model', models: Object.keys(values), since: END - (range === '24h' ? 86400 : 3600), bucket_s: bs,
+    series: { ...p.series, tokens_io: map(bs / 60, n), tokens_cache: map(bs / 600, n) },
+    recent: { ...p.recent, tokens_io: map(1, 15), tokens_cache: map(0.1, 15) } }
+}
+const modelOrGateway = (path) => {
+  const q = new URL('http://x' + path).searchParams
+  return q.get('by') === 'model' ? modelPayload(q.get('range')) : forRange(path)
+}
+
+test('model toggle fetches separately, persists, and model legend never filters gateway charts or chip', async () => {
+  P.saveView(V())
+  const ctx = ctxWith(modelOrGateway)
+  const ui = await mount(React.createElement(P.Throughput, { ctx }), { gcTime: 60000 })
+  const paths = (chart) => [...document.querySelectorAll(`[data-chart="${chart}"] path`)].map((e) => e.dataset.gw)
+  try {
+    assert.equal(ctx.calls.length, 1, 'gateway default does not request model data')
+    await ui.click(button('Show throughput'))
+    const chip = button('Show throughput').textContent
+    await ui.click(button('model'))
+    assert.equal(ctx.calls.at(-1)[0], '/v1/series?range=1h&by=model')
+    assert.equal(P.loadView().by, 'model')
+    assert.deepEqual([...document.querySelectorAll('button[data-model]')].map((e) => e.dataset.model), ['model-a', 'model-b', 'other', 'unreported'])
+    assert.deepEqual(paths('tokens'), ['model-a', 'model-b', 'other'])
+    assert.equal(document.querySelector('[data-now="tokens"]').textContent, '420')
+    assert.equal(button('Show throughput').textContent, chip)
+    const cards = paths('cards'), sessions = paths('sessions')
+    const pick = (m) => document.querySelector(`button[data-model="${m}"]`)
+    await ui.click(pick('model-b'))
+    assert.deepEqual(paths('tokens'), ['model-b'])
+    assert.equal(document.querySelector('[data-now="tokens"]').textContent, '240')
+    assert.deepEqual(paths('cards'), cards)
+    assert.deepEqual(paths('sessions'), sessions)
+    await ui.click(pick('model-b'))
+    assert.equal(paths('tokens').length, 3)
+    await ui.click(pick('model-a'), { shiftKey: true })
+    assert.deepEqual(paths('tokens'), ['model-b', 'other'])
+    assert.ok(pick('model-a').classList.contains('is-off'))
+    await ui.click(button('All models'))
+    await ui.click(pick('unreported'))
+    assert.equal(document.querySelector('[data-now="tokens"]').textContent, '–')
+    await ui.click(button('All models'))
+    await ui.click(document.querySelector('button[data-gw="worker-1"]'))
+    assert.deepEqual(paths('tokens'), ['model-a', 'model-b', 'other'])
+    assert.ok(!paths('cards').includes('hub'))
+    await ui.click(button('+cache'))
+    assert.equal(document.querySelector('[data-now="tokens"]').textContent, '462')
+    await ui.click(button('gateway'))
+    assert.equal(P.loadView().by, 'gateway')
+    assert.equal(document.querySelector('[data-now="tokens"]').textContent, '–', 'gateway filter survives model mode')
+    assert.ok(document.querySelector('button[data-model]') === null)
+  } finally { await ui.close(); localStorage.clear() }
+})
+
+test('persisted model mode refetches 24h without stale model charts, then returns to 1h', async () => {
+  P.saveView(V({ by: 'model' }))
+  let release
+  const pending = new Promise((resolve) => { release = resolve })
+  const ctx = ctxWith((path) => path === '/v1/series?range=24h&by=model' ? pending : modelOrGateway(path))
+  const ui = await mount(React.createElement(P.Throughput, { ctx }), { gcTime: 60000 })
+  try {
+    await ui.click(button('Show throughput'))
+    assert.equal(button('model').getAttribute('aria-pressed'), 'true')
+    assert.equal(ticks()[0], P.timeLabel(END - 3600, '1h'))
+    await ui.click(button('24h'))
+    assert.ok(ctx.calls.some(([path]) => path === '/v1/series?range=24h'))
+    assert.ok(ctx.calls.some(([path]) => path === '/v1/series?range=24h&by=model'))
+    assert.ok(document.querySelector('[data-chart="tokens"]') === null)
+    assert.ok(document.querySelector('[data-chart="sessions"]'))
+    assert.ok(document.querySelector('[data-chart="cards"]'))
+    assert.match(document.body.textContent, /Loading models 24h/)
+    release(modelPayload('24h'))
+    await ui.flush()
+    assert.equal(ticks()[0], P.timeLabel(END - 86400, '24h'))
+    assert.equal(ticks().at(-1), P.timeLabel(END - 300, '24h'))
+    assert.equal(document.querySelector('[data-now="tokens"]').textContent, '420')
+    await ui.click(button('1h'))
+    assert.equal(ticks()[0], P.timeLabel(END - 3600, '1h'))
+    assert.equal(P.loadView().by, 'model')
+  } finally { release(modelPayload('24h')); await ui.close(); localStorage.clear() }
+})
+
+test('model request failure leaves gateway chip and session/card charts usable', async () => {
+  P.saveView(V({ by: 'model' }))
+  const ui = await mount(React.createElement(P.Throughput, { ctx: ctxWith((path) => {
+    if (path.includes('by=model')) throw Error('model timeout')
+    return forRange(path)
+  }) }))
+  try {
+    await ui.click(button('Show throughput'))
+    assert.match(document.body.textContent, /Models 1h unavailable: model timeout/)
+    assert.ok(document.querySelector('[data-chart="tokens"]') === null)
+    assert.ok(document.querySelector('[data-chart="sessions"]'))
+    assert.ok(document.querySelector('[data-chart="cards"]'))
+    assert.match(button('Show throughput').textContent, /600 tok\/m/)
+    await ui.click(button('gateway'))
+    assert.ok(document.querySelector('[data-chart="tokens"]'))
+  } finally { await ui.close(); localStorage.clear() }
 })
 
 test('register: chip right after Runners, palette entry, CSS removed on dispose', () => {

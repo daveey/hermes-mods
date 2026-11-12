@@ -21,6 +21,7 @@ from __future__ import annotations
 import fcntl
 import glob
 import logging
+import math
 import os
 import socket
 import sqlite3
@@ -103,6 +104,70 @@ def snapshot_delta(prev: Mapping, cur: Mapping) -> tuple[int, int]:
     return io, cache
 
 
+def model_snapshot(dbs: list[Path]) -> tuple[dict[tuple[str, str, str], tuple[int, int]], set[str]]:
+    """``({(db, session_id, model): (io, cache)}, {model-capable db paths})`` from ``session_model_usage``.
+
+    Every row is summed (the registry's ``tokens_*_total`` counters sum the same ledger), over provider /
+    base-url / mode / task for one (session, model). The local scalar comes from ``sessions``, which leaves out
+    some auxiliary-call rows, so the models can exceed it: ``store.apportion`` then scales them down to the
+    scalar (the scalar stays the authority). A db without the table (older schema), or whose table cannot be
+    read, is not model-capable: it is absent from the set, so its tokens stay ``unreported``."""
+    snap: dict[tuple[str, str, str], tuple[int, int]] = {}
+    capable: set[str] = set()
+    for db in dbs:
+        try:
+            c = ro_connect(db)
+            try:
+                cols = {r[1] for r in c.execute("PRAGMA table_info(session_model_usage)")}
+                if not {"session_id", "model", "input_tokens", "output_tokens", "cache_read_tokens",
+                        "cache_write_tokens"} <= cols:
+                    continue
+                rows = c.execute(
+                    "SELECT session_id, COALESCE(NULLIF(TRIM(model),''),'unknown'), "
+                    "SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)), "
+                    "SUM(COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0)) "
+                    "FROM session_model_usage GROUP BY 1, 2").fetchall()
+            finally:
+                c.close()
+        except sqlite3.Error as exc:
+            log.debug("throughput: %s model usage unreadable: %s", db, exc)
+            continue
+        for sid, model, io, cache in rows:
+            snap[(str(db), sid, str(model))] = (int(io or 0), int(cache or 0))
+        capable.add(str(db))
+    return snap, capable
+
+
+def model_deltas(prev: Mapping, cur: Mapping) -> tuple[dict[str, int], dict[str, int]]:
+    """``({model: io delta}, {model: cache delta})`` between two model snapshots, with ``snapshot_delta``'s rules
+    per (session, model): new counts in full, vanished 0, lower 0."""
+    io: dict[str, int] = {}
+    cache: dict[str, int] = {}
+    for (db, sid, model), (cio, ccache) in cur.items():
+        pio, pcache = prev.get((db, sid, model), (0, 0))
+        if cio > pio:
+            io[model] = io.get(model, 0) + cio - pio
+        if ccache > pcache:
+            cache[model] = cache.get(model, 0) + ccache - pcache
+    return io, cache
+
+
+def registry_models(raw) -> tuple[dict[str, float], dict[str, float]]:
+    """``tokens_by_model`` ``{model: [io, cache]}`` -> ``({model: io}, {model: cache})``. Anything malformed (not a
+    mapping, bad pair, negative/non-finite/bool numbers) is skipped per model and per kind, never raised."""
+    io: dict[str, float] = {}
+    cache: dict[str, float] = {}
+    if not isinstance(raw, Mapping):
+        return io, cache
+    for model, pair in raw.items():
+        if not isinstance(model, str) or not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        for out, v in ((io, pair[0]), (cache, pair[1])):
+            if not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v) and v >= 0:
+                out[model] = out.get(model, 0.0) + float(v)
+    return io, cache
+
+
 def session_minutes(dbs: list[Path], since: int, until: int) -> Optional[tuple[dict[int, int], dict[int, int]]]:
     """Per-minute session starts and ends in ``[since, until)`` (every minute present, 0 when none). None when any
     state.db can't be read: a partial count would overwrite stored minutes with too-low numbers."""
@@ -148,6 +213,8 @@ class Sampler:
         self._snap: Optional[dict] = None
         self._snap_minute: Optional[int] = None
         self._snap_dbs: set[str] = set()
+        self._msnap: Optional[dict] = None
+        self._msnap_dbs: set[str] = set()
         self._last_prune = 0.0
 
     def me(self, reg: Optional[Mapping]) -> str:
@@ -173,11 +240,23 @@ class Sampler:
         for key, v in (prev or {}).items():
             if key[0] not in readable:
                 snap[key] = v
+        msnap, mcapable = model_snapshot([Path(d) for d in readable])
+        prev_m, prev_mdbs = self._msnap, self._msnap_dbs
+        for key, v in (prev_m or {}).items():
+            if key[0] not in mcapable:
+                msnap[key] = v
         if prev is not None and self._snap_minute is not None:
             io, cache = snapshot_delta(prev, {k: v for k, v in snap.items() if k[0] in prev_dbs})
             self.store.record_delta(me, "tokens_io", self._snap_minute, minute, io)
             self.store.record_delta(me, "tokens_cache", self._snap_minute, minute, cache)
+            # Only consecutive model-readable samples can explain this scalar interval. On recovery,
+            # establish a fresh baseline: an older model delta also includes tokens already unreported.
+            m_io, m_cache = model_deltas(
+                prev_m or {}, {k: v for k, v in msnap.items() if k[0] in prev_mdbs and k[0] in prev_dbs})
+            self.store.record_models(me, "tokens_io", self._snap_minute, minute, io, m_io)
+            self.store.record_models(me, "tokens_cache", self._snap_minute, minute, cache, m_cache)
         self._snap, self._snap_minute, self._snap_dbs = snap, minute, readable | prev_dbs
+        self._msnap, self._msnap_dbs = msnap, mcapable
 
     def sample_local_sessions(self, me: str, minute: int) -> None:
         done = int(self.store.get_meta("sessions_until:" + me) or 0)
@@ -196,12 +275,16 @@ class Sampler:
                 continue  # the local gateway is sampled directly
             metrics = (entry or {}).get("metrics") or {}
             at = metrics.get("at")
+            by_model = dict(zip(("tokens_io", "tokens_cache"), registry_models(metrics.get("tokens_by_model"))))
             for key, metric in REGISTRY_COUNTERS.items():
                 value = metrics.get(key)
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
                     continue
-                self.store.observe_counter(name, metric, minute, float(value),
-                                           float(at) if isinstance(at, (int, float)) else None)
+                at_f = float(at) if isinstance(at, (int, float)) else None
+                if metric in by_model:  # a missing/invalid map just means everything is unreported
+                    self.store.observe_token_counter(name, metric, minute, float(value), at_f, by_model[metric])
+                    continue
+                self.store.observe_counter(name, metric, minute, float(value), at_f)
 
     def tick(self) -> None:
         now = self.clock()

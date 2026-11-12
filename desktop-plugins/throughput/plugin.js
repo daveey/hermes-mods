@@ -11,7 +11,8 @@ export const STORE_KEY = 'hermes-throughput-view'
 export const RANGES = ['1h', '6h', '24h', '7d']
 export const UNITS = ['s', 'm', 'h']
 const UNIT_S = { s: 1, m: 60, h: 3600 }
-export const DEFAULT_VIEW = { unit: 'm', range: '6h', cache: false }
+export const GROUPS = ['gateway', 'model']
+export const DEFAULT_VIEW = { unit: 'm', range: '6h', cache: false, by: 'gateway' }
 const PALETTE = ['#7aa2ff', '#3ddc97', '#f0a43a', '#d982f0', '#5fd4e6', '#ef7b7b', '#c9d36a', '#e8a0c8', '#a0e8c8', '#8fb0ff']
 const FIXED = { ephemeral: '#9aa0aa', unattributed: '#6b7280' }
 const NOREP = 'These gateways don\u2019t report this metric yet (their Board counters arrive with the core token/session counters), so they show \u201c\u2013\u201d, never 0'
@@ -25,13 +26,14 @@ export function loadView(storage = globalThis.localStorage) {
     return {
       unit: UNITS.includes(v.unit) ? v.unit : DEFAULT_VIEW.unit,
       range: RANGES.includes(v.range) ? v.range : DEFAULT_VIEW.range,
-      cache: v.cache === true
+      cache: v.cache === true,
+      by: GROUPS.includes(v.by) ? v.by : DEFAULT_VIEW.by
     }
   } catch { return { ...DEFAULT_VIEW } }
 }
 
 export function saveView(view, storage = globalThis.localStorage) {
-  try { storage?.setItem(STORE_KEY, JSON.stringify({ unit: view.unit, range: view.range, cache: !!view.cache })) } catch {}
+  try { storage?.setItem(STORE_KEY, JSON.stringify({ unit: view.unit, range: view.range, cache: !!view.cache, by: GROUPS.includes(view.by) ? view.by : DEFAULT_VIEW.by })) } catch {}
 }
 
 export function fmt(v) {
@@ -260,14 +262,18 @@ function Chart({ id, title, up, down, upLabel, downLabel, payload, view, gws, co
 // `payload` is the selected range's data, or null while it loads / after it failed (`status` says which); the
 // previous range's data is never drawn under the new range's label. `frame` (the last good payload, any range)
 // only supplies the gateway list for the legend, so the controls stay usable meanwhile.
-export function Panel({ payload, frame = payload, status = null, view, setView, filter, setFilter, onHoverRange }) {
+export function Panel({ payload, frame = payload, status = null, modelPayload = null, modelFrame = null, modelStatus = null, modelFilter = { solo: null, hidden: [] }, setModelFilter, view, setView, filter, setFilter, onHoverRange }) {
   const colors = useMemo(() => colorFor(frame.gateways), [frame.gateways])
   const gws = visibleGateways(frame.gateways, filter)
+  const models = modelFrame?.models || []
+  const modelColors = useMemo(() => colorFor(models), [modelFrame?.models])
+  const modelGws = visibleGateways(models, modelFilter)
   const set = (k) => (v) => setView({ ...view, [k]: v })
   return h('div', { className: 'hermes-tp' },
     h('div', { className: 'hermes-tp-top' },
       h('h2', null, 'Throughput'),
       h('div', { className: 'hermes-tp-ctl' },
+        h(Seg, { label: 'Token grouping', value: view.by || 'gateway', options: GROUPS, onPick: set('by') }),
         h(Seg, { label: 'Unit', value: view.unit, options: UNITS, onPick: set('unit'), render: (u) => '/' + u }),
         h(Seg, { label: 'Range', value: view.range, options: RANGES, onPick: set('range'), onHover: onHoverRange }),
         h(Seg, { label: 'Tokens', value: view.cache, options: [false, true], onPick: set('cache'), render: (c) => (c ? '+cache' : 'in+out') }))),
@@ -280,7 +286,16 @@ export function Panel({ payload, frame = payload, status = null, view, setView, 
       }, h('span', { className: 'hermes-tp-sw', style: { background: colors[g] } }), g)),
       h('span', { className: 'hermes-tp-hint' }, 'click = only \u00b7 \u21e7click = hide')),
     ...(payload ? [
-    h(Chart, { key: 'tokens', id: 'tokens', title: 'Tokens', up: 'tokens', upLabel: view.cache ? 'in+out+cache' : 'in+out', payload, view, gws, colors }),
+    ...(view.by === 'model' ? [
+      h('div', { className: 'hermes-tp-legend', key: 'models', 'aria-label': 'Models' },
+        h('button', { type: 'button', onClick: () => setModelFilter(legendClick(modelFilter, 'all')) }, 'All models'),
+        models.map((m) => h('button', { key: m, type: 'button', 'data-model': m,
+          className: [modelFilter.hidden.includes(m) ? 'is-off' : '', modelFilter.solo === m ? 'is-solo' : ''].join(' ').trim(),
+          onClick: (e) => setModelFilter(legendClick(modelFilter, m, e.shiftKey))
+        }, h('span', { className: 'hermes-tp-sw', style: { background: modelColors[m] } }), m))),
+      modelPayload ? h(Chart, { key: 'tokens-model', id: 'tokens', title: 'Tokens by model', up: 'tokens', upLabel: view.cache ? 'in+out+cache' : 'in+out', payload: modelPayload, view, gws: modelGws, colors: modelColors })
+        : h('div', { key: 'model-pending', className: 'hermes-tp-note hermes-tp-pending', role: 'status' }, modelStatus || `Loading models ${view.range}…`)
+    ] : [h(Chart, { key: 'tokens', id: 'tokens', title: 'Tokens', up: 'tokens', upLabel: view.cache ? 'in+out+cache' : 'in+out', payload, view, gws, colors })]),
     h(Chart, { key: 'sessions', id: 'sessions', title: 'Sessions', up: 'sess_in', down: 'sess_out', upLabel: 'new', downLabel: 'ended', payload, view, gws, colors }),
     h(Chart, { key: 'cards', id: 'cards', title: 'Cards', up: 'cards_in', down: 'cards_out', upLabel: 'created', downLabel: 'done', payload, view, gws, colors }),
     h('div', { className: 'hermes-tp-foot', key: 'foot' }, `Big numbers = average over the last ${nowWindow(view.range)} min; buckets of ${payload.bucket_s / 60} min.`)
@@ -301,17 +316,21 @@ export function Throughput({ ctx }) {
   const [open, setOpen] = useState(false)
   const [view, setViewState] = useState(loadView)
   const [filter, setFilter] = useState({ solo: null, hidden: [] })
+  const [modelFilter, setModelFilter] = useState({ solo: null, hidden: [] })
   const setView = (v) => { setViewState(v); saveView(v) }
   const visible = useVisible()
-  const fetchRange = (range) => async () => {
-    const body = await ctx.rest(`/v1/series?range=${encodeURIComponent(range)}`, { timeoutMs: REQUEST_TIMEOUT_MS })
-    if (!body || !Array.isArray(body.gateways) || !body.series || !body.bucket_s) throw Error('Invalid throughput response')
+  const fetchRange = (range, by = 'gateway') => async () => {
+    const body = await ctx.rest(`/v1/series?range=${encodeURIComponent(range)}${by === 'model' ? '&by=model' : ''}`, { timeoutMs: REQUEST_TIMEOUT_MS })
+    if (!body || !Array.isArray(body.gateways) || (by === 'model' && !Array.isArray(body.models)) || !body.series || !body.bucket_s) throw Error('Invalid throughput response')
     return body
   }
   const client = useQueryClient()
   // Hovering a range button fetches it ahead of the click, so switching is usually instant.
   const prefetch = (range) => {
-    if (range !== view.range) client.prefetchQuery({ queryKey: ['throughput', 'series', range], queryFn: fetchRange(range), staleTime: 10000 }).catch(() => {})
+    if (range !== view.range) {
+      client.prefetchQuery({ queryKey: ['throughput', 'series', range], queryFn: fetchRange(range), staleTime: 10000 }).catch(() => {})
+      if (view.by === 'model') client.prefetchQuery({ queryKey: ['throughput', 'series', range, 'model'], queryFn: fetchRange(range, 'model'), staleTime: 10000 }).catch(() => {})
+    }
   }
   const query = useQuery({
     queryKey: ['throughput', 'series', view.range],
@@ -323,6 +342,20 @@ export function Throughput({ ctx }) {
     staleTime: 10000,
     placeholderData: (prev) => prev
   })
+  const modelQuery = useQuery({
+    queryKey: ['throughput', 'series', view.range, 'model'],
+    queryFn: fetchRange(view.range, 'model'),
+    enabled: view.by === 'model',
+    refetchInterval: visible && view.by === 'model' ? POLL_MS : false,
+    refetchIntervalInBackground: false, refetchOnWindowFocus: false, retry: false, staleTime: 10000,
+    placeholderData: (prev) => prev
+  })
+  const lastModel = useRef(null)
+  if (modelQuery.data) lastModel.current = modelQuery.data
+  const modelPayload = modelQuery.data && !modelQuery.isPlaceholderData && modelQuery.data.range === view.range ? modelQuery.data : null
+  const modelStatus = modelQuery.error
+    ? `Models ${view.range} unavailable: ${String(modelQuery.error.message || modelQuery.error).slice(0, 200)}`
+    : `Loading models ${view.range}…`
   useEffect(() => {
     const show = () => setOpen(true)
     window.addEventListener('hermes-show-throughput', show)
@@ -348,7 +381,7 @@ export function Throughput({ ctx }) {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Throughput', className: 'hermes-tp-popover',
       style: { width: 'min(680px, calc(100vw - 24px))', maxHeight: '80vh', overflowY: 'auto' }
     }, frame
-      ? h(Panel, { payload, frame, status, view, setView, filter, setFilter, onHoverRange: prefetch })
+      ? h(Panel, { payload, frame, status, modelPayload, modelFrame: lastModel.current, modelStatus, modelFilter, setModelFilter, view, setView, filter, setFilter, onHoverRange: prefetch })
       : h('div', { className: 'hermes-tp-note' }, query.error ? `Unavailable: ${String(query.error.message || query.error).slice(0, 200)}` : 'Loading\u2026')))
 }
 
