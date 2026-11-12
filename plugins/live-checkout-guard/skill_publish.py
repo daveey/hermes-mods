@@ -32,7 +32,7 @@ SAFE_SUFFIXES = {'.md', '.txt', '.rst', '.csv', '.json', '.yaml', '.yml',
 def clean_env(env=None):
     """Inherited environment minus Git repository-routing variables."""
     return {k: v for k, v in (os.environ if env is None else env).items()
-            if k not in GIT_ROUTING_ENV}
+            if k not in GIT_ROUTING_ENV and not k.startswith('GIT_CONFIG')}
 
 
 def bounded(command, *, timeout, data=None, env=None, cwd=None):

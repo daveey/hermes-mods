@@ -341,7 +341,10 @@ printf '[{"headSha":"%s","status":"completed","conclusion":"%s","workflowName":"
                                     'GIT_INDEX_FILE': str(decoy / 'index'),
                                     'GIT_COMMON_DIR': str(decoy),
                                     'GIT_OBJECT_DIRECTORY': str(decoy / 'objects'),
-                                    'GIT_NAMESPACE': 'decoy'}):
+                                    'GIT_NAMESPACE': 'decoy',
+                                    'GIT_CONFIG_COUNT': '1',
+                                    'GIT_CONFIG_KEY_0': 'core.worktree',
+                                    'GIT_CONFIG_VALUE_0': str(decoy)}):
             self.assertEqual(self.publish()['status'], 'published')
         self.assertEqual((self.root / '.git/index').read_bytes(), self.index)
         self.assertEqual(list(decoy.iterdir()), [])
