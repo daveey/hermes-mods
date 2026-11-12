@@ -131,6 +131,8 @@ The symptom is many cards crashing within a minute or two on several hosts with 
    - which host: the owning Mac for `machine:macbook`; for `machine:worker-N` or `capability:*`, a matching worker over ssh (`hermes kanban move --json` lists `matches`). A non-matching host answers `cannot claim` or `no such task` and changes nothing.
    - commands: `HERMES_KANBAN_BOARD=default hermes kanban claim <id> --ttl 120`, then `hermes kanban reclaim <id> --reason "<why the hold is false>"`. The reclaimed run is the episode boundary and resets the failure counter, and the dispatcher spawns the card within seconds. Card spec, links and workspace stay intact, unlike re-filing it.
    - Keep quota/auth words out of the reason: it becomes the run's error text.
+   - A Kanban worker's shell is fenced from board-writing CLI verbs (`claim` answers "child contexts cannot mutate Kanban tasks"). Don't route around the fence over ssh. File the release or the code fix as a card instead.
+   - A hold that is not false but too broad cannot be released this way either. Example: a `class:deep` retry card (`retry_after_run_crashed`) held for one provider's real wall while the class has a free provider. `decision()` only tries alternate routes for the default/off/profile_out_of_scope reasons, so that hold is a core bug: fix it in code, not by reclaiming.
    - If the guard then says `active_pr` (a PR URL in a recent comment) and the card owns that PR, `hermes kanban resume <id> --reason "<what it must do on the PR>"` lets it continue.
    - Do this only after step 3 shows no gateway's walls file still lists the provider; otherwise the next run hits the wall again.
 
