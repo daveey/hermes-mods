@@ -263,6 +263,32 @@ there, which execs the skill script.
   move it to an idle machine (`kanban move --runs-on`); never raise it through an uncapped writer. Read back every edit.
 - `kanban_create`/`move` refuse a machine on Board hold (`machine_held`). `hermes-mail admin machine-audit <m>` on the
   hub shows the hold reason and release time. A hold is deliberate, so never clear it to place a card.
+- A sequential core rollout (one worker at a time) moves its hold to the next worker minutes after the last one
+  lifts. Before moving or unblocking a card onto a worker, check that worker's hold live: `kanban_pickup_skips`
+  rows with reason `hold` in the last 5 min, or `claim_deferred(held)` in its gateway.log `dispatcher stuck` line.
+  Re-place ready cards pinned to a newly held worker. Leave cards whose worktree there has unpushed commits (their
+  last `worker_result` says so): they resume when the hold lifts.
+- "Pickup held on <m>" and "Pickup queue full on <m>" alarm cards are pinned to the stalled machine itself, so no agent
+  works them while it is held or full. Re-place the waiting cards yourself. List `ready` cards whose `runs_on` names
+  `machine:<m>` on each board. Find free slots on each target: `max_in_progress` in its `kanban:` config minus its
+  running count. `kanban move` the portable ones to an unheld worker with free slots, then read back and comment why.
+  Leave ship-stage cards whose exact-head approval was recorded on that host, because cross-host review custody can
+  refuse the ship. Read the hold's owner card (rollout or core-drain) for its hard release time.
+- An exact-head approval can be stale for landing. `hermes-core-wt ship` rebases, which makes a new head that the
+  approval no longer covers, whenever main changed any PR file since the merge-base. Before shipping or re-placing an
+  approved PR's card, intersect `git diff --name-only $(git merge-base HEAD origin/main) HEAD` with the same diff
+  against `origin/main`. On overlap, the card needs a rebase plus a new review, so review custody no longer pins it to
+  the old host: move it to a worker with free slots, and have the new review pinned to that worker.
+- Find a PR's owner card by its branch name (`headRefName`, e.g. `wt/<slug>`) and the card ids in the PR body, matched
+  against card bodies and comments on every host. Searching only for `PR<n>`/`#<n>` misses owners that published the
+  PR after their body was written.
+- Count a worker's free slots before moving cards to it: `max_in_progress` minus running, and check
+  `kanban_pickup_skips` for recent `budget_exhausted` rows. One free slot with several contenders is not capacity.
+- A burst of `rate_limited` runs (`HTTP 429 ... quota unavailable for openai-codex/...`) is not an outage by itself.
+  Read the `run_route` events. A `tier_reason` of `default+wall:<provider>` or `+quota_reroute` means later spawns
+  already go to another provider. A host whose core predates first-spawn wall routing wastes only the first spawn of
+  each new card; the quota-wall alert card names the fix commit, so check it with `git merge-base --is-ancestor`. Count
+  `gave_up` events and check the fallback pool's weekly headroom (resetwatch `probe.py --fresh`) before calling it harm.
 - A decision chat's card that's missing from the local board isn't absent: `cross_task read <id>` finds it on its owner gateway.
 - `notify-subscribe` from a Desktop chat warns "binding a different chat" and suggests `agent:main:local:dm:<id>`.
   Ignore that suggestion and keep the bare session id: following it writes a shepherd row for an id that is not a chat.
