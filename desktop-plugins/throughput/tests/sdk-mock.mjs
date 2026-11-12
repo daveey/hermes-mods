@@ -20,6 +20,7 @@ const query = require('@tanstack/react-query')
 const { Popover: P } = require('radix-ui')
 const sdk = {
   useQuery: query.useQuery,
+  useQueryClient: query.useQueryClient,
   STATUSBAR_AREAS: { right: 'statusBar.right' },
   PALETTE_AREA: 'palette',
   Popover: P.Root,
@@ -36,11 +37,11 @@ export async function loadPlugin() {
     (_, s) => `from '${s === 'react' ? pathToFileURL(require.resolve('react')).href : sdkURL}'`)
   return import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
 }
-export async function mount(component) {
+export async function mount(component, { gcTime = 0 } = {}) {
   const container = document.createElement('div')
   document.body.append(container)
   const root = createRoot(container)
-  const client = new query.QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+  const client = new query.QueryClient({ defaultOptions: { queries: { retry: false, gcTime } } })
   const flush = async () => React.act(async () => { await new Promise((r) => setTimeout(r, 35)) })
   await React.act(async () => root.render(React.createElement(query.QueryClientProvider, { client }, component)))
   await flush()

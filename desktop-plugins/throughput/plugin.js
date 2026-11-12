@@ -2,11 +2,11 @@
 // Chip: 34 px token sparkline + "56k tok/m · 1.5 cards/m". Popover: three mirrored stacked charts
 // (inflow above the line, outflow below), stacked by gateway. Data: GET /v1/series?range=… on the
 // local gateway (plugins/throughput/series.py): per-bucket counts, null = gateway doesn't report.
-import { useQuery, STATUSBAR_AREAS, PALETTE_AREA, Popover, PopoverTrigger, PopoverContent } from '@hermes/plugin-sdk'
-import { createElement as h, useState, useEffect, useMemo } from 'react'
+import { useQuery, useQueryClient, STATUSBAR_AREAS, PALETTE_AREA, Popover, PopoverTrigger, PopoverContent } from '@hermes/plugin-sdk'
+import { createElement as h, useState, useEffect, useMemo, useRef } from 'react'
 
 export const POLL_MS = 30000
-export const REQUEST_TIMEOUT_MS = 10000
+export const REQUEST_TIMEOUT_MS = 20000 // the hub answers in 0.3-10 s under load
 export const STORE_KEY = 'hermes-throughput-view'
 export const RANGES = ['1h', '6h', '24h', '7d']
 export const UNITS = ['s', 'm', 'h']
@@ -162,11 +162,11 @@ function Spark({ values, w = 34, h: H = 14 }) {
     h('polyline', { points: pts, fill: 'none', stroke: 'currentColor', strokeWidth: 1.4 }))
 }
 
-function Seg({ value, options, onPick, label, render = (o) => o }) {
+function Seg({ value, options, onPick, onHover, label, render = (o) => o }) {
   return h('div', { className: 'hermes-tp-seg', role: 'group', 'aria-label': label },
     options.map((o) => h('button', {
       key: String(o), type: 'button', className: o === value ? 'is-on' : '', 'aria-pressed': o === value,
-      onClick: () => onPick(o)
+      onClick: () => onPick(o), onPointerEnter: onHover ? () => onHover(o) : undefined
     }, render(o))))
 }
 
@@ -257,29 +257,34 @@ function Chart({ id, title, up, down, upLabel, downLabel, payload, view, gws, co
         D ? tipRows(D, hover.i) : null) : null))
 }
 
-export function Panel({ payload, view, setView, filter, setFilter }) {
-  const colors = useMemo(() => colorFor(payload.gateways), [payload.gateways])
-  const gws = visibleGateways(payload.gateways, filter)
+// `payload` is the selected range's data, or null while it loads / after it failed (`status` says which); the
+// previous range's data is never drawn under the new range's label. `frame` (the last good payload, any range)
+// only supplies the gateway list for the legend, so the controls stay usable meanwhile.
+export function Panel({ payload, frame = payload, status = null, view, setView, filter, setFilter, onHoverRange }) {
+  const colors = useMemo(() => colorFor(frame.gateways), [frame.gateways])
+  const gws = visibleGateways(frame.gateways, filter)
   const set = (k) => (v) => setView({ ...view, [k]: v })
   return h('div', { className: 'hermes-tp' },
     h('div', { className: 'hermes-tp-top' },
       h('h2', null, 'Throughput'),
       h('div', { className: 'hermes-tp-ctl' },
         h(Seg, { label: 'Unit', value: view.unit, options: UNITS, onPick: set('unit'), render: (u) => '/' + u }),
-        h(Seg, { label: 'Range', value: view.range, options: RANGES, onPick: set('range') }),
+        h(Seg, { label: 'Range', value: view.range, options: RANGES, onPick: set('range'), onHover: onHoverRange }),
         h(Seg, { label: 'Tokens', value: view.cache, options: [false, true], onPick: set('cache'), render: (c) => (c ? '+cache' : 'in+out') }))),
     h('div', { className: 'hermes-tp-legend' },
       h('button', { type: 'button', 'data-gw': 'all', className: !filter.solo && !filter.hidden.length ? 'is-solo' : '', onClick: () => setFilter(legendClick(filter, 'all')) }, 'All gateways'),
-      payload.gateways.map((g) => h('button', {
+      frame.gateways.map((g) => h('button', {
         key: g, type: 'button', 'data-gw': g,
         className: [filter.hidden.includes(g) ? 'is-off' : '', filter.solo === g ? 'is-solo' : ''].join(' ').trim(),
         onClick: (e) => setFilter(legendClick(filter, g, e.shiftKey))
       }, h('span', { className: 'hermes-tp-sw', style: { background: colors[g] } }), g)),
       h('span', { className: 'hermes-tp-hint' }, 'click = only \u00b7 \u21e7click = hide')),
-    h(Chart, { id: 'tokens', title: 'Tokens', up: 'tokens', upLabel: view.cache ? 'in+out+cache' : 'in+out', payload, view, gws, colors }),
-    h(Chart, { id: 'sessions', title: 'Sessions', up: 'sess_in', down: 'sess_out', upLabel: 'new', downLabel: 'ended', payload, view, gws, colors }),
-    h(Chart, { id: 'cards', title: 'Cards', up: 'cards_in', down: 'cards_out', upLabel: 'created', downLabel: 'done', payload, view, gws, colors }),
-    h('div', { className: 'hermes-tp-foot' }, `Big numbers = average over the last ${nowWindow(view.range)} min; buckets of ${payload.bucket_s / 60} min.`))
+    ...(payload ? [
+    h(Chart, { key: 'tokens', id: 'tokens', title: 'Tokens', up: 'tokens', upLabel: view.cache ? 'in+out+cache' : 'in+out', payload, view, gws, colors }),
+    h(Chart, { key: 'sessions', id: 'sessions', title: 'Sessions', up: 'sess_in', down: 'sess_out', upLabel: 'new', downLabel: 'ended', payload, view, gws, colors }),
+    h(Chart, { key: 'cards', id: 'cards', title: 'Cards', up: 'cards_in', down: 'cards_out', upLabel: 'created', downLabel: 'done', payload, view, gws, colors }),
+    h('div', { className: 'hermes-tp-foot', key: 'foot' }, `Big numbers = average over the last ${nowWindow(view.range)} min; buckets of ${payload.bucket_s / 60} min.`)
+    ] : [h('div', { className: 'hermes-tp-note hermes-tp-pending', key: 'pending', role: 'status' }, status || `Loading ${view.range}\u2026`)]))
 }
 
 function useVisible() {
@@ -298,13 +303,19 @@ export function Throughput({ ctx }) {
   const [filter, setFilter] = useState({ solo: null, hidden: [] })
   const setView = (v) => { setViewState(v); saveView(v) }
   const visible = useVisible()
+  const fetchRange = (range) => async () => {
+    const body = await ctx.rest(`/v1/series?range=${encodeURIComponent(range)}`, { timeoutMs: REQUEST_TIMEOUT_MS })
+    if (!body || !Array.isArray(body.gateways) || !body.series || !body.bucket_s) throw Error('Invalid throughput response')
+    return body
+  }
+  const client = useQueryClient()
+  // Hovering a range button fetches it ahead of the click, so switching is usually instant.
+  const prefetch = (range) => {
+    if (range !== view.range) client.prefetchQuery({ queryKey: ['throughput', 'series', range], queryFn: fetchRange(range), staleTime: 10000 }).catch(() => {})
+  }
   const query = useQuery({
     queryKey: ['throughput', 'series', view.range],
-    queryFn: async () => {
-      const body = await ctx.rest(`/v1/series?range=${encodeURIComponent(view.range)}`, { timeoutMs: REQUEST_TIMEOUT_MS })
-      if (!body || !Array.isArray(body.gateways) || !body.series || !body.bucket_s) throw Error('Invalid throughput response')
-      return body
-    },
+    queryFn: fetchRange(view.range),
     refetchInterval: visible ? POLL_MS : false,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: false,
@@ -317,8 +328,16 @@ export function Throughput({ ctx }) {
     window.addEventListener('hermes-show-throughput', show)
     return () => window.removeEventListener('hermes-show-throughput', show)
   }, [])
-  const payload = query.data // the previous range's data stays on screen until the new range loads
-  const n = payload ? chipNumbers(payload, view) : null
+  // The chip and the legend keep the last good payload (any range) through a range switch or a failed poll;
+  // the charts draw only the selected range's own data.
+  const last = useRef(null)
+  if (query.data) last.current = query.data
+  const frame = last.current
+  const payload = query.data && !query.isPlaceholderData && query.data.range === view.range ? query.data : null
+  const status = payload ? null : query.error
+    ? `${view.range} unavailable: ${String(query.error.message || query.error).slice(0, 200)}`
+    : `Loading ${view.range}\u2026`
+  const n = frame ? chipNumbers(frame, view) : null
   const label = n ? `${fmt(n.tok)} tok/${view.unit} \u00b7 ${fmt(n.cards)} cards/${view.unit}` : 'Throughput \u2026'
   return h(Popover, { open, onOpenChange: setOpen },
     h(PopoverTrigger, { asChild: true },
@@ -328,8 +347,8 @@ export function Throughput({ ctx }) {
     h(PopoverContent, {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Throughput', className: 'hermes-tp-popover',
       style: { width: 'min(680px, calc(100vw - 24px))', maxHeight: '80vh', overflowY: 'auto' }
-    }, payload
-      ? h(Panel, { payload, view, setView, filter, setFilter })
+    }, frame
+      ? h(Panel, { payload, frame, status, view, setView, filter, setFilter, onHoverRange: prefetch })
       : h('div', { className: 'hermes-tp-note' }, query.error ? `Unavailable: ${String(query.error.message || query.error).slice(0, 200)}` : 'Loading\u2026')))
 }
 
@@ -356,6 +375,7 @@ export const CSS = `
 .hermes-tp-now{display:inline-flex;align-items:baseline;gap:4px}
 .hermes-tp-big{font-size:17px;font-weight:600;font-variant-numeric:tabular-nums}
 .hermes-tp-big.is-down{color:var(--ui-text-secondary)}
+.hermes-tp-pending{padding:24px 0;text-align:center}
 .hermes-tp-lbl,.hermes-tp-foot,.hermes-tp-note{font-size:11px;color:var(--ui-text-tertiary)}
 .hermes-tp-info{margin-left:auto;position:relative;box-sizing:border-box;width:13px;height:13px;border:1px solid var(--ui-text-tertiary);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font:italic 600 9px/1 Georgia,serif;color:var(--ui-text-secondary);cursor:help;align-self:center}
 .hermes-tp-info:hover::after,.hermes-tp-info:focus-visible::after{content:attr(data-tip);position:absolute;right:-2px;top:calc(100% + 5px);z-index:5;padding:4px 8px;border:1px solid var(--ui-stroke-secondary);border-radius:5px;background:var(--ui-bg,#1b1b1f);color:var(--ui-text-primary,inherit);font:normal 400 11px/1.4 system-ui,sans-serif;white-space:normal;width:max-content;max-width:min(360px,calc(100vw - 32px));box-shadow:0 2px 8px rgba(0,0,0,.35);pointer-events:none}

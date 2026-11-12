@@ -217,6 +217,76 @@ test('hover shows per-gateway values and – for gateways without data', async (
   }
 })
 
+// A 6h payload: 72 five-minute buckets ending at END.
+function payload6h() {
+  const p = payload()
+  const map = (o) => Object.fromEntries(Object.entries(o).map(([g, a]) => [g, a && Array.from({ length: 72 }, () => a[0])]))
+  return { ...p, range: '6h', since: END - 21600, bucket_s: 300, series: Object.fromEntries(Object.entries(p.series).map(([m, o]) => [m, map(o)])) }
+}
+const ticks = () => [...document.querySelectorAll('[data-chart="tokens"] .hermes-tp-ticks span')].map((e) => e.textContent)
+
+test('switching range never draws the previous range: loading, then the new window (or its error)', async () => {
+  localStorage.setItem(P.STORE_KEY, JSON.stringify({ unit: 'm', range: '1h', cache: false }))
+  let release
+  const pending = new Promise((res) => { release = res })
+  const ctx = ctxWith((path) => (path.endsWith('range=6h') ? pending : forRange(path)))
+  const ui = await mount(React.createElement(P.Throughput, { ctx }))
+  try {
+    await ui.click(button('Show throughput'))
+    const t1h = ticks()
+    assert.equal(t1h[0], P.timeLabel(END - 3600, '1h'))
+    await ui.click(button('6h'))
+    // the 1h charts are gone while 6h loads; controls stay so the user can switch again
+    assert.equal(document.querySelectorAll('[data-chart]').length, 0)
+    assert.match(document.body.textContent, /Loading 6h/)
+    assert.ok(button('1h') && button('24h'))
+    release(payload6h())
+    await ui.flush()
+    assert.equal(document.querySelectorAll('[data-chart]').length, 3)
+    assert.equal(ticks()[0], P.timeLabel(END - 21600, '6h'))
+    assert.equal(ticks().at(-1), P.timeLabel(END - 300, '6h'))
+  } finally {
+    await ui.close()
+    localStorage.clear()
+  }
+})
+
+test('hovering a range button prefetches it, so the click draws at once', async () => {
+  localStorage.setItem(P.STORE_KEY, JSON.stringify({ unit: 'm', range: '1h', cache: false }))
+  const ctx = ctxWith((path) => (path.endsWith('range=6h') ? payload6h() : forRange(path)))
+  const ui = await mount(React.createElement(P.Throughput, { ctx }), { gcTime: 60000 }) // the app keeps unobserved queries
+  try {
+    await ui.click(button('Show throughput'))
+    await ui.event(button('6h'), 'pointerover', { relatedTarget: document.body })
+    assert.equal(ctx.calls.at(-1)[0], '/v1/series?range=6h')
+    const n = ctx.calls.length
+    await React.act(async () => button('6h').dispatchEvent(new MouseEvent('click', { bubbles: true })))
+    assert.equal(document.querySelectorAll('[data-chart]').length, 3) // no flush: drawn from the prefetch
+    assert.equal(ticks()[0], P.timeLabel(END - 21600, '6h'))
+    assert.equal(ctx.calls.length, n) // fresh prefetch, no second request
+  } finally {
+    await ui.close()
+    localStorage.clear()
+  }
+})
+
+test('a failed range switch shows Unavailable for that range, not the old range', async () => {
+  localStorage.setItem(P.STORE_KEY, JSON.stringify({ unit: 'm', range: '1h', cache: false }))
+  const ctx = ctxWith((path) => { if (path.endsWith('range=24h')) throw Error('timed out'); return forRange(path) })
+  const ui = await mount(React.createElement(P.Throughput, { ctx }))
+  try {
+    await ui.click(button('Show throughput'))
+    await ui.click(button('24h'))
+    assert.equal(document.querySelectorAll('[data-chart]').length, 0)
+    assert.match(document.body.textContent, /24h unavailable: timed out/)
+    await ui.click(button('1h'))
+    assert.equal(document.querySelectorAll('[data-chart]').length, 3)
+  } finally {
+    await ui.close()
+    localStorage.clear()
+  }
+})
+
 test('backend error shows Unavailable, never zeros', async () => {
   const ui = await mount(React.createElement(P.Throughput, { ctx: { rest: async () => { throw Error('404 not found') } } }))
   try {
