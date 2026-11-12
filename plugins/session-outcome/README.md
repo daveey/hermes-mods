@@ -28,7 +28,7 @@ not claimed by this plugin section.
 ## Behavior
 
 - **Tool `session_outcome`.** It is offered only in desktop (including native Local chats whose stored source
-  is `local`), tui and cli chats (a no-cache `check_fn`; the handler also refuses other session sources),
+  is `local`), tui, cli, gui and acp chats (a no-cache `check_fn`; the handler also refuses other session sources),
   and only when core has `hermes_state_outcome`. A bare `local` transport with no session row is not enough.
   Worker/off-switch and subagent exclusions take precedence over a stored interactive source.
   `tests/test_real_core.py::test_bound_local_transport_catalog_and_dispatch` exercises real stored sources,
@@ -58,9 +58,11 @@ not claimed by this plugin section.
     An owning (create/shepherd/origin) sub the chat already has is left as is.
 - **Provider** `user-steps`: user-steps `open_steps(sid)` → `{"decision_items": [...], "waiting_on": []}`, or None
   when the chat has no open steps.
-- **Judge**: is the last assistant message a closing summary? Desktop, tui and cli chats only: any other
-  `source=` (core passes it), or a session row whose source is known and not interactive, gets None with no model
-  call. One call on the subscription pool
+- **Judge**: is the last assistant message a closing summary? Every chat is judged, including a kind never seen
+  before; only a background `source=` (core passes it) or session row (`kanban`, `cron`, `oneshot`, `subagent`,
+  `tool`: `BACKGROUND`) gets None with no model call. An unjudged chat falls to core's length heuristic and shows
+  green on any long reply, so an unlisted kind must fail toward a verdict (kanban-310ed068f0). `INTERACTIVE` and
+  `BACKGROUND` must cover core's `kanban_session_provenance` lists; `tests/test_real_core.py` guards both. One call on the subscription pool
   (`pool-llm`'s `complete`, `anthropic`, `standard` tier, thinking off via `between_tools`, 300 tokens) with a 6 s
   budget. The judge writes one short sentence of reasoning and ends with a YES/NO line; only that last line is read.
   The bare one-token fast-tier answer called clear reports NO ("I posted the reply: <url>", a review ending in its
@@ -137,7 +139,7 @@ also cover receipt passthrough and the older-core warning. Actual Desktop render
 - the gate asks once and passes the second miss (by nudge tag and by the in-memory backup), passes after a tool
   call, on a summary, on an undecided judge, and when a wait or a card's ask outranks; an open user-steps step
   does not vouch for the reply (a NO reply is held, a YES passes), and outside the gate the step still counts;
-- non-interactive sources (cron, slack, Kanban worker) get no tool and no gate; tui and cli do;
+- non-interactive sources (cron, slack, Kanban worker) get no tool and no gate; tui, cli, gui and acp do;
 - a Desktop chat's turn admitted via the gateway `local` platform (no bound source) gets the tool from its
   session row, the same predicate the gate uses, so the gate never asks for a call the chat cannot make;
 - the no-core no-op path.

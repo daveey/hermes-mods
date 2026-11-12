@@ -107,6 +107,11 @@ CASES = [
      "The migration is ready but needs your approval: reply yes to run it against prod.", "NO"),
     ("set up the nightly backup",
      "Which bucket should the backups go to: the prod one or the archive one?", "NO"),
+    # kanban-310ed068f0: an unjudged `local` chat went green on this reply through core's length heuristic; the
+    # judge itself said NO 8/8 on the original.
+    ("is the eval suite built yet?",
+     "No. The requested suite is not built yet. Its hub card is still queued and nobody has claimed it, so nothing "
+     "has run.", "NO"),
 ]
 
 

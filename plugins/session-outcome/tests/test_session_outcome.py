@@ -381,16 +381,20 @@ def test_judge_request_is_capped_and_missing_rows_send_message_only(plugin, home
     assert seen[-1] == "<message>\nDone: shipped, cli.\n</message>"
 
 
-def test_judge_only_interactive_sources(plugin):
+def test_judge_skips_only_background_sources(plugin):
+    """kanban-310ed068f0: an allow-list left new chat kinds (local, later gui/acp) unjudged, so core's heuristic
+    showed them green. Only named background kinds skip the judge; any other kind, even an unknown one, is judged."""
     calls = []
     plugin._llm = lambda s, u: calls.append(u) or "YES"
-    for src in ("slack", "cron", "kanban"):
+    for src in ("cron", "kanban", "oneshot", "subagent", "tool"):
         assert plugin.judge("S1", f"Finished the {src} job.", source=src) is None
-    assert plugin.judge("K1", "Finished the slack job, row source.") is None  # no source kwarg: row says slack
     assert calls == []
     assert plugin.judge("S1", "Deployed and verified.", source="tui") is True
     assert plugin.judge("C1", "Deployed and verified, cli row.") is True
-    assert len(calls) == 2
+    for src in ("gui", "acp", "slack", "never-seen-kind"):
+        assert plugin.judge("S1", f"Finished the {src} work.", source=src) is True
+    assert plugin.judge("K1", "Finished the slack job, row source.") is True  # no source kwarg: row says slack
+    assert len(calls) == 7
 
 
 def test_judge_timeout_returns_none(plugin, monkeypatch):

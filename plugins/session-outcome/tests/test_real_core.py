@@ -66,7 +66,7 @@ def real(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("source,allowed", [
-    ("local", True), ("desktop", True), ("tui", True), ("cli", True),
+    ("local", True), ("desktop", True), ("tui", True), ("cli", True), ("gui", True), ("acp", True),
     ("cron", False), ("kanban", False), ("subagent", False),
     ("oneshot", False), ("slack", False), ("unknown", False),
 ])
@@ -263,3 +263,60 @@ def test_wait_from_a_headless_session_reports_not_linked(real, monkeypatch):
     with kbc.connect_closing() as conn:
         assert kbn.list_notify_subs(conn, tid) == []
     assert res[0] == [] and "not linked" in res[1][0], res
+
+
+# kanban-310ed068f0: a chat whose stored kind was missing from the plugin's hand-written list got no judge verdict,
+# so core's fallback turned this reply green (any 40+ char non-question passes).
+INCIDENT_REPLY = ("No. The requested suite is not built yet. Its hub card is still queued and nobody has claimed it, "
+                  "so nothing has run.")
+
+
+@pytest.mark.parametrize("source", ["gui", "acp", "desktop", "local", "brand-new-chat-kind"])
+def test_unlisted_chat_kind_is_judged_not_heuristic_green(real, tmp_path, source):
+    from hermes_state import SessionDB
+
+    so, plugin = real
+    calls = []
+    plugin._llm = lambda s, u: calls.append(u) or "NO"
+    sid = f"chat-{source}"
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(sid, source=source)
+        db.append_message(sid, role="user", content="Is the suite built?")
+        db.append_message(sid, role="assistant", content=INCIDENT_REPLY)
+    finally:
+        db.close()
+    out = so.derive_outcome(sid, ignore_live_turn=True)
+    assert calls, f"{source}: no judge call; core fell back to its heuristic"
+    assert out["kind"] == "unresolved", out
+
+
+@pytest.mark.parametrize("source", ["kanban", "cron", "oneshot", "subagent", "tool"])
+def test_background_kinds_are_not_judged(real, source):
+    so, plugin = real
+    calls = []
+    plugin._llm = lambda s, u: calls.append(u) or "NO"
+    assert plugin.judge("bg", INCIDENT_REPLY, source=source) is None
+    assert calls == []
+
+
+def test_every_core_session_kind_is_classified(real):
+    """Guard: core's chat and machine kinds (kanban_session_provenance) must be judged / skipped by the plugin, so a
+    kind core adds later can't silently fall back to the heuristic's green, and no kind sits in neither list."""
+    import ast
+
+    so, plugin = real
+    path = CORE / "hermes_cli" / "kanban_session_provenance.py"
+    lists = {}
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            if node.targets[0].id in ("_INTERACTIVE_SOURCES", "MACHINE_SESSION_SOURCES"):
+                lists[node.targets[0].id] = set(ast.literal_eval(node.value.args[0]))
+    assert set(lists) == {"_INTERACTIVE_SOURCES", "MACHINE_SESSION_SOURCES"}, f"core lists moved: {lists}"
+    chats, machines = lists["_INTERACTIVE_SOURCES"], lists["MACHINE_SESSION_SOURCES"]
+    assert not chats - plugin.INTERACTIVE, f"core chat kinds without the end-of-turn check: {chats - plugin.INTERACTIVE}"
+    assert not machines - plugin.BACKGROUND, f"core machine kinds the judge would call: {machines - plugin.BACKGROUND}"
+    assert not plugin.INTERACTIVE & plugin.BACKGROUND
+    plugin._llm = lambda s, u: "NO"
+    for kind in sorted(chats):
+        assert plugin.judge("guard", f"{INCIDENT_REPLY} ({kind})", source=kind) is False, kind

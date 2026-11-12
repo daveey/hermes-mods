@@ -3,7 +3,7 @@
 Contract: side-session-notes session-outcome-contract.md, "Mods". Core owns storage and derivation
 (``hermes_state_outcome``); this plugin only feeds it:
 
-- tool ``session_outcome`` (desktop/tui/cli chats only): ``done`` (summary), ``decide`` (questions with >=2 choices,
+- tool ``session_outcome`` (desktop/tui/cli/gui/acp chats only): ``done`` (summary), ``decide`` (questions with >=2 choices,
   written to the user-steps ledger first, so the For you tiles show them) or ``wait`` (named cards, processes,
   cron, times, capacity or subagents). Each call is ``declare_outcome(sid, outcome)``. A ``wait`` on a card found on
   this gateway's boards also shepherd-subscribes the chat to it (``via: outcome-wait``), so the chat's task list
@@ -43,7 +43,13 @@ log = logging.getLogger("session-outcome")
 
 TOOL = "session_outcome"
 TOOLSET = "session_outcome"
-INTERACTIVE = frozenset({"desktop", "local", "tui", "cli"})
+# Chats that get the tool and the end-of-turn check. Must cover core's chat kinds
+# (hermes_cli/kanban_session_provenance._INTERACTIVE_SOURCES); tests/test_real_core.py guards it.
+INTERACTIVE = frozenset({"desktop", "local", "tui", "cli", "gui", "acp"})
+# The only kinds the judge skips. Every other stored kind, including one never seen before, is judged: a kind left
+# unjudged falls to core's length heuristic and shows green on "No, not built yet" (kanban-310ed068f0). Must cover
+# core's MACHINE_SESSION_SOURCES.
+BACKGROUND = frozenset({"kanban", "cron", "oneshot", "subagent", "tool"})
 WAIT_KINDS = ("card", "process", "cron", "time", "capacity", "subagent")
 JUDGE_BUDGET_S = 6.0  # thinking off, a standard-tier reason-then-verdict call measured 1.4-3.6 s on the hub
 # The gate runs inside a busy Desktop serve process (a 30 s pre_final_gate limit, reply already buffered), where the
@@ -165,7 +171,7 @@ def _interactive(platform: str = "", session_id: str = "") -> bool:
 
 
 def check_fn() -> bool:
-    """Offer the tool only to desktop/tui/cli chats, and only when core can store the outcome. The bound
+    """Offer the tool only to INTERACTIVE chats, and only when core can store the outcome. The bound
     session's stored source decides first, exactly as in the gate: a Desktop chat's turn admitted through
     the gateway's ``local`` platform (cross-session send, notice) binds no HERMES_SESSION_SOURCE, so the
     bare surface reads ``local`` and would hide the tool the gate then asks the chat to call."""
@@ -361,7 +367,7 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
         if not session_id:
             return _err("no session")
         if not _interactive(session_id=session_id):
-            return _err("session_outcome is only for desktop, tui and cli chats")
+            return _err("session_outcome is only for desktop, tui, cli, gui and acp chats")
         try:
             spec = _validate(args if isinstance(args, dict) else {})
         except ValueError as exc:
@@ -722,13 +728,13 @@ def _with_budget(fn: Callable[[], Any], budget: float) -> Any:
 def judge(session_id: str, last_assistant_text: str, *, source: Optional[str] = None) -> Optional[bool]:
     """True = a closing summary, False = not, None = can't tell (core uses its heuristic).
 
-    Only desktop/tui/cli chats are judged: any other ``source`` (or, when core passes none, a session row whose
-    source is known and not interactive) gets None without a model call."""
+    Every chat is judged; only a BACKGROUND ``source`` (or, when core passes none, a session row whose source is
+    BACKGROUND) gets None without a model call. An unlisted kind fails toward a verdict, not toward green."""
     text = last_assistant_text if isinstance(last_assistant_text, str) else ""
     if not text.strip():
         return None
     src = str(source or "").strip().lower() or _row_source(session_id)
-    if src and src not in INTERACTIVE:
+    if src in BACKGROUND:
         return None
     request = _last_request(session_id)
     key = (session_id, hashlib.sha1(f"{request}\0{text}".encode("utf-8", "replace")).hexdigest())
