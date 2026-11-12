@@ -72,11 +72,16 @@ def test_native_queue_drain_owner(owner, consumer, monkeypatch, control):
         rows = db.get_messages_as_conversation(SID, include_row_ids=True)
         canonical = rows[-2]
         assert canonical['role'] == 'user' and canonical['content'] == text
-        assert canonical['_row_id'] != queued['_row_id']
         assert not (canonical.get('display_metadata') or {}).get('_queued_prompt')
-        assert queued['_row_id'] not in {row['_row_id'] for row in rows}
-        all_rows = db.get_messages_as_conversation(SID, include_inactive=True, include_row_ids=True)
-        assert queued['_row_id'] in {row['_row_id'] for row in all_rows}
+        # Core either adopts the accept-time row in place (nothing landed after it: the guarded UPDATE
+        # drops the marker on that same row) or re-places it at the end and deactivates the early row.
+        # Both leave exactly one active, unmarked user row for the prompt.
+        assert [r['_row_id'] for r in rows if r['role'] == 'user' and r['_row_id'] >= queued['_row_id']] \
+            == [canonical['_row_id']]
+        if canonical['_row_id'] != queued['_row_id']:
+            assert queued['_row_id'] not in {row['_row_id'] for row in rows}
+            all_rows = db.get_messages_as_conversation(SID, include_inactive=True, include_row_ids=True)
+            assert queued['_row_id'] in {row['_row_id'] for row in all_rows}
         check(control != 'mismatch')
         if control == 'newer':
             _busy(session, in_flight=REQUEST)
