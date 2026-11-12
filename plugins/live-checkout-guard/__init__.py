@@ -147,11 +147,57 @@ def classify(tool_name: str, args: Any, task_id: str = "") -> Optional[str]:
     return None
 
 
+def _load_sibling(file: str):
+    """Fresh, bytecode-free load of a sibling module (an edit is live on the next call)."""
+    path = _Path(__file__).with_name(file)
+    loader = _DecisionSourceLoader(__name__ + "." + file[:-3], str(path))
+    spec = _import_util.spec_from_file_location(loader.name, path, loader=loader)
+    assert spec is not None and spec.loader is not None
+    module = _import_util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def _skill_finder():
+    """Core's skill lookup (same precedence and external_dirs as skill_manage itself), or None outside core."""
+    try:
+        from tools.skill_manager_tool import _find_skill
+    except Exception:
+        return None
+    return _find_skill
+
+
+def _overlap_checker(mod):
+    return mod.Checker(deadline=8.0)   # bounded: the hook delays the tool call
+
+
+def _skill_overlap(tool_name: str, args: Any) -> Optional[str]:
+    """Refuse a shared skill_manage mutation of a file an open PR changes (pr_overlap.py). Only a confirmed
+    overlap blocks; an unknown lookup allows the edit and the skills publisher holds it instead."""
+    if tool_name.removeprefix("mcp__") != "skill_manage" or not isinstance(args, dict):
+        return None
+    if os.environ.get("SKILL_PR_OVERLAP_GUARD", "1").strip().lower() in {"0", "false", "off", "no"}:
+        return None
+    finder = _skill_finder()
+    if finder is None:
+        return None
+    mod = _load_sibling("pr_overlap.py")
+    return mod.check_skill_manage(args, finder, _overlap_checker(mod))
+
+
 @_with_decisions
 def _pre_tool_call(tool_name: str = "", args: Any = None, task_id: str = "", **_: Any) -> Optional[dict]:
     try:
         if not guard.enabled():
             return None
+        try:
+            overlap = _skill_overlap(tool_name, args)
+        except Exception:
+            logger.debug("live-checkout-guard: PR overlap check failed", exc_info=True)
+            overlap = None
+        if overlap:
+            logger.info("live-checkout-guard blocked %s: open-PR overlap", tool_name)
+            return {"action": "block", "message": overlap}
         why = classify(tool_name, args, str(task_id or ""))
     except Exception:  # never let this plugin break a tool call
         logger.debug("live-checkout-guard classify failed", exc_info=True)
@@ -170,12 +216,7 @@ def _post_tool_call(tool_name: str = "", args: Any = None, result: Any = None,
     try:
         if not guard.enabled():
             return
-        path = _Path(__file__).with_name("skill_publish.py")
-        loader = _DecisionSourceLoader(__name__ + ".skill_publish", str(path))
-        spec = _import_util.spec_from_file_location(loader.name, path, loader=loader)
-        assert spec is not None and spec.loader is not None
-        module = _import_util.module_from_spec(spec)
-        loader.exec_module(module)
+        module = _load_sibling("skill_publish.py")
         root = _Path(guard.root())
         paths = module.written_paths(args if isinstance(args, dict) else {}, result, root)
         if not paths:

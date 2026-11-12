@@ -69,7 +69,17 @@ there and the updater skipped every pass for 1h25m. Tests: `tests_core_root.py`.
   even when built dynamically. Plain Python (`subprocess`, `open`, `os.*`) with non-literal arguments is not: this
   guard is not a sandbox for arbitrary code.
 - `tool_call` / `mcp__tool_call` batches are unwrapped and each call checked.
-- `skill_manage` remains allowed by the pre-call guard. Its successful documentation writes are
+- `skill_manage` remains allowed by the pre-call guard, except an **open-PR overlap**: a mutating op
+  (edit/patch/write_file/remove_file/delete, flat or batched) on an existing skill inside a GitHub-backed clone is
+  checked against the open PRs into that clone's upstream branch (`pr_overlap.py`: repo from `remote.origin.url`,
+  base from `@{u}`, path relative to the clone). A file in an open PR's file list is refused with the PR number and
+  URL, and the writer is told to send the note to the PR's owner instead (editing the shared copy changes the PR's
+  base, forcing a reconciliation and another exact-head review). Only a confirmed overlap blocks: an unavailable or
+  incomplete lookup (HTTP error, rate limit, 8 s deadline, truncated pagination) allows the edit, and the skills
+  publisher (state `hosts/hermes-hub/skills-sync/skills_sync.sh`, the same `pr_overlap.py check` CLI) holds it
+  uncommitted instead and retries. Reads are cached in `~/.hermes/cache/pr-overlap/` (PR list 120 s, files per head
+  sha). Token: `GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth token`. Escape hatch for a user-approved edit:
+  `SKILL_PR_OVERLAP_GUARD=0`. Tests: `tests_pr_overlap.py`. Its successful documentation writes are
   published by the post-call observer described below; failures never turn a successful tool result into an error.
 - Claude Code: `claude_hook.py` is a PreToolUse hook for `Bash` and `Write|Edit|MultiEdit|NotebookEdit`.
   Install: `python3 plugins/live-checkout-guard/claude_hook.py --install [--settings PATH]` (idempotent; default
