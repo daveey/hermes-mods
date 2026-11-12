@@ -80,6 +80,18 @@ def test_display_label_recommendation_and_fallback(tmp_path):
     assert view['recommendedChoiceId'] == 'card-0'
 
 
+@pytest.mark.parametrize('marked,expected', [((1,), 'card-1'), ((2,), 'card-2'), ((0, 2), None), ((), None)])
+def test_display_label_recommendation_on_any_single_choice(tmp_path, marked, expected):
+    mirror, store, path, hr = fixture(tmp_path)
+    for i in marked:
+        hr['choices'][i]['label'] += ' (Recommended)'
+    with sqlite3.connect(path) as c:
+        c.execute('UPDATE tasks SET human_request=?', (json.dumps(hr),))
+    mirror.reconcile(OWNER)
+    view = mirror.present(store.requests(OWNER)[0])['presentation']
+    assert view['recommendedChoiceId'] == expected
+
+
 @pytest.mark.parametrize('case', ['owner', 'revision', 'blank', 'unbound', 'revised'])
 def test_other_rejects_invalid_authority(tmp_path, case):
     mirror, store, path, _ = fixture(tmp_path)

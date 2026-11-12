@@ -247,8 +247,12 @@ class Mirror:
         options = hr.get('choices') or []
         recommended = next((f'card-{i}' for i, opt in enumerate(options)
                             if opt.get('recommended') is True), None)
-        if recommended is None and options and re.search(r'\(recommended\)\s*$', options[0]['label'], re.I):
-            recommended = 'card-0'
+        if recommended is None:
+            # kanban_create's choice schema carries only label/value, so a label is how asks mark their pick.
+            marked = [i for i, opt in enumerate(options)
+                      if re.search(r'\(recommended\)\s*$', str(opt.get('label') or ''), re.I)]
+            if len(marked) == 1:
+                recommended = f'card-{marked[0]}'
         details = '\n\n'.join(str(hr[k]) for k in ('action', 'why_human', 'scope', 'evidence') if hr.get(k))
         return dict(request, presentation=dict(kind='kanban-question', question=question,
                     details=details, recommendedChoiceId=recommended, other=True,
