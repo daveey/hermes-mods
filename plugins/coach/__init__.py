@@ -445,6 +445,14 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         if profiler.blocked(tool_name, args):
             store.log({"event": "agent_block", "rule": "profiler_safety", "tool": tool_name})
             return {"action": "block", "message": profiler.MESSAGE}
+        try:  # a count/LIKE steer-ACK poll matches the steer itself (steer_receipt_guard.py)
+            steer = _load("steer_receipt_guard")
+            if steer.blocked(tool_name, args):
+                store.log({"event": "agent_block", "rule": "steer_receipt", "tool": tool_name,
+                           "session": session_id})
+                return {"action": "block", "message": steer.MESSAGE}
+        except Exception as exc:
+            log.debug("coach steer_receipt_guard: %s", exc)
         msg = _future_clock(session_id, tool_name, args)
         if msg:
             return {"action": "block", "message": msg}

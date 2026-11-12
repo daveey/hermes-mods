@@ -136,6 +136,17 @@ script contents and general shell evaluation are not covered; this is not a sand
 `tests/test_profiler_safety.py` exercises both tool entry paths and the registered hook,
 with safe/non-executing controls and redirection/wrapper regressions.
 
+## Steer ACK polls
+
+`pre_tool_call` refuses (`agent_block rule=steer_receipt`, `steer_receipt_guard.py`) a presence/aggregate probe
+(`count`/`exists`/`total`/`sum`, `select 1`) over `task_comments` whose body filter (`LIKE`/`GLOB`/`instr`) names
+an ACK token. A mid-run steer carries its own reply token, so that poll counts the request as the worker's
+acknowledgement and never checks delivery. The block message points at the kanban-orchestrator skill's read-only
+`scripts/steer_receipt.py`, which reports posted / delivered / acknowledged separately. Row reads
+(`select id, author, body …`) stay allowed. Covered paths: terminal command text (ssh/`bash -lc` escapes
+normalized) and `execute_code` source text; this keys on the demonstrated shape, not general SQL analysis.
+`tests/test_steer_receipt_guard.py` exercises both paths and the registered hook.
+
 ## Long wait before the first reply
 
 `pre_tool_call` refuses (`agent_block rule=long_wait_pending_reply`, `long_wait.py`) one foreground wait of 60 s or
