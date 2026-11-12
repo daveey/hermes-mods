@@ -317,3 +317,23 @@ test('warm caches another chat\'s cards without touching the focused snapshot; a
     assert.deepEqual(m.cachedChips(scopeOf('chat-bg')).kanban.map(c => c.id), ['t_bg'], 'last good copy kept, no warning chip cached')
   } finally { dispose(); delete globalThis.window; delete host.request }
 })
+
+test('a hub-sync replica card is explicit unknown with a replica reason, aged from its source activity, never synced_at', () => {
+  const now = Date.now() / 1000
+  // Exact hubview.session_links row shape: a current producer that carries no execution_observations.
+  const row = { id: 't_remote', title: 'remote', status: 'running', reported_status: 'running', profile: 'default',
+    ownership_state: 'qualified', board: 'default', session_id: 's', via: 'created', gateway: 'hub-ec2', local: false,
+    stale: false, synced_at: now - 5, activity_at: now - 300 }
+  const [chip] = m.hubLinkChips([row])
+  assert.equal(chip.replica, true)
+  assert.equal(chip.observations, null)
+  assert.equal(m.cardRowModel(chip).status, 'unknown')
+  const v = m.unobservedView(chip, now)
+  assert.deepEqual([v.state, v.reason, v.lastKnown, v.sourced], ['unknown', m.REPLICA_REASON, 'running', false])
+  assert.ok(Math.abs(v.ageSec - 300) < 1, 'age from activity_at (source clock), not synced_at (copy time)')
+  assert.equal(m.unobservedView({ ...chip, activityAt: 0 }, now).ageSec, null, 'no source clock: no age')
+  // A live-route row from an older producer keeps the legacy reason.
+  const [legacy] = m.sessionTaskChips([{ ...row, local: true, gateway: '' }])
+  assert.equal(legacy.replica, undefined)
+  assert.equal(m.unobservedView(legacy, now).reason, 'producer_sent_no_observations')
+})

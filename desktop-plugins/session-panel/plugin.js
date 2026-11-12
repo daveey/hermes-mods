@@ -125,6 +125,16 @@ const missingView = (reason, extra = {}) => ({
 
 const classOf = c => c || 'sidebar'
 
+/** No observations array: a hermes-hub replica row (not source evidence; ages from the card's own last activity,
+ *  never `synced_at`) or an older producer. Mirrors session-tasks' `unobservedView`. */
+const REPLICA_REASON = 'hub_replica_not_source_evidence'
+function unobservedView(chip, nowSec) {
+  const lastKnown = chip?.kind === 'kanban' ? str(chip.state) || null : null
+  if (!chip?.replica) return missingView('producer_sent_no_observations')
+  const at = Number(chip.activityAt)
+  return missingView(REPLICA_REASON, { lastKnown, ageSec: at > 0 && Number.isFinite(at) ? Math.max(0, nowSec - at) : null })
+}
+
 /** One record -> view. */
 export function projectView(record, nowSec, sourceClass = 'sidebar', sdk = observationSdk(), expectedIdentity) {
   if (!sdk) return missingView('sdk_projector_unavailable')
@@ -149,7 +159,7 @@ export function summaryView(records, nowSec, sourceClass = 'sidebar', sdk = obse
 export function chipObservation(chip, nowSec, { sdk = observationSdk(), sourceClass = 'sidebar' } = {}) {
   if (!sdk) return missingView('sdk_projector_unavailable')
   const split = splitObservations(chip?.observations)
-  if (!split.present) return missingView('producer_sent_no_observations')
+  if (!split.present) return unobservedView(chip, nowSec)
   const candidates = split.work.filter(r => {
     const id = obsOwn(r, 'identity')
     const kind = chip.kind === 'bg' ? 'process' : chip.kind === 'sub' ? 'subagent' : 'card'
@@ -249,7 +259,7 @@ export function trackSubagents(chips, nowMs, memory) {
 const TERMINAL = new Set(['done', 'archived', 'cancelled', 'canceled', 'resolved', 'withdrawn'])
 const LEGACY_LIVE = new Set(['running', 'review', 'ready', 'todo'])
 const NO_OBSERVATIONS = 'producer_sent_no_observations'
-const legacyLive = (c, ev) => ev?.reason === NO_OBSERVATIONS && c?.kind === 'kanban' && c.look !== 'needs-you' && LEGACY_LIVE.has(str(c.state))
+const legacyLive = (c, ev) => (ev?.reason === NO_OBSERVATIONS || ev?.reason === REPLICA_REASON) && c?.kind === 'kanban' && c.look !== 'needs-you' && LEGACY_LIVE.has(str(c.state))
 export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false, presentationFor = () => null, evidence = () => null } = {}) {
   const now = nowMs / 1000
   const out = { active: [], stuck: [], waiting: [], ready: [], queued: [], unasked: [], lastActivity: 0 }
