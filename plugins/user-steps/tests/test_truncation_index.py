@@ -8,7 +8,13 @@ the ids and titles in the hidden middle, so a stale ask stayed in the user's que
 import pytest
 from test_withdrawal import ROOT, OWNER, complete_request, decision, load_module
 
-spill = pytest.importorskip("tools.hook_output_spill")
+
+@pytest.fixture
+def spill():
+    """Core's spill module. Only the tests that check the spilled view need it: CI has no core checkout, and a
+    module-level importorskip skipped the direct _open_asks_index tests there as well."""
+    return pytest.importorskip("tools.hook_output_spill")
+
 
 TITLES = [
     "Delete the mini CI runner's unused 7.5 GB folder for the repo's old name",
@@ -28,7 +34,7 @@ def _plugin(tmp_path, monkeypatch, name):
     return plugin
 
 
-def _visible_head(text):
+def _visible_head(spill, text):
     """What the agent sees of the head after core's spill (the same config path turn_context uses)."""
     shown = spill.spill_if_oversized(text, session_id="session-a", source="plugin hook",
                                      config=spill.get_spill_config())
@@ -50,18 +56,18 @@ def _seed(plugin, n, scope_chars=5000):
     return reqs
 
 
-def test_open_asks_survive_head_tail_truncation(tmp_path, monkeypatch):
+def test_open_asks_survive_head_tail_truncation(tmp_path, monkeypatch, spill):
     plugin = _plugin(tmp_path, monkeypatch, "truncation_index_hook")
     reqs = _seed(plugin, 3)
     context = plugin.pre_llm_call(session_id="session-a", platform="desktop")["context"]
     assert "Canonical user decisions" in context  # the recorded decision is in the same hook output
-    head = _visible_head(context)
+    head = _visible_head(spill, context)
     for r in reqs:
         assert r["requestId"][:8] in head, head
         assert r["title"][:30] in head, head
 
 
-def test_index_caps_entries_and_fits_head_budget(tmp_path, monkeypatch):
+def test_index_caps_entries_and_fits_head_budget(tmp_path, monkeypatch, spill):
     plugin = _plugin(tmp_path, monkeypatch, "truncation_index_cap_hook")
     reqs = _seed(plugin, 7)
     context = plugin.pre_llm_call(session_id="session-a", platform="desktop")["context"]
@@ -71,7 +77,7 @@ def test_index_caps_entries_and_fits_head_budget(tmp_path, monkeypatch):
     shown = [r for r in reqs if r["requestId"][:8] in index]
     assert 1 <= len(shown) <= 5 and shown == reqs[:len(shown)]
     assert f"+{7 - len(shown)} more" in index
-    assert index in _visible_head(context)
+    assert index in _visible_head(spill, context)
     # The rest of the note is unchanged after the index line.
     assert context.split("\n", 1)[1].startswith("[Canonical requests awaiting a user decision: this list grants NO")
 
