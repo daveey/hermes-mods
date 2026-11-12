@@ -526,6 +526,46 @@ def render_cards(cards: list[dict], replica=None) -> str:
     return "\n".join(lines)
 
 
+def newer_waiting_comment(card: dict, session_id: str) -> str:
+    """Newest post-block evidence from another writer; unreadable history adds nothing."""
+    if not card.get("db"):
+        return ""
+    try:
+        c = _ro(Path(card["db"]))
+        try:
+            blocked = c.execute(
+                "select max(created_at) from task_events where task_id=? and kind='blocked'",
+                (card["id"],)).fetchone()[0]
+            if blocked is None:
+                return ""
+            comments = c.execute(
+                "select id, author, body, created_at from task_comments "
+                "where task_id=? and created_at>? order by created_at desc, id desc",
+                (card["id"], blocked)).fetchall()
+            own = set()
+            for (raw,) in c.execute(
+                    "select payload from task_events where task_id=? and kind='commented'",
+                    (card["id"],)):
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    return ""
+                if payload.get("writer_session") == session_id:
+                    own.add(payload.get("comment_id"))
+            for cid, author, body, ts in comments:
+                if cid in own:
+                    continue
+                when = datetime.fromtimestamp(ts, _PT).strftime("%H:%M PT")
+                author = " ".join(str(author or "").split())[:40]
+                body = " ".join(str(body or "").split())[:160]
+                return (f' — newer comment {when} from {author}: "{body}" '
+                        '(the premise may have changed: read it before reporting this card as waiting)')
+        finally:
+            c.close()
+    except (sqlite3.Error, ValueError, TypeError, OverflowError, OSError):
+        pass
+    return ""
+
+
 def l1_block(session_id: str, ledger: "Ledger | None", db_paths: list[Path] | None = None) -> str | None:
     cards = linked_cards(session_id, db_paths=db_paths)
     answered = ledger.relevant(session_id, limit=8) if ledger else []
@@ -542,7 +582,8 @@ def l1_block(session_id: str, ledger: "Ledger | None", db_paths: list[Path] | No
         parts.append("Cards linked to this chat:\n" + render_cards(cards))
     waiting = waiting_on_david(cards)
     if waiting:
-        parts.append("Waiting on David now:\n" + "\n".join(f"- {x['id']}: {card_ask(x)}" for x in waiting))
+        parts.append("Waiting on David now:\n" + "\n".join(
+            f"- {x['id']}: {card_ask(x)}{newer_waiting_comment(x, session_id)}" for x in waiting))
     if answered:
         parts.append("Asks David has already answered or dismissed (do not ask these again):\n" + "\n".join(
             f"- {a['topic'][:120]} -> {a['answer'][:120]} ({fmt_ts(a['ts'])})" for a in answered))
