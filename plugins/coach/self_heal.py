@@ -908,7 +908,48 @@ def _log_text(tool_log, n=25, chars=2500) -> str:
     return render_tool_log(calls, chars) if calls else "(no tool calls)"
 
 
-def complaint_prompt(prev_reply: str, user_text, tool_log=None, context: str = "") -> str:
+RESTRAINT_RE = re.compile(
+    r"\b(?:don'?t|do not|dont|never|must not|mustn'?t|shouldn'?t|should not|no need to|not to|without|only (?:document|read|"
+    r"draft|propose|plan|report)|stop short of|leave (?:it|that|them) (?:alone|to me))\b", re.I)
+SCOPE_MAX_ENTRIES, SCOPE_MAX_CHARS, SCOPE_SNIP = 6, 1800, 140
+
+
+def _row_user_text(m) -> str:
+    return clean_user(m.get("content")) if isinstance(m, dict) and m.get("role") == "user" else ""
+
+
+def is_ack_snippet(text, m) -> bool:
+    """A bare "don't worry" / "no need to apologise" is not a scope limit."""
+    return bool(re.match(r"(?:don'?t|do not|no need to)\s+(?:worry|apologi[sz]e|rush|stress)",
+                         text[m.start():m.start() + 24], re.I))
+
+
+def request_scope(history, current=None) -> str:
+    """Earlier user instructions that limit what the agent may do ("document it, don't create it"), oldest first,
+    so a complaint judge does not call a wait the user imposed an agent-owned block (agent-d086774bf9).
+    A restraint is shown as the snippet around its wording (never the whole message: no transcript dump); user
+    messages AFTER the first restraint follow in order as short heads, so a later explicit change of instruction
+    is visible and neither overrides the other retroactively. "" when no earlier user message restrains."""
+    rows = [t for t in (_row_user_text(m) for m in (history or [])) if t]
+    cur = clean_user(current) if current is not None else ""
+    if rows and cur and rows[-1] == cur:
+        rows = rows[:-1]  # the hook's history may already end with the message being judged
+    out, seen = [], False
+    for i, t in enumerate(rows, 1):
+        hits = [m for m in RESTRAINT_RE.finditer(t) if not is_ack_snippet(t, m)]
+        if hits:
+            seen = True
+            lo, hi = max(0, hits[0].start() - SCOPE_SNIP), min(len(t), hits[-1].end() + SCOPE_SNIP)
+            out.append(f"[user message {i}/{len(rows)}, restraint] ...{t[lo:hi].strip()}...")
+        elif seen:
+            out.append(f"[user message {i}/{len(rows)}] {t[:240].strip()}")
+    if not seen:
+        return ""
+    out = out[:1] + out[1:][-(SCOPE_MAX_ENTRIES - 1):]  # keep the first restraint and the newest entries
+    return "\n".join(out)[:SCOPE_MAX_CHARS]
+
+
+def complaint_prompt(prev_reply: str, user_text, tool_log=None, context: str = "", scope: str = "") -> str:
     """`context` (digest backstop only): the session title and earlier user messages, for turns whose previous agent
     reply is unknown. Without it a context-free report (\"why didnt this work [screenshot]\") reads as a new issue."""
     ctx = f"SESSION CONTEXT (from a digest):\n{context[:2200]}\n\n" if context else ""
@@ -917,7 +958,10 @@ def complaint_prompt(prev_reply: str, user_text, tool_log=None, context: str = "
     # "made no tool calls" (agent-b6540f8eef). The count, when known, is in the session context.
     log = (_log_text(tool_log) if tool_log or not context
            else "(not available from a digest; see \"Tool calls after the agent's last text\" above)")
-    return (f"{ctx}AGENT'S PREVIOUS FINAL MESSAGE:\n{prev[-3000:]}\n\n"
+    sc = ("EARLIER USER INSTRUCTIONS THAT LIMIT THE AGENT (oldest first; a later message changes an earlier limit "
+          "only if it says so, and never makes the earlier restraint a fault):\n"
+          f"{scope[:SCOPE_MAX_CHARS]}\n\n") if scope else ""
+    return (f"{ctx}{sc}AGENT'S PREVIOUS FINAL MESSAGE:\n{prev[-3000:]}\n\n"
             f"TOOL LOG OF THE AGENT'S PREVIOUS TURN:\n{log}\n\n"
             f"USER'S NEW MESSAGE:\n{clean_user(user_text)[:2000]}")
 
@@ -994,12 +1038,12 @@ def _ask(llm: Callable[[str, str], str], system: str, prompt: str, tries: int = 
 
 def complaint_verdict(prev_reply: str, user_text, llm: Callable[[str, str], str], tool_log=None,
                       confirm: Optional[Callable[[str, str], str]] = None, context: str = "",
-                      trace: Optional[dict] = None) -> Optional[dict]:
+                      trace: Optional[dict] = None, scope: str = "") -> Optional[dict]:
     """The complaint cascade, before the threshold: judge (COMPLAINT_SYS); below GATE stop there. Otherwise a second
     flash opinion (COMPLAINT_STRICT_SYS) and, when configured, the confirm model on COMPLAINT_SYS; p_defect = the mean
     of the stage scores (a non-defect kind scores 0; a stage with no answer after a retry is left out, since counting
     it as 0 halved real catches). Component/symptom come from the strongest stage."""
-    prompt = complaint_prompt(prev_reply, user_text, tool_log, context)
+    prompt = complaint_prompt(prev_reply, user_text, tool_log, context, scope)
     system = _with_profile(COMPLAINT_SYS)
     v1 = _ask(llm, system, prompt, trace=trace, stage="s1")
     if not v1:
@@ -1028,7 +1072,8 @@ def complaint_verdict(prev_reply: str, user_text, llm: Callable[[str, str], str]
 def detect_complaint(prev_reply: str, user_text, llm: Optional[Callable[[str, str], str]] = None,
                      threshold: float = THRESHOLD, tool_log=None,
                      confirm: Optional[Callable[[str, str], str]] = None, context: str = "",
-                     gap_s: Optional[float] = None, trace: Optional[dict] = None) -> Optional[dict]:
+                     gap_s: Optional[float] = None, trace: Optional[dict] = None,
+                     scope: str = "") -> Optional[dict]:
     """pre_llm_call path: core's resume note (backend stopped mid-turn) is a machine signal; otherwise prefilter,
     then the cascade (complaint_verdict) on (previous reply + its turn's tool log, user message). Returns
     {p_defect, kind, component, symptom, fingerprint, source, stages} or None. Fail-open; with `trace` it records
@@ -1045,7 +1090,7 @@ def detect_complaint(prev_reply: str, user_text, llm: Optional[Callable[[str, st
         if not prefilter(user_text):
             t["outcome"] = "prefiltered"
             return None
-        v = complaint_verdict(prev_reply, user_text, llm or aux_judge, tool_log, confirm, context, trace=t)
+        v = complaint_verdict(prev_reply, user_text, llm or aux_judge, tool_log, confirm, context, trace=t, scope=scope)
         if not v:
             ex = t.get("exhausted") or [{}]
             t["outcome"] = "error" if ex[0].get("raised") else "no_opinion"

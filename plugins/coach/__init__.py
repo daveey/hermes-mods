@@ -63,6 +63,15 @@ def _last_assistant(history) -> str:
     return ""
 
 
+def _request_scope(history, user_message) -> str:
+    """Earlier user restraints for the complaint judge (self_heal.request_scope); fail-open."""
+    try:
+        return _load("self_heal").request_scope(history, user_message)
+    except Exception as exc:
+        log.debug("coach request scope unavailable: %s", exc)
+        return ""
+
+
 # Bootstrap the stateless helper without relying on a package name or sys.path.
 _cache_spec = importlib.util.spec_from_file_location("_coach_module_cache", _HERE / "module_cache.py")
 assert _cache_spec and _cache_spec.loader
@@ -189,7 +198,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             _selfheal_run(_selfheal_complaint, session_id, user_message,
                           prev or _last_assistant(conversation_history), platform, parent_session_id,
                           list(coach.loop_state(session_id).get("last_log") or []),
-                          (turn_at - last_seen) if isinstance(last_seen, (int, float)) else None, turn_at)
+                          (turn_at - last_seen) if isinstance(last_seen, (int, float)) else None, turn_at,
+                          _request_scope(conversation_history, user_message))
             loop_hint = _fix_loop(session_id, user_message, turn)
             relay_hint = _relay_repeat(session_id, user_message, platform, parent_session_id)
             plain_hint = _status_plain(session_id, user_message, platform, parent_session_id)
@@ -632,7 +642,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         return None if selfheal_llm else sh.confirm_judge()
 
     def _selfheal_complaint(session_id, user_message, prev, platform="", parent_session_id="", tool_log=None,
-                            gap_s=None, turn_at=None):
+                            gap_s=None, turn_at=None, scope=""):
         # Every judged turn leaves a `selfheal_judged` row (outcome, score, stages, error), and a failure anywhere
         # in here is a row too: a week-long judge outage once looked exactly like "no complaints" (plugin-89461de0ed).
         sh, trace, started = None, {}, time.time()
@@ -655,7 +665,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                "why": "pause_gap_unknown"})
             hit = sh.detect_complaint(prev or "", user_message, llm=selfheal_llm, threshold=sh.threshold(),
                                       confirm=_confirm(sh),
-                                      tool_log=tool_log, gap_s=gap_s, trace=trace)
+                                      tool_log=tool_log, gap_s=gap_s, trace=trace,
+                                      **({"scope": scope} if scope else {}))
             if hasattr(sh, "log_judged"):
                 sh.log_judged(store, trace, session_id, platform, started)
             trace["logged"] = True
