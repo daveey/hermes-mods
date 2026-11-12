@@ -1,0 +1,135 @@
+From d43896b87835ea73ab12bc12dcbcf0fcd088d1b5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:16:14 +0000
+Subject: [PATCH] [daveey] fix(kanban): direct create_task queues portable
+ cards for worker_queue like the front doors
+
+Since kanban.placement.worker_queue.hub = pool:worker (11-12 11:10Z), db_policy
+called creation_decision with queue=True, got the queue decision
+{"where": "local", "runs_on": [...]} and kept only its absent placement_policy.
+Portable cards from direct kb.create_task producers (swarm, triage sweep,
+alert cards) were neither queued for the pool nor worker-pool enrolled: they
+ran on the hub.
+
+resolved_db_placement now returns runs_on too: db_placement queues a portable
+card for the pool label on a Board primary (same outcome as the CLI/tool
+front doors) and otherwise, or with no live labelled machine, keeps
+worker-pool enrollment. Explicit runs_on and placement_checked are unchanged.
+The db_policy wrapper is gone (no callers).
+---
+ hermes_cli/kanban_db.py                    |  2 +-
+ hermes_cli/kanban_worker_placement.py      | 34 +++++++++++++++-------
+ tests/hermes_cli/test_kanban_pool_queue.py | 31 ++++++++++++++++++++
+ 3 files changed, 55 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 0ed65ffdf9..fc13d5a7a7 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1308,7 +1308,7 @@ def create_task(
+     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
+         conn, project_id, project_source_task_id, workspace_kind, workspace_path
+     )
+-    placement_policy, placement_audit = resolved_db_placement(locals())
++    placement_policy, placement_audit, runs_on = resolved_db_placement(locals())
+     parents = tuple(p for p in parents if p)
+     skills_list = _normalize_task_skills(skills)
+ 
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 464ea9bdc5..863b057bd3 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -106,28 +106,40 @@ def creation_audit(args, cfg=None):
+ 
+ 
+ def resolved_db_placement(fields):
+-    """Validate the effective workspace after project inheritance, enrolling only unchecked producers."""
+-    policy = fields["placement_policy"]
++    """``(policy, audit, runs_on)``: validate the effective workspace after project inheritance, placing only
++    unchecked producers (worker queue, else pool enrollment) exactly as the front doors do."""
++    policy, runs_on = fields["placement_policy"], fields["runs_on"]
+     if policy is None and not fields["placement_checked"]:
+-        policy = db_policy(fields)
+-    validate_creation(policy, runs_on=fields["runs_on"], workspace_kind=fields["workspace_kind"],
++        policy, queued = db_placement(fields)
++        runs_on = queued if queued is not None else runs_on
++    validate_creation(policy, runs_on=runs_on, workspace_kind=fields["workspace_kind"],
+                       workspace_path=fields["workspace_path"], project=fields["project_id"],
+                       origin_intent=None, board=fields["board"])
+     audit = fields["placement_audit"]
+     if audit is None:
+         audit = creation_audit(_db_fields(fields))
+-    return policy, audit
++    return policy, audit, runs_on
+ 
+ 
+-def db_policy(fields):
+-    """Enroll direct producers at insertion; front doors may preserve an already checked decision."""
++def db_placement(fields):
++    """``(placement_policy, runs_on)`` for a direct ``create_task`` producer (swarm, triage sweep, alerts, ...).
++
++    Same outcome as the front doors: a portable card of a ``worker_queue`` gateway queues for the pool label on a
++    Board primary (``runs_on`` is a Board placement field); elsewhere, or with no live labelled machine, it keeps
++    worker-pool enrollment. Judging the queue but keeping only ``placement_policy`` (11-12) dropped both. [daveey]
++    """
++    from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_placement as placement
+ 
+     cfg = placement.config()
+-    if not cfg.get("worker_pools"):
+-        return None
+-    result = creation_decision(_db_fields(fields), cfg, placement.reg.self_gateway(), "auto", None)
+-    return (result or {}).get("placement_policy")
++    if not cfg.get("worker_pools") and not cfg.get("worker_queue"):
++        return None, None
++    queue = bool(cfg.get("worker_queue")) and sync.board_mode(fields["conn"]) == "primary"
++    result = creation_decision(_db_fields(fields), cfg, placement.reg.self_gateway(), "auto", None,
++                               queue=queue) or {}
++    if result.get("runs_on") is not None:
++        return None, list(result["runs_on"])
++    return result.get("placement_policy"), None
+ 
+ 
+ def _db_fields(fields):
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index f11f370d95..ad8d09c7e7 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -293,3 +293,34 @@ def test_move_to_self_refuses_only_on_a_found_clean_tree(hub, tmp_path):
+     _commit(ws / "repo", "b.txt")
+     res = km.move_queued(hub.conn, tid, **move)
+     assert res["ok"] and _moved(hub.conn, tid)[-1]["unpushed_state"].startswith("unpushed commits in "), res
++
++
++# --- direct create_task producers (swarm, triage sweep, alert cards) -------------------------------------------
++
++def test_direct_create_task_queues_a_portable_card_like_the_front_doors(hub, monkeypatch):
++    """11-12 11:10Z: with ``worker_queue`` set, the old ``db_policy`` judged the queue decision but kept only its
++    (absent) ``placement_policy``, so a direct ``kb.create_task`` card was neither queued nor pool-enrolled: it ran on
++    the hub."""
++    monkeypatch.setattr(kp, "config", lambda: {**CFG, "worker_pools": {HUB: ["worker-1", "worker-2"]}})
++    _registry(held=("worker-1",))
++    tid = kb.create_task(hub.conn, title="summarise the failing CI jobs", assignee="default", requires=[])
++    assert _runs_on(hub.conn, tid) == [POOL]
++    assert kb.get_task(hub.conn, tid).placement_policy is None  # queued, not also enrolled
++    # Host work stays local and unqueued; an explicit pin and a checked front-door decision are kept as given.
++    tid = kb.create_task(hub.conn, title="restart the gateway service on the hub", assignee="default", requires=[])
++    assert _runs_on(hub.conn, tid) is None and kb.get_task(hub.conn, tid).placement_policy is None
++    tid = kb.create_task(hub.conn, title="pinned", assignee="default", requires=[], runs_on=["machine:worker-2"])
++    assert _runs_on(hub.conn, tid) == ["machine:worker-2"]
++    tid = kb.create_task(hub.conn, title="summarise CI", assignee="default", requires=[], placement_checked=True)
++    assert _runs_on(hub.conn, tid) is None
++
++
++def test_direct_create_task_keeps_pool_enrollment_when_it_cannot_queue(hub, monkeypatch):
++    monkeypatch.setattr(kp, "config", lambda: {**CFG, "worker_pools": {HUB: ["worker-1", "worker-2"]}})
++    _registry(held=("worker-1", "worker-2"))  # no unheld machine carries the label
++    tid = kb.create_task(hub.conn, title="summarise the failing CI jobs", assignee="default", requires=[])
++    assert _runs_on(hub.conn, tid) is None and kb.get_task(hub.conn, tid).placement_policy == "worker-first-v1"
++    _registry()
++    sync.set_mode(hub.conn, "off")  # runs_on is a Board placement field: off a primary, enroll instead
++    tid = kb.create_task(hub.conn, title="summarise the failing CI jobs", assignee="default", requires=[])
++    assert _runs_on(hub.conn, tid) is None and kb.get_task(hub.conn, tid).placement_policy == "worker-first-v1"
+-- 
+2.43.0
+

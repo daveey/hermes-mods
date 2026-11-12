@@ -1,0 +1,248 @@
+From abb6b5bfd3bcba231821fd592da733244d4b6e5e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:56:22 +0000
+Subject: [PATCH] [daveey] kanban: review independence reads the model that
+ ran; repeated review refusals block visibly
+
+Follow-up to #1301 (review t_01a1cee1163b8aa2, two non-blocking findings).
+
+(a) A class-routed implementer run (run_route model `class:deep`, common
+under `kanban.strong_model: class:deep`) left `_implementer_model` with no
+concrete name. A refused review_override then raised ReviewModelUnavailable
+on every claim: an infrastructure spawn_failed with failures at 0, so the
+card deferred silently forever. `_implementer_model` now reads the handoff
+run's `worker_result.route_model` (the live agent's model, booked by
+`route_fields`) first. The concrete-pin review path uses the same receipt,
+so a class pin whose run left one no longer refuses.
+
+When no concrete receipt exists either, the third identical
+ReviewModelUnavailable deferral in a row (`DEFERRAL_LIMIT`, spaced by
+infrastructure_cooldown) force-trips the card to a sticky triage block
+(gave_up `reason_code: review_model_unavailable`) instead of looping.
+The spawn-failure classification moved into
+`kanban_review_model.admission_refusal`, which keeps kanban_db_dispatch.py at
+its line cap.
+
+(b) `_implementer_model` preferred the card's concrete pin over the run
+receipts. Under `pinned+pin_quota_reroute` the pin is not what ran, so
+`_distinct_deep(pin)` could choose the rerouted implementer as its own
+reviewer. The order is now worker_result.route_model, then the run_route
+receipt, then the pin.
+
+Tests (tests/hermes_cli/test_kanban_managed_pin_policy.py): class-routed
+implementer named by worker_result; three identical refusals reach triage;
+rerouted pin (run_route or worker_result receipt, with and without a
+refused override) reviews on a model distinct from the one that ran. All
+six fail on 5f18901334 and pass here.
+---
+ hermes_cli/kanban_db_dispatch.py              |  9 +--
+ hermes_cli/kanban_review_model.py             | 68 +++++++++++++---
+ .../test_kanban_managed_pin_policy.py         | 78 +++++++++++++++++++
+ 3 files changed, 138 insertions(+), 17 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 2c0145932d..cf9404bfa1 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2023,17 +2023,16 @@ def _dispatch_lane_task(
+         _count_spawn(claimed.assignee)
+         return True
+     except Exception as exc:
+-        from tools.process_registry import RestartSafeScopeUnavailable
+-        from hermes_cli.kanban_review_model import ReviewModelUnavailable
++        from hermes_cli.kanban_review_model import admission_refusal
+ 
+-        # Admission failed before any worker ran; preserve its retry budget.
+-        infrastructure = isinstance(exc, (RestartSafeScopeUnavailable, ReviewModelUnavailable))
++        # Admission failed before any worker ran; preserve its retry budget (a repeated review refusal: visible block).
++        infrastructure, exhausted, extra = admission_refusal(conn, claimed.id, exc)
+         if infrastructure:
+             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
+         if _record_task_failure(
+             conn, claimed.id, str(exc),
+             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+-            infrastructure=infrastructure,
++            infrastructure=infrastructure, force_trip=exhausted, event_payload_extra=extra,
+         ):
+             result.auto_blocked.append(claimed.id)
+         return False
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index 26853e048c..aa2cb907f1 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -69,23 +69,66 @@ def refused_override(conn, task):
+     return {"model": override[0], "provider": override[1], "code": refusal.code, "allowed": refusal.allowed}
+ 
+ 
+-def _implementer_model(conn, task):
+-    """Concrete model the implementer ran: the card pin, else the handoff run's ``run_route`` receipt."""
+-    pin = str(getattr(task, "model_override", None) or "").strip()
+-    if pin and not is_class_selector(pin):
+-        return pin
+-    run_id = _handoff(conn, task)[0]
+-    row = run_id is not None and conn.execute(
+-        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='run_route' "
+-        "ORDER BY id DESC LIMIT 1", (task.id, run_id)).fetchone()
++def _run_model(conn, task_id, run_id, kind, key):
++    """Concrete model named by *run_id*'s latest *kind* event under *key*, else None."""
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? "
++                       "ORDER BY id DESC LIMIT 1", (task_id, run_id, kind)).fetchone()
+     try:
+         payload = json.loads(row[0]) if row and row[0] else {}
+     except (TypeError, ValueError):
+         payload = {}
+-    model = str(payload.get("model") or "").strip() if isinstance(payload, dict) else ""
++    model = str(payload.get(key) or "").strip() if isinstance(payload, dict) else ""
+     return model if model and not is_class_selector(model) else None
+ 
+ 
++def _implementer_model(conn, task):
++    """Concrete model the implementer ran, most direct evidence first. [daveey]
++
++    The handoff run's ``worker_result.route_model`` (the live agent's model: the only concrete name when the
++    run was class-routed, e.g. ``kanban.strong_model: class:deep``), then its ``run_route`` receipt (under
++    ``pinned+pin_quota_reroute`` that is the peer that ran, not the pin), and only then the card's concrete pin.
++    Preferring the pin let ``_distinct_deep(pin)`` pick the rerouted implementer as its own reviewer."""
++    run_id = _handoff(conn, task)[0]
++    if run_id is not None:
++        for kind, key in (("worker_result", "route_model"), ("run_route", "model")):
++            model = _run_model(conn, task.id, run_id, kind, key)
++            if model:
++                return model
++    pin = str(getattr(task, "model_override", None) or "").strip()
++    return pin if pin and not is_class_selector(pin) else None
++
++
++# Identical review-admission refusals in a row (spaced by ``infrastructure_cooldown``) before the card leaves
++# the silent infrastructure-retry loop for a visible block. [daveey]
++DEFERRAL_LIMIT = 3
++
++
++def deferral_exhausted(conn, task_id, error):
++    """True when *error* would be the ``DEFERRAL_LIMIT``-th identical ReviewModelUnavailable deferral in a row.
++
++    Such a refusal is ``infrastructure`` (failures stay 0, the breaker never trips), so a cause that never
++    clears (no concrete implementer receipt, no registered independent reviewer) deferred the card forever."""
++    import sqlite3
++    try:
++        rows = conn.execute("SELECT outcome, error FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
++                            "ORDER BY id DESC LIMIT ?", (task_id, DEFERRAL_LIMIT - 1)).fetchall()
++    except sqlite3.Error:
++        return False  # unreadable history keeps the plain infrastructure deferral
++    return len(rows) == DEFERRAL_LIMIT - 1 and all(
++        row[0] == "spawn_failed" and (row[1] or "") == str(error)[:500] for row in rows)
++
++
++def admission_refusal(conn, task_id, exc):
++    """``(infrastructure, force_trip, gave_up extra)`` for a spawn that failed before any worker ran. [daveey]
++
++    A host that cannot place the worker (no restart-safe scope) or an unavailable independent reviewer is
++    infrastructure: retried with the budget untouched, until ``deferral_exhausted`` sends the review to a block."""
++    from tools.process_registry import RestartSafeScopeUnavailable
++    if isinstance(exc, ReviewModelUnavailable) and deferral_exhausted(conn, task_id, str(exc)):
++        return False, True, {"admission_refusal": "review_model_unavailable", "deferrals": DEFERRAL_LIMIT}
++    return isinstance(exc, (RestartSafeScopeUnavailable, ReviewModelUnavailable)), False, None
++
++
+ def _distinct_deep(pin, assignee, *, registered=False):
+     from agent.model_routing_agent import class_requirements
+     from hermes_cli.kanban_model_assignment import _assignee_config
+@@ -138,6 +181,7 @@ def resolve_review_model(conn, task, cfg):
+     pin = str(getattr(task, "model_override", None) or "").strip()
+     if not pin:
+         return None
+-    if is_class_selector(pin):
++    implementer = _implementer_model(conn, task)
++    if not implementer:
+         raise ReviewModelUnavailable("A class pin does not identify the implementer; set review_model in the handoff")
+-    return _independent(pin, cfg, assignee)
++    return _independent(implementer, cfg, assignee)
+diff --git a/tests/hermes_cli/test_kanban_managed_pin_policy.py b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+index af86bc92c2..60b3ced984 100644
+--- a/tests/hermes_cli/test_kanban_managed_pin_policy.py
++++ b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+@@ -262,3 +262,81 @@ def test_registered_review_override_is_kept(board):
+     dispatch_once(conn, spawn_fn=lambda item, *args: seen.append(item.model_override), max_spawn=1)
+     assert seen == ['claude-opus-5-5']
+     assert [e.payload for e in kb.list_events(conn, tid) if e.kind == 'model_tier'][-1]['reason'] == 'review_override'
++
++
++def _receipts(conn, tid, *, route=None, ran=None):
++    """Rewrite the handoff run's run_route receipt to *route* and/or book a worker_result that ran *ran*."""
++    run = conn.execute("SELECT id FROM task_runs WHERE task_id=? AND outcome='review_requested' "
++                       "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0]
++    if route:
++        conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND run_id=? AND kind='run_route'",
++                     (json.dumps({'model': route[0], 'provider': route[1], 'lane': 'ready',
++                                  'source': 'class' if route[0].startswith('class:') else 'pin'}), tid, run))
++    if ran:
++        kb._append_event(conn, tid, 'worker_result', {'exit_code': 0, 'route_provider': ran[1],
++                                                      'route_model': ran[0]}, run_id=run)
++    conn.commit()
++
++
++def _second_deep_route():
++    """Register gpt-6.1-sol as a second deep route on the worker profile."""
++    import os
++    path = Path(os.environ['HERMES_HOME']) / 'profiles' / 'worker' / 'config.yaml'
++    extra = ('      - provider: openai-codex\n        model: gpt-6.1-sol\n        billing: subscription\n'
++             '        weight: 1\n        eligible: true\n        funding_verified: true\n'
++             '        capabilities: {tools: true, streaming: true}\n')
++    text = path.read_text()
++    path.write_text(text.replace('    standard:\n', extra + '    standard:\n', 1))
++
++
++def test_class_routed_implementer_is_named_by_worker_result(board):
++    """Finding (a) of review t_01a1cee1163b8aa2: a class-routed implementer run (run_route ``class:deep``, the
++    common case under ``kanban.strong_model: class:deep``) left _implementer_model with no concrete name, so a
++    refused override deferred silently on every claim. The run's worker_result.route_model is what ran."""
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    conn, _ = board
++    tid = _hand_off_for_review(conn, {'review_model': FABLE})
++    _receipts(conn, tid, route=('class:deep', None), ran=('claude-sonnet-5-5', 'anthropic'))
++    seen = []
++    dispatch_once(conn, spawn_fn=lambda item, *args: seen.append(item.model_override), max_spawn=1)
++    assert seen == ['claude-opus-5-5']
++    assert [e.payload for e in kb.list_events(conn, tid) if e.kind == 'model_tier'][-1]['reason'] == (
++        'review_override_refused')
++
++
++def test_repeated_identical_review_refusal_moves_to_a_visible_block(board, monkeypatch):
++    """With no concrete implementer receipt at all, the third identical refusal stops deferring silently."""
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    DEFERRAL_LIMIT = 3  # hermes_cli.kanban_review_model.DEFERRAL_LIMIT
++    monkeypatch.setenv('HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS', '0')
++    conn, _ = board
++    tid = _hand_off_for_review(conn, {'review_model': FABLE})
++    _receipts(conn, tid, route=('class:deep', None))
++    seen = []
++    for attempt in range(1, DEFERRAL_LIMIT + 1):
++        dispatch_once(conn, spawn_fn=lambda *args: seen.append(args), max_spawn=1)
++        task = kb.get_task(conn, tid)
++        if attempt < DEFERRAL_LIMIT:
++            assert (task.status, task.consecutive_failures) == ('review', 0), attempt
++    assert seen == []
++    assert task.status == 'triage'
++    gave_up = [e.payload for e in kb.list_events(conn, tid) if e.kind == 'gave_up'][-1]
++    # The breaker owns reason_code (worker_failures_exhausted); the admission refusal rides beside it.
++    assert gave_up['admission_refusal'] == 'review_model_unavailable' and gave_up['sticky'] is True
++    assert 'implementer' in gave_up['error'] and FABLE in gave_up['error']
++
++
++@pytest.mark.parametrize('override', [None, FABLE])
++@pytest.mark.parametrize('receipt', ['run_route', 'worker_result'])
++def test_rerouted_pin_reviewer_is_distinct_from_the_model_that_ran(board, override, receipt):
++    """Finding (b): under ``pinned+pin_quota_reroute`` the card's pin is not the model that ran. Preferring
++    the pin let ``_distinct_deep(pin)`` choose the rerouted implementer (here gpt-6.1-sol) as its reviewer."""
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    conn, _ = board
++    _second_deep_route()
++    tid = _hand_off_for_review(conn, {'review_model': override} if override else None, pin='claude-opus-5-5')
++    ran = ('gpt-6.1-sol', 'openai-codex')
++    _receipts(conn, tid, **({'route': ran} if receipt == 'run_route' else {'ran': ran}))
++    seen = []
++    dispatch_once(conn, spawn_fn=lambda item, *args: seen.append(item.model_override), max_spawn=1)
++    assert seen == ['claude-opus-5-5']
+-- 
+2.43.0
+

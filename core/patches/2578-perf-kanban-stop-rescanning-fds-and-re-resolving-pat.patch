@@ -1,0 +1,335 @@
+From 33f6ffb848c20f427c76cb7b30e2af8d4e7f2b98 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:32:06 +0000
+Subject: [PATCH] perf(kanban): stop rescanning fds and re-resolving paths
+ under the board lock on cached reads
+
+Every cached board read takes the board lifecycle lock and runs recover() under it. With no registered
+handle, recover re-ran stranded_sidecars, a readlink of every /proc/self/fd entry, on each read; with ~130
+serve threads each GIL-releasing syscall waits out the switch interval, so a 600-fd scan took ~7 s behind
+4 busy threads (0.5 s reader budget) and readers logged "busy; reused last counts". realpath of the board
+path (one syscall per component) ran twice per read as well.
+
+- _resolved: memoize realpath of absolute board paths for 30 s (relative paths never cached); used by
+  _path, remember and evict_readers.
+- _stranded: reuse a clean scan for <= 5 s while the board's -shm and -wal identities are unchanged; a
+  positive scan is never reused; stale/poisoned boards always rescan.
+- Both caches bounded at 256 entries.
+
+Why (five whys, evidence in t_01a1c6c576aaf5b1 / t_01a1ce5c1d7bfe42):
+1. Residual busy warnings after #1061: 7 in 30 min on kanban.db only (0.23/min vs 0.81/min baseline).
+2. py-spy, 58 lock-wait samples: holders inside recover() (realpath 13, sidecar scan/stat 9) and opens.
+3. recover() runs on every cached read, with the fd scan whenever no handle is registered.
+4. Each of those syscalls convoys on the GIL (measured: raw scan 7.0 s, one stat up to 48 ms).
+5. Not caught: no test bounded the time a cached read holds the board lock under thread contention;
+   test_recover_without_handles_stays_fast_while_threads_are_cpu_bound now does (9.9 s before, <0.5 s after).
+
+Tests: new test_kanban_lifecycle_lock_syscalls.py (8; RED on base: 9.9 s lock hold, 102 resolutions);
+122 related files 2081 passed, 2 failed in test_web_links_stale.py which fail identically on base
+(filed t_01a1ceab6453e0b9). Two independent reviews (second APPROVE). [t_01a1ce5c1d7bfe42]
+---
+ hermes_cli/kanban_generation.py               |  70 ++++++-
+ .../test_kanban_lifecycle_lock_syscalls.py    | 189 ++++++++++++++++++
+ 2 files changed, 255 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_lifecycle_lock_syscalls.py
+
+diff --git a/hermes_cli/kanban_generation.py b/hermes_cli/kanban_generation.py
+index e1c6ecb819..9bf1e0331e 100644
+--- a/hermes_cli/kanban_generation.py
++++ b/hermes_cli/kanban_generation.py
+@@ -89,7 +89,64 @@ def _path(database) -> str | None:
+         value = unquote(value[5:].split("?", 1)[0])
+     if not value or value == ":memory:":
+         return None
+-    return os.path.realpath(value)
++    return _resolved(value)
++
++
++# Board paths are resolved on every cached read, under the board lock in ``recover``. ``realpath`` makes one
++# GIL-releasing syscall per path component; with a hundred busy serve threads each one waits out the switch
++# interval, which was a top board-lock holder on the hub after the fd-scan fix (t_01a1ce5c1d7bfe42).
++# An absolute path's resolution is reused for ``_RESOLVE_TTL_S``: a symlink retargeted under a live board is seen
++# within that window (board paths are not retargeted in practice). Relative paths depend on the cwd: never cached.
++# Plain dict get/set/clear are atomic under the GIL; a racing clear only costs one extra ``realpath``.
++_RESOLVE_TTL_S = 30.0
++_CACHE_MAX = 256
++_clock = time.monotonic
++_resolved_paths: dict[str, tuple[str, float]] = {}
++
++
++def _resolved(value: str) -> str:
++    if not os.path.isabs(value):
++        return os.path.realpath(value)
++    now = _clock()
++    hit = _resolved_paths.get(value)
++    if hit is not None and now - hit[1] < _RESOLVE_TTL_S:
++        return hit[0]
++    real = os.path.realpath(value)
++    if len(_resolved_paths) >= _CACHE_MAX:
++        _resolved_paths.clear()
++    _resolved_paths[value] = (real, now)
++    return real
++
++
++# A clean ``stranded_sidecars`` scan reads every ``/proc/self/fd`` link under the board lock (~7 s for 600 fds behind
++# 4 busy threads). A handle is stranded only when the board's ``-shm`` or ``-wal`` is replaced or deleted, which
++# changes that file's ``(st_dev, st_ino)`` (a held inode cannot be reused); so a clean verdict is reused while both
++# identities are unchanged, for at most ``_CLEAN_SCAN_TTL_S``. A positive verdict is never reused.
++_CLEAN_SCAN_TTL_S = 5.0
++_clean_scans: dict[str, tuple[object, float]] = {}
++
++
++def _file_identity(path: str):
++    try:
++        st = os.stat(path)
++    except OSError:
++        return None
++    return (st.st_dev, st.st_ino)
++
++
++def _stranded(path, current, scan):
++    key = (current, _file_identity(path + "-wal"))
++    hit = _clean_scans.get(path)
++    if hit is not None and hit[0] == key and _clock() - hit[1] < _CLEAN_SCAN_TTL_S:
++        return []
++    found = scan(path)
++    if found:
++        _clean_scans.pop(path, None)
++    else:
++        if len(_clean_scans) >= _CACHE_MAX:
++            _clean_scans.clear()
++        _clean_scans[path] = (key, _clock())
++    return found
+ 
+ 
+ def remember(conn, *, strict=False) -> None:
+@@ -107,7 +164,7 @@ def remember(conn, *, strict=False) -> None:
+             raise
+         return
+     with _lock:
+-        conn._hermes_generation_path = os.path.realpath(path)
++        conn._hermes_generation_path = _resolved(path)
+         conn._hermes_generation_shm = shm_identity(path)
+         conn._hermes_generation_thread = threading.get_ident()
+         _connections.add(conn)
+@@ -170,7 +227,7 @@ def evict_readers(path: str) -> None:
+     from hermes_cli import kanban_session_activity as activity
+ 
+     with _cache_registry_available(activity._RO_CACHE_LOCK):
+-        entries = [(key, entry) for key, entry in activity._RO_CACHE.items() if os.path.realpath(key) == path]
++        entries = [(key, entry) for key, entry in activity._RO_CACHE.items() if _resolved(key) == path]
+     for key, entry in entries:
+         # Never wait while a caller might hold the cache lock: borrowers take that lock
+         # on error. A busy borrower owns its lifecycle and will release it for a retry.
+@@ -231,7 +288,12 @@ def recover(database) -> None:
+         poisoned = path in _poisoned
+     # Also refuse unregistered legacy handles on first/uncached opens. Once poisoned,
+     # keep refusing retries and mode=rw fallbacks until the last dead mapping is gone.
+-    stranded = stranded_sidecars(path) if stale or poisoned or not handles else []
++    if stale or poisoned:
++        stranded = stranded_sidecars(path)
++    elif not handles:
++        stranded = _stranded(path, current, stranded_sidecars)
++    else:
++        stranded = []
+     if not stale and not stranded:
+         with _lock:
+             _poisoned.discard(path)
+diff --git a/tests/hermes_cli/test_kanban_lifecycle_lock_syscalls.py b/tests/hermes_cli/test_kanban_lifecycle_lock_syscalls.py
+new file mode 100644
+index 0000000000..b77fb993b8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_lifecycle_lock_syscalls.py
+@@ -0,0 +1,189 @@
++"""Cached board reads must not hold the board lifecycle lock across avoidable syscalls (t_01a1ce5c1d7bfe42).
++
++On the hub serve (~130 threads) every GIL-releasing syscall under the board lock waits out the 5 ms switch interval
++behind busy threads; per-read ``realpath`` and a clean ``/proc/self/fd`` rescan were the top lock holders left after
++the fd-scan fix, and readers that wait past their 0.5 s budget log "busy; reused last counts".
++"""
++from __future__ import annotations
++
++import os
++import sqlite3
++import sys
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_generation as gen
++
++
++@pytest.fixture(autouse=True)
++def _fresh_caches():
++    for name in ("_resolved_paths", "_clean_scans"):
++        getattr(gen, name, {}).clear()
++    yield
++    for name in ("_resolved_paths", "_clean_scans"):
++        getattr(gen, name, {}).clear()
++
++
++class _Clock:
++    def __init__(self):
++        self.t = 1000.0
++
++    def __call__(self):
++        return self.t
++
++
++def test_board_path_resolves_once_per_ttl_and_again_after(monkeypatch, tmp_path):
++    clock = _Clock()
++    calls = []
++    real = os.path.realpath
++    monkeypatch.setattr(gen, "_clock", clock)
++    monkeypatch.setattr(gen.os.path, "realpath", lambda v: calls.append(v) or real(v))
++    db = str(tmp_path / "kanban.db")
++
++    # realpath recurses on each path component (Python 3.14); count only resolutions of the board path itself.
++    first = gen._path(db)
++    once = len(calls)
++    assert once >= 1
++    for _ in range(50):
++        assert gen._path(db) == first
++    assert len(calls) == once                   # reused: no syscall at all
++
++    clock.t += gen._RESOLVE_TTL_S + 0.1
++    assert gen._path(db) == first
++    assert len(calls) == 2 * once               # resolved again after the TTL
++
++
++def test_retargeted_symlink_is_seen_after_the_ttl(monkeypatch, tmp_path):
++    clock = _Clock()
++    monkeypatch.setattr(gen, "_clock", clock)
++    a, b = tmp_path / "a", tmp_path / "b"
++    a.mkdir(); b.mkdir()
++    link = tmp_path / "board"
++    link.symlink_to(a)
++    assert gen._path(str(link / "kanban.db")) == str(a / "kanban.db")
++    link.unlink(); link.symlink_to(b)
++    clock.t += gen._RESOLVE_TTL_S + 0.1
++    assert gen._path(str(link / "kanban.db")) == str(b / "kanban.db")
++
++
++def test_clean_sidecar_scan_is_reused_only_while_shm_identity_is_unchanged(monkeypatch):
++    clock = _Clock()
++    monkeypatch.setattr(gen, "_clock", clock)
++    scans = []
++    scan = lambda p: scans.append(p) or []
++
++    assert gen._stranded("/b/kanban.db", (1, 10), scan) == []
++    assert gen._stranded("/b/kanban.db", (1, 10), scan) == []
++    assert len(scans) == 1                      # clean verdict reused
++    assert gen._stranded("/b/kanban.db", (1, 11), scan) == []
++    assert len(scans) == 2                      # -shm replaced: rescan at once
++    assert gen._stranded("/b/kanban.db", None, scan) == []
++    assert len(scans) == 3                      # -shm deleted: rescan at once
++    clock.t += gen._CLEAN_SCAN_TTL_S + 0.1
++    assert gen._stranded("/b/kanban.db", None, scan) == []
++    assert len(scans) == 4                      # TTL expired
++
++
++def test_a_positive_sidecar_scan_is_never_reused(monkeypatch):
++    monkeypatch.setattr(gen, "_clock", _Clock())
++    results = [["/b/kanban.db-wal (deleted)"], ["/b/kanban.db-wal (deleted)"], []]
++    scan = lambda p: results.pop(0)
++    assert gen._stranded("/b/kanban.db", (1, 10), scan)
++    assert gen._stranded("/b/kanban.db", (1, 10), scan)
++    assert gen._stranded("/b/kanban.db", (1, 10), scan) == []
++
++
++def test_relative_board_path_is_resolved_against_the_current_directory_every_time(monkeypatch, tmp_path):
++    (tmp_path / "a").mkdir(); (tmp_path / "b").mkdir()
++    monkeypatch.chdir(tmp_path / "a")
++    assert gen._path("kanban.db") == str(tmp_path / "a" / "kanban.db")
++    monkeypatch.chdir(tmp_path / "b")
++    assert gen._path("kanban.db") == str(tmp_path / "b" / "kanban.db")
++
++
++def test_a_replaced_wal_alone_forces_a_rescan(monkeypatch, tmp_path):
++    monkeypatch.setattr(gen, "_clock", _Clock())
++    db = str(tmp_path / "kanban.db")
++    wal = tmp_path / "kanban.db-wal"
++    wal.write_bytes(b"x")
++    keep = open(wal, "rb")                      # hold the old inode so the replacement gets a new one
++    scans = []
++    scan = lambda p: scans.append(p) or []
++    gen._stranded(db, (1, 10), scan)
++    gen._stranded(db, (1, 10), scan)
++    assert len(scans) == 1
++    wal.unlink(); wal.write_bytes(b"y")         # -shm identity unchanged, -wal replaced
++    gen._stranded(db, (1, 10), scan)
++    assert len(scans) == 2
++    keep.close()
++
++
++def _wal_board(tmp_path):
++    db = tmp_path / "kanban.db"
++    conn = sqlite3.connect(db)
++    conn.execute("pragma journal_mode=wal")
++    conn.execute("create table t(x)")
++    conn.commit()
++    return db, conn
++
++
++def test_recover_reuses_a_clean_scan_and_rescans_a_poisoned_board(monkeypatch, tmp_path):
++    from hermes_cli import kanban_lockguard
++
++    monkeypatch.setattr(gen, "_clock", _Clock())
++    db, conn = _wal_board(tmp_path)
++    calls = []
++    monkeypatch.setattr(kanban_lockguard, "stranded_sidecars", lambda p: calls.append(p) or [])
++    try:
++        for _ in range(5):
++            gen.recover(str(db))
++        assert len(calls) == 1                  # no registered handle: scanned once, then reused
++        with gen._lock:
++            gen._poisoned.add(gen._path(str(db)))
++        gen.recover(str(db))
++        assert len(calls) == 2                  # poisoned: always rescans
++    finally:
++        with gen._lock:
++            gen._poisoned.discard(gen._path(str(db)))
++        conn.close()
++
++
++@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc fd scan is Linux-only")
++def test_recover_without_handles_does_not_rescan_fds_while_threads_are_cpu_bound(monkeypatch, tmp_path):
++    """Steady-state cached reads of a clean board run no ``/proc/self/fd`` scan under the board lock.
++
++    Before the fix every read rescanned (~7 s for 600 fds behind 4 busy threads, against a 0.5 s reader budget).
++    Asserted as a call count, not a wall-clock bound, so CPU contention can't make it flaky.
++    """
++    from hermes_cli import kanban_lockguard
++
++    monkeypatch.setattr(gen, "_clock", _Clock())  # frozen: the 5 s clean-scan TTL can't expire under load
++    db, conn = _wal_board(tmp_path)
++    real_scan = kanban_lockguard.stranded_sidecars
++    calls = []
++    monkeypatch.setattr(kanban_lockguard, "stranded_sidecars", lambda p: calls.append(p) or real_scan(p))
++    stop = threading.Event()
++    running = [threading.Event() for _ in range(4)]
++
++    def spin(started):
++        started.set()
++        while not stop.is_set():
++            pass
++
++    spinners = [threading.Thread(target=spin, args=(ev,), daemon=True) for ev in running]
++    try:
++        gen.recover(str(db))                    # first call scans once and records a clean verdict
++        assert len(calls) == 1
++        for t in spinners:
++            t.start()
++        assert all(ev.wait(timeout=5) for ev in running)
++        for _ in range(10):
++            gen.recover(str(db))
++        assert len(calls) == 1, f"recover rescanned fds {len(calls) - 1} times while the board was clean"
++    finally:
++        stop.set()
++        for t in spinners:
++            t.join()
++        conn.close()
+-- 
+2.43.0
+

@@ -1,0 +1,278 @@
+From c87ce28799e3fca91dac9cf536602e230d818c91 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:07:20 +0000
+Subject: [PATCH] [daveey] fix(kanban): release failed-result ready tempdir on
+ retire and start-limit
+
+The failed-result observer only removed its failed-result-*/ready tempdir
+(next to the board db) after a successful observation. A unit that retired
+with exit 78 (import failure, unusable context) or exhausted StartLimitBurst
+left it behind.
+
+- The observer releases the tempdir on both exit-78 paths, best effort and
+  only for the exact failed-result-*/ready shape; errors never change the
+  exit status.
+- arm_service adds ExecStopPost=-rm/-rmdir on the paths passed through
+  --setenv (${VAR} expands to one word, so spaces, % and $ in board paths
+  are safe), so the manager releases the tempdir after every stop, including
+  the last one before start-limit-hit. A restarted observer recreates the
+  directory before acknowledging.
+- Regression tests: tests/hermes_cli/test_kanban_failed_result_retire_cleanup.py
+  (5 fail on base source, 8/8 pass at head). Live systemd 255 check: a
+  crash-looping unit hitting start-limit and an exit-78 unit both leave no
+  tempdir.
+---
+ hermes_cli/kanban_failed_result_observer.py   |  38 ++++--
+ hermes_cli/kanban_failed_result_service.py    |  21 ++++
+ ...est_kanban_failed_result_retire_cleanup.py | 117 ++++++++++++++++++
+ 3 files changed, 166 insertions(+), 10 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_failed_result_retire_cleanup.py
+
+diff --git a/hermes_cli/kanban_failed_result_observer.py b/hermes_cli/kanban_failed_result_observer.py
+index f59c828204..ece5b6c780 100644
+--- a/hermes_cli/kanban_failed_result_observer.py
++++ b/hermes_cli/kanban_failed_result_observer.py
+@@ -165,7 +165,10 @@ def observe(context):
+         # The acknowledgement precedes the writer's result transaction.
+         conn.execute('PRAGMA busy_timeout=250')
+         if context.get('ready_path'):
+-            Path(context['ready_path']).write_text(context['observer_unit'], encoding='utf-8')
++            ready = Path(context['ready_path'])
++            # The unit's ExecStopPost released the directory before this restart.
++            ready.parent.mkdir(exist_ok=True)
++            ready.write_text(context['observer_unit'], encoding='utf-8')
+         else:
+             sys.stdout.buffer.write(READY)
+             sys.stdout.buffer.flush()
+@@ -202,6 +205,22 @@ def observe(context):
+             time.sleep(POLL_SECONDS)
+ 
+ 
++def _release_ready(context):
++    """Best-effort removal of the ``failed-result-*/ready`` acknowledgment tempdir.
++
++    Only that exact shape is touched, so a malformed context cannot aim this at
++    another path. Errors are swallowed: cleanup never changes the exit status.
++    """
++    try:
++        ready = Path(context['ready_path'])
++        if ready.name != 'ready' or not ready.parent.name.startswith('failed-result-'):
++            return
++        ready.unlink(missing_ok=True)
++        ready.parent.rmdir()
++    except (KeyError, TypeError, ValueError, OSError):
++        pass
++
++
+ def main(argv):
+     """Run one observation; returns the process exit status.
+ 
+@@ -210,28 +229,27 @@ def main(argv):
+     forever. Exit ``STARTUP_FAILURE_EXIT``, which the service lists in
+     ``RestartPreventExitStatus``, so the manager retires the unit instead.
+     A missing or malformed context argument is equally deterministic.
++    Retiring releases the readiness tempdir, as success does.
+     """
++    context = None
+     try:
+         context = json.loads(argv[1])
+         if not isinstance(context, dict) or not context.get('db') or any(key not in context for key in CONTEXT_KEYS):
+             raise ValueError(f'context lacks {CONTEXT_KEYS}')
+     except (IndexError, TypeError, ValueError) as exc:
+         print(f'failed-result observer has no usable context, retiring: {exc!r}', file=sys.stderr)
++        if isinstance(context, dict):
++            _release_ready(context)
+         return STARTUP_FAILURE_EXIT
+     try:
+         observe(context)
+     except ImportError as exc:
+         print(f'failed-result observer cannot import its code, retiring: {exc!r}', file=sys.stderr)
++        _release_ready(context)
+         return STARTUP_FAILURE_EXIT
+-    # Only a successful terminal observation releases the readiness artifact.
+-    # Unexpected errors retain it and exit nonzero for manager restart.
+-    if context.get('ready_path'):
+-        ready = Path(context['ready_path'])
+-        ready.unlink(missing_ok=True)
+-        try:
+-            ready.parent.rmdir()
+-        except FileNotFoundError:
+-            pass
++    # Unexpected errors exit nonzero for manager restart; the unit's ExecStopPost
++    # releases the tempdir after each stop and the restart recreates it.
++    _release_ready(context)
+     return 0
+ 
+ 
+diff --git a/hermes_cli/kanban_failed_result_service.py b/hermes_cli/kanban_failed_result_service.py
+index 82594e52c1..527a62144e 100644
+--- a/hermes_cli/kanban_failed_result_service.py
++++ b/hermes_cli/kanban_failed_result_service.py
+@@ -16,6 +16,8 @@ OBSERVER_MODULE = 'hermes_cli.kanban_failed_result_observer'
+ # and ``--collect`` removes it. Committed results stay queued for crash recovery.
+ START_LIMIT_BURST = 10
+ START_LIMIT_INTERVAL_SECONDS = 300
++READY_ENV = 'HERMES_FAILED_RESULT_READY'
++READY_DIR_ENV = 'HERMES_FAILED_RESULT_READY_DIR'
+ 
+ 
+ def observer_argv_env(env, context):
+@@ -33,6 +35,24 @@ def observer_argv_env(env, context):
+     return [*hermes_module_argv(sys.executable, OBSERVER_MODULE), json.dumps(context)], env
+ 
+ 
++def _ready_cleanup_args(ready):
++    """[daveey] Manager-side release of the readiness tempdir after every stop.
++
++    A unit that retires (exit 78) or exhausts ``StartLimitBurst`` never reaches the
++    observer's own cleanup. ``ExecStopPost`` runs after each stop, so a restarted
++    observer recreates the directory before acknowledging. Paths travel as
++    environment values, expanded by ``${...}`` as one word: no specifier or quoting
++    rules apply to board paths. ``-`` keeps a failed cleanup from changing the
++    unit's result. Without ``rm``/``rmdir`` the unit keeps its previous behavior.
++    """
++    rm, rmdir = locate_command('rm').command, locate_command('rmdir').command
++    if not rm or not rmdir:
++        return []
++    return [f'--setenv={READY_ENV}={ready}', f'--setenv={READY_DIR_ENV}={ready.parent}',
++            f'--property=ExecStopPost=-{rm[0]} -f -- ${{{READY_ENV}}}',
++            f'--property=ExecStopPost=-{rmdir[0]} -- ${{{READY_DIR_ENV}}}']
++
++
+ def arm_service(context, *, startup_seconds=5.0):
+     """Acknowledge initialized board access only after systemd takes custody.
+ 
+@@ -65,6 +85,7 @@ def arm_service(context, *, startup_seconds=5.0):
+                f'--property=StartLimitIntervalSec={START_LIMIT_INTERVAL_SECONDS}s',
+                f'--property=StartLimitBurst={START_LIMIT_BURST}',
+                f'--working-directory={project_root_str()}']
++    command += _ready_cleanup_args(ready)
+     # A manager-created service does not inherit its submitter's environment.
+     # Keep profile/path resolution, without forwarding secrets or worker pins.
+     for key in ('PATH', 'PYTHONPATH', 'HERMES_HOME', 'HERMES_KANBAN_HOME', 'HERMES_KANBAN_BOARD',
+diff --git a/tests/hermes_cli/test_kanban_failed_result_retire_cleanup.py b/tests/hermes_cli/test_kanban_failed_result_retire_cleanup.py
+new file mode 100644
+index 0000000000..2700459684
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_failed_result_retire_cleanup.py
+@@ -0,0 +1,117 @@
++"""[daveey] The failed-result-*/ready tempdir is released on every retire path.
++
++Exit 78 (import failure, unusable context) and an exhausted ``StartLimitBurst``
++never reach the observer's success cleanup; the tempdir next to the board must
++not accumulate. No live service mutation.
++"""
++import contextlib
++import json
++import os
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_failed_result_observer as observer
++from hermes_cli import kanban_failed_result_service as service
++from tests.hermes_cli import test_kanban_failed_result_reconcile as fixtures
++
++board = fixtures.board
++
++
++def _tempdir_context(context, tmp_path):
++    directory = tmp_path / 'failed-result-fixture'
++    directory.mkdir()
++    ready = directory / 'ready'
++    ready.write_text('fixture.service')
++    return {**context, 'ready_path': str(ready), 'observer_unit': 'fixture.service',
++            'writer_pid': os.getpid(), 'writer_birth': dispatch._process_fingerprint(os.getpid())}
++
++
++def _import_failure(_):
++    raise ModuleNotFoundError("No module named 'ruamel'")
++
++
++def test_import_failure_retire_releases_tempdir(board, tmp_path, monkeypatch):
++    _, context = board
++    context = _tempdir_context(context, tmp_path)
++    monkeypatch.setattr(observer, 'observe', _import_failure)
++    assert observer.main(['observer', json.dumps(context)]) == observer.STARTUP_FAILURE_EXIT
++    assert not Path(context['ready_path']).parent.exists()
++
++
++def test_unusable_context_retire_releases_tempdir(tmp_path):
++    context = _tempdir_context({}, tmp_path)  # lacks db/task_id/run_id/claim_lock
++    assert observer.main(['observer', json.dumps(context)]) == observer.STARTUP_FAILURE_EXIT
++    assert not Path(context['ready_path']).parent.exists()
++
++
++def test_release_never_masks_retire_exit(board, tmp_path, monkeypatch):
++    _, context = board
++    context = _tempdir_context(context, tmp_path)
++    monkeypatch.setattr(observer, 'observe', _import_failure)
++    def refuse(self):
++        raise PermissionError('fixture: read-only board directory')
++    monkeypatch.setattr(Path, 'rmdir', refuse)
++    assert observer.main(['observer', json.dumps(context)]) == observer.STARTUP_FAILURE_EXIT
++
++
++@pytest.mark.parametrize('ready', ['other/ready', 'failed-result-x/other'])
++def test_release_only_touches_failed_result_ready_shape(tmp_path, ready):
++    target = tmp_path / ready
++    target.parent.mkdir()
++    target.write_text('keep')
++    context = {'ready_path': str(target)}
++    assert observer.main(['observer', json.dumps(context)]) == observer.STARTUP_FAILURE_EXIT
++    assert target.read_text() == 'keep'
++
++
++def test_restarted_observer_recreates_released_tempdir(board, tmp_path, monkeypatch):
++    """ExecStopPost removed the directory before this restart; acknowledgment recreates it."""
++    _, context = board
++    context = _tempdir_context(context, tmp_path)
++    ready = Path(context['ready_path'])
++    ready.unlink()
++    ready.parent.rmdir()
++    class EndPoll(Exception):
++        pass
++    def end_poll(_):
++        raise EndPoll
++    monkeypatch.setattr(observer.time, 'sleep', end_poll)
++    with pytest.raises(EndPoll):
++        observer.observe(context)
++    assert ready.read_text() == context['observer_unit']
++
++
++def test_armed_unit_releases_tempdir_after_every_stop(board, monkeypatch):
++    """Start-limit-hit is decided by the manager after the last stop: only the unit can clean up."""
++    _, context = board
++    tools = {'systemd-run': '/usr/bin/systemd-run', 'rm': '/usr/bin/rm', 'rmdir': '/usr/bin/rmdir'}
++    monkeypatch.setattr(service, 'locate_command', lambda name: SimpleNamespace(command=(tools[name],)))
++    monkeypatch.setattr(service.time, 'sleep', lambda _: None)
++    calls = []
++    def submit(command, **kwargs):
++        calls.append(command)
++        payload = json.loads(command[-1])
++        Path(payload['ready_path']).write_text(payload['observer_unit'])
++        return SimpleNamespace(returncode=0, stderr='')
++    monkeypatch.setattr(service.subprocess, 'run', submit)
++    service.arm_service(context, startup_seconds=1)
++    options = calls[0][:calls[0].index('--')]
++    ready = Path(json.loads(calls[0][-1])['ready_path'])
++    assert f'--setenv={service.READY_ENV}={ready}' in options
++    assert f'--setenv={service.READY_DIR_ENV}={ready.parent}' in options
++    stop_post = [arg.removeprefix('--property=ExecStopPost=') for arg in options
++                 if arg.startswith('--property=ExecStopPost=')]
++    # '-' prefix: a failed cleanup never changes the unit's result.
++    assert stop_post == [f'-/usr/bin/rm -f -- ${{{service.READY_ENV}}}',
++                         f'-/usr/bin/rmdir -- ${{{service.READY_DIR_ENV}}}']
++    with contextlib.suppress(FileNotFoundError):
++        ready.unlink()
++        ready.parent.rmdir()
++
++
++def test_missing_cleanup_tools_keep_previous_unit(monkeypatch):
++    monkeypatch.setattr(service, 'locate_command', lambda name: SimpleNamespace(command=()))
++    assert service._ready_cleanup_args(Path('/b/failed-result-x/ready')) == []
+-- 
+2.43.0
+

@@ -1,0 +1,290 @@
+From e0e620c90c1bdfb0c32cbb55bc71f7f247dccb7c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:21:22 +0000
+Subject: [PATCH] [daveey] kanban_move: refuse a move for ship custody;
+ hermes-core-wt ship lands from every host
+
+Why: on 2026-11-12, PR1187's owner (t_01a1cce501c36450), approved and CI-green, moved itself to
+machine:hub because 'Final hermes-core-wt ship must run in genuine hub task custody'. It then sat
+ready behind the hub's full local lane (6/7 busy) for 45+ minutes. That advice was stale. Since the
+state ship gate judges moved runs and remote reviews from the Board's execution record, ship lands
+from any machine: PR1318 landed from hermes-worker-3 the same hour. Card t_01a1cf350800e915
+proposed a dispatcher ship lane. Its independent design review returned REPLAN: no tool can be the
+marker's producer (the ship tooling never moves cards), a replicated marker cannot be authenticated,
+and an over-cap slot must bypass five capacity gates. Removing the cause keeps the goal instead.
+
+What: move_task, move_queued and move_reclaim refuse a reason that claims ship/landing custody
+(reason_code ship_custody_portable) unless host_reason names a real host-only need. The refusal
+says to run ship where the card runs. No dispatcher change.
+
+Proof:
+- Read-only replay over every board replica and local DB found 651 real moved events. The
+  classifier matches 2: PR1187's, and the custody card's own diagnostic move, which host_reason
+  admits. Real ship-adjacent non-custody reasons are negative test cases.
+- The new file fails at HEAD (wiring absent).
+- 13/13 mutants killed.
+- 13 move/repin/placement files pass, 255 tests; 4 kanban_tools files pass, 111 tests.
+---
+ hermes_cli/kanban_move.py                     |  21 +++-
+ hermes_cli/kanban_move_ship.py                |  39 ++++++
+ .../test_kanban_move_ship_custody.py          | 118 ++++++++++++++++++
+ tools/kanban_tools_schemas.py                 |   3 +-
+ 4 files changed, 175 insertions(+), 6 deletions(-)
+ create mode 100644 hermes_cli/kanban_move_ship.py
+ create mode 100644 tests/hermes_cli/test_kanban_move_ship_custody.py
+
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 1019fdca59..0da674524a 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -22,6 +22,8 @@ Guards:
+ * the board must sync to the Board service (``runs_on`` is a Board placement field).
+ * a target must attest ``capability:host_repo`` when required and ``skill:<pin>`` for every pinned skill,
+   in addition to satisfying the assignee's existing profile-tool check.
++* a reason claiming ship/landing custody needs ``host_reason`` (``ship_custody_portable``): ship lands from every
++  machine (:mod:`hermes_cli.kanban_move_ship`).
+ 
+ Every move is a ``moved`` event ``{from_machine, runs_on, previous_runs_on, reason, move_no, forced}``: the audit log.
+ """
+@@ -110,10 +112,13 @@ def _requirement_matches(matches, machines, requires, skills, *, me=None, assign
+ 
+ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool = False,
+           machines: Optional[Mapping[str, Mapping[str, Any]]] = None, me: Optional[str] = None,
+-          cfg: Optional[dict] = None, host_reason: Optional[str] = None) -> dict[str, Any]:
++          cfg: Optional[dict] = None, host_reason: Optional[str] = None,
++          reason: Optional[str] = None) -> dict[str, Any]:
+     """Validate a move; returns ``{runs_on, previous, matches, move_no, forced, me, host}`` or raises
+-    :class:`MoveRefused`. ``host`` holds the event fields of a pin to one pool worker (:mod:`kanban_move_pool`)."""
++    :class:`MoveRefused`. ``host`` holds the event fields of a pin to one pool worker (:mod:`kanban_move_pool`).
++    A ``reason`` claiming ship custody needs ``host_reason`` (:mod:`kanban_move_ship`)."""
+     from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_move_ship as kms
+     from hermes_cli import kanban_worker_node as wn
+     try:
+         labels = wn.normalize_runs_on(runs_on)
+@@ -121,6 +126,9 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+         raise MoveRefused("invalid_runs_on", str(exc)) from exc
+     if not labels:
+         raise MoveRefused("invalid_runs_on", "runs_on must name at least one label, e.g. ['machine:worker-1']")
++    ship_custody = kms.refusal(reason, host_reason)
++    if ship_custody:
++        raise MoveRefused(kms.SHIP_CUSTODY_REFUSED, ship_custody)
+     row = conn.execute("SELECT status, workspace_kind, workspace_path, runs_on, assignee, requires, skills FROM tasks "
+                        "WHERE id = ?", (task_id,)).fetchone()
+     if row is None:
+@@ -190,7 +198,8 @@ def move_task(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: s
+     if (refused := gate_move(conn, task_id, runs_on)) is not None:
+         return refused  # a hub target must convince the admission judge first [daveey]
+     try:
+-        plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg, host_reason=host_reason)
++        plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg, host_reason=host_reason,
++                     reason=reason)
+     except MoveRefused as exc:
+         return {"ok": False, "reason_code": exc.code, "error": str(exc)}
+ 
+@@ -248,7 +257,8 @@ def move_queued(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason:
+             return {"ok": False, "reason_code": "invalid_runs_on", "error": str(exc)}
+         return repin.repin_to_origin(conn, task_id, list(labels or []), reason, hub=hub)
+     try:
+-        plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg, host_reason=host_reason)
++        plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg, host_reason=host_reason,
++                     reason=reason)
+     except MoveRefused as exc:
+         return {"ok": False, "reason_code": exc.code, "error": str(exc)}
+     with kb.write_txn(conn):
+@@ -285,7 +295,8 @@ def move_reclaim(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason
+     if (refused := gate_move(conn, task_id, runs_on)) is not None:
+         return refused  # a hub target must convince the admission judge first [daveey]
+     try:
+-        plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg, host_reason=host_reason)
++        plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg, host_reason=host_reason,
++                     reason=reason)
+     except MoveRefused as exc:
+         return {"ok": False, "reason_code": exc.code, "error": str(exc)}
+     row = conn.execute("SELECT t.status, t.claim_lock, t.placement_policy, r.uid AS run_uid FROM tasks t "
+diff --git a/hermes_cli/kanban_move_ship.py b/hermes_cli/kanban_move_ship.py
+new file mode 100644
+index 0000000000..95cd09f8a1
+--- /dev/null
++++ b/hermes_cli/kanban_move_ship.py
+@@ -0,0 +1,39 @@
++"""Refuse a card move whose stated reason is ship custody: ``hermes-core-wt ship`` lands from every host. [daveey]
++
++Why: on 2026-11-12 the PR1187 owner (t_01a1cce501c36450), approved and CI-green, moved itself to ``machine:hub``
++with the reason "Final hermes-core-wt ship must run in genuine hub task custody" and then sat ready behind the hub's
++full local lane for 45+ minutes (t_01a1cf350800e915). The advice it followed was stale: since the state ship gate
++judges a moved card's runs and a review that ran elsewhere from the Board's complete execution record, ship lands
++from any machine (PR1318 landed from hermes-worker-3 the same hour). A move only re-queues the ship behind another
++host's backlog. The refusal names the remedy; a card that really needs one host (an unpushed worktree that exists
++only there, hub-local evidence) says so in ``host_reason`` and moves.
++"""
++from __future__ import annotations
++
++import re
++from typing import Optional
++
++SHIP_CUSTODY_REFUSED = "ship_custody_portable"
++
++# "ship ... custody", "custody ... land", "hub (task) custody": a claim that landing needs a particular host.
++_CUSTODY = re.compile(
++    r"\b(?:ship|shipping|land|landing)\b[^.;\n]{0,80}?\bcustody\b"
++    r"|\bcustody\b[^.;\n]{0,80}?\b(?:ship|shipping|land|landing)\b"
++    r"|\bhub\s+(?:task\s+)?custody\b",
++    re.IGNORECASE,
++)
++
++
++def cites_ship_custody(reason: Optional[str]) -> bool:
++    """True when a move reason claims the ship/land step needs a particular host's custody."""
++    return bool(_CUSTODY.search(reason or ""))
++
++
++def refusal(reason: Optional[str], host_reason: Optional[str]) -> Optional[str]:
++    """The refusal message for a ship-custody move without ``host_reason``, else None (the move may proceed)."""
++    if (host_reason or "").strip() or not cites_ship_custody(reason):
++        return None
++    return ("hermes-core-wt ship lands from every machine: its gate reads runs and reviews that happened elsewhere "
++            "from the Board's execution record, so moving for ship custody only queues the ship behind another "
++            "host's backlog. Run ship here; if it refuses, follow the remedy it prints. If this card really needs "
++            "that host (e.g. an unpushed worktree that exists only there), pass host_reason naming it.")
+diff --git a/tests/hermes_cli/test_kanban_move_ship_custody.py b/tests/hermes_cli/test_kanban_move_ship_custody.py
+new file mode 100644
+index 0000000000..84a9e656ff
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_move_ship_custody.py
+@@ -0,0 +1,118 @@
++"""A move whose reason claims ship custody is refused: ``hermes-core-wt ship`` lands from every host. [daveey]
++
++Regression 2026-11-12 (t_01a1cf350800e915): PR1187's owner, approved and CI-green, moved itself to ``machine:hub``
++for "genuine hub task custody" and waited 45+ minutes behind the hub's full lane, while PR1318 landed from
++hermes-worker-3 the same hour. The two classifier positives below are the only matches among the 651 real
++``moved`` events in the hub board replicas (read-only replay); the negatives are real ship-adjacent move reasons.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_move_ship as kms
++from tests.hermes_cli import test_kanban_move as base
++
++svc = base.svc
++gws = base.gws
++
++# Real reasons (hub default-board replica, moved events).
++PR1187 = ("Final hermes-core-wt ship must run in genuine hub task custody (per custody card t_01a1cdcdd0627aaa); "
++          "this run is on hermes-worker-3.")
++CUSTODY_CARD = ("Canonical identity authority is on hub: parent is hub-owned and absent from worker-1 execution DB; "
++                "only replica exists here. Must verify canonical gate under genuine hub-local landing custody")
++NOT_CUSTODY = [
++    "Return to existing hub-only implementation worktree and hermes-core-wt ship state to diagnose real CI failure.",
++    "Landing continuation needs hub's existing reviewed core-wt ship state and worktree; worker-2 has neither and "
++    "SSH to hub is denied. CI is now green, so this is l",
++    "ship gate reads only the local board; review t_01a1cce808ae7ea0 is on the hub",
++    "Hub CPU-gated (load 34 at 20:26 PST); core fix, tests and ship are portable; live proof stays on t_01a1c.",
++    "needs the worker's GPU",
++    "",
++    None,
++]
++
++
++@pytest.mark.parametrize("reason", [
++    PR1187,
++    CUSTODY_CARD,
++    "the shipping step needs custody of the worktree",       # ship ... custody
++    "custody of the review is on the hub, so land there",    # custody ... land
++    "needs hub custody",                                     # hub custody alone
++    "HUB TASK CUSTODY required",
++])
++def test_custody_claims_match(reason):
++    assert kms.cites_ship_custody(reason)
++
++
++@pytest.mark.parametrize("reason", NOT_CUSTODY)
++def test_other_move_reasons_do_not_match(reason):
++    assert not kms.cites_ship_custody(reason)
++
++
++def test_a_custody_claim_across_a_sentence_break_does_not_match():
++    assert not kms.cites_ship_custody("ship is done. The custody card is separate")
++
++
++def test_refusal_needs_both_the_claim_and_no_host_reason():
++    assert "lands from every machine" in (kms.refusal(PR1187, None) or "")
++    assert kms.refusal(PR1187, "   ")  # a blank host reason names nothing
++    assert kms.refusal(PR1187, "unpushed worktree ~/code/_wt/x exists only on the hub") is None
++    assert kms.refusal("needs the worker's GPU", None) is None
++
++
++def _moved(conn, tid):
++    return conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'moved'", (tid,)).fetchone()[0]
++
++
++def test_running_move_for_ship_custody_is_refused_and_leaves_the_run(gws):
++    hub, _ = gws
++    tid, run_id = base._running_hub_card(hub)
++    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason=PR1187, checkpoint="c",
++                       expected_run_id=run_id)
++    assert not res["ok"] and res["reason_code"] == kms.SHIP_CUSTODY_REFUSED, res
++    assert "Run ship here" in res["error"]
++    assert kb.get_task(hub.conn, tid).status == "running" and _moved(hub.conn, tid) == 0
++    assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == [
++        "machine:hub"]
++
++
++def test_a_named_host_need_still_moves(gws):
++    hub, _ = gws
++    tid, run_id = base._running_hub_card(hub)
++    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason=PR1187, checkpoint="c",
++                       expected_run_id=run_id, host_reason="unpushed worktree exists only on worker-1")
++    assert res["ok"], res
++    [ev] = base._events(hub.conn, tid)
++    assert ev["host_reason"] == "unpushed worktree exists only on worker-1"
++
++
++def test_queued_and_reclaim_moves_apply_the_same_rule(gws, monkeypatch):
++    hub, _ = gws
++    hub.enter()
++    queued = kb.create_task(hub.conn, title="q", assignee="default", runs_on=["machine:hub"])
++    res = km.move_queued(hub.conn, queued, runs_on=["machine:worker-1"], reason=CUSTODY_CARD)
++    assert res["reason_code"] == kms.SHIP_CUSTODY_REFUSED and _moved(hub.conn, queued) == 0
++    tid, _run = base._running_hub_card(hub)
++    reclaims = []  # a real reclaim signals the fixture run's worker pid (this test process)
++    monkeypatch.setattr(kb, "reclaim_task", lambda *a, **k: reclaims.append(a) or True)
++    res = km.move_reclaim(hub.conn, tid, runs_on=["machine:worker-1"], reason=PR1187)
++    assert res["reason_code"] == kms.SHIP_CUSTODY_REFUSED and kb.get_task(hub.conn, tid).status == "running"
++    assert reclaims == [] and _moved(hub.conn, tid) == 0
++
++
++def test_tool_kanban_move_refuses_with_the_remedy(gws, monkeypatch):
++    hub, _ = gws
++    tid, run_id = base._running_hub_card(hub)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_move({"runs_on": ["machine:worker-1"], "reason": PR1187, "checkpoint": "c"}))
++    assert "lands from every machine" in json.dumps(out), out
++    assert kb.get_task(hub.conn, tid).status == "running"
++    out = json.loads(kt._handle_move({"runs_on": ["machine:worker-1"], "reason": PR1187, "checkpoint": "c",
++                                      "host_reason": "hub-local evidence file"}))
++    assert out["runs_on"] == ["machine:worker-1"], out
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index e8a0bfe27c..6a4575eb72 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -473,7 +473,8 @@ KANBAN_MOVE_SCHEMA = _schema(
+         "reason": _prop("string", "Why the card must move (what this machine lacks). Logged on the card."),
+         "host_reason": _prop("string", (
+             "Required for runs_on naming one pool worker (machine:worker-N): the card works on that host, or "
+-            "holds unpushed state there. Capacity is never a host reason: use [\"pool:worker\"]."
++            "holds unpushed state there. Capacity is never a host reason: use [\"pool:worker\"]. Also required "
++            "when reason claims ship/landing custody: hermes-core-wt ship lands from every machine."
+         )),
+         "checkpoint": _prop("string", (
+             "Everything the next run needs to resume on the other machine: what is done (commits, branches, "
+-- 
+2.43.0
+

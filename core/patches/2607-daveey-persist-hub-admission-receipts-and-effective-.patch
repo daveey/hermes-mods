@@ -1,0 +1,284 @@
+From 279177504ec175e1e3e757fbcdf782a87442962d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:35:02 +0000
+Subject: [PATCH] [daveey] persist hub admission receipts and effective
+ requirements on tool creates
+
+---
+ hermes_cli/kanban_db_creation.py          |  9 ++-
+ tests/test_kanban_hub_admission_audit.py  | 95 +++++++++++++++++++++++
+ tests/tools/test_kanban_creation_audit.py |  9 ++-
+ tools/kanban_tools.py                     | 18 +++--
+ tools/kanban_tools_placement.py           | 17 ++--
+ 5 files changed, 134 insertions(+), 14 deletions(-)
+ create mode 100644 tests/test_kanban_hub_admission_audit.py
+
+diff --git a/hermes_cli/kanban_db_creation.py b/hermes_cli/kanban_db_creation.py
+index 0cb5d437a2..a207422813 100644
+--- a/hermes_cli/kanban_db_creation.py
++++ b/hermes_cli/kanban_db_creation.py
+@@ -13,11 +13,14 @@ def default_ready_assignee() -> str:
+     return name or "default"
+ 
+ 
+-def tool_creation_audit(args: dict, **effective) -> dict | None:
++def tool_creation_audit(args: dict, *, admission=None, **effective) -> dict | None:
+     """Audit the same normalized fields placement judged, including inherited identity/project. [daveey]"""
+     from hermes_cli.kanban_worker_placement import creation_audit
+ 
+-    return creation_audit({**args, **effective})
++    audit = creation_audit({**args, **effective})
++    if admission and admission.get("hub_admission"):
++        audit = {**(audit or {}), "hub_admission": admission["hub_admission"]}
++    return audit
+ 
+ 
+ def record_created(conn, task_id, *, assignee, status, parents, creator_task_id,
+@@ -46,6 +49,8 @@ def record_created(conn, task_id, *, assignee, status, parents, creator_task_id,
+         # Final insertion policy, not a later assignment or a caller's diagnostic override.
+         "placement_policy": placement_policy,
+     })
++    if isinstance(placement_audit, dict) and placement_audit.get("hub_admission"):
++        kb._append_event(conn, task_id, "hub_admission", placement_audit["hub_admission"])
+     if status == "blocked":
+         # A creation-time human ask is a decision wait: validate_human_request
+         # already refuses dependency/transient/time alongside one, and create
+diff --git a/tests/test_kanban_hub_admission_audit.py b/tests/test_kanban_hub_admission_audit.py
+new file mode 100644
+index 0000000000..01a6295097
+--- /dev/null
++++ b/tests/test_kanban_hub_admission_audit.py
+@@ -0,0 +1,95 @@
++"""Admission receipts survive tool normalization and transactional creation."""
++from dataclasses import asdict
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_db_creation as creation
++from hermes_cli.kanban_hub_admission import Verdict
++from tools import kanban_tools_placement as tools
++from tests.hermes_cli.test_kanban_placement import mac
++
++
++@pytest.fixture
++def receipt():
++    return asdict(Verdict(admit=False, why="portable log read"))
++
++
++def test_creation_audit_carries_preflight_receipt(monkeypatch, receipt):
++    from hermes_cli import kanban_worker_placement as worker
++    monkeypatch.setattr(worker, "creation_audit", lambda fields: None)
++    result = creation.tool_creation_audit({"title": "logs"},
++                                          admission={"hub_admission": receipt})
++    assert result == {"hub_admission": receipt}
++
++
++def test_created_emits_separate_admission_event(monkeypatch, receipt):
++    from hermes_cli import kanban_db as kb
++    events = []
++    monkeypatch.setattr(kb, "_append_event", lambda conn, tid, kind, payload:
++                        events.append((kind, payload)))
++    creation.record_created(Mock(), "t_test", assignee="default", status="ready", parents=[],
++                            creator_task_id=None, tenant=None, workspace_kind="scratch",
++                            workspace_path=None, branch_name=None, project_id=None, skills=[],
++                            goal_mode=False, model_override=None, provider_override=None,
++                            created_by="test", requires=["hub:write"],
++                            placement_policy="worker-first-v1",
++                            placement_audit={"hub_admission": receipt})
++    assert [payload for kind, payload in events if kind == "hub_admission"] == [receipt]
++
++
++def test_admitted_local_response_keeps_receipt(receipt):
++    receipt = {**receipt, "admit": True}
++    marker = {"where": "local", "why": "hub context", "hub_admission": receipt}
++    result = tools._marker_placement_fields(None, "t_test", marker, None)
++    assert result["placement"]["hub_admission"] == receipt
++
++
++def test_refusal_returns_structured_receipt(receipt):
++    import json
++    result = json.loads(tools._placement_refused("hub", "portable", hub_admission=receipt))
++    assert result["hub_admission"] == receipt
++    assert result["created"] is False
++
++
++@pytest.mark.parametrize("admit", [True, False])
++def test_origin_bound_creation_does_not_skip_gate(monkeypatch, admit):
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli import kanban_hub_admission as judge
++    calls = []
++    monkeypatch.setattr(kp, "config", lambda: {"worker_pools": {"hub": ["worker-1"]}})
++    monkeypatch.setattr(kp.reg, "self_gateway", lambda: "hub")
++    def fake(*args, **kwargs):
++        calls.append(args)
++        return Verdict(admit=admit, need="hub_chrome" if admit else None,
++                       evidence="Chrome" if admit else "", why="test")
++    monkeypatch.setattr(judge, "admit", fake)
++    result = tools._origin_enrollment({"title": "Chrome", "placement": "local"}, object(), None)
++    assert result["hub_admission"]["admit"] is admit
++    assert len(calls) == 1
++    assert result.get("placement_policy") == (None if admit else "worker-first-v1")
++
++
++@pytest.mark.parametrize("admit", [True, False])
++def test_tool_create_persists_verdict_and_contract(mac, monkeypatch, admit):
++    import json
++    from tools import kanban_tools as kt
++    from hermes_cli import kanban_db as kb, kanban_placement as kp
++    from hermes_cli import kanban_hub_admission as judge
++    from hermes_cli import kanban_capability_routing as routing
++    monkeypatch.setattr(kp, "config", lambda: {"worker_pools": {"hub": ["worker-1"]}})
++    monkeypatch.setattr(kp.reg, "self_gateway", lambda: "hub")
++    monkeypatch.setattr(routing, "preflight", lambda *a, **kw: None)
++    monkeypatch.setattr(judge, "admit", lambda *a, **kw: Verdict(admit=admit, why="test verdict"))
++    out = json.loads(kt._handle_create({"title": "Read logs on the hub", "requires": []}))
++    assert out.get("ok"), out
++    from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing() as conn:
++        task = kb.get_task(conn, out["task_id"])
++        events = kb.list_events(conn, task.id)
++    receipts = [event.payload for event in events if event.kind == "hub_admission"]
++    assert len(receipts) == 1
++    assert receipts[0]["admit"] is admit
++    assert task.placement_policy == (None if admit else "worker-first-v1")
++    if not admit:
++        assert "hub:write" in task.requires
+diff --git a/tests/tools/test_kanban_creation_audit.py b/tests/tools/test_kanban_creation_audit.py
+index b17e10208f..a143231124 100644
+--- a/tests/tools/test_kanban_creation_audit.py
++++ b/tests/tools/test_kanban_creation_audit.py
+@@ -18,9 +18,15 @@ kanban_home = audit_support.kanban_home
+     ("implicit-assignee", "assignee not allowlisted", None),
+     ("portable", None, "worker-first-v1"),
+     ("empty-project", None, "worker-first-v1"),
+-    ("local-pin", None, None),
++    ("local-pin", None, "worker-first-v1"),
+ ])
+ def test_effective_creation_audit_preserves_enrollment(kanban_home, tmp_path, monkeypatch, case, reason, policy):
++    from hermes_cli import kanban_hub_admission as judge
++    calls = []
++    def deny(*args, **kwargs):
++        calls.append(args)
++        return judge.Verdict(admit=False, why="Public analysis needs no hub context")
++    monkeypatch.setattr(judge, "admit", deny)
+     monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
+     monkeypatch.setattr(kt, "_persisted_identity", lambda: "specialist" if case == "implicit-assignee" else "default")
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+@@ -40,6 +46,7 @@ def test_effective_creation_audit_preserves_enrollment(kanban_home, tmp_path, mo
+         args["placement"] = "local"
+     result = json.loads(kt._handle_create(args))
+     assert result.get("ok"), result
++    assert len(calls) == (1 if case == "local-pin" else 0)
+     with kbc.connect() as conn:
+         task = kb.get_task(conn, result["task_id"])
+         event = next(e for e in kb.list_events(conn, task.id) if e.kind == "created")
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 14feac1b69..fad56a97e8 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1497,7 +1497,8 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+         decision = kp.decide(view, machine_ok=machine_ok)
+         target = decision["where"]
+         if target == "refuse":
+-            return _placement_refused(decision["pin"], decision.get("why", "")), None
++            return _placement_refused(decision.get("pin", "hub"), decision.get("why", ""),
++                                      hub_admission=decision.get("hub_admission")), None
+         if target == "local":
+             local = _local_placement(kp, view, decision, machine_ok=machine_ok, note_local_pin=note_local_pin)
+             stranded = _runstate.stranded_create((local or {}).get("runs_on"))
+@@ -1632,7 +1633,7 @@ def _handle_create(args: dict, **kw) -> str:
+             runs_on = _runstate.placement_runs_on(conn, args.get("placement"))
+             if runs_on is not None:
+                 pinned_machine = str(args.get("placement")).strip()
+-                args = {**args, "placement": "local"}
++                args = {**args, "placement": "local", "runs_on": runs_on}
+         # [daveey] Refuse a second owner: open cards on every board/gateway, not this chat's links.
+         refused, after_create = kanban_overlap.check(conn, args, courier=origin_intent is not None,
+                                                      title=str(title).strip(), session_id=session_id,
+@@ -1660,6 +1661,9 @@ def _handle_create(args: dict, **kw) -> str:
+                 return _placement_refused(_pin, "an origin-bound card is created on this gateway")
+         marker_placement = _origin_enrollment(args, origin, marker_placement, assignee=assignee,
+                                                skills=skills, project_id=project_id)
++        if marker_placement and marker_placement.get("where") == "refuse":
++            return _placement_refused(marker_placement.get("pin", "hub"), marker_placement.get("why", ""),
++                                      hub_admission=marker_placement.get("hub_admission"))
+         try:
+             new_tid = kb.create_task(
+                 conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+@@ -1674,10 +1678,12 @@ def _handle_create(args: dict, **kw) -> str:
+                 creator_task_id=self_tid,
+                 idempotency_key=args.get("idempotency_key"),
+                 max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+-                requires=args.get("requires"), runs_on=runs_on, max_retries=max_retries,
++                requires=(marker_placement or {}).get("requires", args.get("requires")),
++                runs_on=runs_on, max_retries=max_retries,
+                 placement_policy=(marker_placement or {}).get("placement_policy"),
+                 placement_checked=True,  # this front door already checked pins, origins and portability
+-                placement_audit=_creation_audit(args, assignee=str(assignee), skills=skills, project_id=project_id),
++                placement_audit=_creation_audit(args, admission=marker_placement, assignee=str(assignee),
++                                                skills=skills, project_id=project_id),
+                 require_declaration=origin_intent is None and declaration_required(),  # couriers exempt [daveey]
+                 model_override=model_override, provider_override=provider_override, pin_mandatory=pin_mandatory,
+                 goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
+@@ -1722,7 +1728,9 @@ def _handle_create(args: dict, **kw) -> str:
+             # and a caller that archives and re-creates it makes a duplicate. [daveey]
+             extra["runs_on"] = runs_on
+             if pinned_machine:
+-                extra["placement"] = _machine_placement(pinned_machine, runs_on)
++                extra["placement"] = {**_machine_placement(pinned_machine, runs_on),
++                                      **({"hub_admission": marker_placement["hub_admission"]}
++                                         if marker_placement and marker_placement.get("hub_admission") else {})}
+                 extra["note"] = _pinned_note(conn, new_tid, pinned_machine, runs_on)  # + drain wait [daveey]
+         # Every result says where the card runs (a caller that can't tell re-creates it or never learns it is stranded)
+         extra.update(runs_where=_runs_where(runs_on, pinned_machine, marker_placement),  # + contract advisory [daveey]
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index 5cb88229eb..0f7a997d47 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -21,9 +21,12 @@ def _origin_enrollment(args, origin, marker, **effective):
+     from hermes_cli import kanban_placement as kp
+     from hermes_cli.kanban_worker_placement import creation_decision
+     cfg, gateway = kp.config(), kp.reg.self_gateway()
+-    return creation_decision({**args, **effective}, cfg, gateway,
+-                             kp.canonical_pin(args.get("placement") or "auto", gateway, cfg), None,
+-                             queue=False)  # [daveey] origin-bound: the worker queue is not applied here
++    from hermes_cli.kanban_hub_admission_placement import apply
++    view = {**args, **effective}
++    decision = creation_decision(view, cfg, gateway,
++                                 kp.canonical_pin(args.get("placement") or "auto", gateway, cfg), None,
++                                 queue=False)  # [daveey] origin-bound: the worker queue is not applied here
++    return apply(view, decision or {"where": "local", "why": "origin-bound storage"}, gateway, cfg)
+ 
+ 
+ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
+@@ -78,13 +81,14 @@ def _placement_origin(conn, creator_task_id: Optional[str], session_id: Optional
+     return {"session_id": session_id, "origin_profile": None}
+ 
+ 
+-def _placement_refused(pin: str, why: str) -> str:
++def _placement_refused(pin: str, why: str, *, hub_admission=None) -> str:
+     """[daveey] A caller-pinned gateway cannot be honoured: say so instead of creating the card here."""
+     return tool_error(
+         f"placement={pin!r} was not honoured and no card was created: {why}. A pinned gateway is never "
+         "silently replaced by a local card. Use placement='local' (or omit it) to create the card on this "
+         "gateway, or create it on the target with `hermes-hub create-task <gateway> ...`.",
+-        code="placement_unavailable", placement=pin, created=False)
++        code="placement_unavailable", placement=pin, created=False,
++        **({"hub_admission": hub_admission} if hub_admission else {}))
+ 
+ 
+ def _local_placement(kp, view: dict, decision: dict, *, machine_ok, note_local_pin: bool) -> dict:
+@@ -135,7 +139,8 @@ def _marker_placement_fields(conn, new_tid: str, marker_placement: Optional[dict
+                 "note": (f"Created here as {new_tid} so it can wait on its parents; it runs on "
+                          f"{marker_placement['defer']}, not here: when the parents finish the dispatcher "
+                          f"forwards it there and this card completes when that one does.")}
+-    if marker_placement.get("runs_on") or marker_placement.get("placement_policy"):
++    if (marker_placement.get("runs_on") or marker_placement.get("placement_policy")
++            or marker_placement.get("hub_admission")):
+         return {"placement": dict(marker_placement)}
+     out: dict = {"placement": {"where": marker_placement["where"], "why": marker_placement["why"]}}
+     if marker_placement.get("remedy"):
+-- 
+2.43.0
+

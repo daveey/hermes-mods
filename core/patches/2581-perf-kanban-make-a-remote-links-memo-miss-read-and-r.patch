@@ -1,0 +1,1051 @@
+From 13147defe251563609b21ecb77641036325acfc7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:58:37 +0000
+Subject: [PATCH] perf(kanban): make a remote-links memo miss read and
+ re-project only changed replica rows [daveey]
+
+hermes-hub's replica (~12.7k task rows, 56 MB JSON) changes every ~30 s, so the
+remote-links memo missed constantly and each miss re-read, re-decoded and
+re-projected every row under _links_lock (41 thread-seconds of lock wait per
+90 s on the always-on dashboard after round 1).
+
+kanban_replica_rows keeps the rows keyed by (gw, key) and on a miss fetches only
+rows with seq above the last seen, in one aggregated statement; the probe totals
+(count, seq, version, data length) prove deletes and catch in-place rewrites.
+kanban_replica_projection keeps each row's clock-free projection and rebuilds
+only the aggregates when hub staleness or an owner scope's freshness flips. A
+replica without seq/version, a row without seq, a replaced file or any
+unexplained total falls back to the full read. Both paths now emit rows in
+(gw, key) order; a 12k-row fixture compares them step by step.
+---
+ hermes_cli/kanban_replica_projection.py       | 364 ++++++++++++++++++
+ hermes_cli/kanban_replica_rows.py             | 160 ++++++++
+ hermes_cli/kanban_session_activity.py         |  68 ++--
+ hermes_cli/kanban_session_activity_release.py |  18 +-
+ .../test_kanban_replica_incremental.py        | 266 +++++++++++++
+ .../test_kanban_replica_read_memo.py          |   2 +-
+ .../tui_gateway/test_replica_bounded_reads.py |   4 +
+ 7 files changed, 834 insertions(+), 48 deletions(-)
+ create mode 100644 hermes_cli/kanban_replica_projection.py
+ create mode 100644 hermes_cli/kanban_replica_rows.py
+ create mode 100644 tests/hermes_cli/test_kanban_replica_incremental.py
+
+diff --git a/hermes_cli/kanban_replica_projection.py b/hermes_cli/kanban_replica_projection.py
+new file mode 100644
+index 0000000000..83f3ff1336
+--- /dev/null
++++ b/hermes_cli/kanban_replica_projection.py
+@@ -0,0 +1,364 @@
++"""Incremental projection of a replica's task rows into this origin's remote cards. [daveey]
++
++``_project_replica`` (``kanban_session_activity``) projects every replica row on every call. On hermes-hub that is
++~13k rows per remote-links memo miss, and the replica changes every ~30 s or faster, so the projection ran under
++``_links_lock`` most of the time chats were waiting on it. This module keeps each row's clock-free projection
++(decode, key parse, record-level release evidence, links to this origin) keyed by ``(gw, key)`` and the
++aggregates built from them, and on a miss re-projects only the rows ``kanban_replica_rows`` reports changed. The
++clock-dependent inputs (hub staleness, each owner scope's freshness verdict) are the state's key: when one of them
++changes, the aggregates are rebuilt from the kept rows without decoding any. ``project`` answers exactly what
++``_project_replica`` does for the same rows; ``tests/hermes_cli/test_kanban_replica_projection.py`` pins that.
++"""
++from __future__ import annotations
++
++import threading
++from dataclasses import dataclass
++from typing import Any
++
++from hermes_cli.kanban_session_activity_records import _fold_legacy_aliases
++from hermes_cli.kanban_session_activity_release import record_attests_terminal
++
++LINK_RELS = ('shepherd', 'cross_task', 'create-task', 'adopt-task')
++_REMOTE_FIELDS = ("title", "status", "block_kind", "human_request", "assignee", "created_at", "started_at", "priority")
++
++
++def linked_sessions(task: dict[str, Any], me: str, origin_profile: str) -> tuple[str, ...]:
++    """The sessions of this origin (gateway ``me``, profile ``origin_profile``) the record links, sorted."""
++    links = task.get("sessions")
++    if not isinstance(links, list):
++        links = []
++    return tuple(sorted({str(link['session']) for link in links
++                         if isinstance(link, dict) and link.get('session') and link.get('gw') == me
++                         and link.get('profile') == origin_profile and link.get('rel') in LINK_RELS}))
++
++
++def historical_fields(raw: dict[str, Any], tkey: tuple) -> dict[str, Any]:
++    from hermes_cli.kanban_completion_receipt_projection import remote_fields
++    gw, owner_profile, board, tid = tkey
++    return remote_fields(raw, gateway=gw, profile=owner_profile, board=board, task_id=tid)
++
++
++def card_rows(tkey: tuple, t: dict[str, Any], *, sids, closed: bool, synced, stale: bool, me: str,
++              origin_profile: str, legacy_record, historical: dict[str, Any]) -> list[tuple[tuple, dict]]:
++    """``((session, ref), card)`` for each linked session of one projected record (``_project_replica``)."""
++    from hermes_cli.kanban_session_activity import LISTED_STATUSES, _owner_evidence_of, _park_of
++
++    gw, owner_profile, board, tid = tkey
++    prefix = f'{gw}/{owner_profile}/{board}' if owner_profile is not None else f'{gw}/{board}'
++    ref = f'{prefix}/{tid}'
++    out = []
++    for sid in sids:
++        out.append(((sid, ref), {
++            **historical,
++            **{f: t.get(f) for f in _REMOTE_FIELDS},
++            "id": tid, "board": board, "gateway": gw, "key": ref, "session": sid,
++            "via": "shepherd", "root": ref, "remote": True,
++            "profile": owner_profile, "owner_profile": owner_profile,
++            "origin_gateway": me, "origin_profile": origin_profile,
++            "ownership_state": 'unknown' if owner_profile is None else 'qualified',
++            "unfinished": not closed and (t.get("status") in LISTED_STATUSES or bool(t.get("unfinished"))),
++            "released": closed,
++            **({"closed_uncompleted": True} if closed and t.get("status") == "archived"
++               and _owner_evidence_of(t).get("verified") is not True else {}),
++            "reported_status": t.get('reported_status', t.get('status')),
++            "synced_at": synced, "stale": stale,
++            "legacy_record": legacy_record,
++            "legacy_key": t.get('_legacy_key'),
++            # [daveey] What the card waits on is recomputed at read time from these (``_remote_wait``).
++            "park": _park_of(t),
++            **{k: t[k] for k in ("awaiting", "wake_check") if t.get(k)},
++        }))
++    return out
++
++
++class _Stage:
++    """One row's clock-free projection; ``error`` set instead when the row is malformed."""
++    __slots__ = (
++        'attest',
++        'cards',
++        'error',
++        'historical',
++        'legacy',
++        'order',
++        'owner3',
++        'published',
++        'row',
++        'seen',
++        'sids',
++        't',
++        'tkey',
++        'unknown',
++    )
++
++
++def _stage(row: tuple, me: str, origin_profile: str) -> _Stage:
++    from hermes_cli.kanban_session_activity import LISTED_STATUSES, _decode_replica_task
++
++    stats["projected"] += 1
++    gw, record_key, data, updated, version = row
++    st = _Stage()
++    st.row, st.error, st.order = row, None, (str(gw), str(record_key))
++    try:
++        t, digest, evidence = _decode_replica_task(record_key, data)
++        parts = str(record_key).split('/')
++        if len(parts) == 3:
++            owner_profile, board, tid = parts
++        elif len(parts) == 2:
++            owner_profile = None
++            board, tid = parts
++        else:
++            raise ValueError('invalid replica task key')
++        if not all(parts) or tid != str(t['id']):
++            raise ValueError('replica task identity mismatch')
++    except ValueError as exc:
++        st.error = exc
++        return st
++    gw = str(gw)
++    st.tkey = (gw, owner_profile, board, tid)
++    st.t = t
++    st.legacy = {'key': record_key, 'version': version, 'digest': digest} if owner_profile is None else None
++    st.seen = (updated or 0) / 1000.0
++    st.attest = ((gw, owner_profile, board) if record_attests_terminal(t, gw, owner_profile, board, evidence)
++                 else None)
++    st.unknown = ({**t, 'reported_status': t.get('status'), 'status': 'unknown', 'unfinished': True}
++                  if owner_profile is None or t.get('status') not in LISTED_STATUSES else None)
++    created = t.get('created_at')
++    st.published = (board, tid, created) if owner_profile is not None and created is not None else None
++    st.owner3 = (gw, board, tid)
++    st.sids = linked_sessions(t, me, origin_profile)
++    st.historical = st.cards = None
++    return st
++
++
++@dataclass
++class _State:
++    """Aggregates of every kept row under one clock key (``stale``, fresh scopes)."""
++    tag: str
++    gen: int | None
++    key: tuple
++    stages: dict
++    errors: dict
++    tasks: dict
++    raw: dict
++    released: set
++    legacy: dict
++    seen: dict
++    seen_dirty: set
++    seen_rows: dict  # gw -> {(gw, key): seen}
++    owners: dict
++    published: dict  # (board, id, created_at) -> {gw: count}
++    published_out: dict  # same keys -> frozenset(gw)
++    qualified: dict  # (gw, board, id) -> {qualified tkey}
++    legacy_keys: set
++    linked: set
++    order: dict  # tkey -> its (gw, key) in ``stages``
++
++
++_lock = threading.Lock()
++_states: dict[str, _State] = {}
++stats = {"projected": 0, "rebuilt": 0, "historical": 0, "considered": 0}
++
++
++def _new_state(tag: str, key: tuple) -> _State:
++    return _State(tag, None, key, {}, {}, {}, {}, set(), {}, {}, set(), {}, {}, {}, {}, {}, set(), set(), {})
++
++
++def _apply(s: _State, rk: tuple, st: _Stage) -> None:
++    s.stages[rk] = st
++    if st.error is not None:
++        s.errors[rk] = st
++        return
++    stale, fresh = s.key[2], s.key[3]
++    tk = st.tkey
++    s.raw[tk] = st.t
++    s.order[tk] = rk
++    if st.legacy is not None:
++        s.legacy[tk] = st.legacy
++        s.legacy_keys.add(tk)
++    else:
++        s.qualified.setdefault(st.owner3, set()).add(tk)
++    gw = tk[0]
++    s.seen_rows.setdefault(gw, {})[rk] = st.seen
++    if gw not in s.seen_dirty:
++        s.seen[gw] = max(s.seen.get(gw, 0.0), st.seen)
++    if st.attest is not None and not stale and st.attest in fresh:
++        s.released.add(tk)
++        s.tasks[tk] = st.t
++    else:
++        s.tasks[tk] = st.unknown if st.unknown is not None else st.t
++    s.owners[st.owner3] = s.owners.get(st.owner3, 0) + 1
++    if st.published is not None:
++        gws = s.published.setdefault(st.published, {})
++        gws[gw] = gws.get(gw, 0) + 1
++        s.published_out[st.published] = frozenset(gws)
++    if st.sids:
++        s.linked.add(tk)
++
++
++def _unapply(s: _State, rk: tuple) -> None:
++    st = s.stages.pop(rk)
++    if st.error is not None:
++        del s.errors[rk]
++        return
++    tk = st.tkey
++    for d in (s.raw, s.order, s.tasks, s.legacy):
++        d.pop(tk, None)
++    s.released.discard(tk)
++    s.legacy_keys.discard(tk)
++    s.linked.discard(tk)
++    if st.legacy is None:
++        twins = s.qualified[st.owner3]
++        twins.discard(tk)
++        if not twins:
++            del s.qualified[st.owner3]
++    gw_rows = s.seen_rows[tk[0]]
++    del gw_rows[rk]
++    if not gw_rows:
++        del s.seen_rows[tk[0]]
++    if s.seen.get(tk[0]) == st.seen:
++        s.seen_dirty.add(tk[0])  # it may have been this gateway's newest row
++    n = s.owners[st.owner3] - 1
++    if n:
++        s.owners[st.owner3] = n
++    else:
++        del s.owners[st.owner3]
++    if st.published is not None:
++        gws = s.published[st.published]
++        gws[tk[0]] -= 1
++        if not gws[tk[0]]:
++            del gws[tk[0]]
++        if gws:
++            s.published_out[st.published] = frozenset(gws)
++        else:
++            del s.published[st.published], s.published_out[st.published]
++
++
++def _settle_seen(s: _State) -> None:
++    for gw in s.seen_dirty:
++        rows = s.seen_rows.get(gw)
++        if rows:
++            s.seen[gw] = max(0.0, *rows.values())
++        else:
++            s.seen.pop(gw, None)
++    s.seen_dirty.clear()
++
++
++def _advance(s: _State, view, me: str, origin_profile: str) -> None:
++    """Bring ``s`` to ``view``'s rows, re-projecting only rows whose stored text changed."""
++    if s.gen is not None and view.base_gen == s.gen:
++        removed, candidates = view.removed, view.changed
++    else:  # not the view ``s`` was advanced from: compare every row (no decode for unchanged ones)
++        removed = s.stages.keys() - view.by_key.keys()
++        candidates = view.by_key.keys()
++    for rk in removed:
++        if rk in s.stages:
++            _unapply(s, rk)
++    for rk in candidates:
++        row = view.by_key[rk]
++        old = s.stages.get(rk)
++        if old is not None and (old.row is row or old.row == row):  # (gw, profile) is in the state's key
++            continue
++        if old is not None:
++            _unapply(s, rk)
++        _apply(s, rk, _stage(row, me, origin_profile))
++    s.gen = view.gen
++
++
++def _rekeyed(old: _State, key: tuple) -> _State:
++    """``old``'s rows under a new clock key: no row is decoded again."""
++    stats["rebuilt"] += 1
++    s = _new_state(old.tag, key)
++    for rk, st in old.stages.items():
++        _apply(s, rk, st)
++    s.gen = old.gen
++    return s
++
++
++def project(view, now: float, me: str, info_rows: list, last_ok: float | None, offline: float | None, *,
++            fresh: frozenset, qualified_out: set | None = None, owners_out: set | None = None,
++            seen_out: dict | None = None, moved_out: dict | None = None) -> list[dict[str, Any]]:
++    """``_project_replica(path, now, me, view.rows(), info_rows, last_ok, offline, ...)``, incrementally.
++    ``fresh`` is ``fresh_scopes`` of ``info_rows``' heartbeats at ``now``: all the projection reads of them."""
++    from hermes_cli.profiles import get_active_profile_name
++
++    origin_profile = get_active_profile_name()
++    stale = offline is not None or last_ok is None or now - last_ok > _hub_stale_after()
++    key = (me, origin_profile, stale, fresh)
++    with _lock:
++        s = _states.get(view.path)
++        try:
++            if s is None or s.key[:2] != key[:2]:
++                s = _new_state(view.path, key)
++            elif s.key != key:
++                s = _rekeyed(s, key)
++            _advance(s, view, me, origin_profile)
++        except BaseException:
++            _states.pop(view.path, None)
++            raise
++        _states[view.path] = s
++        while len(_states) > 16:
++            _states.pop(next(iter(_states)))
++        return _emit(s, me, origin_profile, last_ok, stale, fresh, qualified_out=qualified_out,
++                     owners_out=owners_out, seen_out=seen_out, moved_out=moved_out)
++
++
++def _hub_stale_after() -> float:
++    from hermes_cli.kanban_session_activity import HUB_STALE_AFTER_S
++    return HUB_STALE_AFTER_S
++
++
++def _emit(s: _State, me: str, origin_profile: str, last_ok, stale: bool, fresh: frozenset, *, qualified_out,
++          owners_out, seen_out, moved_out) -> list[dict[str, Any]]:
++    if s.errors:
++        raise s.errors[min(s.errors, key=lambda rk: s.errors[rk].order)].error
++    _settle_seen(s)
++    if seen_out is not None:
++        seen_out.update(s.seen)
++    if owners_out is not None and not stale:
++        owners_out.update(s.owners)
++    if moved_out is not None and not stale:
++        moved_out.update({'published': dict(s.published_out), 'live_scopes': fresh})
++    # Fold only the legacy records and every qualified record sharing their (gw, board, id): exactly the inputs
++    # ``_fold_legacy_aliases`` reads for them when given every record.
++    sub = {tk: s.tasks[tk] for tk in s.legacy_keys}
++    for gw, _, board, tid in list(sub):
++        for twin in s.qualified.get((gw, board, tid), ()):
++            sub[twin] = s.tasks[twin]
++    before = dict(sub)
++    _fold_legacy_aliases(sub, s.raw)
++    folded = {tk for tk in before if tk not in sub}
++    if qualified_out is not None:
++        qualified_out.update((gw, board, tid) for gw, _, board, tid in folded)
++    changed = {tk for tk, t in sub.items() if t is not before[tk]}
++    found: dict[tuple, dict] = {}
++    for tk in sorted((s.linked | changed) - folded, key=lambda tk: s.stages[s.order[tk]].order):
++        stats["considered"] += 1
++        gw, owner_profile, board, tid = tk
++        if gw == me and owner_profile == origin_profile:
++            continue
++        t = sub.get(tk, s.tasks[tk])
++        st = s.stages[s.order[tk]]
++        sids = st.sids if tk not in changed else linked_sessions(t, me, origin_profile)
++        if not sids:
++            continue
++        if st.historical is None:
++            stats["historical"] += 1
++            st.historical = historical_fields(st.t, tk)
++        owner_seen = s.seen.get(gw) or None
++        synced = min(owner_seen, last_ok) if (owner_seen and last_ok) else (owner_seen or last_ok)
++        inputs = (t, sids, tk in s.released, synced, stale, me, origin_profile)
++        cached = st.cards
++        if cached is None or cached[0] is not t or cached[1:-1] != inputs[1:]:
++            # Cards are read-only (as in ``_links_cache``), so an unchanged record's cards are shared.
++            cached = st.cards = (*inputs, card_rows(
++                tk, t, sids=sids, closed=inputs[2], synced=synced, stale=stale, me=me,
++                origin_profile=origin_profile, legacy_record=s.legacy.get(tk), historical=st.historical))
++        found.update(cached[-1])
++    return list(found.values())
++
++
++def reset() -> None:
++    with _lock:
++        _states.clear()
++    for k in stats:
++        stats[k] = 0
+diff --git a/hermes_cli/kanban_replica_rows.py b/hermes_cli/kanban_replica_rows.py
+new file mode 100644
+index 0000000000..cdf25b7adb
+--- /dev/null
++++ b/hermes_cli/kanban_replica_rows.py
+@@ -0,0 +1,160 @@
++"""The task rows of a hermes-hub replica, read incrementally by ``seq``. [daveey]
++
++hermes-hub stamps every replica write with its feed's monotonic ``seq``, and the replica changes every ~30 s or
++faster on a busy fleet, so the remote-links memo misses all the time. Re-reading every task row on each miss
++(~13k rows, ~56 MB of JSON on hermes-hub) cost ~10 s of every 90 s under ``_links_lock`` while chats waited for it.
++A miss now fetches only the rows whose ``seq`` is above the last one seen, in one aggregated statement, and
++checks the merged rows against the caller's probe aggregate (``count``, ``total(seq)``, ``total(version)``,
++``total(octet_length(data))``). When they disagree (rows were deleted), one identity aggregate drops the vanished
++keys; anything else it cannot explain (a row rewritten at an older seq, a seq that went back, a replaced file)
++falls back to the full read. The result is always exactly the rows a full read returns, in ``(gw, key)`` order.
++"""
++from __future__ import annotations
++
++import json
++import os
++import sqlite3
++import threading
++from dataclasses import dataclass, field
++
++_COLUMNS = "gw, key, data, updated_at, {version}, seq, octet_length(data)"
++_FULL_SQL = f"SELECT json_group_array(json_array({_COLUMNS})) FROM replica WHERE coll = 'tasks'"
++_DELTA_SQL = _FULL_SQL + " AND seq > ?"
++_IDENTITY_SQL = "SELECT json_group_array(json_array(gw, key, seq)) FROM replica WHERE coll = 'tasks'"
++
++
++@dataclass(frozen=True)
++class Rows:
++    """One consistent view of a replica's task rows. Immutable once returned: readers share it."""
++    path: str
++    ident: tuple | None  # (st_dev, st_ino) of the file the rows came from
++    version_column: str
++    by_key: dict[tuple, tuple]  # (gw, key) -> (gw, key, data, updated_at, version), as ``_read_remote_links`` reads
++    meta: dict[tuple, tuple]  # (gw, key) -> (seq, octet length of data)
++    sums: tuple  # (count, total seq, total integer version, total octets): ``_REPLICA_PROBE``'s terms
++    last_seq: int  # the highest seq these rows had (an upper bound once rows were deleted)
++    gen: int
++    base_gen: int | None = None  # the view ``changed``/``removed`` are relative to (None: a full read)
++    changed: frozenset = field(default_factory=frozenset)
++    removed: frozenset = field(default_factory=frozenset)
++
++    def rows(self) -> list[tuple]:
++        by_key = self.by_key
++        return [by_key[k] for k in sorted(by_key, key=_sort_key)]
++
++
++_lock = threading.Lock()
++_views: dict[str, Rows] = {}
++_gen = [0]
++# Work counters, for tests that pin "changed rows only" without timing anything.
++stats = {"full": 0, "delta": 0, "delta_rows": 0, "identity": 0}
++
++
++def file_ident(path) -> tuple | None:
++    try:
++        st = os.stat(path)
++    except OSError:
++        return None
++    return st.st_dev, st.st_ino
++
++
++def _next_gen() -> int:
++    with _lock:
++        _gen[0] += 1
++        return _gen[0]
++
++
++def _decode(packed: str) -> list[tuple]:
++    return [tuple(item) for item in json.loads(packed)]
++
++
++def _sort_key(key: tuple) -> tuple:
++    return str(key[0]), str(key[1])
++
++
++def _terms(row: tuple, meta: tuple) -> tuple:
++    version = row[4]
++    return 1, meta[0], version if type(version) is int else 0, meta[1]
++
++
++def _plus(a: tuple, b: tuple, sign: int = 1) -> tuple:
++    return tuple(x + sign * y for x, y in zip(a, b))
++
++
++def _matches(sums: tuple, probe) -> bool:
++    return (sums[0] == probe[0] and float(sums[1]) == float(probe[3] or 0)
++            and float(sums[2]) == float(probe[4] or 0) and float(sums[3]) == float(probe[5] or 0))
++
++
++def _full(conn: sqlite3.Connection, path: str, ident, version_column: str) -> Rows:
++    stats["full"] += 1
++    by_key, meta, sums = {}, {}, (0, 0, 0, 0)
++    for gw, key, data, updated, version, seq, size in _decode(
++            conn.execute(_FULL_SQL.format(version=version_column)).fetchone()[0]):
++        row, m = (gw, key, data, updated, version), (seq or 0, size or 0)
++        by_key[(gw, key)], meta[(gw, key)] = row, m
++        sums = _plus(sums, _terms(row, m))
++    return Rows(path, ident, version_column, by_key, meta, sums, max((m[0] for m in meta.values()), default=0),
++                _next_gen())
++
++
++def _delta(conn: sqlite3.Connection, base: Rows, probe) -> Rows | None:
++    """``base`` advanced to the snapshot ``probe`` describes, or None when only a full read can tell."""
++    last = base.last_seq
++    stats["delta"] += 1
++    fresh = _decode(conn.execute(_DELTA_SQL.format(version=base.version_column), (last,)).fetchone()[0])
++    stats["delta_rows"] += len(fresh)
++    by_key, meta, sums = dict(base.by_key), dict(base.meta), base.sums
++    changed = set()
++    for gw, key, data, updated, version, seq, size in fresh:
++        k = (gw, key)
++        if k in by_key:
++            sums = _plus(sums, _terms(by_key[k], meta[k]), -1)
++        by_key[k], meta[k] = (gw, key, data, updated, version), (seq or 0, size or 0)
++        sums = _plus(sums, _terms(by_key[k], meta[k]))
++        changed.add(k)
++    removed: set = set()
++    if not _matches(sums, probe):
++        stats["identity"] += 1
++        present = {(gw, key): seq for gw, key, seq in _decode(conn.execute(_IDENTITY_SQL).fetchone()[0])}
++        removed = set(by_key) - present.keys()
++        for k in removed:
++            sums = _plus(sums, _terms(by_key.pop(k), meta.pop(k)), -1)
++        # A kept row whose seq moved without passing ``last`` (rewritten at an older seq, a resync, another
++        # file's rows): only a full read can tell what it holds. Then the totals must add up: a key we never saw
++        # shows in the count, and a row rewritten in place keeps its seq but not, as a rule, its version and length.
++        if any(present.get(k) != m[0] for k, m in meta.items()):
++            return None
++        if not _matches(sums, probe):
++            return None
++    top = max((meta[k][0] for k in changed), default=last)
++    return Rows(base.path, base.ident, base.version_column, by_key, meta, sums, top, _next_gen(),
++                base.gen, frozenset(changed), frozenset(removed))
++
++
++def read(conn: sqlite3.Connection, path, version_column: str, probe, ident) -> Rows:
++    """The task rows in ``conn``'s open read transaction. ``probe`` is ``_REPLICA_PROBE`` read in that same
++    transaction, ``ident`` the file identity taken before ``conn`` was opened. The caller reads here only a replica
++    whose every task row carries a ``seq`` (``probe[0] == probe[1]``) and that has a ``version`` column."""
++    tag = str(path)
++    if ident is None:  # no file identity, so no base to trust
++        return _full(conn, tag, None, version_column)
++    with _lock:
++        base = _views.get(tag)
++    view = None
++    if base is not None and base.ident == ident:
++        view = _delta(conn, base, probe)
++    if view is None:
++        view = _full(conn, tag, ident, version_column)
++    with _lock:
++        if len(_views) >= 16 and tag not in _views:
++            _views.pop(next(iter(_views)))
++        _views[tag] = view
++    return view
++
++
++def reset() -> None:
++    with _lock:
++        _views.clear()
++    for k in stats:
++        stats[k] = 0
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index a7896e9d17..af84a2ccfe 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -27,6 +27,8 @@ from hermes_cli import kanban_session_activity_recent_done as _recent_done
+ from hermes_cli.kanban_session_activity_origin_snapshot import remote_snapshot as _remote_snapshot
+ from hermes_cli.kanban_session_activity_hub import _hub_content_signature
+ from hermes_cli import kanban_scope_heartbeat as _scope_hb
++from hermes_cli import kanban_replica_projection as _replica_projection
++from hermes_cli import kanban_replica_rows as _replica_rows
+ from hermes_cli.kanban_session_activity_release import TERMINAL_STATUSES
+ from hermes_cli.kanban_session_activity_release import owner_attests_terminal as _owner_attests_terminal
+ from hermes_cli.kanban_db_sync import sync_enabled as _board_sync_enabled
+@@ -611,7 +613,6 @@ HUB_STALE_AFTER_S = 180.0  # same as the hub-sync plugin: no successful hub sync
+ # owner's collector publishes (floor 450 s, the window every owner gets when it publishes none). A fixed 450 s
+ # against a loaded hub's ~440 s cycle flapped closed cards between released and "never released". [daveey]
+ SCOPE_HEARTBEAT_FRESH_S = _scope_hb.SCOPE_HEARTBEAT_FLOOR_S
+-_REMOTE_FIELDS = ("title", "status", "block_kind", "human_request", "assignee", "created_at", "started_at", "priority")
+ _remote_last: list[dict[str, Any]] | None = None  # last good read (process lifetime)
+ _remote_scope: tuple[str, ...] | None = None
+ _snapshot_saved: tuple[tuple[str, ...], list[dict[str, Any]]] | None = None  # last (scope, cards) written to disk
+@@ -676,6 +677,7 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+ 
+     live = now is None
+     now = time.time() if now is None else now
++    ident = _replica_rows.file_ident(path) if live else None
+     conn = _open_ro(path)
+     try:
+         conn.execute("BEGIN")  # one snapshot: the memo key must describe the rows it maps to
+@@ -687,7 +689,7 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+         version_column = 'version' if 'version' in columns else 'NULL'
+         info_rows = conn.execute("SELECT gw, data FROM replica WHERE coll = 'gateway' AND key = 'info'").fetchall()
+         last_ok, offline = _meta_float(conn, "last_ok"), _meta_float(conn, "offline_since")
+-        key = None
++        key = view = rows = probe = None
+         stale = offline is not None or last_ok is None or now - last_ok > HUB_STALE_AFTER_S
+         if live and {'seq', 'version'} <= columns:
+             probe = conn.execute(_REPLICA_PROBE).fetchone()
+@@ -709,11 +711,14 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+                 if moved_out is not None:
+                     moved_out.update(memo[9])
+                 return list(memo[3])  # cards are read-only, as in ``_links_cache``
+-        # Aggregate raw text, not json(data): malformed task JSON retains its per-row decode semantics.
+-        # sqlite3 releases/reacquires the GIL per fetched row; under contention 12k rows can stall for 90s.
+-        packed = conn.execute(f"SELECT json_group_array(json_array(gw, key, data, updated_at, {version_column})) "
+-                              "FROM replica WHERE coll = 'tasks'").fetchone()[0]
+-        rows = [tuple(row) for row in json.loads(packed)]
++        if key is not None:  # [daveey] a miss reads and re-projects only the rows whose seq moved
++            view = _replica_rows.read(conn, path, version_column, probe, ident)
++        else:
++            # Aggregate raw text, not json(data): malformed task JSON retains its per-row decode semantics.
++            # sqlite3 releases/reacquires the GIL per fetched row; under contention 12k rows can stall for 90s.
++            packed = conn.execute(f"SELECT json_group_array(json_array(gw, key, data, updated_at, {version_column})) "
++                                  "FROM replica WHERE coll = 'tasks'").fetchone()[0]
++            rows = [tuple(row) for row in json.loads(packed)]
+     finally:
+         conn.close()
+     if key is None:
+@@ -723,8 +728,9 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+     owners: set = set()
+     moved: dict = {}
+     seen_at: dict[str, float] = {}
+-    cards = _project_replica(path, now, me, rows, info_rows, last_ok, offline,
+-                             qualified_out=qualified, owners_out=owners, seen_out=seen_at, moved_out=moved)
++    cards = _replica_projection.project(view, now, me, info_rows, last_ok, offline, fresh=key[3],
++                                        qualified_out=qualified, owners_out=owners, seen_out=seen_at,
++                                        moved_out=moved)
+     # Heartbeat cut-offs are the live verdicts in ``key``, hub staleness the ``stale`` check; a clock step back rereads.
+     _remote_read_memo = (key, now, None, list(cards),
+                          frozenset(qualified), frozenset(owners), stale, _replica_synced(seen_at, last_ok),
+@@ -768,7 +774,8 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+     legacy_records: dict[tuple, dict] = {}
+     global _replica_decoded
+     previous_decoded, decoded = _replica_decoded, {}
+-    for gw, record_key, data, updated, version in rows:
++    # (gw, key) order, which ``kanban_replica_rows`` also keeps: the answer's order never depends on the scan.
++    for gw, record_key, data, updated, version in sorted(rows, key=lambda r: (str(r[0]), str(r[1]))):
+         memo_key = (str(path), str(gw), str(record_key))
+         hit = previous_decoded.get(memo_key)
+         row = hit[1] if hit is not None and hit[0] == data else _decode_replica_task(record_key, data)
+@@ -815,6 +822,8 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+         qualified_out.update((gw, board, tid) for gw, _, board, tid in blank_before - set(tasks))
+     from hermes_cli.profiles import get_active_profile_name
+ 
++    card_rows = _replica_projection.card_rows
++    historical_fields, linked_sessions = _replica_projection.historical_fields, _replica_projection.linked_sessions
+     origin_profile = get_active_profile_name()
+     found: dict[tuple[str, str], dict[str, Any]] = {}
+     for (gw, owner_profile, board, tid), t in tasks.items():
+@@ -822,43 +831,16 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+         # Other profiles on this gateway, and unqualified legacy owners, are not.
+         if gw == me and owner_profile == origin_profile:
+             continue
+-        links = t.get("sessions") if isinstance(t.get("sessions"), list) else []
+-        sids = {str(link['session']) for link in links
+-                if isinstance(link, dict) and link.get('session') and link.get('gw') == me
+-                and link.get('profile') == origin_profile
+-                and link.get('rel') in ('shepherd', 'cross_task', 'create-task', 'adopt-task')}
++        sids = linked_sessions(t, me, origin_profile)
+         if not sids:
+             continue
+         owner_seen = seen_at.get(gw) or None
+         synced = min(owner_seen, last_ok) if (owner_seen and last_ok) else (owner_seen or last_ok)
+         # Observation scope: the linked card only, never its dependency descendants.
+-        closed = (gw, owner_profile, board, tid) in released
+-        prefix = f'{gw}/{owner_profile}/{board}' if owner_profile is not None else f'{gw}/{board}'
+-        ref = f'{prefix}/{tid}'
+-        from hermes_cli.kanban_completion_receipt_projection import remote_fields
+-        historical = remote_fields(raw[(gw, owner_profile, board, tid)], gateway=gw,
+-                                   profile=owner_profile, board=board, task_id=tid)
+-        for sid in sids:
+-            found[(sid, ref)] = {
+-                **historical,
+-                **{f: t.get(f) for f in _REMOTE_FIELDS},
+-                "id": tid, "board": board, "gateway": gw, "key": ref, "session": sid,
+-                "via": "shepherd", "root": ref, "remote": True,
+-                "profile": owner_profile, "owner_profile": owner_profile,
+-                "origin_gateway": me, "origin_profile": origin_profile,
+-                "ownership_state": 'unknown' if owner_profile is None else 'qualified',
+-                "unfinished": not closed and (t.get("status") in LISTED_STATUSES or bool(t.get("unfinished"))),
+-                "released": closed,
+-                **({"closed_uncompleted": True} if closed and t.get("status") == "archived"
+-                   and _owner_evidence_of(t).get("verified") is not True else {}),
+-                "reported_status": t.get('reported_status', t.get('status')),
+-                "synced_at": synced, "stale": stale,
+-                "legacy_record": legacy_records.get((gw, owner_profile, board, tid)),
+-                "legacy_key": t.get('_legacy_key'),
+-                # [daveey] What the card waits on is recomputed at read time from these (``_remote_wait``).
+-                "park": _park_of(t),
+-                **{k: t[k] for k in ("awaiting", "wake_check") if t.get(k)},
+-            }
++        key = (gw, owner_profile, board, tid)
++        found.update(card_rows(key, t, sids=sids, closed=key in released, synced=synced, stale=stale, me=me,
++                               origin_profile=origin_profile, legacy_record=legacy_records.get(key),
++                               historical=historical_fields(raw[key], key)))
+     return list(found.values())
+ 
+ 
+@@ -1933,6 +1915,8 @@ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+     global _annotate_flight_scope, _annotate_flight_result, _annotate_waiters
+     _remote_read_memo = None
+     _hub_signature.reset()
++    _replica_rows.reset()
++    _replica_projection.reset()
+     _annotate_flight_scope = None
+     _annotate_flight_result = None
+     _annotate_waiters = 0
+diff --git a/hermes_cli/kanban_session_activity_release.py b/hermes_cli/kanban_session_activity_release.py
+index 4f69716d67..78e356285d 100644
+--- a/hermes_cli/kanban_session_activity_release.py
++++ b/hermes_cli/kanban_session_activity_release.py
+@@ -27,7 +27,17 @@ def owner_attests_terminal(task: dict[str, Any], gw: str, owner_profile: str | N
+     cards had no other release path, so every one of them stayed open forever. ``evidence`` is the task's
+     ``_owner_evidence`` (``_decode_replica_task``). [daveey]
+     """
+-    if stale or owner_profile is None or task.get('status') not in TERMINAL_STATUSES:
++    if stale or owner_profile is None or not record_attests_terminal(task, gw, owner_profile, board, evidence):
++        return False
++    beat = heartbeats.get((gw, owner_profile, board))
++    return beat is not None and _scope_hb.fresh(beat[0], now, beat[1])
++
++
++def record_attests_terminal(task: dict[str, Any], gw: str, owner_profile: str | None, board: str,
++                            evidence: dict[str, Any]) -> bool:
++    """The part of ``owner_attests_terminal`` that is a pure function of the record (no clock, no hub state), so an
++    incremental projection can decide it once per row text. [daveey]"""
++    if owner_profile is None or task.get('status') not in TERMINAL_STATUSES:
+         return False
+     if task.get('profile') != owner_profile or task.get('board') != board or task.get('gateway') != gw:
+         return False
+@@ -37,7 +47,5 @@ def owner_attests_terminal(task: dict[str, Any], gw: str, owner_profile: str | N
+     # have verified the completion (lifecycle event, run, contract and goal receipts), not just closed it.
+     # An archive is the exception: it produces nothing, so it closes the link without counting as completed
+     # (``closed_uncompleted`` on the row). [daveey]
+-    if task.get('origin_bindings') and evidence.get('verified') is not True and task.get('status') != 'archived':
+-        return False
+-    beat = heartbeats.get((gw, owner_profile, board))
+-    return beat is not None and _scope_hb.fresh(beat[0], now, beat[1])
++    return not (task.get('origin_bindings') and evidence.get('verified') is not True
++                and task.get('status') != 'archived')
+diff --git a/tests/hermes_cli/test_kanban_replica_incremental.py b/tests/hermes_cli/test_kanban_replica_incremental.py
+new file mode 100644
+index 0000000000..06e629fc37
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_incremental.py
+@@ -0,0 +1,266 @@
++"""A live remote-links miss reads and re-projects only the replica rows whose ``seq`` moved. [daveey]
++
++hermes-hub's replica holds ~13k task rows and changes every ~30 s, so the remote-links memo misses all the time.
++Every case here drives a 12k-row hub replica through inserts, updates, deletes, a malformed row and owner-scope
++freshness changes, and after each step compares the live (incremental) read with an explicit-``now`` read, which
++always reads and projects every row through ``_project_replica``. The work counters pin that a step touches the
++changed rows only; nothing here measures wall time.
++"""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_replica_projection as projection
++from hermes_cli import kanban_replica_rows as replica_rows
++from hermes_cli import kanban_session_activity as activity
++from tests.hermes_cli.test_kanban_remote_terminal_release import observed
++from tests.hermes_cli import test_kanban_replica_read_memo as _memo_tests
++from tests.hermes_cli.test_kanban_replica_read_memo import card
++
++hub = _memo_tests.hub  # the 12k-row world builds on that file's hub replica fixture
++N = 12000
++
++
++def _scopes(path, scopes, seq):
++    with sqlite3.connect(path) as db:
++        db.execute("INSERT INTO replica VALUES ('owner','gateway','info',1,?,?,0) ON CONFLICT(gw, coll, key)"
++                   " DO UPDATE SET data=excluded.data, seq=excluded.seq",
++                   (seq, json.dumps({'gateway': 'owner', 'task_scopes': scopes})))
++
++
++def _ok(beat, board='build'):
++    return {'profile': 'work', 'board': board, 'state': 'ok', 'observed_at': beat}
++
++
++class World:
++    def __init__(self, path, clock):
++        self.path, self.clock, self.seq = path, clock, 100
++
++    def write(self, sql, args=()):
++        with sqlite3.connect(self.path) as db:
++            db.execute(sql, args)
++
++    def put(self, key, data, gw='owner', updated=1_000_000):
++        self.seq += 1
++        self.write("INSERT INTO replica VALUES (?,'tasks',?,1,?,?,?) ON CONFLICT(gw, coll, key) DO UPDATE"
++                   " SET version=version+1, seq=excluded.seq, data=excluded.data, updated_at=excluded.updated_at",
++                   (gw, key, self.seq, data, updated))
++
++    def delete(self, key, gw='owner'):
++        self.write("DELETE FROM replica WHERE gw = ? AND coll = 'tasks' AND key = ?", (gw, key))
++
++    def tick(self, now):
++        self.write("UPDATE meta SET v = ? WHERE k = 'last_ok'", (str(now),))
++        self.clock['now'] = now
++
++    def both(self):
++        """(live, explicit, live outs, explicit outs) at one instant; the explicit read is the full path."""
++        outs = [(set(), set(), {}), (set(), set(), {})]
++        live = activity._read_remote_links(self.path, qualified_out=outs[0][0], owners_out=outs[0][1],
++                                           moved_out=outs[0][2])
++        full = activity._read_remote_links(self.path, now=self.clock['now'], qualified_out=outs[1][0],
++                                           owners_out=outs[1][1], moved_out=outs[1][2])
++        return live, full, outs[0], outs[1]
++
++    def same(self):
++        replica_rows.stats.update(dict.fromkeys(replica_rows.stats, 0))
++        projection.stats.update(dict.fromkeys(projection.stats, 0))
++        live, full, live_outs, full_outs = self.both()
++        assert live == full and live_outs == full_outs
++        return live
++
++
++def _task(i, **extra):
++    t = card(f't_{i}', **extra)
++    if i % 4:  # most rows link another origin's session: projected, never cards here
++        t['sessions'] = [{'gw': 'elsewhere', 'profile': 'default', 'session': 's9', 'rel': 'shepherd'}]
++    return t
++
++
++@pytest.fixture
++def world(hub):
++    path, _, statements, clock = hub
++    w = World(path, clock)
++    with sqlite3.connect(path) as db:
++        db.executemany("INSERT INTO replica VALUES (?,'tasks',?,1,?,?,1000000)",
++                       [('owner', f'work/build/t_{i}', i + 1, json.dumps(_task(i))) for i in range(N)])
++    _scopes(path, [_ok(1000.0)], seq=N + 50)
++    w.seq = N + 100
++    return w, statements
++
++
++def test_steps_through_inserts_updates_deletes_and_scope_changes_equal_the_full_read(world):
++    w, _ = world
++    first = w.same()
++    assert replica_rows.stats['full'] == 1 and projection.stats['projected'] == N  # the cold read projects all
++    assert len(first) == N // 4
++
++    w.put('work/build/t_8', json.dumps(_task(8, status='blocked')))  # update, linked
++    w.put('work/build/t_9', json.dumps(_task(9, title='renamed')))  # update, unlinked
++    w.put('work/build/t_new', json.dumps(card('t_new')))  # insert
++    w.tick(1005.0)
++    rows = w.same()
++    assert {r['id']: r['status'] for r in rows}['t_8'] == 'blocked' and 't_new' in {r['id'] for r in rows}
++    assert replica_rows.stats == {'full': 0, 'delta': 1, 'delta_rows': 3, 'identity': 0}
++    assert projection.stats['projected'] == 3
++    assert projection.stats['historical'] == 2  # the two linked rows; the unlinked t_9 makes no card
++    assert projection.stats['considered'] == len(rows)  # only rows linking this origin are looked at
++
++    w.delete('work/build/t_12')  # delete a linked row
++    w.delete('work/build/t_13')
++    w.tick(1010.0)
++    rows = w.same()
++    assert not {'t_12', 't_13'} & {r['id'] for r in rows}
++    assert replica_rows.stats['full'] == 0 and replica_rows.stats['identity'] == 1
++    assert projection.stats['projected'] == 0
++
++    w.put('work/build/t_16', json.dumps(observed(card('t_16', status='done'))))  # owner attests it closed
++    w.tick(1015.0)
++    rows = w.same()
++    assert {r['id']: r['released'] for r in rows}['t_16'] is True and projection.stats['projected'] == 1
++
++    _scopes(w.path, [], seq=w.seq + 1)  # the owner scope goes away: the release no longer holds
++    w.seq += 1
++    w.tick(1020.0)
++    rows = w.same()
++    assert {r['id']: r['released'] for r in rows}['t_16'] is False
++    assert (projection.stats['projected'], projection.stats['rebuilt'], projection.stats['historical']) == (0, 1, 0)
++    assert replica_rows.stats['delta_rows'] == 0
++
++
++def test_a_malformed_row_fails_like_the_full_read_and_recovers(world):
++    w, _ = world
++    w.same()
++    w.put('work/build/t_20', '{bad')
++    w.tick(1005.0)
++    with pytest.raises(ValueError):
++        activity._read_remote_links(w.path)
++    with pytest.raises(ValueError):
++        activity._read_remote_links(w.path, now=w.clock['now'])
++    w.put('work/build/t_20', json.dumps(_task(20, status='blocked')))
++    w.tick(1010.0)
++    assert {r['id']: r['status'] for r in w.same()}['t_20'] == 'blocked'
++    assert replica_rows.stats['full'] == 0 and projection.stats['projected'] == 1
++
++
++def test_legacy_and_qualified_twins_fold_like_the_full_read(world):
++    """A frozen ``board/id`` record folds its shepherd link into its finished qualified twin (an unlinked row)."""
++    w, _ = world
++    w.same()
++    same_card = {'created_at': 500, 'created_by': 'u'}
++    w.put('work/build/t_5', json.dumps(observed({**_task(5, status='done'), **same_card})))  # released
++    w.put('build/t_5', json.dumps({**card('t_5'), 'profile': None, **same_card}))
++    w.put('build/t_legacy', json.dumps({**card('t_legacy'), 'profile': None}))
++    w.tick(1005.0)
++    rows = w.same()
++    assert [r['legacy_key'] for r in rows if r['id'] == 't_5'] == ['owner/build/t_5']
++    assert any(r['id'] == 't_legacy' and r['owner_profile'] is None for r in rows)
++    w.delete('build/t_5')  # the legacy record goes: t_5 links no session of this origin any more
++    w.tick(1010.0)
++    assert 't_5' not in {r['id'] for r in w.same()}
++
++
++def test_a_gateways_newest_row_leaving_moves_its_synced_at_back(world):
++    w, _ = world
++    w.tick(3000.0)
++    w.same()
++    w.put('work/build/t_late', json.dumps(card('t_late')), updated=2_500_000)
++    w.tick(3005.0)
++    assert {r['synced_at'] for r in w.same()} == {2500.0}
++    w.delete('work/build/t_late')
++    w.tick(3010.0)
++    assert {r['synced_at'] for r in w.same()} == {1000.0}
++
++
++def test_this_origins_own_cards_are_not_remote(world):
++    w, _ = world
++    w.same()
++    own = {**card('t_own'), 'gateway': 'origin', 'profile': 'default'}
++    w.put('default/build/t_own', json.dumps(own), gw='origin')
++    w.put('other/build/t_peer', json.dumps({**own, 'id': 't_peer', 'profile': 'other'}), gw='origin')
++    w.tick(1005.0)
++    ids = {r['id'] for r in w.same()}
++    assert 't_own' not in ids and 't_peer' in ids
++
++
++def test_a_row_rewritten_at_an_older_seq_or_a_replaced_file_reads_in_full(world):
++    w, _ = world
++    w.same()
++    w.write("UPDATE replica SET seq = 5, data = ? WHERE key = 'work/build/t_40'",
++            (json.dumps(_task(40, status='blocked')),))
++    w.tick(1005.0)
++    rows = w.same()
++    assert {r['id']: r['status'] for r in rows}['t_40'] == 'blocked'
++    assert replica_rows.stats['full'] == 1  # the delta could not explain it
++
++    w.put('work/build/t_44', json.dumps(_task(44, status='blocked')))
++    w.write("UPDATE replica SET data = ?, seq = 7 WHERE key = 'work/build/t_48'",
++            (json.dumps(_task(48, status='blocked')),))
++    real = replica_rows.file_ident
++    # Same path, another file (st_dev, st_ino): nothing kept from the old file's rows is trusted.
++    replica_rows.file_ident = lambda path: (real(path), 'replaced')
++    try:
++        w.tick(1010.0)
++        rows = w.same()
++    finally:
++        replica_rows.file_ident = real
++    status = {r['id']: r['status'] for r in rows}
++    assert status['t_48'] == 'blocked' and status['t_44'] == 'blocked'
++    assert replica_rows.stats['full'] == 1 and replica_rows.stats['delta'] == 0
++
++
++def test_rows_rewritten_in_place_are_never_trusted(world):
++    """Writes that bypass the feed's seq (same seq, or seqs swapped between rows) read in full."""
++    w, _ = world
++    w.same()
++    w.write("UPDATE replica SET data = ? WHERE key = 'work/build/t_60'", (json.dumps(_task(60, title='renamed')),))
++    w.tick(1005.0)
++    assert {r['id']: r['title'] for r in w.same()}['t_60'] == 'renamed'
++    assert replica_rows.stats['full'] == 1 and replica_rows.stats['identity'] == 1
++    assert projection.stats['projected'] == 1  # a full read still re-projects only the row whose text moved
++
++    w.put('work/build/t_64', json.dumps(_task(64, title='x' * 10)))
++    w.put('work/build/t_68', json.dumps(_task(68, title='y' * 10)))
++    w.tick(1005.0)
++    w.same()
++    s64, s68 = w.seq - 1, w.seq  # swap the titles and the seqs: every total stays put
++    w.write("UPDATE replica SET data = ?, seq = ? WHERE key = 'work/build/t_64'",
++            (json.dumps(_task(64, title='y' * 10)), s68))
++    w.write("UPDATE replica SET data = ?, seq = ? WHERE key = 'work/build/t_68'",
++            (json.dumps(_task(68, title='x' * 10)), s64))
++    w.delete('work/build/t_72')  # so the totals differ and the identity aggregate runs
++    w.tick(1010.0)
++    titles = {r['id']: r['title'] for r in w.same()}
++    assert titles['t_64'] == 'y' * 10 and titles['t_68'] == 'x' * 10
++    assert replica_rows.stats['full'] == 1
++
++
++def test_a_replica_without_a_file_identity_is_read_in_full_every_time(world, monkeypatch):
++    w, _ = world
++    monkeypatch.setattr(replica_rows, 'file_ident', lambda path: None)
++    w.same()
++    w.put('work/build/t_76', json.dumps(_task(76, status='blocked')))
++    w.tick(1005.0)
++    assert {r['id']: r['status'] for r in w.same()}['t_76'] == 'blocked'
++    assert replica_rows.stats == {'full': 1, 'delta': 0, 'delta_rows': 0, 'identity': 0}
++
++
++def test_a_stale_hub_answers_like_the_full_read(world):
++    w, _ = world
++    w.put('work/build/t_80', json.dumps(observed(card('t_80', status='done'))))
++    w.tick(1000.0)
++    assert {r['id']: r['released'] for r in w.same()}['t_80'] is True
++    w.clock['now'] = 1000.0 + activity.HUB_STALE_AFTER_S + 5  # no hub pull since: stale, nothing is released
++    rows = w.same()
++    assert {r['id']: r['released'] for r in rows}['t_80'] is False and all(r['stale'] for r in rows)
++    assert projection.stats['projected'] == 0
++
++
++def test_a_row_without_seq_is_never_read_incrementally(world):
++    w, _ = world
++    w.same()
++    w.write("UPDATE replica SET seq = NULL WHERE key = 'work/build/t_52'")
++    w.tick(1005.0)
++    w.same()
++    assert not any(replica_rows.stats.values())  # the plain full read, not the incremental reader
+diff --git a/tests/hermes_cli/test_kanban_replica_read_memo.py b/tests/hermes_cli/test_kanban_replica_read_memo.py
+index a3125fbc9f..cc118f46c9 100644
+--- a/tests/hermes_cli/test_kanban_replica_read_memo.py
++++ b/tests/hermes_cli/test_kanban_replica_read_memo.py
+@@ -37,7 +37,7 @@ def hub(tmp_path, monkeypatch):
+                          ' updated_at INTEGER, PRIMARY KEY (gw, coll, key));'
+                          'CREATE TABLE outbox(id INTEGER PRIMARY KEY, data TEXT);')
+         db.executemany('INSERT INTO meta VALUES (?,?)', [('gateway', 'origin'), ('last_ok', '1000'), ('cursor', '0')])
+-    seq = {'n': 0}
++    seq = {'n': 100}  # above every hand-placed seq: the hub feed's seq only grows
+ 
+     def put(tid, **extra):
+         seq['n'] += 1
+diff --git a/tests/tui_gateway/test_replica_bounded_reads.py b/tests/tui_gateway/test_replica_bounded_reads.py
+index 45044479cf..cc30c778df 100644
+--- a/tests/tui_gateway/test_replica_bounded_reads.py
++++ b/tests/tui_gateway/test_replica_bounded_reads.py
+@@ -73,6 +73,10 @@ def test_remote_links_miss_preserves_rows_with_bounded_fetches(tmp_path, monkeyp
+     monkeypatch.setattr(activity, '_meta_float', lambda conn, key: None)
+     monkeypatch.setattr(activity, '_remote_read_memo', None)
+     monkeypatch.setattr(activity, '_project_replica', lambda path, now, me, rows, *args, **kwargs: rows)
++    # [daveey] A seq-stamped replica is read through ``kanban_replica_rows`` (incremental), in (gw, key) order.
++    monkeypatch.setattr(activity._replica_projection, 'project', lambda view, *args, **kwargs: view.rows())
++    if modern:
++        expected = sorted(expected, key=lambda r: (r[0], r[1]))
+     assert activity._read_remote_links(path) == expected
+     assert conn.fetched <= 12
+ 
+-- 
+2.43.0
+

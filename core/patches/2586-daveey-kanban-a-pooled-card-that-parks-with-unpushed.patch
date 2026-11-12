@@ -1,0 +1,575 @@
+From d4d2f9330ddac0f53d54fe882c328791e20ad5d2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:59:49 +0000
+Subject: [PATCH] [daveey] kanban: a pooled card that parks with unpushed state
+ stays on its worker
+
+Review of #1247 at 118b512 (comment 6471 on t_01a1ce6551c811ef):
+
+- Park pins unpushed state. kanban_continue, kanban_schedule and kanban_block
+  (with the time and dependency parks it routes to) now check the card's trees
+  before their write txn (kanban_park_pin.plan). A pool:worker card whose run
+  parks here with a dirty tree or commits on no remote is set to
+  runs_on [machine:<this worker>] in the same txn, with a pool_pinned event
+  (unpushed_state, trees). A later park with every tree clean and pushed (or
+  gone) puts it back on the pool (pool_unpinned). Only the gateway that holds
+  the run plans the pin (claim_lock has this host's prefix).
+- The card's trees are found where they live: the workspace and its children,
+  linked worktrees under ~/code/_wt etc. whose worktree-owner marker names the
+  card, and trees the park text names.
+- A move to self is refused as pool_keeps_pushed only when a tree of the card
+  was found and it is clean and pushed; with none found, host_reason stands.
+- Drop the unrelated plugin_hooks.json fingerprint churn.
+- Test: a no-pin create on a worker gateway with worker_queue set gets
+  pool:worker; a placement pin to the ship host and an explicit runs_on stay.
+---
+ default/cache/plugin_hooks.json            |   2 +-
+ hermes_cli/kanban_continuation.py          |   3 +
+ hermes_cli/kanban_db.py                    |   8 +-
+ hermes_cli/kanban_db_schedule.py           |   3 +
+ hermes_cli/kanban_move.py                  |   3 +-
+ hermes_cli/kanban_move_pool.py             | 100 ++++++++++---
+ hermes_cli/kanban_park_pin.py              |  93 ++++++++++++
+ target/cache/plugin_hooks.json             |   2 +-
+ tests/hermes_cli/test_kanban_pool_queue.py | 156 ++++++++++++++++++---
+ 9 files changed, 324 insertions(+), 46 deletions(-)
+ create mode 100644 hermes_cli/kanban_park_pin.py
+
+diff --git a/default/cache/plugin_hooks.json b/default/cache/plugin_hooks.json
+index c9db2f9b7c..586aaabb5f 100644
+--- a/default/cache/plugin_hooks.json
++++ b/default/cache/plugin_hooks.json
+@@ -1 +1 @@
+-{"version": 1, "fingerprint": "4cec563f6759e521562e8298dc4ab519bce0eed7133a8fd50b8e8dcca10fe44a", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
++{"version": 1, "fingerprint": "07774d3f617f2e7bec1c8a60ba7ec9b2c39aecf14b6a24b964230c3bace366a7", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 9c139b2351..3e7ea133b9 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -118,6 +118,8 @@ def continue_task(
+         return {"ok": False, "error": f"resume_after_seconds must be between 0 and {MAX_RESUME_AFTER_SECONDS}"}
+     limit = max_continuations if max_continuations is not None else max_consecutive_continuations()
+     now = int(time.time())
++    from hermes_cli import kanban_park_pin as kpp
++    pin = kpp.plan(conn, task_id, checkpoint)  # git reads stay outside the write txn
+     with kb.write_txn(conn):
+         row = conn.execute(
+             "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+@@ -186,6 +188,7 @@ def continue_task(
+         )
+         if cur.rowcount != 1:
+             return {"ok": False, "error": "task changed state concurrently"}
++        kpp.apply(conn, task_id, pin)  # unpushed state keeps a pooled card on this worker
+         from hermes_cli.kanban_blocker_metadata import blocker_metadata, FIELDS
+         meta = blocker_metadata(conn, task_id, reason=checkpoint, metadata=metadata,
+                                 blocker_id=blocker_id, blocker_provider=blocker_provider,
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 6f5890dc47..5812bddfca 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -32,7 +32,7 @@ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Optional
+ 
+-from hermes_cli import kanban_db_sync as _sync, kanban_priority
++from hermes_cli import kanban_db_sync as _sync, kanban_park_pin as _park_pin, kanban_priority
+ from hermes_cli.kanban_db_values import _first_line, _opt_int, _json_or_null
+ from hermes_cli.kanban_worker_placement import resolved_db_placement, validate_creation
+ from hermes_cli import kanban_placement_forward as _placement_fwd  # stdlib-only at import: no cycle
+@@ -2950,14 +2950,14 @@ def block_task(
+     from hermes_cli.kanban_goal_recovery import record_block
+     from hermes_cli.kanban_reason_comment import reason_comment
+     human_request = validate_block_request(human_request, kind)
++    pin = _park_pin.plan(conn, task_id, reason)  # git reads stay outside the write txn
+     with write_txn(conn), reason_comment(conn, task_id, comment) as noted:
+         if not record_block(conn, task_id, goal_rejection, reason, expected_run_id, kind, human_request):
+             return False
+-        cur_row = conn.execute(
+-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+-        ).fetchone()
++        cur_row = conn.execute("SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,)).fetchone()
+         if cur_row is None:
+             return False
++        _park_pin.apply(conn, task_id, pin)  # unpushed state keeps a pooled card on this worker (same run only)
+         from hermes_cli.kanban_dependency_validation import validate_dependency_block
+         validate_dependency_block(conn, task_id, kind)
+         from hermes_cli import kanban_assignment_routing as assignment_routing
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index dad39b9bf0..74918f57fb 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -35,6 +35,8 @@ def schedule_task(
+     Triage parks reset the dispatcher failure streak without an intermediate dispatchable
+     status; block-loop recurrence evidence is retained, as on unblock."""
+     from hermes_cli.kanban_reason_comment import reason_comment
++    from hermes_cli import kanban_park_pin as kpp
++    pin = kpp.plan(conn, task_id, reason)  # git reads stay outside the write txn
+     with _kb.write_txn(conn), reason_comment(conn, task_id, comment) as noted:
+         if _kb._awaiting_human_answer(conn, task_id):
+             return False
+@@ -79,6 +81,7 @@ def schedule_task(
+             params.append(int(expected_run_id))
+         if conn.execute(sql, params).rowcount != 1:
+             return False
++        kpp.apply(conn, task_id, pin)  # unpushed state keeps a pooled card on this worker
+         # A card behind a shared blocker stays behind it: a park without the id says nothing about
+         # the wall (kanban_shared_blockers.run_effect) unless ``clear_blocker`` says it is gone.
+         from hermes_cli.kanban_block_routing import clear_meta
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 3d3cffe3cb..ec5500de4b 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -147,7 +147,8 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+         raise MoveRefused(exc.code, str(exc)) from exc
+     from hermes_cli import kanban_move_pool as kmp
+     host = kmp.check(labels, pool, me=me, running=exclude_me, previous=wn._parse(row["runs_on"]),
+-                     workspace_path=row["workspace_path"], host_reason=host_reason, force=force, refused=MoveRefused)
++                     workspace_path=row["workspace_path"], host_reason=host_reason, force=force, refused=MoveRefused,
++                     task_id=task_id)
+     from hermes_cli import kanban_runs_on_capabilities as roc
+     try:
+         requires = json.loads(row["requires"]) if row["requires"] else []
+diff --git a/hermes_cli/kanban_move_pool.py b/hermes_cli/kanban_move_pool.py
+index 8652ea03f1..eaf90db6ba 100644
+--- a/hermes_cli/kanban_move_pool.py
++++ b/hermes_cli/kanban_move_pool.py
+@@ -4,17 +4,27 @@ Pinning a card to one worker for capacity froze the choice when capacity changed
+ up to 261 min on ``machine:worker-2`` while it was drain-held and worker-1 and worker-4 had free slots. The queue
+ for any worker is ``runs_on: [pool:worker]`` (:data:`hermes_cli.kanban_placement.POOL_LABEL`, ``hermes kanban move
+ <id> --pool``). A move to ``machine:<x>`` where x carries the pool label is refused without ``host_reason`` (the
+-card works on that host, or holds unpushed state there). A pooled card re-pinned to the machine it is on (a park or
+-continue) must also hold unpushed state there: a clean workspace whose commits are on a remote stays on the pool.
++card works on that host, or holds unpushed state there). A pooled card re-pinned by hand to the machine it is on
++must also hold unpushed state there when a tree of the card was found: a clean tree whose commits are on a remote
++stays on the pool. The park itself pins on unpushed state (:mod:`hermes_cli.kanban_park_pin`).
+ """
+ from __future__ import annotations
+ 
++import json
++import re
+ from pathlib import Path
+-from typing import Any, Mapping, Optional
++from typing import Any, Iterable, Mapping, Optional
+ 
+ HOST_REASON_REQUIRED = "host_reason_required"
+ POOL_KEEPS_PUSHED = "pool_keeps_pushed"
+ 
++_PATH = re.compile(r"(?<![\w.:/-])~?(?:/[\w.@+-]+){2,}")
++# Where linked worktrees live (skill hermes-mods-repo, Git worktrees): a card's tree is often ``~/code/_wt/<slug>``,
++# not inside its scratch workspace.
++_WORKTREE_GLOBS = ("code/_wt/*", "code/_wt-remote/*", "code/*/.worktrees/*", ".hermes/hermes-agent/.worktrees/*")
++OWNER_MARKER = "hermes-owner.json"  # the worktree-owner plugin's marker in a linked worktree's gitdir
++_MAX_TREES = 20
++
+ 
+ def pool_label() -> str:
+     from hermes_cli.kanban_placement import POOL_LABEL
+@@ -28,31 +38,76 @@ def pool_pins(labels: list[str], machines: Mapping[str, Mapping[str, Any]]) -> l
+     return [n for n in names if label in ((machines.get(n) or {}).get("labels") or [])]
+ 
+ 
+-def workspace_unpushed(path: Optional[str]) -> Optional[str]:
+-    """``dirty worktree <p>`` / ``unpushed commits in <p>`` for a git tree in the workspace (itself or a direct
+-    child), else None (no workspace, no git tree, or every tree clean with its commits on a remote)."""
+-    from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+-    if not path:
++def _is_tree(path: Path) -> bool:
++    return (path / ".git").exists()
++
++
++def _owner(tree: Path) -> Optional[str]:
++    """``task_id`` from the worktree-owner marker in a linked worktree's gitdir, else None."""
++    try:
++        head = (tree / ".git").read_text(encoding="utf-8-sig", errors="replace").strip()
++    except OSError:  # a directory .git (a main checkout) carries no owner marker
+         return None
+-    root = Path(path).expanduser()
+-    if not root.is_dir():
++    if not head.startswith("gitdir:"):
+         return None
+-    trees = [root] if (root / ".git").exists() else []
+     try:
+-        trees += sorted(p for p in root.iterdir() if p.is_dir() and (p / ".git").exists())[:20]
+-    except OSError:
+-        return f"unreadable workspace {root}"
++        data = json.loads((Path(head.split(":", 1)[1].strip()) / OWNER_MARKER).read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return None
++    return data.get("task_id") if isinstance(data, dict) else None
++
++
++def card_trees(task_id: Optional[str], path: Optional[str], text: Optional[str] = "",
++               extra: Iterable[str] = ()) -> list[str]:
++    """Git trees on this host that hold the card's work: the workspace and its direct children, linked worktrees
++    whose worktree-owner marker names the card, trees the park text names (``~/code/_wt/<slug>``), and ``extra``."""
++    found: list[Path] = []
++    root = Path(path).expanduser() if path else None
++    if root is not None and root.is_dir():
++        found += [root] if _is_tree(root) else []
++        try:
++            found += sorted(p for p in root.iterdir() if p.is_dir() and _is_tree(p))[:_MAX_TREES]
++        except OSError:
++            pass
++    if task_id:
++        home = Path.home()
++        for pattern in _WORKTREE_GLOBS:
++            found += [p for p in sorted(home.glob(pattern)) if p.is_dir() and _owner(p) == task_id]
++    for raw in [*_PATH.findall(text or ""), *extra]:
++        p = Path(raw.rstrip(".,;:)]'\"")).expanduser()
++        if p.is_dir() and _is_tree(p):
++            found.append(p)
++    out: list[str] = []
++    for p in found:
++        key = str(p.resolve())
++        if key not in out:
++            out.append(key)
++    return out[:_MAX_TREES]
++
++
++def tree_state(trees: Iterable[str]) -> Optional[str]:
++    """``dirty worktree <p>`` / ``unpushed commits in <p>`` for the first tree with state, else None."""
++    from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+     for tree in trees:
+-        if _worktree_is_dirty(str(tree), str(tree)):
++        if not Path(tree).is_dir():
++            continue
++        if _worktree_is_dirty(tree, tree):
+             return f"dirty worktree {tree}"
+-        if _worktree_has_unpushed_commits(str(tree)):
++        if _worktree_has_unpushed_commits(tree):
+             return f"unpushed commits in {tree}"
+     return None
+ 
+ 
++def card_trees_state(task_id: Optional[str], path: Optional[str], text: Optional[str] = "",
++                     extra: Iterable[str] = ()) -> tuple[list[str], Optional[str]]:
++    """``(trees found, unpushed state or None)`` for the card on this host."""
++    trees = card_trees(task_id, path, text, extra)
++    return trees, tree_state(trees)
++
++
+ def check(labels: list[str], machines: Mapping[str, Mapping[str, Any]], *, me: str, running: bool,
+           previous: Optional[list[str]], workspace_path: Optional[str], host_reason: Optional[str],
+-          force: bool, refused: type) -> dict[str, Any]:
++          force: bool, refused: type, task_id: Optional[str] = None) -> dict[str, Any]:
+     """Event fields for a move (``host_reason``, ``unpushed_state``), or raise ``refused(code, message)``."""
+     pins = pool_pins(labels, machines)
+     reason = (host_reason or "").strip()
+@@ -66,12 +121,13 @@ def check(labels: list[str], machines: Mapping[str, Mapping[str, Any]], *, me: s
+             "worker only with host_reason: the card works on that host, or holds unpushed state there."))
+     out: dict[str, Any] = {"host_reason": reason[:500]}
+     if me in pins and not running and label in (previous or []):
+-        unpushed = workspace_unpushed(workspace_path)
+-        if unpushed is None and not force:
++        trees, unpushed = card_trees_state(task_id, workspace_path)
++        # Refuse only on evidence: with no tree of the card found here, the host reason stands.
++        if trees and unpushed is None and not force:
+             raise refused(POOL_KEEPS_PUSHED, (
+-                f"the card is on the pool ({label}) and its workspace on {me} is clean with its commits on a "
+-                "remote, so any worker can resume it: it stays on the pool. Only unpushed state pins it here "
+-                "(pass force if the card works on this host)."))
++                f"the card is on the pool ({label}) and its trees on {me} ({', '.join(trees)}) are clean with their "
++                "commits on a remote, so any worker can resume it: it stays on the pool. Only unpushed state pins it "
++                "here (pass force if the card works on this host)."))
+         if unpushed:
+             out["unpushed_state"] = unpushed
+     return out
+diff --git a/hermes_cli/kanban_park_pin.py b/hermes_cli/kanban_park_pin.py
+new file mode 100644
+index 0000000000..6c869c5ebe
+--- /dev/null
++++ b/hermes_cli/kanban_park_pin.py
+@@ -0,0 +1,93 @@
++"""A pooled card that parks with unpushed state stays on the worker that holds it. [daveey]
++
++A card on the worker queue (``runs_on: [pool:worker]``, :mod:`kanban_move_pool`) can be resumed by any worker. When
++its run parks (``kanban_continue``, ``kanban_schedule``, ``kanban_block`` and the time and dependency parks it routes
++to) with a dirty tree or commits on no remote, another worker resuming it would start without that state. So the
++park pins it to ``machine:<this worker>`` in the same transaction and records the state in a ``pool_pinned`` event.
++A later park of that card whose trees are all clean and pushed (or gone) puts it back on the pool
++(``pool_unpinned``). A clean, pushed tree never pins.
++
++The git checks run before the park's write transaction (:func:`plan`); :func:`apply` only writes, and only while the
++same run is still current. Only the gateway that holds the run (its ``claim_lock`` has this host's prefix) plans a
++pin: a hub-side block of a card running on a worker has no view of that worker's trees.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from typing import Any, Optional
++
++PINNED_EVENT = "pool_pinned"
++UNPINNED_EVENT = "pool_unpinned"
++
++
++def plan(conn: sqlite3.Connection, task_id: str, text: Optional[str] = "") -> Optional[dict[str, Any]]:
++    """What the park of ``task_id``'s current run should do to its placement, or None (nothing)."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_move_pool as kmp
++    from hermes_cli import kanban_worker_node as wn
++    try:
++        if "runs_on" not in sync.table_columns(conn, "tasks") or sync.board_mode(conn) != "primary":
++            return None
++        row = conn.execute("SELECT status, current_run_id, claim_lock, runs_on, workspace_path FROM tasks "
++                           "WHERE id = ?", (task_id,)).fetchone()
++        if row is None or row["status"] != "running" or not row["current_run_id"]:
++            return None
++        if not str(row["claim_lock"] or "").startswith(kb._host_prefix()):
++            return None
++        labels = wn._parse(row["runs_on"]) or []
++        me = str(sync._state(conn)["gateway_id"])
++    except (sqlite3.Error, KeyError, TypeError):
++        return None
++    label = kmp.pool_label()
++    base = {"task_id": task_id, "run_id": int(row["current_run_id"]), "me": me, "runs_on": labels}
++    if label in labels:
++        trees, state = kmp.card_trees_state(task_id, row["workspace_path"], text)
++        return {**base, "op": "pin", "state": state, "trees": trees} if state else None
++    pinned = _last_pin(conn, task_id)
++    if labels != [f"machine:{me}"] or pinned is None or pinned.get("runs_on") != labels:
++        return None
++    trees, state = kmp.card_trees_state(task_id, row["workspace_path"], text, extra=pinned.get("trees") or [])
++    return None if state else {**base, "op": "unpin", "restore": pinned.get("previous_runs_on") or [label],
++                               "trees": trees}
++
++
++def _last_pin(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
++    """Payload of the newest placement event when it is a park pin (a later move or unpin supersedes it)."""
++    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ('moved', ?, ?) "
++                       "ORDER BY id DESC LIMIT 1", (task_id, PINNED_EVENT, UNPINNED_EVENT)).fetchone()
++    if row is None or row["kind"] != PINNED_EVENT:
++        return None
++    try:
++        data = json.loads(row["payload"] or "{}")
++    except ValueError:
++        return None
++    return data if isinstance(data, dict) else None
++
++
++def apply(conn: sqlite3.Connection, task_id: str, step: Optional[dict[str, Any]]) -> bool:
++    """Inside the park's write transaction: write the planned placement while the planned run is still current."""
++    if not step:
++        return False
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_worker_node as wn
++    row = conn.execute("SELECT current_run_id, runs_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None or row["current_run_id"] != step["run_id"] or (wn._parse(row["runs_on"]) or []) != step["runs_on"]:
++        return False
++    me = step["me"]
++    if step["op"] == "pin":
++        target = [f"machine:{me}"]
++        payload = {"from_machine": me, "runs_on": target, "previous_runs_on": step["runs_on"],
++                   "unpushed_state": step["state"], "trees": step["trees"],
++                   "host_reason": f"parked with unpushed state on {me}",
++                   "reason": f"{step['state']}: another worker would resume without it"}
++        kind = PINNED_EVENT
++    else:
++        target = list(step["restore"])
++        payload = {"from_machine": me, "runs_on": target, "previous_runs_on": step["runs_on"], "trees": step["trees"],
++                   "reason": f"every tree is clean and pushed (or gone): back on the pool from {me}"}
++        kind = UNPINNED_EVENT
++    wn.set_runs_on(conn, task_id, target)
++    kb._append_event(conn, task_id, kind, payload, run_id=step["run_id"])
++    return True
+diff --git a/target/cache/plugin_hooks.json b/target/cache/plugin_hooks.json
+index 1f2ab596a1..54d59e2e75 100644
+--- a/target/cache/plugin_hooks.json
++++ b/target/cache/plugin_hooks.json
+@@ -1 +1 @@
+-{"version": 1, "fingerprint": "8cb405cbe98e5c325c760ab92e03f4b04c8e148e779cd3050aafe3c850da5c81", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
++{"version": 1, "fingerprint": "86f89b61b7131caef37774ac851aee29e987756bc9c314b8b87f8c05bfd8a070", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index e2c6ca7c33..f11f370d95 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ 
+ import json
+ import subprocess
++from pathlib import Path
+ 
+ import pytest
+ 
+@@ -47,6 +48,7 @@ def hub(tmp_path, monkeypatch, svc):
+     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+     monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
+     monkeypatch.setattr(kp, "config", lambda: CFG)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)  # card worktrees are looked up under ~/code/_wt
+     sync.consume_dispatcher_wake()
+     gw = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
+     gw.enter()
+@@ -146,28 +148,148 @@ def _git(cwd, *args):
+                    capture_output=True)
+ 
+ 
+-def test_park_of_a_pushed_workspace_keeps_the_pool_and_only_unpushed_state_pins(hub, tmp_path):
+-    _registry()
+-    remote, ws = tmp_path / "remote.git", tmp_path / "ws"
++def _commit(tree, name):
++    (tree / name).write_text(name + "\n")
++    _git(tree, "add", name)
++    _git(tree, "commit", "-qm", name)
++
++
++def _pushed_clone(tmp_path, where):
++    """A clone at ``where`` whose one commit is on its remote."""
++    remote = tmp_path / f"{where.name}-remote.git"
+     _git(tmp_path, "init", "--bare", "-q", str(remote))
+-    _git(tmp_path, "clone", "-q", str(remote), str(ws / "repo"))
+-    (ws / "repo" / "a.txt").write_text("a\n")
+-    _git(ws / "repo", "add", "a.txt")
+-    _git(ws / "repo", "commit", "-qm", "a")
+-    _git(ws / "repo", "push", "-q", "origin", "HEAD:refs/heads/wt/x")
++    _git(tmp_path, "clone", "-q", str(remote), str(where))
++    _commit(where, "a.txt")
++    _git(where, "push", "-q", "origin", "HEAD:refs/heads/wt/x")
++    return where
++
++
++# --- park -------------------------------------------------------------------------------------------------------
++
++@pytest.fixture
++def w2(tmp_path, monkeypatch, svc):
++    """The gateway of pool worker ``worker-2``, running its own card's run as a dispatched worker would."""
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    sync.consume_dispatcher_wake()
++    gw = Gateway(tmp_path, "worker-2", svc, monkeypatch, pickup="true")
++    gw.enter()
++    yield gw
++    gw.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _run(gw, monkeypatch, tid):
++    with kb.write_txn(gw.conn):
++        gw.conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++    assert kb.claim_task(gw.conn, tid) is not None
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(gw.conn, tid)))
++
++
++def _placement_events(conn, tid):
++    return [(k, json.loads(p)) for k, p in conn.execute(
++        "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ('pool_pinned', 'pool_unpinned') "
++        "ORDER BY id", (tid,))]
++
++
++def test_park_keeps_a_pushed_card_on_the_pool_and_pins_only_unpushed_state(w2, tmp_path, monkeypatch):
++    """Through the real park entry points (kanban_continue, kanban_block kind=time, kanban_schedule)."""
++    from tools import kanban_tools as kt
++    conn = w2.conn
++    tid = kb.create_task(conn, title="pool card with a worktree", assignee="default", runs_on=[POOL])
++    ws = tmp_path / "ws"
++    ws.mkdir()
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(ws), tid))
++    # The card's tree lives outside its scratch workspace, where card worktrees usually are (~/code/_wt/<slug>).
++    tree = _pushed_clone(tmp_path, tmp_path / "code" / "_wt" / "pool-card")
++
++    # 1. Clean and pushed: kanban_continue leaves the card on the pool, so any worker can resume it.
++    _run(w2, monkeypatch, tid)
++    out = json.loads(kt._handle_continue({"checkpoint": f"Done: a.txt. Worktree {tree}, pushed as wt/x."}))
++    assert out.get("ok"), out
++    assert _runs_on(conn, tid) == [POOL] and _placement_events(conn, tid) == []
++
++    # 2. An unpushed commit: the time park pins the card to this worker and says why.
++    _run(w2, monkeypatch, tid)
++    _commit(tree, "b.txt")
++    out = json.loads(kt._handle_block({"kind": "time", "clock_only": True, "reason": (
++        f"SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting on CI; b.txt is committed in {tree}")}))
++    assert out.get("ok"), out
++    assert _runs_on(conn, tid) == ["machine:worker-2"]
++    kind, ev = _placement_events(conn, tid)[-1]
++    assert kind == "pool_pinned" and ev["unpushed_state"] == f"unpushed commits in {tree.resolve()}", ev
++    assert ev["previous_runs_on"] == [POOL] and str(tree.resolve()) in ev["trees"], ev
++
++    # 3. Pushed again: the next park (kanban_schedule) puts the card back on the pool.
++    _run(w2, monkeypatch, tid)
++    _git(tree, "push", "-q", "origin", "HEAD:refs/heads/wt/x")
++    out = json.loads(kt._handle_schedule({"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting on CI",
++                                          "clock_only": True}))
++    assert out.get("ok"), out
++    assert _runs_on(conn, tid) == [POOL]
++    assert [k for k, _ in _placement_events(conn, tid)] == ["pool_pinned", "pool_unpinned"]
++
++
++def test_park_pins_a_dirty_tree_found_by_its_owner_marker(w2, tmp_path, monkeypatch):
++    from tools import kanban_tools as kt
++    conn = w2.conn
++    tid = kb.create_task(conn, title="pool card", assignee="default", runs_on=[POOL])
++    main = _pushed_clone(tmp_path, tmp_path / "main")
++    tree = tmp_path / "code" / "_wt" / "marked"
++    _git(main, "worktree", "add", "-q", "-b", "wt/marked", str(tree))
++    gitdir = (tree / ".git").read_text().split(":", 1)[1].strip()
++    (Path(gitdir) / "hermes-owner.json").write_text(json.dumps({"task_id": tid}))
++    (tree / "wip.txt").write_text("not committed\n")
++    _run(w2, monkeypatch, tid)
++    out = json.loads(kt._handle_continue({"checkpoint": "half done", "resume_after_seconds": 600,
++                                          "clock_only": True}))
++    assert out.get("ok"), out
++    assert _runs_on(conn, tid) == ["machine:worker-2"]
++    assert _placement_events(conn, tid)[-1][1]["unpushed_state"] == f"dirty worktree {tree.resolve()}"
++
++
++# --- worker-origin cards ----------------------------------------------------------------------------------------
++
++def test_a_worker_created_card_joins_the_pool_and_a_pin_to_the_ship_host_stays(w2, monkeypatch):
++    """A card a worker run creates used to be a local row only that worker could claim (11-12 06:40: worker-4 held
++    5 waiting cards, one it created itself, while worker-5 ran 3 of 10)."""
++    from tools import kanban_tools as kt
++    monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: "worker-2")
++    monkeypatch.setattr(kp, "config", lambda: {"worker_queue": {"worker-2": POOL}})
++    machines = list(_machines().values())
++    wn.set_registry_fetch(lambda: {"me": "worker-2", "machines": machines})
++    out = json.loads(kt._handle_create({"title": "summarise the failing CI jobs", "assignee": "default",
++                                        "requires": []}))
++    assert out.get("ok") and _runs_on(w2.conn, out["task_id"]) == [POOL], out
++    out = json.loads(kt._handle_create({"title": "re-review PR 1 exact head", "assignee": "default", "requires": [],
++                                        "placement": "worker-2"}))  # a review the land card on worker-2 must read
++    assert out.get("ok") and _runs_on(w2.conn, out["task_id"]) is None, out
++    out = json.loads(kt._handle_create({"title": "pinned", "assignee": "default", "requires": [],
++                                        "runs_on": ["machine:worker-1"]}))
++    assert out.get("ok") and _runs_on(w2.conn, out["task_id"]) == ["machine:worker-1"], out
++
++
++def test_move_to_self_refuses_only_on_a_found_clean_tree(hub, tmp_path):
++    _registry()
++    ws = tmp_path / "ws"
++    ws.mkdir()
+     tid = kb.create_task(hub.conn, title="parked pool card", assignee="default", runs_on=[POOL])
+     with kb.write_txn(hub.conn):
+         hub.conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(ws), tid))
+-    # The parked card is on worker-2 (its run ended there): pinning it back to worker-2 is refused while clean+pushed.
+     move = dict(runs_on=["machine:worker-2"], reason="resume here", host_reason="my worktree is here",
+                 me="worker-2", machines=_machines())
+-    res = km.move_queued(hub.conn, tid, **move)
+-    assert not res["ok"] and res["reason_code"] == "pool_keeps_pushed", res
+-    assert _runs_on(hub.conn, tid) == [POOL]
+-    (ws / "repo" / "b.txt").write_text("b\n")
+-    _git(ws / "repo", "add", "b.txt")
+-    _git(ws / "repo", "commit", "-qm", "b")  # an unpushed commit on worker-2
++    # No tree of the card on this host (it may sit elsewhere): the host reason stands.
+     res = km.move_queued(hub.conn, tid, **move)
+     assert res["ok"], res
+-    ev = _moved(hub.conn, tid)[-1]
+-    assert ev["unpushed_state"].startswith("unpushed commits in ") and ev["host_reason"] == "my worktree is here", ev
++    tid = kb.create_task(hub.conn, title="parked pool card 2", assignee="default", runs_on=[POOL])
++    _pushed_clone(tmp_path, ws / "repo")
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(ws), tid))
++    res = km.move_queued(hub.conn, tid, **move)
++    assert not res["ok"] and res["reason_code"] == "pool_keeps_pushed", res  # found, clean and pushed
++    _commit(ws / "repo", "b.txt")
++    res = km.move_queued(hub.conn, tid, **move)
++    assert res["ok"] and _moved(hub.conn, tid)[-1]["unpushed_state"].startswith("unpushed commits in "), res
+-- 
+2.43.0
+

@@ -1,0 +1,115 @@
+From 3397b97bd9c4764585ed5773f10f204cf1ac39e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:03:44 +0000
+Subject: [PATCH] [daveey] Stranded reroute: the card's creator may reroute its
+ own stranded card; refusal tests for every guard
+
+Review t_01a1cf56f5ea6241 on PR #1356: creator_repin returned not_repinnable to the card's own creator
+(repin.applies false) while any other worker could reroute the same card. The creator path now tries
+stranded_refusal before refusing. Parametrized refusal tests cover non-ready status (blocked/todo/scheduled/
+triage), lease_holder, current_run_id, foreign created_on and a non-primary board.
+
+Proof: 7/7 mutants killed (each stranded_refusal guard dropped, creator path skip/always-reroute);
+test_kanban_stranded_reroute.py 26 passed; 30 related files 878 passed, 0 failed.
+---
+ hermes_cli/kanban_creator_repin.py            |  8 ++-
+ .../test_kanban_stranded_reroute.py           | 62 +++++++++++++++++++
+ 2 files changed, 69 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_creator_repin.py b/hermes_cli/kanban_creator_repin.py
+index 928cefb09b..084f5027bd 100644
+--- a/hermes_cli/kanban_creator_repin.py
++++ b/hermes_cli/kanban_creator_repin.py
+@@ -63,9 +63,15 @@ def creator_repin(conn: sqlite3.Connection, task_id: str, env_task: str, *, runs
+                              f"runs_on no enrolled machine carries, and {task_id} is none of these ({refusal}; "
+                              f"{stranded})"}
+     if not repin.applies(conn, task_id):
++        # The creator is the likeliest worker to find its own stranded child: the reroute open to every
++        # worker is open to it too.
++        stranded = stranded_refusal(conn, task_id)
++        if stranded is None:
++            return stranded_reroute(conn, task_id, env_task, runs_on=runs_on, reason=reason, hub=hub)
+         return {"ok": False, "reason_code": "not_repinnable",
+                 "error": f"{task_id} is not an unstarted worker-first card (running, done, archived or no "
+-                         "placement policy); only the explicit origin repin is allowed here"}
++                         f"placement policy) nor a ready card stranded on impossible runs_on ({stranded}); "
++                         "only the explicit origin repin or a stranded reroute is allowed here"}
+     return km.move_queued(conn, task_id, runs_on=runs_on, reason=reason, hub=hub)
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_stranded_reroute.py b/tests/hermes_cli/test_kanban_stranded_reroute.py
+index 8c582dd3a1..4c45ccb892 100644
+--- a/tests/hermes_cli/test_kanban_stranded_reroute.py
++++ b/tests/hermes_cli/test_kanban_stranded_reroute.py
+@@ -111,6 +111,68 @@ def test_a_claimed_card_is_not_rerouted(hub):
+     assert _runs_on(hub.conn, tid) == ["hermes-hub"]
+ 
+ 
++@pytest.mark.parametrize("status", ["blocked", "todo", "scheduled", "triage"])
++def test_a_card_that_is_not_ready_is_not_rerouted(hub, status):
++    """``move_queued`` alone would move a blocked/todo/scheduled card: the ready-only guard is the fence."""
++    tid = _legacy_card(hub, ["hermes-hub"])
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
++    res = kcr.creator_repin(hub.conn, tid, OTHER_WORKER_TASK, runs_on=["machine:hub"], reason=REASON)
++    assert not res.get("ok") and res["reason_code"] == "not_creator_task", res
++    assert "not a ready, unclaimed card" in res["error"], res
++    assert _runs_on(hub.conn, tid) == ["hermes-hub"]
++
++
++@pytest.mark.parametrize("col,val,why", [
++    ("lease_holder", "worker-1", "not a ready, unclaimed card"),
++    ("current_run_id", 999, "not a ready, unclaimed card"),
++    ("created_on", "worker-1", "ask its home"),
++])
++def test_a_held_or_foreign_card_is_not_rerouted(hub, col, val, why):
++    tid = _legacy_card(hub, ["hermes-hub"])
++    with kb.write_txn(hub.conn):
++        hub.conn.execute(f"UPDATE tasks SET {col} = ? WHERE id = ?", (val, tid))
++    res = kcr.creator_repin(hub.conn, tid, OTHER_WORKER_TASK, runs_on=["machine:hub"], reason=REASON)
++    assert not res.get("ok") and res["reason_code"] == "not_creator_task", res
++    assert why in res["error"], res
++    assert _runs_on(hub.conn, tid) == ["hermes-hub"]
++
++
++def test_a_non_primary_board_is_not_rerouted(hub, monkeypatch):
++    tid = _legacy_card(hub, ["hermes-hub"])
++    monkeypatch.setattr(sync, "board_mode", lambda conn: "mirror")
++    res = kcr.creator_repin(hub.conn, tid, OTHER_WORKER_TASK, runs_on=["machine:hub"], reason=REASON)
++    assert not res.get("ok") and res["reason_code"] == "not_creator_task", res
++    assert "not a Board primary" in res["error"], res
++    assert _runs_on(hub.conn, tid) == ["hermes-hub"]
++
++
++def _created_child(hub, labels):
++    hub.enter()
++    creator = kb.create_task(hub.conn, title="creator", assignee="default")
++    tid = kb.create_task(hub.conn, title="child", assignee="default", creator_task_id=creator)
++    with kb.write_txn(hub.conn):
++        wn.set_runs_on(hub.conn, tid, labels)
++    hub.round()
++    return creator, tid
++
++
++def test_the_creator_reroutes_its_own_stranded_card(hub):
++    creator, tid = _created_child(hub, ["hermes-hub"])
++    res = kcr.creator_repin(hub.conn, tid, creator, runs_on=["machine:hub"], reason=REASON)
++    assert res.get("ok"), res
++    assert _runs_on(hub.conn, tid) == ["machine:hub"]
++    assert any(creator in c.body and "['hermes-hub']" in c.body for c in kb.list_comments(hub.conn, tid))
++
++
++def test_the_creator_still_cannot_move_a_satisfiable_ordinary_card(hub):
++    creator, tid = _created_child(hub, ["linux"])
++    res = kcr.creator_repin(hub.conn, tid, creator, runs_on=["machine:hub"], reason=REASON)
++    assert not res.get("ok") and res["reason_code"] == "not_repinnable", res
++    assert "deliberate placement" in res["error"], res
++    assert _runs_on(hub.conn, tid) == ["linux"]
++
++
+ # --- diagnostic -----------------------------------------------------------------------------------------------
+ 
+ def _ready_row(labels, age=6 * 3600, now=1_800_000_000):
+-- 
+2.43.0
+

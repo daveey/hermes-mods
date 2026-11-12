@@ -1,0 +1,77 @@
+From 8e7091738fa7cca99055b8622ea38021ef63927d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:38:25 +0000
+Subject: [PATCH] [daveey] fix(tui_gateway): no in-place queued-row adoption
+ across a session rotation
+
+The accept row lives in the session live at accept; the drained turn flushes
+under the session live now. After a mid-turn compression rotated to a
+continuation, adopting in the parent stranded the turn's user row there
+(#123545 split). Re-append into the flush session instead.
+---
+ .../test_submit_row_session_target.py         | 34 +++++++++++++++++++
+ tui_gateway/session_auto_continue.py          |  6 ++++
+ 2 files changed, 40 insertions(+)
+
+diff --git a/tests/tui_gateway/test_submit_row_session_target.py b/tests/tui_gateway/test_submit_row_session_target.py
+index aa2c2b50e6..5e915c2fdd 100644
+--- a/tests/tui_gateway/test_submit_row_session_target.py
++++ b/tests/tui_gateway/test_submit_row_session_target.py
+@@ -359,3 +359,37 @@ def test_busy_queue_accept_row_lands_with_the_turn_and_is_addressed_there(monkey
+     finally:
+         server._sessions.pop(sid, None)
+         db.close()
++
++
++def test_queued_row_accepted_before_a_rotation_is_not_adopted_in_the_parent(monkeypatch, tmp_path):
++    """A busy-queued prompt accepted into parent P, then turn A compresses and rotates the agent to
++    continuation C (reply A lands in C). In P the accept row is still the last active row, so the
++    in-place adoption guard would match there — but the drained turn flushes under C. Adopting in P
++    strands the turn's user row (marked persisted, so the flush never re-writes it) in the closed
++    parent: the #123545 split. The drain must re-append into C and retire P's copy."""
++    db = SessionDB(db_path=tmp_path / "state.db")
++    sid, key = _desktop_session(monkeypatch, db)
++    session = server._sessions[sid]
++    try:
++        assert server._ensure_session_db_row(session) is not False
++        agent = _flush_agent(db, key)
++        session["agent"] = agent
++        with session["history_lock"]:
++            session["running"] = True
++            server._start_inflight_turn(session, "turn A")
++        db.append_message(key, "user", content="turn A")
++        assert server._handle_busy_submit("r1", sid, session, "QUEUED-B", "ws-1",
++                                          queued=True, display_kind=None)["result"]["status"] == "queued"
++        child = _rotate_to_compression_child(db, key, agent, reopen_parent=False)
++        db.append_message(child, "assistant", content="reply A")
++
++        fresh = server._replace_queued_user_row_for_turn(session, session["queued_prompt"],
++                                                         is_dispatching=True)
++        assert fresh and fresh.get("_submit_row_session_id") == child, fresh
++        child_active = [r["content"] for r in db.get_messages_as_conversation(child) if r["role"] == "user"]
++        parent_active = [r["content"] for r in db.get_messages_as_conversation(key) if r["role"] == "user"]
++        assert [c for c in child_active if "QUEUED-B" in str(c)] == ["QUEUED-B"], child_active
++        assert not [c for c in parent_active if "QUEUED-B" in str(c)], parent_active
++    finally:
++        server._sessions.pop(sid, None)
++        db.close()
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 978ae1ae79..6b2c1ad1a5 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -564,6 +564,12 @@ def _adopt_queued_user_row_in_place(session: dict, early: dict) -> dict | None:
+             return None
+         try:
+             key = _submit_row_owner_key(early, session)
++            # The row was written under the session live at ACCEPT; the turn flushes under the
++            # session live NOW. A mid-turn compression in between rotated the agent to a
++            # continuation: adopting the row in the closed parent strands the drained turn's user
++            # row there (#123545 split). Re-append into the flush session instead.
++            if key != _submit_row_target_key(session):
++                return None
+             live_id = db.resolve_active_row_id(key, early["_row_id"])
+             if not adopt_queued_user_row_in_place(db, key, live_id):
+                 return None
+-- 
+2.43.0
+

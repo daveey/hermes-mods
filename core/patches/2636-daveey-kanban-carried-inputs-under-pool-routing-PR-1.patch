@@ -1,0 +1,287 @@
+From ffba440b43043d5974f1fd834971efa99ca555c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:16:00 +0000
+Subject: [PATCH] [daveey] kanban: carried inputs under pool routing (PR 1247
+ review notes 2 and 3)
+
+Two non-blocking notes from the independent review of PR 1247 (one worker queue), both
+confirmed on main at fbe7656eda before this change:
+
+(3) without_carried_inputs (hermes_cli/kanban_carried_evidence.py) added every heavy_route
+value to its destination set as a machine name. A label value such as pool:worker is a
+class of machines, so no receipt could ever list it and the carried-input exemption was
+off under pool routing (fail closed). A pool label (is_pool_label) in heavy_route or
+worker_queue now expands to every registry machine that carries it, held or idle
+included, so a machine leaving a hold never runs an input its receipt does not cover.
+An unreadable registry, a label with no machines, or a malformed worker_queue still
+returns the text unchanged. Machine-name routes are unchanged.
+
+(2) required_labels (hermes_cli/kanban_placement_coordination.py) read the raw body,
+while portability's coordination.check reads it after without_carried_inputs. A verified
+carried path naming a tool (.../evidence/token-broker-audit/BRIEF.md) passed the
+portability check but still added capability:token-broker to the queue's runs_on (and
+made legacy_refusal refuse heavy routing). required_labels and legacy_refusal now take
+the caller's placement cfg (optional; placement.config() when omitted, as portability
+does) and strip carried inputs first. queue_decision and _routeless_heavy pass theirs.
+
+Proof: tests/hermes_cli/test_kanban_pool_carried_inputs.py. On main 5 tests fail
+(the pool-route exemption for heavy_route, worker_queue and with worker_pools; the queue
+runs_on; the legacy heavy route), all 12 pass after. Each added condition has a killing
+mutant (9/9 killed). The 17 kanban placement test files plus access-contract,
+repin-notice and worker-node suites pass.
+---
+ hermes_cli/kanban_carried_evidence.py         |  35 ++++-
+ hermes_cli/kanban_placement.py                |   2 +-
+ hermes_cli/kanban_placement_coordination.py   |  18 ++-
+ hermes_cli/kanban_worker_placement.py         |   2 +-
+ .../test_kanban_pool_carried_inputs.py        | 122 ++++++++++++++++++
+ 5 files changed, 169 insertions(+), 10 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pool_carried_inputs.py
+
+diff --git a/hermes_cli/kanban_carried_evidence.py b/hermes_cli/kanban_carried_evidence.py
+index bffb60fd3a..e8169f3f8c 100644
+--- a/hermes_cli/kanban_carried_evidence.py
++++ b/hermes_cli/kanban_carried_evidence.py
+@@ -18,6 +18,24 @@ MAX_AGE = 3600
+ PATH_TOKEN = re.compile(r"(?<![\w/])(?:/home/[^/\s`\"']+|~)/\.hermes/kanban/(?:evidence|workspaces)/[^\s`\"'<>]+")
+ 
+ 
++def _label_members(labels: set[str]) -> set[str] | None:
++    """Every registry machine carrying any of ``labels``; None (fail closed) when unreadable or a label is empty."""
++    from hermes_cli import kanban_worker_node as wn
++    snapshot = wn.registry()
++    machines = snapshot.get("machines") if isinstance(snapshot, dict) else None
++    if not isinstance(machines, dict):
++        return None
++    members = set()
++    for label in labels:
++        names = {name for name, entry in machines.items()
++                 if isinstance(entry, dict) and isinstance(entry.get("labels"), list)
++                 and label in entry["labels"]}
++        if not names:
++            return None
++        members |= names
++    return members
++
++
+ def without_carried_inputs(text: str, cfg: dict) -> str:
+     """Remove only complete, locally intact file tokens with fresh fleet receipts.
+ 
+@@ -34,9 +52,22 @@ def without_carried_inputs(text: str, cfg: dict) -> str:
+         if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
+             return text
+         destinations.update(members)
+-    if not all(isinstance(m, str) for m in routes.values()):
++    queue = cfg.get("worker_queue") or {}
++    if not isinstance(queue, dict):
++        return text
++    if not all(isinstance(m, str) for m in (*routes.values(), *queue.values())):
+         return text
+-    destinations.update(routes.values())
++    from hermes_cli.kanban_placement import is_pool_label
++    labels = {m for m in (*routes.values(), *queue.values()) if is_pool_label(m)}
++    destinations.update(m for m in routes.values() if m not in labels)
++    if labels:
++        # A pool route (``pool:worker``) is every machine carrying the label, not a host named
++        # "pool:worker". Count each one, held or idle included, so a machine leaving a hold
++        # never runs an input its receipt does not cover. [daveey]
++        members = _label_members(labels)
++        if members is None:
++            return text
++        destinations.update(members)
+     if not destinations:
+         return text
+     try:
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 390bb703ec..f5c949fc8e 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -528,7 +528,7 @@ def _routeless_heavy(args: dict, c: _Cfg, self_gw: Optional[str],
+     """Legacy heavy routing; worker pools reuse portability without changing this opt-out path."""
+     from hermes_cli.kanban_placement_coordination import legacy_refusal
+     worker = c.heavy_target(self_gw)
+-    if skip or not worker or legacy_refusal(args) or portable_reason(args, c.raw):
++    if skip or not worker or legacy_refusal(args, c.raw) or portable_reason(args, c.raw):
+         return None
+     title, body = args.get("title") or "", args.get("body") or ""
+     heavy = _heavy_marker(title, body, c)
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index 159826a66a..618b33d314 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -200,19 +200,25 @@ def claim_refusal(card, me):
+                  requires=requires)
+ 
+ 
+-def required_labels(args):
+-    """Coordination labels a card's text, skills and declared access need; None for an unsupported action."""
+-    from hermes_cli.kanban_placement import without_evidence, without_placement_note
+-    text = f"{args.get('title') or ''}\n{without_evidence(without_placement_note(args.get('body') or ''))}"
++def required_labels(args, cfg=None):
++    """Coordination labels a card's text, skills and declared access need; None for an unsupported action.
++
++    Reads the same text as portability's :func:`check`: verified carried inputs are removed first, so a
++    path such as ``.../evidence/token-broker-audit/BRIEF.md`` does not demand a label the check never did.
++    """
++    from hermes_cli import kanban_placement as placement
++    from hermes_cli.kanban_carried_evidence import without_carried_inputs
++    body = placement.without_evidence(placement.without_placement_note(args.get("body") or ""))
++    text = without_carried_inputs(f"{args.get('title') or ''}\n{body}", placement.config() if cfg is None else cfg)
+     required, refusal = requirements(text)
+     if refusal:
+         return None
+     return required | skill_requirements(args.get("skills")) | access_requirements(args.get("requires"))
+ 
+ 
+-def legacy_refusal(args):
++def legacy_refusal(args, cfg=None):
+     """Legacy automatic pins have no policy fence; do not apply coordination exemptions."""
+-    labels = required_labels(args)
++    labels = required_labels(args, cfg)
+     return labels is None or bool(labels)
+ 
+ 
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 5b1d076a69..464ea9bdc5 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -61,7 +61,7 @@ def queue_decision(args, cfg, gateway, pin, origin_intent, machine_ok=None):
+         return None
+     if placement.portable_reason(args, cfg):
+         return None
+-    extra = coordination.required_labels(args)
++    extra = coordination.required_labels(args, cfg)
+     if extra is None or not (machine_ok or placement._machine_picks_up)(label):
+         return None
+     return {"where": "local", "runs_on": [label, *sorted(extra - {label})], "why": QUEUED_WHY.format(label=label)}
+diff --git a/tests/hermes_cli/test_kanban_pool_carried_inputs.py b/tests/hermes_cli/test_kanban_pool_carried_inputs.py
+new file mode 100644
+index 0000000000..b1ac8059aa
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pool_carried_inputs.py
+@@ -0,0 +1,122 @@
++"""Carried inputs under pool routing (``pool:worker``): review notes 2 and 3 on PR 1247. [daveey]
++
++(3) ``without_carried_inputs`` read a ``heavy_route`` value ``pool:worker`` as a machine named "pool:worker", so no
++receipt ever covered it and the exemption was off under pool routing. A pool label now means every registry machine
++carrying it. (2) ``required_labels`` (the queue's ``runs_on`` labels) read the raw body, so a verified carried path
++naming a tool (``.../token-broker-audit/BRIEF.md``) demanded ``capability:token-broker`` that the portability check
++never asked for.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_carried_evidence as ce
++from hermes_cli import kanban_placement as kp
++from hermes_cli import kanban_placement_coordination as coord
++from hermes_cli import kanban_worker_node as wn
++from hermes_cli import kanban_worker_placement as wp
++
++POOL = "pool:worker"
++NAME = "/home/example/.hermes/kanban/evidence/token-broker-audit/BRIEF.md"
++
++
++def _machine(name, labels, **extra):
++    return {"name": name, "state": "active", "labels": labels, "hold": False, **extra}
++
++
++@pytest.fixture
++def carried(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    file = home / "kanban/evidence/token-broker-audit/BRIEF.md"
++    file.parent.mkdir(parents=True)
++    file.write_text("frozen plan\n")
++    digest = hashlib.sha256(file.read_bytes()).hexdigest()
++    receipt = {"version": 1, "verified_at": time.time(), "machines": ["worker-1", "worker-2"],
++               "files": {NAME: digest}}
++    manifest = home / "kanban/carried-evidence.json"
++    manifest.write_text(json.dumps(receipt))
++    monkeypatch.setattr(ce, "get_hermes_home", lambda: home)
++    real_path = ce.Path
++    monkeypatch.setattr(ce, "Path", lambda value: file if value == NAME else real_path(value))
++    machines = [_machine("hub", ["linux"]), _machine("worker-1", ["linux", POOL]),
++                _machine("worker-2", ["linux", POOL], hold=True)]
++    wn.set_registry_fetch(lambda: {"me": "hub", "machines": machines})
++    monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: "hub")
++    yield {"manifest": manifest, "receipt": receipt, "machines": machines,
++           "body": f"Read {NAME}, SHA256 {digest}. Implement the approved plan."}
++    wn.set_registry_fetch(None)
++
++
++# --- note 3: a label-valued route is a pool, not a host name ------------------------------------------------------
++
++@pytest.mark.parametrize("cfg", [{"heavy_route": {"hub": POOL}}, {"worker_queue": {"hub": POOL}},
++                                 {"heavy_route": {"hub": POOL}, "worker_pools": {"hub": ["worker-1"]}}],
++                         ids=["heavy_route", "worker_queue", "with_pools"])
++def test_pool_route_exempts_inputs_every_label_machine_carries(carried, cfg):
++    out = ce.without_carried_inputs(carried["body"], cfg)
++    assert NAME not in out and "[carried input]" in out
++    assert kp.portable_reason({"title": "Implement plan", "body": carried["body"]}, cfg) is None
++
++
++def _down():
++    raise OSError("board unreachable")
++
++
++def _string_labels(machines, receipt):
++    machines[1]["labels"] = machines[2]["labels"] = "linux,pool:worker"  # substring is not membership
++    return {"heavy_route": {"hub": "pool:work"}}
++
++
++_FAULTS = {
++    "uncovered_member": lambda machines, receipt: machines.append(_machine("worker-3", [POOL])),
++    # worker-2 is held now, but leaving the hold must not skip the receipt.
++    "held_member_uncovered": lambda machines, receipt: receipt.update(machines=["worker-1"]),
++    # A label no machine carries is unknown destinations, even beside a covered pool.
++    "empty_label": lambda machines, receipt: {"heavy_route": {"hub": "pool:gpu"},
++                                              "worker_pools": {"hub": ["worker-1"]}},
++    "registry_down": lambda machines, receipt: wn.set_registry_fetch(_down),
++    "string_labels": _string_labels,
++    "bad_queue": lambda machines, receipt: {"heavy_route": {"hub": "worker-1"}, "worker_queue": [POOL]},
++}
++
++
++@pytest.mark.parametrize("fault", sorted(_FAULTS))
++def test_pool_route_fails_closed(carried, fault):
++    receipt = carried["receipt"]
++    cfg = _FAULTS[fault](carried["machines"], receipt) or {"heavy_route": {"hub": POOL}}
++    carried["manifest"].write_text(json.dumps(receipt))
++    assert ce.without_carried_inputs(carried["body"], cfg) == carried["body"]
++
++
++def test_machine_route_still_names_one_host(carried):
++    assert NAME not in ce.without_carried_inputs(carried["body"], {"heavy_route": {"hub": "worker-1"}})
++    assert ce.without_carried_inputs(carried["body"], {"heavy_route": {"hub": "worker-3"}}) == carried["body"]
++
++
++# --- note 2: the queue's labels read the same text as the portability check ---------------------------------------
++
++def test_queue_labels_skip_a_verified_carried_path(carried):
++    # worker_pools covers the receipt on main too, so this isolates note 2 from note 3.
++    cfg = {"worker_queue": {"hub": POOL}, "worker_pools": {"hub": ["worker-1", "worker-2"]}}
++    args = {"title": "Implement plan", "body": carried["body"], "assignee": "default"}
++    assert kp.portable_reason(args, cfg) is None
++    # Before: runs_on [pool:worker, capability:token-broker], a label no pool machine carries.
++    assert wp.queue_decision(args, cfg, "hub", "", None, machine_ok=lambda _: True) == {
++        "where": "local", "runs_on": [POOL], "why": wp.QUEUED_WHY.format(label=POOL)}
++    assert coord.required_labels(args, cfg) == set()
++    # The same path without a covering receipt keeps its label, and a real tool mention still needs one.
++    assert coord.required_labels(args, {}) == {"capability:token-broker"}
++    args["body"] += "\nThen run token-broker exec for the token."
++    assert coord.required_labels(args, cfg) == {"capability:token-broker"}
++
++
++def test_legacy_heavy_route_reads_the_same_text(carried):
++    """``legacy_refusal`` (heavy routing) shares ``required_labels``: a carried path no longer refuses the route."""
++    args = {"title": "Run the regression tests for the parser", "body": carried["body"]}
++    d = kp.decide(args, cfg={"heavy_route": {"hub": "worker-1"}}, self_gw="hub")
++    assert d["where"] == "local" and d["runs_on"] == ["machine:worker-1"], d
++    assert coord.legacy_refusal(args, {}) is True  # uncovered: the path's tool name still counts
+-- 
+2.43.0
+

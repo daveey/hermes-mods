@@ -1,0 +1,362 @@
+From 92a9661b4dcee55ff99776836f31d9212f5b1942 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:33:15 +0000
+Subject: [PATCH] [daveey] kanban: store wake_check verbatim, refuse a probe
+ redaction would change; redactor keeps idempotency_key and other identifier
+ *_key values
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A park's wake_check went through the display redactor before it was stored
+(tools/kanban_tools_park_args.py), and the lowercase assignment rule masked
+idempotency_key='review:pr1305:<sha>' to 'review...26b2'. PR #1305's owner
+parked on that probe; it could never match, and the card waited for its
+fallback wake although both conditions held (t_01a1cf477dece56b).
+
+- wake_check (kanban_block / kanban_schedule / kanban_continue) is stored
+  byte-identical. A probe the redactor would change is refused with
+  wake_check_secret, before the dry run executes it; the error names the
+  assignment (or the word before a bare token) and says to read the secret
+  from env or a file. human_request.resolved_check already refuses the same
+  way (kanban_human_request._refuse_secret).
+- agent/redact.py: exact identifier names idempotency_key, cache_key,
+  sort_key, primary_key, partition_key, dedupe_key, dedup_key (any case)
+  are never masked by the assignment passes (agent/redact_identifier_keys.py).
+  Credential names (api_key, secret_key, private_key, access_key,
+  AWS_SECRET_ACCESS_KEY, password, token) still mask.
+- Comment redaction is unchanged; with the allowlist idempotency_key='…'
+  survives in comments.
+
+Proof: tests/agent/test_redact_identifier_key_names.py and
+tests/tools/test_kanban_probe_verbatim.py: 20 failed / 9 passed on the parent
+(d29b70bd0f), all pass here; the 92 test files that import agent.redact or
+drive the park handlers pass (4197 passed, 6 skipped).
+---
+ agent/redact.py                               |   3 +-
+ agent/redact_identifier_keys.py               |  12 ++
+ .../agent/test_redact_identifier_key_names.py |  56 +++++++
+ tests/tools/test_kanban_probe_verbatim.py     | 145 ++++++++++++++++++
+ tools/kanban_tools_park_args.py               |  38 ++++-
+ 5 files changed, 252 insertions(+), 2 deletions(-)
+ create mode 100644 agent/redact_identifier_keys.py
+ create mode 100644 tests/agent/test_redact_identifier_key_names.py
+ create mode 100644 tests/tools/test_kanban_probe_verbatim.py
+
+diff --git a/agent/redact.py b/agent/redact.py
+index 5af77f7404..bdc770730c 100644
+--- a/agent/redact.py
++++ b/agent/redact.py
+@@ -17,6 +17,7 @@ from urllib.parse import unquote_plus
+ # drift: a blocked file_tools read that falls back to ``cat`` is still caught.
+ from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENAMES
+ from agent.redact_connstr import _KV_CONNSTR_GATE_RE, _redact_kv_connection_strings
++from agent.redact_identifier_keys import IDENTIFIER_KEY_NAMES  # dedupe/cache/db keys: never masked
+ from agent.redact_argv import _SUBPROCESS_COMMAND_SPAN, _redact_subprocess_argv  # SPAN re-exported for tests
+ from agent.redact_headers import (
+     _COOKIE_HEADER_JSON_RE, _COOKIE_HEADER_JSON_UNTERMINATED_RE, _SECRET_HEADER_JSON_RE,
+@@ -457,7 +458,7 @@ def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> b
+     # is a code snippet, not a leaked secret value.
+     # Same programmatic-env-lookup exception as _redact_env above (issue #2852): api_key: os.getenv('X') is
+     # a code snippet, not a leaked secret value.
+-    if _ENV_LOOKUP_VALUE_RE.match(value):
++    if _ENV_LOOKUP_VALUE_RE.match(value) or key.lower() in IDENTIFIER_KEY_NAMES:
+         return False
+     # An earlier pass already masked this value (``***`` or the ``«redacted:…»`` sentinel). Masking it
+     # again only erases what the sentinel deliberately kept — the vendor label (``Digest ***`` →
+diff --git a/agent/redact_identifier_keys.py b/agent/redact_identifier_keys.py
+new file mode 100644
+index 0000000000..5f1c8adcbe
+--- /dev/null
++++ b/agent/redact_identifier_keys.py
+@@ -0,0 +1,12 @@
++"""``*_key`` names that hold identifiers, never credentials. [daveey]
++
++Their values are hashes or ``kind:ref:<sha>`` strings shaped like an opaque token, so the assignment passes'
++value-shape test masked ``idempotency_key='review:pr1305:<sha>'`` inside a Kanban wake_check, and the stored
++probe could never match (t_01a1cf477dece56b). Exact names only, any case: ``my_cache_key_secret`` is not on
++the list, and every credential name (``api_key``, ``secret_key``, ``private_key``, ``access_key``) still masks.
++"""
++from __future__ import annotations
++
++IDENTIFIER_KEY_NAMES = frozenset({
++    "idempotency_key", "cache_key", "sort_key", "primary_key", "partition_key", "dedupe_key", "dedup_key",
++})
+diff --git a/tests/agent/test_redact_identifier_key_names.py b/tests/agent/test_redact_identifier_key_names.py
+new file mode 100644
+index 0000000000..e170921601
+--- /dev/null
++++ b/tests/agent/test_redact_identifier_key_names.py
+@@ -0,0 +1,56 @@
++"""Non-secret ``*_key`` identifiers are not masked by the assignment passes. [daveey]
++
++``idempotency_key='review:pr1305:<sha>'`` was masked to ``'review...26b2'`` (and a second pass to ``'***'``)
++because the lowercase assignment rule treats any ``*_key=`` name as a credential and the value has a
++credential-like shape. A short allowlist of identifier names (dedupe, cache, sort and database keys) keeps
++their values; every credential name still masks.
++"""
++from __future__ import annotations
++
++import pytest
++
++from agent.redact import redact_sensitive_text
++
++SHA = "848af5adae9e29a2ac677f26c732c996997a26b2"
++
++
++def _r(text: str) -> str:
++    return redact_sensitive_text(text, force=True)
++
++
++@pytest.mark.parametrize("text", [
++    f"idempotency_key='review:pr1305:{SHA}'",
++    f"idempotency_key=review:pr1305:{SHA}",
++    f'idempotency_key="core-wt-review:daveey/hermes#1305:{SHA}"',
++    f"IDEMPOTENCY_KEY=review:pr1305:{SHA}",
++    f"select id from tasks where idempotency_key='review:pr1305:{SHA}' and status='done'",
++    f"ssh ubuntu@hermes-hub \"sqlite3 ~/.hermes/kanban.db \\\"select 1 from tasks where "
++    f"idempotency_key='review:pr1305:{SHA}'\\\"\"",
++    f"cache_key={SHA}",
++    f"sort_key=Zz9{SHA}",
++    f"primary_key=user_id_{SHA}",
++    f"partition_key=tenantA:{SHA}",
++    f"dedupe_key=selfheal:{SHA}",
++    f"dedup_key=selfheal:{SHA}",
++])
++def test_non_secret_key_names_survive(text):
++    assert _r(text) == text
++
++
++def test_already_elided_idempotency_key_is_not_masked_further():
++    assert _r("idempotency_key='review...26b2'") == "idempotency_key='review...26b2'"
++
++
++@pytest.mark.parametrize("text, secret", [
++    ("api_key='sk-" + "Zq9" * 12 + "'", "sk-" + "Zq9" * 12),
++    ("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
++    ("password=Hunter2Hunter2xx", "Hunter2Hunter2xx"),
++    ("private_key=MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"),
++    ("secret_key=Qm9vbGVhbkZhbHNlVHJ1ZTEy", "Qm9vbGVhbkZhbHNlVHJ1ZTEy"),
++    ("access_key=AKIA1234567890ABCDEF", "AKIA1234567890ABCDEF"),
++    ("openai_key=" + "Ab3dE" * 8, "Ab3dE" * 8),
++    # a name that only ends in an allowlisted name is not on the list
++    ("my_cache_key_secret=" + "Ab3dE" * 8, "Ab3dE" * 8),
++])
++def test_secret_key_names_still_masked(text, secret):
++    assert secret not in _r(text)
+diff --git a/tests/tools/test_kanban_probe_verbatim.py b/tests/tools/test_kanban_probe_verbatim.py
+new file mode 100644
+index 0000000000..fa648e4386
+--- /dev/null
++++ b/tests/tools/test_kanban_probe_verbatim.py
+@@ -0,0 +1,145 @@
++"""A park's ``wake_check`` is stored exactly as filed, or refused; never silently rewritten. [daveey]
++
++PR #1305's owner parked with a probe ``ssh … "sqlite3 … where idempotency_key='review:pr1305:<sha>'"``. The
++kanban tools ran the probe through the display redactor before storing it, which masked the key to
++``'review...26b2'``, so the stored probe could never match and the card waited for its fallback wake. A probe
++is an executable field: redaction changes what runs. It is now stored byte-identical, and a probe that
++redaction would change (a real inline secret) is refused with an explicit error instead of being stored
++altered. Comments keep their redaction; non-secret ``*_key`` names (``idempotency_key``) survive it.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++KEY = "review:pr1305:848af5adae9e29a2ac677f26c732c996997a26b2"
++PROBE = ("ssh ubuntu@hermes-hub \"sqlite3 -readonly ~/.hermes/kanban.db \\\"select 1 from tasks where "
++         f"idempotency_key='{KEY}' and status='done'\\\" | grep -q 1\"")
++AWAITING = {"kind": "external", "ref": "hub review card", "why": "the hub review card finishes it"}
++
++
++@pytest.fixture
++def worker_env(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")  # the probe ssh's to a host the test has not got
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    from pathlib import Path as _Path
++    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
++
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
++        kb.claim_task(conn, tid)
++        run_id = kb._current_run_id(conn, tid)
++    finally:
++        conn.close()
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    return tid
++
++
++def _stored(tid: str) -> tuple:
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        row = conn.execute("SELECT cmd FROM task_wake_checks WHERE task_id = ?", (tid,)).fetchone()
++        events = [r["payload"] or "" for r in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id = ? ORDER BY id", (tid,))]
++    return (row["cmd"] if row else None), events
++
++
++def _block(probe: str) -> dict:
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_block({"reason": "waiting on the hub review", "kind": "transient",
++                                        "wake_check": probe, "check_every": 600, "awaiting": AWAITING}))
++
++
++def test_block_stores_idempotency_key_probe_byte_identical(worker_env):
++    d = _block(PROBE)
++    assert d.get("ok") is True, d
++    assert d.get("wake_check") == PROBE  # the echo is the stored command
++    cmd, events = _stored(worker_env)
++    assert cmd == PROBE
++    assert any(KEY in e for e in events)
++    assert not any("review..." in e for e in events)
++
++
++def test_schedule_stores_idempotency_key_probe_byte_identical(worker_env):
++    from tools import kanban_tools as kt
++    d = json.loads(kt._handle_schedule({"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting on review",
++                                        "wake_check": PROBE, "awaiting": AWAITING}))
++    assert d.get("ok") is True, d
++    assert _stored(worker_env)[0] == PROBE
++
++
++@pytest.mark.parametrize("secret_assignment", [
++    "OPENAI_API_KEY=sk-proj-" + "Ab3dE" * 8,
++    "api_key='sk-" + "Zq9" * 12 + "'",
++    "AWS_SECRET_ACCESS_KEY=" + "wJalrXUtnFEMI/K7MDENG/bPxRfiCY" + "EXAMPLEKEY",
++])
++def test_block_with_inline_secret_is_refused_not_masked(worker_env, secret_assignment):
++    probe = f"{secret_assignment} curl -sf https://api.example.com/ready"
++    d = _block(probe)
++    assert "error" in d, d
++    assert "wake_check_secret" in json.dumps(d)
++    name = secret_assignment.split("=", 1)[0]
++    assert name in d["error"]  # names the matched assignment
++    assert "env" in d["error"] and "file" in d["error"]
++    value = secret_assignment.split("=", 1)[1].strip("'")
++    assert value not in json.dumps(d)  # the refusal never echoes the secret
++    cmd, events = _stored(worker_env)
++    assert cmd is None
++    assert not any(value in e for e in events)
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, worker_env).status == "running"
++
++
++def test_refusal_names_a_bare_token_by_its_neighbour():
++    from tools.kanban_tools_park_args import _wake_check_secret_error
++    token = "ghp_" + "A1b2" * 10
++    err = _wake_check_secret_error(f'curl -sf -H "Authorization: Bearer {token}" https://api.github.com/x')
++    assert err and err.startswith("wake_check_secret:") and "the value after `Bearer`" in err
++    assert token not in err
++    first = _wake_check_secret_error(f"{token} | grep -q ok")
++    assert first and "its first word" in first and token not in first
++    assert _wake_check_secret_error(f"test -f /tmp/x && grep -q '{KEY}' /tmp/x") is None
++
++
++def test_continue_with_inline_secret_is_refused(worker_env):
++    from tools import kanban_tools as kt
++    d = json.loads(kt._handle_continue({"checkpoint": "done: x; next: y", "resume_after_seconds": 900,
++                                        "wake_check": "GITHUB_TOKEN=ghp_" + "A1b2" * 10 + " gh pr view 1"}))
++    assert "wake_check_secret" in json.dumps(d), d
++    assert _stored(worker_env)[0] is None
++
++
++def test_comment_with_idempotency_key_stored_byte_identical(worker_env):
++    from tools import kanban_tools as kt
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    body = f"Parked on `{KEY}` with probe: {PROBE}"
++    d = json.loads(kt._handle_comment({"task_id": worker_env, "body": body}))
++    assert d.get("ok") is True, d
++    with kbc.connect_closing() as conn:
++        comments = kb.list_comments(conn, worker_env)
++    assert comments[-1].body == body
++
++
++def test_comment_still_masks_real_secret(worker_env):
++    from tools import kanban_tools as kt
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    secret = "sk-proj-" + "Ab3dE" * 8
++    kt._handle_comment({"task_id": worker_env, "body": f"OPENAI_API_KEY={secret}"})
++    with kbc.connect_closing() as conn:
++        comments = kb.list_comments(conn, worker_env)
++    assert secret not in comments[-1].body
+diff --git a/tools/kanban_tools_park_args.py b/tools/kanban_tools_park_args.py
+index b1bc9e3721..d20f221ffb 100644
+--- a/tools/kanban_tools_park_args.py
++++ b/tools/kanban_tools_park_args.py
+@@ -4,6 +4,7 @@ Split out of tools/kanban_tools.py to keep that facade under its size cap; behav
+ """
+ from __future__ import annotations
+ 
++import re
+ from typing import Any, Optional
+ 
+ 
+@@ -64,13 +65,48 @@ def _wake_check_args(args: dict) -> tuple[Optional[str], Optional[int], bool]:
+     try:
+         cmd = kwc.normalize_cmd(args.get("wake_check"))
+         every = kwc.normalize_every(raw_every) if cmd else None
++    except ValueError as exc:
++        _check(False, str(exc))
++        raise  # unreachable: _check raised
++    secret = _wake_check_secret_error(cmd) if cmd else None
++    _check(secret is None, secret or "", WAKE_CHECK_SECRET)  # before the dry run executes it
++    try:
+         err = kwc.dry_run_error(cmd, blocker_id=args.get("blocker_id"))
+         if err:
+             raise ValueError(err)
+     except ValueError as exc:
+         _check(False, str(exc), kwc.refusal_code(str(exc)))
++    return cmd, every, clock_only  # verbatim: the stored probe is the command that runs
++
++
++WAKE_CHECK_SECRET = "wake_check_secret"
++
++
++def _wake_check_secret_error(cmd: str) -> Optional[str]:
++    """Refusal text when the display redactor would change ``cmd``, else None. [daveey]
++
++    A wake_check is executable: storing its redacted form changes what runs (``idempotency_key='review...26b2'``
++    could never match, t_01a1cf477dece56b), and storing it unredacted keeps the secret on the board. So a probe
++    redaction would alter is refused, never stored altered. The message names only the redacted assignment."""
+     from tools.kanban_tools import _redact  # lazy: kanban_tools imports this module
+-    return (_redact(cmd) if cmd else None), every, clock_only
++
++    redacted = _redact(cmd)
++    if redacted == cmd:
++        return None
++    import difflib
++
++    raw, red = cmd.split(), redacted.split()
++    names = []
++    for op, a1, _a2, b1, b2 in difflib.SequenceMatcher(a=raw, b=red, autojunk=False).get_opcodes():
++        if op == "equal":
++            continue
++        m = re.match(r"^['\"]?([A-Za-z0-9_.\-]+)\s*=", red[b1]) if b1 < b2 else None
++        names.append(f"`{m.group(1)}=`" if m else f"the value after `{raw[a1 - 1]}`" if a1 else "its first word")
++    return (f"{WAKE_CHECK_SECRET}: this wake_check contains a secret or credential-shaped value at "
++            f"{', '.join(names[:3])}. Probes run exactly as stored and the board never stores a "
++            "secret, so it was not stored, run or masked. Never inline a secret in a probe: read it from env "
++            "(`$OPENAI_API_KEY`, set in the probe host's environment) or a file (`curl -H @$HOME/.hub-auth ...`, "
++            "`sh ~/bin/check.sh` that fetches it via token-broker), then park again.")
+ 
+ 
+ def _wake_check_echo(wake: tuple) -> dict:
+-- 
+2.43.0
+

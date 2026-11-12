@@ -1,0 +1,308 @@
+From f56a64a589db13ccde76ca21ce0bee35c67203db Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:47:00 +0000
+Subject: [PATCH] [daveey] Host running count: exclude pool-worker-leased cards
+ from the file's sync state, not this process's
+
+hermes-hub 2026-11-12 10:35Z (core 4878154a1e95): from a Kanban worker process,
+`hermes kanban --board default show t_01a1c7c4e00f5d69 --json` gave queue
+{"lane":"local","running":14,"limit":7} ("14/7 running") while the gateway's own
+chat_wait_unclaimed notice a minute later said 6/7 and the gateway held 6 running
+cards. The other 8 were default-board cards leased to worker-1/3/4/6
+(lease_holder != hub, claim_lock NULL).
+
+Cause: kanban_db_connect.connect gives a fenced delegated/worker process a
+`mode=ro` connection that skips init, so the file never joins
+kanban_db_sync._SYNCED_PATHS; board_mode() then says "off" and
+held_elsewhere_sql() excludes nothing. Same for any other-board file opened by
+kanban_host_counts._running_in_file in a process that never synced that board.
+
+Fix: kanban_host_counts._running_in reads kanban_sync_state from the file it
+counts (mode == 'primary' and that row's gateway_id) and applies the same
+held-elsewhere condition as held_elsewhere_sql. No state table, no row, or mode
+off/shadow counts every running card; a primary row without gateway_id or an
+unreadable state raises, so running_on_host reports None (unknown).
+board_mode()/held_elsewhere_sql() and the dispatcher's write paths are
+unchanged; nothing is opened writable.
+
+Proof: tests/hermes_cli/test_kanban_host_counts_held_elsewhere.py (10 tests):
+4 RED on base (worker ro read of a 5 own + 8 leased primary board, other-board
+file read, unreadable state, primary without gateway_id), all GREEN after.
+6 hand mutants of the new conditions all killed. 15 test files importing
+kanban_queue_position/host_counts/parent_unclaimed/chat_wait: 162 passed.
+Removed test_card_running_under_another_gateways_lease_is_not_a_local_slot,
+which pinned the old seam by monkeypatching held_elsewhere_sql; the new file
+covers it with real primary-board rows.
+
+Card: t_01a1cf5749db0a43
+---
+ hermes_cli/kanban_host_counts.py              |  29 ++-
+ .../test_kanban_host_counts_held_elsewhere.py | 193 ++++++++++++++++++
+ .../test_kanban_wait_notice_board_counts.py   |   9 -
+ 3 files changed, 219 insertions(+), 12 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_host_counts_held_elsewhere.py
+
+diff --git a/hermes_cli/kanban_host_counts.py b/hermes_cli/kanban_host_counts.py
+index cb655e7b64..e9ba5625ec 100644
+--- a/hermes_cli/kanban_host_counts.py
++++ b/hermes_cli/kanban_host_counts.py
+@@ -52,11 +52,34 @@ def board_of(conn: sqlite3.Connection) -> Optional[str]:
+         return None
+ 
+ 
++def _own_gateway(conn: sqlite3.Connection) -> Optional[str]:
++    """The file's own gateway id when the file says it is a ``primary`` synced board, else None.
++
++    Read from ``kanban_sync_state`` in the file, not from ``kanban_db_sync.board_mode``: that answers ``off`` unless
++    THIS process installed sync on the file, and a fenced worker's ``mode=ro`` connection (or another board's file
++    opened here) never does. hermes-hub 2026-11-12: a worker's ``kanban show`` said "14/7 running" while the gateway
++    held 6, because 8 cards leased to pool workers were counted as local slots. No ``kanban_sync_state`` table, no
++    row, or a mode other than ``primary`` counts every running card. A primary row without a gateway id, or a
++    state that cannot be read, raises (the caller reports the count unknown)."""
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kanban_sync_state'").fetchone():
++        return None
++    row = conn.execute("SELECT mode, gateway_id FROM kanban_sync_state LIMIT 1").fetchone()
++    if row is None or row[0] != "primary":
++        return None
++    if not row[1]:
++        raise ValueError("primary kanban_sync_state has no gateway_id")
++    return str(row[1])
++
++
+ def _running_in(conn: sqlite3.Connection) -> int:
+-    """Running cards on ``conn``'s file this gateway owns (a card another gateway's lease holds is elsewhere)."""
+-    from hermes_cli import kanban_db as kb
++    """Running cards on ``conn``'s file this gateway owns (a card another gateway's lease holds is elsewhere: the
++    same condition as ``kanban_db_sync.held_elsewhere_sql``, keyed on the file's state, see :func:`_own_gateway`)."""
++    own = _own_gateway(conn)
++    if own is None:
++        return int(conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0])
+     return int(conn.execute(
+-        "SELECT COUNT(*) FROM tasks WHERE status = 'running'" + kb._sync.held_elsewhere_sql(conn)).fetchone()[0])
++        "SELECT COUNT(*) FROM tasks WHERE status = 'running' "
++        "AND NOT (lease_holder IS NOT NULL AND lease_holder != ? AND claim_lock IS NULL)", (own,)).fetchone()[0])
+ 
+ 
+ def _running_in_file(path: Path) -> int:
+diff --git a/tests/hermes_cli/test_kanban_host_counts_held_elsewhere.py b/tests/hermes_cli/test_kanban_host_counts_held_elsewhere.py
+new file mode 100644
+index 0000000000..5f4a3b34d8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_host_counts_held_elsewhere.py
+@@ -0,0 +1,193 @@
++"""Host running count excludes pool-worker-leased cards from what the file says, in any process. [daveey]
++
++hermes-hub 2026-11-12 10:35Z: from a Kanban worker process, ``hermes kanban show`` said "14/7 running" while the
++gateway held 6 (default 5 + example-tools 1). The other 8 were default-board cards leased to worker-1/3/4/6
++(``lease_holder`` another gateway, ``claim_lock`` NULL). The worker's fenced ``mode=ro`` connection never installs
++sync, so ``board_mode`` said ``off`` and ``held_elsewhere_sql`` excluded nothing. The count now reads the file's
++``kanban_sync_state`` (mode + gateway_id) instead of this process's ``_SYNCED_PATHS``.
++"""
++from __future__ import annotations
++
++import sqlite3
++from pathlib import Path
++from urllib.parse import quote
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_host_counts as khc
++from hermes_cli import kanban_lockguard
++from hermes_cli import kanban_queue_position as kqp
++from tests.hermes_cli import kanban_sync_support as support
++
++OWN = "gw_hub_test"
++
++_ENV = ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
++        "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_HOME", "HERMES_DELEGATED_CHILD_CONTEXT",
++        "HERMES_KANBAN_WORKER_TASK")
++
++
++@pytest.fixture
++def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    h = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for key in _ENV:
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 7)
++    support.write_sync_config(h, True)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    kb.create_board("runners")
++    monkeypatch.setattr(sync, "_SYNCED_PATHS", set(sync._SYNCED_PATHS))
++    return h
++
++
++def _seed(board: str | None, *, mode: str, own: int, leased: int) -> str:
++    """``own`` running cards this gateway claims, ``leased`` running cards another gateway's lease holds, and one
++    ready card (returned). Written through a synced connection, as the gateway writes them."""
++    with kbc.connect_closing(board=board) as conn:
++        sync.set_mode(conn, mode)
++        conn.execute("UPDATE kanban_sync_state SET gateway_id = ?", (OWN,))
++        for i in range(own):
++            tid = kb.create_task(conn, title=f"own {i}", assignee="default")
++            conn.execute("UPDATE tasks SET status='running', claim_lock='hub:1', lease_holder=? WHERE id=?",
++                         (OWN, tid))
++        for i in range(leased):
++            tid = kb.create_task(conn, title=f"pool {i}", assignee="default")
++            conn.execute("UPDATE tasks SET status='running', claim_lock=NULL, lease_holder=? WHERE id=?",
++                         (f"worker-{i % 4 + 1}", tid))
++        ready = kb.create_task(conn, title="waiting", assignee="default")
++        conn.commit()
++    return ready
++
++
++def _ro(board: str | None) -> sqlite3.Connection:
++    """The fenced worker's connection: ``mode=ro``, no init, so the file never joins ``_SYNCED_PATHS``."""
++    path = kb.kanban_db_path(board=board).resolve()
++    conn = kanban_lockguard.connect(f"file:{quote(str(path))}?mode=ro", uri=True)
++    conn.row_factory = sqlite3.Row
++    return conn
++
++
++def _forget_sync() -> None:
++    sync._SYNCED_PATHS.clear()
++
++
++def test_worker_read_of_primary_board_counts_only_own_gateway_cards(home):
++    ready = _seed(None, mode="primary", own=5, leased=8)
++    _seed("runners", mode="primary", own=1, leased=0)
++    _forget_sync()
++    conn = _ro(None)
++    try:
++        assert sync.board_mode(conn) == "off"  # the precondition the incident had: this process never synced it
++        assert khc.running_on_host(conn)["running"] == 6
++        place = kqp.position(conn, kb.get_task(conn, ready))
++    finally:
++        conn.close()
++    assert (place["running"], place["limit"]) == (6, 7)
++    assert "6/7 running" in kqp.describe(place)
++
++
++def test_other_board_file_read_excludes_pool_worker_leases(home):
++    _seed(None, mode="primary", own=5, leased=8)
++    ready = _seed("runners", mode="primary", own=1, leased=0)
++    _forget_sync()
++    conn = _ro("runners")
++    try:
++        assert khc._running_in_file(kb.kanban_db_path(board="default").resolve()) == 5
++        assert khc.running_on_host(conn)["running"] == 6
++        assert kqp.position(conn, kb.get_task(conn, ready))["running"] == 6
++    finally:
++        conn.close()
++
++
++def test_gateway_process_with_sync_installed_counts_the_same(home):
++    _seed(None, mode="primary", own=5, leased=8)
++    with kbc.connect_closing() as conn:
++        assert sync.board_mode(conn) == "primary"
++        assert khc.running_on_host(conn)["running"] == 5
++
++
++@pytest.mark.parametrize("mode", ["off", "shadow"])
++def test_board_not_primary_counts_every_running_card(home, mode):
++    _seed(None, mode=mode, own=5, leased=8)
++    _forget_sync()
++    conn = _ro(None)
++    try:
++        assert khc.running_on_host(conn)["running"] == 13
++    finally:
++        conn.close()
++
++
++def test_board_without_sync_state_table_counts_every_running_card(home):
++    _seed(None, mode="primary", own=5, leased=8)
++    with kbc.connect_closing() as conn:
++        conn.execute("DROP TABLE kanban_sync_state")
++        conn.commit()
++    _forget_sync()
++    conn = _ro(None)
++    try:
++        assert khc.running_on_host(conn)["running"] == 13
++    finally:
++        conn.close()
++
++
++def test_sync_state_without_a_row_counts_every_running_card(home):
++    _seed(None, mode="primary", own=5, leased=8)
++    with kbc.connect_closing() as conn:
++        conn.execute("DELETE FROM kanban_sync_state")
++        conn.commit()
++    _forget_sync()
++    conn = _ro(None)
++    try:
++        assert khc.running_on_host(conn)["running"] == 13
++    finally:
++        conn.close()
++
++
++def test_unreadable_sync_state_makes_the_count_unknown(home):
++    _seed(None, mode="primary", own=5, leased=8)
++    with kbc.connect_closing() as conn:
++        conn.execute("DROP TABLE kanban_sync_state")
++        conn.execute("CREATE TABLE kanban_sync_state (board_id TEXT)")  # no mode/gateway_id columns
++        conn.commit()
++    _forget_sync()
++    conn = _ro(None)
++    try:
++        assert khc.running_on_host(conn)["running"] is None
++    finally:
++        conn.close()
++
++
++def test_primary_state_without_a_gateway_id_makes_the_count_unknown(home):
++    _seed(None, mode="primary", own=5, leased=8)
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE kanban_sync_state SET gateway_id = ''")
++        conn.commit()
++    _forget_sync()
++    conn = _ro(None)
++    try:
++        assert khc.running_on_host(conn)["running"] is None
++    finally:
++        conn.close()
++
++
++def test_a_leased_card_this_gateway_still_claims_is_a_local_slot(home):
++    """``claim_lock`` set means a local worker runs it even when a foreign lease row lingers."""
++    _seed(None, mode="primary", own=0, leased=0)
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="claimed here", assignee="default")
++        conn.execute("UPDATE tasks SET status='running', claim_lock='hub:1', lease_holder='worker-1' WHERE id=?",
++                     (tid,))
++        tid2 = kb.create_task(conn, title="no lease", assignee="default")
++        conn.execute("UPDATE tasks SET status='running', claim_lock=NULL, lease_holder=NULL WHERE id=?", (tid2,))
++        conn.commit()
++    _forget_sync()
++    conn = _ro(None)
++    try:
++        assert khc.running_on_host(conn)["running"] == 2
++    finally:
++        conn.close()
+diff --git a/tests/hermes_cli/test_kanban_wait_notice_board_counts.py b/tests/hermes_cli/test_kanban_wait_notice_board_counts.py
+index ddce646242..066342771c 100644
+--- a/tests/hermes_cli/test_kanban_wait_notice_board_counts.py
++++ b/tests/hermes_cli/test_kanban_wait_notice_board_counts.py
+@@ -304,15 +304,6 @@ def test_boards_pinned_to_one_file_count_once(home, monkeypatch):
+         assert khc.running_on_host(conn)["running"] == 2
+ 
+ 
+-def test_card_running_under_another_gateways_lease_is_not_a_local_slot(home, monkeypatch):
+-    from hermes_cli import kanban_db_sync as sync
+-    from hermes_cli import kanban_host_counts as khc
+-    _running(None, 3)
+-    monkeypatch.setattr(sync, "held_elsewhere_sql", lambda conn, alias="": " AND 0")
+-    with kbc.connect_closing(board="runners") as conn:
+-        assert khc.running_on_host(conn)["running"] == 0
+-
+-
+ @pytest.mark.parametrize("field,value", [("outcome", "reclaimed"), ("status", "reclaimed"), ("ended_at", None)])
+ def test_only_a_released_ended_grant_is_unused(field, value):
+     from hermes_cli.kanban_unused_grant import unused_grant_run
+-- 
+2.43.0
+

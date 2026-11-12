@@ -1,0 +1,197 @@
+From 0edc432d7d24e622cd41afa32bac6fdb830d1ee4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:26:45 +0000
+Subject: [PATCH] [daveey] fix(kanban): bound failed-result observer restarts;
+ retire on import/context failure
+
+arm_service armed transient units with Restart=on-failure, RestartSec=500ms and
+StartLimitIntervalSec=0, so a deterministic startup failure (No module named
+'ruamel') restarted forever (~1.7k journal lines / 5 min / unit).
+
+- The observer entrypoint exits 78 (EX_CONFIG) on ImportError or a missing or
+  malformed context argument; the unit lists 78 in RestartPreventExitStatus.
+- Any other repeated crash stops at StartLimitBurst=10 per 300s; the dispatcher
+  sweep still reconciles committed failed results.
+- Regression tests assert the armed properties are bounded and that the real
+  entrypoint exits with the prevent status.
+---
+ hermes_cli/kanban_failed_result_observer.py   | 32 ++++++++-
+ hermes_cli/kanban_failed_result_service.py    | 13 +++-
+ .../test_kanban_failed_result_observer.py     | 72 +++++++++++++++++++
+ 3 files changed, 113 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_failed_result_observer.py b/hermes_cli/kanban_failed_result_observer.py
+index 1b5893bdc1..f59c828204 100644
+--- a/hermes_cli/kanban_failed_result_observer.py
++++ b/hermes_cli/kanban_failed_result_observer.py
+@@ -20,6 +20,9 @@ POLL_SECONDS = 0.5
+ START_SECONDS = 5.0
+ # Bound retries for the short relocation fence, never the dispatcher tick lock.
+ OPEN_SECONDS = 2.0
++# EX_CONFIG: deterministic startup failure; the service never restarts on it.
++STARTUP_FAILURE_EXIT = 78
++CONTEXT_KEYS = ('db', 'task_id', 'run_id', 'claim_lock')
+ 
+ 
+ def arm(context):
+@@ -199,9 +202,27 @@ def observe(context):
+             time.sleep(POLL_SECONDS)
+ 
+ 
+-if __name__ == '__main__':
+-    context = json.loads(sys.argv[1])
+-    observe(context)
++def main(argv):
++    """Run one observation; returns the process exit status.
++
++    [daveey] An import failure (``No module named 'ruamel'`` from a wrong
++    interpreter or a broken checkout) is deterministic: restarting replays it
++    forever. Exit ``STARTUP_FAILURE_EXIT``, which the service lists in
++    ``RestartPreventExitStatus``, so the manager retires the unit instead.
++    A missing or malformed context argument is equally deterministic.
++    """
++    try:
++        context = json.loads(argv[1])
++        if not isinstance(context, dict) or not context.get('db') or any(key not in context for key in CONTEXT_KEYS):
++            raise ValueError(f'context lacks {CONTEXT_KEYS}')
++    except (IndexError, TypeError, ValueError) as exc:
++        print(f'failed-result observer has no usable context, retiring: {exc!r}', file=sys.stderr)
++        return STARTUP_FAILURE_EXIT
++    try:
++        observe(context)
++    except ImportError as exc:
++        print(f'failed-result observer cannot import its code, retiring: {exc!r}', file=sys.stderr)
++        return STARTUP_FAILURE_EXIT
+     # Only a successful terminal observation releases the readiness artifact.
+     # Unexpected errors retain it and exit nonzero for manager restart.
+     if context.get('ready_path'):
+@@ -211,3 +232,8 @@ if __name__ == '__main__':
+             ready.parent.rmdir()
+         except FileNotFoundError:
+             pass
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main(sys.argv))
+diff --git a/hermes_cli/kanban_failed_result_service.py b/hermes_cli/kanban_failed_result_service.py
+index 1b7dcbb19e..82594e52c1 100644
+--- a/hermes_cli/kanban_failed_result_service.py
++++ b/hermes_cli/kanban_failed_result_service.py
+@@ -12,6 +12,10 @@ from pathlib import Path
+ from hermes_platform.resolver import locate_command
+ 
+ OBSERVER_MODULE = 'hermes_cli.kanban_failed_result_observer'
++# Finite restart budget: at most this many starts per interval, then the unit fails
++# and ``--collect`` removes it. Committed results stay queued for crash recovery.
++START_LIMIT_BURST = 10
++START_LIMIT_INTERVAL_SECONDS = 300
+ 
+ 
+ def observer_argv_env(env, context):
+@@ -38,6 +42,7 @@ def arm_service(context, *, startup_seconds=5.0):
+     from tools.environments.local import build_subprocess_env
+     from tools.process_registry import systemd_user_bus_env
+     from hermes_cli._startup_fast import project_root_str
++    from hermes_cli.kanban_failed_result_observer import STARTUP_FAILURE_EXIT
+ 
+     binary = locate_command('systemd-run').command
+     if not binary:
+@@ -52,7 +57,13 @@ def arm_service(context, *, startup_seconds=5.0):
+                '--property=Type=exec', '--property=Slice=app.slice',
+                '--property=Restart=on-failure', '--property=RestartSec=500ms',
+                '--property=RestartForceExitStatus=SIGTERM SIGHUP SIGINT SIGPIPE',
+-               '--property=StartLimitIntervalSec=0',
++               # [daveey] A deterministic startup failure must retire the unit, not
++               # loop forever (~1.7k journal lines / 5 min). The observer exits
++               # STARTUP_FAILURE_EXIT on import/context errors; anything else that
++               # crashes it repeatedly still stops at the start limit.
++               f'--property=RestartPreventExitStatus={STARTUP_FAILURE_EXIT}',
++               f'--property=StartLimitIntervalSec={START_LIMIT_INTERVAL_SECONDS}s',
++               f'--property=StartLimitBurst={START_LIMIT_BURST}',
+                f'--working-directory={project_root_str()}']
+     # A manager-created service does not inherit its submitter's environment.
+     # Keep profile/path resolution, without forwarding secrets or worker pins.
+diff --git a/tests/hermes_cli/test_kanban_failed_result_observer.py b/tests/hermes_cli/test_kanban_failed_result_observer.py
+index 7b14925a3f..c5ee305cd8 100644
+--- a/tests/hermes_cli/test_kanban_failed_result_observer.py
++++ b/tests/hermes_cli/test_kanban_failed_result_observer.py
+@@ -115,3 +115,75 @@ def test_missing_manager_is_not_reported_as_custody(board, monkeypatch):
+     monkeypatch.setattr(service, 'locate_command', lambda name: SimpleNamespace(command=()))
+     with pytest.raises(RuntimeError, match='needs systemd-run'):
+         service.arm_service(context)
++
++
++def _armed_properties(context, monkeypatch):
++    monkeypatch.setattr(service, 'locate_command', lambda name: SimpleNamespace(command=('/usr/bin/systemd-run',)))
++    monkeypatch.setattr(service.time, 'sleep', lambda _: None)
++    calls = []
++    def submit(command, **kwargs):
++        calls.append(command)
++        payload = json.loads(command[-1])
++        Path(payload['ready_path']).write_text(payload['observer_unit'])
++        return SimpleNamespace(returncode=0, stderr='')
++    monkeypatch.setattr(service.subprocess, 'run', submit)
++    service.arm_service(context, startup_seconds=1)
++    props = {}
++    for arg in calls[0][:calls[0].index('--')]:
++        if arg.startswith('--property='):
++            key, _, value = arg.removeprefix('--property=').partition('=')
++            props[key] = value
++    return props
++
++
++def test_armed_unit_restarts_are_bounded(board, monkeypatch):
++    """[daveey] A deterministic startup failure (``No module named 'ruamel'``) looped
++    forever under ``StartLimitIntervalSec=0``. The unit must retire itself."""
++    _, context = board
++    props = _armed_properties(context, monkeypatch)
++    assert props['Restart'] == 'on-failure'
++    interval = props['StartLimitIntervalSec']
++    assert interval.endswith('s') and int(interval[:-1]) > 0
++    assert 0 < int(props['StartLimitBurst']) <= 20
++    assert str(observer.STARTUP_FAILURE_EXIT) in props['RestartPreventExitStatus'].split()
++
++
++@pytest.mark.parametrize('argv', [['observer'], ['observer', 'not json'], ['observer', '[]'],
++                                  ['observer', '{"db": "/x"}']])
++def test_bad_context_retires_with_prevent_exit(argv):
++    assert observer.main(argv) == observer.STARTUP_FAILURE_EXIT
++
++
++def test_import_failure_retires_with_prevent_exit(board, tmp_path, monkeypatch):
++    _, context = board
++    context = _ready_context(context, tmp_path)
++    def broken(_):
++        raise ModuleNotFoundError("No module named 'ruamel'")
++    monkeypatch.setattr(observer, 'observe', broken)
++    assert observer.main(['observer', json.dumps(context)]) == observer.STARTUP_FAILURE_EXIT
++
++
++def test_other_observer_errors_still_restart(board, tmp_path, monkeypatch):
++    _, context = board
++    def broken(_):
++        raise RuntimeError('transient')
++    monkeypatch.setattr(observer, 'observe', broken)
++    with pytest.raises(RuntimeError):
++        observer.main(['observer', json.dumps(_ready_context(context, tmp_path))])
++
++
++def test_subprocess_import_failure_exits_prevent_status(tmp_path):
++    """The real ``-m`` entrypoint maps a lazy import failure to the prevent code."""
++    import subprocess
++    import sys
++    db = tmp_path / 'kanban.db'
++    db.write_bytes(b'')
++    context = {'db': str(db), 'task_id': 't', 'run_id': 1, 'claim_lock': 'x'}
++    root = Path(__file__).resolve().parents[2]
++    # Block a lazily imported observer dependency: importing it raises ImportError.
++    driver = ("import runpy, sys; sys.modules['hermes_cli.kanban_dispatch_owner'] = None; "
++              f"sys.argv = ['observer', sys.argv[1]]; runpy.run_module({observer.__name__!r}, run_name='__main__')")
++    proc = subprocess.run([sys.executable, '-c', driver, json.dumps(context)],
++                          cwd=root, capture_output=True, text=True, timeout=60, check=False)
++    assert proc.returncode == observer.STARTUP_FAILURE_EXIT, proc.stderr[-500:]
++    assert 'retiring' in proc.stderr
+-- 
+2.43.0
+

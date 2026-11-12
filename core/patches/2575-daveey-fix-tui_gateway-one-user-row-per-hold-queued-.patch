@@ -1,0 +1,315 @@
+From dd5a767b3581dbef61ff6c3937b8824de26ff9e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:19:56 +0000
+Subject: [PATCH] [daveey] fix(tui_gateway): one user row per hold-queued
+ prompt.submit
+
+A prompt.submit queued behind the core-update admission hold (queued_reason=core_update) wrote its user
+row at accept (marked _queued_prompt), then the drain's _replace_queued_user_row_for_turn appended an
+identical row at the end and deactivated the accept row. One submit, one turn, two user rows in
+state.db (live on hermes-hub 2026-11-12: msgs 1217133 + 1217162, t_01a1c8d8a5c1f725).
+
+Re-placement exists to keep alternation when the in-flight turn's rows landed AFTER the accept row
+(busy-queue [uA, uB, aA]). When nothing landed after it, the dispatching envelope now adopts the
+accept row in place: one guarded UPDATE drops the never-drained marker only while it is still the
+session's last active row (follows a compaction re-sequenced clone via resolve_active_row_id), and
+the turn adopts that row through the existing _submit_user_row slot, so the flush writes nothing.
+Any later active row, a still-queued (non-dispatching) envelope, or a store error falls back to the
+existing re-append path unchanged. Durable-at-accept and restart retirement (#125577) are unchanged.
+
+Proof: tests/tui_gateway/test_update_hold_submit_queue.py
+test_hold_queued_submit_then_replay_writes_exactly_one_user_row (and the compaction clone case) FAIL
+on the old drain (2 rows: accept inactive+marked, re-append active) and pass now; controls: later row
+still re-placed, still-queued envelope keeps its marker. Isolated serve repro (own HERMES_HOME, fake
+LLM): before 2 rows (1 inactive) / 1 turn, after 1 row / 1 turn; non-queued submit 1 row.
+Mutants: 14 killed, 0 survived. Related suites (queue, persistence, restart retire, admission,
+retry, server, hermes_state/) green.
+---
+ hermes_state_message_content.py               |  22 +++-
+ .../test_adopt_queued_user_row.py             |  76 +++++++++++++
+ .../test_update_hold_submit_queue.py          | 104 ++++++++++++++++++
+ tui_gateway/session_auto_continue.py          |  31 ++++++
+ 4 files changed, 232 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_state/test_adopt_queued_user_row.py
+
+diff --git a/hermes_state_message_content.py b/hermes_state_message_content.py
+index 78a4669d36..4e75f0b413 100644
+--- a/hermes_state_message_content.py
++++ b/hermes_state_message_content.py
+@@ -1,6 +1,26 @@
+ """Addressed user-row content rewrites for SessionDB."""
+ from typing import Any, Optional
+-from hermes_state_common import _MERGE_DISPLAY_META
++from hermes_state_common import _MERGE_DISPLAY_META, QUEUED_PROMPT_METADATA_KEY, _sql_json_extract
++
++
++def adopt_queued_user_row_in_place(db, session_id: str, row_id: Any) -> int:
++    """Turn a still-marked queued accept row into the dispatching turn's own row, IN PLACE (one row per submit).
++
++    Only when it is still the session's LAST active row: nothing landed after it, so the turn's rows follow it
++    and alternation holds without re-appending a copy. Drops the never-drained marker (``reopen_session`` would
++    otherwise retire the row after a restart) and keeps every other display key. One UPDATE, so a row another
++    writer appends concurrently either lands first (no match: the caller re-places as before) or after.
++    Returns the affected row count (0 = not adoptable here)."""
++    if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
++        return 0
++    marker = _sql_json_extract("display_metadata", "$." + QUEUED_PROMPT_METADATA_KEY)
++    return db._write_rowcount(
++        "UPDATE messages SET display_metadata = NULLIF(json_remove(display_metadata, ?), '{}') "
++        "WHERE id = ? AND session_id = ? AND role = 'user' AND active = 1 "
++        f"AND COALESCE({marker}, 0) = 1 "
++        "AND NOT EXISTS (SELECT 1 FROM messages later WHERE later.session_id = ? AND later.active = 1 "
++        "AND later.id > ?)",
++        ("$." + QUEUED_PROMPT_METADATA_KEY, row_id, session_id, session_id, row_id))
+ 
+ 
+ def set_user_message_content(db, session_id: str, row_id: int, content: Any,
+diff --git a/tests/hermes_state/test_adopt_queued_user_row.py b/tests/hermes_state/test_adopt_queued_user_row.py
+new file mode 100644
+index 0000000000..6e6740bfec
+--- /dev/null
++++ b/tests/hermes_state/test_adopt_queued_user_row.py
+@@ -0,0 +1,76 @@
++"""adopt_queued_user_row_in_place: the drain's one-row path for a queued submit (t_01a1ceb141b10c7c)."""
++import json
++
++from hermes_state import SessionDB
++from hermes_state_message_content import adopt_queued_user_row_in_place as _adopt
++
++
++def _meta(db, row_id):
++    with db._lock:
++        row = db._conn.execute("SELECT display_metadata, active FROM messages WHERE id = ?", (row_id,)).fetchone()
++    return (json.loads(row[0]) if row[0] else None), row[1]
++
++
++def _db(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("s", source="scratch")
++    return db
++
++
++def test_last_marked_row_is_unmarked_in_place_keeping_other_keys(tmp_path):
++    db = _db(tmp_path)
++    rid = db.append_message("s", "user", content="hi", display_metadata={"_queued_prompt": True, "reaction": "+1"})
++    assert _adopt(db, "s", rid) == 1
++    assert _meta(db, rid) == ({"reaction": "+1"}, 1)
++    assert db.retire_undrained_queue_rows("s") == 0
++
++
++def test_marker_only_metadata_becomes_null(tmp_path):
++    db = _db(tmp_path)
++    rid = db.append_message("s", "user", content="hi", display_metadata={"_queued_prompt": True})
++    assert _adopt(db, "s", rid) == 1
++    assert _meta(db, rid) == (None, 1)
++
++
++def test_a_later_active_row_refuses(tmp_path):
++    db = _db(tmp_path)
++    rid = db.append_message("s", "user", content="hi", display_metadata={"_queued_prompt": True})
++    db.append_message("s", "assistant", content="later")
++    assert _adopt(db, "s", rid) == 0
++    assert _meta(db, rid) == ({"_queued_prompt": True}, 1)
++
++
++def test_a_later_inactive_row_does_not_refuse(tmp_path):
++    db = _db(tmp_path)
++    rid = db.append_message("s", "user", content="hi", display_metadata={"_queued_prompt": True})
++    later = db.append_message("s", "assistant", content="retired")
++    db.deactivate_message("s", later)
++    assert _adopt(db, "s", rid) == 1
++
++
++def test_a_later_row_in_another_session_does_not_refuse(tmp_path):
++    db = _db(tmp_path)
++    db.create_session("other", source="scratch")
++    rid = db.append_message("s", "user", content="hi", display_metadata={"_queued_prompt": True})
++    db.append_message("other", "assistant", content="elsewhere")
++    assert _adopt(db, "s", rid) == 1
++
++
++def test_unmarked_inactive_wrong_session_or_role_rows_refuse(tmp_path):
++    db = _db(tmp_path)
++    first = db.append_message("s", "user", content="first", display_metadata={"_queued_prompt": True})
++    assert first == 1
++    for bad in (0, -1, True, None, "1"):  # True / "1" would bind as row 1 without the guard
++        assert _adopt(db, "s", bad) == 0, bad
++    assert _meta(db, first) == ({"_queued_prompt": True}, 1)
++    plain = db.append_message("s", "user", content="plain")
++    assert _adopt(db, "s", plain) == 0, "not a queued accept row"
++    gone = db.append_message("s", "user", content="gone", display_metadata={"_queued_prompt": True})
++    db.deactivate_message("s", gone)
++    assert _adopt(db, "s", gone) == 0, "inactive"
++    asst = db.append_message("s", "assistant", content="a", display_metadata={"_queued_prompt": True})
++    assert _adopt(db, "s", asst) == 0, "not a user row"
++    mine = db.append_message("s", "user", content="mine", display_metadata={"_queued_prompt": True})
++    assert _adopt(db, "other", mine) == 0, "wrong session"
++    assert _adopt(db, "", mine) == 0
++    assert _meta(db, mine) == ({"_queued_prompt": True}, 1)
+diff --git a/tests/tui_gateway/test_update_hold_submit_queue.py b/tests/tui_gateway/test_update_hold_submit_queue.py
+index 0fffdb9b41..04a47624eb 100644
+--- a/tests/tui_gateway/test_update_hold_submit_queue.py
++++ b/tests/tui_gateway/test_update_hold_submit_queue.py
+@@ -586,6 +586,110 @@ def test_idle_stop_on_an_unreachable_compute_host_keeps_the_held_prompt(stoppabl
+     assert not held.session.get("queued_prompt")
+ 
+ 
++# ── t_01a1ceb141b10c7c: one hold-queued submit is ONE user row in state.db, not an accept row + a replay row ──
++# Live (hub, 2026-11-12, t_01a1c8d8a5c1f725): a submit queued with queued_reason=core_update left msg 1217133
++# (accept, deactivated) and msg 1217162 (drain re-append) for one prompt; the turn ran once.
++_REAL_PERSIST_QUEUED_USER_ROW = server._persist_queued_user_row
++_REAL_REPLACE_QUEUED_USER_ROW = server._replace_queued_user_row_for_turn
++
++
++def _real_rows_drain(held, monkeypatch):
++    """Real accept-time persist, real claim/dispatch and real drain row handling over a real state.db; only the
++    turn body is recorded (the slot it would adopt via ``_adopt_submit_user_row``)."""
++    from hermes_state import SessionDB
++    db = SessionDB(held.home / "state.db")
++    monkeypatch.setattr(server, "_persist_queued_user_row", _REAL_PERSIST_QUEUED_USER_ROW)
++    monkeypatch.setattr(server, "_dispatch_claimed_queue", _REAL_DISPATCH_CLAIMED_QUEUE)
++    monkeypatch.setattr(server, "_replace_queued_user_row_for_turn", _REAL_REPLACE_QUEUED_USER_ROW)
++    turns = []
++
++    def turn_body(rid, sid, session, text, **kw):
++        turns.append((text, session.get("_submit_user_row")))
++        session["running"] = False
++        server._clear_inflight_turn(session)
++
++    monkeypatch.setattr(server, "_run_prompt_submit", turn_body)
++    return db, turns
++
++
++def _user_rows(db, text):
++    with db._lock:
++        rows = db._conn.execute(
++            "SELECT id, active, display_metadata FROM messages WHERE session_id = ? AND role = 'user' "
++            "AND content = ? ORDER BY id", ("session-key", text)).fetchall()
++    return [(r[0], r[1], json.loads(r[2]) if r[2] else None) for r in rows]
++
++
++def test_hold_queued_submit_then_replay_writes_exactly_one_user_row(held, monkeypatch):
++    db, turns = _real_rows_drain(held, monkeypatch)
++    resp = _submit()
++    assert resp["result"]["queued_reason"] == "core_update", resp
++    accepted = _user_rows(db, "hello there")
++    assert len(accepted) == 1 and accepted[0][1] == 1, "durable and visible at accept"
++    af.clear_hold(held.home)
++    held.timers.pop().target()
++    assert len(turns) == 1, "the turn ran once"
++    rows = _user_rows(db, "hello there")
++    assert len(rows) == 1, f"one submit must be one user row, got {rows}"
++    row_id, active, meta = rows[0]
++    assert active == 1 and not (meta or {}).get("_queued_prompt"), "drained: active and no longer marked queued"
++    assert row_id == accepted[0][0], "the accept-time row itself is the turn's row"
++    text, slot = turns[0]
++    assert text == "hello there" and slot and slot["_row_id"] == row_id, "the turn adopts that row (no 2nd write)"
++    assert not (slot.get("display_metadata") or {}).get("_queued_prompt")
++    assert db.retire_undrained_queue_rows("session-key") == 0, "a restart after the drain does not retire it"
++
++
++def test_queued_row_behind_a_later_row_is_still_replaced_at_the_end(held, monkeypatch):
++    """Control: when the transcript grew past the accept row (the busy-queue shape: the in-flight turn's reply
++    landed after it), the drain must still re-place it at the end so alternation stays [uA, aA, uB]."""
++    db, turns = _real_rows_drain(held, monkeypatch)
++    _submit()
++    db.append_message("session-key", "assistant", content="a reply that landed after the accept")
++    af.clear_hold(held.home)
++    held.timers.pop().target()
++    rows = _user_rows(db, "hello there")
++    assert [r[1] for r in rows] == [0, 1], rows
++    assert turns[0][1]["_row_id"] == rows[1][0]
++    with db._lock:
++        order = [r[0] for r in db._conn.execute(
++            "SELECT role FROM messages WHERE session_id = ? AND active = 1 ORDER BY id", ("session-key",))]
++    assert order == ["assistant", "user"]
++
++
++def test_a_compaction_resequenced_accept_row_is_adopted_at_its_live_id(held, monkeypatch):
++    """An in-place compaction can re-sequence the accept row to a clone at a higher id (#123675): the drain
++    adopts the LIVE clone and appends nothing."""
++    db, turns = _real_rows_drain(held, monkeypatch)
++    _submit()
++    (orig, _, _), = _user_rows(db, "hello there")
++    with db._lock:
++        db._conn.execute(
++            "INSERT INTO messages (session_id, role, content, timestamp, display_metadata) SELECT session_id, role, "
++            "content, timestamp, display_metadata FROM messages WHERE id = ?", (orig,))
++        db._conn.execute("UPDATE messages SET active = 0 WHERE id = ?", (orig,))
++        db._conn.commit()
++    clone = _user_rows(db, "hello there")[1][0]
++    af.clear_hold(held.home)
++    held.timers.pop().target()
++    rows = _user_rows(db, "hello there")
++    assert [(r[0], r[1]) for r in rows] == [(orig, 0), (clone, 1)], rows
++    assert not (rows[1][2] or {}).get("_queued_prompt")
++    assert turns[0][1]["_row_id"] == clone
++
++
++def test_a_still_queued_envelope_is_never_unmarked_in_place(held, monkeypatch):
++    """Only the DISPATCHING envelope adopts in place: a still-queued one must keep its never-drained marker so a
++    restart before its own drain retires it (#125577) instead of gluing it into the previous turn."""
++    db, _ = _real_rows_drain(held, monkeypatch)
++    _submit()
++    envelope = held.session["queued_prompt"]
++    server._replace_queued_user_row_for_turn(held.session, envelope)
++    rows = _user_rows(db, "hello there")
++    assert [(r[1], (r[2] or {}).get("_queued_prompt")) for r in rows] == [(0, True), (1, True)], rows
++    assert db.retire_undrained_queue_rows("session-key") == 1
++
++
+ def test_hold_started_at_reads_the_marker(tmp_path):
+     root = tmp_path / "core-update"
+     assert af.hold_started_at(root) is None, "no hold: unknown, never a guess"
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 388c2fad12..978ae1ae79 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -554,6 +554,31 @@ def _persist_queued_user_row(session: dict, envelope: dict, display_kind: str |
+             envelope["_queued_display_kind"] = display_kind
+ 
+ 
++def _adopt_queued_user_row_in_place(session: dict, early: dict) -> dict | None:
++    """The accept-time row, unmarked, as the dispatching turn's durable dict — or None (the caller re-places
++    it at the end) when it is no longer the session's last active row or the store is unavailable."""
++    from hermes_state_common import QUEUED_PROMPT_METADATA_KEY
++    from hermes_state_message_content import adopt_queued_user_row_in_place
++    with _session_db(session) as db:
++        if db is None:
++            return None
++        try:
++            key = _submit_row_owner_key(early, session)
++            live_id = db.resolve_active_row_id(key, early["_row_id"])
++            if not adopt_queued_user_row_in_place(db, key, live_id):
++                return None
++        except Exception:
++            logger.debug("queued-prompt in-place row adoption failed; re-placing it", exc_info=True)
++            return None
++    adopted = {**early, "_row_id": live_id}
++    meta = {k: v for k, v in (early.get("display_metadata") or {}).items() if k != QUEUED_PROMPT_METADATA_KEY}
++    if meta:
++        adopted["display_metadata"] = meta
++    else:
++        adopted.pop("display_metadata", None)
++    return adopted
++
++
+ def _replace_queued_user_row_for_turn(session: dict, queued: dict, is_dispatching: bool = False) -> dict | None:
+     """Re-place a queued prompt's accept-time row at the transcript END before dispatching its turn.
+ 
+@@ -568,6 +593,12 @@ def _replace_queued_user_row_for_turn(session: dict, queued: dict, is_dispatchin
+     early = queued.get("_submit_user_row")
+     if not (isinstance(early, dict) and isinstance(early.get("_row_id"), int)):
+         return None  # no accept-time row (write failed / pre-feature envelope): the turn persists as before
++    # Nothing landed after the accept row (an idle submit queued behind the core-update hold, or a busy one
++    # whose turn wrote no rows since): the turn's rows follow it, so the DISPATCHING envelope adopts that
++    # row in place. Re-appending here left two user rows for one submit (t_01a1ceb141b10c7c).
++    if is_dispatching and (adopted := _adopt_queued_user_row_in_place(session, early)) is not None:
++        queued["_submit_user_row"] = adopted
++        return adopted
+     # Append the replacement FIRST: if that write fails nothing is deactivated, the accept-time row
+     # stays active (the message stays visible) and the turn's crash persist persists it as before.
+     # The DISPATCHING envelope's replacement carries no marker (its turn adopts the row immediately);
+-- 
+2.43.0
+

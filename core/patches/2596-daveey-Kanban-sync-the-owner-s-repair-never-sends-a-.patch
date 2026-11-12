@@ -1,0 +1,395 @@
+From fc8f0090ee4fb4d29d217192360b54acf48f3c37 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:00:05 +0000
+Subject: [PATCH] [daveey] Kanban sync: the owner's repair never sends a card
+ back to running over its ended run
+
+Hub 2026-11-12 08:27:50Z: worker-4 completed the hub's t_01a1ceaeb6ba593c (Board v18-v20: done, run
+done/completed, current_run_uid NULL). The hub's live row still held the v16 task fields at the replica's
+version 20. repair_divergence read "equal version, fields differ" as an uncaptured local write and queued
+status=running, completed_at=NULL, the ended run as current_run_uid and the old block_kind /
+completion_contract (base_version 20). The Board merges task fields per field by HLC, so the hub's newer
+clock won every field: v21. In the same pass t_01a1ceb44e35f780 (todo after a blocked run on worker-5) became
+v11 running. Both then read running with no claim, no lease and an ended run in every copy, and nothing sweeps
+that shape (the stale-claim sweep needs a claim to expire).
+
+- repair_divergence: when the live status differs and the live current run has already ended (or the
+  replica is done/archived on the same run), the live copy is the stale one. Apply the replica's row to live
+  (feed apply, nothing captured or sent) instead of re-sending live's.
+- heal_running_over_ended_run (primary rounds, next to heal_clobbered_completions): a card that reads running
+  with no claim_lock, no lease and an ended current run goes to done when that run ended completed and the
+  latest completed event names it, else to todo (the promoter makes it ready once parents are done). The write
+  goes through the capture triggers, so the Board is corrected by the same round's push. It runs once per run:
+  a heal the Board outvotes is logged and left alone, so it never loops.
+
+Tests: test_kanban_sync_terminal_regress.py reproduces the regressing write (RED on main: both parametrized
+cases queue status/current_run_uid/completion_contract, Board ends at running). test_kanban_sync_running_heal.py
+covers the already-regressed shape, the once-per-run bound and an open run left alone.
+---
+ hermes_cli/kanban_sync_client.py              |   2 +
+ hermes_cli/kanban_sync_divergence.py          |  87 ++++++++++
+ .../test_kanban_sync_running_heal.py          |  78 +++++++++
+ .../test_kanban_sync_terminal_regress.py      | 151 ++++++++++++++++++
+ 4 files changed, 318 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_running_heal.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_terminal_regress.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 460d67fbc9..6635bf0965 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1027,6 +1027,8 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+                         _REPAIRED_AT[key] = _repair_clock()
+             if mode == "primary":
+                 heal_clobbered_completions(live)
++                from hermes_cli.kanban_sync_divergence import heal_running_over_ended_run
++                heal_running_over_ended_run(live)
+         result.push = push(live, hub, slug, gateway, primary=mode == "primary")
+         from hermes_cli.kanban_sync_attachments import transfer_pending
+         transfer_pending(live, hub, slug)
+diff --git a/hermes_cli/kanban_sync_divergence.py b/hermes_cli/kanban_sync_divergence.py
+index e6fa6f67e8..cea49dba1d 100644
+--- a/hermes_cli/kanban_sync_divergence.py
++++ b/hermes_cli/kanban_sync_divergence.py
+@@ -39,6 +39,9 @@ def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gate
+         fields = {k: v for k, v in mine.items() if k in remote and remote[k] != v and k not in omitted}
+         if not fields:
+             continue
++        if "status" in fields and _stale_lifecycle(live, shadow, row, theirs, mine.get("current_run_uid")):
++            _adopt_replica(live, shadow, tid, theirs, row["status"])
++            continue
+         runs = _diverged_runs(live, shadow, tid)
+         with write_txn(live):
+             # [daveey] The same uncaptured transaction usually ended the card's run too (``complete_task`` writes
+@@ -60,3 +63,87 @@ def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gate
+                      "re-queued", tid, ", ".join(repaired[tid]))
+     return repaired
+ 
++
++_TERMINAL = frozenset({"done", "archived"})
++
++
++def _run_ended(conn: sqlite3.Connection, uid: str) -> bool:
++    row = conn.execute("SELECT ended_at FROM task_runs WHERE uid = ?", (uid,)).fetchone()
++    return row is not None and row[0] is not None
++
++
++def _stale_lifecycle(live: sqlite3.Connection, shadow: sqlite3.Connection, row: sqlite3.Row, theirs: sqlite3.Row,
++                     run_uid: str | None) -> bool:
++    """True when the live status is older than the replica's, not a local edit the service missed.
++
++    ``running`` names an open run: when that run has already ended (in either copy), no local write can have
++    produced the live ``running``; the live row missed the end of its own run. A live non-terminal status over a
++    replica ``done``/``archived`` card on the same run is the same gap. Pushing it would reopen the card for every
++    reader, because the owner's HLC is newer than the worker's end (hub t_01a1ceaeb6ba593c, 2026-11-12). [daveey]"""
++    if not run_uid:
++        return False
++    if row["status"] == "running" and (_run_ended(live, run_uid) or _run_ended(shadow, run_uid)):
++        return True
++    remote_run = shadow.execute("SELECT uid FROM task_runs WHERE id = ?", (theirs["current_run_id"],)).fetchone() \
++        if theirs["current_run_id"] is not None else None
++    return (theirs["status"] in _TERMINAL and row["status"] not in _TERMINAL
++            and (remote_run is None or remote_run[0] == run_uid))
++
++
++def _adopt_replica(live: sqlite3.Connection, shadow: sqlite3.Connection, tid: str, theirs: sqlite3.Row,
++                   stale: str) -> None:
++    """Apply the replica's copy of the card to the live file, as a feed apply (no capture, nothing sent)."""
++    from hermes_cli.kanban_sync_client import _row_fields
++    fields = _row_fields(shadow, "tasks", theirs)
++    cursor = int((sync.sync_state(live) or {}).get("cursor") or 0)
++    sync.apply_remote_changes(
++        live, [sync.RemoteChange(seq=0, table="tasks", uid=tid, op="upsert", fields=fields,
++                                 version=int(theirs["sync_version"]), hlc="", origin_gateway="")],
++        new_cursor=cursor, observers=False, local_pending_wins=True)
++    _log.warning("kanban sync: %s live status %r is older than the service's %r (its run already ended); "
++                 "took the service's copy instead of re-sending it", tid, stale, theirs["status"])
++
++
++def heal_running_over_ended_run(live: sqlite3.Connection) -> dict[str, str]:
++    """Move this file's cards that read ``running`` with no claim, no lease and an ended current run to where that
++    run left them; returns {task id: new status}.
++
++    No writer produces that shape on purpose: a claim opens its run, a local worker holds ``claim_lock``, a pool
++    worker holds the Board lease, and every end of a run moves the card in the same transaction. It is left by a
++    stale copy sent over the run's end (hub t_01a1ceaeb6ba593c, 2026-11-12), and the dispatcher's stale-claim sweep
++    never sees it (no claim to expire), so the card read ``running`` for good. A run ended ``completed`` with the
++    card's latest ``completed`` event naming it is a completion: ``done``. Any other end is a reclaim: ``todo``, which
++    the promoter turns into ``ready`` once the card's parents are done. The write goes through the capture triggers,
++    so the Board's copy is corrected by the same round's push. [daveey]"""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import write_txn
++    rows = live.execute(
++        "SELECT t.id, r.id AS run_id, r.outcome, r.ended_at FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
++        "WHERE t.status = 'running' AND t.claim_lock IS NULL AND t.lease_holder IS NULL "
++        "AND r.ended_at IS NOT NULL").fetchall()
++    healed: dict[str, str] = {}
++    for row in rows:
++        tid = row["id"]
++        with write_txn(live):
++            if live.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'status_healed' "
++                            "AND json_extract(payload, '$.run_id') = ?", (tid, row["run_id"])).fetchone():
++                # Healed once for this run and the Board kept a newer write: report it, never loop on it.
++                continue
++            event = live.execute("SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'completed' "
++                                 "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++            done = row["outcome"] == "completed" and event is not None and event["run_id"] == row["run_id"]
++            status = "done" if done else "todo"
++            changed = live.execute(
++                "UPDATE tasks SET status = ?, current_run_id = NULL, "
++                "completed_at = CASE WHEN ? THEN COALESCE(completed_at, ?) ELSE NULL END, "
++                "block_kind = CASE WHEN ? THEN NULL ELSE block_kind END "
++                "WHERE id = ? AND status = 'running' AND claim_lock IS NULL AND lease_holder IS NULL "
++                "AND current_run_id = ?", (status, done, row["ended_at"], done, tid, row["run_id"])).rowcount
++            if changed:
++                kb._append_event(live, tid, "status_healed", {"from": "running", "to": status,
++                                                              "run_id": row["run_id"], "outcome": row["outcome"]})
++        if changed:
++            healed[tid] = status
++            _log.warning("kanban sync: %s read running over its ended run %s (%s); moved to %s",
++                         tid, row["run_id"], row["outcome"], status)
++    return healed
+diff --git a/tests/hermes_cli/test_kanban_sync_running_heal.py b/tests/hermes_cli/test_kanban_sync_running_heal.py
+new file mode 100644
+index 0000000000..3db078eb12
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_running_heal.py
+@@ -0,0 +1,78 @@
++"""A card the Board already reads ``running`` over its ended run is healed by its owner's sync round. [daveey]
++
++Hub 2026-11-12: t_01a1ceaeb6ba593c (completed) and t_01a1ceb44e35f780 (blocked -> todo) were regressed on the Board
++itself (v21 / v11), so the replica and the live file agreed and no divergence repair could see them."""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_sync_divergence import heal_running_over_ended_run
++from tests.hermes_cli import test_kanban_sync_terminal_regress as base
++
++ME, OTHER, BOARD = base.ME, base.OTHER, base.BOARD
++kanban_home, svc, live = base.kanban_home, base.svc, base.live
++
++
++def _regressed(live, kanban_home, svc, *, status, outcome, completed_at):
++    tid, run_uid = base._running_card(live, kanban_home, svc)
++    if outcome == "completed":
++        run_id = live.execute("SELECT id FROM task_runs WHERE uid = ?", (run_uid,)).fetchone()[0]
++        with kbc.write_txn(live):
++            kb._append_event(live, tid, "completed", {"summary": "landed"}, run_id=run_id)
++    base._worker_ends(svc, tid, run_uid, status=status, outcome=outcome, completed_at=completed_at)
++    base._round(kanban_home, svc)
++    # The stale copy the hub sent at 08:27:50, as the Board stored it.
++    svc.hub(OTHER).ops(BOARD, [{"client_op_id": "stale-copy", "op": "upsert", "table": "tasks", "uid": tid,
++                                "hlc": base._hlc(3_000, OTHER),
++                                "fields": {"status": "running", "completed_at": None, "current_run_uid": run_uid}}])
++    return tid
++
++
++def _clock_after_the_stale_write(live):
++    """The owner heals later than the stale write landed (on the hub: minutes to hours later)."""
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET hlc_last = ?", (f"{int(time.time() * 1000) + 10_000:013d}-0000-{ME}",))
++
++
++def _healed_events(live, tid):
++    return live.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'status_healed'",
++                        (tid,)).fetchone()[0]
++
++
++@pytest.mark.parametrize("status,outcome,completed_at", [
++    ("done", "completed", 1794472039),
++    ("todo", "blocked", None),
++])
++def test_a_running_card_over_an_ended_run_is_moved_where_its_run_left_it(live, kanban_home, svc, status, outcome,
++                                                                        completed_at):
++    tid = _regressed(live, kanban_home, svc, status=status, outcome=outcome, completed_at=completed_at)
++    _clock_after_the_stale_write(live)
++    base._round(kanban_home, svc)  # pulls the regression, heals it, pushes the heal
++    base._round(kanban_home, svc)
++
++    assert base._service_task(svc, tid)["status"] == status
++    assert base._service_task(svc, tid)["current_run_uid"] is None
++    row = live.execute("SELECT status, current_run_id, completed_at, block_kind FROM tasks WHERE id = ?",
++                       (tid,)).fetchone()
++    assert (row["status"], row["current_run_id"]) == (status, None)
++    assert (row["completed_at"] is not None) == (status == "done")
++    if status == "done":
++        assert row["block_kind"] is None
++    assert _healed_events(live, tid) == 1
++
++
++def test_a_heal_the_board_outvotes_is_reported_once_not_looped(live, kanban_home, svc):
++    tid = _regressed(live, kanban_home, svc, status="done", outcome="completed", completed_at=1794472039)
++    for _ in range(3):  # the stale write's clock is ahead of ours: every heal loses the field merge
++        base._round(kanban_home, svc)
++    assert _healed_events(live, tid) == 1
++
++
++def test_a_running_card_with_its_run_open_is_left_alone(live, kanban_home, svc):
++    tid, _run_uid = base._running_card(live, kanban_home, svc)
++    assert heal_running_over_ended_run(live) == {}
++    assert live.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "running"
+diff --git a/tests/hermes_cli/test_kanban_sync_terminal_regress.py b/tests/hermes_cli/test_kanban_sync_terminal_regress.py
+new file mode 100644
+index 0000000000..1b26fc03c2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_terminal_regress.py
+@@ -0,0 +1,151 @@
++"""The owner's divergence repair must never send a card back to ``running`` over its ended run. [daveey]
++
++Hub incident 2026-11-12 (t_01a1ceaeb6ba593c): worker-4 completed the hub's card (Board v18-v20: ``done``, run
++``done/completed``, ``current_run_uid`` NULL). 25 s later the hub's own live file still held the v16 task fields at
++the replica's version 20, so ``repair_divergence`` took the live copy for an uncaptured local write and pushed
++``status=running``, ``completed_at=NULL``, the ended run as ``current_run_uid`` and the old ``block_kind`` /
++``completion_contract`` (Board v21, hub HLC newer than the worker's, so every field won). The same pass did it to
++t_01a1ceb44e35f780 (``todo`` after a ``blocked`` run). Both rows then read ``running`` with no lease and an ended run.
++"""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, OTHER, BOARD = "macbook", "mini", "default"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService()
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    sync.set_mode(conn, "primary")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _round(kanban_home, svc):
++    return ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++
++
++def _hlc(offset_ms: int, gw: str) -> str:
++    return f"{int(time.time() * 1000) + offset_ms:013d}-0000-{gw}"
++
++
++def _service_task(svc, tid):
++    return svc.board(BOARD)["rows"]["tasks"][tid]
++
++
++def _running_card(live, kanban_home, svc) -> tuple[str, str]:
++    """An owner card running a pool worker's run, settled on both sides."""
++    tid = kb.create_task(live, title="pool card", assignee="worker")
++    _round(kanban_home, svc)
++    run_uid = "01a1cedc-8b1c-7715-8c1f-57eefc9f55cd"
++    svc.hub(OTHER).ops(BOARD, [
++        {"client_op_id": "w-run-1", "op": "upsert", "table": "task_runs", "uid": run_uid, "hlc": _hlc(1_000, OTHER),
++         "fields": {"task_id": tid, "profile": "worker", "status": "running", "started_at": int(time.time())}},
++        {"client_op_id": "w-claim-1", "op": "upsert", "table": "tasks", "uid": tid, "hlc": _hlc(1_001, OTHER),
++         "fields": {"status": "running", "current_run_uid": run_uid}},
++    ])
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    assert live.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "running"
++    return tid, run_uid
++
++
++def _worker_ends(svc, tid, run_uid, *, status, outcome, completed_at=None):
++    svc.hub(OTHER).ops(BOARD, [
++        {"client_op_id": f"w-end-run-{status}", "op": "upsert", "table": "task_runs", "uid": run_uid,
++         "hlc": _hlc(2_000, OTHER),
++         "fields": {"task_id": tid, "status": "done" if outcome == "completed" else outcome, "outcome": outcome,
++                    "ended_at": int(time.time())}},
++        {"client_op_id": f"w-end-task-{status}", "op": "upsert", "table": "tasks", "uid": tid,
++         "hlc": _hlc(2_001, OTHER),
++         "fields": {"status": status, "completed_at": completed_at, "current_run_uid": None,
++                    "completion_contract": "https://github.com/o/r/pull/1"}},
++    ])
++
++
++def _live_missed_the_task_fields(live, kanban_home, svc, tid, run_uid):
++    """The observed precondition: the replica and the live file agree on the card's Board version, the live file has
++    the run's end, but its task row still holds the pre-completion fields (the regressing op's base_version was the
++    replica's version and its fields were exactly the v16 values)."""
++    before = dict(live.execute("SELECT status, completed_at, current_run_id, completion_contract FROM tasks "
++                               "WHERE id = ?", (tid,)).fetchone())
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying = 1")  # no capture: the row only missed the feed
++        live.execute("UPDATE tasks SET status = ?, completed_at = ?, current_run_id = ?, completion_contract = ? "
++                     "WHERE id = ?", (before["status"], before["completed_at"], before["current_run_id"],
++                                      before["completion_contract"], tid))
++        live.execute("UPDATE kanban_sync_state SET applying = 0")
++    shadow = kbc.connect(ksc.shadow_path(BOARD))
++    try:
++        replica = shadow.execute("SELECT sync_version FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    finally:
++        shadow.close()
++    assert live.execute("SELECT sync_version FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == replica
++    assert live.execute("SELECT ended_at FROM task_runs WHERE uid = ?", (run_uid,)).fetchone()[0] is not None
++
++
++@pytest.mark.parametrize("status,outcome,completed_at", [
++    ("done", "completed", 1794472039),  # t_01a1ceaeb6ba593c
++    ("todo", "blocked", None),          # t_01a1ceb44e35f780
++])
++def test_divergence_repair_never_reopens_a_card_over_its_ended_run(live, kanban_home, svc, status, outcome,
++                                                                  completed_at):
++    tid, run_uid = _running_card(live, kanban_home, svc)
++    _worker_ends(svc, tid, run_uid, status=status, outcome=outcome, completed_at=completed_at)
++    _live_missed_the_task_fields(live, kanban_home, svc, tid, run_uid)
++
++    shadow = kbc.connect(ksc.shadow_path(BOARD))
++    try:
++        repaired = ksc.repair_divergence(live, shadow, ME)
++    finally:
++        shadow.close()
++    assert tid not in repaired  # the live copy is the stale one: nothing of it goes to the Board
++    _round(kanban_home, svc)
++
++    board = _service_task(svc, tid)
++    assert board["status"] == status
++    assert board["current_run_uid"] is None
++    assert board["completion_contract"] == "https://github.com/o/r/pull/1"
++    row = live.execute("SELECT status, current_run_id, completed_at, completion_contract FROM tasks WHERE id = ?",
++                       (tid,)).fetchone()
++    assert (row["status"], row["current_run_id"], row["completed_at"]) == (status, None, completed_at)
++    assert row["completion_contract"] == "https://github.com/o/r/pull/1"
++
++
++def test_divergence_repair_still_sends_a_real_uncaptured_edit_of_a_running_card(live, kanban_home, svc):
++    """The guard is scoped to a stale lifecycle: a live edit with the run still open goes out as before."""
++    tid, _run_uid = _running_card(live, kanban_home, svc)
++    with kbc.write_txn(live):
++        sync.drop_triggers(live)
++        live.execute("UPDATE tasks SET title = 'renamed in a capture gap' WHERE id = ?", (tid,))
++    shadow = kbc.connect(ksc.shadow_path(BOARD))
++    try:
++        assert ksc.repair_divergence(live, shadow, ME) == {tid: ["title"]}
++    finally:
++        shadow.close()
+-- 
+2.43.0
+

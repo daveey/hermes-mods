@@ -1,0 +1,110 @@
+From db8b5c1168fb31cea166c240acc0750fde853af6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 09:05:19 +0000
+Subject: [PATCH] [daveey] Owner-wake hold release: a core-update requeue no
+ longer consumes it
+
+Review of #1311 (t_01a1ceefe82eaa40): kanban_hold_release._park and
+released_after keyed on the latest run by id, so release -> claim ->
+core-update restart-safe requeue re-held the card active_pr, and the
+operator re-release was then refused ("hold release requires latest
+orderly owner park"). Both now read the latest run passing over
+core-update requeues (latest_run_skipping_requeues), like the
+dependency-park and review-checkpoint paths. A crash still consumes the
+release. Also documents the duplicate-PR residual in the requeue module.
+---
+ hermes_cli/kanban_core_update_requeue.py      |  4 ++++
+ hermes_cli/kanban_hold_release.py             | 12 ++++++----
+ .../test_kanban_owner_wake_hold_release.py    | 22 +++++++++++++++++++
+ 3 files changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_core_update_requeue.py b/hermes_cli/kanban_core_update_requeue.py
+index 9ac2d84540..1b67e4283d 100644
+--- a/hermes_cli/kanban_core_update_requeue.py
++++ b/hermes_cli/kanban_core_update_requeue.py
+@@ -11,6 +11,10 @@ Only an exact manual reclaim with that reason, whose run ended ``reclaimed`` and
+ crash or timeout evidence, qualifies. Any other reclaim, crash or timeout still consumes the
+ handoff (fail closed). A PR the requeued run reported is a newer PR comment and re-arms the
+ guard on its own. Keep the reason in sync with hermes-sync.
++
++Residual: "restart-safe" is a host property, not per-worker quiescence, so a requeued run may
++have opened a PR it had not yet reported. The next run sees the requeued run's transcript tail
++(kanban_worker_recovery); the risk matches the continued/scheduled handoffs.
+ """
+ from __future__ import annotations
+ 
+diff --git a/hermes_cli/kanban_hold_release.py b/hermes_cli/kanban_hold_release.py
+index be7bfac565..04b39f3674 100644
+--- a/hermes_cli/kanban_hold_release.py
++++ b/hermes_cli/kanban_hold_release.py
+@@ -1,7 +1,8 @@
+ """Machine-checked owner-wake recovery, scoped to one dependency park. [daveey]
+ 
+ This is NOT an unblock or merge approval. Only the authenticated tool grant calls
+-release; a new run consumes the receipt even if that run crashes. Generic handoff
++release; a new run consumes the receipt even if that run crashes (a hermes-sync
++core-update restart-safe requeue does not: :mod:`kanban_core_update_requeue`). Generic handoff
+ and recent-success guards deliberately do not recognize this event.
+ """
+ from __future__ import annotations
+@@ -18,12 +19,14 @@ def _identity(row):
+ 
+ 
+ def _park(conn, task_id):
++    from hermes_cli.kanban_core_update_requeue import latest_run_id
++    # Latest run passing over core-update requeues: that pause is not a newer run. [daveey]
+     row = conn.execute(
+         "SELECT e.payload, e.created_at, r.*, t.assignee FROM task_events e "
+         "JOIN task_runs r ON r.id=e.run_id JOIN tasks t ON t.id=e.task_id "
+         "WHERE e.task_id=? AND e.kind='dependency_wait' AND r.task_id=t.id "
+-        "AND r.id=(SELECT MAX(id) FROM task_runs WHERE task_id=t.id) "
+-        "ORDER BY e.id DESC LIMIT 1", (task_id,),
++        "AND r.id IS ? "
++        "ORDER BY e.id DESC LIMIT 1", (task_id, latest_run_id(conn, task_id)),
+     ).fetchone()
+     if row is None or row["outcome"] != "blocked" or row["profile"] != row["assignee"]:
+         raise ValueError("hold release requires latest orderly owner park")
+@@ -132,8 +135,9 @@ def release(conn, task_id, *, supervisor, supervisor_board, precondition):
+ 
+ def released_after(conn, task_id, since, pr_urls):
+     """A receipt older than any claim, or tied with publication, grants nothing."""
++    from hermes_cli.kanban_core_update_requeue import latest_run_skipping_requeues
+     from hermes_cli.kanban_wake_check import foreign_copy
+-    run = conn.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    run = latest_run_skipping_requeues(conn, task_id, skip_unused_grants=False)
+     if run is None:
+         return False
+     urls = {norm_pr(u) for u in pr_urls}
+diff --git a/tests/tools/test_kanban_owner_wake_hold_release.py b/tests/tools/test_kanban_owner_wake_hold_release.py
+index 15196d0824..429d457a72 100644
+--- a/tests/tools/test_kanban_owner_wake_hold_release.py
++++ b/tests/tools/test_kanban_owner_wake_hold_release.py
+@@ -86,3 +86,25 @@ def test_exact_target_release_is_single_use(board, monkeypatch):
+         assert dispatch.check_respawn_guard(conn, task) == "active_pr"
+         assert kb.reclaim_task(conn, task, reason="Worker died", signal_fn=lambda *_: None)
+         assert dispatch.check_respawn_guard(conn, task) == "active_pr"
++
++
++@pytest.mark.parametrize("reason,expected", [("core_update", None), ("Worker died", "active_pr")],
++                         ids=["core_update_requeue", "crash"])
++def test_core_update_requeue_keeps_the_hold_release(board, monkeypatch, reason, expected):
++    """release -> claim -> core-update requeue resumes; a crash consumes the release. [daveey]"""
++    from hermes_cli.kanban_core_update_requeue import CORE_UPDATE_REQUEUE_REASON
++    reason = CORE_UPDATE_REQUEUE_REASON if reason == "core_update" else reason
++    with kbc.connect() as conn:
++        task, _, _ = held(conn, monkeypatch)
++        now = int(time.time()) + 2
++        monkeypatch.setattr(time, "time", lambda: now)
++        assert wake._unblock(task).get("ok") is True
++        assert kb.claim_task(conn, task) is not None
++        assert kb.reclaim_task(conn, task, reason=reason, signal_fn=lambda *_: None)
++        assert kb.get_task(conn, task).status == "ready"
++        assert dispatch.check_respawn_guard(conn, task) == expected
++        if expected is None:
++            # The next real claim consumes it, as before.
++            assert kb.claim_task(conn, task) is not None
++            assert kb.reclaim_task(conn, task, reason="Worker died", signal_fn=lambda *_: None)
++            assert dispatch.check_respawn_guard(conn, task) == "active_pr"
+-- 
+2.43.0
+

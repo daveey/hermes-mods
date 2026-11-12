@@ -1,0 +1,869 @@
+From 4878154a1e95df75263f2a15e0b6e44e5b49d078 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:54:07 +0000
+Subject: [PATCH] [daveey] Fix Kanban wait-notice board counts and unused-grant
+ ready clocks
+
+Wait notices and card reads counted host workers without their board: the other-board sum excluded the process's
+current board (default) instead of the connection being read, so a runners notice said 0/7 busy while default ran
+7. They also opened other boards through writable/migrating connections and turned a read failure into a partial
+sum. And a Board grant claimed and returned unused reset the ready clock to the release time (ready@1794369068 for
+a card waiting since 1794351914).
+
+- kanban_host_counts: board of the connection, other boards opened mode=ro, any failure => running unknown.
+- queue position / notices carry board, observed_at and an admission reason or explicit unknown.
+- _last_ready_entry_ts, ready_since and the chat-wait SQL prefilter ignore unused-grant runs and their claimed
+  events; actual execution, loss and ready transitions still reset it.
+
+Priority advice was already relative-only (kanban_priority.advice); no fixed --priority 10 remains.
+Incidents: default/t_01a1c6809ba7fc32, runners/t_01a1c7d517a4477a, default/t_01a1c6c56a99c3e1. Card t_01a1ce30a39b7172.
+---
+ hermes_cli/kanban_chat_wait.py                |  13 +-
+ hermes_cli/kanban_diagnostics.py              |  14 +-
+ hermes_cli/kanban_host_counts.py              |  94 +++++
+ hermes_cli/kanban_parent_unclaimed.py         |  27 +-
+ hermes_cli/kanban_queue_position.py           |  20 +-
+ hermes_cli/kanban_unused_grant.py             |  51 ++-
+ .../gateway/test_kanban_cross_board_slots.py  |  14 +-
+ .../test_kanban_wait_notice_board_counts.py   | 322 ++++++++++++++++++
+ tests/plugins/test_kanban_foreign_card_api.py |  10 +-
+ tests/tools/test_kanban_show_queue.py         |  26 +-
+ 10 files changed, 551 insertions(+), 40 deletions(-)
+ create mode 100644 hermes_cli/kanban_host_counts.py
+ create mode 100644 tests/hermes_cli/test_kanban_wait_notice_board_counts.py
+
+diff --git a/hermes_cli/kanban_chat_wait.py b/hermes_cli/kanban_chat_wait.py
+index 8d5dab1196..2c5a04d75e 100644
+--- a/hermes_cli/kanban_chat_wait.py
++++ b/hermes_cli/kanban_chat_wait.py
+@@ -107,7 +107,7 @@ def notice_text(payload: Any) -> str:
+         stamp = time.strftime("%H:%M:%SZ", time.gmtime(int(payload["hold_until"])))
+         hold = f"; dispatcher hold {payload['hold_reason']} until {stamp}"
+     return (f"{named}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min with no "
+-            f"worker ({payload.get('queue') or 'queue place unknown'}{hold}). "
++            f"worker ({payload.get('queue') or 'queue place unknown'}{hold}){pu._observation(payload)}. "
+             + pu._options(tid, payload.get("priority_evidence")) + ".")
+ 
+ 
+@@ -117,14 +117,19 @@ def _floor_kinds() -> str:
+ 
+ 
+ # Prefilter only (``pu.ready_since`` decides): the same event floor as the diagnostic, and the latest run's end,
+-# so a long run that a restart requeued never counts as ready time. [daveey]
++# so a long run that a restart requeued never counts as ready time. A Board grant returned unused (a released run
++# with only ``{"unused_grant": true}`` metadata and no worker) is a reservation: neither its ``claimed`` event nor
++# its run's end counts, or a card whose grants keep bouncing would be hidden from the exact check. [daveey]
++_UNUSED_RUN = ("r.outcome = 'released' AND r.worker_pid IS NULL AND r.worker_started_at IS NULL "
++               "AND json_extract(r.metadata, '$.unused_grant') = 1 AND json_extract(r.metadata, '$.lock') IS NULL")
+ _CANDIDATES = (
+     "SELECT t.id, t.title, t.created_at FROM tasks t "
+     "WHERE t.status = 'ready' AND t.claim_lock IS NULL "
+     "AND (t.session_id IS NOT NULL OR EXISTS (SELECT 1 FROM kanban_notify_subs s WHERE s.task_id = t.id)) "
+     f"AND MAX(COALESCE((SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id AND e.kind IN "
+-    f"({_floor_kinds()})), t.created_at), "
+-    "COALESCE((SELECT MAX(r.ended_at) FROM task_runs r WHERE r.task_id = t.id), 0)) "
++    f"({_floor_kinds()}) AND NOT (e.kind = 'claimed' AND e.run_id IN "
++    f"(SELECT r.id FROM task_runs r WHERE r.task_id = t.id AND {_UNUSED_RUN}))), t.created_at), "
++    f"COALESCE((SELECT MAX(r.ended_at) FROM task_runs r WHERE r.task_id = t.id AND NOT ({_UNUSED_RUN})), 0)) "
+     "BETWEEN ? AND ? ORDER BY t.id"
+ )
+ 
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index b2546617c9..bc5126d718 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -723,8 +723,18 @@ def _last_run_end_ts(runs: Iterable[Any]) -> int:
+ 
+ def _last_ready_entry_ts(events: Iterable[Any], runs: Iterable[Any] = ()) -> int:
+     """Latest ready-entry floor; a ``continued`` checkpoint counts only when it resumed straight to ready.
+-    The latest run's end bounds it too, whatever event (if any) the requeue left."""
+-    events = list(events)
++    The latest run's end bounds it too, whatever event (if any) the requeue left.
++
++    A Board grant returned unused (``kanban_unused_grant``) is a reservation, not execution: its ``claimed``
++    event and its run's end never reset the clock, so a card whose grants keep bouncing keeps its real age
++    (default/t_01a1c6c56a99c3e1, 2026-11-10: ready@1794369068 hid a wait since 1794351914). Actual execution,
++    loss and ready transitions still count. [daveey]"""
++    from hermes_cli.kanban_unused_grant import unused_grant_run_ids
++    events, runs = list(events), list(runs)
++    unused = unused_grant_run_ids(runs, events)
++    if unused:
++        events = [ev for ev in events if _task_field(ev, "run_id", None) not in unused]
++        runs = [r for r in runs if _task_field(r, "id", None) not in unused]
+     continued_ready = [_event_ts(ev) for ev in events
+                        if _event_kind(ev) == "continued" and _parse_payload(ev).get("status") == "ready"]
+     return max([_latest_event_ts(events, _READY_WAIT_FLOOR_KINDS), *continued_ready, _last_run_end_ts(runs)])
+diff --git a/hermes_cli/kanban_host_counts.py b/hermes_cli/kanban_host_counts.py
+new file mode 100644
+index 0000000000..cb655e7b64
+--- /dev/null
++++ b/hermes_cli/kanban_host_counts.py
+@@ -0,0 +1,94 @@
++"""Host-wide running-worker count for notices and card reads: tied to the asking connection's board, read-only. [daveey]
++
++hermes-hub 2026-11-10: a ``runners`` notice said "0/7 worker slots busy" while ``default`` ran 7 cards. The notice
++path called ``count_running_tasks_other_boards()`` without its board, which resolved the board to exclude from the
++process's current board (``default``) instead of the connection it was reading, so ``default`` was skipped and
++``runners`` counted twice. Here the board to exclude is the file the connection is attached to, other boards are
++opened ``mode=ro`` (no migration, no write lock on a production DB), and any read failure makes the count
++**unknown** (None), never a partial sum or zero.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import time
++from pathlib import Path
++from typing import Any, Optional
++from urllib.parse import quote
++
++_log = logging.getLogger(__name__)
++
++
++def conn_db_path(conn: sqlite3.Connection) -> Optional[Path]:
++    """Resolved file behind ``conn``'s main database (None for an in-memory or unreadable connection)."""
++    try:
++        for _seq, name, file in conn.execute("PRAGMA database_list").fetchall():
++            if name == "main" and file:
++                return Path(file).expanduser().resolve()
++    except sqlite3.Error:
++        _log.debug("host counts: database_list unavailable", exc_info=True)
++    return None
++
++
++def _board_paths() -> list[tuple[str, Path]]:
++    """``(slug, resolved path)`` of every active board; raises when boards cannot be enumerated."""
++    from hermes_cli import kanban_db as kb
++    out: list[tuple[str, Path]] = []
++    for meta in kb.list_boards(include_archived=False):
++        slug = meta.get("slug") or kb.DEFAULT_BOARD
++        out.append((slug, kb.kanban_db_path(board=slug).expanduser().resolve()))
++    return out
++
++
++def board_of(conn: sqlite3.Connection) -> Optional[str]:
++    """Slug of the board whose file ``conn`` is attached to; None when it matches no active board."""
++    path = conn_db_path(conn)
++    if path is None:
++        return None
++    try:
++        return next((slug for slug, p in _board_paths() if p == path), None)
++    except Exception:  # health: allow BLE001 -- an unreadable board list leaves the board unnamed, not wrong
++        _log.debug("host counts: board list unavailable", exc_info=True)
++        return None
++
++
++def _running_in(conn: sqlite3.Connection) -> int:
++    """Running cards on ``conn``'s file this gateway owns (a card another gateway's lease holds is elsewhere)."""
++    from hermes_cli import kanban_db as kb
++    return int(conn.execute(
++        "SELECT COUNT(*) FROM tasks WHERE status = 'running'" + kb._sync.held_elsewhere_sql(conn)).fetchone()[0])
++
++
++def _running_in_file(path: Path) -> int:
++    uri = f"file:{quote(str(path))}?mode=ro"
++    from hermes_cli import kanban_lockguard
++    other = kanban_lockguard.connect(uri, uri=True, timeout=2.0)
++    try:
++        other.row_factory = sqlite3.Row
++        return _running_in(other)
++    finally:
++        other.close()
++
++
++def running_on_host(conn: sqlite3.Connection) -> dict[str, Any]:
++    """``{"running": int | None, "board": slug | None, "observed_at": epoch}``.
++
++    ``running`` sums ``conn``'s own file and every other active board's file once each (boards sharing a file,
++    as under ``HERMES_KANBAN_DB``, count once). Any failure leaves it None (unknown)."""
++    observed = int(time.time())
++    board = board_of(conn)
++    out: dict[str, Any] = {"running": None, "board": board, "observed_at": observed}
++    path = conn_db_path(conn)
++    if path is None:
++        return out
++    try:
++        total = _running_in(conn)
++        for other in dict.fromkeys(p for _slug, p in _board_paths()):
++            if other == path or not other.exists():
++                continue
++            total += _running_in_file(other)
++    except Exception:  # health: allow BLE001 -- any unreadable board makes the host count unknown, never partial
++        _log.debug("host counts: running count unavailable", exc_info=True)
++        return out
++    out["running"] = total
++    return out
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 215e150def..3cf9e6dd57 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -33,8 +33,8 @@ def ready_since(conn, task_id: str, created_at: Optional[int] = None) -> int:
+     included), else its creation."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_diagnostics import _last_ready_entry_ts
+-    ended = conn.execute("SELECT MAX(ended_at) AS ended_at FROM task_runs WHERE task_id = ?", (task_id,)).fetchall()
+-    since = _last_ready_entry_ts(kb.list_events(conn, task_id), [dict(r) for r in ended])
++    runs = conn.execute("SELECT * FROM task_runs WHERE task_id = ?", (task_id,)).fetchall()
++    since = _last_ready_entry_ts(kb.list_events(conn, task_id), [dict(r) for r in runs])
+     return int(since or created_at or 0)
+ 
+ 
+@@ -61,9 +61,22 @@ def _queue_words(place: dict[str, Any]) -> str:
+     words = ahead_words(place, "{n} card(s) ahead of it") if ahead is not None else "queue place unknown"
+     if place.get("running") is not None and place.get("limit") is not None:
+         words += f", {place['running']}/{place['limit']} worker slots busy"
++    elif place.get("limit") is not None and "running" in place:
++        words += f", running count unknown (cap {place['limit']})"
+     return words
+ 
+ 
++def _observation(payload: dict[str, Any]) -> str:
++    """``board <b>, observed <HH:MM:SSZ>, admission reason <r | unknown>`` for the notice text (empty on an old
++    payload without those fields)."""
++    if "observed_at" not in payload:
++        return ""
++    stamp = time.strftime("%H:%M:%SZ", time.gmtime(int(payload["observed_at"])))
++    admission = payload.get("admission") if isinstance(payload.get("admission"), dict) else {}
++    reason = admission.get("reason") or "unknown"
++    return f" [board {payload.get('board') or 'unknown'}, observed {stamp}, admission reason {reason}]"
++
++
+ def _options(parent_id: str, evidence: Optional[dict[str, Any]] = None) -> str:
+     from hermes_cli.kanban_priority import advice
+     return f"{NO_FIX}: " + advice(parent_id, evidence)
+@@ -78,8 +91,8 @@ def notice_text(payload: Any) -> str:
+     advice = ("Check the current dispatcher verdict and resolve the recorded guard; priority changes do not clear it"
+               if payload.get("respawn_guard") else _options(parent, payload.get("priority_evidence")))
+     return (f"Waiting {payload.get('wait_minutes', '?')} min on parent {named}, which has been ready "
+-            f"{payload.get('ready_minutes', '?')} min with no worker ({payload.get('queue') or 'queue place unknown'}). "
+-            + advice + ".")
++            f"{payload.get('ready_minutes', '?')} min with no worker ({payload.get('queue') or 'queue place unknown'})"
++            + _observation(payload) + ". " + advice + ".")
+ 
+ 
+ def ready_hint(conn, task, *, now: Optional[float] = None) -> Optional[str]:
+@@ -153,8 +166,12 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+     wait (``kanban_chat_wait``), where ``waiting_on`` is ``task_id`` itself; ``extra`` adds payload fields (its
+     clock hold). Returns True when it posted."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_host_counts as khc
+     from hermes_cli import kanban_queue_position as kqp
+     place = _place(conn, waiting_on)
++    observed = {"board": place.get("board") or khc.board_of(conn), "observed_at": place.get("observed_at") or int(time.time()),
++                "admission": ({"reason": "core_update_hold", "status": "held"} if (extra or {}).get("core_update_hold")
++                              else {"reason": None, "status": "unknown"})}
+     guard = place.get("reason") if place.get("lane") == "respawn_guard" else None
+     with kb.write_txn(conn):
+         if any(kb._json_dict(p).get("wait_event_id") == wait_key and kb._json_dict(p).get("parent") == waiting_on
+@@ -168,7 +185,7 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+         kb._append_event(conn, task_id, kind, {
+             "parent": waiting_on, "parent_title": parent_title, "wait_event_id": wait_key,
+             "wait_minutes": _minutes(waited_seconds), "ready_minutes": _minutes(ready_seconds),
+-            "queue": kqp.describe(place) if guard else _queue_words(place), **(extra or {}),
++            "queue": kqp.describe(place) if guard else _queue_words(place), **observed, **(extra or {}),
+             "respawn_guard": guard,
+             "priority_evidence": lane_evidence(conn, waiting_on),
+         })
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 88c3db8907..0ccddfc83c 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -13,6 +13,7 @@ from __future__ import annotations
+ 
+ import logging
+ import sqlite3
++import time
+ from typing import Any, Optional
+ 
+ _log = logging.getLogger(__name__)
+@@ -33,13 +34,14 @@ def _ahead(conn: sqlite3.Connection, task) -> int:
+ 
+ 
+ def _running_and_limit(conn: sqlite3.Connection, board: Optional[str]) -> tuple[Optional[int], Optional[int]]:
+-    """The host's running workers (every board) and its ``max_in_progress`` cap, as the dispatcher counts them."""
++    """The host's running workers (every board) and its ``max_in_progress`` cap, as the dispatcher counts them.
++
++    The board to exclude from the other-board sum is the one ``conn`` is attached to (``kanban_host_counts``),
++    never the process's current board; ``board`` only labels a connection that matches no active board. An
++    unreadable count is unknown (None), not zero or a partial sum."""
+     from hermes_cli import kanban_db_dispatch as kbd
+-    try:
+-        running = kbd.count_running_tasks(conn) + kbd.count_running_tasks_other_boards(board)
+-    except Exception:  # health: allow BLE001 -- an unreadable count is unknown, not zero
+-        _log.debug("kanban queue position: running count unavailable", exc_info=True)
+-        running = None
++    from hermes_cli import kanban_host_counts as khc
++    running = khc.running_on_host(conn)["running"]
+     try:
+         limit = kbd.resolve_max_in_progress(kbd.configured_max_in_progress())
+     except Exception:  # health: allow BLE001 -- an unreadable cap is unknown
+@@ -170,6 +172,7 @@ def position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Opt
+     placed = placement(conn, task.id)
+     if placed is not None:
+         return placed
++    from hermes_cli import kanban_host_counts as khc
+     running, limit = _running_and_limit(conn, board)
+     from hermes_cli import kanban_board_share as share
+     try:
+@@ -177,7 +180,8 @@ def position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Opt
+     except Exception:  # health: allow BLE001 -- other boards are advisory; an unreadable count is unknown
+         _log.debug("kanban queue position: other boards unavailable", exc_info=True)
+         elsewhere = None
+-    place = {"lane": "local", "ahead": _ahead(conn, task), "running": running, "limit": limit, "approximate": True}
++    place = {"lane": "local", "ahead": _ahead(conn, task), "running": running, "limit": limit, "approximate": True,
++             "board": khc.board_of(conn) or board, "observed_at": int(time.time())}
+     if elsewhere:  # only when other boards' cards rank ahead: the single-board payload keeps its shape
+         place["ahead_other_boards"] = elsewhere
+     return place
+@@ -265,6 +269,8 @@ def describe(place: Optional[dict[str, Any]]) -> Optional[str]:
+              else "waiting for a local slot")
+     if place.get("running") is not None and place.get("limit") is not None:
+         words += f", {place['running']}/{place['limit']} running"
++    elif place.get("limit") is not None and "running" in place:
++        words += f", running count unknown (cap {place['limit']})"
+     return words + ". " + _NOT_STUCK
+ 
+ 
+diff --git a/hermes_cli/kanban_unused_grant.py b/hermes_cli/kanban_unused_grant.py
+index 86f28fdbc0..c0c4ec4e68 100644
+--- a/hermes_cli/kanban_unused_grant.py
++++ b/hermes_cli/kanban_unused_grant.py
+@@ -4,30 +4,57 @@ from __future__ import annotations
+ import sqlite3
+ 
+ 
+-def is_unused_grant(conn: sqlite3.Connection, run) -> bool:
+-    """Require a bare Board grant/release, with no contradictory execution trace."""
++def _get(row, key):
++    try:
++        return row[key]
++    except (KeyError, IndexError, TypeError):
++        return getattr(row, key, None)  # an Event/Run dataclass is not subscriptable
++
++
++def _dict(raw) -> dict:
+     from hermes_cli import kanban_db as kb
++    return raw if isinstance(raw, dict) else kb._json_dict(raw)
++
+ 
+-    metadata = kb._json_dict(run["metadata"])
+-    if (run["status"] != "released" or run["outcome"] != "released" or run["ended_at"] is None
+-            or set(metadata) != {"unused_grant"} or metadata.get("unused_grant") is not True):
++def unused_grant_run(run, events) -> bool:
++    """Pure core of :func:`is_unused_grant`: ``run`` (row or dict) and ``events`` (that run's events, each with
++    ``kind`` and ``payload`` as dict or JSON text) show a bare Board grant/release and nothing else."""
++    metadata = _dict(_get(run, "metadata"))
++    if (_get(run, "status") not in (None, "released") or _get(run, "outcome") != "released"
++            or _get(run, "ended_at") is None or set(metadata) != {"unused_grant"}
++            or metadata.get("unused_grant") is not True):
+         return False
+-    if any(run[key] is not None for key in ("worker_pid", "worker_started_at", "last_heartbeat_at", "claim_lock")):
++    if any(_get(run, key) is not None for key in ("worker_pid", "worker_started_at", "last_heartbeat_at", "claim_lock")):
+         return False
+-    if run["summary"] or run["error"]:
++    if _get(run, "summary") or _get(run, "error"):
+         return False
+     released = False
+-    for event in conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND run_id = ?",
+-                              (run["task_id"], run["id"])):
+-        payload = kb._json_dict(event["payload"])
+-        if event["kind"] == "claimed" and "lock" not in payload:
++    for event in events:
++        payload = _dict(_get(event, "payload"))
++        if _get(event, "kind") == "claimed" and "lock" not in payload:
+             continue
+-        if event["kind"] != "released" or payload.get("unused_grant") is not True:
++        if _get(event, "kind") != "released" or payload.get("unused_grant") is not True:
+             return False
+         released = True
+     return released
+ 
+ 
++def unused_grant_run_ids(runs, events) -> set:
++    """Ids of ``runs`` that were unused grants, judged from the task's ``events`` (matched by ``run_id``)."""
++    by_run: dict = {}
++    for event in events:
++        by_run.setdefault(_get(event, "run_id"), []).append(event)
++    return {_get(run, "id") for run in runs
++            if _get(run, "id") is not None and unused_grant_run(run, by_run.get(_get(run, "id"), []))}
++
++
++def is_unused_grant(conn: sqlite3.Connection, run) -> bool:
++    """Require a bare Board grant/release, with no contradictory execution trace."""
++    events = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND run_id = ?",
++                          (run["task_id"], run["id"])).fetchall()
++    return unused_grant_run(run, events)
++
++
+ def latest_started_run(conn: sqlite3.Connection, task_id: str):
+     """Latest run, ignoring only positively attested, unstarted unused grants.
+ 
+diff --git a/tests/gateway/test_kanban_cross_board_slots.py b/tests/gateway/test_kanban_cross_board_slots.py
+index fa997064b4..f2fcc95a3d 100644
+--- a/tests/gateway/test_kanban_cross_board_slots.py
++++ b/tests/gateway/test_kanban_cross_board_slots.py
+@@ -41,6 +41,14 @@ def _card(board, title, priority, *, ready_since=None):
+     return tid
+ 
+ 
++def _running(board):
++    """One worker really running on ``board``: the queue place counts it through that board's file (read-only)."""
++    with kbc.connect_closing(board=board) as conn:
++        busy = kb.create_task(conn, title="busy", assignee="default")
++        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (busy,))
++        conn.commit()
++
++
+ def _dispatcher(monkeypatch, spawned, *, start_board):
+     from gateway.kanban_watchers_dispatcher import _DispatcherSettings, _KanbanDispatcher
+     real = kbd.dispatch_once
+@@ -124,7 +132,7 @@ def test_a_guarded_starved_head_does_not_win_its_board_every_first_pick(home, mo
+     with kbc.connect_closing(board="hermes") as conn:
+         assert kb.get_task(conn, filler).status == "ready"
+     mine = _card("default", "default p900 card", 900)
+-    monkeypatch.setattr(kbd, "count_running_tasks_other_boards", lambda board=None: 1)
++    _running("hermes")
+     with kbc.connect_closing(board="default") as conn:
+         place = kqp.position(conn, kb.get_task(conn, mine), "default")
+     assert place is not None and "ahead_other_boards" not in place, place
+@@ -144,7 +152,7 @@ def test_board_started_nothing_keeps_the_starvation_pick(home):
+ def test_queue_text_counts_higher_ranked_cards_on_other_boards(home, monkeypatch):
+     from hermes_cli import kanban_parent_unclaimed as pu
+     from hermes_cli import kanban_queue_position as kqp
+-    monkeypatch.setattr(kbd, "count_running_tasks_other_boards", lambda board=None: 1)
++    _running("hermes")
+     _card("hermes", "hermes higher card", 900)
+     _card("hermes", "hermes lower card", 0)
+     mine = _card("default", "default card", 500)
+@@ -160,7 +168,7 @@ def test_queue_text_counts_higher_ranked_cards_on_other_boards(home, monkeypatch
+ def test_no_other_board_ahead_keeps_the_single_board_wording(home, monkeypatch):
+     from hermes_cli import kanban_parent_unclaimed as pu
+     from hermes_cli import kanban_queue_position as kqp
+-    monkeypatch.setattr(kbd, "count_running_tasks_other_boards", lambda board=None: 1)
++    _running("hermes")
+     _card("hermes", "hermes lower card", 0)
+     mine = _card("default", "default card", 500)
+     with kbc.connect_closing(board="default") as conn:
+diff --git a/tests/hermes_cli/test_kanban_wait_notice_board_counts.py b/tests/hermes_cli/test_kanban_wait_notice_board_counts.py
+new file mode 100644
+index 0000000000..ddce646242
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wait_notice_board_counts.py
+@@ -0,0 +1,322 @@
++"""Wait notices name their board, read host counts read-only, and measure ready time without unused grants. [daveey]
++
++Incidents (hermes-hub, 2026-11-10): runners/t_01a1c7d517a4477a was told "0/7 worker slots busy" while default had
++7 running cards (the notice path called the host count without its board, so the count excluded ``default`` and
++double-counted ``runners``); default/t_01a1c6c56a99c3e1 had a claimed+released ``unused_grant`` pair that reset its
++ready age to the release time (``ready@1794369068``) though it had waited since ``continuation_woken`` 1794351914.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_chat_wait as cw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_notify as kn
++from hermes_cli import kanban_diagnostics as kd
++from hermes_cli import kanban_parent_unclaimed as pu
++from hermes_cli import kanban_queue_position as kqp
++
++_ENV = ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
++        "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_HOME", "HERMES_DELEGATED_CHILD_CONTEXT",
++        "HERMES_KANBAN_WORKER_TASK")
++
++
++@pytest.fixture
++def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for key in _ENV:
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 7)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    kb.create_board("runners")
++    return h
++
++
++def _running(board: str | None, n: int) -> None:
++    with kbc.connect_closing(board=board) as conn:
++        for i in range(n):
++            tid = kb.create_task(conn, title=f"busy {i}", assignee="default")
++            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
++        conn.commit()
++
++
++def _waiting_card(conn, *, age_s: int = 40 * 60) -> str:
++    """A subscribed ready card whose ready episode began ``age_s`` ago."""
++    now = int(time.time())
++    tid = kb.create_task(conn, title="waiting", assignee="default")
++    kn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="origin-chat", delivery_metadata={"reason": "create"})
++    conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (now - age_s, tid))
++    conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (now - age_s, tid))
++    conn.commit()
++    return tid
++
++
++def _notice(conn, tid: str, kind: str) -> dict:
++    (payload,) = [json.loads(p) for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, kind))]
++    return payload
++
++
++# --- board identity and host counts ------------------------------------------------------------------------------
++
++
++def test_runners_board_position_counts_default_runs_without_a_board_argument(home):
++    _running(None, 7)
++    with kbc.connect_closing(board="runners") as conn:
++        tid = _waiting_card(conn)
++        place = kqp.position(conn, kb.get_task(conn, tid))  # no board passed, as every notice path does
++    assert (place["running"], place["limit"]) == (7, 7)
++    assert place["board"] == "runners"
++
++
++def test_default_board_position_does_not_count_itself_twice(home):
++    _running(None, 3)
++    _running("runners", 2)
++    with kbc.connect_closing() as conn:
++        tid = _waiting_card(conn)
++        place = kqp.position(conn, kb.get_task(conn, tid))
++    assert place["running"] == 5
++    assert place["board"] == "default"
++
++
++def test_host_count_opens_no_writable_connection(home, monkeypatch):
++    _running(None, 7)
++    with kbc.connect_closing(board="runners") as conn:
++        tid = _waiting_card(conn)
++
++        def _no_writer(*a, **k):
++            raise AssertionError("a notice must not open a migrating/writable board connection")
++
++        monkeypatch.setattr(kbd._kbc, "connect", _no_writer)
++        place = kqp.position(conn, kb.get_task(conn, tid))
++    assert place["running"] == 7
++
++
++def test_unreadable_other_board_makes_the_running_count_unknown_not_a_partial_sum(home):
++    _running(None, 7)
++    (kb.kanban_db_path(board="default")).write_bytes(b"not a sqlite file" * 64)
++    with kbc.connect_closing(board="runners") as conn:
++        tid = _waiting_card(conn)
++        place = kqp.position(conn, kb.get_task(conn, tid))
++    assert place["running"] is None
++    assert "busy" not in pu._queue_words(place)
++    assert "unknown" in pu._queue_words(place)
++
++
++# --- every notice path carries board, observation time and an admission reason or unknown --------------------------
++
++
++def test_direct_chat_wait_notice_names_board_count_time_and_unknown_admission(home):
++    _running(None, 7)
++    with kbc.connect_closing(board="runners") as conn:
++        tid = _waiting_card(conn)
++        before = int(time.time())
++        assert cw.sweep(conn) == 1
++        payload = _notice(conn, tid, cw.NOTICE_KIND)
++    assert payload["board"] == "runners"
++    assert "7/7 worker slots busy" in payload["queue"]
++    assert before <= payload["observed_at"] <= int(time.time())
++    assert payload["admission"] == {"reason": None, "status": "unknown"}
++    text = cw.notice_text(payload)
++    assert "runners" in text and "admission reason unknown" in text and "7/7" in text
++
++
++def test_parent_unclaimed_notice_names_board_count_time_and_unknown_admission(home):
++    _running(None, 7)
++    with kbc.connect_closing(board="runners") as conn:
++        parent = _waiting_card(conn)
++        child = kb.create_task(conn, title="child", assignee="default", parents=[parent])
++        kn.add_notify_sub(conn, task_id=child, platform="tui", chat_id="origin-chat",
++                          delivery_metadata={"reason": "create"})
++        now = int(time.time())
++        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'dependency_wait', "
++                     "'{}', ?)", (child, now - 40 * 60))
++        conn.commit()
++        assert pu.sweep(conn) == 1
++        payload = _notice(conn, child, pu.NOTICE_KIND)
++    assert payload["board"] == "runners"
++    assert "7/7 worker slots busy" in payload["queue"]
++    assert payload["admission"]["status"] == "unknown"
++    assert isinstance(payload["observed_at"], int)
++    text = pu.notice_text(payload)
++    assert "runners" in text and "admission reason unknown" in text
++
++
++def test_show_path_without_board_reads_the_connections_board(home):
++    _running(None, 7)
++    with kbc.connect_closing(board="runners") as conn:
++        tid = _waiting_card(conn)
++        place = kqp.read(conn, kb.get_task(conn, tid), None)
++    assert place["running"] == 7 and place["board"] == "runners"
++    assert "7/7 running" in kqp.describe(place)
++
++
++def test_unknown_running_count_is_worded_unknown_in_card_reads(home):
++    place = {"lane": "local", "ahead": 3, "running": None, "limit": 7, "approximate": True, "board": "runners"}
++    assert "running count unknown" in kqp.describe(place)
++
++
++# --- ready clock: unused grants never reset it -----------------------------------------------------------------
++
++
++def _grant_pair(conn, tid: str, at: int, *, lock: bool = False) -> int:
++    """A Board reservation claimed and returned unused at ``at`` (no worker spawned)."""
++    cur = conn.execute("INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome, metadata) "
++                       "VALUES (?, 'released', ?, ?, 'released', ?)", (tid, at, at, json.dumps({"unused_grant": True})))
++    run_id = cur.lastrowid
++    claimed = {"run_id": run_id, **({"lock": "hub:1"} if lock else {})}
++    conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'claimed', ?, ?)",
++                 (tid, run_id, json.dumps(claimed), at))
++    conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'released', ?, ?)",
++                 (tid, run_id, json.dumps({"unused_grant": True}), at))
++    conn.commit()
++    return run_id
++
++
++def _woken_card(conn, *, woken_ago: int = 40 * 60) -> tuple[str, int]:
++    now = int(time.time())
++    tid = _waiting_card(conn, age_s=3 * 3600)
++    woken = now - woken_ago
++    conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'continuation_woken', "
++                 "'{}', ?)", (tid, woken))
++    conn.commit()
++    return tid, woken
++
++
++def test_repeated_unused_grants_preserve_the_ready_age(home):
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid, woken = _woken_card(conn)
++        _grant_pair(conn, tid, now - 600)
++        _grant_pair(conn, tid, now - 60)
++        assert pu.ready_since(conn, tid) == woken
++        assert cw.sweep(conn) == 1  # the SQL prefilter must not hide a card whose grants are recent
++        payload = _notice(conn, tid, cw.NOTICE_KIND)
++    assert payload["wait_event_id"] == f"ready@{woken}"
++    assert payload["ready_minutes"] == 40
++
++
++def test_pure_diagnostic_floor_ignores_unused_grant_runs_and_their_events(home):
++    events = [
++        {"id": 1, "kind": "continuation_woken", "created_at": 1000, "payload": {}, "run_id": None},
++        {"id": 2, "kind": "claimed", "created_at": 5000, "payload": {"run_id": 7}, "run_id": 7},
++        {"id": 3, "kind": "released", "created_at": 5000, "payload": {"unused_grant": True}, "run_id": 7},
++    ]
++    runs = [{"id": 7, "status": "released", "outcome": "released", "started_at": 5000, "ended_at": 5000,
++             "metadata": json.dumps({"unused_grant": True})}]
++    assert kd._last_ready_entry_ts(events, runs) == 1000
++
++
++def test_a_grant_carrying_a_worker_lock_is_real_execution_and_still_resets(home):
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid, _woken = _woken_card(conn)
++        _grant_pair(conn, tid, now - 600, lock=True)
++        assert pu.ready_since(conn, tid) == now - 600
++
++
++def test_actual_lost_worker_after_unused_grants_resets_the_clock(home):
++    now = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid, _woken = _woken_card(conn, woken_ago=3 * 3600)
++        _grant_pair(conn, tid, now - 2 * 3600)
++        meta = {"exit_code": 76, "owner_restart": True, "retry_status": "ready"}
++        cur = conn.execute("INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome, metadata) "
++                           "VALUES (?, 'reclaimed', ?, ?, 'reclaimed', ?)",
++                           (tid, now - 5400, now - 2400, json.dumps(meta)))
++        conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES "
++                     "(?, ?, 'claimed', ?, ?)", (tid, cur.lastrowid, json.dumps({"lock": "hub:1"}), now - 5400))
++        conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES "
++                     "(?, ?, 'owner_restart_lost', ?, ?)", (tid, cur.lastrowid, json.dumps(meta), now - 2400))
++        conn.commit()
++        assert pu.ready_since(conn, tid) == now - 2400
++        assert cw.sweep(conn) == 1
++        assert _notice(conn, tid, cw.NOTICE_KIND)["ready_minutes"] == 40
++
++
++# --- advice: no fixed priority command, no uncoordinated takeover --------------------------------------------------
++
++
++def test_notice_and_queue_advice_carry_no_fixed_priority_or_takeover_command(home):
++    from hermes_cli import kanban_chat_wait, kanban_queue_position
++    texts = [pu._options("t_x"), kanban_chat_wait.NO_PROMISE, kanban_queue_position._NOT_STUCK]
++    for text in texts:
++        assert "--priority 10" not in text
++        assert "do the work here" not in text.lower() and "do work here" not in text.lower()
++
++
++# --- guards on the new conditions ----------------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("field,value", [("worker_pid", 4242), ("worker_started_at", 5000), ("last_heartbeat_at", 5000),
++                                         ("claim_lock", "hub:1"), ("summary", "did work"), ("error", "boom")])
++def test_a_grant_run_with_any_execution_trace_is_not_unused(field, value):
++    from hermes_cli.kanban_unused_grant import unused_grant_run
++    run = {"id": 7, "status": "released", "outcome": "released", "ended_at": 5000,
++           "metadata": json.dumps({"unused_grant": True}), field: value}
++    events = [{"kind": "claimed", "payload": {"run_id": 7}}, {"kind": "released", "payload": {"unused_grant": True}}]
++    assert unused_grant_run(run, events) is False
++    del run[field]
++    assert unused_grant_run(run, events) is True
++
++
++def test_a_grant_whose_run_has_no_release_receipt_is_not_unused():
++    from hermes_cli.kanban_unused_grant import unused_grant_run
++    run = {"id": 7, "status": "released", "outcome": "released", "ended_at": 5000,
++           "metadata": json.dumps({"unused_grant": True})}
++    assert unused_grant_run(run, [{"kind": "claimed", "payload": {"run_id": 7}}]) is False
++    assert unused_grant_run(run, [{"kind": "spawned", "payload": {"pid": 1}}]) is False
++
++
++def test_in_memory_connection_has_unknown_board_and_count(home):
++    import sqlite3
++    from hermes_cli import kanban_host_counts as khc
++    mem = sqlite3.connect(":memory:")
++    assert khc.board_of(mem) is None
++    got = khc.running_on_host(mem)
++    assert got["running"] is None and got["board"] is None
++
++
++def test_board_without_a_database_file_is_skipped_not_unknown(home):
++    from hermes_cli import kanban_host_counts as khc
++    _running(None, 2)
++    kb.kanban_db_path(board="runners").unlink()
++    with kbc.connect_closing() as conn:
++        assert khc.running_on_host(conn)["running"] == 2
++
++
++def test_boards_pinned_to_one_file_count_once(home, monkeypatch):
++    from hermes_cli import kanban_host_counts as khc
++    _running(None, 2)
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="default")))
++    with kbc.connect_closing() as conn:
++        assert khc.running_on_host(conn)["running"] == 2
++
++
++def test_card_running_under_another_gateways_lease_is_not_a_local_slot(home, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_host_counts as khc
++    _running(None, 3)
++    monkeypatch.setattr(sync, "held_elsewhere_sql", lambda conn, alias="": " AND 0")
++    with kbc.connect_closing(board="runners") as conn:
++        assert khc.running_on_host(conn)["running"] == 0
++
++
++@pytest.mark.parametrize("field,value", [("outcome", "reclaimed"), ("status", "reclaimed"), ("ended_at", None)])
++def test_only_a_released_ended_grant_is_unused(field, value):
++    from hermes_cli.kanban_unused_grant import unused_grant_run
++    run = {"id": 7, "status": "released", "outcome": "released", "ended_at": 5000,
++           "metadata": json.dumps({"unused_grant": True}), field: value}
++    events = [{"kind": "claimed", "payload": {"run_id": 7}}, {"kind": "released", "payload": {"unused_grant": True}}]
++    assert unused_grant_run(run, events) is False
+diff --git a/tests/plugins/test_kanban_foreign_card_api.py b/tests/plugins/test_kanban_foreign_card_api.py
+index 2b111c3d8b..173d92e1ae 100644
+--- a/tests/plugins/test_kanban_foreign_card_api.py
++++ b/tests/plugins/test_kanban_foreign_card_api.py
+@@ -172,7 +172,12 @@ def _set(tid, **cols):
+ def test_ready_card_reports_local_queue_position(kanban_home, api, monkeypatch):
+     from hermes_cli import kanban_db_dispatch as kbd
+     monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 6)
+-    monkeypatch.setattr(kbd, "count_running_tasks_other_boards", lambda board=None: 2)
++    kb.create_board("other")  # 2 workers on another board, really counted through its file
++    with kbc.connect_closing(board="other") as other:
++        for i in range(2):
++            busy = kb.create_task(other, title=f"busy {i}", assignee="default")
++            other.execute("UPDATE tasks SET status='running' WHERE id=?", (busy,))
++        other.commit()
+     high = _live_card("p5 new", assignee="default", priority=5)
+     old = _live_card("p0 old", assignee="default", priority=0)
+     new = _live_card("p0 new", assignee="default", priority=0)
+@@ -189,7 +194,8 @@ def test_ready_card_reports_local_queue_position(kanban_home, api, monkeypatch):
+     from hermes_cli import kanban_worker_placement as kwp
+     _set(pool, placement_policy=kwp.POLICY, created_at=10)  # waits for the worker pool, not a local slot
+     q = api.get(f"/api/plugins/kanban/tasks/{new}").json()["queue"]
+-    assert q == {"lane": "local", "ahead": 2, "running": 3, "limit": 6, "approximate": True}
++    assert isinstance(q.pop("observed_at"), int)
++    assert q == {"lane": "local", "ahead": 2, "running": 3, "limit": 6, "approximate": True, "board": "default"}
+     assert api.get(f"/api/plugins/kanban/tasks/{old}").json()["queue"]["ahead"] == 1
+     assert api.get(f"/api/plugins/kanban/tasks/{high}").json()["queue"]["ahead"] == 0
+ 
+diff --git a/tests/tools/test_kanban_show_queue.py b/tests/tools/test_kanban_show_queue.py
+index 4e31788ed9..20a765bc50 100644
+--- a/tests/tools/test_kanban_show_queue.py
++++ b/tests/tools/test_kanban_show_queue.py
+@@ -36,7 +36,12 @@ def home(tmp_path, monkeypatch):
+     kb.init_db()
+     from hermes_cli import kanban_db_dispatch as kbd
+     monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 7)
+-    monkeypatch.setattr(kbd, "count_running_tasks_other_boards", lambda board=None: 7)
++    kb.create_board("other")  # 7 workers on another board, really counted through its file (read-only)
++    with kbc.connect_closing(board="other") as other:
++        for i in range(7):
++            busy = kb.create_task(other, title=f"busy {i}", assignee="default")
++            other.execute("UPDATE tasks SET status='running' WHERE id=?", (busy,))
++        other.commit()
+     yield h
+     kwn.set_registry_fetch(None)
+ 
+@@ -88,14 +93,20 @@ def _rest(tid):
+     return TestClient(app).get(f"/api/plugins/kanban/tasks/{tid}").json()
+ 
+ 
+-LOCAL_BEHIND_ONE = {"lane": "local", "ahead": 1, "running": 7, "limit": 7, "approximate": True}
++LOCAL_BEHIND_ONE = {"lane": "local", "ahead": 1, "running": 7, "limit": 7, "approximate": True, "board": "default"}
++
++
++def _placed(queue):
++    """The queue place without its observation time (it varies by the second)."""
++    assert isinstance(queue.pop("observed_at"), int)
++    return queue
+ 
+ 
+ def test_tool_shows_queue_for_a_fresh_ready_card_at_the_cap(home):
+     _card("p5 ahead", priority=5, created_at=200)
+     tid = _card("p0 mine", priority=0, created_at=100)
+     out = _tool(tid)
+-    assert out.get("queue") == LOCAL_BEHIND_ONE
++    assert _placed(out.get("queue")) == LOCAL_BEHIND_ONE
+     note = out.get("queue_note") or ""
+     assert "1 ahead" in note and "7/7" in note
+     assert "not stuck" in note and "outside the dispatcher" in note
+@@ -105,7 +116,7 @@ def test_cli_json_and_text_show_the_queue(home, capsys):
+     _card("p5 ahead", priority=5, created_at=200)
+     tid = _card("p0 mine", priority=0, created_at=100)
+     rc, out = _cli(capsys, "show", tid, "--json")
+-    assert rc == 0 and json.loads(out).get("queue") == LOCAL_BEHIND_ONE
++    assert rc == 0 and _placed(json.loads(out).get("queue")) == LOCAL_BEHIND_ONE
+     rc, out = _cli(capsys, "show", tid)
+     assert rc == 0
+     line = next((ln for ln in out.splitlines() if ln.strip().startswith("queue:")), "")
+@@ -166,7 +177,12 @@ def test_rest_tool_and_cli_agree_on_queue(home, monkeypatch, capsys, unplaceable
+     rest = _rest(tid).get("queue")
+     tool = _tool(tid).get("queue")
+     rc, out = _cli(capsys, "show", tid, "--json")
+-    assert rc == 0 and rest is not None and rest == tool == json.loads(out).get("queue")
++    assert rc == 0 and rest is not None
++
++    def place(queue):
++        """The place each read reports, without its wall-clock observation second (three reads can straddle one)."""
++        return {k: v for k, v in queue.items() if k != "observed_at"}
++    assert place(rest) == place(tool) == place(json.loads(out).get("queue"))
+ 
+ 
+ def test_dispatcher_records_unplaceable_once(home, monkeypatch):
+-- 
+2.43.0
+

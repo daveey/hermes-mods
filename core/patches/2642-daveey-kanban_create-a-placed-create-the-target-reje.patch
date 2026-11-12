@@ -1,0 +1,121 @@
+From 8d6cc4de1d24234a2ba62bbc6e2457f8ca0ba8c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:09:17 +0000
+Subject: [PATCH] [daveey] kanban_create: a placed create the target rejected
+ reports the refusal, never "IS created"
+
+Review t_01a1cf610e4e2f39 on the previous commit: _place_remote never read a
+terminal rejection. When await_task_id returned (None, None) because the
+request was rejected/expired/failed, the creator chat was still told "The card
+IS created ... Do NOT call kanban_create again" with task_id null. With the
+new origin_idempotency_conflict refusal that turned a visible duplicate into
+silently lost work.
+
+Now a rejected request returns a tool error (created: false) carrying the
+target's code. origin_idempotency_conflict names the card that holds the key
+as existing_task_id (kanban_create's key semantics), with how to read it or
+pick another key; any other refusal says no card was created and why. A still
+pending request keeps the "IS created" note.
+---
+ .../test_kanban_placement_rejected.py         | 35 ++++++++++++++++++-
+ tools/kanban_tools.py                         | 27 ++++++++++++++
+ 2 files changed, 61 insertions(+), 1 deletion(-)
+
+diff --git a/tests/hermes_cli/test_kanban_placement_rejected.py b/tests/hermes_cli/test_kanban_placement_rejected.py
+index c538282de2..e257b64c58 100644
+--- a/tests/hermes_cli/test_kanban_placement_rejected.py
++++ b/tests/hermes_cli/test_kanban_placement_rejected.py
+@@ -13,7 +13,7 @@ import time
+ 
+ import pytest
+ 
+-from tests.hermes_cli.test_kanban_placement import HUB_TID, NEW_HELP, _done_parent, _forwarder, _options
++from tests.hermes_cli.test_kanban_placement import HUB_TID, NEW_HELP, ROUTE, _done_parent, _forwarder, _options
+ 
+ pytest_plugins = ["tests.hermes_cli.test_kanban_placement"]  # its ``mac`` fixture (fake hub + board)
+ 
+@@ -192,3 +192,36 @@ def test_remote_rejection_reads_the_incident_row(mac):
+     _reject(mac, "placement:x:1", error="exit 1")
+     assert kp.remote_rejection("placement:x:1") == {"state": "rejected", "code": None, "matches": [],
+                                                      "total_matches": 0, "error": "exit 1"}
++
++
++@pytest.mark.parametrize("shape", ["idempotency_conflict", "plain"])
++def test_direct_placed_create_reports_a_rejection_never_says_created(mac, monkeypatch, shape):
++    """Review t_01a1cf610e4e2f39: the owner refuses a placed create whose idempotency_key a live card already
++    holds (origin_idempotency_conflict). The creator's kanban_create must surface that refusal, naming the
++    holding card, instead of "The card IS created ... Do NOT call kanban_create again" with task_id null."""
++    from hermes_cli import kanban_placement as kp
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**ROUTE, "wait_seconds": 2})
++    mac["result"]["help"] = NEW_HELP  # a client that carries idempotency_key
++    key = "review:pr1305:848af5adae9e29a2ac677f26c732c996997a26b2"
++    held = "t_01a1cec8510df47f"
++    res = ({"error": f"origin_idempotency_conflict: idempotency_key {key!r} already names card {held} on this board",
++            "code": "origin_idempotency_conflict", "handoff_complete": False, "status": "rejected"}
++           if shape == "idempotency_conflict" else {"error": "no such profile/session here"})
++
++    def reject_on_spawn(argv):
++        rid = mac["calls"][-1][mac["calls"][-1].index("--id") + 1]
++        mac["hub"].execute("UPDATE sent SET state='rejected', result=?, done_at=? WHERE id=?",
++                           (json.dumps(res), time.time(), rid))
++        mac["hub"].commit()
++    monkeypatch.setattr(kp, "hub_spawn", reject_on_spawn)
++    out = json.loads(kt._handle_create({"title": "Review PR 1305", "idempotency_key": key,
++                                        "session_id": "20261027_183000_abc123"}))
++    assert out.get("ok") is not True and "error" in out, out
++    assert "IS created" not in json.dumps(out) and "Do NOT call kanban_create again" not in json.dumps(out)
++    assert out["placed"]["request_id"] and out["placed"]["task_id"] is None and out["created"] is False
++    if shape == "idempotency_conflict":
++        assert out["code"] == "origin_idempotency_conflict" and out["existing_task_id"] == held, out
++        assert held in out["error"]
++    else:
++        assert out["code"] == "placement_rejected" and "no such profile" in out["error"], out
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 0b3171bf2f..7e3d101794 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1437,6 +1437,31 @@ def _handle_attachments(args: dict, **kw) -> str:
+                 _fields(a, _ATTACHMENT_FIELDS) for a in kb.list_attachments(conn, tid)]})
+ 
+ 
++def _placed_rejection(kp, rid: str, target: str, fields: dict) -> Optional[str]:
++    """[daveey] The tool error for a placed create the target refused (terminal), None while it is not refused.
++
++    origin_idempotency_conflict: a live card on the target already holds the creator's idempotency_key. That
++    card is named as ``existing_task_id`` (kanban_create's key semantics: the key's card, not a new one); it
++    was not bound to this chat, so the creator uses it or picks another key."""
++    import re
++    why = kp.remote_rejection(rid)
++    if not why:
++        return None
++    code = why.get("code") or "placement_rejected"
++    error = why.get("error") or f"{target} {why.get('state') or 'rejected'} request {rid}"
++    extra: dict = {"created": False, **fields}
++    if code == "origin_idempotency_conflict" and (m := re.search(r"already names card (t_[A-Za-z0-9_]+)", error)):
++        extra["existing_task_id"] = m.group(1)
++        error = (f"No card was created: {m.group(1)} on {target} already holds this idempotency_key. Use that "
++                 f"card (cross_task @task:default@{target}/{m.group(1)}) or create with a different key. "
++                 f"({error})")
++    else:
++        error = f"No card was created: {target} refused request {rid}: {error}"
++    if why.get("matches"):
++        extra["matches"] = why["matches"]
++    return tool_error(error, code=code, **extra)
++
++
+ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, session_id, conn=None,
+                   note_local_pin: bool = True, origin_profile=None) -> tuple[Optional[str], Optional[dict]]:
+     """[daveey] Create the card on the gateway ``kanban.placement`` routes this one to.
+@@ -1493,6 +1518,8 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+                     f"`hermes-hub tasks --gw {target}`.")
+             return _ok(task_id=tid, status=remote_status or "created", **fields, runs_where=target,
+                        note=note), None
++        if not placed.get("queued_only") and (refused := _placed_rejection(kp, rid, target, fields)):
++            return refused, None  # the target refused it: no card, never "IS created" [daveey]
+         note = (f"{retry}The card IS created: it is queued on {target} as request {rid} and {target} makes the "
+                 f"card from it (it runs there, not here: {decision['why']}). Do NOT call kanban_create again "
+                 "for this card: an identical call returns this same request. Changed calls with an explicit "
+-- 
+2.43.0
+

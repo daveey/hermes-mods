@@ -1,6 +1,6 @@
 # A refusal caused by earlier history compacts once and retries
 
-Patches: **2539, 2540**.
+Patches: **2539, 2540, 2590**.
 
 ## Behavior
 
@@ -21,6 +21,16 @@ A safety-filter refusal on a turn's first model call, before any tool round, can
 ## Tests
 
 Source coverage, **not run in this mirror** (the mirror pass only verifies patch replay and tree equality; it does not rerun these tests): `tests/agent/test_content_policy_history_trigger.py` (step outcomes: retry, summary refused, retry refused without a second compaction, tool-round and first-message paths, system-message pass-through), `test_content_policy_history_trigger_loop.py` (answered after one compaction; a second refusal ends with the new-chat copy after two calls, through `run_conversation`), and `test_content_policy_history_trigger_db.py` (real `SessionDB` and compressor: system prompt kept, one current user row). Covered entry path: the agent conversation loop only; gateway, Desktop and TUI surfaces are untested.
+
+## Follow-up 2590: rotation-mode retry sends the current message once
+
+- **Behavior:** under the legacy `compression.in_place: false` (rotation mode), the history-refusal retry no longer repeats the current message. Before, the child session stored it folded onto itself (`U\n\nU`) and the retry request carried it a third time. Now the child session holds it once and the retry request ends with it exactly once. A refusal handled where no turn identity is available keeps the drop-and-notice path instead of compacting and retrying.
+- **How it works:**
+  - `adopt_grown_durable_parent` (moved from `agent/conversation_compression.py` to the new `agent/conversation_compression_adopt.py`, imported back under its old name `_adopt_grown_durable_parent`) takes the caller's `verbatim_tail`. When the adopted durable parent already ends with the tail's persisted rows (same role and content), it drops them from the adopted end, so the later rejoin of the tail does not fold it onto itself. The same adoption path serves a rotation-mode `/compress here N`; no test drives that command (untested).
+  - `history_refusal_step` (`agent/turn_refusal_history.py`) ends the retry request via the new `_with_current_once`: it pops trailing user rows whose content only repeats the current text (including a folded copy), then appends the current message unless the last row already is it.
+  - The one-retry cap is now keyed on `turn_id`, falling back to the agent's `_current_turn_id`. With neither, `history_refusal_step` returns None (drop-and-notice), because the cap could not tell a refused retry from a new turn and would compact and retry forever.
+- **Code:** `agent/conversation_compression.py`, `agent/conversation_compression_adopt.py` (new), `agent/turn_refusal_history.py`.
+- **Tests:** source coverage, **not run in this mirror**: `tests/agent/test_content_policy_history_trigger.py` (folded-head and no-turn-id unit cases) and `test_content_policy_history_trigger_db.py` (rotation-mode variant with a real `SessionDB`: the request's last user content equals the current message once, and the child session rows hold it once). Entry path: the agent conversation loop only, as for the earlier entries.
 
 ## Applying
 

@@ -1,0 +1,321 @@
+From 0a71734110a67464ca33643baf3fb801772ea585 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:16:19 +0000
+Subject: [PATCH] [daveey] preflight hub placement through evidenced admission
+
+---
+ hermes_cli/kanban_hub_admission_placement.py |  61 +++++++++++
+ hermes_cli/kanban_placement.py               |  34 +++++-
+ hermes_cli/kanban_placement_coordination.py  |   2 +-
+ hermes_cli/kanban_placement_diagnostics.py   |  19 +---
+ tests/test_kanban_hub_admission_placement.py | 109 +++++++++++++++++++
+ tools/kanban_tools_placement.py              |   4 +
+ 6 files changed, 209 insertions(+), 20 deletions(-)
+ create mode 100644 hermes_cli/kanban_hub_admission_placement.py
+ create mode 100644 tests/test_kanban_hub_admission_placement.py
+
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+new file mode 100644
+index 0000000000..610452f30c
+--- /dev/null
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -0,0 +1,61 @@
++"""Apply hub admission to an otherwise valid placement decision, before persistence."""
++from __future__ import annotations
++
++import os
++from dataclasses import asdict
++
++from hermes_cli import kanban_hub_admission as judge
++
++
++def is_hub(name, cfg):
++    from hermes_cli.kanban_placement import canonical_pin
++    return canonical_pin(name, "hub", cfg) in ("hub", "hermes-hub")
++
++
++def apply(args, decision, gateway, cfg):
++    """Keep structural/non-hub outcomes unchanged; denied explicit hub pins refuse.
++
++    Returned requires are effective persistence inputs, not just creation-time checks.
++    A worker policy cannot coexist with runs_on, so hub access travels in requires.
++    """
++    from hermes_cli.kanban_placement import structural_reason
++    from hermes_cli.kanban_worker_placement import POLICY, WAITING
++
++    if decision.get("where") == "refuse" or structural_reason({**args, "runs_on": None}, cfg):
++        return decision
++    labels = args.get("runs_on")
++    machines = [v[8:] for v in labels or [] if isinstance(v, str) and v.startswith("machine:")]
++    machine_hub = any(is_hub(v, cfg) for v in machines)
++    destination = decision.get("defer") or decision.get("where")
++    local_hub = destination == "local" and is_hub(gateway, cfg)
++    if not machine_hub:
++        if machines or decision.get("runs_on") or decision.get("placement_policy"):
++            return decision
++        if not local_hub and not is_hub(destination, cfg):
++            return decision
++    pin = args.get("placement") or "auto"
++    explicit = machine_hub or is_hub(pin, cfg)
++    if args.get("force_hub"):
++        if os.environ.get("HERMES_KANBAN_TASK") or os.environ.get("HERMES_KANBAN_WORKER_TASK"):
++            return {"where": "refuse", "why": "force_hub is unavailable to dispatcher workers"}
++        verdict = judge.Verdict(admit=True, why="operator override", forced=True)
++    else:
++        try:
++            verdict = judge.admit(args, hub_reason=args.get("hub_reason"))
++        except Exception:  # health: allow BLE001 -- never let caller fallback admit a failed judge
++            verdict = judge.Verdict()
++    audit = asdict(verdict)
++    if verdict.forced:
++        audit["session"] = os.environ.get("HERMES_SESSION_ID", "")
++    if verdict.admit:
++        return {**decision, "hub_admission": audit}
++    if explicit:
++        return {"where": "refuse", "why": verdict.why, "hub_admission": audit, "pin": "hub"}
++    pools = cfg.get("worker_pools") or {}
++    if not pools.get(gateway):
++        return {"where": "refuse", "why": "hub admission denied; no worker pool configured",
++                "hub_admission": audit}
++    requires = args.get("requires") or []
++    requires = [requires] if isinstance(requires, str) else list(requires)
++    return {"where": "local", "placement_policy": POLICY, "why": WAITING,
++            "requires": list(dict.fromkeys([*requires, "hub:write"])), "hub_admission": audit}
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index e50dc599c4..6e7b9e8aa7 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -473,8 +473,36 @@ def without_evidence(body: str) -> str:
+     return _EVIDENCE.sub("", body or "")
+ 
+ 
++def structural_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
++    """Non-textual restrictions that admission cannot override."""
++    c = _Cfg(config() if cfg is None else cfg)
++    if args.get("needs"):
++        return "gateway-scoped need"
++    if (args.get("workspace_kind") or "scratch") != "scratch":
++        return "host workspace"
++    board = args.get("board")
++    if board and board != "default":
++        return "non-default board"
++    if (args.get("assignee") or "default") not in c.assignees():
++        return "assignee not allowlisted"
++    # Explicit tool defaults are equivalent to omission, as on the CLI path.
++    # A blocked initial status still needs origin-side human-request handling.
++    if any(args.get(k) not in (None, "", [], False)
++           for k in UNCARRIED_OPTIONS if not (k == "initial_status" and args.get(k) == "running")):
++        return "uncarried option"
++    reqs = args.get("requires") or []
++    reqs = [reqs] if isinstance(reqs, str) else list(reqs)
++    from hermes_cli import kanban_placement_coordination as coordination
++    ordinary = [r for r in reqs if r not in coordination.ACCESS_LABELS]
++    if any(reg.is_gateway_need(r) for r in ordinary):
++        return "gateway-scoped requirement"
++    if any(str(r) not in c.carried_requires() for r in ordinary):
++        return "uncarried requirement"
++    return None
++
++
+ def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+-    """Why a card cannot leave its origin; None means structurally portable, not admitted.
++    """Legacy portability scan; hub text matches request admission, not permission to stay.
+ 
+     Keep the conservative legacy routeless-heavy boundary, excluding only its heavy-marker
+     requirement. Worker profile/tool/skill attestations and capacity are Board admission checks.
+@@ -673,7 +701,7 @@ def canonical_pin(pin, self_gw: Optional[str] = None, cfg: Optional[dict] = None
+             hit = {str(k).strip().lower(): str(v).strip().lower() for k, v in aliases.items()}.get(p)
+             if hit:
+                 return hit
+-        known = {str(self_gw or "").strip().lower()}
++        known = {"hub", str(self_gw or "").strip().lower()}
+         route = raw.get("route")
+         if isinstance(route, dict):
+             known |= {str(k).strip().lower() for k in route} | {str(v).strip().lower() for v in route.values()}
+@@ -726,6 +754,8 @@ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+         known = sg.strip().lower() if isinstance(sg, str) else ""
+         out = _decide(args, origin_intent=origin_intent, now=now, cfg=cfg, self_gw=sg, live=live,
+                       locate=locate, carries=carries, machine_ok=machine_ok, info=info)
++        from hermes_cli.kanban_hub_admission_placement import apply
++        out = apply(args, out, sg, config() if cfg is None else cfg)
+         pin = explicit_foreign_pin(args, sg, cfg)
+         if pin and origin_intent is None and out.get("where") == "local" and not out.get("defer"):
+             return {"where": "refuse", "why": out.get("why", ""), "pin": pin}
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index aabd98d6f8..159826a66a 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -62,7 +62,7 @@ _TOOLS = {
+ # Explicit task contracts, not authority inferred from prose. These declarations
+ # describe existing restricted access; they never install credentials or grant writes.
+ ACCESS_LABELS = {"ssh:mbp": "capability:ssh-mbp", "ssh:mini": "capability:ssh-mini",
+-                 "hub:read": "capability:hub-read"}
++                 "hub:read": "capability:hub-read", "hub:write": "capability:hub-write"}
+ _ACCESS = (
+     (re.compile(r"\bssh\b", re.IGNORECASE), {"ssh:mbp", "ssh:mini"}),
+     (re.compile(r"\bon the hub\b|\bthe hub's\b|\bjournalctl\b|\bkanban\.db\b", re.IGNORECASE),
+diff --git a/hermes_cli/kanban_placement_diagnostics.py b/hermes_cli/kanban_placement_diagnostics.py
+index 04323dc427..e01c354cb1 100644
+--- a/hermes_cli/kanban_placement_diagnostics.py
++++ b/hermes_cli/kanban_placement_diagnostics.py
+@@ -16,25 +16,10 @@ def portability(args: dict, cfg=None) -> tuple[str | None, str | None]:
+     from hermes_cli.kanban_published_worktree import without_published_worktrees
+ 
+     c = p._Cfg(p.config() if cfg is None else cfg)
+-    if args.get("needs"):
+-        return "gateway-scoped need", None
+-    if (args.get("workspace_kind") or "scratch") != "scratch":
+-        return "host workspace", None
+-    board = args.get("board")
+-    if board and board != "default":
+-        return "non-default board", None
+-    if (args.get("assignee") or "default") not in c.assignees():
+-        return "assignee not allowlisted", None
+-    if any(args.get(k) not in (None, "", [], False)
+-           for k in p.UNCARRIED_OPTIONS if not (k == "initial_status" and args.get(k) == "running")):
+-        return "uncarried option", None
++    if reason := p.structural_reason(args, c.raw):
++        return reason, None
+     reqs = args.get("requires") or []
+     reqs = [reqs] if isinstance(reqs, str) else list(reqs)
+-    ordinary = [r for r in reqs if r not in coordination.ACCESS_LABELS]
+-    if any(p.reg.is_gateway_need(r) for r in ordinary):
+-        return "gateway-scoped requirement", None
+-    if any(str(r) not in c.carried_requires() for r in ordinary):
+-        return "uncarried requirement", None
+     title = args.get("title") or ""
+     body = p.without_evidence(p.without_placement_note(args.get("body") or ""))
+     if hit := p._local_marker(title, body, args.get("skills"), c):
+diff --git a/tests/test_kanban_hub_admission_placement.py b/tests/test_kanban_hub_admission_placement.py
+new file mode 100644
+index 0000000000..b3a4ebdd76
+--- /dev/null
++++ b/tests/test_kanban_hub_admission_placement.py
+@@ -0,0 +1,109 @@
++"""Hub candidate admission never changes non-hub or structural decisions."""
++import pytest
++
++from hermes_cli import kanban_hub_admission as judge
++from hermes_cli import kanban_placement as placement
++
++
++@pytest.fixture
++def gate(monkeypatch):
++    calls = []
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
++    def fake(fields, *, hub_reason=None):
++        calls.append((fields, hub_reason))
++        return judge.Verdict(admit=fields.get("title") == "Chrome", need="hub_chrome",
++                             evidence="Chrome", why="test verdict")
++    monkeypatch.setattr(judge, "admit", fake)
++    return calls
++
++
++def decide(fields, gateway="hub"):
++    return placement.decide(fields, self_gw=gateway,
++                            cfg={"worker_pools": {"hub": ["worker-1"]}},
++                            live=lambda _: None, carries=True)
++
++
++@pytest.mark.parametrize("pin", ["auto", "local"])
++@pytest.mark.parametrize("title,admitted", [("Chrome", True), ("Read ~/.hermes/logs on the hub", False)])
++def test_hub_auto_candidate(gate, title, admitted, pin):
++    result = decide({"title": title, "placement": pin})
++    assert result["hub_admission"]["admit"] is admitted
++    assert result.get("placement_policy") == (None if admitted else "worker-first-v1")
++    if not admitted:
++        assert "hub:write" in result["requires"]
++    assert len(gate) == 1
++
++
++@pytest.mark.parametrize("pin", ["hub", "hermes-hub"])
++@pytest.mark.parametrize("title,where", [("Chrome", "hub"), ("Read logs", "refuse")])
++def test_explicit_foreign_hub(gate, pin, title, where):
++    assert decide({"title": title, "placement": pin}, "mac")["where"] == where
++    assert len(gate) == 1
++
++
++@pytest.mark.parametrize("fields", [{"workspace_kind": "dir"}, {"board": "other"},
++                                     {"requires": ["host_repo"]}, {"needs": ["ssh:somewhere"]},
++                                     {"assignee": "other"}])
++def test_structural_zero_calls(gate, fields):
++    decide({"title": "Read ~/.hermes/logs on the hub", **fields})
++    assert gate == []
++
++
++@pytest.mark.parametrize("fields,gateway", [({"placement": "local"}, "mac"),
++    ({"runs_on": ["machine:worker-1"]}, "hub"), ({"title": "code"}, "mac")])
++def test_nonhub_zero_calls(gate, fields, gateway):
++    decide(fields, gateway)
++    assert gate == []
++
++
++def test_force_operator_audit(gate, monkeypatch):
++    monkeypatch.setenv("HERMES_SESSION_ID", "operator-session")
++    result = decide({"title": "Read logs", "placement": "hub", "force_hub": True})
++    assert result["hub_admission"]["forced"] is True
++    assert result["hub_admission"]["session"] == "operator-session"
++    assert gate == []
++
++
++@pytest.mark.parametrize("variable", ["HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK"])
++def test_force_worker_refused(gate, monkeypatch, variable):
++    monkeypatch.setenv(variable, "t_worker")
++    result = decide({"placement": "hub", "force_hub": True})
++    assert result["where"] == "refuse"
++    assert gate == []
++
++
++def test_machine_hub_pin_denied(gate):
++    result = decide({"title": "Read logs", "runs_on": ["machine:hub"]})
++    assert result["where"] == "refuse"
++    assert len(gate) == 1
++
++
++def test_machine_hub_pin_admitted(gate):
++    result = decide({"title": "Chrome", "runs_on": ["machine:hub"]})
++    assert result["where"] == "local"
++    assert result["hub_admission"]["admit"] is True
++
++
++def test_judge_exception_cannot_fall_back_to_hub(gate, monkeypatch):
++    def broken(*args, **kwargs):
++        raise RuntimeError("judge unavailable")
++    monkeypatch.setattr(judge, "admit", broken)
++    result = decide({"placement": "hub"})
++    assert result["where"] == "refuse"
++    assert result["hub_admission"]["why"] == "admission unavailable"
++
++
++def test_denied_without_pool_refuses(gate):
++    result = placement.decide({"title": "Read logs"}, self_gw="hub", cfg={})
++    assert result["where"] == "refuse"
++    assert result["hub_admission"]["admit"] is False
++
++
++def test_tool_keeps_verdict_and_effective_contract(gate):
++    from tools.kanban_tools_placement import _local_placement
++    fields = {"title": "Read logs", "placement": "local"}
++    decision = decide(fields)
++    result = _local_placement(placement, fields, decision, machine_ok=None, note_local_pin=True)
++    assert result == decision
++    assert len(gate) == 1
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index 3008fcaaed..5cb88229eb 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -95,6 +95,10 @@ def _local_placement(kp, view: dict, decision: dict, *, machine_ok, note_local_p
+     elsewhere without the pin also gets a ``note`` naming that target (the card is still created here).
+     """
+     why = decision.get("why") or ""
++    if decision.get("hub_admission"):
++        # Admission already resolved the execution target; advisory re-deciding
++        # would make another model call and could discard the effective contract.
++        return dict(decision)
+     if decision.get("placement_policy"):
+         return {"where": "local", "placement_policy": decision["placement_policy"], "why": why}
+     if decision.get("defer"):
+-- 
+2.43.0
+

@@ -1,0 +1,890 @@
+From 5e1005946a5f83d51adb5e852cf85bb86565d18d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:16:39 -0800
+Subject: [PATCH] [daveey] Kanban wakes queued behind a busy turn fold into one
+ turn built from live card state
+
+---
+ gateway/kanban_tui_owner.py            |   5 +-
+ gateway/kanban_wake_fold.py            | 194 +++++++++++++++++++
+ gateway/kanban_watchers_notifier.py    |   7 +-
+ gateway/session_automation.py          |  37 +++-
+ gateway/wake.py                        |   9 +-
+ locales/af.yaml                        |   2 +
+ locales/ar.yaml                        |   2 +
+ locales/de.yaml                        |   2 +
+ locales/en.yaml                        |   2 +
+ locales/es.yaml                        |   2 +
+ locales/fr.yaml                        |   2 +
+ locales/ga.yaml                        |   2 +
+ locales/hu.yaml                        |   2 +
+ locales/it.yaml                        |   2 +
+ locales/ja.yaml                        |   2 +
+ locales/ko.yaml                        |   2 +
+ locales/pt.yaml                        |   2 +
+ locales/ru.yaml                        |   2 +
+ locales/tr.yaml                        |   2 +
+ locales/uk.yaml                        |   2 +
+ locales/zh-hant.yaml                   |   2 +
+ locales/zh.yaml                        |   2 +
+ tests/gateway/test_kanban_wake_fold.py | 246 +++++++++++++++++++++++++
+ tests/hermes_cli/test_kanban_notify.py |   6 +
+ 24 files changed, 530 insertions(+), 8 deletions(-)
+ create mode 100644 gateway/kanban_wake_fold.py
+ create mode 100644 tests/gateway/test_kanban_wake_fold.py
+
+diff --git a/gateway/kanban_tui_owner.py b/gateway/kanban_tui_owner.py
+index 9fab8fa211..d5a433d73a 100644
+--- a/gateway/kanban_tui_owner.py
++++ b/gateway/kanban_tui_owner.py
+@@ -185,7 +185,10 @@ async def deliver(notification: Any) -> None:
+         return
+     from gateway.session_automation import admit_route_wake
+     from hermes_state_runtime import RuntimeStoreError
+-    metadata = {"notification_category": "diagnostic"} if diagnostic else {}
++    metadata: dict[str, Any] = {"notification_category": "diagnostic"} if diagnostic else {}
++    # What a later wake for this chat folds from while this one still waits (kanban_wake_fold).
++    metadata["kanban_cards"] = [{"task_id": notification.task_id, "board": notification.board_slug or "",
++                                 "kinds": sorted({ev.kind for ev in d["events"]}), "text": "\n".join(texts)}]
+     try:
+         admitted = await admit_route_wake(runner, adapter, live.source, "\n".join(texts), "kanban-wake", metadata)
+     except Exception as exc:  # health: allow BLE001 -- delivery boundary: any admission failure rewinds the claim (logged with traceback) so no notice is lost
+diff --git a/gateway/kanban_wake_fold.py b/gateway/kanban_wake_fold.py
+new file mode 100644
+index 0000000000..f764b69f04
+--- /dev/null
++++ b/gateway/kanban_wake_fold.py
+@@ -0,0 +1,194 @@
++"""Kanban wakes that pile up behind a busy turn run as ONE turn, built from live card state. [daveey]
++
++Each Kanban wake (producer ``kanban-wake``) used to commit its own FIFO row, so a chat whose turns
++take 30-80 min fell further behind with every card event: on 2026-11-11 chat
++20261026_170127_f07c32 was 19 wakes (3.5 h) behind, and each wake that finally ran told it about a
++card "ready with no worker" that had been done for hours (t_01a1cec8510df47f).
++
++A wake admitted while another Kanban wake for the same route is still the session's LAST queued
++input joins that row instead, like process completions (``session_automation._admit_folded_completion``):
++the waiting row is cancelled in the new admission's own transaction (``_fold_queued``), so a prompt
++admitted after it, or a claim that started it first, keeps the two apart. The batch is rebuilt from
++the cards each row carries (``kanban_cards``): several events for one card collapse to the latest,
++and a card whose premise no longer holds (an unclaimed wait now claimed or done, a block now
++resolved) is relabelled with its live status. Every card keeps its ``[kanban] Task <id> <kind>.``
++line, which the follow-through and ask-gate plugins match.
++"""
++from __future__ import annotations
++
++import contextlib
++import json
++import logging
++import re
++
++from hermes_state_runtime import RuntimeStoreError, list_session_admissions
++
++logger = logging.getLogger(__name__)
++
++PRODUCER = 'kanban-wake'
++_CARD_KEYS = frozenset({'task_id', 'board', 'kinds', 'text'})
++_MAX_CARDS = 200
++_MAX_CARD_TEXT = 32000
++
++_FOLD_HEADER = ('[IMPORTANT: {count} Kanban task updates arrived while this session was busy. Each card '
++                'below shows its state when this batch was built; an earlier premise that no longer holds '
++                'is relabelled. Treat them as one batch and give one consolidated response.]')
++
++# The live statuses under which a wake's premise still holds. A kind absent here reports an outcome
++# (completed, review_requested, ...) and is never relabelled.
++_PREMISE_HOLDS = {
++    'chat_wait_unclaimed': frozenset({'triage', 'todo', 'ready'}),
++    'blocked': frozenset({'blocked', 'triage'}),
++    'block_loop_detected': frozenset({'blocked', 'triage'}),
++    'crashed': frozenset({'triage', 'todo', 'ready', 'running', 'blocked', 'review', 'scheduled'}),
++    'timed_out': frozenset({'triage', 'todo', 'ready', 'running', 'blocked', 'review', 'scheduled'}),
++}
++_STATUS_LABELS = {
++    'done': 'completed', 'archived': 'archived', 'running': 'claimed by a worker (running)',
++    'ready': 'ready', 'todo': 'todo', 'triage': 'in triage', 'scheduled': 'scheduled',
++    'blocked': 'blocked; needs attention', 'review': 'in review',
++}
++_LEGACY_HEAD = re.compile(r'^\[kanban\] Task (\S+) ')
++_LEGACY_BOARD = re.compile(r'^Board: (\S+)$', re.MULTILINE)
++
++
++def card_metadata(metadata):
++    """Validate a wake's ``kanban_cards`` (what a later wake folds from) for the stored descriptor."""
++    cards = metadata.get('kanban_cards')
++    if cards is None:
++        return {}
++    if not isinstance(cards, list) or not cards or len(cards) > _MAX_CARDS:
++        raise RuntimeStoreError('invalid_params')
++    for card in cards:
++        if (not isinstance(card, dict) or set(card) - _CARD_KEYS or not isinstance(card.get('text'), str)
++                or len(card['text']) > _MAX_CARD_TEXT
++                or not all(isinstance(card.get(key, ''), str) for key in ('task_id', 'board'))
++                or not isinstance(card.get('kinds', []), list)
++                or not all(isinstance(kind, str) for kind in card.get('kinds', []))):
++            raise RuntimeStoreError('invalid_params')
++    return {'kanban_cards': [dict(card) for card in cards]}
++
++
++def wake_lock(runner):
++    """Serialises the read-tail-then-fold of Kanban wakes in this process: two wakes folding into the
++    same tail would otherwise both read it, and the second (refused by the write guard) queue alone."""
++    import asyncio
++    lock = runner.__dict__.get('_kanban_wake_lock')
++    if lock is None:
++        lock = runner.__dict__['_kanban_wake_lock'] = asyncio.Lock()
++    return lock
++
++
++def _descriptor(payload):
++    return payload.get('local_automation_v1') or (payload.get('native_text_v1') or {}).get('automation') or {}
++
++
++def _producer(request_id):
++    try:
++        identity = json.loads(request_id)
++    except (TypeError, ValueError):
++        return None
++    return identity[0] if isinstance(identity, list) and identity else None
++
++
++def waiting_wake(authority, owner, route):
++    """The route's own Kanban wake row that is the LAST queued input of session ``owner``, or None.
++    Only the tail folds (the rule of ``_waiting_completion``): a wake never jumps ahead of, or
++    folds across, a prompt or any other input queued after it."""
++    queued = [row for row in list_session_admissions(authority.db, session_id=owner) if row['status'] == 'queued']
++    tail = queued[-1] if queued else None
++    if tail is None or tail['principal_id'] != 'automation:' + route or _producer(tail['request_id']) != PRODUCER:
++        return None
++    if _descriptor(tail['payload']).get('display_kind'):
++        return None
++    return tail
++
++
++def _legacy_cards(text):
++    """A row queued before cards were stored: one card parsed from its text (opaque when unparsable)."""
++    head = _LEGACY_HEAD.match(text)
++    board = _LEGACY_BOARD.search(text)
++    return [{'task_id': head.group(1) if head else '', 'board': board.group(1) if board else '',
++             'kinds': [], 'text': text.rstrip()}]
++
++
++def _merge(old_cards, new_cards):
++    """Cards in first-seen order; a later event for the same card replaces the earlier one."""
++    merged, order = {}, []
++    for index, card in enumerate([*old_cards, *new_cards]):
++        key = card.get('task_id') or f'#opaque-{index}'
++        if key not in merged:
++            order.append(key)
++        merged[key] = dict(card)
++    return [merged[key] for key in order]
++
++
++def _live_task(card):
++    """``(status, latest handoff summary)`` of the card on its board, or ``(None, '')``."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with contextlib.closing(kbc.connect(board=card.get('board') or None)) as conn:
++        task = kb.get_task(conn, card['task_id'])
++        if task is None:
++            return None, ''
++        summary = (kb.latest_summary(conn, card['task_id']) or task.result or '') if task.status == 'done' else ''
++        return task.status, summary.strip()
++
++
++def refresh_card(card):
++    """``card`` with its live status applied: a wake whose premise no longer holds (an unclaimed wait
++    since claimed or done, a block since resolved) is relabelled with the card's current status. An
++    unreadable board leaves the card as delivered."""
++    kinds = card.get('kinds') or []
++    premises = [kind for kind in kinds if kind in _PREMISE_HOLDS]
++    if not card.get('task_id') or not premises:
++        return card
++    try:
++        status, result = _live_task(card)
++    except Exception:  # health: allow BLE001 -- a live read is best effort: the wake still goes in as delivered
++        logger.debug('kanban wake fold: live state of %s unreadable', card['task_id'], exc_info=True)
++        return card
++    if status is None:
++        return card
++    if all(status in _PREMISE_HOLDS[kind] for kind in premises):
++        return card
++    if status == 'done' and 'completed' in kinds:
++        return card
++    lines = card['text'].split('\n')
++    head = lines[0]
++    earlier = head.removeprefix(f"[kanban] Task {card['task_id']} ").rstrip('.') or ', '.join(premises)
++    label = _STATUS_LABELS.get(status, status)
++    out = [f"[kanban] Task {card['task_id']} {label}.",
++           f'Note: an earlier wake for this card said "{earlier}"; that no longer holds. Live status: {status}.']
++    rest = lines[1:] if _LEGACY_HEAD.match(head) else lines
++    out.extend(rest)
++    if status == 'done' and result and not any(line.startswith('Result:') for line in rest):
++        out.insert(2, 'Result: ' + result.splitlines()[0][:400])
++    return {**card, 'kinds': [{'done': 'completed'}.get(status, status)], 'text': '\n'.join(out).rstrip()}
++
++
++def fold_into(event, waiting, identity):
++    """Rewrite ``event`` (the new wake) as the batch of ``waiting``'s cards and its own, live-refreshed.
++    Blocking: it reads the Kanban board, so callers run it off the event loop."""
++    new_cards = event.metadata.get('kanban_cards') or []
++    new_body = '\n\n'.join(card['text'] for card in new_cards)
++    guidance = event.text[len(new_body):].strip() if new_body and event.text.startswith(new_body) else ''
++    descriptor = _descriptor(waiting['payload'])
++    old_cards = descriptor.get('kanban_cards') or _legacy_cards(str(waiting['payload'].get('text') or ''))
++    if not descriptor.get('kanban_cards') and guidance and old_cards[0]['text'].endswith(guidance):
++        old_cards[0]['text'] = old_cards[0]['text'][:-len(guidance)].rstrip()
++    # The stored cards stay as delivered; the live relabel is redone each time the batch is rebuilt.
++    cards = _merge(old_cards, new_cards)
++    parts = [refresh_card(card)['text'] for card in cards]
++    if len(cards) > 1:
++        parts.insert(0, _FOLD_HEADER.format(count=len(cards)))
++    if guidance:
++        parts.append(guidance)
++    event.text = '\n\n'.join(parts)
++    event.metadata['kanban_cards'] = cards
++    event.metadata['automation_identities'] = sorted({
++        *(descriptor.get('identities') or [waiting['request_id']]),
++        *(event.metadata.get('automation_identities') or [identity])})
++    # The batch mutes only when every wake in it did.
++    if descriptor.get('notification_category', 'result') == 'result':
++        event.metadata.pop('notification_category', None)
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index f1deb65874..adbd2be1db 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -605,6 +605,7 @@ class _KanbanNotification:
+         self.adapter: Any = None
+         self.is_push_adapter = True
+         self.wake_kinds: set = set()
++        self.wake_card: Optional[dict] = None
+ 
+     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
+ 
+@@ -695,6 +696,9 @@ class _KanbanNotification:
+         if self.wake_review_detail:
+             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
+         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
++        # What a later wake for the same chat folds from while this one still waits (kanban_wake_fold).
++        self.wake_card = {"task_id": sub["task_id"], "board": self.board_slug or "",
++                          "kinds": [k for k in _WAKE_KINDS if k in self.wake_kinds], "text": synth}
+ 
+     def _log_woke(self) -> None:
+         logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
+@@ -764,7 +768,8 @@ class _KanbanNotification:
+                 raise RuntimeError(f"Kanban wake profile {self.sub_profile!r} no longer exists")
+         async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
+             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source,
+-                               notification_category="diagnostic" if self.wake_diagnostic else "result")
++                               notification_category="diagnostic" if self.wake_diagnostic else "result",
++                               kanban_card=self.wake_card)
+         self._log_woke()
+ 
+     async def _send_event(self, ev: Any, msg: str) -> bool:
+diff --git a/gateway/session_automation.py b/gateway/session_automation.py
+index e12148875b..d26647257b 100644
+--- a/gateway/session_automation.py
++++ b/gateway/session_automation.py
+@@ -257,6 +257,7 @@ def _fold_queued(admission_id, session_id, replaced, skip=()):
+         payload = json.loads(row[1])
+         payload['text'] = _FOLDED_TEXT
+         _descriptor(payload).pop('identities', None)
++        _descriptor(payload).pop('kanban_cards', None)
+         conn.execute('UPDATE session_admissions SET payload_json=? WHERE admission_id=?',
+                      (json.dumps(payload, separators=(',', ':'), ensure_ascii=False), admission_id))
+     return guard
+@@ -429,7 +430,7 @@ def automation_display_metadata(metadata):
+ _AUTOMATION_METADATA = frozenset({'gateway_session_key', 'gateway_session_id', 'automation_identities',
+     'turn_author', 'notification_origin', 'original_trigger_message_id', 'notification_category',
+     'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick',
+-    'completion_wakes_parent'})
++    'completion_wakes_parent', 'kanban_cards'})
+ 
+ 
+ def admission_display(payload):
+@@ -466,8 +467,9 @@ def snapshot_automation(authority, adapter, event, identity):
+             or event.media_urls or event.prompt_response or event.source.platform == Platform.API_SERVER
+             or set(event.metadata) - _AUTOMATION_METADATA):
+         raise RuntimeStoreError('invalid_params')
++    from gateway.kanban_wake_fold import card_metadata
+     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
+-                    | _tick_metadata(event.metadata))
++                    | _tick_metadata(event.metadata) | card_metadata(event.metadata))
+     entry = _owner(runner, event, authority)
+     from gateway.session_detached import detached_route_of
+     if event.source.platform == Platform.LOCAL or detached_route_of(event.source):
+@@ -554,6 +556,8 @@ def snapshot_local_automation(authority, adapter, event, identity, entry):
+     descriptor.update(automation_notification_metadata(event.metadata))
+     descriptor.update(automation_display_metadata(event.metadata))
+     descriptor.update(_tick_metadata(event.metadata))
++    from gateway.kanban_wake_fold import card_metadata
++    descriptor.update(card_metadata(event.metadata))
+     if 'completion_wakes_parent' in event.metadata:
+         # A failed async delegation: the parent must act on it, so it runs as a turn even when no viewer
+         # is attached (gateway/session_completion_notes.py). Only ``True`` is stored, so an older
+@@ -880,7 +884,7 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
+                              message_id=identity, metadata={'gateway_session_key': key,
+                                                             'gateway_session_id': entry.session_id,
+                                                             **(metadata or {})})
+-        await authority.admit_automation(adapter, event, identity)
++        await _admit_route_wake_event(runner, authority, adapter, event, identity, entry, producer)
+         return True
+     from gateway.session_envelope import restore_native
+     envelope = committed_route_envelope(authority, entry)
+@@ -893,5 +897,30 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
+                          message_id=identity, metadata={'gateway_session_key': key,
+                                                         'gateway_session_id': entry.session_id,
+                                                         **(metadata or {})})
+-    await authority.admit_automation(adapter, event, identity)
++    await _admit_route_wake_event(runner, authority, adapter, event, identity, entry, producer)
+     return True
++
++
++async def _admit_route_wake_event(runner, authority, adapter, event, identity, entry, producer):
++    """A Kanban wake carrying its cards folds into a Kanban wake still waiting at the FIFO tail
++    (``gateway.kanban_wake_fold``), so a busy chat runs ONE turn for every card event that piled up.
++    The waiting row is cancelled in this admission's own transaction (``_fold_queued``); when it was
++    claimed first, or a prompt landed behind it meanwhile, this wake queues alone."""
++    from gateway import kanban_wake_fold
++    if producer != kanban_wake_fold.PRODUCER or not event.metadata.get('kanban_cards'):
++        return await authority.admit_automation(adapter, event, identity)
++    import asyncio
++    async with kanban_wake_fold.wake_lock(runner):
++        waiting = await asyncio.to_thread(
++            kanban_wake_fold.waiting_wake, authority, _route_owner(authority, entry), entry.session_key)
++        if waiting is not None:
++            unfolded = event.text, dict(event.metadata)
++            await asyncio.to_thread(kanban_wake_fold.fold_into, event, waiting, identity)
++            try:
++                return await authority.admit_automation(adapter, event, identity,
++                                                        replaces=waiting['admission_id'], fold=())
++            except RuntimeStoreError as exc:
++                if exc.reason != 'stale_generation':
++                    raise
++                event.text, event.metadata = unfolded
++        return await authority.admit_automation(adapter, event, identity)
+diff --git a/gateway/wake.py b/gateway/wake.py
+index fb78998e91..d700844d07 100644
+--- a/gateway/wake.py
++++ b/gateway/wake.py
+@@ -125,12 +125,15 @@ def _runner_draining(adapter: Any) -> bool:
+ 
+ 
+ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
+-                       notification_category: str = "result", profile: Optional[str] = None) -> None:
++                       notification_category: str = "result", profile: Optional[str] = None,
++                       kanban_card: Optional[dict] = None) -> None:
+     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
+     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
+     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
+     names the served profile that canonically owns a non-push destination; a non-default value is
+     delivered in-process under the caller's profile scope (see ``_self_post_chat_completion``).
++    ``kanban_card`` (``{task_id, board, kinds, text}``) rides a FIFO wake so a later wake for the same
++    route folds into it while it waits (``gateway.kanban_wake_fold``).
+     Raises on failure so the caller can rewind/retry."""
+     if adapter_supports_push(adapter):
+         if source is None:
+@@ -140,7 +143,9 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
+         if runner is not None:
+             from gateway.session_automation import admit_route_wake
+             from hermes_state_runtime import RuntimeStoreError
+-            category = {"notification_category": notification_category} if notification_category != "result" else {}
++            category: dict[str, Any] = {"notification_category": notification_category} if notification_category != "result" else {}
++            if kanban_card:
++                category["kanban_cards"] = [{**kanban_card, "text": str(kanban_card.get("text") or "")[:32000]}]
+             try:
+                 if await admit_route_wake(runner, adapter, source, text, "kanban-wake", category):
+                     return  # committed to the session FIFO: never interrupts the admitted turn
+diff --git a/locales/af.yaml b/locales/af.yaml
+index 13f41b7bfe..f22dcf3012 100644
+--- a/locales/af.yaml
++++ b/locales/af.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/ar.yaml b/locales/ar.yaml
+index bc58342ad0..f1b20c12ab 100644
+--- a/locales/ar.yaml
++++ b/locales/ar.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "أُحيلت للمراجعة؛ اكتمل التنفيذ"
+       changes_requested: "طلبت المراجعة تغييرات (BLOCK)؛ التنفيذ غير معتمد"
+       block_loop_detected: "أُحيلت إلى الفرز بعد تكرار الحجب؛ تحتاج إلى اهتمام بالتنسيق"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "تغيّرت الحالة"
+       status_joiner: "، "
+       message: "[kanban] المهمة {task_id} {status}.\nالعنوان: {title}\nالمُكلَّف: @{assignee}\nاللوحة: {board}\n\nراجع النتيجة أو قرّر الخطوة التالية."
+diff --git a/locales/de.yaml b/locales/de.yaml
+index 40c6820942..59735d2f7a 100644
+--- a/locales/de.yaml
++++ b/locales/de.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/en.yaml b/locales/en.yaml
+index 0e3adfde3d..43ecb2d458 100644
+--- a/locales/en.yaml
++++ b/locales/en.yaml
+@@ -237,6 +237,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/es.yaml b/locales/es.yaml
+index 1204e1305c..b2d4816807 100644
+--- a/locales/es.yaml
++++ b/locales/es.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/fr.yaml b/locales/fr.yaml
+index 30e4e5a60d..a3bcbffed1 100644
+--- a/locales/fr.yaml
++++ b/locales/fr.yaml
+@@ -260,6 +260,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/ga.yaml b/locales/ga.yaml
+index 24b4a06464..61c55b81e9 100644
+--- a/locales/ga.yaml
++++ b/locales/ga.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/hu.yaml b/locales/hu.yaml
+index 1aa5e6841e..8efbc00409 100644
+--- a/locales/hu.yaml
++++ b/locales/hu.yaml
+@@ -237,6 +237,8 @@ gateway:
+       review_requested: "átadva átnézésre; a megvalósítás elkészült"
+       changes_requested: "az átnézés módosításokat kért (BLOCK); a megvalósítás nincs jóváhagyva"
+       block_loop_detected: "ismételt blokkolások után triázsra irányítva; orkesztrációs figyelmet igényel"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "állapota megváltozott"
+       status_joiner: ", "
+       message: "[kanban] A(z) {task_id} feladat {status}.\nCím: {title}\nFelelős: @{assignee}\nTábla: {board}\n\nNézd meg az eredményt, vagy dönts a következő lépésről."
+diff --git a/locales/it.yaml b/locales/it.yaml
+index 93ecfa3ff9..c63240b8f1 100644
+--- a/locales/it.yaml
++++ b/locales/it.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/ja.yaml b/locales/ja.yaml
+index 5b67e66723..556e803a98 100644
+--- a/locales/ja.yaml
++++ b/locales/ja.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/ko.yaml b/locales/ko.yaml
+index 3cc6cbd20d..f8387da7bd 100644
+--- a/locales/ko.yaml
++++ b/locales/ko.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/pt.yaml b/locales/pt.yaml
+index 075a910bf5..dcd6a01d2b 100644
+--- a/locales/pt.yaml
++++ b/locales/pt.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/ru.yaml b/locales/ru.yaml
+index b2feffcb1f..e8451ca6ba 100644
+--- a/locales/ru.yaml
++++ b/locales/ru.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/tr.yaml b/locales/tr.yaml
+index 52d9f4b13f..f97a8c6b99 100644
+--- a/locales/tr.yaml
++++ b/locales/tr.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/uk.yaml b/locales/uk.yaml
+index 928afb47d4..6fc8532bbb 100644
+--- a/locales/uk.yaml
++++ b/locales/uk.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/zh-hant.yaml b/locales/zh-hant.yaml
+index b43d09a09f..5ddac29ccc 100644
+--- a/locales/zh-hant.yaml
++++ b/locales/zh-hant.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "handed off for review; the implementation is done"
+       changes_requested: "review requested changes (BLOCK); implementation is not approved"
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/zh.yaml b/locales/zh.yaml
+index 3126cdaf7d..9e5ecf4fc7 100644
+--- a/locales/zh.yaml
++++ b/locales/zh.yaml
+@@ -234,6 +234,8 @@ gateway:
+       review_requested: "已交付评审；实现已完成"
+       changes_requested: "评审要求修改（BLOCK)，实现未获批准"
+       block_loop_detected: "反复阻塞后被转入待分诊，需要编排关注"
++      dependency_parent_unclaimed: "has a parent card waiting with no worker"
++      chat_wait_unclaimed: "is ready with no worker claiming it"
+       status_default: "状态变化"
+       status_joiner: "，"
+       message: "[kanban] 任务 {task_id} {status}。\n标题: {title}\n执行者: @{assignee}\n看板: {board}\n\n请检查结果或决定下一步动作。"
+diff --git a/tests/gateway/test_kanban_wake_fold.py b/tests/gateway/test_kanban_wake_fold.py
+new file mode 100644
+index 0000000000..406a46c238
+--- /dev/null
++++ b/tests/gateway/test_kanban_wake_fold.py
+@@ -0,0 +1,246 @@
++"""Kanban wakes that pile up behind a busy turn run as ONE turn built from live card state (t_01a1cec8510df47f).
++
++On 2026-11-11 Desktop chat 20261026_170127_f07c32 fell 19 wakes (3.5 h) behind: each Kanban wake
++committed its own FIFO row and ran its own 30-80 min turn, and the wakes that finally ran described
++cards that had long since been claimed or completed. Real session authority, real state.db FIFO and a
++real Kanban board; nothing claims (``_schedule`` is disabled), so every admitted row stays queued
++exactly as it does behind a running turn.
++"""
++import inspect
++
++import pytest
++
++from gateway import kanban_wake_fold, session_automation
++from gateway.wake import deliver_wake
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_state_runtime import list_session_admissions
++
++GUIDANCE = ("This is an automatic task-status notification, not a request to decompose the task again. "
++            "Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that "
++            "already exist.")
++_STATUS = {'completed': 'completed', 'chat_wait_unclaimed': 'is ready with no worker claiming it',
++           'blocked': 'blocked; needs attention'}
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
++
++    def task(title, **kw):
++        conn = kbc.connect()
++        try:
++            return kb.create_task(conn, title=title, assignee='worker', **kw)
++        finally:
++            conn.close()
++    return task
++
++
++def _complete(tid, summary):
++    conn = kbc.connect()
++    try:
++        assert kb.complete_task(conn, tid, summary=summary, force=True)
++    finally:
++        conn.close()
++
++
++def _block(tid):
++    conn = kbc.connect()
++    try:
++        assert kb.block_task(conn, tid, reason='needs a decision', kind='needs_input', human_request=dict(
++            action='Choose A. Unblock = proceed; archive = drop it.', why_human='Owner decision',
++            interaction='reply', scope='Fixture', evidence='Fixture decision'))
++    finally:
++        conn.close()
++
++
++def _claim(tid):
++    conn = kbc.connect()
++    try:
++        assert kb.claim_task(conn, tid) is not None
++    finally:
++        conn.close()
++
++
++async def _wake(adapter, source, tid, kind):
++    """What the notifier's ``wake()`` hands ``deliver_wake`` for one event of card ``tid``."""
++    body = f'[kanban] Task {tid} {_STATUS[kind]}.\nTitle: card {tid}\nAssignee: @worker\nBoard: default'
++    kwargs = {}
++    if 'kanban_card' in inspect.signature(deliver_wake).parameters:  # absent on the parent: RED shows behaviour
++        kwargs['kanban_card'] = {'task_id': tid, 'board': '', 'kinds': [kind], 'text': body}
++    await deliver_wake(adapter, text=body + '\n\n' + GUIDANCE, source=source, **kwargs)
++
++
++async def _local_chat(tmp_path, monkeypatch):
++    from tests.gateway.test_session_end_delegations import _local
++    runner, authority, ref, _actor = await _local(tmp_path, monkeypatch)
++    live = authority.sessions[ref.session_id]
++    adapter = runner._delivery_adapter_for(live.source)
++
++    def queued():
++        return [row for row in list_session_admissions(authority.db, session_id=ref.session_id)
++                if row['status'] == 'queued']
++    return authority, adapter, live.source, queued, None
++
++
++async def _discord_chat(tmp_path, monkeypatch):
++    from tests.gateway.test_completion_fold import _discord_session
++    authority, human, complete, queued = await _discord_session(tmp_path, monkeypatch)
++    runner = authority.runner
++    from gateway.config import Platform
++    adapter = runner.adapters[Platform.DISCORD]
++    adapter.gateway_runner = runner  # what the adapter registry sets at connect (``run_adapters``)
++    source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
++    human.complete = complete
++    return authority, adapter, source, queued, human
++
++
++def _automation(rows):
++    return [row for row in rows if row['principal_id'].startswith('automation:')]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('chat', [_local_chat, _discord_chat], ids=['local', 'discord'])
++async def test_five_wakes_queued_during_a_turn_run_as_one_turn(tmp_path, monkeypatch, board, chat):
++    authority, adapter, source, queued, _human = await chat(tmp_path, monkeypatch)
++    try:
++        tids = [board(f'card {n}') for n in range(5)]
++        for tid in tids:
++            await _wake(adapter, source, tid, 'completed')
++        rows = _automation(queued())
++        assert len(rows) == 1, [row['payload']['text'][:60] for row in rows]
++        text = rows[0]['payload']['text']
++        assert text.startswith('[IMPORTANT: 5 Kanban task updates arrived while this session was busy.')
++        for tid in tids:  # the line follow-through and ask-gate match stays intact for every card
++            assert f'[kanban] Task {tid} completed.' in text
++        assert text.count(GUIDANCE) == 1 and text.endswith(GUIDANCE)
++        assert text.count('Kanban task updates arrived') == 1  # re-folding replaces the header
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('stale_read', [False, True])
++async def test_a_wake_queued_after_a_human_prompt_never_folds_ahead_of_it(tmp_path, monkeypatch, board, stale_read):
++    """``stale_read``: the prompt commits after the tail was read but before the fold is written."""
++    authority, adapter, source, queued, human = await _discord_chat(tmp_path, monkeypatch)
++    try:
++        first, second = board('first'), board('second')
++        await _wake(adapter, source, first, 'completed')
++        if stale_read:
++            tail = queued()[-1]
++            monkeypatch.setattr(kanban_wake_fold, 'waiting_wake', lambda *args: tail)
++        await human('queued follow-up')
++        await _wake(adapter, source, second, 'completed')
++        assert [row['payload']['text'].split('\n')[0] for row in queued()] == [
++            'running turn', f'[kanban] Task {first} completed.', 'queued follow-up',
++            f'[kanban] Task {second} completed.']
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_a_claimed_wake_is_never_rewritten(tmp_path, monkeypatch, board):
++    authority, adapter, source, queued, _human = await _local_chat(tmp_path, monkeypatch)
++    try:
++        first, second = board('first'), board('second')
++        await _wake(adapter, source, first, 'completed')
++        tail = queued()[-1]
++        monkeypatch.setattr(kanban_wake_fold, 'waiting_wake', lambda *args: tail)
++        authority.db._execute_write(lambda conn: conn.execute(  # the drain claims it after the tail was read
++            "UPDATE session_admissions SET status='started',owner_epoch=?,generation=1 WHERE admission_id=?",
++            (authority.epoch, tail['admission_id'])))
++        await _wake(adapter, source, second, 'completed')
++        rows = {row['admission_id']: row for row in list_session_admissions(
++            authority.db, session_id=tail['payload']['local_automation_v1']['owner'], pending_only=False)}
++        assert rows[tail['admission_id']]['payload'] == tail['payload']
++        assert [row['payload']['text'].split('\n')[0] for row in queued()] == [f'[kanban] Task {second} completed.']
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_an_unclaimed_wait_for_a_card_completed_before_the_fold_says_completed(tmp_path, monkeypatch, board):
++    authority, adapter, source, queued, _human = await _local_chat(tmp_path, monkeypatch)
++    try:
++        waited, other, running = board('waited on'), board('other'), board('claimed meanwhile')
++        await _wake(adapter, source, waited, 'chat_wait_unclaimed')
++        await _wake(adapter, source, running, 'chat_wait_unclaimed')
++        _complete(waited, 'shipped the fix')
++        _claim(running)
++        await _wake(adapter, source, other, 'completed')
++        [row] = _automation(queued())
++        text = row['payload']['text']
++        assert f'[kanban] Task {waited} completed.' in text
++        assert 'Result: shipped the fix' in text
++        assert f'[kanban] Task {running} claimed by a worker (running).' in text
++        assert 'is ready with no worker claiming it.\n' not in text  # no stale premise left as a headline
++        assert text.count('Note: an earlier wake for this card said') == 2
++        # The stored cards stay as delivered, so a later rebuild relabels from live state again.
++        cards = row['payload']['local_automation_v1']['kanban_cards']
++        assert [card['kinds'] for card in cards] == [['chat_wait_unclaimed']] * 2 + [['completed']]
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_two_events_for_one_card_give_one_line(tmp_path, monkeypatch, board):
++    authority, adapter, source, queued, _human = await _local_chat(tmp_path, monkeypatch)
++    try:
++        tid = board('one card')
++        await _wake(adapter, source, tid, 'chat_wait_unclaimed')
++        _block(tid)
++        await _wake(adapter, source, tid, 'blocked')
++        [row] = _automation(queued())
++        text = row['payload']['text']
++        assert text.count(f'[kanban] Task {tid}') == 1
++        assert text.startswith(f'[kanban] Task {tid} blocked; needs attention.')
++        assert 'Kanban task updates arrived' not in text  # one card: no batch header
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_process_completion_folding_is_unchanged_and_never_crosses_a_wake(tmp_path, monkeypatch, board):
++    authority, adapter, source, queued, human = await _discord_chat(tmp_path, monkeypatch)
++    try:
++        first, second = board('first'), board('second')
++        await human.complete('proc_a')
++        await human.complete('proc_b')
++        await _wake(adapter, source, first, 'completed')
++        await human.complete('proc_c')
++        await _wake(adapter, source, second, 'completed')
++        heads = [row['payload']['text'].split('\n')[0] for row in queued()]
++        assert heads == ['running turn', '[IMPORTANT: 2 background process results arrived while this session was '
++                         'busy. Treat them as one batch and give one consolidated response; preserve failures and '
++                         'actionable results.]', f'[kanban] Task {first} completed.',
++                         '[IMPORTANT: proc_c finished]', f'[kanban] Task {second} completed.']
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_a_wake_queued_before_the_upgrade_still_folds(tmp_path, monkeypatch, board):
++    """A row admitted by the old code carries no cards: its text is folded as one card."""
++    authority, adapter, source, queued, _human = await _local_chat(tmp_path, monkeypatch)
++    try:
++        old, new = board('old'), board('new')
++        await deliver_wake(adapter, text=f'[kanban] Task {old} completed.\nTitle: old\nBoard: default\n\n{GUIDANCE}',
++                           source=source)
++        await _wake(adapter, source, new, 'completed')
++        [row] = _automation(queued())
++        text = row['payload']['text']
++        assert text.startswith('[IMPORTANT: 2 Kanban task updates')
++        assert f'[kanban] Task {old} completed.' in text and f'[kanban] Task {new} completed.' in text
++        assert text.count(GUIDANCE) == 1
++    finally:
++        authority.db.close()
++
++
++def test_card_metadata_rejects_malformed_cards():
++    from hermes_state_runtime import RuntimeStoreError
++    assert kanban_wake_fold.card_metadata({}) == {}
++    for bad in ([], [{'text': 1}], [{'text': 'x', 'extra': 1}], [{'text': 'x', 'kinds': 'completed'}], 'x'):
++        with pytest.raises(RuntimeStoreError):
++            kanban_wake_fold.card_metadata({'kanban_cards': bad})
++    assert 'kanban_cards' in session_automation._AUTOMATION_METADATA
+diff --git a/tests/hermes_cli/test_kanban_notify.py b/tests/hermes_cli/test_kanban_notify.py
+index 9beafce14e..8bdd458379 100644
+--- a/tests/hermes_cli/test_kanban_notify.py
++++ b/tests/hermes_cli/test_kanban_notify.py
+@@ -484,6 +484,12 @@ async def test_notifier_wake_only_skips_send_and_advances_cursor(kanban_home):
+     # cursor advanced; otherwise it would re-wake on every poll).
+     wake_mock.assert_awaited_once()
+     assert tid in wake_mock.await_args.kwargs["text"]
++    # The wake carries its card, so a later wake for the same chat folds into it while it waits
++    # (gateway/kanban_wake_fold.py, t_01a1cec8510df47f).
++    card = wake_mock.await_args.kwargs["kanban_card"]
++    assert (card["task_id"], card["kinds"]) == (tid, ["blocked"])
++    assert card["text"].startswith(f"[kanban] Task {tid} ")
++    assert wake_mock.await_args.kwargs["text"].startswith(card["text"])
+ 
+     # The subscription survives (blocked is non-terminal) but its cursor moved
+     # past the blocked event.
+-- 
+2.43.0
+

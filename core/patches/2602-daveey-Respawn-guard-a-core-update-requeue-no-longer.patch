@@ -1,0 +1,328 @@
+From f1b81aee0da8f609ab500497ca23925cbb747973 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:35:12 +0000
+Subject: [PATCH] [daveey] Respawn guard: a core-update requeue no longer
+ consumes a PR owner's handoff
+
+hermes-sync's core drain requeues every restart-safe worker with
+`hermes kanban reclaim --reason 'hermes-sync core update: restart-safe worker
+requeue'`. The one-shot PR-owner handoffs (an orderly dependency park, a review
+checkpoint via resumes_review, a same-second immediate checkpoint) were consumed
+by "the latest run", so that requeued run burned them and the dispatcher then
+held the owner `active_pr` with no worker (2026-11-12: t_01a1ce8aff1f09c1 on
+worker-5 sat 12 min after its exact-head APPROVE until an operator intervened).
+
+New hermes_cli/kanban_core_update_requeue.py recognises only a manual reclaim
+with exactly that reason, on a run that ended `reclaimed` with no crash,
+timeout, spawn_failed or gave_up event. _dependency_handoff_after,
+_immediate_checkpoint_after and resumes_review now pass over such runs (and
+ignore their `reclaimed` event), so the next respawn resumes as if the requeue
+never happened. Any other reclaim, crash or timeout still consumes the handoff,
+and a PR the requeued run reported is a newer PR comment that re-arms the guard.
+
+resumes_review did not release the incident card for the same reason: it joins
+the dependency_wait park to `MAX(task_runs.id)`, which was the requeued run.
+
+Tests: tests/hermes_cli/test_kanban_core_update_requeue_handoff.py (15), RED
+before (3 requeue cases fail) and GREEN after; crash/other-reason reclaims stay
+held in both.
+---
+ hermes_cli/kanban_core_update_requeue.py      |  67 ++++++++++
+ hermes_cli/kanban_db_dispatch_pr_state.py     |  19 ++-
+ hermes_cli/kanban_dependency_review.py        |  10 +-
+ ...test_kanban_core_update_requeue_handoff.py | 125 ++++++++++++++++++
+ 4 files changed, 211 insertions(+), 10 deletions(-)
+ create mode 100644 hermes_cli/kanban_core_update_requeue.py
+ create mode 100644 tests/hermes_cli/test_kanban_core_update_requeue_handoff.py
+
+diff --git a/hermes_cli/kanban_core_update_requeue.py b/hermes_cli/kanban_core_update_requeue.py
+new file mode 100644
+index 0000000000..9ac2d84540
+--- /dev/null
++++ b/hermes_cli/kanban_core_update_requeue.py
+@@ -0,0 +1,67 @@
++"""A hermes-sync core-update requeue is a pause, not a crash. [daveey]
++
++``hermes-sync``'s core drain (``reclaim_core_update_workers`` in the state repo) requeues every
++restart-safe worker with ``hermes kanban reclaim <task> --reason CORE_UPDATE_REQUEUE_REASON`` just
++before ``hermes update``. The one-shot PR-owner handoffs (an orderly dependency park, a
++review checkpoint) are consumed by "the next execution"; without this module that requeued run
++counted as one, so the guard then held the owner ``active_pr`` with no worker (2026-11-12,
++t_01a1ce8aff1f09c1 on worker-5). A requeued run is skipped as if it never ran.
++
++Only an exact manual reclaim with that reason, whose run ended ``reclaimed`` and carries no
++crash or timeout evidence, qualifies. Any other reclaim, crash or timeout still consumes the
++handoff (fail closed). A PR the requeued run reported is a newer PR comment and re-arms the
++guard on its own. Keep the reason in sync with hermes-sync.
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Optional
++
++CORE_UPDATE_REQUEUE_REASON = "hermes-sync core update: restart-safe worker requeue"
++
++_FAILURE_KINDS = ("crashed", "timed_out", "spawn_failed", "gave_up")
++
++
++def is_core_update_requeue(conn: sqlite3.Connection, run) -> bool:
++    """True only for a run the core updater's restart-safe requeue closed."""
++    from hermes_cli import kanban_db as kb
++
++    if run["outcome"] != "reclaimed" or run["ended_at"] is None:
++        return False
++    requeued = False
++    for event in conn.execute(
++        "SELECT kind, payload FROM task_events WHERE task_id = ? AND run_id = ? "
++        f"AND kind IN ('reclaimed', {', '.join('?' * len(_FAILURE_KINDS))})",
++        (run["task_id"], run["id"], *_FAILURE_KINDS),
++    ):
++        if event["kind"] != "reclaimed":
++            return False
++        payload = kb._json_dict(event["payload"])
++        if payload.get("manual") is not True or payload.get("reason") != CORE_UPDATE_REQUEUE_REASON:
++            return False
++        requeued = True
++    return requeued
++
++
++def requeued_run_ids(conn: sqlite3.Connection, task_id: str) -> set[int]:
++    return {run["id"] for run in conn.execute(
++        "SELECT * FROM task_runs WHERE task_id = ? AND outcome = 'reclaimed'", (task_id,))
++        if is_core_update_requeue(conn, run)}
++
++
++def latest_run_skipping_requeues(conn: sqlite3.Connection, task_id: str, *, skip_unused_grants: bool):
++    """Latest run, passing over core-update requeues (and, when asked, attested unused grants)."""
++    from hermes_cli.kanban_unused_grant import is_unused_grant
++
++    for run in conn.execute("SELECT * FROM task_runs WHERE task_id = ? ORDER BY id DESC", (task_id,)):
++        if is_core_update_requeue(conn, run):
++            continue
++        if skip_unused_grants and is_unused_grant(conn, run):
++            continue
++        return run
++    return None
++
++
++def latest_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
++    run = latest_run_skipping_requeues(conn, task_id, skip_unused_grants=False)
++    return None if run is None else run["id"]
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 5cc05b960a..b2aa9d084a 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -124,12 +124,13 @@ def _immediate_checkpoint_after(
+     Same-second PR reporting and checkpointing is normal within one worker run.
+     """
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_core_update_requeue import is_core_update_requeue
+ 
+-    run = conn.execute(
+-        "SELECT id, outcome, ended_at, metadata FROM task_runs "
+-        "WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
++    # A core-update requeue after the checkpoint is skipped, not a newer run. [daveey]
++    run = next((r for r in conn.execute(
++        "SELECT * FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC",
+         (task_id,),
+-    ).fetchone()
++    ) if not is_core_update_requeue(conn, r)), None)
+     if run is None or run["outcome"] != "continued":
+         return False
+     ended_at = kb._to_epoch(run["ended_at"])
+@@ -331,9 +332,10 @@ def _dependency_handoff_after(conn: sqlite3.Connection, task_id: str, since: int
+     """
+     from hermes_cli import kanban_db as kb
+ 
+-    from hermes_cli.kanban_unused_grant import latest_started_run
++    from hermes_cli.kanban_core_update_requeue import latest_run_skipping_requeues, requeued_run_ids
+ 
+-    run = latest_started_run(conn, task_id)
++    # A core-update requeue is a pause, not the consuming execution (kanban_core_update_requeue).
++    run = latest_run_skipping_requeues(conn, task_id, skip_unused_grants=True)
+     task = kb.get_task(conn, task_id)
+     if run is not None and (task is None or run["profile"] != task.assignee):
+         return False
+@@ -374,7 +376,9 @@ def _dependency_handoff_after(conn: sqlite3.Connection, task_id: str, since: int
+     if not any(e["kind"] == "claimed" and e["run_id"] == run["id"] and at <= parked_at
+                for at, e in timed):
+         return False
++    requeued = requeued_run_ids(conn, task_id)
+     if any(e["kind"] in {"crashed", "reclaimed", "timed_out"} and at >= parked_at
++           and not (e["kind"] == "reclaimed" and e["run_id"] in requeued)
+            for at, e in timed):
+         return False
+     if not any(e["kind"] == "promoted" and at >= ended
+@@ -434,7 +438,8 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     one continuation after parent completion/promotion: it must belong to the latest
+     claimed run of this card and assignee, ended orderly as blocked, with no subsequent
+     crash/reclaim/timeout. Operator-only links or synthetic unclaimed runs do not count;
+-    the next execution claim consumes the handoff (a proven unused grant does not).
++    the next execution claim consumes the handoff (a proven unused grant or a hermes-sync
++    core-update restart-safe requeue does not: :mod:`kanban_core_update_requeue`).
+     A same-second dependency park counts only when
+     its server-stamped comment watermark covers the newest PR comment; otherwise it stays guarded.
+     This does not change the separate review-checkpoint exception below. So does
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index a941c605f9..c8eb864090 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -335,17 +335,21 @@ def _checkpoint_matches_run(evidence, run):
+ 
+ 
+ def resumes_review(conn, task_id, pr_urls, *, discharged=()):
+-    """One continuation only: claiming any new run consumes the park's permission."""
++    """One continuation only: claiming any new run consumes the park's permission
++    (a hermes-sync core-update requeue does not: :mod:`kanban_core_update_requeue`)."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_core_update_requeue import latest_run_id
+     from hermes_cli.kanban_db_dispatch_pr_policy import norm_pr
+ 
++    # Latest run passing over core-update requeues: that pause is not the consuming claim
++    # (2026-11-12: t_01a1ce8aff1f09c1 held after an exact-head APPROVE). [daveey]
+     row = conn.execute(
+         "SELECT e.payload, e.created_at, r.*, t.assignee "
+         "FROM task_events e JOIN task_runs r ON r.id = e.run_id "
+         "JOIN tasks t ON t.id = e.task_id "
+         "WHERE e.task_id = ? AND e.kind = 'dependency_wait' AND r.task_id = t.id "
+-        "AND r.id = (SELECT MAX(id) FROM task_runs WHERE task_id = t.id) "
+-        "ORDER BY e.id DESC LIMIT 1", (task_id,),
++        "AND r.id IS ? "
++        "ORDER BY e.id DESC LIMIT 1", (task_id, latest_run_id(conn, task_id)),
+     ).fetchone()
+     if row is None or row["outcome"] != "blocked" or row["profile"] != row["assignee"]:
+         return False
+diff --git a/tests/hermes_cli/test_kanban_core_update_requeue_handoff.py b/tests/hermes_cli/test_kanban_core_update_requeue_handoff.py
+new file mode 100644
+index 0000000000..7c6de3e26d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_core_update_requeue_handoff.py
+@@ -0,0 +1,125 @@
++"""A hermes-sync core-update requeue must not consume a PR owner's one-shot handoff. [daveey]
++
++Production (2026-11-12, worker-5): the owner of PR #1271 parked on a re-review, the review
++approved, the card was promoted and claimed, and 41 s later the core updater's restart-safe
++requeue reclaimed that run. The dispatcher then held the card ``active_pr`` with no worker
++until an operator intervened. That requeue is a deliberate pause, not a crash: the next
++respawn resumes as if the requeued run never happened. A real crash keeps the hold.
++"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli.kanban_core_update_requeue import CORE_UPDATE_REQUEUE_REASON
++from tests.hermes_cli import test_kanban_dependency_review as dr
++
++board = dr.board
++HEAD, PR, finish_reviews, parked = dr.HEAD, dr.PR, dr.finish_reviews, dr.parked
++
++CRASH = "Worker died"
++
++
++def _approved(board):
++    task, reviews = parked(board)
++    finish_reviews(board, reviews, metadata={"verdict": "APPROVE", "head": HEAD, "pr": PR})
++    kb.add_comment(board, task, "reviewer", "APPROVE at exact head " + HEAD + " " + PR)
++    assert kb.get_task(board, task).status == "ready"
++    assert dispatch.check_respawn_guard(board, task) is None
++    return task
++
++
++def _ordering(board):
++    """An ordering (non-review) dependency: the parent's result is no review verdict."""
++    task, reviews = parked(board)
++    finish_reviews(board, reviews, metadata={"changed_files": ["a.py"]})
++    assert kb.get_task(board, task).status == "ready"
++    assert dispatch.check_respawn_guard(board, task) is None
++    return task
++
++
++def _reclaim(board, task, reason):
++    assert kb.claim_task(board, task) is not None
++    assert kb.reclaim_task(board, task, reason=reason, signal_fn=lambda *_: None)
++    assert kb.get_task(board, task).status == "ready"
++
++
++@pytest.mark.parametrize("setup", [_approved, _ordering], ids=["review_checkpoint", "ordering"])
++def test_core_update_requeue_keeps_the_handoff(board, setup):
++    task = setup(board)
++    _reclaim(board, task, CORE_UPDATE_REQUEUE_REASON)
++    assert dispatch.check_respawn_guard(board, task) is None
++    # Twice in a row (two drains) still resumes; the next real claim consumes it.
++    _reclaim(board, task, CORE_UPDATE_REQUEUE_REASON)
++    assert dispatch.check_respawn_guard(board, task) is None
++    assert kb.claim_task(board, task) is not None
++    assert kb.reclaim_task(board, task, reason=CRASH, signal_fn=lambda *_: None)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++@pytest.mark.parametrize("setup", [_approved, _ordering], ids=["review_checkpoint", "ordering"])
++@pytest.mark.parametrize("reason", [CRASH, None, CORE_UPDATE_REQUEUE_REASON + " (by hand)"])
++def test_crash_or_other_reclaim_still_consumes_the_handoff(board, setup, reason):
++    task = setup(board)
++    _reclaim(board, task, reason)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++@pytest.mark.parametrize("setup", [_approved, _ordering], ids=["review_checkpoint", "ordering"])
++def test_requeued_run_that_published_a_new_pr_stays_held(board, setup):
++    """The requeue is neutral only for its own run: a PR it reported re-arms the guard."""
++    from tests.hermes_cli.kanban_guard_helpers import worker_comment
++
++    task = setup(board)
++    assert kb.claim_task(board, task) is not None
++    worker_comment(board, task, "dev", "Opened " + PR + "7")
++    assert kb.reclaim_task(board, task, reason=CORE_UPDATE_REQUEUE_REASON, signal_fn=lambda *_: None)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_crash_event_on_requeued_run_is_not_neutral(board):
++    task = _ordering(board)
++    _reclaim(board, task, CORE_UPDATE_REQUEUE_REASON)
++    run = board.execute("SELECT MAX(id) FROM task_runs WHERE task_id = ?", (task,)).fetchone()[0]
++    with kb.write_txn(board):
++        kb._append_event(board, task, "crashed", {"pid": 1}, run_id=run)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++@pytest.mark.parametrize("reason,held", [(CORE_UPDATE_REQUEUE_REASON, None), (CRASH, "active_pr")],
++                         ids=["core_update_requeue", "crash"])
++def test_same_second_immediate_checkpoint_survives_requeue(board, monkeypatch, reason, held):
++    """The same-second ``kanban_continue`` handoff (latest ended run) skips a requeue too."""
++    import time
++
++    from hermes_cli import kanban_continuation as continuation
++    from tests.hermes_cli.kanban_guard_helpers import worker_comment
++
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    task = kb.create_task(board, title="implementation", assignee="dev")
++    kb.claim_task(board, task)
++    run = kb.get_task(board, task).current_run_id
++    worker_comment(board, task, "dev", "Published " + PR)
++    result = continuation.continue_task(board, task, checkpoint="PR open, next: CI", expected_run_id=run,
++                                        resume_after_seconds=0)
++    assert result["ok"], result
++    assert dispatch.check_respawn_guard(board, task) is None
++    _reclaim(board, task, reason)
++    assert dispatch.check_respawn_guard(board, task) == held
++
++
++@pytest.mark.parametrize("reason,respawns", [(CORE_UPDATE_REQUEUE_REASON, True), (CRASH, False)],
++                         ids=["core_update_requeue", "crash"])
++def test_dispatcher_respawns_after_core_update_requeue(board, monkeypatch, reason, respawns):
++    """Incident sequence through the real dispatcher tick: park -> APPROVE -> claim -> reclaim."""
++    spawned: list[str] = []
++    monkeypatch.setattr(dispatch, "_profile_exists_fn", lambda: (lambda _name: True))
++    task = _approved(board)
++    _reclaim(board, task, reason)
++    result = dispatch.dispatch_once(board, spawn_fn=lambda t, _ws, board=None: spawned.append(t.id))
++    guarded = [tid for tid, _ in result.respawn_guarded]
++    if respawns:
++        assert spawned == [task] and task not in guarded
++        assert not [e for e in kb.list_events(board, task) if e.kind == "respawn_guarded"]
++    else:
++        assert spawned == [] and (task, "active_pr") in result.respawn_guarded
+-- 
+2.43.0
+

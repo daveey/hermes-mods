@@ -1,0 +1,467 @@
+From 11eae2099181fd39c776a7791fe9624ccef3642c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:09:11 +0000
+Subject: [PATCH] [daveey] Gateway tick passes read once per pass, not once per
+ card
+
+Hub gateway profile 2026-11-12 (t_01a1ccca7a1979a7; 4,948 cards, 139% of a core after PR1170/PR1125):
+- divergence repair: one replica read per 500 settled cards and one omissions read per pass
+  (was one SELECT of each per card every sync round, 13% of samples)
+- tui owner claim: one owned_live_session answer per chat per collector tick
+  (was one state.db lineage walk per pending row, 1,655 rows over 122 chats, 9%)
+- wait notices: the already-posted check runs before the queue place (5%)
+- gateway_names: answer reused while hub.db, its WAL and the mail config keep identity/size/mtime,
+  5 s at most, never for a file written inside the timestamp granularity (4%)
+
+No pass, notice or retry is removed; each change has an operation-budget test that failed before it.
+---
+ gateway/kanban_tui_owner.py                   |  13 +-
+ hermes_cli/kanban_origin.py                   |  42 +++-
+ hermes_cli/kanban_parent_unclaimed.py         |  13 +-
+ hermes_cli/kanban_sync_divergence.py          |  23 +-
+ .../gateway/test_kanban_tui_owner_delivery.py |  25 ++
+ .../test_gateway_tick_read_budget.py          | 218 ++++++++++++++++++
+ 6 files changed, 321 insertions(+), 13 deletions(-)
+ create mode 100644 tests/hermes_cli/test_gateway_tick_read_budget.py
+
+diff --git a/gateway/kanban_tui_owner.py b/gateway/kanban_tui_owner.py
+index d5a433d73a..bae39b1aba 100644
+--- a/gateway/kanban_tui_owner.py
++++ b/gateway/kanban_tui_owner.py
+@@ -142,9 +142,20 @@ def has_local_sibling(conn: Any, sub: dict) -> bool:
+     return row is not None
+ 
+ 
++def _owned_this_tick(collector: Any, sub: dict) -> Any:
++    """:func:`owned_live_session` once per chat per collector tick: a chat's cards share one answer, and each
++    answer costs a lineage walk in state.db (1,655 pending tui rows over 122 chats on the hub). The delivery
++    re-check still reads fresh. [daveey]"""
++    seen = collector.__dict__.setdefault("_tui_owned", {})
++    key = (sub.get("notifier_profile") or None, str(sub.get("chat_id") or ""), bool(sub.get("thread_id")))
++    if key not in seen:
++        seen[key] = owned_live_session(collector.runner, sub)
++    return seen[key]
++
++
+ def claim(collector: Any, conn: Any, slug: str, sub: dict) -> Optional[dict]:
+     """Claim one tui row's unseen events for this gateway, or None (left to the legacy backend)."""
+-    if has_local_sibling(conn, sub) or owned_live_session(collector.runner, sub) is None:
++    if has_local_sibling(conn, sub) or _owned_this_tick(collector, sub) is None:
+         return None
+     from hermes_cli import kanban_db_notify as _kbn
+     old_cursor, cursor, events = _kbn.claim_unseen_events_for_sub(
+diff --git a/hermes_cli/kanban_origin.py b/hermes_cli/kanban_origin.py
+index c30ac22220..a06e4ee1e7 100644
+--- a/hermes_cli/kanban_origin.py
++++ b/hermes_cli/kanban_origin.py
+@@ -25,6 +25,7 @@ import os
+ import re
+ import shlex
+ import sqlite3
++import time
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Iterable, Mapping, Optional
+@@ -96,10 +97,46 @@ def _ro(path: Path) -> sqlite3.Connection:
+         return conn
+ 
+ 
++_NAMES_MAX_AGE_S = 5.0
++_NAMES_RACY_NS = 100_000_000
++_names_memo: Optional[tuple[tuple, float, str, frozenset]] = None
++
++
++def _stat_sig(path: Path) -> Optional[tuple[int, int, int]]:
++    try:
++        st = path.stat()
++    except OSError:
++        return None
++    return st.st_ino, st.st_mtime_ns, st.st_size
++
++
++def _mail_config() -> Path:
++    return Path(os.environ.get("HERMES_MAIL_CONFIG") or Path.home() / ".config" / "hermes-mail" / "config.json")
++
++
+ def gateway_names() -> tuple[str, set[str]]:
+-    """``(this gateway, every gateway hermes-hub knows)`` from the local hub.db; ("", set()) without one."""
++    """``(this gateway, every gateway hermes-hub knows)`` from the local hub.db; ("", set()) without one.
++
++    The answer is reused while its inputs (hub.db, its WAL, the mail config) keep their identity, size and mtime,
++    for at most ``_NAMES_MAX_AGE_S``: links reconcile, creator backfill and provenance checks ask once per row,
++    and each uncached answer opens hub.db (4% of hub gateway CPU, 2026-11-12). [daveey]"""
++    global _names_memo
++    path, cfg = _hub_db(), _mail_config()
++    key = (str(path), _stat_sig(path) if path else None, _stat_sig(Path(f"{path}-wal")) if path else None,
++           str(cfg), _stat_sig(cfg))
++    memo, now = _names_memo, time.monotonic()
++    if memo is not None and memo[0] == key and now - memo[1] < _NAMES_MAX_AGE_S:
++        return memo[2], set(memo[3])
++    me, known = _read_gateway_names(path, cfg)
++    # A file written within the timestamp granularity could change again under the same signature: not kept.
++    racy = time.time_ns() - _NAMES_RACY_NS
++    _names_memo = None if any(isinstance(sig, tuple) and sig[1] >= racy for sig in key) else (
++        key, now, me, frozenset(known))
++    return me, known
++
++
++def _read_gateway_names(path: Optional[Path], cfg: Path) -> tuple[str, set[str]]:
+     me, known = "", set()
+-    path = _hub_db()
+     if path is not None:
+         try:
+             conn = _ro(path)
+@@ -113,7 +150,6 @@ def gateway_names() -> tuple[str, set[str]]:
+             pass
+     if not me:
+         try:
+-            cfg = Path(os.environ.get("HERMES_MAIL_CONFIG") or Path.home() / ".config" / "hermes-mail" / "config.json")
+             me = str(json.loads(cfg.read_text(encoding="utf-8-sig")).get("gateway") or "")
+         except (OSError, ValueError, AttributeError):
+             me = ""
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 9a5dd9db77..3db903111a 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -164,6 +164,13 @@ def safe_sweep(conn) -> int:
+     return posted + kanban_chat_wait.safe_sweep(conn)
+ 
+ 
++def _already_posted(conn, task_id: str, waiting_on: str, wait_key: Any, kind: str) -> bool:
++    from hermes_cli import kanban_db as kb
++    return any(kb._json_dict(p).get("wait_event_id") == wait_key and kb._json_dict(p).get("parent") == waiting_on
++               for (p,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                                        (task_id, kind)))
++
++
+ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_seconds: float,
+                 ready_seconds: float, parent_title: Optional[str] = None, kind: str = NOTICE_KIND,
+                 extra: Optional[dict[str, Any]] = None) -> bool:
+@@ -175,15 +182,15 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_host_counts as khc
+     from hermes_cli import kanban_queue_position as kqp
++    if _already_posted(conn, task_id, waiting_on, wait_key, kind):
++        return False  # before the queue place: every tick asks again for each long-ready card [daveey]
+     place = _place(conn, waiting_on)
+     observed = {"board": place.get("board") or khc.board_of(conn), "observed_at": place.get("observed_at") or int(time.time()),
+                 "admission": ({"reason": "core_update_hold", "status": "held"} if (extra or {}).get("core_update_hold")
+                               else {"reason": None, "status": "unknown"})}
+     guard = place.get("reason") if place.get("lane") == "respawn_guard" else None
+     with kb.write_txn(conn):
+-        if any(kb._json_dict(p).get("wait_event_id") == wait_key and kb._json_dict(p).get("parent") == waiting_on
+-               for (p,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+-                                        (task_id, kind))):
++        if _already_posted(conn, task_id, waiting_on, wait_key, kind):
+             return False
+         still = conn.execute("SELECT status, claim_lock FROM tasks WHERE id = ?", (waiting_on,)).fetchone()
+         if still is None or still["status"] != "ready" or still["claim_lock"]:
+diff --git a/hermes_cli/kanban_sync_divergence.py b/hermes_cli/kanban_sync_divergence.py
+index cbcb0e85e2..0e4b23ca40 100644
+--- a/hermes_cli/kanban_sync_divergence.py
++++ b/hermes_cli/kanban_sync_divergence.py
+@@ -8,6 +8,7 @@ import time
+ from hermes_cli import kanban_db_sync as sync
+ 
+ _log = logging.getLogger(__name__)
++_CHUNK = 500
+ 
+ 
+ def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) -> dict[str, list[str]]:
+@@ -22,20 +23,30 @@ def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gate
+     status, and the service refused every lease as ``not_claimable`` for 3 h. Returns {task id: fields queued}."""
+     from hermes_cli.kanban_sync_client import _row_fields, _diverged_runs
+     from hermes_cli.kanban_db_connect import write_txn
+-    from hermes_cli.kanban_sync_omissions import held_fields, repair_holds
++    from hermes_cli.kanban_sync_omissions import repair_holds
+     held = repair_holds(live, "tasks")
+     seen = {r[0]: r[1] for r in shadow.execute(
+         "SELECT id, sync_version FROM tasks WHERE (created_on = ? OR created_on IS NULL) AND sync_version IS NOT NULL",
+         (gateway,))}
+     repaired: dict[str, list[str]] = {}
+-    rows = live.execute("SELECT * FROM tasks WHERE sync_version IS NOT NULL").fetchall()
++    rows = [r for r in live.execute("SELECT * FROM tasks WHERE sync_version IS NOT NULL").fetchall()
++            if r["id"] not in held and seen.get(r["id"]) == r["sync_version"]]
++    # One replica read per chunk and one omissions read per pass, not one of each per settled card: the scan
++    # visits every synced card each round (13% of hub gateway CPU at 4,948 cards, 2026-11-12). [daveey]
++    replica: dict[str, sqlite3.Row] = {}
++    for i in range(0, len(rows), _CHUNK):
++        ids = [r["id"] for r in rows[i:i + _CHUNK]]
++        replica.update((r["id"], r) for r in shadow.execute(
++            f"SELECT * FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids))
++    omissions: dict[str, set[str]] = {}
++    for uid, field in live.execute(
++            "SELECT row_uid, field FROM kanban_sync_omissions WHERE table_name='tasks' AND state!='delivered'"):
++        omissions.setdefault(uid, set()).add(field)
+     for row in rows:
+         tid = row["id"]
+-        if tid in held or seen.get(tid) != row["sync_version"]:
+-            continue
+-        theirs = shadow.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++        theirs = replica[tid]
+         mine, remote = _row_fields(live, "tasks", row), _row_fields(shadow, "tasks", theirs)
+-        omitted = held_fields(live, "tasks", tid)
++        omitted = omissions.get(tid, ())
+         fields = {k: v for k, v in mine.items() if k in remote and remote[k] != v and k not in omitted}
+         if not fields:
+             continue
+diff --git a/tests/gateway/test_kanban_tui_owner_delivery.py b/tests/gateway/test_kanban_tui_owner_delivery.py
+index 3c36334fce..64d21a19ce 100644
+--- a/tests/gateway/test_kanban_tui_owner_delivery.py
++++ b/tests/gateway/test_kanban_tui_owner_delivery.py
+@@ -375,3 +375,28 @@ async def test_registry_backed_gateway_claims_and_delivers_owned_tui_row(env, tm
+     _complete(tid)
+     await _tick(runner)
+     assert [a["chat"] for a in admitted] == [CHAT_B] and _row(tid, CHAT_B)[0] == _max_event(tid)
++
++
++def test_an_unowned_chat_costs_one_lineage_read_per_tick_however_many_cards_it_has(env, monkeypatch):
++    """Hub profile 2026-11-12: 1,655 pending tui rows over 122 chats, one state.db lineage walk per row per
++    tick (9% of gateway CPU). Rows of one chat share the tick's answer; each tick still asks again. [daveey]"""
++    runner, authority, admitted, _outcome = env
++    calls = []
++    real = authority.logical_owner
++
++    def counted(sid):
++        calls.append(sid)
++        return real(sid)
++
++    authority.logical_owner = counted
++    for i in range(6):
++        _complete(_task(f"a{i}", CHAT_A))
++    _complete(_task("b", CHAT_B))
++    assert asyncio.run(_tick(runner)) == []
++    assert sorted(calls) == [CHAT_A, CHAT_B]
++    calls.clear()
++    authority.sessions[CHAT_A] = _Live(CHAT_A)  # the gateway now runs chat A with work in its ledger
++    authority.db.work(CHAT_A)
++    deliveries = asyncio.run(_tick(runner))
++    assert len(deliveries) == 6 and {d["sub"]["chat_id"] for d in deliveries} == {CHAT_A}
++    assert calls.count(CHAT_B) == 1 and len(admitted) == 6
+diff --git a/tests/hermes_cli/test_gateway_tick_read_budget.py b/tests/hermes_cli/test_gateway_tick_read_budget.py
+new file mode 100644
+index 0000000000..6b711b72d6
+--- /dev/null
++++ b/tests/hermes_cli/test_gateway_tick_read_budget.py
+@@ -0,0 +1,218 @@
++"""Per-tick gateway passes read once per pass, not once per card. [daveey]
++
++Hub gateway profile 2026-11-12 (t_01a1ccca7a1979a7, 4,948 cards, 139% of a core): the divergence repair read the
++replica once per settled card every sync round (13% of samples), the wait-notice sweeps computed a queue place for
++every long-ready card every dispatcher tick before finding its notice already posted (5%), and ``gateway_names``
++opened hub.db once per link in the links pass (4%).
++"""
++from __future__ import annotations
++
++import os
++import sqlite3
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_chat_wait as cw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_notify as kn
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_origin
++from hermes_cli import kanban_parent_unclaimed as pu
++from hermes_cli import kanban_queue_position as kqp
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, BOARD = "macbook", "default"
++
++
++# --- divergence repair --------------------------------------------------------------------------------------------
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize("cards", [3, 40])
++def test_divergence_repair_reads_the_replica_per_pass_not_per_card(live, kanban_home, monkeypatch, cards):
++    svc = FakeService()
++    sync.set_mode(live, "primary")
++    ids = [kb.create_task(live, title=f"card {i}", assignee="worker") for i in range(cards)]
++    for _ in range(3):
++        ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    real, seen = ksc.repair_divergence, []
++
++    def counted(live_conn, shadow, gateway):
++        statements = []
++        shadow.set_trace_callback(statements.append)
++        try:
++            return real(live_conn, shadow, gateway)
++        finally:
++            shadow.set_trace_callback(None)
++            seen.append([s for s in statements if s.lstrip().upper().startswith("SELECT")])
++
++    monkeypatch.setattr(ksc, "repair_divergence", counted)
++    with kbc.write_txn(live):
++        sync.drop_triggers(live)  # an uncaptured write: only the repair scan finds it
++        live.execute("UPDATE tasks SET title = 'gap edit' WHERE id = ?", (ids[-1],))
++    sync.install_triggers(live)
++    ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++    assert seen, "the repair scan did not run after a local write"
++    assert len(seen[0]) <= 2, f"{len(seen[0])} replica reads for {cards} settled cards: {seen[0][:6]}"
++    assert svc.board(BOARD)["rows"]["tasks"][ids[-1]]["title"] == "gap edit", "the uncaptured edit was not healed"
++
++
++# --- wait notices ---------------------------------------------------------------------------------------------------
++
++_ENV = ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
++        "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_HOME", "HERMES_DELEGATED_CHILD_CONTEXT",
++        "HERMES_KANBAN_WORKER_TASK")
++
++
++@pytest.fixture
++def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    for key in _ENV:
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 7)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return h
++
++
++def _waiting_card(conn, *, age_s: int = 40 * 60) -> str:
++    now = int(time.time())
++    tid = kb.create_task(conn, title="waiting", assignee="default")
++    kn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="origin-chat", delivery_metadata={"reason": "create"})
++    conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (now - age_s, tid))
++    conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (now - age_s, tid))
++    conn.commit()
++    return tid
++
++
++def _count_places(monkeypatch) -> list:
++    real, places = kqp.position, []
++
++    def counted(conn, task, *a, **k):
++        places.append(task.id)
++        return real(conn, task, *a, **k)
++
++    monkeypatch.setattr(kqp, "position", counted)
++    return places
++
++
++def test_a_posted_wait_notice_costs_no_queue_place_on_later_ticks(home, monkeypatch):
++    places = _count_places(monkeypatch)
++    with kbc.connect_closing() as conn:
++        cards = [_waiting_card(conn) for _ in range(5)]
++        assert cw.sweep(conn) == 5
++        assert sorted(places) == sorted(cards)  # the notice itself still names the queue place
++        places.clear()
++        for _ in range(3):
++            assert cw.sweep(conn) == 0
++        assert places == [], f"queue place recomputed for already-noticed cards: {places}"
++        notices = conn.execute("SELECT COUNT(*) FROM task_events WHERE kind=?", (cw.NOTICE_KIND,)).fetchone()[0]
++    assert notices == 5
++
++
++def test_a_parent_unclaimed_notice_costs_no_queue_place_once_posted(home, monkeypatch):
++    places = _count_places(monkeypatch)
++    with kbc.connect_closing() as conn:
++        parent = _waiting_card(conn)
++        child = kb.create_task(conn, title="child", assignee="default", parents=[parent])
++        kn.add_notify_sub(conn, task_id=child, platform="tui", chat_id="origin-chat")
++        kb._append_event(conn, child, "dependency_wait", {"reason": "parent"})
++        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (int(time.time()) - 3600, child))
++        conn.commit()
++        assert pu.sweep(conn) == 1
++        assert places == [parent]
++        places.clear()
++        assert pu.sweep(conn) == 0
++    assert places == []
++
++
++# --- gateway names ------------------------------------------------------------------------------------------------
++
++
++@pytest.fixture
++def hub_db(tmp_path, monkeypatch):
++    state = tmp_path / "hub-state"
++    state.mkdir()
++    monkeypatch.setenv("HERMES_HUB_STATE", str(state))
++    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(tmp_path / "absent.json"))
++    monkeypatch.setattr(kanban_origin, "_names_memo", None, raising=False)
++    db = sqlite3.connect(state / "hub.db")
++    db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
++    db.execute("CREATE TABLE replica (gw TEXT)")
++    db.execute("INSERT INTO meta VALUES ('gateway', 'hub')")
++    db.execute("INSERT INTO replica VALUES ('macbook')")
++    db.commit()
++    old = time.time() - 60
++    os.utime(state / "hub.db", (old, old))  # a settled file, as on a running host
++    yield db
++    db.close()
++
++
++def _opens(monkeypatch) -> list:
++    real, opened = kanban_origin._ro, []
++
++    def counted(path):
++        opened.append(str(path))
++        return real(path)
++
++    monkeypatch.setattr(kanban_origin, "_ro", counted)
++    return opened
++
++
++def test_gateway_names_opens_hub_db_once_for_a_pass_of_lookups(hub_db, monkeypatch):
++    opened = _opens(monkeypatch)
++    answers = [kanban_origin.gateway_names() for _ in range(200)]
++    assert all(a == ("hub", {"hub", "macbook"}) for a in answers)
++    assert len(opened) == 1, f"{len(opened)} hub.db opens for 200 lookups"
++    answers[0][1].add("mutated by a caller")
++    assert kanban_origin.gateway_names()[1] == {"hub", "macbook"}
++
++
++def test_gateway_names_sees_a_hub_db_write_at_once(hub_db, monkeypatch):
++    opened = _opens(monkeypatch)
++    assert kanban_origin.gateway_names() == ("hub", {"hub", "macbook"})
++    hub_db.execute("INSERT INTO replica VALUES ('mini')")
++    hub_db.commit()
++    assert kanban_origin.gateway_names() == ("hub", {"hub", "macbook", "mini"})
++    assert len(opened) == 2
++
++
++def test_gateway_names_rereads_after_the_age_bound_and_never_keeps_a_just_written_file(hub_db, monkeypatch):
++    opened = _opens(monkeypatch)
++    clock = [1000.0]
++    monkeypatch.setattr(kanban_origin.time, "monotonic", lambda: clock[0])
++    kanban_origin.gateway_names()
++    clock[0] += kanban_origin._NAMES_MAX_AGE_S + 0.1
++    kanban_origin.gateway_names()
++    assert len(opened) == 2
++    hub_db.execute("INSERT INTO replica VALUES ('mini')")
++    hub_db.commit()  # written inside the timestamp granularity: the answer is used once, not remembered
++    kanban_origin.gateway_names()
++    kanban_origin.gateway_names()
++    assert len(opened) == 4
+-- 
+2.43.0
+

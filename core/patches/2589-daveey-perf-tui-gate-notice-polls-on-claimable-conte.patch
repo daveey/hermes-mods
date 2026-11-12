@@ -1,0 +1,426 @@
+From e8d9f6bc54a625405850f74db1cedbd9d77b4692 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 09:02:40 +0000
+Subject: [PATCH] [daveey] perf(tui): gate notice polls on claimable content,
+ not every board commit
+
+The hub's tui-notif-poller threads used 11% of a core (10% of serve samples in
+_notif_poll_kanban) with nothing to deliver (t_01a1cee98b798343).
+
+Root cause: each chat's poller gated every board on PRAGMA data_version, and the
+main board commits ~40 times a minute with heartbeats, claims and run stamps that
+no poller reads. The gate opened on nearly every 5 s tick, so every live chat ran
+a full writable claim poll of every board. The remote half re-read and re-wrote
+the whole observation ledger (one SELECT per terminal card under BEGIN
+IMMEDIATE) on every replica commit, which a remote heartbeat also triggers.
+
+- notification_idle.board_signature: what a chat's poll could claim, i.e. the
+  newest deliverable-kind event id (AUTOINCREMENT, scanned incrementally) and the
+  chat's own tui subscription rows (cursor, in-flight mark). It is read once per
+  commit for every chat in the process. Bookkeeping commits and other chats'
+  subscription changes keep it. A table-less file still keys on data_version,
+  and an unreadable one is never unchanged. The quiet-board memo, the post-poll
+  board_quiet proof and the in-flight liveness retries are unchanged.
+- kanban_remote_observations._persist: observation rows are insert-once, so
+  first_seen is remembered per ledger file. A replica commit with no new
+  terminal state opens no ledger. Freshness values are identical, and a
+  restarted backend reads the same rows back.
+- _session_lineage: reuse a found chain for 30 s instead of opening state.db
+  per chat per tick. A chat not yet in the store is looked up again.
+
+Synthetic bench (9 chats, 1600 tui subs, heartbeat-only commit per tick):
+local 24.1 -> 4.4 ms CPU/tick and 270 -> 0 full polls; remote collect opens
+the ledger 30 -> 0 times.
+---
+ .../test_notification_content_gate.py         | 195 ++++++++++++++++++
+ tui_gateway/notification_idle.py              |  68 ++++++
+ tui_gateway/session_notifications.py          |  46 +++--
+ 3 files changed, 295 insertions(+), 14 deletions(-)
+ create mode 100644 tests/tui_gateway/test_notification_content_gate.py
+
+diff --git a/tests/tui_gateway/test_notification_content_gate.py b/tests/tui_gateway/test_notification_content_gate.py
+new file mode 100644
+index 0000000000..0c78f47b1a
+--- /dev/null
++++ b/tests/tui_gateway/test_notification_content_gate.py
+@@ -0,0 +1,195 @@
++"""The notice poller gates each board on what a chat's poll could claim, not on every commit (t_01a1cee98b798343).
++
++The main board commits ~40 times a minute with heartbeats, claims and run bookkeeping. A commit-revision gate
++(``PRAGMA data_version``) opened on nearly every 5 s tick, so every live chat re-ran a full writable claim poll
++of every board, and every chat's remote collect re-read the whole observation ledger, for nothing to deliver.
++"""
++import json
++import sqlite3
++import time
++from unittest.mock import patch
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from tui_gateway import notification_idle
++from tui_gateway import server
++
++CHAT = "tui-session-key-1"
++
++
++def _task(chat=CHAT):
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="notify tui", assignee="worker")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=chat)
++        return tid
++    finally:
++        conn.close()
++
++
++def _heartbeat(tid):
++    """What a live worker writes: the task's heartbeat clock and a heartbeat event row."""
++    conn = kbc.connect()
++    try:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?", (int(time.time()), tid))
++            kb._append_event(conn, tid, "heartbeat", None)
++    finally:
++        conn.close()
++
++
++def _complete(tid):
++    conn = kbc.connect()
++    try:
++        kb.complete_task(conn, tid, summary="all done")
++    finally:
++        conn.close()
++
++
++def _settled(*sessions):
++    for session in sessions:  # first poll records the signature; its own empty claim may move it once
++        assert server._collect_kanban_notifications(session) == []
++        assert server._collect_kanban_notifications(session) == []
++
++
++@pytest.fixture
++def full_polls(monkeypatch):
++    calls = []
++    real = server._kb_poll_board_now
++
++    def counted(*args, **kwargs):
++        calls.append(args[4])  # session_key
++        return real(*args, **kwargs)
++
++    monkeypatch.setattr(server, "_kb_poll_board_now", counted)
++    return calls
++
++
++def test_heartbeat_commit_does_not_repoll_the_board(full_polls):
++    tid = _task()
++    session = {"session_key": CHAT}
++    _settled(session)
++    full_polls.clear()
++    _heartbeat(tid)
++    _heartbeat(_task(chat="another-chat"))  # another chat's card: subscription insert + heartbeat
++    assert server._collect_kanban_notifications(session) == []
++    assert full_polls == []
++    _complete(tid)  # a deliverable event still re-polls and delivers exactly once
++    texts = server._collect_kanban_notifications(session)
++    assert len(texts) == 1 and tid in texts[0]
++    assert server._collect_kanban_notifications(session) == []
++
++
++def test_board_content_is_read_once_per_commit_for_every_chat(monkeypatch):
++    tid = _task()
++    sessions = [{"session_key": CHAT}, {"session_key": "chat-two"}, {"session_key": "chat-three"}]
++    _settled(*sessions)
++    reads = []
++    real = notification_idle._notify_content
++    monkeypatch.setattr(notification_idle, "_notify_content", lambda *a: reads.append(1) or real(*a))
++    _heartbeat(tid)
++    for session in sessions:
++        assert server._collect_kanban_notifications(session) == []
++    assert len(reads) == 1
++
++
++def test_own_cursor_rewind_repolls_and_redelivers(full_polls):
++    tid = _task()
++    session = {"session_key": CHAT}
++    _settled(session)
++    _complete(tid)
++    first = server._collect_kanban_notifications(session)
++    assert len(first) == 1
++    [sub] = [s for s in kbn.list_notify_subs(kbc.connect(), task_id=tid) if s["chat_id"] == CHAT]
++    assert server._collect_kanban_notifications(session) == []
++    full_polls.clear()
++    conn = kbc.connect()
++    try:  # a refused turn hands the range back: no new event, only this chat's cursor moves
++        assert kbn.rewind_notify_cursor(conn, task_id=tid, platform="tui", chat_id=CHAT,
++                                        claimed_cursor=sub["last_event_id"], old_cursor=0)
++    finally:
++        conn.close()
++    again = server._collect_kanban_notifications(session)
++    assert full_polls == [CHAT]
++    assert len(again) == 1 and tid in again[0]
++
++
++def test_foreign_in_flight_claim_keeps_polling(full_polls):
++    """Liveness retries for another holder's claim are unchanged: an in-flight row is never memoized quiet."""
++    tid = _task()
++    session = {"session_key": CHAT}
++    _settled(session)
++    conn = kbc.connect()
++    try:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE kanban_notify_subs SET inflight_from = 0, inflight_pid = 1 WHERE task_id = ?",
++                         (tid,))
++    finally:
++        conn.close()
++    full_polls.clear()
++    server._collect_kanban_notifications(session)
++    server._collect_kanban_notifications(session)
++    assert full_polls == [CHAT, CHAT]
++
++
++def test_unreadable_board_is_never_unchanged(tmp_path):
++    assert server._kb_board_file_sig(tmp_path / "missing.db", CHAT) is None
++
++
++# ---- remote collect -----------------------------------------------------------------------------------------
++
++def test_remote_heartbeat_does_not_reopen_the_observation_ledger(tmp_path, monkeypatch):
++    from tests.tui_gateway.test_kanban_remote_notices import _card, _hub
++    from tui_gateway import kanban_remote_notices as krn
++    from tui_gateway import kanban_remote_observations as obs
++    now = 1_800_000_000.0
++    done = _card("t_done_remote", CHAT, status="done", at=now - 60)
++    replica = _hub(tmp_path, [done])
++    with sqlite3.connect(replica) as conn:
++        conn.executemany("INSERT INTO meta VALUES (?,?)", [("cursor", "100"), ("head", "100")])
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks','default/default/t_live',?,2)",
++                     (json.dumps({"id": "t_live", "status": "running"}),))
++    ledger = tmp_path / "ledger.db"
++    krn._reset_for_tests()
++    first = obs.observe(replica, ledger, now)
++    assert first
++
++    opened = []
++    real = krn._ledger
++    monkeypatch.setattr(krn, "_ledger", lambda *a, **kw: opened.append(1) or real(*a, **kw))
++    with sqlite3.connect(replica) as conn:  # the owner's heartbeat on a running card moves the feed
++        conn.execute("UPDATE replica SET seq = 3, data = ? WHERE key = 'default/default/t_live'",
++                     (json.dumps({"id": "t_live", "status": "running", "hb": 1}),))
++    assert obs.observe(replica, ledger, now + 5) == first
++    assert opened == []
++
++    later = _card("t_later_remote", CHAT, status="done", at=now + 5)
++    with sqlite3.connect(replica) as conn:  # a new terminal state is recorded once, with the ledger's clock
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,4)", (later["key"], json.dumps(later["task"])))
++    fresh = obs.observe(replica, ledger, now + 10)
++    assert opened == [1]
++    assert {k: v for k, v in fresh.items() if k[1] != later["key"]} == first
++    with sqlite3.connect(ledger) as conn:
++        rows = conn.execute("SELECT ref, first_seen FROM observations ORDER BY ref").fetchall()
++    assert [ref for ref, _ in rows] == ["hub/default/default/t_done_remote", "hub/default/default/t_later_remote"]
++    assert dict(rows)["hub/default/default/t_later_remote"] == now + 10
++
++    krn._reset_for_tests()  # a restarted backend reads the same first_seen back from the ledger
++    assert obs.observe(replica, ledger, now + 20) == fresh
++
++
++def test_session_lineage_is_reused_between_polls(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session("root", "desktop")
++        db.create_session("fork", "desktop", parent_session_id="root")
++    assert server._session_lineage("fork") == ("root",)
++    with patch.object(sqlite3, "connect", side_effect=AssertionError("re-read state.db")):
++        assert server._session_lineage("fork") == ("root",)
++        server._lineage_memo.clear()
++        assert server._session_lineage("fork") == ()  # unreadable: no lineage, and nothing remembered
++    assert server._session_lineage("fork") == ("root",)
+diff --git a/tui_gateway/notification_idle.py b/tui_gateway/notification_idle.py
+index f086f18855..f0bc7f5212 100644
+--- a/tui_gateway/notification_idle.py
++++ b/tui_gateway/notification_idle.py
+@@ -7,6 +7,8 @@ from __future__ import annotations
+ 
+ import contextlib
+ import logging
++import threading
++from pathlib import Path
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -59,6 +61,72 @@ def board_quiet(path, session_key):
+         return False
+ 
+ 
++# [daveey] Board path -> (reader, data_version, events scanned up to, newest notify-kind event id, tui subs by
++# chat). data_version moves on every commit, and the main board commits ~40 times a minute with heartbeats,
++# claims and run bookkeeping that no chat poller reads, so a commit gate re-polled every board for every chat on
++# nearly every tick (t_01a1cee98b798343). What a chat's poll can claim is fixed by two inputs: the newest
++# deliverable-kind event id (AUTOINCREMENT, so any new one is above it) and that chat's own tui subscription
++# rows (cursor, in-flight mark). Read both once per commit for every chat in this process.
++_SIGS: dict[str, tuple] = {}
++_SIGS_LOCK = threading.Lock()
++_SIGS_MAX = 64
++
++
++def _notify_content(conn, version, held):
++    from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS
++    present = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
++                                          "('task_events', 'kanban_notify_subs')")}
++    if len(present) != 2:
++        return None  # not a board (yet): fall back to the commit revision
++    conn.execute("BEGIN")  # one snapshot for the event scan and the subscription rows
++    try:
++        top = int(conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0] or 0)
++        start, newest = (held[2], held[3]) if held is not None and held[2] <= top else (0, 0)
++        if top > start:
++            marks = ",".join("?" for _ in _KANBAN_NOTIFY_KINDS)
++            row = conn.execute(f"SELECT MAX(id) FROM task_events WHERE id > ? AND id <= ? AND kind IN ({marks})",
++                               (start, top, *_KANBAN_NOTIFY_KINDS)).fetchone()
++            newest = max(newest, int(row[0] or 0))
++        rows = conn.execute("SELECT chat_id, task_id, platform, thread_id, last_event_id, inflight_from "
++                            "FROM kanban_notify_subs WHERE LOWER(platform) = 'tui' "
++                            "ORDER BY chat_id, task_id, platform, thread_id").fetchall()
++    finally:
++        conn.execute("COMMIT")
++    by_chat: dict = {}
++    for row in rows:
++        by_chat.setdefault(row[0], []).append(tuple(row))
++    return conn, version, top, newest, {chat: tuple(subs) for chat, subs in by_chat.items()}
++
++
++def board_signature(path, chat_id=None):
++    """What a poll of ``path`` for ``chat_id`` could claim: equal signatures mean no new deliverable event and no
++    change to that chat's subscription rows, so a bookkeeping commit (heartbeat, claim of another card, run
++    stamps) keeps it. A board without the notify tables keys on its commit revision. Raises like any read."""
++    from hermes_cli.kanban_session_activity import cached_ro
++    key = str(path)
++    with cached_ro(Path(path)) as conn:
++        version = conn.execute("PRAGMA data_version").fetchone()[0]
++        with _SIGS_LOCK:
++            held = _SIGS.get(key)
++        if held is not None and held[0] is not conn:
++            held = None  # another reader (reopened, replaced file): its scan offsets prove nothing here
++        if held is None or held[1] != version:
++            held = _notify_content(conn, version, held)
++            if held is None:
++                return conn, version
++            with _SIGS_LOCK:
++                if len(_SIGS) >= _SIGS_MAX:
++                    _SIGS.clear()
++                _SIGS[key] = held
++    subs = held[4] if chat_id is None else held[4].get(chat_id, ())
++    return "notify", held[3], subs
++
++
++def reset_board_signatures() -> None:
++    with _SIGS_LOCK:
++        _SIGS.clear()
++
++
+ def state_revision(db):
+     """A retained read-only observer sees both this process's and foreign commits."""
+     from tui_gateway.kanban_replica_observer import fingerprint
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 36828d2e94..a997e95d51 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -667,12 +667,13 @@ def _kb_board_key(_kb, board_meta) -> tuple[str, str]:
+         return slug, f"slug:{slug}"
+ 
+ 
+-def _kb_board_file_sig(db_path) -> tuple | None:
+-    """A commit revision from a guarded retained reader (stat alone misses WAL publication)."""
+-    from hermes_cli.kanban_session_activity import cached_ro
++def _kb_board_file_sig(db_path, chat_id: str | None = None) -> tuple | None:
++    """What a poll of this board for ``chat_id`` could claim, read through a guarded retained reader once per
++    commit for every chat (``notification_idle.board_signature``): bookkeeping commits keep it, so they no
++    longer re-poll every board for every chat (t_01a1cee98b798343). Stat alone misses WAL publication."""
++    from tui_gateway.notification_idle import board_signature
+     try:
+-        with cached_ro(Path(db_path)) as conn:
+-            return conn, conn.execute("PRAGMA data_version").fetchone()[0]
++        return board_signature(db_path, chat_id)
+     except Exception:
+         logger.debug("Kanban revision unavailable", exc_info=True)
+         return None  # unreadable never means unchanged
+@@ -684,10 +685,11 @@ def _kb_poll_board(_kb, slug: str, session_key: str, claims: list | None = None,
+     writable unless it has a subscription owned by this exact session (a failed read-only probe — locked/corrupt DB —
+     falls through so delivery is preserved).
+ 
+-    *seen* (the session's ``{db path: file signature}``) skips a board whose files have not moved since this
+-    session's last completed poll: no commit means no new event to claim. 21 open chats each probing every board
+-    every 5 s, and opening it writable to re-claim nothing, kept the Desktop backend busy. The signature is taken
+-    before the poll, so a commit during it is polled again next tick."""
++    *seen* (the session's ``{db path: signature}``) skips a board where nothing this session could claim has
++    changed since its last completed poll (``_kb_board_file_sig``): no new deliverable event and no change to its
++    own subscription rows. 21 open chats each probing every board every 5 s, and opening it writable to re-claim
++    nothing, kept the Desktop backend busy. The signature is taken before the poll, so a commit during it is
++    polled again next tick."""
+     from hermes_cli import kanban_db_connect as _kbc
+     from hermes_cli import kanban_db_notify as _kbn
+     from hermes_cli.kanban_placement import is_placeholder_session
+@@ -701,7 +703,7 @@ def _kb_poll_board(_kb, slug: str, session_key: str, claims: list | None = None,
+     if seen is not None:
+         with contextlib.suppress(Exception):
+             db_path = str(_kb.kanban_db_path(board=slug))
+-            sig = _kb_board_file_sig(db_path)
++            sig = _kb_board_file_sig(db_path, session_key)
+         if reclaimed and sig is not None and seen.get(db_path) == (session_key, sig):
+             from hermes_constants import get_hermes_home
+             from tui_gateway.kanban_consumer_health import polled
+@@ -859,14 +861,25 @@ def _collect_kanban_notifications(session: dict, claims: list | None = None) ->
+     return texts + _collect_remote_kanban_notifications(session_key, claims)
+ 
+ 
++_LINEAGE_TTL_S = 30.0
++_lineage_memo: dict[tuple, tuple] = {}  # (state.db, session key) -> (monotonic at, lineage)
++
++
+ def _session_lineage(session_key: str, limit: int = 8) -> tuple:
+-    """Earlier ids of this chat (compaction parents): a remote card stays linked to the id that created it."""
++    """Earlier ids of this chat (compaction parents): a remote card stays linked to the id that created it.
++
++    Every live chat's poller asked for it every 5 s, opening state.db each time (t_01a1cee98b798343). A chat's
++    parents are set when it is created and only change on import or deletion repair, so a found chain is reused
++    for ``_LINEAGE_TTL_S``; a chat not yet in the store is looked up again on the next poll."""
++    from hermes_constants import get_hermes_home
++    path = Path(get_hermes_home()) / "state.db"
++    memo_key, now = (str(path), session_key), time.monotonic()
++    if (hit := _lineage_memo.get(memo_key)) is not None and now - hit[0] < _LINEAGE_TTL_S:
++        return hit[1]
+     out: list = []
++    found = False
+     with contextlib.suppress(Exception):
+         import sqlite3
+-        from pathlib import Path
+-        from hermes_constants import get_hermes_home
+-        path = Path(get_hermes_home()) / "state.db"
+         if not path.is_file():
+             return ()
+         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
+@@ -874,12 +887,17 @@ def _session_lineage(session_key: str, limit: int = 8) -> tuple:
+             sid = session_key
+             for _ in range(limit):
+                 row = conn.execute("SELECT parent_session_id FROM sessions WHERE id = ?", (sid,)).fetchone()
++                found = found or (row is not None and sid == session_key)
+                 if not row or not row[0] or row[0] in out:
+                     break
+                 sid = str(row[0])
+                 out.append(sid)
+         finally:
+             conn.close()
++    if found:
++        if len(_lineage_memo) >= 256:
++            _lineage_memo.clear()
++        _lineage_memo[memo_key] = (now, tuple(out))
+     return tuple(out)
+ 
+ 
+-- 
+2.43.0
+

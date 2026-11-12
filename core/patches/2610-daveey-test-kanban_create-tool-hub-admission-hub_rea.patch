@@ -1,0 +1,160 @@
+From 39f8c51e0c05c70ea6f9c961cbcad3ad5bcaf013 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:11:22 +0000
+Subject: [PATCH] [daveey] test kanban_create tool hub admission: hub_reason,
+ force_hub, machine:hub intent, remote hub pin
+
+---
+ tests/tools/test_kanban_hub_admission_tool.py | 140 ++++++++++++++++++
+ 1 file changed, 140 insertions(+)
+ create mode 100644 tests/tools/test_kanban_hub_admission_tool.py
+
+diff --git a/tests/tools/test_kanban_hub_admission_tool.py b/tests/tools/test_kanban_hub_admission_tool.py
+new file mode 100644
+index 0000000000..f2cb72d84c
+--- /dev/null
++++ b/tests/tools/test_kanban_hub_admission_tool.py
+@@ -0,0 +1,140 @@
++"""The kanban_create tool consults the hub admission judge on every hub-bound path. [daveey]
++
++Fake judge only (never a live model): hub auto create with ``hub_reason``, ``force_hub`` inside and
++outside a dispatcher worker, ``runs_on machine:hub`` keeping its explicit intent, and an explicit
++``placement="hub"`` from another gateway (denied = refused, nothing forwarded).
++"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_placement as placement
++from tests.hermes_cli import test_kanban_portable_reason_audit as audit_support
++from tests.hermes_cli.hub_judge_support import hub_judge
++from tools import kanban_tools as kt
++
++kanban_home = audit_support.kanban_home
++MARKED = "Read ~/.hermes/logs/agent.log on the hub"
++
++
++def _events(tid, kind="hub_admission"):
++    with kbc.connect() as conn:
++        return [e.payload for e in kb.list_events(conn, tid) if e.kind == kind]
++
++
++@pytest.fixture
++def synced(kanban_home):
++    """A board that syncs as primary, so ``runs_on`` rows exist."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as ksc
++    (kanban_home / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n  placement:\n"
++                                             "    worker_pools:\n      hub: [worker-1]\n")
++    kb.init_db()
++    with kbc.connect(kanban_home / "kanban.db") as db:
++        ksc.ensure_identity(db, "default", "hub")
++        sync.set_mode(db, "primary")
++    return kanban_home
++
++
++@pytest.fixture
++def on_gateway(kanban_home, monkeypatch, hub_judge):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
++    monkeypatch.setattr(kt, "_persisted_identity", lambda: "default")
++
++    def use(gateway):
++        monkeypatch.setattr(placement.reg, "self_gateway", lambda: gateway)
++        return hub_judge
++    return use
++
++
++@pytest.mark.parametrize("admit", [True, False])
++def test_tool_hub_auto_create_passes_hub_reason(on_gateway, admit):
++    judge = on_gateway("hub")
++    judge.admit_next = admit
++    result = json.loads(kt._handle_create({"title": MARKED, "requires": [],
++                                           "hub_reason": "needs the hub's signed-in Chrome"}))
++    assert result.get("ok"), result
++    assert [c["hub_reason"] for c in judge.calls] == ["needs the hub's signed-in Chrome"]
++    (event,) = _events(result["task_id"])
++    assert event["admit"] is admit
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, result["task_id"])
++    if admit:
++        assert task.placement_policy is None
++    else:
++        assert task.placement_policy == "worker-first-v1"
++        assert "hub:write" in task.requires
++
++
++@pytest.mark.parametrize("variable", ["HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK"])
++def test_tool_force_hub_refused_inside_worker(on_gateway, monkeypatch, variable):
++    judge = on_gateway("hub")
++    monkeypatch.setenv(variable, "t_parent")
++    result = json.loads(kt._handle_create({"title": MARKED, "requires": [], "force_hub": True}))
++    assert not result.get("ok")
++    assert "force_hub" in json.dumps(result)
++    assert judge.calls == []
++    with kbc.connect() as conn:
++        assert kb.list_tasks(conn) == []
++
++
++def test_tool_force_hub_outside_worker_recorded(on_gateway):
++    judge = on_gateway("hub")
++    result = json.loads(kt._handle_create({"title": MARKED, "requires": [], "force_hub": True}))
++    assert result.get("ok"), result
++    assert judge.calls == []
++    (event,) = _events(result["task_id"])
++    assert event["forced"] is True and event["admit"] is True
++    with kbc.connect() as conn:
++        assert kb.get_task(conn, result["task_id"]).placement_policy is None
++
++
++@pytest.mark.parametrize("admit", [True, False])
++def test_tool_runs_on_machine_hub_keeps_explicit_intent(synced, on_gateway, monkeypatch, admit):
++    from hermes_cli import kanban_sync_runstate as runstate
++    from hermes_cli import kanban_worker_node as wn
++    judge = on_gateway("hub")
++    judge.admit_next = admit
++    monkeypatch.setattr(runstate, "explicit_runs_on", lambda conn, value, courier=False: value)
++    monkeypatch.setattr(runstate, "stranded_create", lambda *a, **kw: "")
++    monkeypatch.setattr(wn, "check_machine_pins", lambda *a, **kw: None)
++    result = json.loads(kt._handle_create({"title": "Rotate the Board admin key", "requires": [],
++                                           "runs_on": ["machine:hub"]}))
++    assert len(judge.calls) == 1, result
++    with kbc.connect() as conn:
++        tasks = kb.list_tasks(conn)
++        if admit:
++            assert result.get("ok"), result
++            row = conn.execute("SELECT runs_on FROM tasks WHERE id=?", (result["task_id"],)).fetchone()
++            assert json.loads(row[0]) == ["machine:hub"]
++        else:
++            assert not result.get("ok") and tasks == []
++            assert result.get("hub_admission", {}).get("admit") is False
++
++
++@pytest.mark.parametrize("admit", [True, False])
++def test_tool_placement_hub_from_another_gateway(on_gateway, monkeypatch, admit):
++    import functools
++    judge = on_gateway("mac")
++    judge.admit_next = admit
++    sent = []
++
++    def fake_remote(view, **kw):
++        sent.append((view, kw["target"]))
++        return {"ok": True, "request_id": "req-1", "queued_only": True}
++    monkeypatch.setattr(placement, "create_remote", fake_remote)
++    # The hub is live and carries every option, so routing (not liveness) decides.
++    monkeypatch.setattr(placement, "decide", functools.partial(placement.decide, live=lambda _: None, carries=True))
++    result = json.loads(kt._handle_create({"title": "Rotate the Board admin key", "requires": [],
++                                           "placement": "hub"}))
++    assert len(judge.calls) == 1, (result, sent)
++    with kbc.connect() as conn:
++        assert kb.list_tasks(conn) == []  # never a local copy
++    if admit:
++        assert [target for _, target in sent] == ["hub"]
++    else:
++        assert sent == [] and not result.get("ok")
++        assert result["hub_admission"]["admit"] is False
+-- 
+2.43.0
+

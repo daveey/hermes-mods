@@ -1,0 +1,103 @@
+From 4d99051caf03414edba34ba6f5ab3f1b29b38b41 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:02:54 +0000
+Subject: [PATCH] [daveey] kanban: carried-input pool routes fail closed
+ without a sync identity; denied-card queue reads carried-stripped text
+
+Review t_01a1cf5d174a7018 on PR 1347 @5bd32bf723 (after rebase onto abec81ec81):
+- without_carried_inputs returns early when the text has no carried-path token, so
+  portability under worker_queue/heavy_route=pool:* never reads the machine registry.
+- _label_members fails closed (None) when registry() raises, e.g. SyncUnavailable from
+  load_identity on a gateway with no sync identity (crashed CLI create in
+  test_kanban_hub_admission_entry/placement worker_queue tests).
+- hub admission pool_route passes cfg to required_labels, like queue_decision.
+
+Proof: 3 new tests in tests/hermes_cli/test_kanban_pool_carried_inputs.py fail with the
+source reverted and pass after (15/15); each change has a killing mutant (3/3).
+22 kanban placement / pool / carried / hub-admission / worker-node files: 998 passed.
+---
+ hermes_cli/kanban_carried_evidence.py         |  7 ++++-
+ hermes_cli/kanban_hub_admission_placement.py  |  2 +-
+ .../test_kanban_pool_carried_inputs.py        | 31 +++++++++++++++++++
+ 3 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_carried_evidence.py b/hermes_cli/kanban_carried_evidence.py
+index e8169f3f8c..2ca566b1c9 100644
+--- a/hermes_cli/kanban_carried_evidence.py
++++ b/hermes_cli/kanban_carried_evidence.py
+@@ -21,7 +21,10 @@ PATH_TOKEN = re.compile(r"(?<![\w/])(?:/home/[^/\s`\"']+|~)/\.hermes/kanban/(?:e
+ def _label_members(labels: set[str]) -> set[str] | None:
+     """Every registry machine carrying any of ``labels``; None (fail closed) when unreadable or a label is empty."""
+     from hermes_cli import kanban_worker_node as wn
+-    snapshot = wn.registry()
++    try:
++        snapshot = wn.registry()
++    except Exception:  # health: allow BLE001 -- no sync identity (SyncUnavailable) or broken registry: fail closed
++        return None
+     machines = snapshot.get("machines") if isinstance(snapshot, dict) else None
+     if not isinstance(machines, dict):
+         return None
+@@ -43,6 +46,8 @@ def without_carried_inputs(text: str, cfg: dict) -> str:
+     worker cannot silently make the exemption apply to an unprovisioned host.
+     The card must itself pin the matching SHA256. Other markers stay visible.
+     """
++    if not PATH_TOKEN.search(text):
++        return text  # nothing to exempt, so never resolve destinations (the registry) for it
+     pools = cfg.get("worker_pools") or {}
+     routes = cfg.get("heavy_route") or {}
+     if not isinstance(pools, dict) or not isinstance(routes, dict):
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index 2afacb5d7c..e1973834c4 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -399,7 +399,7 @@ def pool_route(args, cfg, gateway, audit, requires, *, queue=True, machine_ok=No
+     from hermes_cli.kanban_worker_placement import POLICY, QUEUED_WHY, WAITING
+ 
+     label = kp._Cfg(cfg).queue_label(gateway) if queue else None
+-    extra = coordination.required_labels({**args, "requires": requires}) if label else None
++    extra = coordination.required_labels({**args, "requires": requires}, cfg) if label else None
+     if label and extra is not None and (machine_ok or kp._machine_picks_up)(label):
+         out = {"where": "local", "runs_on": [label, *sorted(extra - {label})],
+                "why": QUEUED_WHY.format(label=label), "hub_admission": audit}
+diff --git a/tests/hermes_cli/test_kanban_pool_carried_inputs.py b/tests/hermes_cli/test_kanban_pool_carried_inputs.py
+index b1ac8059aa..c4260acd63 100644
+--- a/tests/hermes_cli/test_kanban_pool_carried_inputs.py
++++ b/tests/hermes_cli/test_kanban_pool_carried_inputs.py
+@@ -120,3 +120,34 @@ def test_legacy_heavy_route_reads_the_same_text(carried):
+     d = kp.decide(args, cfg={"heavy_route": {"hub": "worker-1"}}, self_gw="hub")
+     assert d["where"] == "local" and d["runs_on"] == ["machine:worker-1"], d
+     assert coord.legacy_refusal(args, {}) is True  # uncovered: the path's tool name still counts
++
++
++# --- rebase onto hub-admission worker_queue (abec81ec81): no sync identity, and the denied-card queue path -------
++
++def _no_identity():
++    from hermes_cli import kanban_sync_client as ksc
++    raise ksc.SyncUnavailable("no sync identity")
++
++
++def test_registry_without_sync_identity_fails_closed(carried, monkeypatch):
++    """``registry()`` raises ``SyncUnavailable`` before its fetch try on a gateway with no sync identity."""
++    wn.set_registry_fetch(None)
++    monkeypatch.setattr("hermes_cli.kanban_sync_client.load_identity", _no_identity)
++    assert ce.without_carried_inputs(carried["body"], {"worker_queue": {"hub": POOL}}) == carried["body"]
++
++
++def test_text_without_carried_path_never_reads_the_registry(monkeypatch):
++    calls = []
++    monkeypatch.setattr(wn, "registry", lambda: calls.append(1))  # counted, since _label_members swallows raises
++    body = "Implement the approved plan."
++    assert ce.without_carried_inputs(body, {"worker_queue": {"hub": POOL}}) == body
++    assert kp.portable_reason({"title": "Implement plan", "body": body}, {"worker_queue": {"hub": POOL}}) is None
++    assert calls == []
++
++
++def test_denied_card_queue_labels_skip_a_verified_carried_path(carried):
++    from hermes_cli import kanban_hub_admission_placement as hap
++    cfg = {"worker_queue": {"hub": POOL}, "worker_pools": {"hub": ["worker-1", "worker-2"]}}
++    args = {"title": "Implement plan", "body": carried["body"], "assignee": "default"}
++    out = hap.pool_route(args, cfg, "hub", {}, None, machine_ok=lambda _: True)
++    assert out["runs_on"] == [POOL], out
+-- 
+2.43.0
+

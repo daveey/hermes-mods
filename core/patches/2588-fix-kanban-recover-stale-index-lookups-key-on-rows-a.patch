@@ -1,0 +1,178 @@
+From bfd43c991224e004c1eb7c6276d24b397c5c86f6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 09:25:30 +0000
+Subject: [PATCH] fix(kanban-recover): stale-index lookups key on rows actually
+ inserted, not scan output [daveey]
+
+A damaged leaf with garbage cell pointers can make a scan return rows with
+arbitrary rowids. Such a row usually fails NOT NULL and INSERT OR IGNORE drops
+it; when its rowid equals a deleted row a stale index entry still lists, the
+old `listed - set(rows)` skipped that rowid's point lookup, so it was never
+marked stale and _fill_from_backup resurrected the deleted row. `recovered`
+also counted the dropped row.
+
+_salvage_table now inserts into dst itself, then point-looks-up every listed
+rowid dst lacks (inserting a clean hit, marking a clean miss stale), and
+reports the rows actually inserted. Regression test injects a NULL garbage
+row with a deleted rowid into the scan output (RED before, GREEN after).
+---
+ hermes_cli/kanban_db_recover.py            | 57 ++++++++++++----------
+ tests/hermes_cli/test_kanban_db_recover.py | 38 +++++++++++++++
+ 2 files changed, 69 insertions(+), 26 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_recover.py b/hermes_cli/kanban_db_recover.py
+index 912968cb5d..bc52070e6c 100644
+--- a/hermes_cli/kanban_db_recover.py
++++ b/hermes_cli/kanban_db_recover.py
+@@ -308,20 +308,23 @@ def _table_indexes(conn: sqlite3.Connection, table: str) -> list[tuple[str, bool
+ Listed = dict[str, tuple[list[str], dict[int, tuple]]]
+ 
+ 
+-def _salvage_table(src: sqlite3.Connection, table: str, sql: Optional[str]
+-                   ) -> tuple[dict[Any, tuple], list[str], int, Listed, set[int]]:
+-    """Every readable row of ``table``: ``(rows by key, column names, failed read paths, listed)``.
+-    The key is the rowid (or the whole row for WITHOUT ROWID tables). ``listed`` maps each index to
+-    the rowids it still lists (with the index's key columns, for the report): a covering scan reads
+-    only the index b-tree, so it names rows whose table page may be unreadable. The last element
+-    holds listed rowids a point lookup found cleanly absent (no read error): stale index entries
+-    of deleted rows, dropped from ``listed`` so they are never filled back in from a backup."""
++def _salvage_table(src: sqlite3.Connection, dst: sqlite3.Connection, table: str, sql: Optional[str]
++                   ) -> tuple[int, list[str], int, Listed, set[int]]:
++    """Copy every readable row of ``table`` into ``dst``: ``(rows inserted, column names, failed read
++    paths, listed, stale)``. ``listed`` maps each index to the rowids it still lists (with the index's
++    key columns, for the report): a covering scan reads only the index b-tree, so it names rows whose
++    table page may be unreadable. ``stale`` holds listed rowids a point lookup found cleanly absent (no
++    read error): stale index entries of deleted rows, dropped from ``listed`` so they are never filled
++    back in from a backup. The lookups cover every listed rowid ``dst`` lacks after the scans' insert,
++    not those the scans missed: a damaged leaf can make a scan return a garbage row with any rowid,
++    which the insert then drops (NOT NULL), and keying on scan output would let that hide a stale
++    entry and make the backup fill resurrect the deleted row."""
+     try:
+         columns = [str(r[1]) for r in src.execute(f"PRAGMA table_info({_q(table)})")]
+     except sqlite3.DatabaseError:
+         columns = []
+     if not columns:
+-        return {}, [], 1, {}, set()
++        return 0, [], 1, {}, set()
+     cols = ", ".join(_q(c) for c in columns)
+     rowid = not _is_without_rowid(sql)
+     rows: dict[Any, tuple] = {}
+@@ -342,6 +345,14 @@ def _salvage_table(src: sqlite3.Connection, table: str, sql: Optional[str]
+                 rows.setdefault(row[0], row[1:])
+             else:
+                 rows.setdefault(row, row)
++    names = ", ".join(_q(c) for c in columns)
++    if rowid:
++        insert = f"INSERT OR IGNORE INTO {_q(table)} (rowid, {names}) VALUES ({', '.join('?' * (len(columns) + 1))})"
++        inserted = dst.executemany(insert, [(k, *v) for k, v in rows.items()]).rowcount
++    else:
++        insert = f"INSERT OR IGNORE INTO {_q(table)} ({names}) VALUES ({', '.join('?' * len(columns))})"
++        inserted = dst.executemany(insert, list(rows.values())).rowcount
++    inserted = max(inserted, 0)
+     listed: Listed = {}
+     stale: set[int] = set()
+     if rowid:
+@@ -351,18 +362,21 @@ def _salvage_table(src: sqlite3.Connection, table: str, sql: Optional[str]
+             order = ", ".join(_q(c) for c in icols)
+             got, _ = _read_rows(src, f"SELECT rowid, {order} FROM {_q(table)} INDEXED BY {_q(index)} ORDER BY {order}")
+             listed[index] = (icols, {int(r[0]): tuple(r[1:]) for r in got if isinstance(r[0], int)})
+-        # Point lookups for every listed row no scan produced: a scan that stops on a damaged page
+-        # can also drop the row it was holding, while a lookup reaches any intact leaf directly.
+-        for rid in sorted({rid for _cols, entries in listed.values() for rid in entries} - set(rows)):
++        # Point lookups for every listed row the insert did not produce: a scan that stops on a damaged
++        # page can drop the row it was holding, and a garbage scan row can take a listed rowid and then
++        # fail the insert, while a lookup reaches any intact leaf directly.
++        have = {r[0] for r in dst.execute(f"SELECT rowid FROM {_q(table)}")}
++        for rid in sorted({rid for _cols, entries in listed.values() for rid in entries} - have):
+             got, stopped = _read_rows(src, f"{select} WHERE rowid = ?", (rid,))
+             if not got and not stopped:
+                 stale.add(rid)
+-            for row in got:
+-                rows.setdefault(row[0], row[1:])
++            found = [(rid, *row[1:]) for row in got if row[0] == rid][:1]
++            if found:
++                inserted += max(dst.executemany(insert, found).rowcount, 0)
+         for _cols, entries in listed.values():
+             for rid in stale:
+                 entries.pop(rid, None)
+-    return rows, columns, failed, listed, stale
++    return inserted, columns, failed, listed, stale
+ 
+ 
+ def _healthy_fill_source(db_path: Path, exclude: set[Path]) -> Optional[Path]:
+@@ -422,21 +436,12 @@ def _build(snapshot: Path, out: Path, fill: Optional[Path], result: RecoveryResu
+             dst.execute(str(sql))
+         listed_by_table: dict[str, Listed] = {}
+         for name, sql in tables:
+-            rows, columns, failed, listed, stale = _salvage_table(src, name, sql)
++            inserted, _columns, failed, listed, stale = _salvage_table(src, dst, name, sql)
+             listed_by_table[name] = listed
+             loss = result.tables.setdefault(name, TableLoss())
+             loss.unreadable_paths = failed
+             loss.stale_index_entries = len(stale)
+-            if not columns:
+-                continue
+-            names = ", ".join(_q(c) for c in columns)
+-            if _is_without_rowid(sql):
+-                dst.executemany(f"INSERT OR IGNORE INTO {_q(name)} ({names}) VALUES ({', '.join('?' * len(columns))})",
+-                                list(rows.values()))
+-            else:
+-                dst.executemany(f"INSERT OR IGNORE INTO {_q(name)} (rowid, {names}) "
+-                                f"VALUES ({', '.join('?' * (len(columns) + 1))})", [(k, *v) for k, v in rows.items()])
+-            loss.recovered = len(rows)
++            loss.recovered = inserted
+         if fill is not None:
+             _fill_from_backup(dst, fill, tables, listed_by_table, result)
+         # Lost: rowids an index still lists that neither the salvage nor the fill produced.
+diff --git a/tests/hermes_cli/test_kanban_db_recover.py b/tests/hermes_cli/test_kanban_db_recover.py
+index f6e51b8bd1..42c543f85a 100644
+--- a/tests/hermes_cli/test_kanban_db_recover.py
++++ b/tests/hermes_cli/test_kanban_db_recover.py
+@@ -430,6 +430,44 @@ def test_stale_index_entries_of_deleted_rows_are_not_filled_back_in(home):
+     assert after == before
+ 
+ 
++def test_garbage_scan_row_with_a_deleted_rowid_does_not_hide_its_stale_index_entry(home, monkeypatch):
++    """A damaged leaf can make a scan parse garbage cells and return rows with arbitrary rowids. One that
++    lands on a deleted row's rowid (still listed by a stale index entry) and fails NOT NULL is dropped by the
++    insert; it must not skip that rowid's stale lookup, so the backup fill can't resurrect the deleted row."""
++    path = home / "kanban.db"
++    _make_board(path)
++    shutil.copy2(path, path.with_name(path.name + ".corrupt.0123456789abcdef.bak"))
++    conn = sqlite3.connect(path)
++    deleted = [r[0] for r in conn.execute("SELECT id FROM task_events ORDER BY id DESC LIMIT 40")]
++    ncols = len(conn.execute("PRAGMA table_info(task_events)").fetchall())
++    conn.close()
++    _delete_behind_the_indexes(path, deleted)
++    before = _payloads(path)
++    lost = _damage_table(path, "task_events")
++    assert not set(lost) & set(deleted)
++    victim = deleted[0]
++    real_read, injected = rec._read_rows, []
++
++    def read_with_garbage(conn, sql, params=()):
++        rows, stopped = real_read(conn, sql, params)
++        if sql.startswith("SELECT rowid,") and "task_events" in sql and not params and "INDEXED BY" not in sql:
++            injected.append(sql)
++            rows = rows + [(victim, *([None] * ncols))]  # every column NULL: NOT NULL drops it on insert
++        return rows, stopped
++
++    monkeypatch.setattr(rec, "_read_rows", read_with_garbage)
++    result = rec.recover(path, file_card=False, reconcile_sync=False)
++
++    assert injected, "the scan paths were not intercepted"
++    assert result.status == "recovered", result.reason
++    events = result.tables["task_events"]
++    after = _payloads(path)
++    assert victim not in after, "a deleted row came back from the backup behind a garbage scan row"
++    assert after == before
++    assert events.stale_index_entries >= len(deleted)
++    assert events.recovered == len(before) - len(lost), "recovered counts rows that were never inserted"
++
++
+ def test_writes_during_every_pass_install_nothing(home, monkeypatch):
+     """A board written through all rebuild passes is left as is (status contended), never overwritten."""
+     path = home / "kanban.db"
+-- 
+2.43.0
+

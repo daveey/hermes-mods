@@ -1,0 +1,241 @@
+From f5ed8c97f97acdfe39a186edbe1fb770ea8e1070 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:09:40 +0000
+Subject: [PATCH] fix(kanban): an unused Board grant does not spend a parked
+ owner's review continuation [daveey]
+
+resumes_review, the owner-wake hold release and the guard notice selected the
+card's newest run row (MAX(id)). A Board grant returned unused adds a newer
+'released' row that ran nothing, so a finished exact-head review no longer
+resumed its owner and active_pr held it until the PR merged. They now use
+latest_started_run, as the ordering-dependency handoff has since 6e0d3134b35.
+Any started, failed or unattested run still consumes the continuation.
+---
+ hermes_cli/kanban_core_update_requeue.py      |   5 -
+ hermes_cli/kanban_dependency_review.py        |  13 +--
+ hermes_cli/kanban_dependency_review_notice.py |   8 +-
+ hermes_cli/kanban_hold_release.py             |  13 +--
+ ...t_kanban_dependency_review_unused_grant.py | 102 ++++++++++++++++++
+ 5 files changed, 121 insertions(+), 20 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_dependency_review_unused_grant.py
+
+diff --git a/hermes_cli/kanban_core_update_requeue.py b/hermes_cli/kanban_core_update_requeue.py
+index 1b67e4283d..c37356d78c 100644
+--- a/hermes_cli/kanban_core_update_requeue.py
++++ b/hermes_cli/kanban_core_update_requeue.py
+@@ -19,7 +19,6 @@ have opened a PR it had not yet reported. The next run sees the requeued run's t
+ from __future__ import annotations
+ 
+ import sqlite3
+-from typing import Optional
+ 
+ CORE_UPDATE_REQUEUE_REASON = "hermes-sync core update: restart-safe worker requeue"
+ 
+@@ -65,7 +64,3 @@ def latest_run_skipping_requeues(conn: sqlite3.Connection, task_id: str, *, skip
+         return run
+     return None
+ 
+-
+-def latest_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+-    run = latest_run_skipping_requeues(conn, task_id, skip_unused_grants=False)
+-    return None if run is None else run["id"]
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index e77d25c4fa..2985d8917b 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -340,19 +340,20 @@ def resumes_review(conn, task_id, pr_urls, *, discharged=()):
+     """One continuation only: claiming any new run consumes the park's permission
+     (a hermes-sync core-update requeue does not: :mod:`kanban_core_update_requeue`)."""
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_core_update_requeue import latest_run_id
++    from hermes_cli.kanban_core_update_requeue import latest_run_skipping_requeues
+     from hermes_cli.kanban_db_dispatch_pr_policy import norm_pr
+ 
+-    # Latest run passing over core-update requeues: that pause is not the consuming claim
+-    # (2026-11-12: t_01a1ce8aff1f09c1 held after an exact-head APPROVE). [daveey]
++    # The park must be the card's latest run that executed. Passed over: a core-update
++    # requeue (that pause is not the consuming claim; 2026-11-12: t_01a1ce8aff1f09c1 held
++    # after an exact-head APPROVE) and a Board grant returned unused (it ran nothing). [daveey]
++    latest = latest_run_skipping_requeues(conn, task_id, skip_unused_grants=True)
+     row = conn.execute(
+         "SELECT e.payload, e.created_at, r.*, t.assignee "
+         "FROM task_events e JOIN task_runs r ON r.id = e.run_id "
+         "JOIN tasks t ON t.id = e.task_id "
+         "WHERE e.task_id = ? AND e.kind = 'dependency_wait' AND r.task_id = t.id "
+-        "AND r.id IS ? "
+-        "ORDER BY e.id DESC LIMIT 1", (task_id, latest_run_id(conn, task_id)),
+-    ).fetchone()
++        "AND r.id = ? ORDER BY e.id DESC LIMIT 1", (task_id, latest["id"]),
++    ).fetchone() if latest is not None else None
+     if row is None or row["outcome"] != "blocked" or row["profile"] != row["assignee"]:
+         return False
+     payload = kb._json_dict(row["payload"])
+diff --git a/hermes_cli/kanban_dependency_review_notice.py b/hermes_cli/kanban_dependency_review_notice.py
+index 7742ee85f7..26f1bcc6e2 100644
+--- a/hermes_cli/kanban_dependency_review_notice.py
++++ b/hermes_cli/kanban_dependency_review_notice.py
+@@ -10,13 +10,15 @@ def finished_review_hold(conn, task_id):
+     """
+     from hermes_cli import kanban_db as kb
+ 
++    from hermes_cli.kanban_core_update_requeue import latest_run_skipping_requeues
++    # Same run the guard reads: not a core-update requeue, not an unused Board grant.
++    latest = latest_run_skipping_requeues(conn, task_id, skip_unused_grants=True)
+     row = conn.execute(
+         "SELECT e.payload, e.created_at, r.* FROM task_events e "
+         "JOIN task_runs r ON r.id=e.run_id WHERE e.task_id=? "
+         "AND e.kind='dependency_wait' AND r.task_id=e.task_id "
+-        "AND r.id=(SELECT MAX(id) FROM task_runs WHERE task_id=e.task_id) "
+-        "ORDER BY e.id DESC LIMIT 1", (task_id,),
+-    ).fetchone()
++        "AND r.id=? ORDER BY e.id DESC LIMIT 1", (task_id, latest["id"]),
++    ).fetchone() if latest is not None else None
+     if row is None:
+         return ""
+     evidence = kb._json_dict(row["payload"]).get("review_checkpoint")
+diff --git a/hermes_cli/kanban_hold_release.py b/hermes_cli/kanban_hold_release.py
+index 04b39f3674..df5b375fa5 100644
+--- a/hermes_cli/kanban_hold_release.py
++++ b/hermes_cli/kanban_hold_release.py
+@@ -19,15 +19,16 @@ def _identity(row):
+ 
+ 
+ def _park(conn, task_id):
+-    from hermes_cli.kanban_core_update_requeue import latest_run_id
+-    # Latest run passing over core-update requeues: that pause is not a newer run. [daveey]
++    from hermes_cli.kanban_core_update_requeue import latest_run_skipping_requeues
++    # Latest run that executed: a core-update requeue is a pause, not a newer run, and an
++    # unused Board grant ran nothing. [daveey]
++    latest = latest_run_skipping_requeues(conn, task_id, skip_unused_grants=True)
+     row = conn.execute(
+         "SELECT e.payload, e.created_at, r.*, t.assignee FROM task_events e "
+         "JOIN task_runs r ON r.id=e.run_id JOIN tasks t ON t.id=e.task_id "
+         "WHERE e.task_id=? AND e.kind='dependency_wait' AND r.task_id=t.id "
+-        "AND r.id IS ? "
+-        "ORDER BY e.id DESC LIMIT 1", (task_id, latest_run_id(conn, task_id)),
+-    ).fetchone()
++        "AND r.id=? ORDER BY e.id DESC LIMIT 1", (task_id, latest["id"]),
++    ).fetchone() if latest is not None else None
+     if row is None or row["outcome"] != "blocked" or row["profile"] != row["assignee"]:
+         raise ValueError("hold release requires latest orderly owner park")
+     payload = kb._json_dict(row["payload"])
+@@ -137,7 +138,7 @@ def released_after(conn, task_id, since, pr_urls):
+     """A receipt older than any claim, or tied with publication, grants nothing."""
+     from hermes_cli.kanban_core_update_requeue import latest_run_skipping_requeues
+     from hermes_cli.kanban_wake_check import foreign_copy
+-    run = latest_run_skipping_requeues(conn, task_id, skip_unused_grants=False)
++    run = latest_run_skipping_requeues(conn, task_id, skip_unused_grants=True)
+     if run is None:
+         return False
+     urls = {norm_pr(u) for u in pr_urls}
+diff --git a/tests/hermes_cli/test_kanban_dependency_review_unused_grant.py b/tests/hermes_cli/test_kanban_dependency_review_unused_grant.py
+new file mode 100644
+index 0000000000..6bac30cc68
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dependency_review_unused_grant.py
+@@ -0,0 +1,102 @@
++"""A Board grant returned unused must not spend a parked owner's review continuation.
++
++The ordering-parent path already ignores such grants (test_kanban_dependency_unused_grant);
++a review parent routes through ``resumes_review``, the guard notice and the owner-wake
++hold release, which each looked at the card's newest run row.
++"""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from hermes_cli import kanban_dependency_review as review
++from hermes_cli import kanban_hold_release as hold
++from hermes_cli.kanban_dependency_review_notice import finished_review_hold
++from tests.hermes_cli import test_kanban_dependency_pr_handoff as helpers
++from tests.hermes_cli.test_kanban_dependency_unused_grant import release_unused
++
++board = helpers.board
++PR = helpers.PR
++HEAD = "b" * 40
++
++
++def parked_on_review(conn, monkeypatch, *, metadata=None):
++    """Owner publishes its PR, parks on a review card, and the review finishes."""
++    task, run, clock = helpers.park(conn, monkeypatch, finish=False)
++    parent = kb.parent_ids(conn, task)[0]
++    clock[0] += 10
++    kb.claim_task(conn, parent)
++    reviewer_run = kb.get_task(conn, parent).current_run_id
++    body = {"verdict": "request_changes", "reviewed_pr": PR, "reviewed_sha": HEAD} if metadata is None else metadata
++    assert kb.complete_task(conn, parent, summary="Review complete", expected_run_id=reviewer_run, metadata=body)
++    kb.recompute_ready(conn)
++    assert kb.get_task(conn, task).status == "ready"
++    return task, run, clock
++
++
++def test_fixture_resumes_without_a_grant(board, monkeypatch):
++    task, _, _ = parked_on_review(board, monkeypatch)
++    assert review.resumes_review(board, task, [PR])
++    assert prs.active_pr_reason(board, task, int(time.time())) is None
++
++
++def test_unused_grants_preserve_review_continuation(board, monkeypatch, all_assignees_spawnable):
++    task, _, clock = parked_on_review(board, monkeypatch)
++    release_unused(board, task, clock)
++    release_unused(board, task, clock)
++    assert review.resumes_review(board, task, [PR])
++    assert prs.active_pr_reason(board, task, int(time.time())) is None
++    launched = []
++    result = dispatch.dispatch_once(board, spawn_fn=lambda task, workspace, **kwargs: launched.append(task.id) or 123456789)
++    assert task in launched, result
++    # The real claim consumes the one continuation.
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++
++
++@pytest.mark.parametrize("evidence", ["worker_bound", "spawned", "crashed", "reclaimed", "timed_out", "heartbeat"])
++def test_used_or_failed_grant_still_consumes_review_continuation(board, monkeypatch, evidence):
++    task, _, clock = parked_on_review(board, monkeypatch)
++    release_unused(board, task, clock, evidence=evidence)
++    assert not review.resumes_review(board, task, [PR])
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++
++
++def test_release_without_unused_receipt_still_consumes_review_continuation(board, monkeypatch):
++    task, _, clock = parked_on_review(board, monkeypatch)
++    release_unused(board, task, clock, unused=False)
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++
++
++def test_guard_notice_describes_the_park_behind_an_unused_grant(board, monkeypatch):
++    # A short head is not exact, so the owner stays held; the notice must still name the
++    # refused predicate instead of going silent because the newest run row is a bare grant.
++    task, _, clock = parked_on_review(
++        board, monkeypatch, metadata={"verdict": "request_changes", "reviewed_pr": PR, "reviewed_sha": "b59783b8"})
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++    before = finished_review_hold(board, task)
++    assert "exact_head refused" in before
++    release_unused(board, task, clock)
++    assert finished_review_hold(board, task) == before
++
++
++def test_hold_release_scope_and_receipt_survive_an_unused_grant(board, monkeypatch):
++    task, run, clock = parked_on_review(board, monkeypatch)
++    release_unused(board, task, clock)
++    row, captured, proofs = hold._scope(board, task)
++    assert row["id"] == run and proofs
++    clock[0] += 1
++    with kb.write_txn(board):
++        kb._append_event(board, task, "hold_released", {
++            "via": "owner-wake-hold-release", "supervisor": "s", "supervisor_board": "b",
++            "park": hold._identity(row), "prs": sorted(captured), "reviews": proofs,
++            "scope": "one_continuation", "merge_authorized": False})
++    clock[0] += 1
++    published = clock[0] - 100
++    assert hold.released_after(board, task, published, [PR])
++    release_unused(board, task, clock)
++    assert hold.released_after(board, task, published, [PR])
++    # A started run consumes the receipt.
++    release_unused(board, task, clock, evidence="spawned")
++    assert not hold.released_after(board, task, published, [PR])
+-- 
+2.43.0
+

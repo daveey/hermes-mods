@@ -1,0 +1,286 @@
+From c2b89eb678a49cb1f77a77b625dab85150e9726f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:22:02 +0000
+Subject: [PATCH] [daveey] fix(update): an agent cron turn no longer refuses
+ every instant checkpoint of its run
+
+A cron_cut instant update tolerates confirmed Kanban workers plus the cron runs it
+cuts. An agent cron job (kanban-hub-pin-sweep, hourly, ~11 min) also executes its
+turn on the session owner, so the gateway total counted it twice: once as the
+scheduler run and once as an authority turn. checkpoint_for_update then saw one
+unit of unknown work and refused every attempt for the whole run.
+
+hermes-hub 2026-11-12 10:36-10:39Z: six refused update runs, each with the
+gateway reporting exactly one unit more than managed Kanban sessions + cron runs
+(10 vs 7+2, 9 vs 6+2); the passing runs at 10:51, 11:05 and 11:14 had no agent
+cron in flight and matched exactly.
+
+cron_turn_count() counts executing authority turns whose frozen policy source is
+cron, each session once and only in a bucket the total counts; an unreadable
+policy is not a cron turn (fail closed). The checkpoint verb and the restart
+wait's Kanban/cron cap add it under a cron_cut intent only.
+---
+ gateway/run_shutdown_restart_wait.py       | 14 +++-
+ gateway/session_runtime_workers.py         | 30 ++++++++
+ gateway/update_checkpoint.py               |  6 +-
+ tests/gateway/test_core_update_cron_cut.py | 15 ++++
+ tests/gateway/test_cron_turn_count.py      | 83 ++++++++++++++++++++++
+ tests/gateway/test_update_checkpoint.py    | 18 +++++
+ 6 files changed, 161 insertions(+), 5 deletions(-)
+ create mode 100644 tests/gateway/test_cron_turn_count.py
+
+diff --git a/gateway/run_shutdown_restart_wait.py b/gateway/run_shutdown_restart_wait.py
+index 3af28602ce..431d7557ca 100644
+--- a/gateway/run_shutdown_restart_wait.py
++++ b/gateway/run_shutdown_restart_wait.py
+@@ -17,7 +17,7 @@ from contextlib import suppress
+ from pathlib import Path
+ from typing import Optional
+ 
+-from gateway.session_runtime_workers import kanban_managed_count
++from gateway.session_runtime_workers import cron_turn_count, kanban_managed_count
+ 
+ # Only the update's post-grace Kanban wait: human turns retain their normal budget.
+ CORE_UPDATE_KANBAN_WAIT_S = 15.0
+@@ -52,7 +52,7 @@ class GatewayRestartWaitMixin:
+         Each cut run is logged with its job id and start time; its next tick reruns it.
+         """
+         kanban = kanban_managed_count(self) if intent is not None else 0
+-        cron = self._restart_wait_cron_counts()["awaitable"] if self._intent_cuts_cron(intent) else 0
++        cron = self._cut_cron_count(intent)
+         if kanban + cron <= 0 or self._awaitable_work_count() != kanban + cron:
+             return None, False
+         since = now if since is None else since
+@@ -83,11 +83,19 @@ class GatewayRestartWaitMixin:
+         if intent is None or not intent.exists():
+             return
+         # Under a "cron_cut" intent the cron runs were cut with the cards (t_01a18dbde9f8b2f0).
+-        cron = self._restart_wait_cron_counts()["awaitable"] if self._intent_cuts_cron(intent) else 0
++        cron = self._cut_cron_count(intent)
+         if self._awaitable_work_count() > kanban_managed_count(self) + cron:
+             return
+         self._stop_kanban_leash_s = CORE_UPDATE_KANBAN_STOP_LEASH_S
+ 
++    def _cut_cron_count(self, intent: Optional[Path]) -> int:
++        """Awaitable work a ``cron_cut`` intent cuts: the awaitable cron runs plus the agent turns
++        those runs execute on this owner (``cron_turn_count``), which the total counts again as
++        turns; 0 without such an intent."""
++        if not self._intent_cuts_cron(intent):
++            return 0
++        return self._restart_wait_cron_counts()["awaitable"] + cron_turn_count(self)
++
+     def _intent_cuts_cron(self, intent: Optional[Path]) -> bool:
+         """The update intent says cron runs in flight are cut, not awaited (``"cron_cut": true``). Read per
+         intent (re-read each poll: tiny file); a missing or unreadable intent never cuts."""
+diff --git a/gateway/session_runtime_workers.py b/gateway/session_runtime_workers.py
+index 21742c5670..f508a0e405 100644
+--- a/gateway/session_runtime_workers.py
++++ b/gateway/session_runtime_workers.py
+@@ -46,6 +46,36 @@ def kanban_managed_count(runner):
+                for worker in getattr(authority, '_managed_workers', {}).values())
+ 
+ 
++def cron_turn_count(runner):
++    """Executing authority turns of scheduled-job sessions (frozen policy source ``cron``).
++
++    An agent cron fire runs its turn on the owner (``session_cron.operation('submit')``), so the
++    work total counts it once as the scheduler's cron run and once more as this authority turn
++    (``_running_agents``, a managed worker or an unmapped executing session). A ``cron_cut``
++    update cuts that turn with its run; callers that tolerate cut cron runs add this count, or an
++    hourly agent cron refuses every checkpoint for its whole run [daveey]. A session counts once and
++    only when a bucket of the total counts it (never more than the total holds for it); a policy
++    that cannot be read is not a cron turn, so the turn stays awaited (fail closed).
++    """
++    from gateway.session_policy import policy_for_source
++    running = getattr(runner, '_running_agents', {})
++    count = 0
++    for authority in all_authorities(runner):
++        workers = getattr(authority, '_managed_workers', {})
++        sids = {sid for sid, live, _generation in executing_sessions(authority)
++                if live.route in running or sid not in workers}
++        sids.update(sid for sid, worker in list(workers.items()) if not worker.closed.is_set())
++        sessions = getattr(authority, 'sessions', {})
++        for sid in sids:
++            live = sessions.get(sid)
++            try:
++                policy = policy_for_source(runner, getattr(live, 'source', None))
++            except Exception:  # health: allow BLE001 -- unreadable policy: not provably a cron turn, stays awaited
++                continue
++            count += getattr(policy, 'source', None) == 'cron'
++    return count
++
++
+ def managed_worker_units(authority):
+     """One ``active_work`` entry per live managed worker of *authority*: its session and its own process."""
+     return [{'kind': 'managed', 'session': sid, 'pid': (worker.worker or (worker.process.pid,))[0]}
+diff --git a/gateway/update_checkpoint.py b/gateway/update_checkpoint.py
+index 686d652352..578377ecad 100644
+--- a/gateway/update_checkpoint.py
++++ b/gateway/update_checkpoint.py
+@@ -15,7 +15,7 @@ from hermes_constants import get_default_hermes_root, get_hermes_home
+ from hermes_cli import admission_fence
+ from gateway.cron_pause import preserve_cron_slots
+ from gateway.status import _pid_exists
+-from gateway.session_runtime_workers import kanban_managed_count
++from gateway.session_runtime_workers import cron_turn_count, kanban_managed_count
+ from gateway.run_shutdown_restart_wait import CORE_UPDATE_KANBAN_WAIT_S, CORE_UPDATE_KANBAN_STOP_LEASH_S
+ 
+ CHECKPOINT_PAUSE = True
+@@ -99,7 +99,9 @@ def checkpoint_for_update(runner, loop, params):
+             if not state["held"] or not set(state["reservation_ids"]).issubset(known):
+                 return
+             from gateway.run_active_work_verb import _delegation_units
+-            cron = runner._active_cron_job_count() if intent.get("cron_cut") is True else 0
++            # A cut cron run includes its agent turn on this owner (``cron_turn_count``).
++            cron = (runner._active_cron_job_count() + cron_turn_count(runner)
++                    if intent.get("cron_cut") is True else 0)
+             if (_delegation_units(time.time())
+                     or runner._active_work_count() != kanban_managed_count(runner) + cron):
+                 return
+diff --git a/tests/gateway/test_core_update_cron_cut.py b/tests/gateway/test_core_update_cron_cut.py
+index 3b55a0d7c3..2dd935fe5b 100644
+--- a/tests/gateway/test_core_update_cron_cut.py
++++ b/tests/gateway/test_core_update_cron_cut.py
+@@ -60,6 +60,21 @@ async def test_cron_cut_intent_caps_the_cron_wait_and_logs_each_cut(monkeypatch,
+     assert 'job1' in cut[1]
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize('cron_cut, turns, waited', [(True, 1, 15), (False, 1, 1800), (True, 0, 1800)])
++async def test_cron_cut_also_caps_the_agent_turn_of_a_restart_safe_cron_run(monkeypatch, tmp_path, cron_cut,
++                                                                           turns, waited):
++    """An agent cron run in a restart-safe worker is not awaitable itself, but its turn on this owner is
++    counted as work (hermes-hub 2026-11-12 10:36Z: kanban-hub-pin-sweep). A cron cut covers that turn;
++    a plain intent, or a unit that is not a cron turn, keeps the full wait."""
++    body = {'pid': 1, 'kind': 'unfenced', **({'cron_cut': True} if cron_cut else {})}
++    runner = _runner(tmp_path, monkeypatch, body, cron=0, kanban=1, chat=1)
++    monkeypatch.setattr(wait, 'cron_turn_count', lambda _: turns, raising=False)
++    clock = _virtual_clock(monkeypatch)
++    assert await runner._await_active_work_before_restart() is False
++    assert waited <= clock[0] < waited + 0.2, f'waited {clock[0]}s'
++
++
+ @pytest.mark.asyncio
+ async def test_plain_intent_still_waits_for_cron(monkeypatch, tmp_path):
+     runner = _runner(tmp_path, monkeypatch, {'pid': 1, 'kind': 'unfenced'}, cron=1)
+diff --git a/tests/gateway/test_cron_turn_count.py b/tests/gateway/test_cron_turn_count.py
+new file mode 100644
+index 0000000000..78341d7c7a
+--- /dev/null
++++ b/tests/gateway/test_cron_turn_count.py
+@@ -0,0 +1,83 @@
++"""``cron_turn_count``: the agent turns of cron runs, counted exactly where the work total counts them.
++
++A ``cron_cut`` core update cuts cron runs; an agent cron's turn runs on the owner, so the total holds it
++once as the scheduler run and once as a turn. Callers add this count to the cut cron work, so it must
++never exceed what the total holds for those sessions (an overcount would waive unknown work).
++"""
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import session_policy
++from gateway.session_runtime_workers import cron_turn_count, uncounted_runtime_work
++
++
++class _Task:
++    def done(self):
++        return False
++
++
++def _live(sid, source, *, executing=True):
++    stream = SimpleNamespace(execution={"execution_generation": 1} if executing else {})
++    return SimpleNamespace(route=f"route-{sid}", source=source, task=_Task(), event_stream=stream)
++
++
++def _worker(*, closed=False):
++    event = threading.Event()
++    if closed:
++        event.set()
++    return SimpleNamespace(closed=event)
++
++
++@pytest.fixture
++def policies(monkeypatch):
++    """source -> frozen policy; a source mapped to an exception makes the policy unreadable."""
++    table = {}
++
++    def lookup(runner, source):
++        value = table.get(source)
++        if isinstance(value, Exception):
++            raise value
++        return value
++    monkeypatch.setattr(session_policy, "policy_for_source", lookup)
++    return table
++
++
++def _runner(sessions, workers=None, running=()):
++    authority = SimpleNamespace(sessions=sessions, _managed_workers=workers or {},
++                                _mutation_tasks={}, _side_agents={})
++    return SimpleNamespace(session_authority=authority, _running_agents={r: object() for r in running})
++
++
++def test_in_process_cron_turn_counts_once(policies):
++    policies["cron-src"] = SimpleNamespace(source="cron")
++    policies["chat-src"] = SimpleNamespace(source="gui")
++    runner = _runner({"c": _live("c", "cron-src"), "d": _live("d", "chat-src")})
++    assert cron_turn_count(runner) == 1
++
++
++def test_cron_turn_in_running_agents_or_managed_worker_counts_once(policies):
++    policies["cron-src"] = SimpleNamespace(source="cron")
++    policies["card-src"] = SimpleNamespace(source="kanban")
++    sessions = {"a": _live("a", "cron-src"), "b": _live("b", "cron-src"), "k": _live("k", "card-src")}
++    runner = _runner(sessions, workers={"b": _worker(), "k": _worker()}, running=["route-a"])
++    assert cron_turn_count(runner) == 2
++
++
++def test_never_counts_what_the_total_does_not(policies):
++    """A closed worker still executing and outside ``_running_agents`` is in no bucket of the total;
++    an idle cron session is not work either."""
++    policies["cron-src"] = SimpleNamespace(source="cron")
++    sessions = {"closed": _live("closed", "cron-src"), "idle": _live("idle", "cron-src", executing=False)}
++    runner = _runner(sessions, workers={"closed": _worker(closed=True)})
++    assert uncounted_runtime_work(runner) == 0
++    assert cron_turn_count(runner) == 0
++
++
++def test_unreadable_policy_is_not_a_cron_turn(policies):
++    from hermes_state_runtime import RuntimeStoreError
++    policies["broken"] = RuntimeStoreError("storage_unavailable")
++    policies["cron-src"] = SimpleNamespace(source="cron")
++    runner = _runner({"x": _live("x", "broken"), "c": _live("c", "cron-src")})
++    assert cron_turn_count(runner) == 1
+diff --git a/tests/gateway/test_update_checkpoint.py b/tests/gateway/test_update_checkpoint.py
+index abd00d62fa..1d02ff418e 100644
+--- a/tests/gateway/test_update_checkpoint.py
++++ b/tests/gateway/test_update_checkpoint.py
+@@ -105,6 +105,24 @@ def test_unknown_work_in_callback_is_not_tolerated(checkpoint):
+     runner.request_restart.assert_not_called()
+ 
+ 
++@pytest.mark.parametrize("cron_cut, turns, accepted", [
++    (True, 1, True),    # the agent turn of the cut cron run: cut with it
++    (False, 1, False),  # no cron cut: the turn is awaited like any work
++    (True, 0, False),   # the extra unit is not a cron turn: unknown work stays refused
++])
++def test_agent_cron_turn_is_cut_with_its_run(checkpoint, monkeypatch, cron_cut, turns, accepted):
++    """hermes-hub 2026-11-12 10:36-10:39Z: an hourly agent cron (kanban-hub-pin-sweep) counted once as
++    its scheduler run and once as its owner turn, so every checkpoint of its 11-minute run was refused."""
++    module, home, runner, intent = checkpoint
++    intent["cron_cut"] = cron_cut
++    (home / "core-update/intent").write_text(json.dumps(intent))
++    runner._active_work_count = lambda: 3  # 1 Kanban card + 1 cron run + its agent turn
++    runner._active_cron_job_count = lambda: 1
++    monkeypatch.setattr(module, "cron_turn_count", lambda r: turns, raising=False)
++    assert bool(invoke(module, runner)["pausing"]) is accepted
++    assert runner.request_restart.called is accepted
++
++
+ def test_reservation_added_before_callback_is_rechecked(checkpoint):
+     module, home, runner, _intent = checkpoint
+     reservations = []
+-- 
+2.43.0
+

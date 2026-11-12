@@ -1,0 +1,156 @@
+From 5eb572abd91668333a409a40d20f08d24664b713 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 09:31:23 +0000
+Subject: [PATCH] [daveey] perf(kanban): recent-done memo reads unkeyed boards;
+ shared links slugs count on every board
+
+Review 5872045494 on PR #1322:
+- memoized(): a board_memo_key failure (unopenable board's stat fallback) skipped the attention read; now the
+  board is read without the memo and never cached.
+- kanban_links_narrow.remember: a slug two boards share (boards/default vs kanban.db) counts as read on both.
+- test_kanban_remote_inventory_cache: the stub row is remote, so the fixture board is one the projection never
+  reads; the store change is now a ledger commit, and an unrelated board commit is asserted to keep the entry.
+
+Refs: t_01a1cee98aaa8db1
+---
+ hermes_cli/kanban_links_narrow.py             |  8 ++--
+ .../kanban_session_activity_recent_done.py    |  9 ++++-
+ .../test_kanban_incremental_refresh.py        | 37 +++++++++++++++++++
+ .../test_kanban_remote_inventory_cache.py     | 16 ++++++--
+ 4 files changed, 63 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_links_narrow.py b/hermes_cli/kanban_links_narrow.py
+index 6253a1dd98..ad83d8f7e2 100644
+--- a/hermes_cli/kanban_links_narrow.py
++++ b/hermes_cli/kanban_links_narrow.py
+@@ -32,7 +32,9 @@ def remember(entry: tuple, project: Callable, board_paths: Iterable[Any], slug_o
+         _read.pop(entry[1], None)
+     if not getattr(project, DECLARES_BOARD_READS, False):
+         return entry
+-    paths = {slug_of(p): str(p) for p in board_paths}
++    paths: dict[str, set[str]] = {}
++    for p in board_paths:  # a slug two boards share (boards/default vs kanban.db) counts as read on both
++        paths.setdefault(slug_of(p), set()).add(str(p))
+     read: set[str] = set()
+     for row in entry[4]:
+         try:
+@@ -41,10 +43,10 @@ def remember(entry: tuple, project: Callable, board_paths: Iterable[Any], slug_o
+         except (KeyError, TypeError):
+             return entry  # unknown shape: exact fingerprint only
+         if local and board in paths:
+-            read.add(paths[board])
++            read.update(paths[board])
+     with _lock:
+         _read.pop(entry[1], None)
+-        _read[entry[1]] = (entry, frozenset(read), frozenset(paths.values()))
++        _read[entry[1]] = (entry, frozenset(read), frozenset(p for ps in paths.values() for p in ps))
+         while len(_read) > 64:
+             del _read[next(iter(_read))]
+     return entry
+diff --git a/hermes_cli/kanban_session_activity_recent_done.py b/hermes_cli/kanban_session_activity_recent_done.py
+index fcc18836b6..78df2f668e 100644
+--- a/hermes_cli/kanban_session_activity_recent_done.py
++++ b/hermes_cli/kanban_session_activity_recent_done.py
+@@ -59,7 +59,14 @@ def memoized(path: Path, since: float, read: Callable[[Path, float], list[tuple[
+     """``read(path, since)``, served from this scope's last read of the board while its ``memo_key`` is unchanged and
+     ``since`` is no earlier than that read's. Returns fresh card dicts (callers and checks may hold them)."""
+     slot = (scope, str(path))
+-    key = memo_key(path)  # before the read: a commit during it moves the key for the next call
++    try:
++        key = memo_key(path)  # before the read: a commit during it moves the key for the next call
++    except sqlite3.Error:
++        # No key vouches for a memo row (unopenable/vanished board): read as before, never cache, and let the
++        # read decide whether this board counts.
++        with _memo_lock:
++            _memo.pop(slot, None)
++        return read(path, since)
+     with _memo_lock:
+         hit = _memo.get(slot)
+     if hit is not None and hit[0] == key and since >= hit[1]:
+diff --git a/tests/hermes_cli/test_kanban_incremental_refresh.py b/tests/hermes_cli/test_kanban_incremental_refresh.py
+index 2affbf5c31..0986495e8f 100644
+--- a/tests/hermes_cli/test_kanban_incremental_refresh.py
++++ b/tests/hermes_cli/test_kanban_incremental_refresh.py
+@@ -221,3 +221,40 @@ def test_recent_done_memo_drops_rows_past_a_later_cutoff(boards):
+     assert len(calls) == 2
+     rd.memoized(path, now - 300, read, lambda p: ("revision", 2))  # a moved key: read
+     assert len(calls) == 3
++
++
++def test_recent_done_memo_key_failure_reads_without_caching(boards):
++    """A board whose memo key can't be taken (unopenable, vanished) is still read, and never cached."""
++    import sqlite3
++
++    from hermes_cli import kanban_session_activity_recent_done as rd
++
++    calls: list = []
++
++    def read(path, since):
++        calls.append(since)
++        return [("s", {"id": "x", "completed_at": since + 1})]
++
++    def broken(_path):
++        raise sqlite3.OperationalError("unable to open database file")
++
++    path = boards[0][0]
++    assert [c["id"] for _, c in rd.memoized(path, 1.0, read, broken)] == ["x"]
++    assert [c["id"] for _, c in rd.memoized(path, 1.0, read, broken)] == ["x"]
++    assert len(calls) == 2
++
++
++def test_links_narrow_counts_a_shared_slug_as_read_on_every_board():
++    entry = (0.0, ("scope",), (("p1", 1), ("p2", 1), ("p3", 1)), [],
++             [{"gateway": "g", "profile": "d", "origin_gateway": "g", "origin_profile": "d", "board": "default"}])
++    narrow.reset()
++
++    def project():
++        return None
++
++    setattr(project, narrow.DECLARES_BOARD_READS, True)
++    slugs = {"p1": "default", "p2": "default", "p3": "other"}
++    narrow.remember(entry, project, ["p1", "p2", "p3"], lambda p: slugs[p])
++    assert narrow.matches(entry, (("p1", 1), ("p2", 1), ("p3", 2)))  # only the unread board moved
++    assert not narrow.matches(entry, (("p1", 1), ("p2", 2), ("p3", 1)))  # the second "default" board moved
++    narrow.reset()
+diff --git a/tests/hermes_cli/test_kanban_remote_inventory_cache.py b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+index a640e70af7..f8d0c0b53a 100644
+--- a/tests/hermes_cli/test_kanban_remote_inventory_cache.py
++++ b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+@@ -54,12 +54,23 @@ def test_unchanged_stores_share_one_projection(projection):
+     assert calls['n'] == 1
+ 
+ 
++def _write_ledger(board):
++    """Commit to the origin ledger, a store every projection reads. (The stub row is remote, so the local board is
++    one this projection never read: kanban_links_narrow keeps the projection across that board's commits.)"""
++    with sqlite3.connect(board.parent / 'kanban/origin-ledger.db') as db:
++        db.execute('CREATE TABLE IF NOT EXISTS bump (n INTEGER)')
++        db.execute('INSERT INTO bump VALUES (1)')
++
++
+ def test_a_store_change_reprojects(projection):
+     calls, board = projection
+     activity._remote_links()
+-    with sqlite3.connect(board) as db:
++    with sqlite3.connect(board) as db:  # a board no row of this projection reads
+         db.execute("INSERT INTO tasks VALUES ('t_two', 'ready')")
+     activity._remote_links()
++    assert calls['n'] == 1
++    _write_ledger(board)
++    activity._remote_links()
+     assert calls['n'] == 2
+ 
+ 
+@@ -79,8 +90,7 @@ def test_stale_ok_readers_never_wait_for_a_rebuild(projection):
+     first = activity._remote_links(stale_ok=True)
+     gate = threading.Event()
+     calls['gate'] = gate  # the next projection is held open
+-    with sqlite3.connect(board) as db:
+-        db.execute("INSERT INTO tasks VALUES ('t_two', 'ready')")
++    _write_ledger(board)
+     try:
+         for _ in range(5):  # one rebuild running and held; every read still returns at once
+             started = _time.monotonic()
+-- 
+2.43.0
+

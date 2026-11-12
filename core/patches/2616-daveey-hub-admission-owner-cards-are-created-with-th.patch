@@ -1,0 +1,424 @@
+From a7c5d5202445d6351bf15606ace3fda870435e27 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 09:13:03 +0000
+Subject: [PATCH] [daveey] hub admission: owner cards are created with the
+ judged text; replayed couriers reuse their landing
+
+Review t_01a1ced25af29218: relay-time owner verdicts judge the hub's own local-owner text (shared builder) and store it on the route, so the probe creates exactly that card; a stored verdict runs the judge's full validation and a failed check is a final deny, not a retry; only a hub home is judged at relay time, the verdict event is recorded where the owner lands, and an owner sent to the hub is judged by the hub's own create; a re-applied courier request reuses its stored placement (no second judge, no conflict); the hub CLI receive path judges without the origin's placement note; the unreachable placement_policy branch is gone.
+---
+ hermes_cli/kanban_capability_routing.py       | 55 ++++++++--------
+ hermes_cli/kanban_hub_admission.py            | 24 ++++---
+ hermes_cli/kanban_hub_admission_placement.py  | 58 +++++++++++++----
+ tests/test_kanban_hub_admission_entry.py      | 10 +++
+ tests/test_kanban_hub_admission_relay.py      | 62 +++++++++++++++++--
+ tests/tools/test_kanban_hub_admission_tool.py | 21 +++++++
+ tools/kanban_tools_placement.py               |  2 +-
+ 7 files changed, 177 insertions(+), 55 deletions(-)
+
+diff --git a/hermes_cli/kanban_capability_routing.py b/hermes_cli/kanban_capability_routing.py
+index 135b07e17b..fb74822da0 100644
+--- a/hermes_cli/kanban_capability_routing.py
++++ b/hermes_cli/kanban_capability_routing.py
+@@ -364,18 +364,18 @@ def _park_relay(conn, task_id: str, needs: list[str], *, reason: str, gateway: s
+                "generation": generations.get(n, 1), "relay": mode, "relayed_at": int(now), "from_gateway": me}
+               for n in needs]
+     ids = ",".join(r["request_id"] for r in routes)
+-    # [daveey] Judge the owner card at relay time, never in the wait-check probe that applies the relay:
+-    # the home may route it to the hub, and the probe's own 30 s timeout cannot hold a 30 s judge call.
++    # [daveey] An owner card lands on the hub only when the hub is the card's home and holds the need
++    # (_local_owner there). Judge exactly that card's text now, never in the wait-check probe that
++    # applies the relay (its 30 s timeout cannot hold a 30 s judge call), and store the judged text
++    # on the route so the probe creates that very card. A non-hub home makes no model call (a hub
++    # it routes to judges on its own create). The verdict event is recorded only where it lands.
+     from hermes_cli.kanban_hub_admission_placement import owner_verdict
+     waiting = kb.get_task(conn, task_id)
+-    relay_board = kb.get_current_board() or "default"
+-    if waiting is not None and not conn.in_transaction:
++    if waiting is not None and mode == RELAY_HOME and _is_hub_gateway(gateway) and not conn.in_transaction:
+         for r in routes:
+-            owner_title = redact_sensitive_text(
+-                f"Capability owner: {r['need']} for {gateway}/{task_id} ({(waiting.title or '')[:80]})", force=True)
+-            r["hub_admission"] = owner_verdict(
+-                owner_title, owner_body(waiting, r["need"], self_gw=gateway, board=relay_board, reason=reason),
+-                need=r["need"])
++            r["owner_title"], r["owner_body"] = local_owner_text(waiting, r["need"], self_gw=gateway,
++                                                                 from_gw=me, reason=reason)
++            r["hub_admission"] = owner_verdict(r["owner_title"], r["owner_body"], need=r["need"])
+     until = datetime.fromtimestamp(int(now) + WAKE_HORIZON, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+     if mode == RELAY_HOME:
+         summary = (f"relayed {', '.join(needs)} to {gateway}, this card's home gateway: {me} is a Board worker "
+@@ -399,10 +399,6 @@ def _park_relay(conn, task_id: str, needs: list[str], *, reason: str, gateway: s
+             "awaiting": [{"kind": "card", "ref": f"{gateway}/request/{r['request_id']}",
+                           "why": f"capability {r['need']} ({mode} relay)"} for r in routes],
+         })
+-        for r in routes:
+-            if r.get("hub_admission"):
+-                kb._append_event(conn, task_id, "hub_admission", {**r["hub_admission"], "relay": mode,
+-                                                                  "request_id": r["request_id"]})
+         ok = ktp.park(conn, task_id, reason=park_reason, requested_kind="capability", source_status=source,
+                       expected_run_id=expected_run_id, wake_check=wake_check, check_every=WAKE_EVERY,
+                       awaiting={"kind": "card", "ref": routes[0]["request_id"], "gateway": gateway,
+@@ -815,17 +811,8 @@ def _apply_relay(conn, task, entry: dict, payload: dict, *, now: Optional[float]
+     body = owner_body(task, need, self_gw=self_gw, board=board, reason=reason)
+     argv = [_hub_cli(), "create-task", gw, title, "--body", body, "--assignee", _owner_assignee(),
+             "--origin-session", "", "--id", rid, *_overlap_option_argv(None, overlap_exclusions(conn, task.id))]
+-    if _is_hub_gateway(gw):
+-        from hermes_cli.kanban_hub_admission_placement import gate_owner, stored_owner_verdict
+-        audit = stored_owner_verdict(entry, title, body)
+-        if audit is None:  # no usable relay-time verdict: fail retryably, the worker re-relays (re-judged)
+-            return _relay_fail(conn, task.id, entry, "hub_admission_unavailable",
+-                               f"owner card for {need} was not sent to the hub: no hub admission verdict was "
+-                               "recorded at relay time (judge unavailable). Route the need again to retry.")
+-        gate_owner(conn, task.id, title, body, need=need, audit=audit)
+-        if not audit["admit"]:
+-            return _relay_fail(conn, task.id, entry, "hub_admission_denied",
+-                               f"owner card for {need} was not sent to the hub: hub admission denied ({audit['why']})")
++    # [daveey] An owner sent to the hub is judged there, on this exact text, by its own create
++    # (hermes kanban create's admission preflight), outside this probe's timeout.
+     rc, out = _create_task(argv)
+     if rc not in (0, 3):
+         if age < RELAY_RETRY_S:
+@@ -842,11 +829,11 @@ def _apply_relay(conn, task, entry: dict, payload: dict, *, now: Optional[float]
+     return 1, f"{rid} sent to {gw} (relayed from {from_gw})"
+ 
+ 
+-def _local_owner(conn, task, entry: dict, *, need: str, rid: str, self_gw: str, from_gw: str,
+-                 reason: str) -> tuple[int, str]:
+-    """The waiting card's own gateway holds the need: the owner card is a local card pinned to this machine."""
+-    from hermes_cli import kanban_db as kb
++def local_owner_text(task, need: str, *, self_gw: str, from_gw: str, reason: str) -> tuple[str, str]:
++    """Title and body of the owner card the waiting card's own gateway opens for ``need``.
+ 
++    Shared by the relay-time judge and :func:`_local_owner`, so the judged text is the card's text.
++    """
+     excerpt = redact_sensitive_text((reason or "").strip(), force=True)[:3000]
+     title = redact_sensitive_text(f"Capability owner: {need} for {task.id} ({(task.title or '')[:80]})", force=True)
+     body = (
+@@ -869,12 +856,24 @@ def _local_owner(conn, task, entry: dict, *, need: str, rid: str, self_gw: str,
+         f"{task.id} is parked on this card: completing it wakes {task.id} within about {WAKE_EVERY // 60} min, "
+         f"and it resumes on {from_gw}.\n"
+     )
++    return title, body
++
++
++def _local_owner(conn, task, entry: dict, *, need: str, rid: str, self_gw: str, from_gw: str,
++                 reason: str) -> tuple[int, str]:
++    """The waiting card's own gateway holds the need: the owner card is a local card pinned to this machine."""
++    from hermes_cli import kanban_db as kb
++
++    title, body = local_owner_text(task, need, self_gw=self_gw, from_gw=from_gw, reason=reason)
+     own = _own_gateway(conn)
+     if _is_hub_gateway(self_gw) or (own and _is_hub_gateway(own)):
+         # [daveey] The hub holds the need: the owner stays here only if admitted; a denied owner
+         # enrolls in the worker pool with the hub-write requirement (Board: capability:hub-write).
++        # The card is created with exactly the text judged at relay time.
+         from hermes_cli.kanban_hub_admission_placement import gate_owner, stored_owner_verdict
+         from hermes_cli.kanban_worker_placement import POLICY
++        if isinstance(entry.get("owner_title"), str) and isinstance(entry.get("owner_body"), str):
++            title, body = entry["owner_title"], entry["owner_body"]
+         audit = stored_owner_verdict(entry, title, body)
+         if audit is None:  # never judged inside this probe; never a permanent route either
+             return _relay_fail(conn, task.id, entry, "hub_admission_unavailable",
+diff --git a/hermes_cli/kanban_hub_admission.py b/hermes_cli/kanban_hub_admission.py
+index 08772db2ea..25455a3a25 100644
+--- a/hermes_cli/kanban_hub_admission.py
++++ b/hermes_cli/kanban_hub_admission.py
+@@ -45,28 +45,32 @@ def _skill():
+     return body, hashlib.sha256(text.encode()).hexdigest()
+ 
+ 
+-def _parse(text, fields, hub_reason, sha):
+-    invalid = Verdict(why="invalid admission verdict", skill_sha=sha)
+-    try:
+-        result = json.loads(text)
+-    except (ValueError, TypeError):
+-        return invalid
++def validated(result, fields, hub_reason, sha):
++    """The Verdict for a well-formed, evidence-checked ``{admit, need, evidence, why}`` dict, else None."""
+     if not isinstance(result, dict) or set(result) != {"admit", "need", "evidence", "why"}:
+-        return invalid
++        return None
+     if (type(result["admit"]) is not bool or not isinstance(result["evidence"], str)
+             or not isinstance(result["why"], str) or not result["why"].strip()):
+-        return invalid
++        return None
+     need = result["need"]
+     if need is not None and (not isinstance(need, str) or need not in NEEDS):
+-        return invalid
++        return None
+     if result["admit"]:
+         quote = result["evidence"]
+         inputs = (fields.get("title") or "", fields.get("body") or "", hub_reason or "")
+         if need is None or not quote.strip() or not any(quote in item for item in inputs):
+-            return invalid
++            return None
+     return Verdict(**result, skill_sha=sha)
+ 
+ 
++def _parse(text, fields, hub_reason, sha):
++    try:
++        result = json.loads(text)
++    except (ValueError, TypeError):
++        result = None
++    return validated(result, fields, hub_reason, sha) or Verdict(why="invalid admission verdict", skill_sha=sha)
++
++
+ def _cache(key, verdict=None):
+     from hermes_cli.config import get_hermes_home
+     directory = get_hermes_home() / "kanban"
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index 991f804952..5b3a4a3008 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -39,12 +39,39 @@ def _verdict(fields, hub_reason=None):
+         return judge.Verdict()
+ 
+ 
+-def courier_plan(conn, args, runs_on, *, cfg=None, gateway=None):
++def _prior_landing(conn, request_id):
++    """The placement an earlier apply of the same courier request persisted, or None.
++
++    A re-applied request (crash after commit, adapter timeout) must rebuild the identical
++    immutable envelope; judging again could flip the verdict and raise origin_creation_conflict.
++    """
++    import json
++    import sqlite3
++    if conn is None or not request_id:
++        return None
++    try:
++        row = conn.execute("SELECT intent_json FROM origin_creation_intents WHERE request_id = ?",
++                           (request_id,)).fetchone()
++        options = (json.loads(row[0]) or {}).get("options") or {} if row else None
++    except (sqlite3.OperationalError, TypeError, ValueError):
++        return None  # no intents table yet, or an unreadable row: create_with_origin reports it
++    if not isinstance(options, dict):
++        return None
++    from hermes_cli.kanban_worker_placement import POLICY, WAITING
++    audit = (options.get("placement_audit") or {}).get("hub_admission")
++    out = {"where": "local", "why": "courier replay", **({"hub_admission": audit} if audit else {})}
++    if options.get("placement_policy") == POLICY:
++        out.update(placement_policy=POLICY, why=WAITING, requires=options.get("requires"))
++    return out if audit or out.get("placement_policy") else {}
++
++
++def courier_plan(conn, args, runs_on, *, cfg=None, gateway=None, request_id=None):
+     """A courier create landing on the hub: ``None`` (not hub-bound) or the admission placement.
+ 
+     Runs in the receiving ``kanban_create`` before its write transaction, before the card can be
+     claimed. Admitted: ``{"hub_admission": audit}`` (stays here). Denied: worker-first enrollment
+-    with ``requires`` + ``hub:write``; ``where="refuse"`` when it cannot go to the pool.
++    with ``requires`` + ``hub:write``; ``where="refuse"`` when it cannot go to the pool. A request
++    already applied reuses its stored placement and makes no model call.
+     """
+     from hermes_cli import kanban_placement as kp
+     from hermes_cli.kanban_worker_placement import POLICY, WAITING
+@@ -55,8 +82,9 @@ def courier_plan(conn, args, runs_on, *, cfg=None, gateway=None):
+     machines = [v[8:] for v in runs_on or [] if v.startswith("machine:")]
+     if runs_on is not None and not any(is_hub(m, cfg) for m in machines) and not hub_only(runs_on, cfg):
+         return None  # the lease labels let a worker claim it: not a hub slot
+-    if args.get("placement_policy"):
+-        return None
++    prior = _prior_landing(conn, request_id)
++    if prior is not None:
++        return prior or None
+     # validate_creation's own fences: a worker-first card cannot carry a host workspace, board or project.
+     pinned = (runs_on is not None or (args.get("workspace_kind") or "scratch") != "scratch"
+               or args.get("workspace_path") or args.get("project_id")
+@@ -188,17 +216,24 @@ def owner_verdict(title, body, *, need):
+ 
+ 
+ def stored_owner_verdict(entry, title, body):
+-    """The relay-time verdict for the owner card being sent now, or None when it cannot be used.
++    """The relay-time verdict for the owner card being created now, or None when it cannot be used.
+ 
+-    An admit counts only while its evidence still occurs verbatim in the text being sent.
++    None means the judge was unavailable (retryable). A stored verdict that fails the judge's own
++    validation (need off the allowlist, evidence not verbatim in ``title``/``body``) is a final
++    deny, never a retry: re-relaying would replay the same cached verdict on the same text.
+     """
+     audit = (entry or {}).get("hub_admission")
+     if not isinstance(audit, dict) or not isinstance(audit.get("admit"), bool):
+         return None
+     if audit.get("why") == judge.Verdict().why:
+         return None  # the judge was unavailable at relay time: retry, never a permanent answer
+-    if audit["admit"] and not (audit.get("evidence") and (audit["evidence"] in title or audit["evidence"] in body)):
+-        return None
++    sha = audit["skill_sha"] if isinstance(audit.get("skill_sha"), str) else ""
++    result = {k: audit.get(k) for k in ("admit", "need", "evidence", "why")}
++    if judge.validated(result, {"title": title, "body": body}, None, sha) is None:
++        return {**asdict(judge.Verdict(why="relay-time admission verdict failed validation (need or verbatim "
++                                           "evidence)", skill_sha=sha)),
++                "entry": audit.get("entry") or "capability_owner", "capability": audit.get("capability"),
++                "invalid": True}
+     return audit
+ 
+ 
+@@ -294,10 +329,9 @@ def apply(args, decision, gateway, cfg, *, origin_intent=None):
+             return {"where": "refuse", "why": "force_hub is unavailable to dispatcher workers"}
+         verdict = judge.Verdict(admit=True, why="operator override", forced=True)
+     else:
+-        try:
+-            verdict = judge.admit(args, hub_reason=args.get("hub_reason"))
+-        except Exception:  # health: allow BLE001 -- never let caller fallback admit a failed judge
+-            verdict = judge.Verdict()
++        from hermes_cli.kanban_placement import without_placement_note
++        # A routed card's placement note names the origin's host needs (Chrome, Keychain): never hub evidence.
++        verdict = _verdict({**args, "body": without_placement_note(args.get("body") or "")}, args.get("hub_reason"))
+     audit = asdict(verdict)
+     if verdict.forced:
+         audit["session"] = os.environ.get("HERMES_SESSION_ID", "")
+diff --git a/tests/test_kanban_hub_admission_entry.py b/tests/test_kanban_hub_admission_entry.py
+index eb9f438a5d..e940b03741 100644
+--- a/tests/test_kanban_hub_admission_entry.py
++++ b/tests/test_kanban_hub_admission_entry.py
+@@ -60,6 +60,16 @@ def test_cli_hub_auto_create(hub_cli, admit):
+         assert "hub:write" in task.requires
+ 
+ 
++def test_cli_receive_judges_without_the_origin_placement_note(hub_cli):
++    """Review t_01a1ced25af29218: only courier_plan stripped the origin's note (its Chrome and
++    Keychain), so a plain create-task receive on the hub judged the origin's host needs."""
++    note = ("Placed on hub by macbook's default placement rule (kanban.placement): only the MacBook's "
++            "Chrome profile and Keychain count; don't park or ask David.")
++    assert _cli_create(MARKED, "--body", f"Work text.\n\n{note}") == 0
++    body = hub_cli.calls[0]["card"]["body"]
++    assert "Work text." in body and "Placed on hub" not in body and "Keychain" not in body
++
++
+ @pytest.mark.parametrize("admit", [True, False])
+ def test_cli_runs_on_machine_hub(hub_cli, monkeypatch, admit):
+     from hermes_cli import kanban_worker_node as wn
+diff --git a/tests/test_kanban_hub_admission_relay.py b/tests/test_kanban_hub_admission_relay.py
+index b8c5ec79d9..e5f8879c45 100644
+--- a/tests/test_kanban_hub_admission_relay.py
++++ b/tests/test_kanban_hub_admission_relay.py
+@@ -28,11 +28,12 @@ REASON = f"Renew the Board dashboard session in {QUOTE}; read back the cookie ex
+ 
+ 
+ @pytest.fixture
+-def pair(tmp_path, monkeypatch):
++def pair(tmp_path, monkeypatch, request):
++    home = getattr(request, "param", HUB)
+     svc = FakeService(lease_runs=True)
+     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+     sync.consume_dispatcher_wake()
+-    hub = Gw(tmp_path, HUB, svc, monkeypatch, pickup=False, hub_replica=True)
++    hub = Gw(tmp_path, home, svc, monkeypatch, pickup=False, hub_replica=True)
+     worker = Gw(tmp_path, WORKER, svc, monkeypatch, pickup="explicit", hub_replica=False)
+     hub.holds(NEED)
+     worker.holds("sudo:nopasswd")
+@@ -124,11 +125,64 @@ def test_owner_verdict_inside_an_open_transaction_is_recorded(pair):
+         "admission unavailable"]
+ 
+ 
+-def test_stored_admit_whose_quote_left_the_text_is_not_used():
++def test_stored_owner_verdict_runs_the_judges_full_validation():
++    """Review t_01a1ced25af29218: only the quote was re-checked, and a failed check read as
++    "judge unavailable" (a retry that replays the same cached verdict up to generation 5)."""
+     from hermes_cli.kanban_hub_admission_placement import stored_owner_verdict
+     entry = {"hub_admission": {"admit": True, "need": "hub_chrome", "evidence": QUOTE, "why": "x"}}
+     assert stored_owner_verdict(entry, "title", f"body with {QUOTE}")["admit"] is True
+-    assert stored_owner_verdict(entry, "title", "body without it") is None
++    moved = stored_owner_verdict(entry, "title", "body without it")
++    assert moved["admit"] is False and moved["invalid"] is True  # a final deny, not None (retry)
++    off_list = {"hub_admission": {"admit": True, "need": "hub_gpu", "evidence": QUOTE, "why": "x"}}
++    assert stored_owner_verdict(off_list, "title", f"body with {QUOTE}")["admit"] is False
+     assert stored_owner_verdict({}, "t", "b") is None
+     assert stored_owner_verdict({"hub_admission": {"admit": False, "why": "admission unavailable"}}, "t", "b") is None
+     assert stored_owner_verdict({"hub_admission": {"admit": False, "why": "pool can"}}, "t", "b")["admit"] is False
++
++
++def test_admit_quoting_owner_template_text_creates_exactly_the_judged_card(pair, monkeypatch):
++    """Review blocker: the relay judged owner_body() text but the hub's probe created a card from
++    another template, so an admit quoting the template failed the quote check."""
++    hub, worker, calls, _verdict = pair
++
++    def quoting_template(fields, *, hub_reason=None):
++        calls.append(fields)
++        first = fields["body"].splitlines()[0]  # template boilerplate, not the waiting card's reason
++        return judge.Verdict(admit=True, need="hub_chrome", evidence=first, why="template quote")
++
++    monkeypatch.setattr(judge, "admit", quoting_template)
++    _tid, _res, rid = _relay(hub, worker)
++    rc, msg = kcr.wait_check(rid)
++    assert rc == 1 and "hub_admission" not in msg, msg
++    owner = hub.conn.execute("SELECT title, body, runs_on, placement_policy FROM tasks WHERE idempotency_key = ?",
++                             (rid,)).fetchone()
++    assert owner is not None, msg
++    assert (owner["title"], owner["body"]) == (calls[0]["title"], calls[0]["body"])
++    assert json.loads(owner["runs_on"]) == [f"machine:{HUB}"] and owner["placement_policy"] is None
++    assert len(calls) == 1
++
++
++def test_invalid_stored_admit_is_a_final_deny_not_a_retry(pair):
++    hub, worker, calls, verdict = pair
++    verdict["value"] = judge.Verdict(admit=True, need="hub_gpu", evidence=QUOTE, why="off the allowlist")
++    tid, _res, rid = _relay(hub, worker)
++    rc, msg = kcr.wait_check(rid)
++    assert rc == 1 and "hub_admission_unavailable" not in msg, msg
++    owner = _owner(hub, rid)
++    assert owner["placement_policy"] == "worker-first-v1" and json.loads(owner["requires"]) == ["hub:write"]
++    (event,) = [e.payload for e in kb.list_events(hub.conn, tid) if e.kind == "hub_admission"]
++    assert event["admit"] is False and event["invalid"] is True
++    assert len(calls) == 1
++
++
++@pytest.mark.parametrize("pair", ["mini"], indirect=True)
++def test_relay_to_a_non_hub_home_makes_no_model_call_and_no_event(pair):
++    hub, worker, calls, _verdict = pair  # "hub" here is the mini: the card's home, holding the need
++    tid, res, rid = _relay(hub, worker)
++    assert calls == [] and "hub_admission" not in res["routes"][0]
++    rc, msg = kcr.wait_check(rid)
++    assert rc == 1, msg
++    assert calls == []
++    assert json.loads(_owner(hub, rid)["runs_on"]) == ["machine:mini"]
++    for g in (hub, worker):
++        assert [e for e in kb.list_events(g.conn, tid) if e.kind == "hub_admission"] == []
+diff --git a/tests/tools/test_kanban_hub_admission_tool.py b/tests/tools/test_kanban_hub_admission_tool.py
+index d815a0eabd..a3b599cb70 100644
+--- a/tests/tools/test_kanban_hub_admission_tool.py
++++ b/tests/tools/test_kanban_hub_admission_tool.py
+@@ -158,6 +158,27 @@ def test_tool_courier_create_landing_on_hub_is_judged(on_gateway, admit):
+     assert [e["admit"] for e in _events(result["task_id"])] == [admit]
+ 
+ 
++@pytest.mark.parametrize("first", [False, True])
++def test_tool_courier_replay_reuses_the_first_landing(on_gateway, first):
++    """Review t_01a1ced25af29218: a re-applied request whose verdict flipped (an unavailable deny is
++    not cached) rebuilt a different envelope and raised origin_creation_conflict."""
++    judge = on_gateway("hub")
++    judge.admit_next = first
++    intent = {"request_id": f"request-replay-{first}",
++              "owner": {"gateway": "hub", "profile": "default", "board": "default"},
++              "origin": {"gateway": "macbook", "profile": "default", "session": "s_mac"}}
++    args = {"title": MARKED, "requires": [], "assignee": "default"}
++    one = json.loads(kt._handle_create(dict(args), origin_intent=intent))
++    judge.admit_next = not first
++    two = json.loads(kt._handle_create(dict(args), origin_intent=intent))
++    assert one.get("task_id") and two.get("task_id") == one["task_id"], two
++    assert len(judge.calls) == 1  # the replay makes no model call
++    with kbc.connect() as conn:
++        assert len(kb.list_tasks(conn)) == 1
++        task = kb.get_task(conn, one["task_id"])
++    assert (task.placement_policy is None) is first
++
++
+ @pytest.mark.parametrize("admit", [True, False])
+ def test_tool_placement_hub_from_another_gateway(on_gateway, monkeypatch, admit):
+     import functools
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index 65ade6388c..f89453592b 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -19,7 +19,7 @@ def _courier_landing(conn, args, origin_intent, marker, runs_on, **effective):
+     if origin_intent is None:
+         return marker
+     from hermes_cli.kanban_hub_admission_placement import courier_plan
+-    return courier_plan(conn, {**args, **effective}, runs_on) or marker
++    return courier_plan(conn, {**args, **effective}, runs_on, request_id=origin_intent.get("request_id")) or marker
+ 
+ 
+ def _origin_enrollment(args, origin, marker, **effective):
+-- 
+2.43.0
+

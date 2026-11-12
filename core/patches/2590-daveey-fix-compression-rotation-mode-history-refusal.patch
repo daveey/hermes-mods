@@ -1,0 +1,354 @@
+From c0f4e1b5ffb709168050227f559b4030489c27f1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 09:29:26 +0000
+Subject: [PATCH] [daveey] fix(compression): rotation-mode history-refusal
+ retry sends the current message once
+
+Under the legacy compression.in_place: false, _adopt_grown_durable_parent adopted the
+durable parent, which already holds the persisted current-turn row, and the caller's
+verbatim_tail ([current]) was then rejoined onto it: the child session stored
+"U\n\nU" and history_refusal_step appended current a third time to the retry request.
+
+- The adoption drops the verbatim tail's durable copy from the adopted end (also covers
+  /compress here N in rotation mode). The function moves to
+  agent/conversation_compression_adopt.py to offset the FILE_LINES growth.
+- history_refusal_step drops trailing user rows that only repeat the current text
+  before appending it, and keys the one-retry cap on turn_id or _current_turn_id;
+  without any turn identity it keeps the drop-and-notice path instead of looping.
+- Tests: rotation-mode real-DB variant (request's last user content == current once,
+  child session rows hold it once), folded-head and no-turn-id unit tests.
+
+Follow-up of review t_01a1cef18e3ef70f (PR #1300).
+---
+ agent/conversation_compression.py             | 57 +--------------
+ agent/conversation_compression_adopt.py       | 73 +++++++++++++++++++
+ agent/turn_refusal_history.py                 | 30 ++++++--
+ .../test_content_policy_history_trigger.py    | 26 ++++++-
+ .../test_content_policy_history_trigger_db.py | 34 +++++++++
+ 5 files changed, 158 insertions(+), 62 deletions(-)
+ create mode 100644 agent/conversation_compression_adopt.py
+
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 04120de975..b69ba118a0 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -48,6 +48,7 @@ from agent.session_activity import ActivityProvenance, normalize_activity_proven
+ from agent.usage_anchor import set_usage_anchor
+ from hermes_state_ids import new_session_id as mint_session_id
+ from hermes_state_pidns import holder_namespace_token
++from agent.conversation_compression_adopt import adopt_grown_durable_parent as _adopt_grown_durable_parent
+ from agent.conversation_compression_watermark import held_archive_watermark
+ 
+ logger = logging.getLogger(__name__)
+@@ -2802,57 +2803,6 @@ def _adopt_if_parent_rotated(
+     return messages, _existing_sp
+ 
+ 
+-def _adopt_grown_durable_parent(agent: Any, lease: _CompressionLease, messages: list) -> Optional[list]:
+-    """Return the durable parent transcript when it outgrew the in-memory snapshot.
+-    Rotation only (in-place never loses rows). The snapshot predates the lease: if durable grew, a writer
+-    committed a turn — ADOPT it (aborting wedged busy sessions forever). Length check only: in-memory edits of
+-    past turns are legal. Adoption advances ``lease.watermark`` to the snapshot's newest row, so publication
+-    clones only rows the snapshot does not already carry."""
+-    if lease.db is None or not lease.sid:
+-        return None
+-    durable_loader = getattr(type(lease.db), "get_messages_as_conversation", None)
+-    if not callable(durable_loader):
+-        return None
+-    durable_parent = durable_loader(lease.db, lease.sid)
+-    if not (isinstance(durable_parent, list) and len(durable_parent) > len(messages)):
+-        return None
+-    # In-memory carries this turn's un-persisted user tail; flush it via the normal
+-    # rotation-boundary path before adopting, else skip adoption (would drop input).
+-    # The in-memory transcript carries the CURRENT turn's un-persisted user tail (anchored by
+-    # _persist_user_message_idx) that the durable snapshot read above does not contain yet. Flush that tail
+-    # through the normal rotation-boundary path (conversation_history = the already-durable prefix, #68196
+-    # boundary) BEFORE adopting, then re-read the durable parent so the adopted snapshot includes the live
+-    # input. If the flush fails (or the anchor is unknown), skip adoption entirely: replacing the in-memory
+-    # transcript with a snapshot that lacks the user's input would silently drop it from the summarized and
+-    # rotated history (#adopt-live-tail).
+-    _preflush_idx = getattr(agent, "_persist_user_message_idx", None)
+-    # No un-persisted tail means the transcript is fully durable: adopting the longer parent cannot drop input.
+-    _preflush_ok = True
+-    if isinstance(_preflush_idx, int) and 0 <= _preflush_idx < len(messages):
+-        _preflush_ok = False
+-        with contextlib.suppress(Exception):
+-            _preflush_ok = agent._flush_messages_to_session_db(messages, conversation_history=messages[:_preflush_idx])
+-    if not _preflush_ok:
+-        logger.warning(
+-            "compression: session=%s grew before lease (%d → %d msgs) but the pre-adoption flush of the "
+-            "live tail failed; skipping durable-snapshot adoption so un-persisted user input is kept",
+-            lease.sid, len(messages), len(durable_parent),
+-        )
+-        return None
+-    # Re-read after the flush so the adopted snapshot carries the just-persisted tail.
+-    durable_parent = durable_loader(lease.db, lease.sid, include_row_ids=True)
+-    if not (isinstance(durable_parent, list) and len(durable_parent) > len(messages)):
+-        return None
+-    adopted_row_ids = [rid for m in durable_parent if isinstance(rid := m.pop("_row_id", None), int)]
+-    if lease.watermark is not None and adopted_row_ids:
+-        lease.watermark = max(lease.watermark, *adopted_row_ids)
+-    logger.info(
+-        "compression: session=%s grew before lease (%d → %d msgs); adopting durable snapshot", lease.sid, len(messages),
+-        len(durable_parent),
+-    )
+-    return durable_parent
+-
+-
+ def _pre_compress_memory_context(agent: Any, messages: list, checkpoint_required: bool) -> str:
+     """Provider ``on_pre_compress()`` insights to surface in the summary ("" if none).
+     Raw messages stay the API v1 provider contract; normalized evidence goes only to API v2+ checkpoint
+@@ -3735,7 +3685,7 @@ def _run_summary_phase(
+     agent: Any, messages: list, *, lease: _CompressionLease, in_place: bool, checkpoint_required: bool,
+     approx_tokens: Optional[int], focus_topic: Optional[str], force: bool, bypass_cooldown: bool,
+     commit_fence: Optional[CompressionCommitFence], hard_cancel_event: Any, system_message: str,
+-    attempt: _Attempt,
++    attempt: _Attempt, verbatim_tail: Optional[list] = None,
+ ) -> _SummaryPhase:
+     """Adopt a grown durable parent, gather memory context and run the summarizer.
+     A hard cancel restores the compressor snapshot + live list, records a stall backoff while the lease is
+@@ -3753,7 +3703,7 @@ def _run_summary_phase(
+     try:
+         lease.start_refresher()
+         if not in_place:
+-            _adopted_parent = _adopt_grown_durable_parent(agent, lease, messages)
++            _adopted_parent = _adopt_grown_durable_parent(agent, lease, messages, verbatim_tail)
+             if _adopted_parent is not None:
+                 messages = _adopted_parent
+                 pre_msg_count = len(messages)
+@@ -4092,6 +4042,7 @@ def compress_context(
+         agent, messages, lease=lease, in_place=in_place, checkpoint_required=checkpoint_required,
+         approx_tokens=approx_tokens, focus_topic=focus_topic, force=force, bypass_cooldown=bypass_cooldown,
+         commit_fence=commit_fence, hard_cancel_event=_hard_cancel_event, system_message=system_message, attempt=attempt,
++        verbatim_tail=verbatim_tail,
+     )
+     if phase.abort_prompt is not None:
+         return phase.messages, phase.abort_prompt
+diff --git a/agent/conversation_compression_adopt.py b/agent/conversation_compression_adopt.py
+new file mode 100644
+index 0000000000..7caf4425d5
+--- /dev/null
++++ b/agent/conversation_compression_adopt.py
+@@ -0,0 +1,73 @@
++"""Adopting a rotation parent that grew in the durable store before the compression lease.
++
++Split out of :mod:`agent.conversation_compression` (FILE_LINES ratchet). The origin module imports
++:func:`adopt_grown_durable_parent` back as ``_adopt_grown_durable_parent`` for ``_run_summary_phase``.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import logging
++from typing import Any, Optional
++
++# The origin module's logger: these lines keep their source in agent.log and in caplog filters.
++logger = logging.getLogger("agent.conversation_compression")
++
++
++def adopt_grown_durable_parent(
++    agent: Any, lease: Any, messages: list, verbatim_tail: Optional[list] = None,
++) -> Optional[list]:
++    """Return the durable parent transcript when it outgrew the in-memory snapshot.
++    Rotation only (in-place never loses rows). The snapshot predates the lease: if durable grew, a writer
++    committed a turn — ADOPT it (aborting wedged busy sessions forever). Length check only: in-memory edits of
++    past turns are legal. Adoption advances ``lease.watermark`` to the snapshot's newest row, so publication
++    clones only rows the snapshot does not already carry."""
++    if lease.db is None or not lease.sid:
++        return None
++    durable_loader = getattr(type(lease.db), "get_messages_as_conversation", None)
++    if not callable(durable_loader):
++        return None
++    durable_parent = durable_loader(lease.db, lease.sid)
++    if not (isinstance(durable_parent, list) and len(durable_parent) > len(messages)):
++        return None
++    # In-memory carries this turn's un-persisted user tail; flush it via the normal
++    # rotation-boundary path before adopting, else skip adoption (would drop input).
++    # The in-memory transcript carries the CURRENT turn's un-persisted user tail (anchored by
++    # _persist_user_message_idx) that the durable snapshot read above does not contain yet. Flush that tail
++    # through the normal rotation-boundary path (conversation_history = the already-durable prefix, #68196
++    # boundary) BEFORE adopting, then re-read the durable parent so the adopted snapshot includes the live
++    # input. If the flush fails (or the anchor is unknown), skip adoption entirely: replacing the in-memory
++    # transcript with a snapshot that lacks the user's input would silently drop it from the summarized and
++    # rotated history (#adopt-live-tail).
++    _preflush_idx = getattr(agent, "_persist_user_message_idx", None)
++    # No un-persisted tail means the transcript is fully durable: adopting the longer parent cannot drop input.
++    _preflush_ok = True
++    if isinstance(_preflush_idx, int) and 0 <= _preflush_idx < len(messages):
++        _preflush_ok = False
++        with contextlib.suppress(Exception):
++            _preflush_ok = agent._flush_messages_to_session_db(messages, conversation_history=messages[:_preflush_idx])
++    if not _preflush_ok:
++        logger.warning(
++            "compression: session=%s grew before lease (%d → %d msgs) but the pre-adoption flush of the "
++            "live tail failed; skipping durable-snapshot adoption so un-persisted user input is kept",
++            lease.sid, len(messages), len(durable_parent),
++        )
++        return None
++    # Re-read after the flush so the adopted snapshot carries the just-persisted tail.
++    durable_parent = durable_loader(lease.db, lease.sid, include_row_ids=True)
++    if not (isinstance(durable_parent, list) and len(durable_parent) > len(messages)):
++        return None
++    adopted_row_ids = [rid for m in durable_parent if isinstance(rid := m.pop("_row_id", None), int)]
++    # The caller keeps ``verbatim_tail`` out of ``messages`` and rejoins it after the summary: drop its durable
++    # copy from the adopted end, else the rejoin folds the tail onto itself ("U\n\nU", stored in the child).
++    n_tail = len(verbatim_tail or ())
++    if n_tail and [(m.get("role"), m.get("content")) for m in durable_parent[-n_tail:]] == [
++            (t.get("role"), t.get("content")) for t in verbatim_tail]:
++        durable_parent = durable_parent[:-n_tail]
++    if lease.watermark is not None and adopted_row_ids:
++        lease.watermark = max(lease.watermark, *adopted_row_ids)
++    logger.info(
++        "compression: session=%s grew before lease (%d → %d msgs); adopting durable snapshot", lease.sid, len(messages),
++        len(durable_parent),
++    )
++    return durable_parent
+diff --git a/agent/turn_refusal_history.py b/agent/turn_refusal_history.py
+index 2be2a87dea..42409094f7 100644
+--- a/agent/turn_refusal_history.py
++++ b/agent/turn_refusal_history.py
+@@ -73,6 +73,21 @@ def _log(agent: Any, outcome: str) -> None:
+                    getattr(agent, "log_prefix", ""), outcome)
+ 
+ 
++def _with_current_once(compressed: list, current: Any) -> list:
++    """End the retry request with the current message exactly once: drop trailing user rows that only
++    repeat its text (a head that already carries it, possibly folded onto itself as ``"U\\n\\nU"``), then
++    append it. Appending to such a head sent the message three times."""
++    text = current.get("content") if isinstance(current, dict) else None
++    while (isinstance(text, str) and text.strip() and compressed and isinstance(compressed[-1], dict)
++           and compressed[-1].get("role") == "user" and isinstance(compressed[-1].get("content"), str)
++           and text in compressed[-1]["content"] and not compressed[-1]["content"].replace(text, "").strip()):
++        compressed.pop()
++    last = compressed[-1] if compressed else None
++    if not (isinstance(last, dict) and last.get("role") == "user" and last.get("content") == text):
++        compressed.append(current)
++    return compressed
++
++
+ def history_refusal_step(
+     agent: Any, *, messages: Any, current_turn_user_idx: Any, turn_id: Any, system_message: Any,
+     effective_task_id: Any,
+@@ -85,7 +100,12 @@ def history_refusal_step(
+     if not is_history_triggered(messages, current_turn_user_idx):
+         # Checked first: a refusal after this turn's retry ran a tool round keeps the tool-round copy.
+         return None
+-    if getattr(agent, "_history_refusal_retry_turn", None) == turn_id and turn_id is not None:
++    turn_key = turn_id or getattr(agent, "_current_turn_id", None)
++    if not turn_key:
++        # No turn identity: the one-retry cap could not tell a refused retry from a new turn and
++        # would compact + retry forever. Keep the drop-and-notice path.
++        return None
++    if getattr(agent, "_history_refusal_retry_turn", None) == turn_key:
+         _log(agent, "refused")
+         return HistoryRefusalStep("refused")
+     head = list(messages[:current_turn_user_idx])
+@@ -108,13 +128,9 @@ def history_refusal_step(
+         # The summary over the earlier history alone did not commit (the summarizer refused or aborted).
+         _log(agent, "summary_refused")
+         return HistoryRefusalStep("summary_refused")
+-    compressed = list(compressed)
+-    last = compressed[-1] if compressed else None
+-    if not (isinstance(last, dict) and last.get("role") == "user"
+-            and last.get("content") == current.get("content")):
+-        compressed.append(current)
++    compressed = _with_current_once(list(compressed), current)
+     idx = len(compressed) - 1
+-    agent._history_refusal_retry_turn = turn_id  # one compaction + retry per turn
++    agent._history_refusal_retry_turn = turn_key  # one compaction + retry per turn
+     # "retried": the compacted request is resent; a refusal of it logs outcome=refused next.
+     _log(agent, "retried")
+     return HistoryRefusalStep("retry", compressed, compressed[:idx], prompt)
+diff --git a/tests/agent/test_content_policy_history_trigger.py b/tests/agent/test_content_policy_history_trigger.py
+index cb1ce9ad80..8b71d073f9 100644
+--- a/tests/agent/test_content_policy_history_trigger.py
++++ b/tests/agent/test_content_policy_history_trigger.py
+@@ -60,12 +60,12 @@ def _messages():
+     ]
+ 
+ 
+-def _call(agent, messages, idx=2, history=None, retry=None):
++def _call(agent, messages, idx=2, history=None, retry=None, turn_id: "str | None" = "turn-1"):
+     return handle_content_policy_refusal(
+         agent, _refusal_response(), retry or TurnRetryState(), thinking_spinner=None, messages=messages,
+         api_messages=list(messages), api_kwargs={}, active_system_prompt=None,
+         conversation_history=history if history is not None else messages[:idx],
+-        api_call_count=1, effective_task_id="t", turn_id="turn-1", api_request_id="r",
++        api_call_count=1, effective_task_id="t", turn_id=turn_id, api_request_id="r",
+         api_start_time=0.0, retry_count=0, max_retries=3, current_turn_user_idx=idx,
+     )
+ 
+@@ -118,6 +118,28 @@ def test_retry_refused_again_does_not_compact_twice(caplog):
+     assert "outcome=refused" in caplog.text
+ 
+ 
++def test_head_already_ending_in_current_message_sends_it_once():
++    """A head that already carries the current message, folded onto itself ("U\\n\\nU"), must not get it
++    appended a third time (legacy compression.in_place: false, review of PR #1300)."""
++    agent = _agent()
++    current = "should we do it on the mini or the hub?"
++    summary = {"role": "assistant", "content": "[CONTEXT COMPACTION] earlier discussion"}
++    agent._compress_context.side_effect = lambda m, s, **kw: (
++        [summary, {"role": "user", "content": f"{current}\n\n{current}"}], "sys")
++    verdict = _call(agent, _messages())
++    assert verdict.action == "break"
++    assert [m["content"] for m in verdict.messages] == [summary["content"], current]
++
++
++def test_no_turn_identity_keeps_drop_and_notice_path():
++    """Without a turn id the one-retry cap cannot tell a refused retry from a new turn."""
++    agent = _agent()
++    agent._current_turn_id = None
++    verdict = _call(agent, _messages(), turn_id=None)
++    assert verdict.action == "return"
++    agent._compress_context.assert_not_called()
++
++
+ def test_caller_system_message_passes_through_and_returned_prompt_is_adopted():
+     """A normal turn's caller system_message is None. Handing the full built prompt to _compress_context
+     as the caller's message doubled the rebuilt prompt (review of PR #1300)."""
+diff --git a/tests/agent/test_content_policy_history_trigger_db.py b/tests/agent/test_content_policy_history_trigger_db.py
+index 266777ddd2..49113e8e06 100644
+--- a/tests/agent/test_content_policy_history_trigger_db.py
++++ b/tests/agent/test_content_policy_history_trigger_db.py
+@@ -83,3 +83,37 @@ def test_history_refusal_retry_keeps_system_prompt_and_one_current_row(session):
+     assert sum(c.startswith("U13 ") for c in live) == 1
+     assert sum(c.startswith("U13 ") for c in shown) == 1
+     assert not any(MARKER in c for c in live)
++
++
++def test_history_refusal_retry_rotation_mode_sends_current_once(session):
++    """Legacy ``compression.in_place: false``: the compressor's head already ends in the current message
++    (merged into the user-turn anchor), so appending it again sent it 3x and stored it doubled."""
++    db, agent = session
++    agent.compression_in_place = False
++    for n in range(1, 13):
++        extra = f" {MARKER}" if n == 2 else ""
++        body = f"A{n} answer{extra} " + "lorem ipsum dolor " * 400
++        _gateway_turn(db, agent, f"U{n} question", lambda body=body, **kw: _reply(content=body))
++
++    calls = []
++
++    def provider(**kw):
++        calls.append(kw)
++        if any(MARKER in str(m.get("content") or "") for m in kw.get("messages") or []):
++            return _reply(refusal="I can't continue this conversation.")
++        return _reply(content="A13 It runs on the hub.")
++
++    current = "U13 does it run on the mini or the hub?"
++    result = _gateway_turn(db, agent, current, provider)
++
++    assert len(calls) == 2
++    assert result.get("final_response") == "A13 It runs on the hub."
++    retry_users = [m for m in calls[-1]["messages"] if m.get("role") == "user"]
++    assert retry_users[-1]["content"] == current
++    sent = "\n".join(str(m.get("content") or "") for m in calls[-1]["messages"])
++    assert sent.count(current) == 1
++    child = agent.session_id
++    assert child != "sid"  # rotation mode moved the turn to a child session
++    rows = [m.get("content") or "" for m in db.get_messages_as_conversation(child)
++            if isinstance(m.get("content"), str)]
++    assert "\n".join(rows).count(current) == 1
+-- 
+2.43.0
+

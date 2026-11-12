@@ -1,0 +1,247 @@
+From f9565195f31ce0f10af1a6fa6e31b7b3ec401c13 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:58:38 +0000
+Subject: [PATCH] perf(kanban): probe read-only before a notice claim or orphan
+ recovery takes the write lock [daveey]
+
+Every chat's poller ran recover_orphaned_notify_claims and
+claim_unseen_events_for_sub every few seconds, each opening BEGIN IMMEDIATE on
+kanban.db even with nothing to do: 109 thread-seconds per 90 s queueing in
+_execute_boundary_with_retry on hermes-hub. A read-only probe now decides
+first; only a row with an unseen event of a notify kind, or an in-flight claim
+due a rewind, takes the write lock, and the transaction decides again, so claim
+exclusivity is unchanged.
+---
+ hermes_cli/kanban_db_notify.py                |  72 +++++++++--
+ .../test_kanban_notice_idle_probe.py          | 117 ++++++++++++++++++
+ 2 files changed, 176 insertions(+), 13 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_notice_idle_probe.py
+
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index 33356f1728..4e13ade2d3 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -576,8 +576,16 @@ def claim_unseen_events_for_sub(
+     like an orphan: a holder that cannot deliver (it does not own the chat) blocked the owner forever
+     (t_01a199de3003e911). [daveey]
+     """
++    key = _sub_key(task_id, platform, chat_id, thread_id)
++    # [daveey] Read-only probe first: every chat's poller calls this every few seconds, and taking the board's
++    # write lock (``BEGIN IMMEDIATE``) only to find nothing new queued the pollers behind each other and behind
++    # workers. Nothing is claimed here: when the probe sees an unseen event or an in-flight marker it may have to
++    # act on, the transaction below decides again, so claim exclusivity is unchanged.
++    if not _claim_may_act(conn, key, task_id, kinds, kinds if deliverable_kinds is None else deliverable_kinds,
++                          durable):
++        cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
++        return (0, 0, []) if cursor is None else (cursor, cursor, [])
+     with _kb.write_txn(conn):
+-        key = _sub_key(task_id, platform, chat_id, thread_id)
+         if durable:
+             row = conn.execute(
+                 "SELECT inflight_from, inflight_pid, inflight_start, inflight_at, last_event_id "
+@@ -626,6 +634,38 @@ def claim_unseen_events_for_sub(
+ # In-flight (claimed, not yet durably delivered) notice claims. [daveey]
+ # ---------------------------------------------------------------------------
+ 
++
++def _claim_may_act(conn: sqlite3.Connection, key: tuple, task_id: str, kinds: Optional[Iterable[str]],
++                   deliverable: Optional[Iterable[str]], durable: bool) -> bool:
++    """Read-only: could :func:`claim_unseen_events_for_sub` write anything for this row now? False exactly when it
++    would return no events without writing: unsubscribed, another live process's claim that is not stuck, or no
++    unseen event of ``kinds``. The decision is made again inside the write transaction. [daveey]"""
++    row = conn.execute(
++        "SELECT inflight_from, inflight_pid, inflight_start, inflight_at, last_event_id "
++        "FROM kanban_notify_subs " + _SUB_KEY_WHERE, key,
++    ).fetchone()
++    if row is None:
++        return False
++    if durable and row["inflight_from"] is not None:
++        if not _holder_alive(row) or _stuck_live_claim(conn, task_id, row, deliverable, key=key):
++            return True  # a rewind is due
++        if not _holder_is_me(row):
++            return False
++    kind_list = list(kinds) if kinds else None
++    return conn.execute(
++        "SELECT EXISTS (SELECT 1 FROM task_events WHERE task_id = ? AND id > ?"
++        + (" AND kind IN (" + ",".join("?" * len(kind_list)) + ")" if kind_list else "") + ")",
++        (task_id, int(row["last_event_id"]), *(kind_list or ())),
++    ).fetchone()[0] == 1
++
++
++def _recovery_due(conn: sqlite3.Connection, row, key: tuple) -> Optional[str]:
++    """Why :func:`recover_orphaned_notify_claims` rewinds this in-flight row (``None``: it is left alone)."""
++    if not _holder_alive(row):
++        return ""
++    return _stuck_live_claim(conn, row["task_id"], row, None, key=key)
++
++
+ _MY_HOLDER: Optional[tuple[int, Optional[int]]] = None
+ 
+ # A LIVE process's unacknowledged claim older than this no longer blocks another consumer of the row. A healthy
+@@ -794,22 +834,28 @@ def recover_orphaned_notify_claims(
+         where.append("chat_id = ?")
+         params.append(chat_id)
+     n = 0
++    sql = ("SELECT task_id, platform, chat_id, thread_id, inflight_from, inflight_pid, inflight_start, "
++           "inflight_at, last_event_id FROM kanban_notify_subs WHERE " + " AND ".join(where))
++    # [daveey] Read-only probe first: every chat's poller runs this every few seconds, almost always with nothing
++    # to rewind, and ``BEGIN IMMEDIATE`` queued those pollers for the board's write lock. The transaction below
++    # reads and decides again, so only a row the probe found due takes the lock.
++    try:
++        probe = conn.execute(sql, params).fetchall()
++    except sqlite3.OperationalError:
++        return 0  # pre-migration board
++    from hermes_cli.kanban_notify_clock import prune
++    if not any(_recovery_due(conn, r, _sub_key(r["task_id"], r["platform"], r["chat_id"], r["thread_id"]))
++               is not None for r in probe):
++        prune(conn)
++        return 0
+     with _kb.write_txn(conn):
+-        try:
+-            rows = conn.execute(
+-                "SELECT task_id, platform, chat_id, thread_id, inflight_from, inflight_pid, inflight_start, "
+-                "inflight_at, last_event_id FROM kanban_notify_subs WHERE " + " AND ".join(where), params,
+-            ).fetchall()
+-        except sqlite3.OperationalError:
+-            return 0  # pre-migration board
+-        from hermes_cli.kanban_notify_clock import prune
++        rows = conn.execute(sql, params).fetchall()
+         prune(conn)
+         for r in rows:
+             key = _sub_key(r["task_id"], r["platform"], r["chat_id"], r["thread_id"])
+-            if not _holder_alive(r):
+-                n += _rewind_orphan(conn, key, r)
+-            elif why := _stuck_live_claim(conn, r["task_id"], r, None, key=key):
+-                n += _rewind_orphan(conn, key, r, why=why)
++            why = _recovery_due(conn, r, key)
++            if why is not None:
++                n += _rewind_orphan(conn, key, r, why=why or None)
+     return n
+ 
+ 
+diff --git a/tests/tui_gateway/test_kanban_notice_idle_probe.py b/tests/tui_gateway/test_kanban_notice_idle_probe.py
+new file mode 100644
+index 0000000000..4df0c59110
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_notice_idle_probe.py
+@@ -0,0 +1,117 @@
++"""[daveey] An idle chat poll takes no board write lock.
++
++Every chat's poller runs ``_kb_poll_board_now`` every few seconds. Opening ``BEGIN IMMEDIATE`` for
++``recover_orphaned_notify_claims`` and ``claim_unseen_events_for_sub`` with nothing to claim or recover queued
++those pollers for the kanban.db write lock (108 thread-seconds of 90 s on hermes-hub, in
++``_execute_boundary_with_retry``). A read-only probe decides first; claiming stays inside the write transaction.
++"""
++import contextlib
++import os
++import time
++from types import SimpleNamespace
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++
++KEY = "20261112_040336_f74a3e"
++
++
++def _task() -> str:
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="Idle card", assignee="default")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=KEY)
++        return tid
++
++
++def _event(tid: str, kind: str) -> int:
++    with contextlib.closing(kbc.connect()) as conn:
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, kind, {})
++        return int(conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0])
++
++
++def _hold(tid: str, *, inflight_from: int, last_event_id: int, pid: int) -> None:
++    with contextlib.closing(kbc.connect()) as conn:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE kanban_notify_subs SET inflight_from = ?, last_event_id = ?, inflight_pid = ?, "
++                         "inflight_start = NULL, inflight_at = ? WHERE task_id = ?",
++                         (inflight_from, last_event_id, pid, int(time.time()), tid))
++
++
++def _sub(tid: str) -> dict:
++    with contextlib.closing(kbc.connect()) as conn:
++        return dict(conn.execute("SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone())
++
++
++def _poll(claims=None):
++    """(texts, write transactions the poll's board connection opened)."""
++    begins = []
++
++    def connect(*args, **kwargs):
++        conn = kbc.connect(*args, **kwargs)
++        conn.set_trace_callback(lambda sql: begins.append(sql) if sql.upper().startswith("BEGIN") else None)
++        return conn
++
++    from tui_gateway import server  # the split module's functions run against server.py's globals
++
++    texts = server._kb_poll_board_now(kb, SimpleNamespace(connect=connect), kbn, kb.DEFAULT_BOARD, KEY, claims)
++    return texts, begins
++
++
++def test_an_idle_poll_opens_no_write_transaction():
++    tid = _task()
++    _poll([])  # settle anything the creation left to claim
++    texts, begins = _poll([])
++    assert texts == [] and begins == []
++    _event(tid, "blocked")
++    texts, begins = _poll([])
++    assert len(texts) == 1 and begins  # a new event is claimed, inside the write transaction
++    assert _sub(tid)["inflight_pid"] == os.getpid()
++    texts, begins = _poll([])  # our own claim in flight, nothing new: still idle
++    assert texts == [] and begins == []
++
++
++def test_a_live_foreign_claim_is_left_alone_without_the_write_lock(monkeypatch):
++    tid = _task()
++    _poll([])
++    before = _sub(tid)["last_event_id"]
++    blocked = _event(tid, "blocked")
++    _hold(tid, inflight_from=before, last_event_id=blocked, pid=os.getppid())  # another live process holds it
++    _event(tid, "unblocked")  # unseen, but its holder delivers it
++    texts, begins = _poll([])
++    assert texts == [] and begins == []
++    assert _sub(tid)["inflight_pid"] == os.getppid()
++
++
++def test_a_dead_holders_claim_is_still_recovered_and_delivered(monkeypatch):
++    tid = _task()
++    _poll([])
++    before = _sub(tid)["last_event_id"]
++    blocked = _event(tid, "blocked")
++    _hold(tid, inflight_from=before, last_event_id=blocked, pid=os.getppid())
++    monkeypatch.setattr(kbn, "_holder_alive", lambda row: int(row["inflight_pid"]) != os.getppid())
++    texts, begins = _poll([])
++    assert len(texts) == 1 and begins
++    assert _sub(tid)["inflight_pid"] == os.getpid()
++
++
++def test_unseen_events_of_silent_kinds_only_take_no_write_lock():
++    tid = _task()
++    _poll([])
++    with contextlib.closing(kbc.connect()) as conn:
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "commented", {})  # not a notify kind
++    texts, begins = _poll([])
++    assert texts == [] and begins == []
++
++
++def test_an_unsubscribed_row_claims_nothing_without_the_write_lock():
++    tid = _task()
++    _event(tid, "blocked")
++    begins = []
++    with contextlib.closing(kbc.connect()) as conn:
++        conn.set_trace_callback(lambda sql: begins.append(sql) if sql.upper().startswith("BEGIN") else None)
++        got = kbn.claim_unseen_events_for_sub(conn, task_id=tid, platform="tui", chat_id="someone-else",
++                                              durable=True)
++    assert got == (0, 0, []) and begins == []
+-- 
+2.43.0
+

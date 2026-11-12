@@ -1,0 +1,135 @@
+From 4da6ac7746bd63cb834a3547ed4de7b29dda4ae9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:13:24 +0000
+Subject: [PATCH] [daveey] Resume a split per-PR exact-head review of a
+ multi-PR checkpoint
+
+A dependency park whose checkpoint names two PRs (core + plugin), awaited by one
+exact-head approval card per PR, each naming its own reviewed_pr, was held by the
+active_pr respawn guard forever: the approval path required every parent to approve
+every holding PR. Now every awaited parent must still approve a checkpointed PR, and
+the union of those approvals must cover every holding PR. A sibling that never
+approved, or an approval of an unrelated PR, still keeps the hold. One continuation
+only, as before.
+
+Seen live: t_01a1ceba11be1290 (core PR1285 + hermes-mods PR60, reviews
+t_01a1cec3170d7163 / t_01a1cec318020429).
+---
+ hermes_cli/kanban_dependency_review.py        | 13 ++-
+ .../test_kanban_dependency_review_split.py    | 83 +++++++++++++++++++
+ 2 files changed, 89 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_dependency_review_split.py
+
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index 50b16ee848..510e0eecba 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -376,10 +376,9 @@ def resumes_review(conn, task_id, pr_urls, *, discharged=()):
+     reviewed = set().union(*(_reviewed_prs(conn, p, parked_at, row["id"], captured_set) for p in parents))
+     if urls.issubset(reviewed):
+         return True
+-    # Without repair evidence, every awaited parent must approve. One approval does not cover a
+-    # sibling that never reviewed, and a named unrelated PR does not cover
+-    # the checkpoint set.
+-    return all(
+-        urls.issubset(_approval_prs(conn, p, parked_at, row["id"], captured_set))
+-        for p in parents
+-    )
++    # Without repair evidence, every awaited parent must approve a checkpointed PR and together
++    # they must approve every holding PR. One approval does not cover a sibling that never
++    # reviewed, and a named unrelated PR approves nothing. A split review (one card per PR of
++    # a multi-repo change, each naming its own reviewed_pr) is covered by the union.
++    approvals = [_approval_prs(conn, p, parked_at, row["id"], captured_set) for p in parents]
++    return all(approvals) and urls.issubset(set().union(*approvals))
+diff --git a/tests/hermes_cli/test_kanban_dependency_review_split.py b/tests/hermes_cli/test_kanban_dependency_review_split.py
+new file mode 100644
+index 0000000000..72897a33fa
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dependency_review_split.py
+@@ -0,0 +1,83 @@
++"""A two-PR checkpoint reviewed by one exact-head approval card per PR resumes once.
++
++Production shape (t_01a1ceba11be1290): a core PR and a plugin PR, one review card each,
++each approving only its own ``reviewed_pr``. The all-parents-approve-every-PR rule held
++that owner forever, although every awaited parent approved and every PR was approved.
++"""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from tests.hermes_cli import test_kanban_dependency_review as helpers
++from tests.hermes_cli.kanban_guard_helpers import worker_comment
++
++board = helpers.board
++
++CORE = "https://github.com/example/core/pull/10"
++MODS = "https://github.com/example/mods/pull/60"
++
++
++def parked_two_prs(conn):
++    parked_at = int(time.time())
++    with pytest.MonkeyPatch.context() as clock:
++        clock.setattr(time, "time", lambda: parked_at - 1)
++        task = kb.create_task(conn, title="implementation", assignee="dev")
++        kb.claim_task(conn, task)
++        run = kb.get_task(conn, task).current_run_id
++        worker_comment(conn, task, "dev", f"Core {CORE} and plugin {MODS}")
++        clock.setattr(time, "time", lambda: parked_at)
++        reviews = [kb.create_task(conn, title=f"review {n}", assignee="reviewer") for n in (1, 2)]
++        for review in reviews:
++            kb.link_tasks(conn, review, task, expected_child_run_id=run)
++        assert kb.block_task(conn, task, kind="dependency", reason="Independent review",
++                             expected_run_id=run)
++    return task, reviews
++
++
++def finish(conn, reviews, prs, verdicts=("approve", "approve")):
++    for review, pr, verdict in zip(reviews, prs, verdicts):
++        kb.claim_task(conn, review)
++        run = kb.get_task(conn, review).current_run_id
++        assert kb.complete_task(conn, review, summary="Review complete", expected_run_id=run,
++                                metadata={"verdict": verdict, "reviewed_pr": pr,
++                                          "reviewed_sha": helpers.HEAD})
++    kb.recompute_ready(conn)
++
++
++def test_split_per_pr_approvals_resume_once(board):
++    task, reviews = parked_two_prs(board)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++    finish(board, reviews, (CORE, MODS))
++    assert kb.get_task(board, task).status == "ready"
++    assert dispatch.check_respawn_guard(board, task) is None
++    # One continuation only: the next claim consumes it, a crash does not grant another.
++    assert kb.claim_task(board, task) is not None
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++    assert kb.reclaim_task(board, task, reason="Worker died", signal_fn=lambda *_: None)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++@pytest.mark.parametrize("prs,verdicts", [
++    ((CORE, CORE), ("approve", "approve")),  # nobody approved the plugin PR
++    ((CORE, MODS + "1"), ("approve", "approve")),  # second approval names an unrelated PR
++    ((CORE, MODS), ("approve", "unknown-but-not-approval")),  # sibling did not approve
++    # The first approval covers the whole checkpoint, but the sibling still never approved.
++    ((None, MODS), ("approve", "unknown-but-not-approval")),
++])
++def test_split_approvals_must_cover_every_pr_and_every_parent(board, prs, verdicts):
++    task, reviews = parked_two_prs(board)
++    data = [{"verdict": v, "reviewed_sha": helpers.HEAD} | ({"reviewed_pr": p} if p else {})
++            for p, v in zip(prs, verdicts)]
++    for review, metadata in zip(reviews, data):
++        kb.claim_task(board, review)
++        run = kb.get_task(board, review).current_run_id
++        # An unknown verdict is repair evidence for its own PR only; drop the exact head so
++        # it cannot resume through the repair path and the approval rule alone decides.
++        if metadata["verdict"] != "approve":
++            metadata = {k: v for k, v in metadata.items() if k != "reviewed_sha"}
++        assert kb.complete_task(board, review, summary="Review complete", expected_run_id=run,
++                                metadata=metadata)
++    kb.recompute_ready(board)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
+-- 
+2.43.0
+

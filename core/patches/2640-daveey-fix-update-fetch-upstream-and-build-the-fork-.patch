@@ -1,0 +1,549 @@
+From b1f18f7327701015d350cd80dd6ecb601c185db5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:01:09 +0000
+Subject: [PATCH] [daveey] fix(update): fetch upstream and build the fork merge
+ before pausing gateways
+
+`hermes update` on a fork kept this install's gateways paused through the
+whole upstream sync: a network `git fetch upstream` (77 s on worker-6's
+blob:none clone), the comparison, and on updates.fork_merge_upstream the
+off-tree merge-tree, its conflict card (up to 60 s in a fresh interpreter)
+and the CI gate. None of that writes a file of the live checkout. Worker-6's
+pause lasted 111 s (incident b111bb8f) against 8-47 s fleet-wide.
+
+`_prepare_upstream_sync` now runs that work in `_cmd_update_impl` after the
+origin fetch and the pre-commit-point refusals, before the commit point stops
+the gateways. The fork merge is built on origin/main, where the origin pull
+leaves a HEAD that is behind or at it; when HEAD has commits origin/main
+lacks, the merge is still built on HEAD in the sync as before. The paused
+`_sync_with_upstream_if_needed` takes the prepared plan once (same root) and
+reuses the merge only when HEAD is the commit it was built on; otherwise it
+builds it on HEAD. It never fetches again. The upstream fast-forward, a real
+tree move, stays paused under `checkout_move` with its marker, debt and
+syntax preflight unchanged. Direct callers with no prepared plan behave as
+before.
+
+Behaviour notes: the conflict report and the CI gate now run from the
+pre-update checkout's code (the update has not moved the tree yet), and an
+update that the pause later defers has already fetched upstream and filed or
+staged its merge. `_push_synced_fork` (publish after the upstream ff, the
+strictly-behind path only) still runs paused; unchanged here.
+
+Proof: tests/hermes_cli/test_update_upstream_before_pause.py records call
+order over a real `cmd_update` on local git fixtures (no network). On base
+source all 7 fail: fetch upstream, conflict report and CI gate run after
+'pause'. With the change they pass: on the fork-merge path they run before
+the pause, the only paused git step is the origin ff, and on the ff path the
+upstream `merge --ff-only` runs paused inside a checkout_move bound to the
+upstream commit. Mutants (drop the HEAD-ancestor guard, the merge_head
+check, the root check, the per-attempt reset, the take-once) each fail one
+or more tests. 213 update-related test files: 4459 passed, 0 failed.
+---
+ hermes_cli/update_cmd.py                      |  10 +-
+ hermes_cli/update_cmd_git.py                  | 145 +++++++---
+ .../test_update_upstream_before_pause.py      | 256 ++++++++++++++++++
+ 3 files changed, 370 insertions(+), 41 deletions(-)
+ create mode 100644 tests/hermes_cli/test_update_upstream_before_pause.py
+
+diff --git a/hermes_cli/update_cmd.py b/hermes_cli/update_cmd.py
+index 62190b5ac6..9dc5e6fcf2 100644
+--- a/hermes_cli/update_cmd.py
++++ b/hermes_cli/update_cmd.py
+@@ -101,8 +101,8 @@ from hermes_cli.update_cmd_git import (
+     _has_upstream_remote, _is_fork, _locate_real_git, _mark_skip_upstream_prompt,
+     _normalize_managed_eol, _park_detached_head, _portable_git_candidates, _print_fetch_failure,
+     _print_parked_branch_kept_notice, _print_parked_branch_skip_warning,
+-    _prune_orphan_rescue_refs, _push_synced_fork, _should_skip_upstream_prompt, _sync_fork_with_upstream,
+-    _sync_with_upstream_if_needed, UpstreamTargetBroken)
++    _prune_orphan_rescue_refs, _prepare_upstream_sync, _push_synced_fork, _should_skip_upstream_prompt,
++    _sync_fork_with_upstream, _sync_with_upstream_if_needed, UpstreamTargetBroken)
+ from hermes_cli.update_cmd_maint import (
+     _PRE_UPDATE_SNAPSHOT_KEEP, _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
+     _checkout_version, _ensure_acp_launcher, _ensure_fhs_path_guard, _finish_dashboard_update_cleanup,
+@@ -1915,6 +1915,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
+                 target_ref = held
+                 held_message = f"✓ Holding at this build until a newer {channel} release ships."
+         _refuse_before_commit_point(git_cmd, target_ref, _windows_gateway_resume)
++        # The upstream fetch/compare and the fork merge's off-tree work, before any gateway is paused.
++        sync_upstream = is_fork and branch == "main" and not release_sha
++        _prepare_upstream_sync(git_cmd, _m().PROJECT_ROOT, enabled=sync_upstream, assume_yes=assume_yes,
++                               input_fn=gw_input_fn)
+         _plan = _prepare_checkout_for_update(
+             git_cmd, branch, current_branch, is_fork=is_fork, assume_yes=assume_yes,
+             gateway_mode=gateway_mode, gw_input_fn=gw_input_fn, switch_branch=opts.switch_branch,
+@@ -1944,7 +1948,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
+             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
+             keep_stash=opts.keep_stash, target_ref=target_ref, pre_sync_sha=_plan.pre_sync_sha,
+             rollback_branch=_plan.rollback_branch,
+-            sync_upstream=is_fork and branch == "main" and not release_sha, assume_yes=assume_yes,
++            sync_upstream=sync_upstream, assume_yes=assume_yes,
+             in_place_update=_plan.in_place_update, _windows_gateway_resume=_windows_gateway_resume,
+             expected_sha=completion_request.get("expected_sha"))
+         _apply_pulled_update(
+diff --git a/hermes_cli/update_cmd_git.py b/hermes_cli/update_cmd_git.py
+index ebdc8076a5..794100147f 100644
+--- a/hermes_cli/update_cmd_git.py
++++ b/hermes_cli/update_cmd_git.py
+@@ -12,6 +12,7 @@ from contextlib import nullcontext, suppress
+ import subprocess
+ import sys
+ from datetime import datetime, timedelta, timezone, UTC
++from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Optional
+ 
+@@ -419,9 +420,9 @@ def _fork_merges_upstream() -> bool:
+     return False
+ 
+ 
+-def _synthesize_upstream_merge(git_cmd: list[str], cwd: Path, upstream: str) -> Optional[str]:
+-    """Merge commit of ``upstream`` into HEAD built without touching the work tree; None on conflict/error."""
+-    head = _git_stdout(git_cmd, ["rev-parse", "HEAD"], cwd)
++def _synthesize_upstream_merge(git_cmd: list[str], cwd: Path, upstream: str, head: Optional[str] = None) -> Optional[str]:
++    """Merge commit of ``upstream`` into *head* (HEAD by default) built without touching the work tree; None on conflict/error."""
++    head = head or _git_stdout(git_cmd, ["rev-parse", "HEAD"], cwd)
+     if not head:
+         print("  ✗ Could not resolve HEAD. Skipping upstream merge.")
+         return None
+@@ -456,46 +457,51 @@ class UpstreamTargetBroken(Exception):
+         self.sha, self.path, self.error = sha, path, error
+ 
+ 
+-def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: bool = False, input_fn=None,
+-                                  checkout_move=None) -> bool:
+-    """Offer to add ``upstream``, compare origin/main vs upstream/main, ff-pull when strictly behind, then push origin.
++@dataclass
++class _UpstreamPlan:
++    """What the upstream sync found before any tree write. ``action``: ``done`` (``verdict`` is the
++    sync's result), ``ff`` (fast-forward the live tree to ``upstream``), ``merge`` (the fork merge is
++    still to build) or ``merged`` (built on ``merge_head`` and handed to the CI gate; ``verdict``)."""
+ 
+-    Returns True only when origin/main was actually verified against upstream/main; False when the check never
+-    happened, so the caller never reports "up to date" on an origin-only compare. Fetches only upstream/main:
+-    a bare fetch drags in thousands of auto-generated branches. ``UpstreamTargetBroken`` when the
+-    upstream commit fails the startup syntax check: nothing moved, the caller rolls the update back.
++    action: str
++    verdict: bool = False
++    upstream: str = ""
++    upstream_ahead: int = 0
++    root: str = ""
++    merge_head: str = ""
+ 
+-    ``checkout_move(target)`` is the caller's context for the one tree write (the merge): the
+-    paused gateways' tree gate is bound to *target* before git writes a file.
+ 
+-    See #97052.
+-    """
++#: The plan ``_prepare_upstream_sync`` made before the gateways were paused; the sync takes it once.
++_PREPARED: Optional[_UpstreamPlan] = None
++
++
++def _plan_upstream_sync(git_cmd: list[str], cwd: Path, *, assume_yes: bool, input_fn) -> _UpstreamPlan:
++    """The sync's half that writes no file of the live tree: offer ``upstream``, fetch upstream/main, compare."""
+     from hermes_cli.update_cmd import _count_commits_between, _has_upstream_remote, _no_prompt_git_kwargs, _should_skip_upstream_prompt
+     from hermes_cli.update_cmd_check import tracking_refspec
+     from hermes_cli.update_custody import run_git
+     if not _has_upstream_remote(git_cmd, cwd) and (
+         _should_skip_upstream_prompt() or not _offer_upstream_remote(git_cmd, cwd, assume_yes=assume_yes, input_fn=input_fn)
+     ):
+-        return False
++        return _UpstreamPlan("done")
+     print("\n→ Fetching upstream...")
+     try:
+         run_git(git_cmd, ["fetch", "upstream", tracking_refspec("upstream", "main"), "--quiet"], cwd=cwd, capture_output=True, check=True, **_no_prompt_git_kwargs())
+     except subprocess.CalledProcessError:
+         print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
+-        return False
++        return _UpstreamPlan("done")
+     # One commit for the whole sync (m2): the short `upstream/main` also names a local branch of
+     # that name, so the count and the merge could each see a different commit.
+     upstream = _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "refs/remotes/upstream/main^{commit}"], cwd)
+     origin_ahead = _count_commits_between(git_cmd, cwd, upstream, "refs/remotes/origin/main") if upstream else -1
+     upstream_ahead = _count_commits_between(git_cmd, cwd, "refs/remotes/origin/main", upstream) if upstream else -1
+-    if origin_ahead < 0 or upstream_ahead < 0:
++    if not upstream or origin_ahead < 0 or upstream_ahead < 0:
+         print("  ✗ Could not compare branches. Skipping upstream sync.")
+-        return False
+-    target = upstream  # what the live tree fast-forwards to: upstream itself, or a merge of it into the fork
++        return _UpstreamPlan("done")
+     if origin_ahead > 0:
+         if upstream_ahead == 0:
+             print(f"  ✓ Fork is up to date with upstream ({origin_ahead} fork commit(s) on top)")
+-            return True
++            return _UpstreamPlan("done", True)
+         if not _fork_merges_upstream():
+             print(
+                 f"\nℹ Your fork has {origin_ahead} commit(s) not on upstream.\n"
+@@ -503,26 +509,89 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes:
+                 "  If you want to merge upstream changes, run:\n    git pull upstream main\n"
+                 "  (or set updates.fork_merge_upstream: true to merge on every update)"
+             )
+-            return True
+-        # updates.fork_merge_upstream: carry the fork's commits forward by merging upstream into the fork.
+-        # The merge is built off-tree (merge-tree + commit-tree) and handed to the fork's CI gate; the
+-        # live checkout does not move to it. It arrives through the normal origin pull once the full
+-        # suite passed on the fork's runners and the gate landed it on main.
+-        merged = _synthesize_upstream_merge(git_cmd, cwd, upstream)
+-        if merged is None:
+-            return False
+-        print(f"\n→ Fork is {upstream_ahead} commit(s) behind upstream\n"
+-              f"→ Handing the upstream merge ({merged[:10]}) to the fork's CI gate...")
+-        if _sync_fork_with_upstream(git_cmd, cwd, merged):
+-            print("  ✓ An upstream sync that passed the fork's full suite is on main; the next update pulls it")
+-        else:
+-            print("  ℹ Upstream sync not on main yet (staged, in CI, or refused above); main is unchanged")
+-        return True
+-    elif upstream_ahead == 0:
++            return _UpstreamPlan("done", True)
++        return _UpstreamPlan("merge", upstream=upstream, upstream_ahead=upstream_ahead)
++    if upstream_ahead == 0:
+         print("  ✓ Fork is up to date with upstream")
+-        return True
++        return _UpstreamPlan("done", True)
++    return _UpstreamPlan("ff", upstream=upstream, upstream_ahead=upstream_ahead)
++
++
++def _merge_upstream_into_fork(git_cmd: list[str], cwd: Path, plan: _UpstreamPlan, head: Optional[str] = None) -> bool:
++    """updates.fork_merge_upstream: carry the fork's commits forward by merging upstream into *head* (HEAD).
++
++    The merge is built off-tree (merge-tree + commit-tree) and handed to the fork's CI gate; the
++    live checkout does not move to it. It arrives through the normal origin pull once the full
++    suite passed on the fork's runners and the gate landed it on main."""
++    merged = _synthesize_upstream_merge(git_cmd, cwd, plan.upstream, head)
++    if merged is None:
++        return False
++    print(f"\n→ Fork is {plan.upstream_ahead} commit(s) behind upstream\n"
++          f"→ Handing the upstream merge ({merged[:10]}) to the fork's CI gate...")
++    if _sync_fork_with_upstream(git_cmd, cwd, merged):
++        print("  ✓ An upstream sync that passed the fork's full suite is on main; the next update pulls it")
+     else:
+-        print(f"\n→ Fork is {upstream_ahead} commit(s) behind upstream\n→ Pulling from upstream...")
++        print("  ℹ Upstream sync not on main yet (staged, in CI, or refused above); main is unchanged")
++    return True
++
++
++def _prepare_upstream_sync(git_cmd: list[str], cwd: Path, *, enabled: bool, assume_yes: bool = False,
++                           input_fn=None) -> None:
++    """Run the sync's network and off-tree work BEFORE the gateways are paused (worker-6: a 111 s pause).
++
++    The upstream fetch, the comparison and, on the fork-merge path, the off-tree merge, its conflict
++    report and the CI gate write no file of the live checkout, so no gateway needs to be stopped for
++    them. The merge is built on origin/main, where the origin pull leaves a HEAD that is behind or at
++    it; ``_sync_with_upstream_if_needed`` reuses the result only when HEAD is there. The upstream
++    fast-forward, a real tree move, stays in the paused window under ``checkout_move``.
++    """
++    global _PREPARED
++    _PREPARED = None
++    if not enabled:
++        return
++    plan = _plan_upstream_sync(git_cmd, cwd, assume_yes=assume_yes, input_fn=input_fn)
++    origin = _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "refs/remotes/origin/main^{commit}"], cwd)
++    if plan.action == "merge" and origin and _git_ok(git_cmd, ["merge-base", "--is-ancestor", "HEAD", origin], cwd):
++        plan.action, plan.merge_head = "merged", origin
++        plan.verdict = _merge_upstream_into_fork(git_cmd, cwd, plan, origin)
++    plan.root = str(Path(cwd).resolve())
++    _PREPARED = plan
++
++
++def _take_prepared_upstream_sync(cwd: Path) -> Optional[_UpstreamPlan]:
++    """The plan ``_prepare_upstream_sync`` made for *cwd* in this attempt, handed out once; else None."""
++    global _PREPARED
++    plan, _PREPARED = _PREPARED, None
++    return plan if plan is not None and plan.root == str(Path(cwd).resolve()) else None
++
++
++def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: bool = False, input_fn=None,
++                                  checkout_move=None) -> bool:
++    """Offer to add ``upstream``, compare origin/main vs upstream/main, ff-pull when strictly behind, then push origin.
++
++    Returns True only when origin/main was actually verified against upstream/main; False when the check never
++    happened, so the caller never reports "up to date" on an origin-only compare. Fetches only upstream/main:
++    a bare fetch drags in thousands of auto-generated branches. ``UpstreamTargetBroken`` when the
++    upstream commit fails the startup syntax check: nothing moved, the caller rolls the update back.
++
++    ``checkout_move(target)`` is the caller's context for the one tree write (the merge): the
++    paused gateways' tree gate is bound to *target* before git writes a file. The plan
++    ``_prepare_upstream_sync`` made before the pause replaces the fetch and comparison here.
++
++    See #97052.
++    """
++    from hermes_cli.update_cmd import _no_prompt_git_kwargs
++    from hermes_cli.update_custody import run_git
++    plan = _take_prepared_upstream_sync(cwd) or _plan_upstream_sync(git_cmd, cwd, assume_yes=assume_yes,
++                                                                     input_fn=input_fn)
++    if plan.action == "merged" and plan.merge_head != _git_stdout(git_cmd, ["rev-parse", "HEAD"], cwd):
++        plan.action = "merge"  # HEAD is not the commit the prepared merge was built on: build it on HEAD
++    if plan.action == "merge":
++        return _merge_upstream_into_fork(git_cmd, cwd, plan)
++    if plan.action != "ff":
++        return plan.verdict
++    target = plan.upstream  # what the live tree fast-forwards to
++    print(f"\n→ Fork is {plan.upstream_ahead} commit(s) behind upstream\n→ Pulling from upstream...")
+     # A tree move like the pull itself: the marker and the owed tail are armed before git writes,
+     # and the just-fetched ref is merged (a second `git pull` fetch could move past the marker's target).
+     from hermes_cli import update_cmd_commit as _commit
+diff --git a/tests/hermes_cli/test_update_upstream_before_pause.py b/tests/hermes_cli/test_update_upstream_before_pause.py
+new file mode 100644
+index 0000000000..a5c3f4a23e
+--- /dev/null
++++ b/tests/hermes_cli/test_update_upstream_before_pause.py
+@@ -0,0 +1,256 @@
++"""The upstream fetch, compare and fork merge run BEFORE the gateways are paused (worker-6, 111 s).
++
++``hermes update`` on a fork used to fetch upstream (77 s on a partial clone), build the off-tree
++fork merge and file its conflict card while this install's gateways were stopped. None of that
++writes a file of the live checkout. A call-order recorder over a real ``cmd_update`` on local git
++fixtures (no network) shows that it now runs before the pause, while the fast-forward from upstream,
++a real tree move, still runs paused and under ``checkout_move``.
++"""
++from contextlib import contextmanager
++from pathlib import Path
++import subprocess
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import main as cli_main, update_cmd, update_cmd_git, update_receipt
++from hermes_cli.update_inventory import UpdatePlan
++
++
++def git(root, *args):
++    return subprocess.run(['git', *args], cwd=root, check=True, capture_output=True,
++                          text=True, encoding='utf-8').stdout.strip()
++
++
++def commit(root, text, message):
++    (root / 'content.txt').write_text(text, encoding='utf-8')
++    git(root, '-c', 'commit.gpgsign=false', 'commit', '-qam', message)
++    return git(root, 'rev-parse', 'HEAD')
++
++
++class Recorder:
++    """What ran, in order, and whether this run's gateways were paused (or a tree move open) then."""
++
++    def __init__(self):
++        self.events, self.paused, self.moves = [], False, []
++
++    def note(self, name, *detail):
++        self.events.append((name, *detail, 'paused' if self.paused else 'running',
++                            self.moves[-1] if self.moves else None))
++
++    def names(self, state=None):
++        return [e[0] for e in self.events if e[0] != 'pause' and (state is None or e[-2] == state)]
++
++
++@pytest.fixture
++def fork(tmp_path, monkeypatch):
++    for key in ('HERMES_UPDATE_HANDOFF_PID', 'HERMES_UPDATE_REEXEC'):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv('GIT_CONFIG_GLOBAL', str(tmp_path / 'git-config'))
++    monkeypatch.setenv('GIT_CONFIG_NOSYSTEM', '1')
++    monkeypatch.setenv('GIT_ALLOW_PROTOCOL', 'file')
++    origin = tmp_path / 'origin'
++    origin.mkdir()
++    git(origin, 'init', '-q', '-b', 'main')
++    git(origin, 'config', 'user.name', 'Fixture')
++    git(origin, 'config', 'user.email', 'fixture@example.invalid')
++    (origin / 'content.txt').write_text('base\n', encoding='utf-8')
++    (origin / '.gitignore').write_text('.bytecode-fingerprint\n', encoding='utf-8')
++    git(origin, 'add', 'content.txt', '.gitignore')
++    git(origin, '-c', 'commit.gpgsign=false', 'commit', '-qm', 'base')
++    base = git(origin, 'rev-parse', 'HEAD')
++    clone = tmp_path / 'install'
++    git(tmp_path, 'clone', '-q', str(origin), str(clone))
++    upstream = tmp_path / 'upstream'
++    git(tmp_path, 'clone', '-q', str(origin), str(upstream))
++    for repo in (clone, upstream):
++        git(repo, 'config', 'user.name', 'Fixture')
++        git(repo, 'config', 'user.email', 'fixture@example.invalid')
++    git(clone, 'remote', 'add', 'upstream', str(upstream))
++
++    monkeypatch.setattr(cli_main, 'PROJECT_ROOT', clone)
++    monkeypatch.setattr(update_receipt, '_code_identity', lambda **_: {'commit': base})
++    monkeypatch.setattr(cli_main, '_run_pre_update_backup', lambda *_: 'snapshot')
++    monkeypatch.setattr(cli_main, '_pause_windows_gateways_for_update', lambda: None)
++    from hermes_cli import update_cmd_pause_gate, update_cmd_posix_pause as posix_pause, update_custody
++    monkeypatch.setattr(posix_pause, '_discover_systemd', list)
++    monkeypatch.setattr(posix_pause, '_discover_launchd', list)
++    monkeypatch.setattr(posix_pause, '_discover_bare', lambda pids: ([], []))
++    monkeypatch.setattr(cli_main, '_resume_windows_gateways_after_update', lambda state: None)
++    monkeypatch.setattr(cli_main, '_install_hangup_protection', lambda **_: {'installed': False})
++    monkeypatch.setattr(cli_main, '_finalize_update_output', lambda *_: None)
++    monkeypatch.setattr('hermes_cli.update_inventory.collect_runtime_inventory', lambda: UpdatePlan(
++        install_method='git', expected_sha=git(clone, 'rev-parse', 'HEAD'), profiles=['default']))
++    monkeypatch.setattr(cli_main, '_sync_with_upstream_if_needed', update_cmd_git._sync_with_upstream_if_needed)
++    requests = []
++    monkeypatch.setattr(update_cmd, 'run_completion', lambda request: requests.append(request) or {
++        'exit_code': 0, 'receipt': None})
++
++    rec = Recorder()
++    real_pause = posix_pause.pause_at_commit_point
++
++    def pause():  # the commit point stops this install's gateways; the update resumes them at its end
++        if not rec.paused:
++            rec.note('pause')
++        rec.paused = True
++        return real_pause()
++
++    monkeypatch.setattr(posix_pause, 'pause_at_commit_point', pause)
++    real_run_git = update_custody.run_git
++
++    def run_git(git_cmd, args, *a, **kw):
++        if args[:2] == ['fetch', 'upstream']:
++            rec.note('fetch upstream')
++        if args[:2] == ['merge', '--ff-only']:
++            rec.note('merge --ff-only', args[2])
++        return real_run_git(git_cmd, args, *a, **kw)
++
++    monkeypatch.setattr(update_custody, 'run_git', run_git)
++    real_move = update_cmd_pause_gate._checkout_move
++
++    @contextmanager
++    def checkout_move(token, *targets, **kw):
++        with real_move(token, *targets, **kw) as step:
++            rec.moves.append(targets)
++            try:
++                yield step
++            finally:
++                rec.moves.pop()
++
++    monkeypatch.setattr(update_cmd_pause_gate, '_checkout_move', checkout_move)
++    report = []
++
++    def conflict_report(cwd, sha, conflicts):
++        rec.note('conflict report')
++        report.append((sha, conflicts))
++        return 't_conflict_owner'
++
++    monkeypatch.setattr('hermes_cli.update_upstream_conflict.report', conflict_report)
++    gate = []
++
++    def ci_gate(git_cmd, cwd, head='HEAD'):
++        rec.note('ci gate')
++        gate.append(head)
++        return False
++
++    monkeypatch.setattr(update_cmd_git, '_sync_fork_with_upstream', ci_gate)
++    args = SimpleNamespace(branch=None, channel='main', yes=True, force=True, force_venv=True, check=False,
++                           plan=False, gateway=True, install_id=False, set_channel=None)
++    return SimpleNamespace(origin=origin, clone=clone, upstream=upstream, base=base, rec=rec, args=args,
++                           requests=requests, report=report, gate=gate)
++
++
++@pytest.mark.parametrize('conflict', [True, False], ids=['conflict', 'clean'])
++def test_fork_merge_fetches_merges_and_reports_before_the_gateways_pause(fork, monkeypatch, conflict):
++    t = fork
++    monkeypatch.setattr(update_cmd_git, '_fork_merges_upstream', lambda: True)
++    upstream_tip = commit(t.upstream, 'upstream\n', 'upstream change')
++    if not conflict:
++        (t.origin / 'fork.txt').write_text('fork\n', encoding='utf-8')
++        git(t.origin, 'add', 'fork.txt')
++        git(t.origin, '-c', 'commit.gpgsign=false', 'commit', '-qm', 'fork change')
++        fork_tip = git(t.origin, 'rev-parse', 'HEAD')
++    else:
++        fork_tip = commit(t.origin, 'fork\n', 'fork change')
++
++    cli_main.cmd_update(t.args)
++
++    # The origin pull still moved the tree (paused); the fork merge never did.
++    assert git(t.clone, 'rev-parse', 'HEAD') == fork_tip
++    assert len(t.requests) == 1
++    off_tree = ['fetch upstream', 'conflict report'] if conflict else ['fetch upstream', 'ci gate']
++    assert t.rec.names('running') == off_tree, t.rec.events
++    assert t.rec.names('paused') == ['merge --ff-only'], t.rec.events  # the origin fast-forward only
++    assert [e[0] for e in t.rec.events].index('pause') == len(off_tree)
++    if conflict:
++        assert t.report == [(upstream_tip, ['content.txt'])] and t.gate == []
++    else:
++        [merged] = t.gate  # built on origin/main, where the pull put HEAD, before the pause
++        assert git(t.clone, 'rev-list', '--parents', '-n1', merged).split()[1:] == [fork_tip, upstream_tip]
++        assert t.report == []
++
++
++def test_upstream_fast_forward_still_moves_the_tree_paused_under_checkout_move(fork):
++    t = fork
++    origin_tip = commit(t.origin, 'origin\n', 'origin change')
++    git(t.upstream, 'pull', '-q', '--ff-only', 'origin', 'main')
++    upstream_tip = commit(t.upstream, 'upstream\n', 'upstream change')  # the fork is strictly behind
++
++    cli_main.cmd_update(t.args)
++
++    assert git(t.clone, 'rev-parse', 'HEAD') == upstream_tip
++    assert t.rec.names('running') == ['fetch upstream'], t.rec.events
++    ff = [e for e in t.rec.events if e[0] == 'merge --ff-only']
++    assert [e[1] for e in ff] == [origin_tip, upstream_tip]
++    upstream_ff = ff[1]
++    # Gateways stopped, inside a checkout_move whose tree gate is bound to the upstream commit.
++    assert upstream_ff[-2:] == ('paused', (upstream_tip,)), t.rec.events
++    # Unchanged here: the validated sync is published through the gate after the syntax guard.
++    assert t.gate == ['HEAD'] and t.report == []
++
++
++def test_prepared_plan_is_used_once_and_never_fetches_again(fork, monkeypatch):
++    """The paused sync reuses the prepared fetch and merge; a second sync plans afresh."""
++    t = fork
++    monkeypatch.setattr(update_cmd_git, '_fork_merges_upstream', lambda: True)
++    commit(t.upstream, 'upstream\n', 'upstream change')
++    commit(t.clone, 'fork\n', 'fork change')
++    git(t.clone, 'update-ref', 'refs/remotes/origin/main', git(t.clone, 'rev-parse', 'HEAD'))
++    update_cmd_git._prepare_upstream_sync(['git'], t.clone, enabled=True, assume_yes=True)
++    assert t.rec.names() == ['fetch upstream', 'conflict report']
++    assert update_cmd_git._sync_with_upstream_if_needed(['git'], t.clone, assume_yes=True) is False
++    assert t.rec.names() == ['fetch upstream', 'conflict report']  # nothing ran twice
++    assert update_cmd_git._sync_with_upstream_if_needed(['git'], t.clone, assume_yes=True) is False
++    assert t.rec.names() == ['fetch upstream', 'conflict report'] * 2
++
++
++def test_prepared_merge_is_rebuilt_on_head_when_head_is_elsewhere(fork, monkeypatch):
++    t = fork
++    monkeypatch.setattr(update_cmd_git, '_fork_merges_upstream', lambda: True)
++    upstream_tip = commit(t.upstream, 'upstream\n', 'upstream change')
++    (t.origin / 'fork.txt').write_text('fork\n', encoding='utf-8')
++    git(t.origin, 'add', 'fork.txt')
++    git(t.origin, '-c', 'commit.gpgsign=false', 'commit', '-qm', 'fork change')
++    git(t.clone, 'fetch', '-q', 'origin')
++    origin_tip = git(t.clone, 'rev-parse', 'origin/main')
++    update_cmd_git._prepare_upstream_sync(['git'], t.clone, enabled=True, assume_yes=True)
++    assert len(t.gate) == 1  # built on origin/main before any pause
++    # HEAD did not land on origin/main (here: never pulled), so the merge is not the one prepared.
++    assert update_cmd_git._sync_with_upstream_if_needed(['git'], t.clone, assume_yes=True) is True
++    assert t.rec.names() == ['fetch upstream', 'ci gate', 'ci gate']
++    first, second = (git(t.clone, 'rev-list', '--parents', '-n1', m).split()[1:] for m in t.gate)
++    assert first == [origin_tip, upstream_tip] and second == [t.base, upstream_tip]
++
++
++def test_no_merge_before_the_pause_when_the_pull_cannot_land_on_origin_main(fork, monkeypatch):
++    """A HEAD with commits origin/main lacks does not land on origin/main: build the merge on HEAD later."""
++    t = fork
++    monkeypatch.setattr(update_cmd_git, '_fork_merges_upstream', lambda: True)
++    upstream_tip = commit(t.upstream, 'upstream\n', 'upstream change')
++    (t.clone / 'local.txt').write_text('local\n', encoding='utf-8')
++    git(t.clone, 'add', 'local.txt')
++    git(t.clone, '-c', 'commit.gpgsign=false', 'commit', '-qm', 'local')
++    local = git(t.clone, 'rev-parse', 'HEAD')
++    (t.origin / 'fork.txt').write_text('fork\n', encoding='utf-8')
++    git(t.origin, 'add', 'fork.txt')
++    git(t.origin, '-c', 'commit.gpgsign=false', 'commit', '-qm', 'fork change')
++    git(t.clone, 'fetch', '-q', 'origin')
++    update_cmd_git._prepare_upstream_sync(['git'], t.clone, enabled=True, assume_yes=True)
++    assert t.rec.names() == ['fetch upstream'] and t.gate == []
++    assert update_cmd_git._sync_with_upstream_if_needed(['git'], t.clone, assume_yes=True) is True
++    assert t.rec.names() == ['fetch upstream', 'ci gate']  # no second fetch
++    [merged] = t.gate
++    assert git(t.clone, 'rev-list', '--parents', '-n1', merged).split()[1:] == [local, upstream_tip]
++
++
++def test_disabled_or_foreign_root_prepares_nothing(fork, tmp_path):
++    t = fork
++    commit(t.upstream, 'upstream\n', 'upstream change')
++    update_cmd_git._prepare_upstream_sync(['git'], t.clone, enabled=True, assume_yes=True)
++    assert update_cmd_git._PREPARED is not None and t.rec.names() == ['fetch upstream']
++    # A later attempt that does not sync upstream drops the earlier attempt's plan and fetches nothing.
++    update_cmd_git._prepare_upstream_sync(['git'], t.clone, enabled=False, assume_yes=True)
++    assert update_cmd_git._PREPARED is None and t.rec.names() == ['fetch upstream']
++    update_cmd_git._prepare_upstream_sync(['git'], t.clone, enabled=True, assume_yes=True)
++    assert update_cmd_git._take_prepared_upstream_sync(Path(tmp_path / 'elsewhere')) is None
++    assert update_cmd_git._PREPARED is None  # handed out (or dropped) once
+-- 
+2.43.0
+

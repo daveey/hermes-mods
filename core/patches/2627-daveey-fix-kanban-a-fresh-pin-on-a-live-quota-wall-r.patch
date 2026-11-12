@@ -1,0 +1,411 @@
+From c6f6f02c6260579ce53ccfc1b3af89fab0ae20e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 09:29:19 +0000
+Subject: [PATCH] [daveey] fix(kanban): a fresh pin on a live quota wall
+ reroutes in class instead of waiting the wall out
+
+Review 5871917933 on #1320 (kanban-dd62aef001): the new pre-claim pinned_quota_wall hold stopped every
+fresh pinned card on a live-pool wall before its first run. pinned_route rule 1 needs a wall from one of
+the card's own runs, which a held card never gets, so a non-mandatory pin on a far wall with a free
+class peer waited the whole wall out (the M4 56 h case the reroute was built for).
+
+- kanban_pin_reroute.fresh_live_wall: a card with no run before its current one, whose concrete pin's
+  live pool is quota-walled right now, counts that wall as rule 1 evidence (the same evidence its worker
+  would exit 75 on). resolve_dispatch_tier passes it, so preview and admission reroute the first run.
+- own_walls also reads earlier model_reroute events: a fresh card's reroute has no quota episode, and
+  its next run must not go back into the wall it knows. record() names the live reset in the comment.
+- kanban_dispatch_skip.pinned_quota_hold holds only when pinned_route would not reroute (mandatory pin,
+  wall under pin_quota_reroute_min_hours, no eligible peer); an unreadable policy still holds.
+- kanban_diagnostics: a current pinned_quota_wall skip with a future until is a deliberate hold
+  (held_in_ready warning, with hold_until), not stranded_in_ready (critical after 3 h).
+- record() dedupes pinned_quota_wall on until too, so a moved reset reaches the notice;
+  per_profile_capped counts as an ordering skip (priority advice kept).
+
+Proof: new tests test_fresh_pin_on_a_far_live_wall_reroutes_on_its_first_run (the reviewer's repro
+shape: tick 1 spawns the peer, no dispatch_skipped, second run still on the peer, back on the pin after
+the reset), test_fresh_pin_with_no_reroute_is_held_on_its_live_wall[mandatory|near_wall|no_peer]
+(one skip, held_in_ready warning), plus dedupe/ordering tests. 9/9 mutants of the new conditions killed.
+---
+ hermes_cli/kanban_diagnostics.py              | 30 ++++++++--
+ hermes_cli/kanban_dispatch_skip.py            | 48 +++++++++------
+ hermes_cli/kanban_model_tier.py               |  4 +-
+ hermes_cli/kanban_pin_reroute.py              | 34 +++++++++--
+ tests/hermes_cli/test_kanban_dispatch_skip.py | 25 ++++++++
+ tests/hermes_cli/test_kanban_pin_reroute.py   | 59 +++++++++++++++++++
+ .../hermes_cli/test_kanban_provider_walls.py  |  4 +-
+ 7 files changed, 175 insertions(+), 29 deletions(-)
+
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index bae6e9b7a2..67e4d09f6d 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -777,7 +777,23 @@ def _foreign_machines(task, cfg) -> list[str]:
+             if str(l).startswith("machine:") and str(l).split(":", 1)[1] != own]
+ 
+ 
+-def _ready_hold_reason(task, events, cfg) -> Optional[str]:
++def _pinned_quota_hold_until(events, now) -> Optional[int]:
++    """Reset time when the current ready episode's latest ``dispatch_skipped`` is a ``pinned_quota_wall``
++    hold still in the future (``kanban_dispatch_skip``); else None. Same episode bounds as its reader."""
++    from hermes_cli.kanban_dispatch_skip import EVENT, PINNED_QUOTA_WALL, _episode_kinds
++    bounds = _episode_kinds() | {EVENT}
++    for ev in sorted(events or [], key=lambda ev: (_event_ts(ev), _task_field(ev, "id", 0) or 0), reverse=True):
++        if _event_kind(ev) not in bounds:
++            continue
++        payload = _parse_payload(ev) if _event_kind(ev) == EVENT else {}
++        until = payload.get("until")
++        if payload.get("reason") == PINNED_QUOTA_WALL and isinstance(until, (int, float)) and until > now:
++            return int(until)
++        return None
++    return None
++
++
++def _ready_hold_reason(task, events, cfg, now=None) -> Optional[str]:
+     """Last observed guard or current foreign-machine pin, not a live admission verdict.
+ 
+     Capacity checks can precede pickup/guard evaluation, leaving old guard history on a
+@@ -789,6 +805,8 @@ def _ready_hold_reason(task, events, cfg) -> Optional[str]:
+         return "respawn_guarded"
+     if _foreign_machines(task, cfg):
+         return "foreign_runs_on"
++    if _pinned_quota_hold_until(events, time.time() if now is None else now):
++        return "pinned_quota_wall"  # a fresh pin held on its live quota wall (kanban-dd62aef001)
+     return None
+ 
+ 
+@@ -808,7 +826,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     if not assignee.strip():
+         return []
+     # A deliberate hold is reported by _rule_held_in_ready, not as a stranded card.
+-    if _ready_hold_reason(task, events, cfg):
++    if _ready_hold_reason(task, events, cfg, now):
+         return []
+ 
+     # Most recent event that put the task into ready; with none (old task /
+@@ -864,7 +882,7 @@ def _rule_held_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+         return []
+     if not (_task_field(task, "assignee") or "").strip():
+         return []
+-    reason = _ready_hold_reason(task, events, cfg)
++    reason = _ready_hold_reason(task, events, cfg, now)
+     if not reason:
+         return []
+     since = _last_ready_entry_ts(events, runs) or int(_task_field(task, "created_at", 0) or 0)
+@@ -872,6 +890,8 @@ def _rule_held_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     if not since or age < float(cfg.get("stranded_threshold_seconds", 30 * 60)):
+         return []
+     guard_reason, hold_until = _guard_clock(events, runs, cfg, since) if reason == "respawn_guarded" else (None, None)
++    if reason == "pinned_quota_wall":
++        hold_until = _pinned_quota_hold_until(events, now)
+     hold = f"{reason}: {guard_reason}" if guard_reason else reason
+     if hold_until:
+         stamp = time.strftime("%H:%M:%SZ", time.gmtime(hold_until))
+@@ -879,11 +899,13 @@ def _rule_held_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     return [Diagnostic(
+         kind="held_in_ready", severity="warning",
+         title=(f"Ready {int(age / 60)}m, last observed hold ({hold})" if reason == "respawn_guarded"
+-               else f"Ready {int(age / 60)}m, held ({reason})"),
++               else f"Ready {int(age / 60)}m, held ({hold})"),
+         detail=("The last recorded dispatch decision was a guard hold; the current hold is not verified. "
+                 "A cleared blocker, capacity limit, or missing pickup can leave this historical event "
+                 "unchanged. Check the execution machine's current dispatcher verdict."
+                 if reason == "respawn_guarded" else
++                "Its explicit model pin is quota-walled and no same-class reroute applies; it starts when "
++                "the wall resets." if reason == "pinned_quota_wall" else
+                 "A foreign machine:* pin waits for that machine (or a re-file)."),
+         actions=[_cli_hint("Check dispatcher status", "hermes kanban diagnostics")],
+         first_seen_at=since, last_seen_at=since, count=1,
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index 2b5c512920..417e8ec348 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -79,13 +79,17 @@ def record(conn: sqlite3.Connection, task_id: str, reason: str, *, detail: Any =
+         if row is None or row["status"] not in ("ready", "review"):
+             return False  # it left the lane this tick (no-progress park, claimed): nothing waits any more
+         skips = episode_skips(conn, task_id)
+-        if skips and (skips[0].get("reason"), skips[0].get("detail")) == (reason, detail):
++        until = None if until is None else int(until)
++        # A moved reset is news for a quota hold (the notice names it); other reasons key on reason + detail.
++        key = (reason, detail, until if reason == PINNED_QUOTA_WALL else None)
++        if skips and (skips[0].get("reason"), skips[0].get("detail"),
++                      skips[0].get("until") if reason == PINNED_QUOTA_WALL else None) == key:
+             return False
+         if len(skips) >= MAX_PER_EPISODE:
+             return False
+         payload: dict[str, Any] = {"reason": reason, "detail": detail, **(extra or {})}
+         if until is not None:
+-            payload["until"] = int(until)
++            payload["until"] = until
+         kb._append_event(conn, task_id, EVENT, payload)
+     return True
+ 
+@@ -120,24 +124,28 @@ def record_tick(conn: sqlite3.Connection, result: Any, *, dry_run: bool = False)
+ 
+ 
+ def pinned_quota_hold(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, str, float]]:
+-    """``(model, provider, reset)`` when ``task_id`` has no run yet, an explicit concrete pin, and that pin's
+-    provider pool is quota-walled for the model right now; else None.
++    """``(model, provider, reset)`` when ``task_id`` has no run yet, an explicit concrete pin, that pin's
++    provider pool is quota-walled for the model right now, and no same-class reroute applies; else None.
+ 
+-    Only a fresh card: once a run hit the wall its quota episode (``kanban_quota_episode``) and the in-class
+-    reroute (``kanban_pin_reroute``) decide. A fresh pinned card is routed straight to its pin
+-    (``kanban_model_tier.resolve_dispatch_tier``), so claiming it would only spawn a worker into the wall."""
++    Only a fresh card: once a run hit the wall its quota episode (``kanban_quota_episode``) decides. A fresh
++    card the in-class reroute can move (non-mandatory pin, far wall, a free peer: ``kanban_pin_reroute``,
++    which reads the same live wall for a fresh card) is left to the claim, which routes it to the peer.
++    Any other fresh pin would only spawn a worker into the wall."""
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_pin_reroute import pin
+-    from hermes_cli.kanban_provider_walls import live_quota_wall
+-    if conn.execute("SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)).fetchone() is not None:
++    from hermes_cli.kanban_pin_reroute import fresh_live_wall, pin, pinned_route
++    task = kb.get_task(conn, task_id)
++    pinned = pin(task) if task is not None and getattr(task, "current_run_id", None) is None else None
++    if pinned is None or not (walls := fresh_live_wall(conn, task, pinned=pinned)):
+         return None
+-    pinned = pin(kb.get_task(conn, task_id))
+-    if pinned is None:
+-        return None
+-    until = live_quota_wall(pinned[1], pinned[0])
+-    if until is None or until <= time.time():
+-        return None
+-    return pinned[0], pinned[1], float(until)
++    try:
++        from hermes_cli.kanban_model_tier import load_tier_config
++        if pinned_route(conn, task, lane="ready", now=time.time(), cfg=load_tier_config(), current=walls):
++            return None
++    except sqlite3.Error:
++        raise
++    except Exception:  # health: allow BLE001 -- like the quota episode, an unreadable policy holds, never guesses
++        _log.warning("kanban dispatch: pin reroute probe failed for %s; holding on the wall", task_id, exc_info=True)
++    return pinned[0], pinned[1], walls[pinned[1]]
+ 
+ 
+ def hold_pinned_quota(conn: sqlite3.Connection, task_id: str, result: Any, *, lane: str) -> bool:
+@@ -186,8 +194,10 @@ def words(skip: dict[str, Any], *, now: Optional[float] = None) -> str:
+ 
+ 
+ def is_ordering(skip: Optional[dict[str, Any]]) -> bool:
+-    """True when the skip is about queue order or slots, where priority is a fair question."""
+-    return bool(skip) and skip.get("reason") == "claim_deferred" and skip.get("detail") == "capacity"
++    """True when the skip is about queue order or slots, where priority is a fair question: a Board capacity
++    deferral, or the assignee's per-profile cap (a slot wait among that profile's own cards)."""
++    return bool(skip) and ((skip.get("reason") == "claim_deferred" and skip.get("detail") == "capacity")
++                           or skip.get("reason") == "per_profile_capped")
+ 
+ 
+ def advice(skip: dict[str, Any]) -> str:
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 471e2cf1e4..ba85f7b53a 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -310,8 +310,10 @@ def resolve_dispatch_tier(conn, task, *, lane, cfg=None):
+         if not route and not active(conn, task.id):
+             # The episode is closed (a rerouted run ended) but the pin's wall may still be up.
+             import time
++            from hermes_cli.kanban_pin_reroute import fresh_live_wall
+             try:
+-                route = pinned_route(conn, task, lane=lane, now=time.time(),
++                now = time.time()  # a fresh card's live-pool wall stands in for its own run's (kanban-dd62aef001)
++                route = pinned_route(conn, task, lane=lane, now=now, current=fresh_live_wall(conn, task, now),
+                                      cfg=load_tier_config() if cfg is None else cfg)
+             except sqlite3.Error:
+                 raise
+diff --git a/hermes_cli/kanban_pin_reroute.py b/hermes_cli/kanban_pin_reroute.py
+index e723ea3d79..a017607afa 100644
+--- a/hermes_cli/kanban_pin_reroute.py
++++ b/hermes_cli/kanban_pin_reroute.py
+@@ -7,8 +7,10 @@ an explicit pin had no fallback, and workers cannot re-pin a card. David, 11-11
+ 
+ Rule (:func:`pinned_route`); every condition must hold, anything else keeps the pin as before:
+ 
+-1. one of the card's own runs hit a wall on the pin's provider (its ``quota_episode`` receipts, or the
+-   live episode), and that wall is still up;
++1. one of the card's own runs hit a wall on the pin's provider (its ``quota_episode`` receipts, an
++   earlier ``model_reroute``, or the live episode), and that wall is still up; or the card has no earlier
++   run and the live pool is quota-walled for the pinned model right now (:func:`fresh_live_wall`): its
++   first run would only exit 75 into that wall to learn it (kanban-dd62aef001);
+ 2. it resets ``kanban.pin_quota_reroute_min_hours`` (default 6) or more from now;
+ 3. the pin is not mandatory: neither ``tasks.model_pin_mandatory`` nor the ``require_model`` marker;
+ 4. the lane is ready, not review;
+@@ -79,8 +81,8 @@ def own_walls(conn: Any, task_id: str, now: float,
+               current: Optional[dict[str, float]] = None) -> dict[str, tuple[float, Any]]:
+     """``provider -> (until, episode_id)`` for every wall this card's own runs hit that is still up.
+ 
+-    Read from the card's ``quota_episode`` receipts; ``current`` adds the live episode's walls (its
+-    receipt may not carry them yet)."""
++    Read from the card's ``quota_episode`` receipts and earlier ``model_reroute`` events (a fresh card's
++    reroute has no episode); ``current`` adds the live episode's walls (its receipt may not carry them yet)."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_quota_episode import _providers, episode
+     out: dict[str, tuple[float, Any]] = {}
+@@ -92,6 +94,10 @@ def own_walls(conn: Any, task_id: str, now: float,
+         state = kb._json_dict(row[0])
+         for name in _providers(state):
+             add(name, state.get("until"), state.get("episode_id"))
++    for row in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?", (task_id, EVENT)):
++        moved = kb._json_dict(row[0])
++        if isinstance(moved.get("walled_provider"), str):
++            add(moved["walled_provider"], moved.get("resets_at"), moved.get("episode_id"))
+     if current:
+         live = episode(conn, task_id) or {}
+         for name, until in current.items():
+@@ -99,6 +105,24 @@ def own_walls(conn: Any, task_id: str, now: float,
+     return out
+ 
+ 
++def fresh_live_wall(conn: Any, task: Any, now: Optional[float] = None,
++                    pinned: Optional[tuple[str, str]] = None) -> Optional[dict[str, float]]:
++    """``{provider: reset}`` when ``task`` has no run before its current one and the live pool is quota-walled
++    for its concrete pin (``pinned``, default :func:`pin`) right now; else None.
++
++    The same evidence the worker's startup resolver exits 75 on (``kanban_provider_walls.live_quota_wall``),
++    so it stands in for rule 1's own-run wall on a card that has had no run to hit it."""
++    from hermes_cli.kanban_provider_walls import live_quota_wall
++    pinned = pinned or pin(task)
++    if pinned is None or conn.execute("SELECT 1 FROM task_runs WHERE task_id = ? AND id IS NOT ? LIMIT 1",
++                                      (task.id, getattr(task, "current_run_id", None))).fetchone() is not None:
++        return None
++    until = live_quota_wall(pinned[1], pinned[0])
++    if until is None or until <= (time.time() if now is None else now):
++        return None
++    return {pinned[1]: float(until)}
++
++
+ def pinned_route(conn: Any, task: Any, *, lane: str, now: float, cfg: Optional[dict],
+                  current: Optional[dict[str, float]] = None) -> Optional[tuple[str, str]]:
+     """Same-class ``(model, provider)`` this pinned card's run may use instead of its walled pin, or None.
+@@ -157,6 +181,8 @@ def record(conn: Any, task: Any, origin: tuple[str, str], target: tuple[str, str
+     for wall in (_outstanding(conn, task.id, state, now) if state else []):
+         if origin[1] in _providers(wall):
+             current[origin[1]] = max(current.get(origin[1], 0), wall["until"])
++    if not current:
++        current = fresh_live_wall(conn, task, now, pinned=origin) or {}
+     resets_at, episode_id = own_walls(conn, task.id, now, current).get(origin[1], (None, None))
+     payload = {"from_model": origin[0], "from_provider": origin[1], "to_model": target[0],
+                "to_provider": target[1], "walled_provider": origin[1], "resets_at": resets_at,
+diff --git a/tests/hermes_cli/test_kanban_dispatch_skip.py b/tests/hermes_cli/test_kanban_dispatch_skip.py
+index fa45efccc0..47cbfdc2a7 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_skip.py
++++ b/tests/hermes_cli/test_kanban_dispatch_skip.py
+@@ -200,6 +200,31 @@ def test_ordering_skip_keeps_the_capacity_advice(board, monkeypatch):
+         assert "relative priority bump" in qp.describe(place)
+ 
+ 
++def test_per_profile_cap_is_an_ordering_skip(board, monkeypatch):
++    _clock(monkeypatch)
++    monkeypatch.setattr(qp, "_running_and_limit", lambda *_a: (4, 7))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="capped", assignee="a")
++        assert skips.record(conn, tid, "per_profile_capped", detail="a")
++        payload = skips.notice_fields(qp.position(conn, kb.get_task(conn, tid)), 3600)
++        assert skips.is_ordering(payload["dispatch_skip"]) and skips.notice_advice(payload) is None
++        assert not skips.is_ordering({"reason": "claim_deferred", "detail": "labels"})
++
++
++def test_a_moved_quota_reset_appends_other_reasons_ignore_until(board, monkeypatch):
++    _clock(monkeypatch)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="walled", assignee="a")
++        detail = "claude-opus-5-5 (anthropic)"
++        assert skips.record(conn, tid, skips.PINNED_QUOTA_WALL, detail=detail, until=RESET)
++        assert not skips.record(conn, tid, skips.PINNED_QUOTA_WALL, detail=detail, until=RESET + 0.4)
++        assert skips.record(conn, tid, skips.PINNED_QUOTA_WALL, detail=detail, until=RESET + 3600)
++        assert skips.latest(conn, tid)["until"] == RESET + 3600  # the notice names the new reset
++        assert skips.record(conn, tid, "owner_down", detail="x", until=RESET)
++        assert not skips.record(conn, tid, "owner_down", detail="x", until=RESET + 60)
++        assert [p.get("until") for p in _skips(conn, tid)] == [RESET, RESET + 3600, RESET]
++
++
+ def test_review_lane_is_never_pin_held(board, monkeypatch):
+     _clock(monkeypatch)
+     _walled(monkeypatch)
+diff --git a/tests/hermes_cli/test_kanban_pin_reroute.py b/tests/hermes_cli/test_kanban_pin_reroute.py
+index e7abb2a3d3..6a85886b88 100644
+--- a/tests/hermes_cli/test_kanban_pin_reroute.py
++++ b/tests/hermes_cli/test_kanban_pin_reroute.py
+@@ -295,6 +295,65 @@ def test_failed_record_keeps_the_pin(board, monkeypatch, all_assignees_spawnable
+         assert _events(conn, tid, 'model_tier')[-1]['reason'] != 'pinned+pin_quota_reroute:openai-codex'
+ 
+ 
++# --- a fresh card on a live-pool wall (kanban-dd62aef001) -----------------------------------------
++
++def _live_codex_wall(monkeypatch, until):
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda p, m: until[0] if (m, p) == PIN else None)
++
++
++def test_fresh_pin_on_a_far_live_wall_reroutes_on_its_first_run(board, monkeypatch, all_assignees_spawnable):
++    """Review 5871917933: a fresh pin has no run to put the wall in its episode, so a pre-claim hold on the
++    live wall used to wait the whole wall out. The live wall now stands in for rule 1 on a fresh card."""
++    clock = _clock(monkeypatch)
++    _deep(monkeypatch)
++    until = [float(clock[0] + 55 * 3600)]
++    _live_codex_wall(monkeypatch, until)
++    with kbc.connect() as conn:
++        tid = _pinned_card(conn)
++        assert _tick(conn) == [PEER]  # no exit-75 run into the wall first
++        assert _events(conn, tid, 'dispatch_skipped') == []
++        task = kb.get_task(conn, tid)
++        assert (task.model_override, task.provider_override) == PIN
++        [event] = _events(conn, tid, 'model_reroute')
++        assert (event['walled_provider'], event['resets_at'], event['episode_id']) == ('openai-codex', until[0], None)
++        [comment] = _comments(conn, tid)
++        assert 'gpt-6-astra (openai-codex) is out until' in comment
++        # Its rerouted run ends: the card is no longer fresh, and its own reroute keeps it off the wall.
++        kb.reclaim_task(conn, tid, reason='test')
++        clock[0] += 3600
++        assert _tick(conn) == [PEER]
++        assert len(_events(conn, tid, 'model_reroute')) == 2 and len(_comments(conn, tid)) == 1
++        # After the reset the pin is back, even though the card still carries the reroute history.
++        kb.reclaim_task(conn, tid, reason='test')
++        clock[0] = int(until[0]) + 1
++        until[0] = None
++        assert _tick(conn) == [PIN]
++
++
++@pytest.mark.parametrize('case', ['mandatory', 'near_wall', 'no_peer'])
++def test_fresh_pin_with_no_reroute_is_held_on_its_live_wall(board, monkeypatch, all_assignees_spawnable, case):
++    from hermes_cli.kanban_diagnostics import compute_task_diagnostics
++    clock = _clock(monkeypatch)
++    config, _ = _deep(monkeypatch)
++    if case == 'no_peer':
++        _block_peer('disabled', monkeypatch, config, clock)
++    until = [float(clock[0] + (4 if case == 'near_wall' else 55) * 3600)]
++    _live_codex_wall(monkeypatch, until)
++    with kbc.connect() as conn:
++        tid = _pinned_card(conn, mandatory=case == 'mandatory')
++        for _ in range(4):
++            assert _tick(conn) == []
++            clock[0] += 1800
++        [skip] = _events(conn, tid, 'dispatch_skipped')
++        assert (skip['reason'], skip['until']) == ('pinned_quota_wall', int(until[0]))
++        assert _events(conn, tid, 'model_reroute') == []
++        # Board diagnostics read the deliberate hold as held_in_ready (warning), never stranded_in_ready.
++        diags = compute_task_diagnostics(kb.get_task(conn, tid), kb.list_events(conn, tid),
++                                         kb.list_runs(conn, tid), now=clock[0])
++        assert [(d.kind, d.severity) for d in diags] == [('held_in_ready', 'warning')]
++        assert diags[0].data['hold_reason'] == 'pinned_quota_wall' and diags[0].data['hold_until'] == int(until[0])
++
++
+ # --- the mandatory mark: create, set-model, tool, sync ---------------------------------------------
+ 
+ def test_create_flag_requires_a_pin_and_persists(board):
+diff --git a/tests/hermes_cli/test_kanban_provider_walls.py b/tests/hermes_cli/test_kanban_provider_walls.py
+index 9d0f93b192..c049bac740 100644
+--- a/tests/hermes_cli/test_kanban_provider_walls.py
++++ b/tests/hermes_cli/test_kanban_provider_walls.py
+@@ -137,7 +137,9 @@ def test_live_pool_exhaustion_counts_as_wall_without_a_crash(board, monkeypatch)
+                             provider_override=CODEX)
+     seen = _dispatch(conn)
+     assert seen[tid][:2] == (OPUS, "anthropic")
+-    # Exact pins keep their tuple: never rewritten, and a fresh one on a live wall is held (kanban_dispatch_skip).
++    # Exact pins keep their tuple: never rewritten. This fresh one has no same-class peer ("default" has no
++    # routing policy), so it is held on the live wall (kanban_dispatch_skip); with a free class peer it is
++    # rerouted instead (test_kanban_pin_reroute::test_fresh_pin_on_a_far_live_wall_reroutes_on_its_first_run).
+     assert pinned not in seen
+     assert [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ? AND kind = 'dispatch_skipped'",
+                                        (pinned,))] == ["dispatch_skipped"]
+-- 
+2.43.0
+

@@ -87,6 +87,14 @@ class EscapeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Missing'):
             repair.validate_markers(b'x = 1')
 
+    def test_composed_named_markers_are_folded_and_compiled(self):
+        # 2678: a table entry built from names with ``+`` is folded from the AST, never executed.
+        repair.validate_markers(b'A = r"\\bx"\nB = (A + "|" + r"y\\b")\nDEFAULT_LOCAL_MARKERS = (B, A)')
+        with self.assertRaises(re.error):
+            repair.validate_markers(b'A = r"\\m"\nB = A + "x"\nDEFAULT_LOCAL_MARKERS = (B,)')
+        with self.assertRaises(KeyError):
+            repair.validate_markers(b'B = f() + "x"\nDEFAULT_LOCAL_MARKERS = (B,)')
+
     def test_repair_policy_delta_is_exact(self):
         checker.checked_policy()
         with tempfile.TemporaryDirectory() as directory:

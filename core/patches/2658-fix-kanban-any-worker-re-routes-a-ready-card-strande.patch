@@ -1,0 +1,535 @@
+From 24a4b14f05a189a40fe4cf9d199f28db22b6a887 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:33:51 +0000
+Subject: [PATCH] fix(kanban): any worker re-routes a ready card stranded on
+ impossible runs_on; diagnostic and asks name it [daveey]
+
+Self-heal agent-7489fcf5cd. Hub card t_01a1a521638d0a78 sat ready 128 h on runs_on
+['hermes-hub'] (no enrolled machine carries it). PR #971 refuses such labels only at
+create, so legacy rows never leased; the fixing worker was refused not_owner and asked
+David to 'mark t_01a1a521638d0a78 Done'.
+
+- kanban_runs_on_capabilities.impossible(): the create-time check, shared.
+- kanban_creator_repin: third kanban_move(task_id=<other>) grant. A ready, unclaimed
+  card of this gateway whose stored runs_on is impossible against a KNOWN registry may
+  be re-routed by any scoped worker; move_queued still refuses unsatisfiable targets.
+  Old labels are kept in a comment; blocked asks naming the card get a Superseded note
+  (never auto-unblocked: human gates stay human-released).
+- stranded_in_ready names held_reason=impossible_runs_on and the reroute call
+  (cfg registry, or the process's cached registry; never a network fetch).
+- Worker ownership refusal names kanban_move(task_id=...) / operator op routes.
+- Ask lint refuses a human_request that only asks for a Kanban edit/complete/archive
+  of a card id (board_op_ask).
+---
+ hermes_cli/kanban_block_policy.py             |  34 +++-
+ hermes_cli/kanban_creator_repin.py            |  85 +++++++-
+ hermes_cli/kanban_diagnostics.py              |  44 ++++-
+ hermes_cli/kanban_runs_on_capabilities.py     |  19 +-
+ .../test_kanban_stranded_reroute.py           | 185 ++++++++++++++++++
+ tools/kanban_tools.py                         |   5 +-
+ tools/kanban_tools_schemas.py                 |   5 +-
+ 7 files changed, 360 insertions(+), 17 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_stranded_reroute.py
+
+diff --git a/hermes_cli/kanban_block_policy.py b/hermes_cli/kanban_block_policy.py
+index 228370de9d..cef052a6dc 100644
+--- a/hermes_cli/kanban_block_policy.py
++++ b/hermes_cli/kanban_block_policy.py
+@@ -216,6 +216,34 @@ _RELAY = re.compile(
+     re.IGNORECASE)
+ 
+ ROUTE_GAP_CODE = "agent_route_gap"
++BOARD_OP_CODE = "board_op_ask"
++# [daveey] self-heal agent-7489fcf5cd: "One board action is required: mark `t_01a1a521638d0a78` Done in Hermes
++# Kanban". The ask line (before its Unblock/archive tail) is an imperative Kanban write on a named card: a
++# bookkeeping step agents have routes for. Kept narrow: a card id, a board verb first in the clause, a board term.
++_BOARD_OP = re.compile(
++    r"(?:^|[.:;]\s*)(?:please\s+)?(?:mark|move|set|complete|close|archive|edit|change|re-?route|delete|cancel)\b"
++    r"(?:\s+(?:card|task))?\s+`?t_[0-9a-f]{8,}`?"
++    r"[^.;]{0,80}?\b(?:done|complete[d]?|archived?|runs_on|labels?|status|board|kanban|dashboard)\b",
++    re.IGNORECASE)
++_ASK_TAIL = re.compile(r"\bun-?block\s*=", re.IGNORECASE)
++
++
++def board_op_ask_error(human_request) -> Optional[str]:
++    """Typed refusal for a human_request whose ask is only a Kanban edit/complete/archive of a named card."""
++    if not isinstance(human_request, dict):
++        return None
++    action = " ".join(str(human_request.get("action") or "").split())
++    head = _ASK_TAIL.split(action, 1)[0]
++    m = _BOARD_OP.search(head)
++    if not m:
++        return None
++    return (f"{BOARD_OP_CODE}: human_request.action only asks David to edit, complete or archive a Kanban card "
++            f"({m.group(0).strip(' .:;')!r}). Board bookkeeping is agent work: a ready card stranded on runs_on no "
++            "machine carries -> kanban_move(task_id=<it>, runs_on=['machine:<registered-name>'], reason=...); a "
++            "card another gateway created -> kanban_supervisor_request operator op; an unstarted orphan in your "
++            "creator tree -> kanban_supervisor_request archive op; a card whose own run must finish it -> "
++            "kanban_comment the proof on it so its worker completes it. Keep human_request for what only David "
++            "can do: approve, pay, sign in, a physical step.")
+ # The typed answers of the agent routes (capability routing, placement, supervisor routing). A human_request that
+ # cites one of them as its reason asks David to do an agent's step because the route failed. [daveey]
+ _ROUTE_GAP = re.compile(
+@@ -316,7 +344,8 @@ def user_ask_lint_error(human_request) -> Optional[str]:
+     if not isinstance(human_request, dict):
+         return None
+     action = " ".join(str(human_request.get("action") or "").split())
+-    relay = agent_relay_ask_error(action, human_request) or agent_route_gap_error(human_request)
++    relay = (agent_relay_ask_error(action, human_request) or agent_route_gap_error(human_request)
++             or board_op_ask_error(human_request))
+     if relay:
+         return relay
+     missing = [label for label, rx in (("what unblocking the card does", _UNBLOCK),
+@@ -334,7 +363,8 @@ def user_ask_lint_error(human_request) -> Optional[str]:
+ def ask_lint_check(human_request) -> tuple:
+     """``_check`` args for the tool entry points: ``(ok, message, rejection)``."""
+     err = user_ask_lint_error(human_request)
+-    code = next((c for c in (RELAY_ASK_CODE, ROUTE_GAP_CODE) if err and err.startswith(c)), ASK_LINT_CODE)
++    code = next((c for c in (RELAY_ASK_CODE, ROUTE_GAP_CODE, BOARD_OP_CODE) if err and err.startswith(c)),
++                ASK_LINT_CODE)
+     return err is None, err or "", code
+ 
+ 
+diff --git a/hermes_cli/kanban_creator_repin.py b/hermes_cli/kanban_creator_repin.py
+index 712005f955..928cefb09b 100644
+--- a/hermes_cli/kanban_creator_repin.py
++++ b/hermes_cli/kanban_creator_repin.py
+@@ -10,6 +10,11 @@ not a running card, not a card another task created, not a card without a worker
+ A second, equally narrow grant covers an orphaned wait (``kanban_repin_owner``): the generated
+ ``repin-owner:<target>`` supervisor may make the same origin repin of exactly its one listed target
+ (``supervisor_refusal``). It is not a general owner-wake move power: no other card, board or target.
++
++A third grant covers a stranded card (``stranded_refusal``, self-heal agent-7489fcf5cd): any scoped worker may
++re-route a READY, never-claimed card of this gateway whose stored ``runs_on`` no enrolled machine carries (rows
++written before the create-time check, e.g. ``["hermes-hub"]``) to labels an active machine does carry. The registry
++must be known; a satisfiable placement is never touched. Without it the worker could only ask David to edit the card.
+ """
+ from __future__ import annotations
+ 
+@@ -48,10 +53,15 @@ def creator_repin(conn: sqlite3.Connection, task_id: str, env_task: str, *, runs
+     if _creator_task_id(conn, task_id) != env_task:
+         refusal = supervisor_refusal(conn, task_id, env_task, runs_on)
+         if refusal is not None:
++            stranded = stranded_refusal(conn, task_id)
++            if stranded is None:
++                return stranded_reroute(conn, task_id, env_task, runs_on=runs_on, reason=reason, hub=hub)
+             return {"ok": False, "reason_code": "not_creator_task",
+                     "error": f"worker is scoped to task {env_task}; it may move another card only to repin a "
+                              f"worker-first card its own task created (or, as its generated repin-owner "
+-                             f"supervisor, its one listed orphaned card), and {task_id} is neither ({refusal})"}
++                             f"supervisor, its one listed orphaned card), or to re-route a ready card whose "
++                             f"runs_on no enrolled machine carries, and {task_id} is none of these ({refusal}; "
++                             f"{stranded})"}
+     if not repin.applies(conn, task_id):
+         return {"ok": False, "reason_code": "not_repinnable",
+                 "error": f"{task_id} is not an unstarted worker-first card (running, done, archived or no "
+@@ -59,6 +69,79 @@ def creator_repin(conn: sqlite3.Connection, task_id: str, env_task: str, *, runs
+     return km.move_queued(conn, task_id, runs_on=runs_on, reason=reason, hub=hub)
+ 
+ 
++REROUTE_AUTHOR = "kanban-reroute"
++
++
++def _registry_view(conn: sqlite3.Connection) -> tuple[str | None, dict | None]:
++    """``(me, machines)`` from the Board registry, ``(me, None)`` when it is unknown (unreachable or empty)."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++    me = (sync.sync_state(conn) or {}).get("gateway_id")
++    try:
++        reg = wn.registry()
++    except Exception:  # health: allow BLE001 -- unknown registry: refuse, never guess impossibility
++        reg = None
++    machines = (reg or {}).get("machines") or None
++    return (str(me) if me else None), machines
++
++
++def stranded_refusal(conn: sqlite3.Connection, task_id: str) -> str | None:
++    """None when ``task_id`` is a ready, never-claimed card of this gateway whose stored ``runs_on`` no enrolled
++    machine carries (the create-time check of PR #971 only guards new rows), so any scoped worker may re-route it
++    with ``kanban_move(task_id=...)``; else why not. An unknown registry is a refusal: impossibility needs evidence.
++    The new labels are checked by ``kanban_move.move_queued`` (an active, unheld machine must carry them)."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_runs_on_capabilities as roc
++    from hermes_cli import kanban_worker_node as wn
++    if sync.board_mode(conn) != "primary":
++        return "board is not a Board primary"
++    row = conn.execute("SELECT status, runs_on, claim_lock, lease_holder, current_run_id, created_on FROM tasks "
++                       "WHERE id = ?", (task_id,)).fetchone()
++    if row is None:
++        return f"no card {task_id} here"
++    me, machines = _registry_view(conn)
++    if row["created_on"] not in (None, me):
++        return f"{task_id} was created on {row['created_on']}; ask its home (operator call)"
++    if row["status"] != "ready" or row["claim_lock"] or row["lease_holder"] or row["current_run_id"] is not None:
++        return f"{task_id} is not a ready, unclaimed card"
++    labels = wn._parse(row["runs_on"])
++    if not labels:
++        return f"{task_id} has no runs_on labels to re-route"
++    if machines is None or not me:
++        return "the Board machine registry is unknown, so impossible labels cannot be proven"
++    if not roc.impossible(labels, machines, me):
++        return f"runs_on={labels} is carried by an enrolled machine (a deliberate placement)"
++    return None
++
++
++def stranded_reroute(conn: sqlite3.Connection, task_id: str, env_task: str, *, runs_on: Any, reason: str,
++                     hub: Any = None) -> dict[str, Any]:
++    """Re-route a card :func:`stranded_refusal` cleared: ``move_queued`` (which refuses unsatisfiable new labels),
++    then a comment keeping the old labels so the rewrite can be undone, and a note on any open ask that names it."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_move as km
++    from hermes_cli import kanban_worker_node as wn
++    old = wn._parse(conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (task_id,)).fetchone()[0])
++    res = km.move_queued(conn, task_id, runs_on=runs_on, reason=reason, hub=hub,
++                         event_extra={"rerouted_by": env_task, "stranded_runs_on": old})
++    if not res.get("ok"):
++        return res
++    note = (f"Re-routed by {env_task}: runs_on {old} matched no enrolled machine (stranded in ready); now "
++            f"{res.get('runs_on')}. Reason: {reason[:500]}. Previous runs_on kept here for undo (no machine "
++            "carries it, so restoring it strands the card again).")
++    asks = [r[0] for r in conn.execute(
++        "SELECT id FROM tasks WHERE status = 'blocked' AND id != ? AND human_request LIKE ?",
++        (task_id, f"%{task_id}%")).fetchall()]
++    with kb.write_txn(conn):
++        kb.add_comment(conn, task_id, REROUTE_AUTHOR, note)
++        for ask in asks:
++            kb.add_comment(conn, ask, REROUTE_AUTHOR,
++                           f"Superseded: the board step this ask names on {task_id} was done by an agent "
++                           f"({env_task} re-routed it to {res.get('runs_on')}). Archive this ask unless it asks "
++                           "for something else.")
++    return {**res, "rerouted_from": old, "superseded_asks": asks}
++
++
+ def supervisor_refusal(conn: sqlite3.Connection, task_id: str, env_task: str, runs_on: Any) -> str | None:
+     """None when ``env_task`` is the generated repin-owner supervisor of ``task_id`` and the move is its one
+     allowed action (the origin repin of a still-orphaned, unstarted, no-pool-worker wait); else why not.
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index 67e4d09f6d..302a7f46ae 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -810,6 +810,22 @@ def _ready_hold_reason(task, events, cfg, now=None) -> Optional[str]:
+     return None
+ 
+ 
++def _impossible_runs_on(task, cfg) -> Optional[list[str]]:
++    """The card's runs_on when the Board registry is known and no enrolled machine carries every label (a typo or
++    alias such as ``hermes-hub``), else None. The registry comes from cfg ``registry`` (``{me, machines}``) or, when
++    absent, this process's cached registry read only (never a network fetch from a diagnostic)."""
++    from hermes_cli import kanban_runs_on_capabilities as roc
++    from hermes_cli import kanban_worker_node as wn
++    labels = wn._parse(_task_field(task, "runs_on"))
++    if not labels:
++        return None
++    reg = cfg["registry"] if "registry" in cfg else (wn._REGISTRY.get("value") if wn._REGISTRY.get("at") else None)
++    if not reg:
++        return None
++    me = str(reg.get("me") or "")
++    return labels if roc.impossible(labels, reg.get("machines") or {}, me) else None
++
++
+ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     """Assigned, unclaimed, ``ready`` for >= cfg["stranded_threshold_seconds"]
+     (default 30 min). Deliberately age-based and identity-agnostic so it
+@@ -860,17 +876,33 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+                          payload={"current_assignee": assignee}),
+         _cli_hint("Check dispatcher status", "hermes kanban diagnostics"),
+     ]
++    detail = (f"This task has been ready for {age_str} but nothing has claimed it. Common causes: "
++              f"assignee {assignee!r} is misspelled, the profile was deleted, or the external worker "
++              f"pool for this lane is down. Confirm the assignee is correct and that a worker is "
++              f"actually polling for it.")
++    title = f"Ready for {age_str} with no worker"
++    impossible = _impossible_runs_on(task, cfg)
++    held: dict = {}
++    if impossible:
++        # [daveey] self-heal agent-7489fcf5cd: a stored label no enrolled machine carries never leases; any
++        # worker may re-route it (kanban_creator_repin.stranded_refusal), so name that instead of a human edit.
++        tid = _task_field(task, "id") or "<task_id>"
++        held = {"held_reason": "impossible_runs_on", "runs_on": impossible}
++        title = f"Ready for {age_str}: runs_on {impossible} matches no enrolled machine"
++        detail = (f"No enrolled Board machine carries every label in runs_on={impossible} (labels_mismatch), so "
++                  f"this card can never be claimed. Any worker can re-route it: kanban_move(task_id='{tid}', "
++                  "runs_on=['machine:<registered-name>' or a real label], reason=...). This is agent work, not "
++                  "an ask for David.")
++        actions.insert(0, _cli_hint("Re-route to a real machine",
++                                    f"hermes kanban move {tid} --runs-on machine:<registered-name>", suggested=True))
+     return [Diagnostic(
+         kind="stranded_in_ready", severity=severity,
+-        title=f"Ready for {age_str} with no worker",
+-        detail=f"This task has been ready for {age_str} but nothing has claimed it. Common causes: "
+-               f"assignee {assignee!r} is misspelled, the profile was deleted, or the external worker "
+-               f"pool for this lane is down. Confirm the assignee is correct and that a worker is "
+-               f"actually polling for it.",
++        title=title,
++        detail=detail,
+         actions=actions,
+         first_seen_at=last_ready_ts, last_seen_at=last_ready_ts, count=1,
+         data={"ready_since": last_ready_ts, "age_seconds": int(age_seconds),
+-              "assignee": assignee, "threshold_seconds": int(threshold_seconds)},
++              "assignee": assignee, "threshold_seconds": int(threshold_seconds), **held},
+     )]
+ 
+ 
+diff --git a/hermes_cli/kanban_runs_on_capabilities.py b/hermes_cli/kanban_runs_on_capabilities.py
+index 0cdf45a172..a43cae6a4d 100644
+--- a/hermes_cli/kanban_runs_on_capabilities.py
++++ b/hermes_cli/kanban_runs_on_capabilities.py
+@@ -134,6 +134,18 @@ def check(runs_on: Optional[list[str]], *, assignee: Optional[str], requires, wo
+     raise PlacementCapabilityMismatch(assignee, list(runs_on), {n: v for n, v in verdicts.items() if v})
+ 
+ 
++def impossible(labels: Optional[list[str]], machines: Optional[Mapping[str, Mapping[str, Any]]], me: str) -> bool:
++    """True when the registry is known and NO enrolled machine carries every label (a typo'd or alias label such as
++    ``hermes-hub``), so the card can never be leased. No candidates is not evidence of missing profile tools
++    (:func:`check` deliberately allows unknown tools), but it IS evidence of an impossible label conjunction.
++    Held/inactive machines count: temporary unavailability is not a typo. An empty registry or a missing self entry
++    is incomplete evidence (as in :func:`runs_elsewhere`), so it never says impossible."""
++    from hermes_cli import kanban_worker_node as wn
++    if not labels or not machines or not machines.get(me):
++        return False
++    return not any(set(labels) <= wn.effective_labels(entry, name) for name, entry in machines.items())
++
++
+ def check_create(conn, runs_on, *, assignee: Optional[str], requires, workspace_kind: str = "scratch") -> None:
+     """:func:`check` for ``create_task`` on a Board primary: the local check read THIS machine's profile."""
+     if runs_on is None:
+@@ -149,12 +161,7 @@ def check_create(conn, runs_on, *, assignee: Optional[str], requires, workspace_
+         reg = None
+     machines = reg.get("machines") if reg is not None else None
+     me = wn._own(conn)
+-    # No candidates is not evidence of missing profile tools (check deliberately
+-    # allows unknown tools). It IS evidence of an impossible label conjunction.
+-    # Include held/inactive machines: temporary unavailability is not a typo.
+-    # A missing self entry is incomplete evidence, as in runs_elsewhere.
+-    if labels and machines and machines.get(me) and not any(
+-            set(labels) <= wn.effective_labels(entry, name) for name, entry in machines.items()):
++    if impossible(labels, machines, me):
+         raise ValueError(
+             f"runs_on={labels}: no enrolled machine carries all these labels. Nothing was written. "
+             "Use placement='<gateway>' to name a gateway, or runs_on=['machine:<registered-name>'] "
+diff --git a/tests/hermes_cli/test_kanban_stranded_reroute.py b/tests/hermes_cli/test_kanban_stranded_reroute.py
+new file mode 100644
+index 0000000000..8c582dd3a1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_stranded_reroute.py
+@@ -0,0 +1,185 @@
++"""A ready card stranded on runs_on labels no enrolled machine carries gets a worker route. [daveey]
++
++Self-heal agent-7489fcf5cd: hub card t_01a1a521638d0a78 sat ``ready`` for 128 h with ``runs_on=["hermes-hub"]``, a
++label no Board machine has (``labels_mismatch``). The worker that fixed the create-time check (PR #971) could not
++re-route or finish it (``kanban_complete`` refused ``not_owner``; ``kanban_move`` of another card only repins a
++worker-first card the caller created), so it asked David to "mark t_01a1a521638d0a78 Done". Covered here:
++
++* ``kanban_move(task_id=<stranded card>)`` from any scoped worker re-routes it, only when the registry is known, the
++  old labels are impossible and the new ones are satisfiable; the old labels are kept in a comment;
++* the stranded_in_ready diagnostic names ``impossible_runs_on`` and the reroute;
++* the ownership refusal names that route;
++* an ask that only asks David to edit/complete/archive a card is refused (``board_op_ask``).
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_creator_repin as kcr
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, WORKER, Gateway
++
++OTHER_WORKER_TASK = "t_01a1c0c6a7d4f3af"  # the PR #971 worker: neither creator nor repin supervisor
++REASON = "runs_on ['hermes-hub'] matches no enrolled machine (labels_mismatch); the hub is machine:hub"
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True, machines=MACHINES)
++
++
++@pytest.fixture
++def hub(tmp_path, monkeypatch, svc):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    g = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    yield g
++    g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _legacy_card(hub, labels):
++    """A row written before PR #971's create-time check: create, then set the stored labels directly."""
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="Close out the stuck verify", assignee="default")
++    with kb.write_txn(hub.conn):
++        wn.set_runs_on(hub.conn, tid, labels)
++    hub.round()
++    return tid
++
++
++def _runs_on(conn, tid):
++    return json.loads(conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0] or "null")
++
++
++def test_any_worker_reroutes_an_impossible_label_card_and_it_gets_claimed(hub):
++    tid = _legacy_card(hub, ["hermes-hub"])
++    hub.tick()
++    assert kb.get_task(hub.conn, tid).status == "ready"  # stranded: no machine carries "hermes-hub"
++    ask = kb.create_task(hub.conn, title="For you: close the stuck card", assignee="default")
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status = 'blocked', human_request = ? WHERE id = ?",
++                         (json.dumps({"action": f"Mark `{tid}` Done in Hermes Kanban."}), ask))
++    res = kcr.creator_repin(hub.conn, tid, OTHER_WORKER_TASK, runs_on=["machine:hub"], reason=REASON)
++    assert res.get("ok"), res
++    assert res["superseded_asks"] == [ask]
++    assert any("Superseded" in c.body for c in kb.list_comments(hub.conn, ask))
++    assert kb.get_task(hub.conn, ask).status == "blocked"  # a human gate is noted, never released by an agent
++    assert _runs_on(hub.conn, tid) == ["machine:hub"]
++    notes = [c.body for c in kb.list_comments(hub.conn, tid)]
++    assert any("['hermes-hub']" in n and OTHER_WORKER_TASK in n for n in notes), notes  # undo trail
++    hub.round()
++    hub.tick()
++    assert kb.get_task(hub.conn, tid).status == "running"
++
++
++def test_a_satisfiable_card_is_not_rerouted(hub):
++    tid = _legacy_card(hub, ["linux"])  # hub and worker-1 both carry it: a deliberate placement
++    res = kcr.creator_repin(hub.conn, tid, OTHER_WORKER_TASK, runs_on=["machine:hub"], reason=REASON)
++    assert not res.get("ok") and res["reason_code"] == "not_creator_task", res
++    assert _runs_on(hub.conn, tid) == ["linux"]
++
++
++def test_new_labels_must_be_satisfiable(hub):
++    tid = _legacy_card(hub, ["hermes-hub"])
++    res = kcr.creator_repin(hub.conn, tid, OTHER_WORKER_TASK, runs_on=["also-not-a-label"], reason=REASON)
++    assert not res.get("ok"), res
++    assert _runs_on(hub.conn, tid) == ["hermes-hub"]
++
++
++def test_unknown_registry_refuses(hub):
++    tid = _legacy_card(hub, ["hermes-hub"])
++    wn.set_registry_fetch(lambda: (_ for _ in ()).throw(OSError("board down")))
++    res = kcr.creator_repin(hub.conn, tid, OTHER_WORKER_TASK, runs_on=["machine:hub"], reason=REASON)
++    assert not res.get("ok"), res
++    assert _runs_on(hub.conn, tid) == ["hermes-hub"]
++
++
++def test_a_claimed_card_is_not_rerouted(hub):
++    tid = _legacy_card(hub, ["hermes-hub"])
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET claim_lock = 'someone:1' WHERE id = ?", (tid,))
++    res = kcr.creator_repin(hub.conn, tid, OTHER_WORKER_TASK, runs_on=["machine:hub"], reason=REASON)
++    assert not res.get("ok"), res
++    assert _runs_on(hub.conn, tid) == ["hermes-hub"]
++
++
++# --- diagnostic -----------------------------------------------------------------------------------------------
++
++def _ready_row(labels, age=6 * 3600, now=1_800_000_000):
++    return {"id": "t_01a1a521638d0a78", "status": "ready", "assignee": "default", "claim_lock": None,
++            "runs_on": json.dumps(labels), "created_at": now - age}
++
++
++def test_stranded_diagnostic_names_impossible_runs_on_and_the_reroute():
++    from hermes_cli import kanban_diagnostics as kd
++    now = 1_800_000_000
++    reg = {"me": HUB, "machines": MACHINES}
++    diags = kd.compute_task_diagnostics(_ready_row(["hermes-hub"]), [], [], now=now, config={"registry": reg})
++    [d] = [d for d in diags if d.kind == "stranded_in_ready"]
++    assert d.data["held_reason"] == "impossible_runs_on", d.data
++    assert d.data["runs_on"] == ["hermes-hub"]
++    assert "kanban_move(task_id=" in d.detail and "t_01a1a521638d0a78" in d.detail
++    # A satisfiable label keeps the generic stranded text; an unknown registry never claims impossibility.
++    ok = kd.compute_task_diagnostics(_ready_row(["linux"]), [], [], now=now, config={"registry": reg})
++    assert all(d.data.get("held_reason") is None for d in ok if d.kind == "stranded_in_ready")
++    unknown = kd.compute_task_diagnostics(_ready_row(["hermes-hub"]), [], [], now=now, config={"registry": None})
++    assert all(d.data.get("held_reason") is None for d in unknown if d.kind == "stranded_in_ready")
++
++
++# --- the ownership refusal names the route ---------------------------------------------------------------------
++
++def test_not_owner_refusal_names_the_reroute(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_TASK", OTHER_WORKER_TASK)
++    from tools import kanban_tools as kt
++    d = json.loads(kt._handle_complete({"task_id": "t_01a1a521638d0a78", "summary": "verified elsewhere"}))
++    assert d.get("rejection") == "not_owner", d
++    assert "kanban_move(task_id=" in d["error"] and "kanban_supervisor_request" in d["error"], d
++
++
++# --- board-op asks ---------------------------------------------------------------------------------------------
++
++BOARD_OP_ASKS = [
++    # the 7489fcf5cd ask, with the unblock/archive tail the ask lint already requires
++    "One board action is required: mark `t_01a1a521638d0a78` Done in Hermes Kanban. Unblock = the chain "
++    "finishes; archive = leave it ready.",
++    "Mark t_01a1a521638d0a78 done. Unblock = continue; archive = drop it.",
++    "Archive card t_01a1a819f78f7cf2 on the hub board. Unblock = proceed; archive = keep it.",
++    "Edit t_01a17c8fcd5e795a runs_on to ['machine:hub'] in the Kanban dashboard. Unblock = resume; archive = drop.",
++    "Please move t_01a1a521638d0a78 to Done on the board. Unblock = finish; archive = leave it.",
++]
++REAL_ASKS = [
++    "Approve the $40 EC2 launch in this chat. Unblock = launch it and run the soak; archive = no launch.",
++    "Sign in to github.com/settings/billing in Chrome and raise the Actions limit. Unblock = rerun CI; "
++    "archive = leave CI red.",
++    "Reply A or B in this chat: A ships t_01a1a521638d0a78's PR now, B holds it. Unblock = do the pick; "
++    "archive = hold.",
++    "Plug the Pi into the hallway outlet. Unblock = the agent pairs it; archive = skip the device.",
++]
++HR = {"why_human": "workers cannot complete a card they do not own (not_owner)", "interaction": "reply",
++      "scope": "one card", "evidence": "kanban_complete refused not_owner"}
++
++
++@pytest.mark.parametrize("action", BOARD_OP_ASKS)
++def test_board_op_ask_is_refused(action):
++    from hermes_cli.kanban_block_policy import ask_lint_check, user_ask_lint_error
++    err = user_ask_lint_error({**HR, "action": action})
++    assert err and err.startswith("board_op_ask"), err
++    assert "kanban_move(task_id=" in err
++    assert ask_lint_check({**HR, "action": action})[2] == "board_op_ask"
++
++
++@pytest.mark.parametrize("action", REAL_ASKS)
++def test_real_human_ask_passes(action):
++    from hermes_cli.kanban_block_policy import user_ask_lint_error
++    assert user_ask_lint_error({**HR, "action": action}) is None
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 7e3d101794..53865720a9 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -382,7 +382,10 @@ def _enforce_worker_task_ownership(tid: str) -> None:
+     if env_tid and tid != env_tid:
+         raise _Reject(
+             f"worker is scoped to task {env_tid}; refusing to mutate {tid}. Use kanban_comment "
+-            f"to hand off information to other tasks, or kanban_create to spawn follow-up work.")
++            f"to hand off information to other tasks, or kanban_create to spawn follow-up work. "
++            f"If {tid} is a ready card stranded on runs_on labels no machine carries, re-route it yourself: "
++            f"kanban_move(task_id='{tid}', runs_on=[...], reason=...). A card another gateway created: "
++            "kanban_supervisor_request operator op. Never ask David to edit, complete or archive a card.")
+ 
+ 
+ def _worker_guard(tool_name: str, args: dict) -> str:
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 6a4575eb72..f045bfbece 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -461,7 +461,10 @@ KANBAN_MOVE_SCHEMA = _schema(
+         "for dir/worktree cards. After it returns, end your turn with a one-line reply; do not call more tools. "
+         "Exception: task_id = a worker-first card YOUR task created that no pool worker can run (its "
+         "'No pool worker can run this card' notice) and runs_on = [\"machine:<origin>\"] repins that card to the "
+-        "origin instead; your own run continues. Every other card is refused."
++        "origin instead; your own run continues. Second exception: task_id = a READY, unclaimed card of this "
++        "gateway whose runs_on no enrolled machine carries (stranded: e.g. ['hermes-hub']) may be re-routed by any "
++        "worker to labels a machine does carry (e.g. ['machine:hub']); the old labels are kept in a comment. "
++        "Every other card is refused."
+     ),
+     {
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+-- 
+2.43.0
+

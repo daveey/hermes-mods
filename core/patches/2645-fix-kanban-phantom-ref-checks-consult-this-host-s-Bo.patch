@@ -1,0 +1,322 @@
+From 538767a61c44898d2364fdb6b2a02fee813a8e54 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:55:11 +0000
+Subject: [PATCH] fix(kanban): phantom-ref checks consult this host's Board
+ replica before calling an id phantom [daveey]
+
+worker-1 completing t_01a1ceb5fa5abe36 (run 13081): the completion gate refused created_cards
+t_01a1cedb2faf7341 (created on worker-3 by an earlier run of the same card, linked as its child), and
+the summary scan flagged t_01a1cf4d49ca68bb (created on the hub 2 min earlier). Both cards were in
+worker-1's Board replica (kanban/sync-shadow/default.db, 9.7k cards); its live kanban.db holds 227.
+
+Why the earlier fix 0b1715a3f43 didn't hold: it only made "no hub replica" non-authoritative on a
+Board-synced host. Here a fresh hub replica answered authoritatively without the 2-minute-old card,
+and the created_cards gate never consulted any replica at all (live file only).
+
+Now both the created_cards gate (_verify_created_cards) and the summary scan / prose_phantom_refs
+diagnostic first look ids up in every sync-shadow/<board>.db, read-only (never creating a file;
+an unreadable replica is skipped). The gate keeps its trust rule: a replica card counts only if its
+created_by is the completer's assignee/id or the replica links it as the completer's child. An id
+absent from the live board and every replica is still flagged, and the gate still refuses it.
+
+Proof: tests/hermes_cli/test_kanban_board_replica_refs.py, 9 of 11 tests RED on db8b5c1168f, all
+GREEN after; 0b1715a3f43's tests (test_kanban_false_signals.py) unchanged and green; 319 tests in 9
+kanban files green; mutants M1-M8 on every new condition killed.
+---
+ hermes_cli/kanban_board_replica_refs.py       |  63 +++++++
+ hermes_cli/kanban_db.py                       |  17 +-
+ .../test_kanban_board_replica_refs.py         | 177 ++++++++++++++++++
+ 3 files changed, 245 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/kanban_board_replica_refs.py
+ create mode 100644 tests/hermes_cli/test_kanban_board_replica_refs.py
+
+diff --git a/hermes_cli/kanban_board_replica_refs.py b/hermes_cli/kanban_board_replica_refs.py
+new file mode 100644
+index 0000000000..713e35e0ea
+--- /dev/null
++++ b/hermes_cli/kanban_board_replica_refs.py
+@@ -0,0 +1,63 @@
++"""Card-id lookups in this host's Board replicas (``kanban/sync-shadow/<board>.db``). [daveey]
++
++A Board-synced host's live board file holds only part of each board (its own cards plus the copies it claimed); its
++Board replica holds the whole board. So an id the live file lacks may still be a real card, and the phantom-ref
++checks (the ``created_cards`` completion gate and the summary scan/diagnostics) ask the replica before the hub
++replica, which can answer "fresh" yet lack a card minted minutes earlier.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++from pathlib import Path
++from typing import Iterable, Optional
++
++
++def _replica_paths() -> list[Path]:
++    from hermes_cli.kanban_db import kanban_home
++    from hermes_cli.kanban_db_sync import SHADOW_DIR
++
++    try:
++        return sorted(p for p in (kanban_home() / "kanban" / SHADOW_DIR).glob("*.db") if p.is_file())
++    except OSError:
++        return []
++
++
++def replica_tasks(ids: Iterable[str], parent: Optional[str] = None) -> tuple[dict[str, Optional[str]], set[str]]:
++    """``({id: created_by}, linked)`` for the ``ids`` any Board replica holds; ``linked`` = those the replica links as
++    children of ``parent``. An unreadable replica answers nothing (read-only; a missing file is never created)."""
++    from hermes_cli.kanban_generation import open_ro
++
++    want = list(dict.fromkeys(ids))
++    found: dict[str, Optional[str]] = {}
++    linked: set[str] = set()
++    for path in _replica_paths() if want else ():  # nothing to look up: open no file (perf only)
++        rest = [i for i in want if i not in found]
++        marks = ",".join("?" * len(rest))
++        try:
++            conn = open_ro(path)
++            try:
++                found.update((r[0], r[1]) for r in conn.execute(
++                    f"SELECT id, created_by FROM tasks WHERE id IN ({marks})", rest))
++                linked.update(r[0] for r in conn.execute(
++                    f"SELECT child_id FROM task_links WHERE parent_id = ? AND child_id IN ({marks})",
++                    (parent, *rest)))
++            finally:
++                conn.close()
++        except sqlite3.Error:
++            continue
++    return found, linked
++
++
++def unresolved_after_replica(missing: list[str]) -> list[str]:
++    """``missing`` (not on the local board) minus ids a Board replica or the hub replica knows; [] when the hub
++    replica cannot say for the rest."""
++    missing = [p for p in missing if p not in replica_tasks(missing)[0]]
++    try:
++        from hermes_cli.kanban_session_activity import replica_task_resolution
++        found, authoritative = replica_task_resolution(missing)
++    except Exception:  # health: allow BLE001 -- advisory scan; an unusable replica means "unknown", never a flag
++        return []
++    if not authoritative:
++        return []
++    return [p for p in missing if p not in found]
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index ff20169ba9..631bee2995 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2452,6 +2452,10 @@ def _verify_created_cards(
+     # Pull the set of cards linked as children of the completing task.
+     # Cheap: one query, indexed on parent_id.
+     linked_children: set[str] = set(child_ids(conn, completing_task_id))
++    # A Board-synced live file is partial: ask the Board replica for the rest (same trust rule). [daveey]
++    remote, remote_children = _replica_tasks([c for c in ordered if c not in found], completing_task_id)
++    found.update(remote)
++    linked_children |= remote_children
+ 
+     verified: list[str] = []
+     phantom: list[str] = []
+@@ -2479,18 +2483,7 @@ def _scan_prose_for_phantom_ids(conn: sqlite3.Connection, text: str) -> list[str
+     return unresolved_after_replica(missing)
+ 
+ 
+-def unresolved_after_replica(missing: list[str]) -> list[str]:
+-    """``missing`` (not on the local board) minus ids the hub replica knows; [] when the replica cannot say."""
+-    if not missing:
+-        return []
+-    try:
+-        from hermes_cli.kanban_session_activity import replica_task_resolution
+-        found, authoritative = replica_task_resolution(missing)
+-    except Exception:  # health: allow BLE001 -- advisory scan; an unusable replica means "unknown", never a flag
+-        return []
+-    if not authoritative:
+-        return []
+-    return [p for p in missing if p not in found]
++from hermes_cli.kanban_board_replica_refs import replica_tasks as _replica_tasks, unresolved_after_replica
+ 
+ 
+ class HallucinatedCardsError(ValueError):
+diff --git a/tests/hermes_cli/test_kanban_board_replica_refs.py b/tests/hermes_cli/test_kanban_board_replica_refs.py
+new file mode 100644
+index 0000000000..e7218b603b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_board_replica_refs.py
+@@ -0,0 +1,177 @@
++"""Phantom-ref checks consult this host's Board replica (``kanban/sync-shadow/<board>.db``) before calling an id
++hallucinated.
++
++worker-1 completing t_01a1ceb5fa5abe36 (run 13081): its live ``kanban.db`` held 227 of the board's ~9.7k cards, its
++Board replica held all of them, and a fresh hub replica answered authoritatively without the 2-minute-old hub card.
++The completion gate refused ``created_cards`` naming t_01a1cedb2faf7341 (created by an earlier run of the same card
++on worker-3, linked as its child), and the summary scan flagged t_01a1cf4d49ca68bb (a hub-created card).
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_diagnostics as kd
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++
++OTHER_NODE_CHILD = "t_01a1cedb2faf7341"  # created on worker-3 by an earlier run of the completing card
++HUB_CARD = "t_01a1cf4d49ca68bb"  # created on the hub two minutes before the summary named it
++FOREIGN_CARD = "t_01a1cf4eda4b0000"  # real Board card, another profile made it, not linked to the completer
++MADE_UP = "t_deadbeef00ff"
++
++
++def _fresh_hub_without_cards(state_dir):
++    """A hub replica that answers (fresh, online) but does not hold the Board cards."""
++    state_dir.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(state_dir / "hub.db")
++    conn.execute("CREATE TABLE replica (coll TEXT, gw TEXT, key TEXT, data TEXT, updated_at INTEGER)")
++    conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
++    conn.execute("INSERT INTO meta VALUES ('gateway', 'worker-1')")
++    conn.execute("INSERT INTO meta VALUES ('last_ok', ?)", (str(time.time() - 2),))
++    conn.commit()
++    conn.close()
++
++
++def _seed_replica(rows, links=(), board="default"):
++    replica = kbc.connect(ksc.shadow_path(board))
++    try:
++        now = int(time.time())
++        with kbc.write_txn(replica):
++            for tid, created_by, created_on in rows:
++                replica.execute("INSERT INTO tasks (id, title, status, created_at, created_by, created_on) "
++                                "VALUES (?, ?, 'todo', ?, ?, ?)", (tid, tid, now, created_by, created_on))
++            for parent, child in links:
++                replica.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, child))
++    finally:
++        replica.close()
++
++
++@pytest.fixture
++def worker_node(tmp_path, monkeypatch):
++    """worker-1's shape: Board sync on, a fresh hub replica, and a Board replica holding cards the live file lacks."""
++    home = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hubstate"))
++    support.write_sync_config(home, True)
++    _fresh_hub_without_cards(tmp_path / "hubstate")
++    leases = support.lease_client()
++    next(leases)
++    conn = kbc.connect(home / "kanban.db")
++    tid = kb.create_task(conn, title="workers fall behind core", assignee="default")
++    kb.claim_task(conn, tid)
++    _seed_replica([(OTHER_NODE_CHILD, "default", "worker-3"), (HUB_CARD, "default", "hub"),
++                   (FOREIGN_CARD, "someone-else", "worker-2")], links=[(tid, OTHER_NODE_CHILD)])
++    yield conn, tid
++    conn.close()
++    leases.close()
++
++
++def _events(conn, tid, kind):
++    return [json.loads(r[0]) for r in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?", (tid, kind))]
++
++
++def _diag_refs(conn, tid):
++    diags = kd.compute_task_diagnostics(kb.get_task(conn, tid), kb.list_events(conn, tid), [], now=int(time.time()))
++    return [d.data["phantom_refs"] for d in diags if d.kind == "prose_phantom_refs"]
++
++
++def test_created_card_from_another_worker_node_is_verified_from_the_board_replica(worker_node):
++    """(1) The child exists only in the Board replica (created on worker-3, linked there): verified, not phantom."""
++    conn, tid = worker_node
++    assert kb.get_task(conn, OTHER_NODE_CHILD) is None  # not in this node's partial live file
++    assert kb.complete_task(conn, tid, summary="filed the stall detector", created_cards=[OTHER_NODE_CHILD])
++    assert _events(conn, tid, "completion_blocked_hallucination") == []
++    (done,) = _events(conn, tid, "completed")
++    assert done["verified_cards"] == [OTHER_NODE_CHILD]
++
++
++def test_summary_naming_a_hub_card_only_the_board_replica_holds_is_not_flagged(worker_node):
++    """(2) A fresh hub replica lacking the card no longer wins: the Board replica has it."""
++    conn, tid = worker_node
++    assert kb.complete_task(conn, tid, summary=f"worker-6 claimed {HUB_CARD} at 10:28:50Z")
++    assert _events(conn, tid, "suspected_hallucinated_references") == []
++    assert _diag_refs(conn, tid) == []
++
++
++def test_id_found_nowhere_is_still_flagged_and_still_refused(worker_node):
++    conn, tid = worker_node
++    with pytest.raises(kb.HallucinatedCardsError) as err:
++        kb.complete_task(conn, tid, summary="done", created_cards=[OTHER_NODE_CHILD, MADE_UP])
++    assert err.value.phantom == [MADE_UP]
++    (blocked,) = _events(conn, tid, "completion_blocked_hallucination")
++    assert blocked["phantom_cards"] == [MADE_UP] and blocked["verified_cards"] == [OTHER_NODE_CHILD]
++    assert kb.get_task(conn, tid).status == "running"
++    assert kb.complete_task(conn, tid, summary=f"saw {HUB_CARD} and {MADE_UP}")
++    (flag,) = _events(conn, tid, "suspected_hallucinated_references")
++    assert flag["phantom_refs"] == [MADE_UP]
++    assert _diag_refs(conn, tid) == [[MADE_UP]]
++
++
++def test_replica_card_another_profile_made_is_still_phantom_as_created_card(worker_node):
++    """Existence in the replica is not ownership: the trust rule (creator or linked child) still applies."""
++    conn, tid = worker_node
++    with pytest.raises(kb.HallucinatedCardsError) as err:
++        kb.complete_task(conn, tid, summary="done", created_cards=[FOREIGN_CARD])
++    assert err.value.phantom == [FOREIGN_CARD]
++    assert kb.complete_task(conn, tid, summary=f"see {FOREIGN_CARD}")  # merely naming a real card is fine
++    assert _events(conn, tid, "suspected_hallucinated_references") == []
++
++
++def test_replica_card_created_by_the_completing_task_id_is_verified(worker_node):
++    conn, tid = worker_node
++    _seed_replica([("t_01a1cf000000beef", tid, "worker-3")])
++    assert kb.complete_task(conn, tid, summary="done", created_cards=["t_01a1cf000000beef"])
++
++
++def test_replica_link_verifies_a_child_another_profile_created(worker_node):
++    """The replica's parent link counts like a local one (a planner profile made the child, the worker linked it)."""
++    conn, tid = worker_node
++    _seed_replica([("t_01a1cf00000c0de0", "planner", "worker-3")], links=[(tid, "t_01a1cf00000c0de0")])
++    assert kb.complete_task(conn, tid, summary="done", created_cards=["t_01a1cf00000c0de0"])
++
++
++def test_unreadable_replica_is_skipped_and_the_readable_one_still_answers(worker_node):
++    conn, tid = worker_node
++    ksc.shadow_path("aaa-broken").write_bytes(b"not a sqlite file" * 64)  # sorts before default.db
++    assert kb.complete_task(conn, tid, summary=f"see {HUB_CARD}", created_cards=[OTHER_NODE_CHILD])
++    assert _events(conn, tid, "suspected_hallucinated_references") == []
++
++
++def test_ids_spread_over_two_board_replicas_all_resolve(worker_node):
++    """A summary naming cards on two boards: the second replica is still asked for what the first lacked."""
++    conn, tid = worker_node
++    _seed_replica([("t_01a1cf00000bb000", "default", "hub")], board="bb")  # bb.db sorts before default.db
++    assert kb.complete_task(conn, tid, summary=f"see t_01a1cf00000bb000 and {HUB_CARD}")
++    assert _events(conn, tid, "suspected_hallucinated_references") == []
++
++
++def test_nothing_to_look_up_opens_no_replica(worker_node, monkeypatch):
++    from hermes_cli import kanban_board_replica_refs as refs
++    from hermes_cli import kanban_generation
++
++    opened = []
++    monkeypatch.setattr(kanban_generation, "open_ro", lambda p, *a, **k: opened.append(p))
++    assert refs.replica_tasks([], "t_x") == ({}, set())
++    assert opened == []
++
++
++def test_missing_board_replica_is_not_created_and_changes_nothing(tmp_path, monkeypatch):
++    """No Board replica file: the lookup never creates one, and the gate behaves exactly as before."""
++    home = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hubstate"))
++    conn = kbc.connect(home / "kanban.db")
++    try:
++        tid = kb.create_task(conn, title="t", assignee="default")
++        kb.claim_task(conn, tid)
++        with pytest.raises(kb.HallucinatedCardsError):
++            kb.complete_task(conn, tid, summary="done", created_cards=[OTHER_NODE_CHILD])
++        assert not ksc.shadow_path("default").exists()
++    finally:
++        conn.close()
+-- 
+2.43.0
+

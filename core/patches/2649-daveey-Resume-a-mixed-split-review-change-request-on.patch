@@ -1,0 +1,147 @@
+From 594ef08507f8285cc48d9ed3618320841dce5c92 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:15:35 +0000
+Subject: [PATCH] [daveey] Resume a mixed split review: change request on one
+ PR, approval of the other
+
+A dependency park whose checkpoint names two PRs, awaited by one exact-head review
+card per PR, was held by the active_pr respawn guard forever when the reviews
+disagreed: PR1325's review requested changes and PR1326's approved. The repair path
+needed one change request to cover every holding PR and the split-approval path
+needed every awaited parent to approve, so neither matched and the owner had no way
+back to repair PR1325.
+
+Now each awaited parent may contribute either exact-head repair evidence or an
+approval, and together they must cover every holding PR. A parent not named in the
+checkpoint's awaited list must still approve every holding PR on its own; an
+inexact head, an unrelated PR or an uncovered PR keeps the hold. One continuation
+only, no merge approval.
+
+Seen live: t_01a1cedd5cab762d (reviews t_01a1cf0900b1b318 / t_01a1cf0901efcf95).
+Kanban: t_01a1cf326e9d395f
+---
+ hermes_cli/kanban_dependency_review.py        | 10 ++-
+ .../test_kanban_dependency_review_mixed.py    | 81 +++++++++++++++++++
+ 2 files changed, 88 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_dependency_review_mixed.py
+
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index 6c84f18360..e77d25c4fa 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -379,7 +379,8 @@ def resumes_review(conn, task_id, pr_urls, *, discharged=()):
+     urls -= {norm_pr(u) for u in discharged}
+     if not urls:
+         return False
+-    reviewed = set().union(*(_reviewed_prs(conn, p, parked_at, row["id"], captured_set) for p in parents))
++    repairs = {p: _reviewed_prs(conn, p, parked_at, row["id"], captured_set) for p in parents}
++    reviewed = set().union(*repairs.values())
+     if urls.issubset(reviewed):
+         return True
+     # Without repair evidence, every awaited parent must approve a checkpointed PR. One approval
+@@ -389,10 +390,13 @@ def resumes_review(conn, task_id, pr_urls, *, discharged=()):
+     # A parent that is here only because its history could not be proven finished before the
+     # park (legacy checkpoint, reopened or replica-unverified) must approve every holding PR on
+     # its own: its pre-park approval of another PR is not evidence for this one.
++    # Mixed split reviews (one named parent requests changes on its PR, a sibling approves
++    # the other) also resume: each named parent left exact-head evidence for a checkpointed
++    # PR and together they cover every holding PR. Still no merge approval, one continuation.
+     approvals = {p: _approval_prs(conn, p, parked_at, row["id"], captured_set) for p in parents}
+-    if not all(approvals.values()):
++    if not all(approvals[p] or repairs[p] for p in parents):
+         return False
+     named = evidence.get("awaited") if isinstance(evidence.get("awaited"), list) else ()
+     if not all(urls.issubset(a) for p, a in approvals.items() if p not in named):
+         return False
+-    return urls.issubset(set().union(*approvals.values()))
++    return urls.issubset(reviewed.union(*approvals.values()))
+diff --git a/tests/hermes_cli/test_kanban_dependency_review_mixed.py b/tests/hermes_cli/test_kanban_dependency_review_mixed.py
+new file mode 100644
+index 0000000000..750595bbb9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dependency_review_mixed.py
+@@ -0,0 +1,81 @@
++"""A two-PR checkpoint whose per-PR reviews disagree (one approves, one requests changes) resumes once.
++
++Production shape (t_01a1cedd5cab762d): a state PR1325 and a state PR1326, one exact-head
++review card each. PR1326's review approved; PR1325's review requested changes. The repair
++path needed one parent's change request to cover both PRs and the split-approval path needed
++every parent to approve, so the owner was held by ``active_pr`` with no path back to repair
++PR1325, though every awaited parent left exact-head evidence for its own PR.
++"""
++import json
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli.kanban_dependency_review import resumes_review
++from tests.hermes_cli import test_kanban_dependency_review as helpers
++from tests.hermes_cli import test_kanban_dependency_review_split as split
++
++board = helpers.board
++CORE, MODS = split.CORE, split.MODS
++
++
++def finish(conn, reviews, metadata):
++    for review, data in zip(reviews, metadata):
++        kb.claim_task(conn, review)
++        run = kb.get_task(conn, review).current_run_id
++        assert kb.complete_task(conn, review, summary="Review complete", expected_run_id=run, metadata=data)
++    kb.recompute_ready(conn)
++
++
++def changes(pr):
++    return {"verdict": "request_changes", "reviewed_pr": pr, "reviewed_sha": helpers.HEAD}
++
++
++def approve(pr):
++    return {"verdict": "approve", "reviewed_pr": pr, "reviewed_sha": helpers.HEAD}
++
++
++def test_changes_on_one_pr_and_approval_of_the_other_resume_once(board):
++    task, reviews = split.parked_two_prs(board)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++    finish(board, reviews, [changes(CORE), approve(MODS)])
++    assert kb.get_task(board, task).status == "ready"
++    assert dispatch.check_respawn_guard(board, task) is None
++    # One continuation only: the next claim consumes it, a crash does not grant another.
++    assert kb.claim_task(board, task) is not None
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++    assert kb.reclaim_task(board, task, reason="Worker died", signal_fn=lambda *_: None)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_mixed_reviews_must_still_cover_every_pr(board):
++    # Change request and approval both name the core PR: nobody reviewed the plugin PR.
++    task, reviews = split.parked_two_prs(board)
++    finish(board, reviews, [changes(CORE), approve(CORE)])
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_mixed_reviews_need_exact_head_evidence_from_every_parent(board):
++    # The plugin review has no exact head: it is neither an approval nor repair evidence.
++    task, reviews = split.parked_two_prs(board)
++    finish(board, reviews, [changes(CORE), {"verdict": "approve", "reviewed_pr": MODS, "head": "0d0f9d77"}])
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_mixed_approval_of_unrelated_pr_does_not_cover(board):
++    task, reviews = split.parked_two_prs(board)
++    finish(board, reviews, [changes(CORE), approve(MODS + "1")])
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_legacy_checkpoint_mixed_reviews_keep_per_parent_rule(board):
++    # Without an explicit awaited list, a parent approving only one PR covers nothing on its own.
++    task, reviews = split.parked_two_prs(board)
++    row = board.execute("SELECT id, payload FROM task_events WHERE task_id = ? "
++                        "AND kind = 'dependency_wait'", (task,)).fetchone()
++    payload = json.loads(row["payload"])
++    payload["review_checkpoint"].pop("awaited", None)
++    with kb.write_txn(board):
++        board.execute("UPDATE task_events SET payload = ? WHERE id = ?", (json.dumps(payload), row["id"]))
++    finish(board, reviews, [changes(CORE), approve(MODS)])
++    assert resumes_review(board, task, [CORE, MODS]) is False
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
+-- 
+2.43.0
+

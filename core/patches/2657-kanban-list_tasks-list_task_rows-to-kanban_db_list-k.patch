@@ -1,0 +1,205 @@
+From 36f99041582c6d70098dd08a9b4706085d63a02f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:27:01 +0000
+Subject: [PATCH] kanban: list_tasks/list_task_rows to kanban_db_list
+ (kanban_db back under its line cap); one lazy kanban_wake_check import in
+ board_read (boundary baseline)
+
+---
+ hermes_cli/kanban_db.py                | 56 +---------------------
+ hermes_cli/kanban_db_list.py           | 65 ++++++++++++++++++++++++++
+ plugins/kanban/dashboard/board_read.py | 11 +++--
+ 3 files changed, 74 insertions(+), 58 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_list.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 4a421cd7ff..0ed65ffdf9 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -30,7 +30,7 @@ import time
+ from contextvars import ContextVar, Token
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, Callable, Iterable, Optional, Sequence
++from typing import Any, Callable, Iterable, Optional
+ 
+ from hermes_cli import kanban_db_sync as _sync, kanban_park_pin as _park_pin, kanban_priority
+ from hermes_cli.kanban_db_values import _first_line, _opt_int, _json_or_null
+@@ -1443,59 +1443,6 @@ VALID_SORT_ORDERS: dict[str, str] = {
+ }
+ 
+ 
+-def list_tasks(
+-    conn: sqlite3.Connection, *, assignee: Optional[str] = None, status: Optional[str] = None,
+-    tenant: Optional[str] = None, session_id: Optional[str] = None, include_archived: bool = False,
+-    limit: Optional[int] = None, order_by: Optional[str] = None,
+-    workflow_template_id: Optional[str] = None, current_step_key: Optional[str] = None,
+-    extra_where: str = "", extra_params: Sequence[Any] = (), parse: Optional[Callable[[sqlite3.Row], Task]] = None,
+-) -> list[Task]:
+-    """``parse`` (default ``Task.from_row``) lets the board reuse a Task parsed from identical row values."""
+-    return [(parse or Task.from_row)(r) for r in list_task_rows(
+-        conn, assignee=assignee, status=status, tenant=tenant, session_id=session_id,
+-        include_archived=include_archived, limit=limit, order_by=order_by,
+-        workflow_template_id=workflow_template_id, current_step_key=current_step_key,
+-        extra_where=extra_where, extra_params=extra_params)]
+-
+-
+-def list_task_rows(
+-    conn: sqlite3.Connection, *, assignee: Optional[str] = None, status: Optional[str] = None,
+-    tenant: Optional[str] = None, session_id: Optional[str] = None, include_archived: bool = False,
+-    limit: Optional[int] = None, order_by: Optional[str] = None,
+-    workflow_template_id: Optional[str] = None, current_step_key: Optional[str] = None,
+-    columns: str = "*", extra_where: str = "", extra_params: Sequence[Any] = (),
+-) -> list[sqlite3.Row]:
+-    """``list_tasks``'s raw rows (``columns`` selected, ``extra_where`` ANDed in): the board
+-    re-parses only rows whose values changed since its last read."""
+-    if status is not None and status not in VALID_STATUSES:
+-        raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+-    query = f"SELECT {columns} FROM tasks WHERE 1=1"
+-    params: list[Any] = []
+-    for col, val in (
+-        ("assignee", _canonical_assignee(assignee)), ("status", status), ("tenant", tenant),
+-        ("session_id", session_id), ("workflow_template_id", workflow_template_id),
+-        ("current_step_key", current_step_key),
+-    ):
+-        if val is not None:
+-            query += f" AND {col} = ?"
+-            params.append(val)
+-    if not include_archived and status != "archived":
+-        query += " AND status != 'archived'"
+-    if extra_where:
+-        query += f" AND ({extra_where})"
+-        params.extend(extra_params)
+-    if order_by is not None:
+-        order_by = order_by.strip().lower()
+-        if order_by not in VALID_SORT_ORDERS:
+-            raise ValueError(f"order_by must be one of {sorted(VALID_SORT_ORDERS.keys())}")
+-        query += f" ORDER BY {VALID_SORT_ORDERS[order_by]}"
+-    else:  # the dispatcher's lane order: a card others wait on first among its effective priority [daveey]
+-        query += f" ORDER BY {DISPATCH_ORDER}"
+-    if limit:
+-        query += f" LIMIT {int(limit)}"
+-    return conn.execute(query, params).fetchall()
+-
+-
+ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
+     profile = _canonical_assignee(profile)
+@@ -4111,6 +4058,7 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
+ from hermes_cli.kanban_db_comment_ids import (
+     add_comment, agent_comment_ids, comment_id_before_run_start, delivered_comment_ids, own_comment_ids, writer_provenance)
+ from hermes_cli.kanban_db_archive import archive_task
++from hermes_cli.kanban_db_list import list_task_rows, list_tasks
+ from hermes_cli.kanban_db_schedule import schedule_task
+ from hermes_cli.kanban_db_edit import PriorityLowerRefused, edit_task
+ from hermes_cli.kanban_reason_comment import _awaiting_human_answer
+diff --git a/hermes_cli/kanban_db_list.py b/hermes_cli/kanban_db_list.py
+new file mode 100644
+index 0000000000..d1164ac184
+--- /dev/null
++++ b/hermes_cli/kanban_db_list.py
+@@ -0,0 +1,65 @@
++"""``list_tasks`` / ``list_task_rows`` (split out of ``kanban_db``). [daveey]
++
++Late-bound via ``_kb`` (import-cycle breaking) so monkeypatching ``kanban_db`` helpers in
++tests still reaches this code. Re-exported from ``kanban_db``.
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Any, Callable, Optional, Sequence
++
++
++def list_tasks(
++    conn: sqlite3.Connection, *, assignee: Optional[str] = None, status: Optional[str] = None,
++    tenant: Optional[str] = None, session_id: Optional[str] = None, include_archived: bool = False,
++    limit: Optional[int] = None, order_by: Optional[str] = None,
++    workflow_template_id: Optional[str] = None, current_step_key: Optional[str] = None,
++    extra_where: str = "", extra_params: Sequence[Any] = (), parse: Optional[Callable[[sqlite3.Row], _kb.Task]] = None,
++) -> list[_kb.Task]:
++    """``parse`` (default ``Task.from_row``) lets the board reuse a Task parsed from identical row values."""
++    return [(parse or _kb.Task.from_row)(r) for r in list_task_rows(
++        conn, assignee=assignee, status=status, tenant=tenant, session_id=session_id,
++        include_archived=include_archived, limit=limit, order_by=order_by,
++        workflow_template_id=workflow_template_id, current_step_key=current_step_key,
++        extra_where=extra_where, extra_params=extra_params)]
++
++
++def list_task_rows(
++    conn: sqlite3.Connection, *, assignee: Optional[str] = None, status: Optional[str] = None,
++    tenant: Optional[str] = None, session_id: Optional[str] = None, include_archived: bool = False,
++    limit: Optional[int] = None, order_by: Optional[str] = None,
++    workflow_template_id: Optional[str] = None, current_step_key: Optional[str] = None,
++    columns: str = "*", extra_where: str = "", extra_params: Sequence[Any] = (),
++) -> list[sqlite3.Row]:
++    """``list_tasks``'s raw rows (``columns`` selected, ``extra_where`` ANDed in): the board
++    re-parses only rows whose values changed since its last read."""
++    if status is not None and status not in _kb.VALID_STATUSES:
++        raise ValueError(f"status must be one of {sorted(_kb.VALID_STATUSES)}")
++    query = f"SELECT {columns} FROM tasks WHERE 1=1"
++    params: list[Any] = []
++    for col, val in (
++        ("assignee", _kb._canonical_assignee(assignee)), ("status", status), ("tenant", tenant),
++        ("session_id", session_id), ("workflow_template_id", workflow_template_id),
++        ("current_step_key", current_step_key),
++    ):
++        if val is not None:
++            query += f" AND {col} = ?"
++            params.append(val)
++    if not include_archived and status != "archived":
++        query += " AND status != 'archived'"
++    if extra_where:
++        query += f" AND ({extra_where})"
++        params.extend(extra_params)
++    if order_by is not None:
++        order_by = order_by.strip().lower()
++        if order_by not in _kb.VALID_SORT_ORDERS:
++            raise ValueError(f"order_by must be one of {sorted(_kb.VALID_SORT_ORDERS.keys())}")
++        query += f" ORDER BY {_kb.VALID_SORT_ORDERS[order_by]}"
++    else:  # the dispatcher's lane order: a card others wait on first among its effective priority [daveey]
++        query += f" ORDER BY {_kb.DISPATCH_ORDER}"
++    if limit:
++        query += f" LIMIT {int(limit)}"
++    return conn.execute(query, params).fetchall()
++
++
++from hermes_cli import kanban_db as _kb
+diff --git a/plugins/kanban/dashboard/board_read.py b/plugins/kanban/dashboard/board_read.py
+index 0df0b54992..9329211d02 100644
+--- a/plugins/kanban/dashboard/board_read.py
++++ b/plugins/kanban/dashboard/board_read.py
+@@ -41,6 +41,11 @@ def _raw(rows) -> tuple:
+ _NO_EVENTS = (0, None)  # _event_marks of a task without events
+ 
+ 
++def _wake_states(conn: sqlite3.Connection, row_ids: list) -> dict:
++    from hermes_cli import kanban_wake_check as kwc  # lazy, as before the incremental split
++    return kwc.load_states(conn, row_ids)
++
++
+ def _event_marks(conn: sqlite3.Connection, row_ids: list) -> dict[str, tuple]:
+     """``{task_id: (event count, max event id)}``: an insert or delete moves it. Events are otherwise
+     immutable: the only in-place UPDATEs (run_id on completion) commit with a task row change and
+@@ -79,8 +84,7 @@ def diagnostic_inputs(conn: sqlite3.Connection, task_ids: Optional[list[str]] =
+     events_by_task = _rows_by_task(conn, "task_events", row_ids)
+     runs_by_task = _rows_by_task(conn, "task_runs", row_ids)
+     graph_by_task = kanban_db.task_graph_contexts(conn, row_ids)
+-    from hermes_cli import kanban_wake_check as kwc
+-    wake_by_task = kwc.load_states(conn, row_ids)
++    wake_by_task = _wake_states(conn, row_ids)
+     return tuple(rows), events_by_task, runs_by_task, graph_by_task, wake_by_task
+ 
+ 
+@@ -170,8 +174,7 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+         else:  # vanished between reads: no events held, so never vouch for a mark
+             events[tid] = ()
+             memo[tid] = (tuple(r), _raw(runs[tid]), None, ())
+-    from hermes_cli import kanban_wake_check as kwc
+-    inputs = (tuple(diag_rows), events, runs, kanban_db.task_graph_contexts(conn, ids), kwc.load_states(conn, ids))
++    inputs = (tuple(diag_rows), events, runs, kanban_db.task_graph_contexts(conn, ids), _wake_states(conn, ids))
+     return inputs, memo
+ 
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,754 @@
+From a62cc5c07064a1b026898bd485daaf8bb1a53d00 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:59:43 +0000
+Subject: [PATCH] [daveey] gate CLI create, move, capability owners and show on
+ hub admission
+
+---
+ hermes_cli/kanban.py                          |  33 +++-
+ hermes_cli/kanban_capability_routing.py       |  48 +++++
+ hermes_cli/kanban_hub_admission_placement.py  | 121 ++++++++++++-
+ hermes_cli/kanban_move.py                     |   9 +
+ hermes_cli/kanban_parser.py                   |   7 +
+ hermes_cli/kanban_placement.py                |  10 +-
+ tests/hermes_cli/conftest.py                  |  13 ++
+ tests/hermes_cli/test_kanban_placement.py     |   6 -
+ .../test_kanban_placement_runs_on.py          |   1 +
+ .../test_kanban_worker_placement.py           |  12 +-
+ tests/hermes_cli/test_kanban_worker_repin.py  |   5 +-
+ tests/test_kanban_hub_admission_entry.py      | 165 ++++++++++++++++++
+ tests/tools/conftest.py                       |   8 +
+ tools/kanban_show.py                          |   5 +
+ tools/kanban_tools_schemas.py                 |  10 ++
+ 15 files changed, 422 insertions(+), 31 deletions(-)
+ create mode 100644 tests/test_kanban_hub_admission_entry.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index c3a5a74dc0..b7343a99e2 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -463,6 +463,20 @@ def _cmd_create(args: argparse.Namespace) -> int:
+     except kanban_origin.OriginError as exc:
+         return _err(f"kanban: {exc.code}: {exc}", 2)
+     origin_binding = None
++    # [daveey] Hub admission runs before any connection/write lock: the judge is a model call.
++    from hermes_cli.kanban_hub_admission_placement import cli_plan
++    plan = cli_plan(args, body, ws_kind, ws_path, getattr(args, "board", None) or kb.get_current_board(),
++                    assignee=(args.assignee or (_profile_author() if in_worker or _agent_invoked() else None)
++                              or _cli_default_assignee(args)))
++    if plan.get("where") == "refuse":
++        if getattr(args, "json", False):
++            _print_json({"ok": False, "created": False, "code": "hub_admission_denied",
++                         "error": plan.get("why", ""), "hub_admission": plan.get("hub_admission")})
++            return 2
++        verdict = plan.get("hub_admission") or {}
++        return _err(f"kanban: hub_admission_denied: {plan.get('why', '')} (no card was created; "
++                    f"need={verdict.get('need')!r}). Drop the hub pin, or give --hub-reason "
++                    "quoting what only the hub can do.", 2)
+     with kbc.connect_closing() as conn:
+         # An --idempotency-key hit returns an existing card: never re-stamp/re-subscribe it.
+         idem_hit = bool(idem_key) and conn.execute(
+@@ -492,7 +506,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         from hermes_cli.kanban_ask_resolved import AskFilingRefused, check_create_filing, create_context
+         assignee = (args.assignee or (_profile_author() if in_worker or _agent_invoked() else None)
+                     or _cli_default_assignee(args))
+-        from hermes_cli.kanban_worker_placement import cli_audit, cli_policy, cli_runs_on
++        from hermes_cli.kanban_worker_placement import cli_audit, cli_runs_on
++        from hermes_cli.kanban_hub_admission_placement import with_admission as _with_admission
+         try:
+             # [daveey] A blocked ask's resolved_check runs once first, as the sweep will run it for this assignee
+             # and workspace: already met or broken refuses the create. A key hit returns the card: no probe.
+@@ -503,7 +518,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             task_id = kb.create_task(
+                 conn, title=args.title, body=body,
+                 assignee=assignee,
+-                session_id=session_id, requires=getattr(args, "requires", None),
++                session_id=session_id, requires=plan.get("requires", getattr(args, "requires", None)),
+                 chat_origin=origin.ref if origin else getattr(args, "origin_session", None),
+                 # [daveey] Same declaration gate as the kanban_create tool, for agent/worker shells only.
+                 require_declaration=(in_worker or _agent_invoked()) and declaration_required(),
+@@ -524,10 +539,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                  if in_worker else None),
+                 validate_workspace=True, validate_skills=True,  # [daveey] no --runs-on: queue for the worker pool
+-                runs_on=cli_runs_on(conn, args, body, ws_kind, ws_path, board, assignee=assignee),
+-                placement_policy=cli_policy(args, body, ws_kind, ws_path, board, assignee=assignee),
++                runs_on=(None if plan.get("placement_policy") else
++                         cli_runs_on(conn, args, body, ws_kind, ws_path, board, assignee=assignee)),
++                placement_policy=plan.get("placement_policy"),
+                 placement_checked=True, board=board,
+-                placement_audit=cli_audit(args, body, ws_kind, ws_path, board, assignee=assignee),
++                placement_audit=_with_admission(cli_audit(args, body, ws_kind, ws_path, board, assignee=assignee),
++                                                plan),
+                 insert_guard=after_create.guard,  # re-checks overlap under the write lock [daveey]
+             )
+         except kanban_overlap.OverlapRefused as exc:  # landed under the write lock after the first check
+@@ -777,6 +794,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
+             "wake_check": wake_check,
+             "queue_reason": queue_reason,
+             **details,
++            **({"hub_admission": [e.payload for e in events if e.kind == "hub_admission"][-1]}
++               if any(e.kind == "hub_admission" for e in events) else {}),
+         })
+         return 0
+ 
+@@ -801,6 +820,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
+         field("model", f"{task.model_override}{_prov}")
+     _print_max_retries(task)
+     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
++    _verdicts = [e.payload for e in events if e.kind == "hub_admission" and isinstance(e.payload, dict)]
++    if _verdicts:  # [daveey] why this card is (or is not) on the hub
++        from hermes_cli.kanban_hub_admission_placement import describe as _describe_admission
++        field("hub", _describe_admission(_verdicts[-1]))
+ 
+     # Diagnostics up top so CLI users see distress signals before scrolling.
+     from hermes_cli import kanban_diagnostics as kd
+diff --git a/hermes_cli/kanban_capability_routing.py b/hermes_cli/kanban_capability_routing.py
+index 06d764d3ea..524c9258ee 100644
+--- a/hermes_cli/kanban_capability_routing.py
++++ b/hermes_cli/kanban_capability_routing.py
+@@ -108,6 +108,13 @@ def needs_from_requires(requires) -> list[str]:
+     return [r for r in (requires or []) if reg.is_gateway_need(r)]
+ 
+ 
++def _is_hub_gateway(name) -> bool:
++    """[daveey] Hub-bound owner cards go through hub admission (kanban_hub_admission_placement)."""
++    from hermes_cli.kanban_hub_admission_placement import is_hub
++    from hermes_cli import kanban_placement as kp
++    return bool(name) and is_hub(str(name), kp.config())
++
++
+ def _hub_cli() -> str:
+     return reg.hub_cli_path(reg._config().get("hub_cli"))
+ 
+@@ -518,6 +525,21 @@ def route(conn, task_id: str, needs, *, reason: str, expected_run_id: Optional[i
+             overlap_opts = _overlap_option_argv(None, overlap_exclusions(conn, task_id))
+         argv = [hub, "create-task", gw, title, "--body", body, "--assignee", assignee,
+                 "--origin-session", "", "--id", rid, *overlap_opts]
++        if stored is None and _is_hub_gateway(gw):
++            # [daveey] An owner card bound for the hub must convince the admission judge first;
++            # a denied one is refused visibly (the waiting card's worker re-plans with hub-admin).
++            from hermes_cli.kanban_hub_admission_placement import gate_owner
++            audit = gate_owner(conn, task_id, title, body, need=r["need"])
++            if not audit["admit"]:
++                done = ", ".join(x["request_id"] for x in routes)
++                raise CapabilityRouteError(
++                    "hub_admission_denied",
++                    f"owner card for {r['need']} was not sent to the hub: hub admission denied "
++                    f"({audit['why']}). Pool workers have hub ssh + hub-admin (capability:hub-write): "
++                    "do the action from a worker, or give the waiting card a hub_reason."
++                    + (f" Already queued: {done}." if done else ""),
++                    details={"need": r["need"], "gateway": gw, "hub_admission": audit,
++                             "queued": [x["request_id"] for x in routes]})
+         rc, out = _create_task(argv)
+         # 0 = sent, 3 = queued locally (hub unreachable; sent on the next sync). Both are durable.
+         if rc not in (0, 3):
+@@ -772,6 +794,12 @@ def _apply_relay(conn, task, entry: dict, payload: dict, *, now: Optional[float]
+     body = owner_body(task, need, self_gw=self_gw, board=board, reason=reason)
+     argv = [_hub_cli(), "create-task", gw, title, "--body", body, "--assignee", _owner_assignee(),
+             "--origin-session", "", "--id", rid, *_overlap_option_argv(None, overlap_exclusions(conn, task.id))]
++    if _is_hub_gateway(gw):
++        from hermes_cli.kanban_hub_admission_placement import gate_owner
++        audit = gate_owner(conn, task.id, title, body, need=need)
++        if not audit["admit"]:
++            return _relay_fail(conn, task.id, entry, "hub_admission_denied",
++                               f"owner card for {need} was not sent to the hub: hub admission denied ({audit['why']})")
+     rc, out = _create_task(argv)
+     if rc not in (0, 3):
+         if age < RELAY_RETRY_S:
+@@ -816,6 +844,26 @@ def _local_owner(conn, task, entry: dict, *, need: str, rid: str, self_gw: str,
+         f"and it resumes on {from_gw}.\n"
+     )
+     own = _own_gateway(conn)
++    if _is_hub_gateway(self_gw) or (own and _is_hub_gateway(own)):
++        # [daveey] The hub holds the need: the owner stays here only if admitted; a denied owner
++        # enrolls in the worker pool with the hub-write requirement (Board: capability:hub-write).
++        from hermes_cli.kanban_hub_admission_placement import gate_owner
++        from hermes_cli.kanban_worker_placement import POLICY
++        audit = gate_owner(conn, task.id, title, body, need=need)
++        if not audit["admit"]:
++            owner = kb.create_task(conn, title=title, body=body, assignee=_owner_assignee(),
++                                   created_by="capability-relay", idempotency_key=rid,
++                                   requires=["hub:write"], placement_policy=POLICY,
++                                   placement_audit={"hub_admission": audit})
++            with kb.write_txn(conn):
++                kb._append_event(conn, task.id, ROUTED_EVENT, {
++                    "routes": [{"need": need, "gateway": "worker-pool", "request_id": rid,
++                                "generation": entry.get("generation", 1), "owner_task": owner,
++                                "relayed_from": from_gw, "hub_admission": "denied"}],
++                    "local": [need], "self_gateway": self_gw,
++                    "awaiting": [{"kind": "card", "ref": owner, "why": f"capability {need}"}],
++                })
++            return 1, f"{rid} -> pool owner {owner} (hub admission denied: {audit['why']})"
+     try:
+         owner = kb.create_task(conn, title=title, body=body, assignee=_owner_assignee(),
+                                created_by="capability-relay", idempotency_key=rid,
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index 336b14c05d..c31990bf5a 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -12,15 +12,119 @@ def is_hub(name, cfg):
+     return canonical_pin(name, "hub", cfg) in ("hub", "hermes-hub")
+ 
+ 
+-def apply(args, decision, gateway, cfg):
++def gate_move(conn, task_id, runs_on, *, cfg=None):
++    """``None`` when a move does not target the hub or the judge admits it, else a refusal dict.
++
++    Runs before the mover's write transaction (never a model call under the SQLite lock) and
++    records every verdict as a ``hub_admission`` event on the card.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_placement as kp
++
++    raw = [runs_on] if isinstance(runs_on, str) else list(runs_on or [])
++    cfg = kp.config() if cfg is None else cfg
++    labels = [str(v).strip() for v in raw if isinstance(v, str)]
++    if not any(v.lower().startswith("machine:") and is_hub(v[8:], cfg) for v in labels):
++        return None
++    row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None:
++        return None  # the mover's own check reports an unknown card
++    if conn.in_transaction:
++        return {"ok": False, "reason_code": "hub_admission_unavailable",
++                "error": "hub admission cannot run inside an open transaction"}
++    try:
++        verdict = judge.admit({"title": row["title"], "body": row["body"]})
++    except Exception:  # health: allow BLE001 -- a failed judge is a deny
++        verdict = judge.Verdict()
++    audit = {**asdict(verdict), "entry": "move", "runs_on": labels}
++    with kb.write_txn(conn):
++        kb._append_event(conn, task_id, "hub_admission", audit)
++    if verdict.admit:
++        return None
++    return {"ok": False, "reason_code": "hub_admission_denied",
++            "error": f"hub admission denied: {verdict.why}", "hub_admission": audit}
++
++
++def latest_verdict(conn, task_id):
++    """The card's most recent ``hub_admission`` event payload (``kanban_show`` / queue notes)."""
++    import json
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'hub_admission' "
++                       "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    if row is None or not row[0]:
++        return None
++    try:
++        payload = json.loads(row[0])
++    except (TypeError, ValueError):
++        return None
++    return payload if isinstance(payload, dict) else None
++
++
++def describe(verdict):
++    """One line: denied (why) / admitted: need, "evidence" / forced by operator."""
++    if not verdict:
++        return ""
++    if verdict.get("forced"):
++        return f"hub admission: forced by operator (session {verdict.get('session') or '?'})"
++    if verdict.get("admit"):
++        return f"hub admission: admitted, {verdict.get('need')}: \"{(verdict.get('evidence') or '')[:120]}\""
++    return f"hub admission: denied ({(verdict.get('why') or '')[:160]})"
++
++
++def gate_owner(conn, waiting_task_id, title, body, *, need):
++    """Judge a capability owner card bound for the hub; records the verdict on the waiting card.
++
++    Returns the audit dict (``admit`` says whether the owner may run on the hub).
++    """
++    from hermes_cli import kanban_db as kb
++    if conn.in_transaction:  # never a model call under the SQLite write lock
++        return {**asdict(judge.Verdict()), "entry": "capability_owner", "capability": need}
++    try:
++        verdict = judge.admit({"title": title, "body": body})
++    except Exception:  # health: allow BLE001 -- a failed judge is a deny
++        verdict = judge.Verdict()
++    audit = {**asdict(verdict), "entry": "capability_owner", "capability": need}
++    with kb.write_txn(conn):
++        kb._append_event(conn, waiting_task_id, "hub_admission", audit)
++    return audit
++
++
++def with_admission(audit, plan):
++    """Carry the preflight verdict into ``record_created`` (emits the ``hub_admission`` event)."""
++    if plan and plan.get("hub_admission"):
++        return {**(audit or {}), "hub_admission": plan["hub_admission"]}
++    return audit
++
++
++def cli_plan(args, body, workspace_kind, workspace_path, board, *, assignee=None):
++    """``hermes kanban create``: the worker-first decision plus admission, computed before any write."""
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli import kanban_worker_node as wn
++    from hermes_cli.kanban_worker_placement import _cli_fields, creation_decision
++
++    cfg, gateway = kp.config(), kp.reg.self_gateway()
++    fields = _cli_fields(args, body, workspace_kind, workspace_path, board, assignee=assignee)
++    if fields.get("runs_on") is not None:
++        try:
++            fields["runs_on"] = list(wn.normalize_runs_on(fields["runs_on"]) or [])
++        except ValueError:
++            return {"where": "local", "why": "invalid runs_on (create reports it)"}
++    decision = creation_decision(fields, cfg, gateway, "auto", None) if cfg.get("worker_pools") else None
++    return apply(fields, decision or {"where": "local", "why": "cli create"}, gateway, cfg)
++
++
++def apply(args, decision, gateway, cfg, *, origin_intent=None):
+     """Keep structural/non-hub outcomes unchanged; denied explicit hub pins refuse.
+ 
+     Returned requires are effective persistence inputs, not just creation-time checks.
+     A worker policy cannot coexist with runs_on, so hub access travels in requires.
++    Courier applies (``origin_intent``: another gateway's routed create landing here) keep
++    today's behaviour: the origin decided the route, and worker-first cannot carry a courier.
+     """
+     from hermes_cli.kanban_placement import structural_reason
+     from hermes_cli.kanban_worker_placement import POLICY, WAITING
+ 
++    if origin_intent is not None:
++        return decision
+     if decision.get("where") == "refuse" or structural_reason({**args, "runs_on": None}, cfg):
+         return decision
+     labels = args.get("runs_on")
+@@ -34,9 +138,9 @@ def apply(args, decision, gateway, cfg):
+         # Any explicit runs_on (even [] = any machine) is executed by the Board lease, not this slot.
+         if labels is not None or decision.get("runs_on") or decision.get("placement_policy"):
+             return decision
+-        # A foreign gateway's automatic route to the hub is judged by the hub's own
+-        # ingress (it lands there as a hub-local create); only explicit pins are judged here,
+-        # so non-hub origins make zero model calls unless the caller names the hub.
++        # A foreign gateway's automatic route to the hub is the origin's routing decision (it lands
++        # as a courier apply, unchanged); only explicit hub pins are judged at the origin, so
++        # non-hub origins make zero model calls unless the caller names the hub.
+         if not local_hub and not (explicit and is_hub(destination, cfg)):
+             return decision
+     if args.get("force_hub"):
+@@ -56,7 +160,7 @@ def apply(args, decision, gateway, cfg):
+     if explicit:
+         return {"where": "refuse", "why": verdict.why, "hub_admission": audit, "pin": "hub"}
+     pools = cfg.get("worker_pools") or {}
+-    if not pools.get(gateway):
++    if gateway not in pools:
+         return {"where": "refuse", "why": "hub admission denied; no worker pool configured",
+                 "hub_admission": audit}
+     requires = args.get("requires") or []
+@@ -65,7 +169,8 @@ def apply(args, decision, gateway, cfg):
+     # claim. runs_on stays owned by the worker-first reservation, so the label travels in requires,
+     # and only for cards whose text hit a hub-state marker (they may still need hub-admin).
+     from hermes_cli.kanban_placement import portable_reason
++    out = {"where": "local", "placement_policy": POLICY, "why": WAITING, "hub_admission": audit}
+     if portable_reason(args, cfg):
+-        requires = list(dict.fromkeys([*requires, "hub:write"]))
+-    return {"where": "local", "placement_policy": POLICY, "why": WAITING,
+-            "requires": requires, "hub_admission": audit}
++        # Only when hub:write is added: an omitted requires must stay omitted (declaration gate).
++        out["requires"] = list(dict.fromkeys([*requires, "hub:write"]))
++    return out
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index ec5500de4b..1019fdca59 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -186,6 +186,9 @@ def move_task(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason: s
+     reason = (reason or "").strip()
+     if not reason:
+         return {"ok": False, "reason_code": "reason_required", "error": "reason is required (why this card must move)"}
++    from hermes_cli.kanban_hub_admission_placement import gate_move
++    if (refused := gate_move(conn, task_id, runs_on)) is not None:
++        return refused  # a hub target must convince the admission judge first [daveey]
+     try:
+         plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg, host_reason=host_reason)
+     except MoveRefused as exc:
+@@ -232,6 +235,9 @@ def move_queued(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason:
+     reason = (reason or "").strip()
+     if not reason:
+         return {"ok": False, "reason_code": "reason_required", "error": "reason is required (why this card must move)"}
++    from hermes_cli.kanban_hub_admission_placement import gate_move
++    if (refused := gate_move(conn, task_id, runs_on)) is not None:
++        return refused  # a hub target must convince the admission judge first [daveey]
+     from hermes_cli import kanban_worker_repin as repin
+     if repin.applies(conn, task_id):
+         # A worker-first card's placement is Board-owned: a local relabel would be stripped, so only the Board's
+@@ -275,6 +281,9 @@ def move_reclaim(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason
+     reason = (reason or "").strip()
+     if not reason:
+         return {"ok": False, "reason_code": "reason_required", "error": "reason is required (why this card must move)"}
++    from hermes_cli.kanban_hub_admission_placement import gate_move
++    if (refused := gate_move(conn, task_id, runs_on)) is not None:
++        return refused  # a hub target must convince the admission judge first [daveey]
+     try:
+         plan = check(conn, task_id, runs_on, force=force, machines=machines, me=me, cfg=cfg, host_reason=host_reason)
+     except MoveRefused as exc:
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 47c40bf3b2..9ea0dd2fbb 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -239,6 +239,13 @@ _SPECS = [
+         _arg("--runs-on", dest="runs_on", default=None, metavar="LABELS",
+              help="Machine labels the card needs, comma-separated (synced boards only): linux, "
+                   "macos,xcode, machine:<name>; '' or '[]' = any machine; omit for the default placement"),
++        _arg("--hub-reason", dest="hub_reason", default=None, metavar="TEXT",
++             help="Why this card needs the hub itself (hub Chrome, Board admin key, ...). Fed to the "
++                  "hub-admission judge; its quote can be the evidence. Without admission a hub card "
++                  "goes to the worker pool (or an explicit hub pin is refused)."),
++        _arg("--force-hub", dest="force_hub", action="store_true",
++             help="Operator override: keep the card on the hub without the admission judge. Refused "
++                  "inside a dispatcher worker; recorded as a forced hub_admission event."),
+         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
+         _arg("--workspace",
+              help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 6e7b9e8aa7..a637bc22b4 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -754,8 +754,14 @@ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+         known = sg.strip().lower() if isinstance(sg, str) else ""
+         out = _decide(args, origin_intent=origin_intent, now=now, cfg=cfg, self_gw=sg, live=live,
+                       locate=locate, carries=carries, machine_ok=machine_ok, info=info)
+-        from hermes_cli.kanban_hub_admission_placement import apply
+-        out = apply(args, out, sg, config() if cfg is None else cfg)
++        from hermes_cli.kanban_hub_admission_placement import apply, is_hub
++        raw_cfg = config() if cfg is None else cfg
++        try:
++            out = apply(args, out, sg, raw_cfg, origin_intent=origin_intent)
++        except Exception as exc:  # health: allow BLE001 -- admission must fail closed on the hub
++            if is_hub(sg, raw_cfg) or is_hub(out.get("where"), raw_cfg):
++                return {"where": "refuse", "why": f"hub admission failed: {exc}", "pin": "hub"}
++            raise
+         pin = explicit_foreign_pin(args, sg, cfg)
+         if pin and origin_intent is None and out.get("where") == "local" and not out.get("defer"):
+             return {"where": "refuse", "why": out.get("why", ""), "pin": pin}
+diff --git a/tests/hermes_cli/conftest.py b/tests/hermes_cli/conftest.py
+index 8e1e0f7c95..bd09b76939 100644
+--- a/tests/hermes_cli/conftest.py
++++ b/tests/hermes_cli/conftest.py
+@@ -5,6 +5,19 @@ from __future__ import annotations
+ import pytest
+ 
+ 
++@pytest.fixture(autouse=True)
++def _admitting_hub_judge(monkeypatch):
++    """Hub admission never reaches a live model in tests. [daveey]
++
++    Legacy placement/move/routing suites pin the pre-admission logic, so the default fake
++    admits (the old "stays on the hub" outcome). Gate behaviour is tested with the explicit
++    ``hub_judge`` fixture (tests/hermes_cli/hub_judge_support.py) and tests/test_kanban_hub_admission*.
++    """
++    from hermes_cli import kanban_hub_admission as judge
++    from tests.hermes_cli.hub_judge_support import FakeJudge
++    monkeypatch.setattr(judge, "admit", FakeJudge())
++
++
+ @pytest.fixture(autouse=True)
+ def _isolate_kanban_worker_process_registries(monkeypatch):
+     """Spawn doubles and exit classifications belong to one test, not the next tick's test.
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 47410b437b..3f2df1805c 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -17,14 +17,8 @@ import pytest
+ 
+ from hermes_cli import kanban_capability_registry as reg
+ from hermes_cli import kanban_placement as kp
+-from tests.hermes_cli.hub_judge_support import hub_judge
+ 
+ 
+-@pytest.fixture(autouse=True)
+-def _admitting_judge(hub_judge):
+-    """Hub candidates are judged; legacy routing tests run under an admitting fake judge."""
+-    return hub_judge
+-
+ ROUTE = {"route": {"macbook": "hub"}, "creator_session": {"hub": "20261023_052109_5b3dee"}}
+ ALIVE = lambda target: None
+ NOWHERE = lambda need: {"need": need, "local": "absent", "holders": [], "stale": []}
+diff --git a/tests/hermes_cli/test_kanban_placement_runs_on.py b/tests/hermes_cli/test_kanban_placement_runs_on.py
+index 1c9b0c1f53..66c31cbb96 100644
+--- a/tests/hermes_cli/test_kanban_placement_runs_on.py
++++ b/tests/hermes_cli/test_kanban_placement_runs_on.py
+@@ -60,6 +60,7 @@ HANDLED_ELSEWHERE = {
+     "placement",                  # the routing input itself
+     "board", "parents", "workspace_kind",  # decide() keeps the card local on these
+     "human_action_now",           # only meaningful with initial_status, which is uncarried
++    "hub_reason", "force_hub",    # consumed by hub admission at the origin, before routing [daveey]
+ }
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_worker_placement.py b/tests/hermes_cli/test_kanban_worker_placement.py
+index aee21a34aa..1a612d8509 100644
+--- a/tests/hermes_cli/test_kanban_worker_placement.py
++++ b/tests/hermes_cli/test_kanban_worker_placement.py
+@@ -5,12 +5,6 @@ from hermes_cli import kanban_placement as placement
+ from tests.hermes_cli.hub_judge_support import hub_judge
+ 
+ 
+-@pytest.fixture(autouse=True)
+-def _admitting_judge(hub_judge):
+-    """Hub candidates are judged; these suites pin the pre-admission logic under an admitting judge."""
+-    return hub_judge
+-
+-
+ @pytest.mark.parametrize("title", ["Summarize a public paper", "Run the full test suite"])
+ def test_portable_reason_accepts_light_and_heavy_scratch_work(title):
+     assert placement.portable_reason({"title": title, "requires": ["terminal", "file"]}, {}) is None
+@@ -101,9 +95,9 @@ def test_hub_bound_work_keeps_legacy_route(fields):
+ def test_courier_and_host_work_bypass_worker_policy(hub_judge):
+     cfg = {"worker_pools": {"hub": ["worker-1"]}}
+     assert "placement_policy" not in placement.decide({"title": "Analyze data"}, origin_intent=object(), cfg=cfg, self_gw="hub")
+-    hub_judge.admit_next = False  # a denied courier card is still a hub candidate: it enrolls, no hub:write
+-    denied = placement.decide({"title": "Analyze data"}, origin_intent=object(), cfg=cfg, self_gw="hub")
+-    assert denied["placement_policy"] == "worker-first-v1" and "hub:write" not in denied["requires"]
++    hub_judge.admit_next = False  # a courier apply keeps the origin's route: no judge, no enrollment
++    assert "placement_policy" not in placement.decide({"title": "Analyze data"}, origin_intent=object(), cfg=cfg, self_gw="hub")
++    assert hub_judge.calls == []
+     assert "placement_policy" not in placement.decide({"title": "Inspect ~/code/repo", "requires": ["host_repo"]},
+                                                       cfg=cfg, self_gw="hub")
+ 
+diff --git a/tests/hermes_cli/test_kanban_worker_repin.py b/tests/hermes_cli/test_kanban_worker_repin.py
+index 0f9af3499e..df6f94e0b6 100644
+--- a/tests/hermes_cli/test_kanban_worker_repin.py
++++ b/tests/hermes_cli/test_kanban_worker_repin.py
+@@ -286,7 +286,10 @@ def test_http_refusal_leaves_policy_and_outbox_unchanged(conn, board_stub, statu
+                                        {"task_id": tid, "expected_revision": 4, "runs_on": ["machine:hub"]})]
+     assert board_stub["lock_free"] == [True]  # no write transaction held across the network call
+     assert _local(conn, tid) == (wp.POLICY, None, "ready")
+-    assert conn.execute("SELECT count(*) FROM kanban_sync_outbox").fetchone()[0] == 0 and not _moved(conn, tid)
++    # The admitted hub_admission audit event is the only write (the judge runs before the Board call).
++    assert conn.execute("SELECT count(*) FROM kanban_sync_outbox WHERE table_name != 'task_events'"
++                        ).fetchone()[0] == 0 and not _moved(conn, tid)
++    assert [e.kind for e in kb.list_events(conn, tid) if e.kind == "hub_admission"] == ["hub_admission"]
+ 
+ 
+ def test_http_success_with_failed_readback_keeps_local_policy(conn, board_stub, monkeypatch):
+diff --git a/tests/test_kanban_hub_admission_entry.py b/tests/test_kanban_hub_admission_entry.py
+new file mode 100644
+index 0000000000..12eed1ef5d
+--- /dev/null
++++ b/tests/test_kanban_hub_admission_entry.py
+@@ -0,0 +1,165 @@
++"""Every entry path that can put a card on the hub consults the admission judge. [daveey]
++
++One test per path (CLI auto create, CLI runs_on machine:hub, CLI force, move to machine:hub,
++capability owner routed to the hub, capability owner held locally by the hub); each checks the
++deny and the admit outcome with a fake judge (never a live model).
++"""
++import argparse
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban as cli
++from hermes_cli import kanban_capability_routing as kcr
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_placement as placement
++from tests.hermes_cli import test_kanban_capability_routing as routing_support
++from tests.hermes_cli import test_kanban_worker_policy_db as fixtures
++from tests.hermes_cli.hub_judge_support import hub_judge
++
++conn = fixtures.conn
++env = routing_support.env
++MARKED = "Read ~/.hermes/logs/agent.log on the hub"
++
++
++def _events(db, tid, kind="hub_admission"):
++    return [e.payload for e in kb.list_events(db, tid) if e.kind == kind]
++
++
++def _cli_create(*argv):
++    parser = argparse.ArgumentParser()
++    cli.build_parser(parser.add_subparsers())
++    return cli._cmd_create(parser.parse_args(["kanban", "create", *argv]))
++
++
++@pytest.fixture
++def hub_cli(conn, monkeypatch, hub_judge):
++    monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": []}})
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
++    return hub_judge
++
++
++@pytest.mark.parametrize("admit", [True, False])
++def test_cli_hub_auto_create(hub_cli, admit):
++    hub_cli.admit_next = admit
++    assert _cli_create(MARKED, "--hub-reason", "only the hub has it") == 0
++    assert hub_cli.calls[0]["hub_reason"] == "only the hub has it"
++    with kbc.connect_closing() as db:
++        (task,) = kb.list_tasks(db)
++        (event,) = _events(db, task.id)
++    assert event["admit"] is admit
++    if admit:
++        assert task.placement_policy is None  # stays on the hub
++    else:
++        assert task.placement_policy == "worker-first-v1"
++        assert "hub:write" in task.requires
++
++
++@pytest.mark.parametrize("admit", [True, False])
++def test_cli_runs_on_machine_hub(hub_cli, monkeypatch, admit):
++    from hermes_cli import kanban_worker_node as wn
++    monkeypatch.setattr(wn, "check_machine_pins", lambda *a, **kw: None)
++    hub_cli.admit_next = admit
++    rc = _cli_create("Rotate the Board admin key", "--runs-on", "machine:hub")
++    assert len(hub_cli.calls) == 1
++    with kbc.connect_closing() as db:
++        tasks = kb.list_tasks(db)
++        if admit:
++            assert rc == 0 and len(tasks) == 1
++            row = db.execute("SELECT runs_on FROM tasks WHERE id=?", (tasks[0].id,)).fetchone()
++            assert json.loads(row[0]) == ["machine:hub"]
++            assert _events(db, tasks[0].id)[0]["admit"] is True
++        else:
++            assert rc == 2 and tasks == []  # refused: the creator re-places it
++
++
++def test_cli_force_hub_outside_worker_is_recorded(hub_cli):
++    assert _cli_create(MARKED, "--force-hub") == 0
++    assert hub_cli.calls == []
++    with kbc.connect_closing() as db:
++        (task,) = kb.list_tasks(db)
++        (event,) = _events(db, task.id)
++    assert event["forced"] is True and event["admit"] is True
++    assert "session" in event
++    assert task.placement_policy is None
++
++
++def test_cli_force_hub_inside_worker_is_refused(hub_cli, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
++    assert _cli_create(MARKED, "--force-hub") == 2
++    with kbc.connect_closing() as db:
++        assert kb.list_tasks(db) == []
++
++
++@pytest.mark.parametrize("admit", [True, False])
++def test_move_to_machine_hub(conn, monkeypatch, hub_judge, admit):
++    from hermes_cli import kanban_move as km
++    monkeypatch.setattr(placement, "config", dict)
++    hub_judge.admit_next = admit
++    tid = kb.create_task(conn, title="Analyze data", assignee="default")
++    res = km.move_queued(conn, tid, runs_on=["machine:hub"], reason="needs the hub",
++                         machines={"hub": {"state": "active", "pickup": False}}, me="hub")
++    assert len(hub_judge.calls) == 1
++    (event,) = _events(conn, tid)
++    assert event["admit"] is admit and event["entry"] == "move"
++    if admit:
++        assert res.get("reason_code") != "hub_admission_denied"
++    else:
++        assert res["ok"] is False and res["reason_code"] == "hub_admission_denied"
++        assert _events(conn, tid, "moved") == []
++
++
++def test_move_to_a_worker_makes_no_judge_call(conn, hub_judge):
++    from hermes_cli import kanban_move as km
++    tid = kb.create_task(conn, title="Read logs on the hub", assignee="default")
++    km.move_queued(conn, tid, runs_on=["machine:worker-1"], reason="portable",
++                   machines={"worker-1": {"state": "active", "pickup": "all", "labels": []}}, me="hub")
++    assert hub_judge.calls == []
++
++
++def _route_to_hub(env, monkeypatch):
++    mail = env["home"].parent / "mail.json"
++    mail.write_text(json.dumps({"gateway": "macbook"}))
++    routing_support.publish(env["hub"], "hub", {routing_support.NEED: time.time() - 60})
++
++
++@pytest.mark.parametrize("admit", [True, False])
++def test_capability_owner_routed_to_the_hub(env, monkeypatch, hub_judge, admit):
++    _route_to_hub(env, monkeypatch)
++    hub_judge.admit_next = admit
++    with kbc.connect_closing() as db:
++        tid = routing_support.running(db)
++        if admit:
++            out = kcr.route(db, tid, [routing_support.NEED], reason="Rotate the Board admin key")
++            assert [r["gateway"] for r in out["routes"]] == ["hub"]
++            assert env["calls"][0][2] == "hub"
++        else:
++            with pytest.raises(kcr.CapabilityRouteError) as exc:
++                kcr.route(db, tid, [routing_support.NEED], reason="tail the hub logs")
++            assert exc.value.code == "hub_admission_denied"
++            assert env["calls"] == []  # nothing was sent to the hub
++        (event,) = _events(db, tid)
++    assert event["admit"] is admit and event["entry"] == "capability_owner"
++    assert len(hub_judge.calls) == 1
++
++
++@pytest.mark.parametrize("admit", [True, False])
++def test_capability_owner_held_by_the_hub_itself(env, hub_judge, admit):
++    hub_judge.admit_next = admit
++    need = routing_support.NEED
++    with kbc.connect_closing() as db:
++        tid = routing_support.running(db)
++        task = kb.get_task(db, tid)
++        rid = kcr.request_id(tid, need)
++        kcr._local_owner(db, task, {"request_id": rid, "generation": 1}, need=need, rid=rid,
++                         self_gw="hub", from_gw="worker-1", reason="do the scoped action")
++        owner = next(t for t in kb.list_tasks(db) if t.id != tid)
++    if admit:
++        assert owner.placement_policy is None
++    else:
++        assert owner.placement_policy == "worker-first-v1"
++        assert owner.requires == ["hub:write"]
+diff --git a/tests/tools/conftest.py b/tests/tools/conftest.py
+index 175536b2d4..312a70eedc 100644
+--- a/tests/tools/conftest.py
++++ b/tests/tools/conftest.py
+@@ -19,6 +19,14 @@ capsule = _capsule_fixtures.capsule
+ fake_docker = _capsule_fixtures.fake_docker
+ 
+ 
++@pytest.fixture(autouse=True)
++def _admitting_hub_judge(monkeypatch):
++    """Hub admission never reaches a live model in tool tests; the default fake admits. [daveey]"""
++    from hermes_cli import kanban_hub_admission as judge
++    from tests.hermes_cli.hub_judge_support import FakeJudge
++    monkeypatch.setattr(judge, "admit", FakeJudge())
++
++
+ @pytest.fixture(autouse=True)
+ def _no_host_browser_use_cli():
+     """Keep the host's browser-harness install out of tests.
+diff --git a/tools/kanban_show.py b/tools/kanban_show.py
+index 5f1e438a0e..0a616f9b02 100644
+--- a/tools/kanban_show.py
++++ b/tools/kanban_show.py
+@@ -56,12 +56,17 @@ def _detail(kb, conn, task, args, *, replica: bool) -> dict:
+         except Exception:  # health: allow BLE001 -- an advisory hint must never fail the read
+             queue_hint = None
+         details = kqp.detail_fields(conn, task, args.get("board"))
++    from hermes_cli.kanban_hub_admission_placement import describe, latest_verdict
++    verdict = latest_verdict(conn, tid)
++    if verdict and details.get("queue_note"):
++        details["queue_note"] = f"{details['queue_note']} ({describe(verdict)})"
+     return {
+         "task": kt._fields(task, kt._TASK_FIELDS),
+         "source": "replica" if replica else "live",
+         **capsule,
+         "queue_reason": kqr.latest(conn, tid),
+         **details,
++        **({"hub_admission": verdict} if verdict else {}),
+         **({"queue_hint": queue_hint} if queue_hint else {}),
+         "parents": kb.parent_ids(conn, tid),
+         "unsatisfied_parents": [
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index e3d5f8680b..e8a0bfe27c 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -792,6 +792,16 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "Ids of open cards a create_overlap refusal named that this card is NOT a duplicate of. "
+                 "Needs distinct_reason; recorded as a create_overlap event on the new card.")},
+         "distinct_reason": _prop("string", "Why this card is separate work from the distinct_from cards."),
++        "hub_reason": _prop("string", (
++                "Only for a card that needs the hub itself: what only the hub has (its signed-in "
++                "Chrome, the Board admin key, instance-role SSM, a Desktop-session interaction, an "
++                "existing hub worktree with unpushed commits, a hermes-hub command acting with the "
++                "hub's key, or live gateway state hub-admin cannot reach). A Sonnet admission judge "
++                "reads it with the card; without admission a hub card goes to the worker pool (pool "
++                "workers have hub ssh + hub-admin) and an explicit hub pin is refused.")),
++        "force_hub": _prop("boolean", (
++                "Operator override: keep the card on the hub without the admission judge. Refused "
++                "inside dispatcher workers; recorded as a forced hub_admission event.")),
+         "idempotency_key": _prop("string", (
+                 "If a non-archived task with this key already "
+                 "exists, return that task's id instead of creating "
+-- 
+2.43.0
+

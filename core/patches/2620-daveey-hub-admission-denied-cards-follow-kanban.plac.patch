@@ -1,0 +1,279 @@
+From abec81ec81c3248333bab167a78748ccce45deb8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:10:36 +0000
+Subject: [PATCH] [daveey] hub admission: denied cards follow
+ kanban.placement.worker_queue (pool:worker + capability:hub-write) when set,
+ never machine:worker-N; courier/origin-bound denies stay worker-first
+
+---
+ hermes_cli/kanban.py                         | 15 ++---
+ hermes_cli/kanban_hub_admission_placement.py | 66 ++++++++++++++++----
+ hermes_cli/kanban_placement.py               |  2 +-
+ tests/test_kanban_hub_admission_entry.py     | 24 +++++++
+ tests/test_kanban_hub_admission_placement.py | 42 +++++++++++++
+ tools/kanban_tools_placement.py              |  2 +-
+ 6 files changed, 128 insertions(+), 23 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 3442c6a445..0ad7f44d6f 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -459,7 +459,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         return _err(f"kanban: {exc.code}: {exc}", 2)
+     origin_binding = None
+     # [daveey] Hub admission (a model call) runs before any connection/write lock.
+-    from hermes_cli.kanban_hub_admission_placement import cli_preflight, with_admission as _with_admission
++    from hermes_cli.kanban_hub_admission_placement import cli_create_fields, cli_preflight
+     assignee = (args.assignee or (_profile_author() if in_worker or _agent_invoked() else None)
+                 or _cli_default_assignee(args))
+     plan, refused_rc = cli_preflight(args, body, ws_kind, ws_path, getattr(args, "board", None)
+@@ -493,7 +493,6 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         from hermes_cli.kanban_capabilities import RequiresDeclarationMissing, declaration_required
+         from hermes_cli.kanban_worker_node import MachinePinRefused, check_machine_pins
+         from hermes_cli.kanban_ask_resolved import AskFilingRefused, check_create_filing, create_context
+-        from hermes_cli.kanban_worker_placement import cli_audit, cli_runs_on
+         try:
+             # [daveey] A blocked ask's resolved_check runs once first, as the sweep will run it for this assignee
+             # and workspace: already met or broken refuses the create. A key hit returns the card: no probe.
+@@ -504,7 +503,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             task_id = kb.create_task(
+                 conn, title=args.title, body=body,
+                 assignee=assignee,
+-                session_id=session_id, requires=plan.get("requires", getattr(args, "requires", None)),
++                session_id=session_id,
+                 chat_origin=origin.ref if origin else getattr(args, "origin_session", None),
+                 # [daveey] Same declaration gate as the kanban_create tool, for agent/worker shells only.
+                 require_declaration=(in_worker or _agent_invoked()) and declaration_required(),
+@@ -524,13 +523,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
+                 human_request=getattr(args, "human_request", None),
+                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                  if in_worker else None),
+-                validate_workspace=True, validate_skills=True,  # [daveey] no --runs-on: queue for the worker pool
+-                runs_on=(None if plan.get("placement_policy") else
+-                         cli_runs_on(conn, args, body, ws_kind, ws_path, board, assignee=assignee)),
+-                placement_policy=plan.get("placement_policy"),
+-                placement_checked=True, board=board,
+-                placement_audit=_with_admission(cli_audit(args, body, ws_kind, ws_path, board, assignee=assignee),
+-                                                plan),
++                validate_workspace=True, validate_skills=True, placement_checked=True, board=board,
++                # [daveey] no --runs-on: queue for the worker pool; hub admission's placement and receipt
++                **cli_create_fields(conn, plan, args, body, ws_kind, ws_path, board, assignee=assignee),
+                 insert_guard=after_create.guard,  # re-checks overlap under the write lock [daveey]
+             )
+         except kanban_overlap.OverlapRefused as exc:  # landed under the write lock after the first check
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index e2937ebb48..2afacb5d7c 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -102,8 +102,8 @@ def courier_plan(conn, args, runs_on, *, cfg=None, gateway=None, request_id=None
+         return {"where": "refuse", "why": verdict.why, "hub_admission": audit, "pin": "hub"}
+     requires = args.get("requires") or []
+     requires = [requires] if isinstance(requires, str) else list(requires)
+-    return {"where": "local", "placement_policy": POLICY, "why": WAITING, "hub_admission": audit,
+-            "requires": list(dict.fromkeys([*requires, "hub:write"]))}
++    # Courier creation never takes the worker queue (queue_decision's own rule): worker-first.
++    return pool_route(args, cfg, gateway, audit, list(dict.fromkeys([*requires, "hub:write"])), queue=False)
+ 
+ 
+ def gate_move(conn, task_id, runs_on, *, cfg=None):
+@@ -274,6 +274,26 @@ def with_admission(audit, plan):
+     return audit
+ 
+ 
++def cli_create_fields(conn, plan, args, body, workspace_kind, workspace_path, board, *, assignee):
++    """``create_task`` placement kwargs for ``hermes kanban create`` from the preflight ``plan``.
++
++    A denied card the plan queued (``runs_on: [<pool label>, ...]``) keeps that queue only on a Board
++    primary (``runs_on`` is a Board placement field); elsewhere it is enrolled worker-first instead.
++    """
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_worker_placement import POLICY, cli_audit, cli_runs_on
++
++    policy, runs_on = plan.get("placement_policy"), plan.get("runs_on")
++    if runs_on is not None and sync.board_mode(conn) != "primary":
++        policy, runs_on = (POLICY if plan.get("hub_admission") else policy), None
++    if policy is None and runs_on is None:
++        runs_on = cli_runs_on(conn, args, body, workspace_kind, workspace_path, board, assignee=assignee)
++    return {"requires": plan.get("requires", getattr(args, "requires", None)), "runs_on": runs_on,
++            "placement_policy": policy,
++            "placement_audit": with_admission(cli_audit(args, body, workspace_kind, workspace_path, board,
++                                                        assignee=assignee), plan)}
++
++
+ def cli_plan(args, body, workspace_kind, workspace_path, board, *, assignee=None):
+     """``hermes kanban create``: the worker-first decision plus admission, computed before any write."""
+     from hermes_cli import kanban_placement as kp
+@@ -291,7 +311,7 @@ def cli_plan(args, body, workspace_kind, workspace_path, board, *, assignee=None
+     return apply(fields, decision or {"where": "local", "why": "cli create"}, gateway, cfg)
+ 
+ 
+-def apply(args, decision, gateway, cfg, *, origin_intent=None):
++def apply(args, decision, gateway, cfg, *, origin_intent=None, queue=True, machine_ok=None):
+     """Keep structural/non-hub outcomes unchanged; denied explicit hub pins refuse.
+ 
+     Returned requires are effective persistence inputs, not just creation-time checks.
+@@ -349,18 +369,42 @@ def apply(args, decision, gateway, cfg, *, origin_intent=None):
+         return {**decision, "hub_admission": audit}
+     if explicit:
+         return {"where": "refuse", "why": verdict.why, "hub_admission": audit, "pin": "hub"}
+-    pools = cfg.get("worker_pools") or {}
+-    if gateway not in pools:
+-        return {"where": "refuse", "why": "hub admission denied; no worker pool configured",
+-                "hub_admission": audit}
+     requires = args.get("requires") or []
+     requires = [requires] if isinstance(requires, str) else list(requires)
+     # Board contract (hermes-hub #90): requires hub:write -> capability:hub-write at reservation and
+-    # claim. runs_on stays owned by the worker-first reservation, so the label travels in requires,
+-    # and only for cards whose text hit a hub-state marker (they may still need hub-admin).
++    # claim, and the worker queue's coordination labels; only for cards whose text hit a hub-state
++    # marker (they may still need hub-admin).
+     from hermes_cli.kanban_placement import portable_reason
+-    out = {"where": "local", "placement_policy": POLICY, "why": WAITING, "hub_admission": audit}
+     if portable_reason(args, cfg):
+         # Only when hub:write is added: an omitted requires must stay omitted (declaration gate).
+-        out["requires"] = list(dict.fromkeys([*requires, "hub:write"]))
++        requires = list(dict.fromkeys([*requires, "hub:write"]))
++    elif not args.get("requires"):
++        requires = None
++    out = pool_route(args, cfg, gateway, audit, requires, queue=queue, machine_ok=machine_ok)
++    if out.get("runs_on") is None and gateway not in (cfg.get("worker_pools") or {}):
++        return {"where": "refuse", "why": "hub admission denied; no worker pool configured",
++                "hub_admission": audit}
++    return out
++
++
++def pool_route(args, cfg, gateway, audit, requires, *, queue=True, machine_ok=None):
++    """Where a denied card goes: the worker queue (``runs_on: [<pool label>, ...]``) when ``queue``
++    and ``kanban.placement.worker_queue`` names a live label for this gateway, else worker-first.
++
++    Never a ``machine:worker-N`` pin. The queue's coordination labels include ``requires``'
++    (``hub:write`` -> ``capability:hub-write``), so only a hub-write worker claims it.
++    """
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli import kanban_placement_coordination as coordination
++    from hermes_cli.kanban_worker_placement import POLICY, QUEUED_WHY, WAITING
++
++    label = kp._Cfg(cfg).queue_label(gateway) if queue else None
++    extra = coordination.required_labels({**args, "requires": requires}) if label else None
++    if label and extra is not None and (machine_ok or kp._machine_picks_up)(label):
++        out = {"where": "local", "runs_on": [label, *sorted(extra - {label})],
++               "why": QUEUED_WHY.format(label=label), "hub_admission": audit}
++    else:
++        out = {"where": "local", "placement_policy": POLICY, "why": WAITING, "hub_admission": audit}
++    if requires is not None:
++        out["requires"] = requires
+     return out
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index dc6ac36770..390bb703ec 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -769,7 +769,7 @@ def decide(args: dict, *, origin_intent=None, now: Optional[float] = None, cfg:
+         from hermes_cli.kanban_hub_admission_placement import apply, is_hub
+         raw_cfg = config() if cfg is None else cfg
+         try:
+-            out = apply(args, out, sg, raw_cfg, origin_intent=origin_intent)
++            out = apply(args, out, sg, raw_cfg, origin_intent=origin_intent, machine_ok=machine_ok)
+         except Exception as exc:  # health: allow BLE001 -- admission must fail closed on the hub
+             if is_hub(sg, raw_cfg) or is_hub(out.get("where"), raw_cfg):
+                 return {"where": "refuse", "why": f"hub admission failed: {exc}", "pin": "hub"}
+diff --git a/tests/test_kanban_hub_admission_entry.py b/tests/test_kanban_hub_admission_entry.py
+index a880a6042a..8c47b8d1b6 100644
+--- a/tests/test_kanban_hub_admission_entry.py
++++ b/tests/test_kanban_hub_admission_entry.py
+@@ -61,6 +61,30 @@ def test_cli_hub_auto_create(hub_cli, admit):
+         assert "hub:write" in task.requires
+ 
+ 
++@pytest.mark.parametrize("mode,queued", [("primary", True), ("off", False)])
++def test_cli_denied_follows_worker_queue(hub_cli, monkeypatch, mode, queued):
++    """Operator 11-12 (PR #1247): with kanban.placement.worker_queue set, a denied CLI card joins
++    the pool queue (Board primary only, runs_on being a Board field), never machine:worker-N."""
++    from hermes_cli import kanban_db_sync as sync
++    monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": []},
++                                                      "worker_queue": {"hub": "pool:worker"}})
++    monkeypatch.setattr(placement, "_machine_picks_up", lambda label: label == "pool:worker")
++    monkeypatch.setattr(sync, "board_mode", lambda _conn: mode)
++    hub_cli.admit_next = False
++    assert _cli_create(MARKED) == 0
++    with kbc.connect_closing() as db:
++        (task,) = kb.list_tasks(db)
++        raw = db.execute("SELECT runs_on FROM tasks WHERE id = ?", (task.id,)).fetchone()[0]
++    runs_on = json.loads(raw) if raw else None
++    assert "hub:write" in (task.requires or [])
++    if queued:
++        assert {"pool:worker", "capability:hub-write"} <= set(runs_on or [])
++        assert task.placement_policy is None
++    else:
++        assert not runs_on and task.placement_policy == "worker-first-v1"
++    assert not any(v.startswith("machine:") for v in runs_on or [])
++
++
+ def test_cli_receive_judges_without_the_origin_placement_note(hub_cli):
+     """Review t_01a1ced25af29218: only courier_plan stripped the origin's note (its Chrome and
+     Keychain), so a plain create-task receive on the hub judged the origin's host needs."""
+diff --git a/tests/test_kanban_hub_admission_placement.py b/tests/test_kanban_hub_admission_placement.py
+index c2fc7d66c7..5794b596e1 100644
+--- a/tests/test_kanban_hub_admission_placement.py
++++ b/tests/test_kanban_hub_admission_placement.py
+@@ -160,3 +160,45 @@ def test_tool_keeps_verdict_and_effective_contract(gate):
+     result = _local_placement(placement, fields, decision, machine_ok=None, note_local_pin=True)
+     assert result == decision
+     assert len(gate) == 1
++
++
++QUEUE_CFG = {"worker_queue": {"hub": "pool:worker"}}
++
++
++@pytest.mark.parametrize("cfg", [QUEUE_CFG, {**QUEUE_CFG, "worker_pools": {"hub": ["worker-1"]}}])
++def test_denied_follows_worker_queue(gate, cfg):
++    """Operator 11-12 (PR #1247): a denied card joins the one worker queue, never machine:worker-N;
++    hub:write rides along as capability:hub-write so only a hub-write worker claims it."""
++    result = placement.decide({"title": "Read ~/.hermes/logs on the hub"}, self_gw="hub", cfg=cfg,
++                              live=lambda _: None, carries=True, machine_ok=lambda label: label == "pool:worker")
++    assert result["where"] == "local"
++    assert result["runs_on"][0] == "pool:worker"
++    assert "capability:hub-write" in result["runs_on"]
++    assert not any(v.startswith("machine:") for v in result["runs_on"])
++    assert "placement_policy" not in result
++    assert "hub:write" in result["requires"]
++    assert result["hub_admission"]["admit"] is False
++    assert len(gate) == 1
++
++
++def test_denied_without_live_queue_label_is_worker_first(gate):
++    cfg = {**QUEUE_CFG, "worker_pools": {"hub": ["worker-1"]}}
++    result = placement.decide({"title": "Read ~/.hermes/logs on the hub"}, self_gw="hub", cfg=cfg,
++                              live=lambda _: None, carries=True, machine_ok=lambda _label: False)
++    assert result.get("placement_policy") == "worker-first-v1"
++    assert "runs_on" not in result
++
++
++def test_admitted_ignores_worker_queue(gate):
++    result = placement.decide({"title": "Chrome"}, self_gw="hub", cfg=QUEUE_CFG, live=lambda _: None,
++                              carries=True, machine_ok=lambda _label: True)
++    assert result["hub_admission"]["admit"] is True
++    assert not result.get("runs_on")
++
++
++def test_origin_and_courier_denies_never_queue(gate, monkeypatch):
++    from hermes_cli import kanban_hub_admission_placement as hap
++    monkeypatch.setattr(placement, "_machine_picks_up", lambda _label: True)
++    audit = {"admit": False}
++    assert "runs_on" not in hap.pool_route({"title": "x"}, QUEUE_CFG, "hub", audit, ["hub:write"], queue=False)
++    assert hap.pool_route({"title": "x"}, QUEUE_CFG, "hub", audit, ["hub:write"])["runs_on"][0] == "pool:worker"
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index f89453592b..d2e7fe3fef 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -34,7 +34,7 @@ def _origin_enrollment(args, origin, marker, **effective):
+     decision = creation_decision(view, cfg, gateway,
+                                  kp.canonical_pin(args.get("placement") or "auto", gateway, cfg), None,
+                                  queue=False)  # [daveey] origin-bound: the worker queue is not applied here
+-    return apply(view, decision or {"where": "local", "why": "origin-bound storage"}, gateway, cfg)
++    return apply(view, decision or {"where": "local", "why": "origin-bound storage"}, gateway, cfg, queue=False)
+ 
+ 
+ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
+-- 
+2.43.0
+

@@ -1,0 +1,434 @@
+From 2db650ce1e51fbd378f29406ffb80eb7de63134a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 09:16:37 +0000
+Subject: [PATCH] [daveey] perf(desktop): one batched primary read for a
+ concrete local profile's sidebar
+
+With registry gateways or remote profiles configured, the Electron intercept
+of GET /api/profiles/sessions/sidebar always fanned out to three
+/api/profiles/sessions reads. For a concrete profile with no remote override
+each of those is a plain primary read, so every sidebar refresh cost three
+list requests on the primary gateway (measured 0.75/s, the largest share of
+its request time) where its batched /sidebar route answers all three slices
+in one read (~5 ms vs ~9.5 ms handler CPU unchanged, 81 vs 112 ms after a
+state.db change, 2.2 ms inside its response cache).
+
+After the existing remote/registry and pinned-source guards, such a profile
+now reads the primary's /api/profiles/sessions/sidebar once with the original
+query, stamps the primary owner tag on unowned rows of all three slices (copy,
+no mutation) and returns the batched response unchanged otherwise. Any failure
+of that read (older primary 404, timeout, transport) runs today's three-slice
+path for that request; nothing is remembered. 'all' and remote-override
+profiles keep the three-slice path.
+
+The decision, the stamping and the slice fan-out move to
+profile-session-routing.ts (main.ts is at its line cap and shrinks by 3).
+---
+ apps/desktop/electron/main.ts                 |  23 +-
+ .../electron/profile-session-routing.ts       |  83 ++++++
+ .../profile-session-sidebar-batch.test.ts     | 243 ++++++++++++++++++
+ 3 files changed, 336 insertions(+), 13 deletions(-)
+ create mode 100644 apps/desktop/electron/profile-session-sidebar-batch.test.ts
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 3db83329a5..1fc31dd5e2 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -475,13 +475,13 @@ import { migrateActiveProfileIfMissing as migrateActiveProfileIfMissingPure } fr
+ import { prepareProfileRenameLifecycle, profileRenameFromRequest } from './profile-rename-routing'
+ import {
+   applyRemoteProfileSessionOutcomes,
+-  assembleSidebarSessionSlices,
+-  buildSidebarSessionSliceParams,
+   composeUnifiedSessionResponse,
++  fanOutSidebarSessionSlices,
+   fetchAllProfilesAggregatePerProfile,
+   fetchAllProfilesSessionsPerProfile,
+   fetchPrimaryProfileSessions,
+   fetchRemoteProfileSessions,
++  fetchSidebarSessionsBatchedOrSliced,
+   findRemoteOwnerProfileForSession,
+   hasPinnedRegistrySessionSource,
+   isAllProfilesAggregateRequest,
+@@ -15566,10 +15566,8 @@ async function interceptSessionRequestForRemote(request, registryConnectionId =
+ 
+   // Batched sidebar slices. With no remote profiles the local batched endpoint
+   // (one DB open per profile) serves it directly — take the fast path. When
+-  // remotes exist, fan the three slices back out to the per-slice
+-  // /api/profiles/sessions path (which already merges remote rows correctly) and
+-  // reassemble; local profiles fall back to three primary reads there, but
+-  // remote correctness is preserved.
++  // remotes exist, a concrete local profile still reads the primary's batched
++  // route once; otherwise fan the slices out to /api/profiles/sessions.
+   if (method === 'GET' && pathname === '/api/profiles/sessions/sidebar') {
+     const remoteProfiles = configuredRemoteProfileNames()
+ 
+@@ -15587,16 +15585,15 @@ async function interceptSessionRequestForRemote(request, registryConnectionId =
+       return undefined
+     }
+ 
+-    const { recents: recentsSp, cron: cronSp, messaging: messagingSp } = buildSidebarSessionSliceParams(searchParams)
+     const ownerTag = primaryRowsOwnerTag(registryConnectionId, readDesktopConnectionsRegistry().primary)
+ 
+-    const [recents, cron, messaging] = await Promise.all([
+-      fetchProfilesSessionSlice(recentsSp, remoteProfiles, registrySources, ownerTag, registryConnectionId),
+-      fetchProfilesSessionSlice(cronSp, remoteProfiles, registrySources, ownerTag, registryConnectionId),
+-      fetchProfilesSessionSlice(messagingSp, remoteProfiles, registrySources, ownerTag, registryConnectionId)
+-    ])
++    const readSlice = sp => fetchProfilesSessionSlice(sp, remoteProfiles, registrySources, ownerTag, registryConnectionId)
++    const fanOut = () => fanOutSidebarSessionSlices(searchParams, readSlice)
+ 
+-    return assembleSidebarSessionSlices(recents, cron, messaging)
++    // [daveey] A concrete local profile: one batched primary read, the slices only on its failure.
++    return fetchSidebarSessionsBatchedOrSliced(searchParams, {
++      fanOut, fetchJsonForProfile, hasRemoteOverride: profileHasRemoteOverride, ownerTag
++    })
+   }
+ 
+   // Per-session read/mutation. Owner is in ?profile= (reads) or request.profile
+diff --git a/apps/desktop/electron/profile-session-routing.ts b/apps/desktop/electron/profile-session-routing.ts
+index 31aafb0845..ca4c2359c6 100644
+--- a/apps/desktop/electron/profile-session-routing.ts
++++ b/apps/desktop/electron/profile-session-routing.ts
+@@ -326,6 +326,89 @@ export async function fetchPrimaryProfileSessions(
+   }
+ }
+ 
++/** The concrete profile whose whole sidebar the primary's batched route can
++ *  serve in one read [daveey], or null when the sidebar must fan out per
++ *  slice: `all` merges remote/registry rows, an override reads its remote.
++ *  Same scope read as buildSidebarSessionSliceParams. */
++export function batchedPrimarySidebarProfile(
++  searchParams: URLSearchParams,
++  hasRemoteOverride: (profile: string) => unknown
++): string | null {
++  const profile = (searchParams.get('recents_profile') || 'all').trim() || 'all'
++
++  return profile !== 'all' && !hasRemoteOverride(profile) ? profile : null
++}
++
++/** Stamp `ownerTag` on every unowned row of a batched sidebar response (the
++ *  three slices), as fetchPrimaryProfileSessions does for one slice. Copy,
++ *  never mutate; a null tag returns the response as is. */
++export function tagSidebarSlicesOwner(data: unknown, ownerTag: string | null | undefined): unknown {
++  if (!ownerTag || !data || typeof data !== 'object') {
++    return data
++  }
++
++  const response = data as Record<string, unknown>
++  const tagged: Record<string, unknown> = { ...response }
++
++  for (const key of ['recents', 'cron', 'messaging']) {
++    const slice = response[key]
++
++    if (slice && typeof slice === 'object' && Array.isArray((slice as { sessions?: unknown }).sessions)) {
++      tagged[key] = {
++        ...slice,
++        sessions: rowsOf(slice).map(row =>
++          row && typeof row === 'object' && !String((row as Record<string, unknown>).connection_id ?? '').trim()
++            ? { ...row, connection_id: ownerTag }
++            : row
++        )
++      }
++    }
++  }
++
++  return tagged
++}
++
++/** The per-slice sidebar path: the three slice reads from one workspace
++ *  scope, reassembled into the batched response shape. */
++export async function fanOutSidebarSessionSlices(
++  searchParams: URLSearchParams,
++  readSlice: (sliceParams: URLSearchParams) => Promise<unknown>
++) {
++  const { recents, cron, messaging } = buildSidebarSessionSliceParams(searchParams)
++  const [recentsData, cronData, messagingData] = await Promise.all([recents, cron, messaging].map(readSlice))
++
++  return assembleSidebarSessionSlices(recentsData, cronData, messagingData)
++}
++
++/** Serve the sidebar while remotes or registry gateways exist [daveey]. A
++ *  concrete profile with no remote override lives wholly on the primary, so
++ *  one batched `/sidebar` read replaces the three per-slice reads. Any failure
++ *  of that read (an older primary 404s the route, timeout, transport) runs
++ *  `fanOut`, the per-slice path, for this request only. */
++export async function fetchSidebarSessionsBatchedOrSliced(
++  searchParams: URLSearchParams,
++  deps: {
++    fanOut: () => Promise<unknown>
++    fetchJsonForProfile: FetchJsonForProfile
++    hasRemoteOverride: (profile: string) => unknown
++    ownerTag: string | null
++  }
++): Promise<unknown> {
++  if (batchedPrimarySidebarProfile(searchParams, deps.hasRemoteOverride) !== null) {
++    let data: unknown
++
++    try {
++      data = await deps.fetchJsonForProfile(null, `/api/profiles/sessions/sidebar?${searchParams}`)
++    } catch {
++      return deps.fanOut()
++    }
++
++    return tagSidebarSlicesOwner(data, deps.ownerTag)
++  }
++
++  return deps.fanOut()
++}
++
+ /** Reassemble the batched sidebar response from its three per-slice reads,
+  *  keeping each slice's `errors` so a failed scan is never read as an
+  *  authoritative empty slice. */
+diff --git a/apps/desktop/electron/profile-session-sidebar-batch.test.ts b/apps/desktop/electron/profile-session-sidebar-batch.test.ts
+new file mode 100644
+index 0000000000..0c910cd52e
+--- /dev/null
++++ b/apps/desktop/electron/profile-session-sidebar-batch.test.ts
+@@ -0,0 +1,243 @@
++import assert from 'node:assert/strict'
++
++import { test } from 'vitest'
++
++import {
++  batchedPrimarySidebarProfile,
++  fanOutSidebarSessionSlices,
++  fetchPrimaryProfileSessions,
++  fetchSidebarSessionsBatchedOrSliced,
++  tagSidebarSlicesOwner
++} from './profile-session-routing'
++
++// [daveey] With registry gateways connected, every sidebar refresh of a concrete
++// local profile used to cost three /api/profiles/sessions reads on the primary.
++// The primary's batched /sidebar route serves the same three slices in one read.
++
++type Call = { profile: string | null; path: string }
++
++const QUERY =
++  'recents_profile=default&recents_limit=20&cron_limit=50&messaging_limit=100&recents_exclude=cron&messaging_exclude=tui'
++
++const batched = () => ({
++  recents: {
++    sessions: [
++      { id: 'r1', profile: 'default' },
++      { id: 'r2', profile: 'default', connection_id: 'mac-mini' }
++    ],
++    profiles_truncated: { default: false },
++    profiles_usage: { default: { cost_usd: 1.5, tokens: 1200 } }
++  },
++  cron: { sessions: [{ id: 'c1', profile: 'default', connection_id: '  ' }] },
++  messaging: { sessions: [{ id: 'm1', profile: 'default' }], total: 1 },
++  errors: [{ profile: 'default', error: 'transient' }],
++  storage: { other: 'corrupt' },
++  profiles_failed: { other: { failed: true, retry: true } }
++})
++
++/** Today's per-slice path, built from the same module pieces main.ts uses for
++ *  a concrete local profile (fetchProfilesSessionSlice -> fetchPrimaryProfileSessions). */
++function sliceFanOut(
++  searchParams: URLSearchParams,
++  fetchJson: (profile: string | null, path: string) => Promise<unknown>,
++  ownerTag: string | null
++) {
++  return () => fanOutSidebarSessionSlices(searchParams, sp => fetchPrimaryProfileSessions(sp, fetchJson, { ownerTag }))
++}
++
++function recorder(answer: (call: Call) => unknown) {
++  const calls: Call[] = []
++
++  const fetchJson = async (profile: string | null, path: string) => {
++    calls.push({ profile, path })
++
++    return answer({ profile, path })
++  }
++
++  return { calls, fetchJson }
++}
++
++test('a concrete local profile reads the whole sidebar from the primary in one batched request', async () => {
++  const searchParams = new URLSearchParams(QUERY)
++  const { calls, fetchJson } = recorder(() => batched())
++
++  await fetchSidebarSessionsBatchedOrSliced(searchParams, {
++    fanOut: sliceFanOut(searchParams, fetchJson, null),
++    fetchJsonForProfile: fetchJson,
++    hasRemoteOverride: () => false,
++    ownerTag: null
++  })
++
++  assert.deepEqual(calls, [{ profile: null, path: `/api/profiles/sessions/sidebar?${QUERY}` }])
++})
++
++test('the batched response keeps its other keys and stamps the owner tag on bare rows of every slice', async () => {
++  const searchParams = new URLSearchParams(QUERY)
++  const response = batched()
++  const before = structuredClone(response)
++  const { fetchJson } = recorder(() => response)
++
++  const result = (await fetchSidebarSessionsBatchedOrSliced(searchParams, {
++    fanOut: async () => assert.fail('fan-out must not run'),
++    fetchJsonForProfile: fetchJson,
++    hasRemoteOverride: () => false,
++    ownerTag: 'local'
++  })) as ReturnType<typeof batched>
++
++  assert.deepEqual(response, before, 'input not mutated')
++  assert.deepEqual(
++    (['recents', 'cron', 'messaging'] as const).map(key =>
++      result[key].sessions.map((row: Record<string, unknown>) => [row.id, row.connection_id])
++    ),
++    [
++      [
++        ['r1', 'local'],
++        ['r2', 'mac-mini']
++      ],
++      [['c1', 'local']],
++      [['m1', 'local']]
++    ]
++  )
++  assert.deepEqual(result.recents.profiles_truncated, before.recents.profiles_truncated)
++  assert.deepEqual(result.recents.profiles_usage, before.recents.profiles_usage)
++  assert.equal(result.messaging.total, 1)
++  assert.deepEqual(result.errors, before.errors)
++  assert.deepEqual(result.storage, before.storage)
++  assert.deepEqual(result.profiles_failed, before.profiles_failed)
++})
++
++test('a null owner tag leaves the batched response untouched', async () => {
++  const response = batched()
++  assert.equal(tagSidebarSlicesOwner(response, null), response)
++
++  const { fetchJson } = recorder(() => response)
++
++  const result = await fetchSidebarSessionsBatchedOrSliced(new URLSearchParams(QUERY), {
++    fanOut: async () => assert.fail('fan-out must not run'),
++    fetchJsonForProfile: fetchJson,
++    hasRemoteOverride: () => false,
++    ownerTag: null
++  })
++
++  assert.deepEqual(result, batched())
++})
++
++test('owner tagging copies every slice and leaves owned rows alone', () => {
++  const response = batched()
++  const tagged = tagSidebarSlicesOwner(response, 'nous-cloud') as ReturnType<typeof batched>
++
++  assert.notEqual(tagged, response)
++  assert.notEqual(tagged.recents, response.recents)
++  assert.equal(tagged.recents.sessions[1], response.recents.sessions[1], 'an owned row is passed through')
++  assert.equal(response.recents.sessions[0].connection_id, undefined)
++  assert.equal(response.cron.sessions[0].connection_id, '  ')
++})
++
++test('a failed batched read falls back to the three per-slice reads and returns their result', async () => {
++  for (const failure of [
++    Object.assign(new Error('No such API endpoint'), { statusCode: 404 }),
++    new Error('timed out')
++  ]) {
++    const searchParams = new URLSearchParams(QUERY)
++
++    const { calls, fetchJson } = recorder(({ path }) => {
++      if (path.startsWith('/api/profiles/sessions/sidebar')) {
++        throw failure
++      }
++
++      const source = new URL(path, 'http://x').searchParams.get('source')
++
++      return { sessions: [{ id: source === 'cron' ? 'cron-1' : 'chat-1' }], total: 1, profile_totals: { default: 1 } }
++    })
++
++    const fanOut = sliceFanOut(searchParams, fetchJson, 'local')
++
++    const result = (await fetchSidebarSessionsBatchedOrSliced(searchParams, {
++      fanOut,
++      fetchJsonForProfile: fetchJson,
++      hasRemoteOverride: () => false,
++      ownerTag: 'local'
++    })) as any
++
++    assert.equal(calls[0].path, `/api/profiles/sessions/sidebar?${QUERY}`)
++    assert.deepEqual(
++      calls.slice(1).map(call => [call.profile, new URL(call.path, 'http://x').pathname]),
++      [
++        [null, '/api/profiles/sessions'],
++        [null, '/api/profiles/sessions'],
++        [null, '/api/profiles/sessions']
++      ]
++    )
++    assert.deepEqual(result.recents.sessions, [{ id: 'chat-1', connection_id: 'local' }])
++    assert.deepEqual(result.cron.sessions, [{ id: 'cron-1', connection_id: 'local' }])
++    assert.equal(result.recents.total, 1)
++  }
++})
++
++test('every refresh retries the batched read after a failure (route-missing is not remembered)', async () => {
++  let batchedReads = 0
++
++  const { fetchJson } = recorder(({ path }) => {
++    if (path.startsWith('/api/profiles/sessions/sidebar')) {
++      batchedReads += 1
++      throw Object.assign(new Error('No such API endpoint'), { statusCode: 404 })
++    }
++
++    return { sessions: [], total: 0, profile_totals: {} }
++  })
++
++  for (let round = 0; round < 2; round += 1) {
++    const searchParams = new URLSearchParams(QUERY)
++    await fetchSidebarSessionsBatchedOrSliced(searchParams, {
++      fanOut: sliceFanOut(searchParams, fetchJson, null),
++      fetchJsonForProfile: fetchJson,
++      hasRemoteOverride: () => false,
++      ownerTag: null
++    })
++  }
++
++  assert.equal(batchedReads, 2)
++})
++
++test('the all-profiles scope and a remote-override profile keep the per-slice path', async () => {
++  for (const [query, override] of [
++    ['recents_profile=all&recents_limit=20', () => false],
++    ['recents_limit=20', () => false],
++    ['recents_profile=work&recents_limit=20', (profile: string) => profile === 'work']
++  ] as const) {
++    const searchParams = new URLSearchParams(query)
++    const { calls, fetchJson } = recorder(() => ({ sessions: [], total: 0, profile_totals: {} }))
++    const fanned = { fanned: true }
++    let fanOuts = 0
++
++    const result = await fetchSidebarSessionsBatchedOrSliced(searchParams, {
++      fanOut: async () => {
++        fanOuts += 1
++
++        return fanned
++      },
++      fetchJsonForProfile: fetchJson,
++      hasRemoteOverride: override,
++      ownerTag: 'local'
++    })
++
++    assert.equal(result, fanned, query)
++    assert.equal(fanOuts, 1, query)
++    assert.deepEqual(calls, [], query)
++  }
++})
++
++test('the batched scope reads recents_profile like the slice params do', () => {
++  assert.equal(
++    batchedPrimarySidebarProfile(new URLSearchParams('recents_profile=%20default%20'), () => false),
++    'default'
++  )
++  assert.equal(
++    batchedPrimarySidebarProfile(new URLSearchParams('recents_profile=%20'), () => false),
++    null
++  )
++  assert.equal(
++    batchedPrimarySidebarProfile(new URLSearchParams('recents_profile=work'), () => true),
++    null
++  )
++})
+-- 
+2.43.0
+

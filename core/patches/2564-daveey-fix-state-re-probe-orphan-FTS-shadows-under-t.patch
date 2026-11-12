@@ -1,0 +1,173 @@
+From 0530558ba0fe75fff32f849f2e00d500ec9d70d4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:41:02 +0000
+Subject: [PATCH] [daveey] fix(state): re-probe orphan FTS shadows under the
+ write lock
+
+The #103840 orphan-shadow repair probed "vtable row absent" and "shadow
+tables present" as two autocommit SELECTs, each its own snapshot. When
+several gateways open a fresh state.db at once (only the ledger tables
+exist yet), a sibling's CREATE VIRTUAL TABLE can commit between the two
+reads; the opener then treated the just-published family as orphaned and
+dropped its live shadow tables. messages_fts_trigram was left with no
+_config table, so every later read of it fails with "vtable constructor
+failed: messages_fts_trigram".
+
+That is the cell5 flake: test_concurrent_reboots_claim_each_obligation_once
+failed in PRAGMA integrity_check after three concurrent rebooters
+bootstrapped FTS (CI run 43176395347). A candidate is now re-probed and
+dropped inside one BEGIN IMMEDIATE (a caller's open transaction already
+pins one snapshot), so a live family is never dropped.
+
+Test: a cursor proxy commits a sibling's CREATE VIRTUAL TABLE between the
+two probes; RED on main (live family dropped), GREEN with the fix.
+---
+ hermes_state_fts.py                           | 48 ++++++++++----
+ .../test_fts_orphan_shadow_repair.py          | 62 +++++++++++++++++++
+ 2 files changed, 97 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_state_fts.py b/hermes_state_fts.py
+index d1f1141cab..693a75976d 100644
+--- a/hermes_state_fts.py
++++ b/hermes_state_fts.py
+@@ -128,6 +128,22 @@ def base_source_view_is_stale(cursor: sqlite3.Cursor) -> bool:
+ _FTS5_SHADOW_SUFFIXES = ("content", "data", "docsize", "idx", "config")
+ 
+ 
++def _orphan_fts_shadows(cursor: sqlite3.Cursor, family: str) -> list[str]:
++    """Shadow tables of ``family`` present while its vtable row is absent (empty when the vtable is live)."""
++    vtable_live = cursor.execute(
++        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? "
++        "AND sql LIKE 'CREATE VIRTUAL TABLE%'",
++        (family,),
++    ).fetchone()
++    if vtable_live:
++        return []
++    shadows = [f"{family}_{suffix}" for suffix in _FTS5_SHADOW_SUFFIXES]
++    return [row[0] for row in cursor.execute(
++        f"SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ({','.join('?' for _ in shadows)})",
++        shadows,
++    ).fetchall()]
++
++
+ def _drop_orphan_fts_shadow_tables(cursor: sqlite3.Cursor, families: Sequence[str]) -> list[str]:
+     """Drop, per family, shadow tables whose virtual table row is absent from sqlite_master.
+ 
+@@ -135,25 +151,31 @@ def _drop_orphan_fts_shadow_tables(cursor: sqlite3.Cursor, families: Sequence[st
+     ``messages_fts_trigram_*``) and leaves a family alone whenever its vtable is live. The
+     shadows are derived index state; the caller recreates and rebuilds from ``messages``.
+     Returns the families that were repaired.
++
++    In autocommit each probe reads its own snapshot, so a sibling opener's CREATE VIRTUAL TABLE can
++    commit between "no vtable row" and "shadows present"; dropping then strips a live family's shadow
++    tables (``vtable constructor failed`` forever after). A candidate is therefore re-probed and dropped
++    under one write lock; a caller's open transaction already pins one snapshot.
+     """
+     repaired: list[str] = []
+     for family in families:
+-        vtable_live = cursor.execute(
+-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? "
+-            "AND sql LIKE 'CREATE VIRTUAL TABLE%'",
+-            (family,),
+-        ).fetchone()
+-        if vtable_live:
++        if not _orphan_fts_shadows(cursor, family):
+             continue
+-        shadows = [f"{family}_{suffix}" for suffix in _FTS5_SHADOW_SUFFIXES]
+-        orphans = [row[0] for row in cursor.execute(
+-            f"SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ({','.join('?' for _ in shadows)})",
+-            shadows,
+-        ).fetchall()]
++        owns_transaction = not cursor.connection.in_transaction
++        if owns_transaction:
++            cursor.execute("BEGIN IMMEDIATE")
++        try:
++            orphans = _orphan_fts_shadows(cursor, family)
++            for name in orphans:
++                cursor.execute(f'DROP TABLE "{name}"')
++            if owns_transaction:
++                cursor.connection.commit()
++        except BaseException:
++            if owns_transaction:
++                cursor.connection.rollback()
++            raise
+         if not orphans:
+             continue
+-        for name in orphans:
+-            cursor.execute(f'DROP TABLE "{name}"')
+         logger.warning(
+             "Dropped orphan FTS5 shadow tables of %s (%s); the index is recreated from messages",
+             family, ", ".join(orphans),
+diff --git a/tests/hermes_state/test_fts_orphan_shadow_repair.py b/tests/hermes_state/test_fts_orphan_shadow_repair.py
+index f7661b20c6..a950b59a07 100644
+--- a/tests/hermes_state/test_fts_orphan_shadow_repair.py
++++ b/tests/hermes_state/test_fts_orphan_shadow_repair.py
+@@ -65,3 +65,65 @@ def test_orphaned_base_family_is_repaired_and_healthy_trigram_untouched(tmp_path
+         reopened.close()
+     # Same rowids: the healthy family was neither dropped nor recreated.
+     assert _fts_master_rows(db_path, "messages_fts_trigram") == trigram_before
++
++
++class _SiblingPublishesBetweenReads:
++    """Cursor proxy: a concurrent opener publishes ``family`` right after the vtable probe.
++
++    Autocommit gives each SELECT its own snapshot, so a sibling's CREATE VIRTUAL TABLE can
++    commit between "no vtable row" and "shadow tables present" (gateways rebooting at once
++    over a fresh state.db, the cell5 concurrent-reboot flake).
++    """
++
++    def __init__(self, cursor, publish):
++        self._cursor, self._publish = cursor, publish
++
++    def execute(self, sql, params=()):
++        result = self._cursor.execute(sql, params)
++        if self._publish is not None and "LIKE 'CREATE VIRTUAL TABLE%'" in sql:
++            rows = result.fetchall()
++            publish, self._publish = self._publish, None
++            publish()
++            return _Rows(rows)
++        return result
++
++    def __getattr__(self, name):
++        return getattr(self._cursor, name)
++
++
++class _Rows:
++    def __init__(self, rows):
++        self._rows = rows
++
++    def fetchone(self):
++        return self._rows[0] if self._rows else None
++
++    def fetchall(self):
++        return list(self._rows)
++
++
++def test_sibling_publishing_family_mid_probe_is_not_treated_as_orphan(tmp_path):
++    from hermes_state_fts import _drop_orphan_fts_shadow_tables
++
++    db_path = tmp_path / "state.db"
++    opener = sqlite3.connect(db_path, isolation_level=None)
++    opener.execute("PRAGMA journal_mode=WAL")
++    sibling = sqlite3.connect(db_path, isolation_level=None)
++
++    def publish():
++        sibling.execute("CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(content, tokenize='trigram')")
++
++    try:
++        repaired = _drop_orphan_fts_shadow_tables(
++            _SiblingPublishesBetweenReads(opener.cursor(), publish), ("messages_fts_trigram",),
++        )
++        assert repaired == []
++        assert not opener.in_transaction
++        assert opener.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
++        shadows = {r[0] for r in opener.execute(
++            "SELECT name FROM sqlite_master WHERE name LIKE 'messages_fts_trigram_%'"
++        )}
++        assert {"messages_fts_trigram_config", "messages_fts_trigram_data"} <= shadows
++    finally:
++        sibling.close()
++        opener.close()
+-- 
+2.43.0
+

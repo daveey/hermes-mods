@@ -1,0 +1,297 @@
+From e197a270bc10971d3af667fc9175db3006529ca2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:41:50 +0000
+Subject: [PATCH] [daveey] Kanban sync heal: keep parks, guard live claims,
+ sync the heal's run
+
+Follow-ups from the PR1341 exact-head review (GitHub review 5872637434):
+
+- _stale_lifecycle: a live claim_lock is a local worker holding the card,
+  so a terminal replica on the same run is never adopted over it.
+- heal_running_over_ended_run: a run that ended blocked, review_requested
+  or scheduled puts the card back in that park (blocked/review/scheduled)
+  instead of todo, when the park's own event is the card's last lifecycle
+  move. A dependency block, a later unblock/wake/reopen, or a missing park
+  event still lands todo as before.
+- The once-per-run gate now logs a warning when it skips a card.
+- status_healed carries the run as the event's run_id column (synced as
+  run_uid) instead of a local id in the payload; the gate reads both.
+- Committed negative tests: a held claim_lock and a held lease keep the card
+  running over an ended run.
+---
+ hermes_cli/kanban_sync_divergence.py          |  61 ++++++++--
+ .../test_kanban_sync_running_heal.py          | 107 ++++++++++++++++--
+ 2 files changed, 148 insertions(+), 20 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_divergence.py b/hermes_cli/kanban_sync_divergence.py
+index cea49dba1d..cbcb0e85e2 100644
+--- a/hermes_cli/kanban_sync_divergence.py
++++ b/hermes_cli/kanban_sync_divergence.py
+@@ -79,11 +79,14 @@ def _stale_lifecycle(live: sqlite3.Connection, shadow: sqlite3.Connection, row:
+     ``running`` names an open run: when that run has already ended (in either copy), no local write can have
+     produced the live ``running``; the live row missed the end of its own run. A live non-terminal status over a
+     replica ``done``/``archived`` card on the same run is the same gap. Pushing it would reopen the card for every
+-    reader, because the owner's HLC is newer than the worker's end (hub t_01a1ceaeb6ba593c, 2026-11-12). [daveey]"""
++    reader, because the owner's HLC is newer than the worker's end (hub t_01a1ceaeb6ba593c, 2026-11-12). A live
++    ``claim_lock`` is a local worker holding the card right now, so that copy is never stale. [daveey]"""
+     if not run_uid:
+         return False
+     if row["status"] == "running" and (_run_ended(live, run_uid) or _run_ended(shadow, run_uid)):
+         return True
++    if row["claim_lock"] is not None:
++        return False
+     remote_run = shadow.execute("SELECT uid FROM task_runs WHERE id = ?", (theirs["current_run_id"],)).fetchone() \
+         if theirs["current_run_id"] is not None else None
+     return (theirs["status"] in _TERMINAL and row["status"] not in _TERMINAL
+@@ -104,6 +107,38 @@ def _adopt_replica(live: sqlite3.Connection, shadow: sqlite3.Connection, tid: st
+                  "took the service's copy instead of re-sending it", tid, stale, theirs["status"])
+ 
+ 
++# A run outcome that parks the card -> (its landing status, the event the park writes).
++_PARKS = {"blocked": ("blocked", "blocked"), "review_requested": ("review", "review_requested"),
++          "scheduled": ("scheduled", "scheduled")}
++# Moves that take a card out of a park after its run ended; any later event naming a ``status`` counts too.
++_LEFT_PARK = ("unblocked", "promoted", "promoted_manual", "reopened", "continuation_woken", "condition_met",
++              "changes_requested", "dependency_wait", "block_loop_detected", "completed", "archived")
++
++
++def _parked_status(live: sqlite3.Connection, tid: str, run: sqlite3.Row) -> str | None:
++    """The park the ended run left the card in, or None when it is unknown or the card has left it since.
++
++    A ``blocked`` outcome is not proof of ``blocked``: a dependency block lands ``todo`` and a loop ``triage``, so the
++    park's own event (written in the run's end transaction, at or after the run's start) must name it, and no later
++    event may have moved the card on (an unblock, a wake, a review reopen)."""
++    park = _PARKS.get(run["outcome"] or "")
++    if park is None:
++        return None
++    status, kind = park
++    end = live.execute("SELECT id, created_at FROM task_events WHERE task_id = ? AND kind = ? "
++                       "AND (run_id = ? OR created_at >= ?) ORDER BY created_at DESC, id DESC LIMIT 1",
++                       (tid, kind, run["run_id"], run["started_at"])).fetchone()
++    if end is None:
++        return None
++    marks = ",".join("?" * len(_LEFT_PARK))
++    left = live.execute(
++        f"SELECT 1 FROM task_events WHERE task_id = ? AND id != ? "
++        f"AND (created_at > ? OR (created_at = ? AND id > ?)) "
++        f"AND (kind IN ({marks}) OR json_extract(payload, '$.status') IS NOT NULL) LIMIT 1",
++        (tid, end["id"], end["created_at"], end["created_at"], end["id"], *_LEFT_PARK)).fetchone()
++    return None if left else status
++
++
+ def heal_running_over_ended_run(live: sqlite3.Connection) -> dict[str, str]:
+     """Move this file's cards that read ``running`` with no claim, no lease and an ended current run to where that
+     run left them; returns {task id: new status}.
+@@ -112,27 +147,33 @@ def heal_running_over_ended_run(live: sqlite3.Connection) -> dict[str, str]:
+     worker holds the Board lease, and every end of a run moves the card in the same transaction. It is left by a
+     stale copy sent over the run's end (hub t_01a1ceaeb6ba593c, 2026-11-12), and the dispatcher's stale-claim sweep
+     never sees it (no claim to expire), so the card read ``running`` for good. A run ended ``completed`` with the
+-    card's latest ``completed`` event naming it is a completion: ``done``. Any other end is a reclaim: ``todo``, which
+-    the promoter turns into ``ready`` once the card's parents are done. The write goes through the capture triggers,
+-    so the Board's copy is corrected by the same round's push. [daveey]"""
++    card's latest ``completed`` event naming it is a completion: ``done``. A run that parked the card (``blocked``,
++    ``review_requested``, ``scheduled``) puts it back in that park when the park's own event is the card's last
++    lifecycle move (``_parked_status``), so a heal never re-dispatches a card that was waiting. Any other end is a
++    reclaim: ``todo``, which the promoter turns into ``ready`` once the card's parents are done. The write goes
++    through the capture triggers, so the Board's copy is corrected by the same round's push. [daveey]"""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_db_connect import write_txn
+     rows = live.execute(
+-        "SELECT t.id, r.id AS run_id, r.outcome, r.ended_at FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
++        "SELECT t.id, r.id AS run_id, r.outcome, r.started_at, r.ended_at FROM tasks t "
++        "JOIN task_runs r ON r.id = t.current_run_id "
+         "WHERE t.status = 'running' AND t.claim_lock IS NULL AND t.lease_holder IS NULL "
+         "AND r.ended_at IS NOT NULL").fetchall()
+     healed: dict[str, str] = {}
+     for row in rows:
+-        tid = row["id"]
++        tid, changed = row["id"], 0
+         with write_txn(live):
++            # ``run_id`` is the event column (synced as ``run_uid``); the payload key is the pre-column record.
+             if live.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'status_healed' "
+-                            "AND json_extract(payload, '$.run_id') = ?", (tid, row["run_id"])).fetchone():
+-                # Healed once for this run and the Board kept a newer write: report it, never loop on it.
++                            "AND (run_id = ? OR json_extract(payload, '$.run_id') = ?)",
++                            (tid, row["run_id"], row["run_id"])).fetchone():
++                _log.warning("kanban sync: %s still reads running over its ended run %s after one heal; the Board "
++                             "kept a newer write, not healing it again", tid, row["run_id"])
+                 continue
+             event = live.execute("SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'completed' "
+                                  "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+             done = row["outcome"] == "completed" and event is not None and event["run_id"] == row["run_id"]
+-            status = "done" if done else "todo"
++            status = "done" if done else _parked_status(live, tid, row) or "todo"
+             changed = live.execute(
+                 "UPDATE tasks SET status = ?, current_run_id = NULL, "
+                 "completed_at = CASE WHEN ? THEN COALESCE(completed_at, ?) ELSE NULL END, "
+@@ -141,7 +182,7 @@ def heal_running_over_ended_run(live: sqlite3.Connection) -> dict[str, str]:
+                 "AND current_run_id = ?", (status, done, row["ended_at"], done, tid, row["run_id"])).rowcount
+             if changed:
+                 kb._append_event(live, tid, "status_healed", {"from": "running", "to": status,
+-                                                              "run_id": row["run_id"], "outcome": row["outcome"]})
++                                                              "outcome": row["outcome"]}, run_id=row["run_id"])
+         if changed:
+             healed[tid] = status
+             _log.warning("kanban sync: %s read running over its ended run %s (%s); moved to %s",
+diff --git a/tests/hermes_cli/test_kanban_sync_running_heal.py b/tests/hermes_cli/test_kanban_sync_running_heal.py
+index 3db078eb12..a0b5901e1f 100644
+--- a/tests/hermes_cli/test_kanban_sync_running_heal.py
++++ b/tests/hermes_cli/test_kanban_sync_running_heal.py
+@@ -4,25 +4,33 @@ Hub 2026-11-12: t_01a1ceaeb6ba593c (completed) and t_01a1ceb44e35f780 (blocked -
+ itself (v21 / v11), so the replica and the live file agreed and no divergence repair could see them."""
+ from __future__ import annotations
+ 
++import logging
+ import time
+ 
+ import pytest
+ 
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as ksc
+ from hermes_cli.kanban_sync_divergence import heal_running_over_ended_run
+ from tests.hermes_cli import test_kanban_sync_terminal_regress as base
+ 
+ ME, OTHER, BOARD = base.ME, base.OTHER, base.BOARD
+ kanban_home, svc, live = base.kanban_home, base.svc, base.live
+ 
++# The event each run end writes in its own transaction.
++_END_EVENT = {"completed": "completed", "blocked": "blocked", "review_requested": "review_requested",
++              "scheduled": "scheduled"}
+ 
+-def _regressed(live, kanban_home, svc, *, status, outcome, completed_at):
++
++def _regressed(live, kanban_home, svc, *, status, outcome, completed_at, end_event=True, after=None):
+     tid, run_uid = base._running_card(live, kanban_home, svc)
+-    if outcome == "completed":
++    if end_event and outcome in _END_EVENT:
+         run_id = live.execute("SELECT id FROM task_runs WHERE uid = ?", (run_uid,)).fetchone()[0]
+         with kbc.write_txn(live):
+-            kb._append_event(live, tid, "completed", {"summary": "landed"}, run_id=run_id)
++            kb._append_event(live, tid, _END_EVENT[outcome], {"summary": "run end"}, run_id=run_id)
++            for kind, payload in after or ():
++                kb._append_event(live, tid, kind, payload)
+     base._worker_ends(svc, tid, run_uid, status=status, outcome=outcome, completed_at=completed_at)
+     base._round(kanban_home, svc)
+     # The stale copy the hub sent at 08:27:50, as the Board stored it.
+@@ -43,16 +51,22 @@ def _healed_events(live, tid):
+                         (tid,)).fetchone()[0]
+ 
+ 
++def _heal_through_rounds(live, kanban_home, svc):
++    _clock_after_the_stale_write(live)
++    base._round(kanban_home, svc)  # pulls the regression, heals it, pushes the heal
++    base._round(kanban_home, svc)
++
++
+ @pytest.mark.parametrize("status,outcome,completed_at", [
+     ("done", "completed", 1794472039),
+     ("todo", "blocked", None),
+ ])
+ def test_a_running_card_over_an_ended_run_is_moved_where_its_run_left_it(live, kanban_home, svc, status, outcome,
+                                                                         completed_at):
+-    tid = _regressed(live, kanban_home, svc, status=status, outcome=outcome, completed_at=completed_at)
+-    _clock_after_the_stale_write(live)
+-    base._round(kanban_home, svc)  # pulls the regression, heals it, pushes the heal
+-    base._round(kanban_home, svc)
++    # The blocked case has no ``blocked`` event: t_01a1ceb44e35f780's run ended blocked, its card read todo.
++    tid = _regressed(live, kanban_home, svc, status=status, outcome=outcome, completed_at=completed_at,
++                     end_event=outcome == "completed")
++    _heal_through_rounds(live, kanban_home, svc)
+ 
+     assert base._service_task(svc, tid)["status"] == status
+     assert base._service_task(svc, tid)["current_run_uid"] is None
+@@ -65,14 +79,87 @@ def test_a_running_card_over_an_ended_run_is_moved_where_its_run_left_it(live, k
+     assert _healed_events(live, tid) == 1
+ 
+ 
+-def test_a_heal_the_board_outvotes_is_reported_once_not_looped(live, kanban_home, svc):
++@pytest.mark.parametrize("status,outcome", [
++    ("blocked", "blocked"),
++    ("review", "review_requested"),
++    ("scheduled", "scheduled"),
++])
++def test_a_run_that_parked_the_card_puts_it_back_in_that_park_not_todo(live, kanban_home, svc, status, outcome):
++    """Plain ``todo`` would re-dispatch a card that was waiting on a human, a reviewer or a clock."""
++    tid = _regressed(live, kanban_home, svc, status=status, outcome=outcome, completed_at=None)
++    _heal_through_rounds(live, kanban_home, svc)
++
++    assert live.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[:] \
++        == (status, None)
++    assert base._service_task(svc, tid)["status"] == status
++
++
++@pytest.mark.parametrize("left", [("unblocked", None), ("condition_met", {"status": "ready"})])
++def test_a_park_the_card_has_since_left_falls_back_to_todo(live, kanban_home, svc, left):
++    tid = _regressed(live, kanban_home, svc, status="todo", outcome="blocked", completed_at=None, after=[left])
++    _heal_through_rounds(live, kanban_home, svc)
++    assert live.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "todo"
++
++
++def test_the_heal_event_names_its_run_so_the_board_gets_the_run_uid(live, kanban_home, svc):
+     tid = _regressed(live, kanban_home, svc, status="done", outcome="completed", completed_at=1794472039)
+-    for _ in range(3):  # the stale write's clock is ahead of ours: every heal loses the field merge
+-        base._round(kanban_home, svc)
++    _heal_through_rounds(live, kanban_home, svc)
++    run_uid = base._service_task(svc, tid).get("current_run_uid")
++    assert run_uid is None
++    local = live.execute("SELECT run_id, payload FROM task_events WHERE task_id = ? AND kind = 'status_healed'",
++                         (tid,)).fetchone()
++    assert local["run_id"] is not None
++    assert '"run_id"' not in (local["payload"] or "")  # a local id means nothing on another gateway
++    events = [e for e in svc.board(BOARD)["rows"]["task_events"].values()
++              if e.get("task_id") == tid and e.get("kind") == "status_healed"]
++    assert len(events) == 1
++    assert events[0]["run_uid"] == live.execute("SELECT uid FROM task_runs WHERE id = ?",
++                                                (local["run_id"],)).fetchone()[0]
++
++
++def test_a_heal_the_board_outvotes_is_reported_once_not_looped(live, kanban_home, svc, caplog):
++    tid = _regressed(live, kanban_home, svc, status="done", outcome="completed", completed_at=1794472039)
++    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_sync_divergence"):
++        for _ in range(3):  # the stale write's clock is ahead of ours: every heal loses the field merge
++            base._round(kanban_home, svc)
+     assert _healed_events(live, tid) == 1
++    assert any("after one heal" in r.getMessage() and tid in r.getMessage() for r in caplog.records)
+ 
+ 
+ def test_a_running_card_with_its_run_open_is_left_alone(live, kanban_home, svc):
+     tid, _run_uid = base._running_card(live, kanban_home, svc)
+     assert heal_running_over_ended_run(live) == {}
+     assert live.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "running"
++
++
++@pytest.mark.parametrize("column,holder", [("claim_lock", "hermes-worker-4:123"), ("lease_holder", OTHER)])
++def test_a_held_claim_or_lease_keeps_the_card_running_over_an_ended_run(live, kanban_home, svc, column, holder):
++    """A live holder still owns the card: the heal never takes it away, whatever its run row says."""
++    tid, run_uid = base._running_card(live, kanban_home, svc)
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying = 1")
++        live.execute("UPDATE task_runs SET ended_at = ?, outcome = 'completed' WHERE uid = ?",
++                     (int(time.time()), run_uid))
++        live.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (holder, tid))
++        live.execute("UPDATE kanban_sync_state SET applying = 0")
++    assert heal_running_over_ended_run(live) == {}
++    assert live.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "running"
++    assert _healed_events(live, tid) == 0
++
++
++def test_divergence_repair_never_adopts_a_terminal_replica_over_a_live_claim(live, kanban_home, svc):
++    """Replica ``done`` on the same run, live non-terminal with a local worker's ``claim_lock``: not stale."""
++    tid, run_uid = base._running_card(live, kanban_home, svc)
++    base._worker_ends(svc, tid, run_uid, status="done", outcome="completed", completed_at=1794472039)
++    base._live_missed_the_task_fields(live, kanban_home, svc, tid, run_uid)
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying = 1")
++        live.execute("UPDATE tasks SET status = 'ready', claim_lock = 'hermes-worker-4:123' WHERE id = ?", (tid,))
++        live.execute("UPDATE kanban_sync_state SET applying = 0")
++    shadow = kbc.connect(ksc.shadow_path(BOARD))
++    try:
++        ksc.repair_divergence(live, shadow, ME)
++    finally:
++        shadow.close()
++    row = live.execute("SELECT status, claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert (row["status"], row["claim_lock"]) == ("ready", "hermes-worker-4:123")
+-- 
+2.43.0
+

@@ -1,0 +1,188 @@
+From 40ee6f5b586d794f95339b35144ed98b8c336227 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 08:37:55 +0000
+Subject: [PATCH] [daveey] Kanban sync: a pulled comment keeps its sending
+ gateway, so wait-comment --from-gateway can match it
+
+t_01a1ccfca36ad3e3 parked on `hermes kanban wait-comment ... --from-gateway <gw>` and slept through two
+replies that a worker-1 chat wrote as author `default`. The Board's row carried origin_gateway=worker-1,
+but task_comments.origin_gateway is machine-local (LOCAL_COLUMNS) and nothing derived it on apply, so the
+pulled copy stored NULL. With a profile-named author, no --from-gateway value could ever match a comment
+that arrived through the feed.
+
+- apply_remote_changes (_upsert_row): a newly inserted task_comments row gets origin_gateway from the
+  author when it names a gateway (relay hub:gw:<x>, <x>/t_...), else from the change's writing gateway.
+  Never this gateway's own name; a malformed sender stays NULL; an existing local row is not touched.
+- kanban_worker_node._changes_for: a card copied from the replica carries each comment's origin_gateway
+  as the change's sender, so worker-node imports keep it too.
+
+Proof: tests/hermes_cli/test_kanban_comment_origin.py section (e): 3 of the new cases fail before
+(None stored), all pass after; 769 sync/pickup tests and 90 comment/worker-node tests pass.
+Rows already pulled with NULL stay NULL (the Board's /evidence row has the sender if needed).
+---
+ hermes_cli/kanban_comment_origin.py           | 13 +++
+ hermes_cli/kanban_db_sync.py                  |  7 ++
+ hermes_cli/kanban_worker_node.py              |  4 +-
+ .../hermes_cli/test_kanban_comment_origin.py  | 88 +++++++++++++++++++
+ 4 files changed, 111 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_comment_origin.py b/hermes_cli/kanban_comment_origin.py
+index 168917fc57..537fbdc02c 100644
+--- a/hermes_cli/kanban_comment_origin.py
++++ b/hermes_cli/kanban_comment_origin.py
+@@ -61,6 +61,19 @@ def resolve_origin(author: Optional[str], explicit: Optional[str] = None) -> Opt
+     return gateway_from_author(author) or _local_gateway()
+ 
+ 
++def synced_origin(author: Optional[str], writer: Optional[str]) -> Optional[str]:
++    """``origin_gateway`` for a comment pulled from the Board: the author's gateway, else the writing gateway.
++
++    Unlike :func:`resolve_origin` it never falls back to this gateway: a pulled row was written elsewhere, and an
++    unknown sender stays NULL rather than impersonating the local gateway (t_01a1ccfca36ad3e3 slept through two
++    worker-1 replies authored ``default`` because the pulled copies kept no sender at all)."""
++    found = gateway_from_author(author)
++    if found:
++        return found
++    name = str(writer or "").strip()
++    return name if _GATEWAY_NAME.match(name) else None
++
++
+ def ensure_origin_column(conn: sqlite3.Connection) -> None:
+     """Migration: add ``task_comments.origin_gateway`` to an older board and back-fill it once."""
+     from hermes_cli.sqlite_util import add_column_if_missing
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 51c5d4c6f9..273b9c7774 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1343,6 +1343,13 @@ def _upsert_row(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: Ap
+     if table == "task_attachments":
+         cols["stored_path"] = ""
+         result.blobs_to_fetch.append(ch.uid)
++    if table == "task_comments" and "origin_gateway" in table_columns(conn, table):
++        # Machine-local, so never copied from the wire as a column: derive it the way a local write does, from
++        # the author (a relay names its sender) or else the gateway that wrote the row. [daveey]
++        from hermes_cli.kanban_comment_origin import synced_origin
++        origin = synced_origin(cols.get("author"), ch.origin_gateway)
++        if origin:
++            cols["origin_gateway"] = origin
+     names = ["uid", *cols]
+     conn.execute(f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+                  (ch.uid, *cols.values()))
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 721ff49e7f..a3dea51293 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -443,8 +443,10 @@ def _changes_for(replica: sqlite3.Connection, tid: str, card: sqlite3.Row) -> li
+             if row["uid"] is None:
+                 continue
+             version = int(row["sync_version"] or 0) if "sync_version" in row.keys() else 0
++            # A comment's sender is machine-local (never a wire field): carry the replica's as the change's writer.
++            sender = (row["origin_gateway"] or "") if table == "task_comments" and "origin_gateway" in row.keys() else ""
+             out.append(sync.RemoteChange(0, table, row["uid"], "upsert", ksc._row_fields(replica, table, row),
+-                                         version, "", ""))
++                                         version, "", sender))
+     # Its parent edges too: once the copy is here the feed applies its later links (own_partition), so a copy
+     # without the earlier ones disagreed with the Board for as long as it ran.
+     for row in replica.execute("SELECT * FROM task_links WHERE child_id = ? ORDER BY parent_id", (tid,)).fetchall():
+diff --git a/tests/hermes_cli/test_kanban_comment_origin.py b/tests/hermes_cli/test_kanban_comment_origin.py
+index f0419ace3e..1eee307f51 100644
+--- a/tests/hermes_cli/test_kanban_comment_origin.py
++++ b/tests/hermes_cli/test_kanban_comment_origin.py
+@@ -263,6 +263,94 @@ def test_answered_hub_request_wakes_a_card_whose_probe_still_fails(kanban_home,
+         assert kb.get_task(conn, tid).status == "scheduled"
+ 
+ 
++# -- (e) comments that arrive through the Board feed -------------------------------------------------
++# Regression for t_01a1ccfca36ad3e3 (2026-11-12): parked on `wait-comment --from-gateway <gw>`, the card slept
++# through two replies a worker-1 chat wrote as author `default`. The Board row said origin_gateway=worker-1, but
++# the pulled copy stored NULL (origin_gateway is machine-local and nothing derived it), so no gateway matched.
++
++@pytest.fixture
++def synced_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    """``kanban_home`` with ``kanban.sync.enabled: true`` (sync tables and capture triggers installed)."""
++    from tests.hermes_cli import kanban_sync_support as support
++    home = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(tmp_path / "no-mail.json"))
++    support.write_sync_config(home, True)
++    kb.init_db()
++    return home
++
++
++def _synced_comment(tid: str, author: str) -> dict:
++    return {"task_id": tid, "author": author, "body": "PR1165 merged: measure from the next launch",
++            "created_at": int(time.time())}
++
++
++@pytest.mark.parametrize("author,feed_origin,want_origin", [
++    ("default", "worker-1", "worker-1"),        # the incident: a profile-named author written on worker-1
++    ("hub:gw:macbook", "hub", "macbook"),       # the relay names the real sender, which wins over the writer
++    ("default", "", None),                      # no sender on the wire: unknown, never this gateway's name
++    ("default", "not a gateway!", None),        # a malformed sender is not stored
++])
++def test_feed_comment_keeps_the_sending_gateway(synced_home, tmp_path, capsys, author, feed_origin,
++                                                want_origin) -> None:
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++        after = kb.add_comment(conn, tid, "default", "parked")
++        client.ensure_identity(conn, "default", "worker-3")
++        sync.set_mode(conn, "primary")
++        change = sync.RemoteChange(1, "task_comments", "01a1cebe-926b-753b-9c59-8a437dfc7269", "upsert",
++                                   _synced_comment(tid, author), 1, "", feed_origin)
++        sync.apply_remote_changes(conn, [change], new_cursor=1, observers=False)
++        got = conn.execute("SELECT origin_gateway FROM task_comments WHERE uid = ?",
++                           ("01a1cebe-926b-753b-9c59-8a437dfc7269",)).fetchone()[0]
++    assert got == want_origin
++    if want_origin:
++        assert _cli()("wait-comment", tid, "--after-id", str(after), "--from-gateway", want_origin) == 0
++    capsys.readouterr()
++
++
++def test_feed_does_not_overwrite_a_local_origin(synced_home) -> None:
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++        cid = kb.add_comment(conn, tid, "hub:gw:macbook", "relay", origin_gateway="macbook")
++        cuid = conn.execute("SELECT uid FROM task_comments WHERE id = ?", (cid,)).fetchone()[0]
++        client.ensure_identity(conn, "default", "worker-3")
++        sync.set_mode(conn, "primary")
++        change = sync.RemoteChange(1, "task_comments", cuid, "upsert",
++                                   _synced_comment(tid, "hub:gw:macbook"), 2, "", "hub")
++        sync.apply_remote_changes(conn, [change], new_cursor=1, observers=False)
++        got = conn.execute("SELECT origin_gateway FROM task_comments WHERE id = ?", (cid,)).fetchone()[0]
++    assert got == "macbook"
++
++
++def test_worker_import_carries_the_replica_origin(synced_home, tmp_path) -> None:
++    """A card a worker node copies from its replica keeps each comment's sender (kanban_worker_node)."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli import kanban_worker_node as node
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="worker")
++        fields = json.loads(conn.execute("SELECT fields FROM kanban_sync_outbox WHERE table_name='tasks' "
++                                         "AND row_uid=? ORDER BY rowid LIMIT 1", (tid,)).fetchone()[0])
++    fields.update(created_on="worker-1", runs_on=json.dumps(["machine:worker-3"]))
++    with kbc.connect(tmp_path / "replica.db") as replica, kbc.connect(tmp_path / "worker.db") as worker:
++        client.ensure_identity(replica, "default", "worker-3")
++        client.ensure_identity(worker, "default", "worker-3")
++        sync.set_mode(worker, "primary")
++        sync.apply_remote_changes(replica, [
++            sync.RemoteChange(1, "tasks", tid, "upsert", fields, 1, "", "worker-1"),
++            sync.RemoteChange(2, "task_comments", "01a1cebe-926b-753b-9c59-8a437dfc7269", "upsert",
++                              _synced_comment(tid, "default"), 1, "", "worker-1"),
++        ], new_cursor=2, observers=False)
++        assert node.import_cards(worker, replica, [tid]) == [tid]
++        got = worker.execute("SELECT origin_gateway FROM task_comments WHERE task_id = ?", (tid,)).fetchone()[0]
++    assert got == "worker-1"
++
++
+ def test_pending_hub_request_keeps_the_card_parked(kanban_home, tmp_path, monkeypatch) -> None:
+     _hub(tmp_path, "running")
+     with kbc.connect_closing() as conn:
+-- 
+2.43.0
+

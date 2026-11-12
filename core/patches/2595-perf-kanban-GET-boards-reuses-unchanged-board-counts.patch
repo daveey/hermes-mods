@@ -1,0 +1,371 @@
+From d29b70bd0f3ba1a459b39c306be8c67ad68f89ea Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:02:52 +0000
+Subject: [PATCH] perf(kanban): GET /boards reuses unchanged board counts and
+ skips the projects db [daveey]
+
+The Desktop polls GET /api/plugins/kanban/boards about 0.29 times/s. Every call
+opened a fresh guarded read-only connection per board for
+`SELECT status, COUNT(*) FROM tasks GROUP BY status`, and opened the projects db
+although no listed board had a project_id (21-28 CPU-ms per unchanged call on the
+captured Mac stores).
+
+- board_counts: keep the last counts per board db path, keyed on
+  board_rows.version(path) = (observer generation, dev, ino, schema_version,
+  data_version). The version is read before the count query, so a commit during
+  the query is re-read next poll. version() None (unobservable board) reads
+  uncached and stores nothing; a failed query stores nothing; a hit returns a
+  copy. No timer or TTL.
+- board_rows.MAX_OBSERVERS 4 -> 16: with 5+ live boards an observer would
+  otherwise be evicted and reopened every poll (new generation = permanent miss,
+  and it would evict the /board rows observer too). OBSERVER_IDLE_S unchanged.
+- list_boards: call _projects_by_id() only when a listed board has a truthy
+  project_id. Response shape unchanged.
+
+/board, board_snapshot, board_prewarm behaviour and every cadence are unchanged.
+
+Tests: tests/plugins/test_kanban_boards_poll_counts.py (8). On the parent
+f9565195f3, 3 fail: the unchanged-poll test (6 count connections opened on the
+second call), the commit test and the bookkeeping-commit test (all 6 boards
+re-read instead of only the changed one). Mutants killed: always hit, key without
+data_version, store on failed query, no copy on hit.
+
+Benchmark (local fixture on a Linux pool worker, not a Mac number): 6 boards
+(default + 5 named), one with 20,001 tasks; parent and candidate in separate
+processes, each on a fresh copy of the same fixture at the same path; median
+time.process_time over 20 calls after one warm-up, two rounds:
+- unchanged list_boards(): parent 15.8 / 17.5 ms, candidate 4.5 / 3.3 ms
+- after one status commit to the 20k board (per call): parent 14.6 / 13.5 ms,
+  candidate 4.2 / 4.3 ms
+- with a project-scoped board added (unchanged): parent 8.8 / 8.2 ms,
+  candidate 3.2 / 3.3 ms
+JSON responses byte-equal between parent and candidate for the unchanged,
+changed and project_id cases (2394 / 2394 / 2795 bytes). The captured Mac stores
+are replayed by the owner card after the merge.
+---
+ plugins/kanban/dashboard/board_counts.py      |  53 ++++-
+ plugins/kanban/dashboard/board_rows.py        |   2 +-
+ plugins/kanban/dashboard/plugin_api.py        |   3 +-
+ .../plugins/test_kanban_boards_poll_counts.py | 209 ++++++++++++++++++
+ 4 files changed, 261 insertions(+), 6 deletions(-)
+ create mode 100644 tests/plugins/test_kanban_boards_poll_counts.py
+
+diff --git a/plugins/kanban/dashboard/board_counts.py b/plugins/kanban/dashboard/board_counts.py
+index 0b4896d2e5..1224140d15 100644
+--- a/plugins/kanban/dashboard/board_counts.py
++++ b/plugins/kanban/dashboard/board_counts.py
+@@ -1,9 +1,31 @@
+-"""Switcher counts need no schema reconciliation or writer initialization."""
++"""Switcher counts need no schema reconciliation or writer initialization.
++
++GET /boards is polled continuously, and every board's count query used to open a
++fresh guarded connection. The last counts per board file are kept, keyed on
++``board_rows.version`` (observer generation, file identity, schema_version and
++``PRAGMA data_version``). Any commit by another connection moves that version, so
++an unchanged board costs two PRAGMAs on a retained connection and a changed board
++is read again on the next poll. There is no timer: the key alone decides.
++"""
++from collections import OrderedDict
+ from contextlib import closing
+ import sqlite3
++import threading
+ 
+ from hermes_cli import kanban_db
+ from hermes_cli.kanban_generation import open_ro
++from plugins.kanban.dashboard import board_rows
++
++MAX_CACHED = 64  # board files with remembered counts (one small dict each)
++
++_lock = threading.Lock()
++_cached: "OrderedDict[str, tuple[tuple, dict[str, int]]]" = OrderedDict()
++
++
++def _query(path) -> dict[str, int]:
++    with closing(open_ro(path)) as conn:
++        return {status: int(count) for status, count in conn.execute(
++            "SELECT status, COUNT(*) FROM tasks GROUP BY status")}
+ 
+ 
+ def board_counts(slug: str) -> dict[str, int]:
+@@ -11,10 +33,33 @@ def board_counts(slug: str) -> dict[str, int]:
+ 
+     Use the generation-guarded query-only connection, including its missing WAL
+     sidecar fallback. Writer connect still owns integrity checks and migrations.
++    The version is read before the query, so a commit that lands during the query
++    is read again next time. An unobservable board (version None) and a failed
++    query store nothing. A hit returns a copy: callers mutate and serialize it.
+     """
+     try:
+-        with closing(open_ro(kanban_db.kanban_db_path(board=slug))) as conn:
+-            return {status: int(count) for status, count in conn.execute(
+-                "SELECT status, COUNT(*) FROM tasks GROUP BY status")}
++        path = kanban_db.kanban_db_path(board=slug)
++        key = str(path)
++        ver = board_rows.version(key)
++        if ver is not None:
++            with _lock:
++                hit = _cached.get(key)
++                if hit is not None and hit[0] == ver:
++                    _cached.move_to_end(key)
++                    return dict(hit[1])
++        counts = _query(path)
+     except (OSError, ValueError, sqlite3.Error):
+         return {}
++    if ver is not None:
++        with _lock:
++            _cached[key] = (ver, dict(counts))
++            _cached.move_to_end(key)
++            while len(_cached) > MAX_CACHED:
++                _cached.popitem(last=False)
++    return counts
++
++
++def clear() -> None:
++    """Forget every remembered count (tests)."""
++    with _lock:
++        _cached.clear()
+diff --git a/plugins/kanban/dashboard/board_rows.py b/plugins/kanban/dashboard/board_rows.py
+index 3fe72d2d95..51cb357af5 100644
+--- a/plugins/kanban/dashboard/board_rows.py
++++ b/plugins/kanban/dashboard/board_rows.py
+@@ -46,7 +46,7 @@ log = logging.getLogger(__name__)
+ 
+ T = TypeVar("T")
+ 
+-MAX_OBSERVERS = 4  # board files with a retained observer connection
++MAX_OBSERVERS = 16  # board files with a retained observer (GET /boards observes every live board)
+ MAX_ENTRIES = 8  # materialized row sets (board x query params)
+ OBSERVER_IDLE_S = 600.0  # an observer unused this long is closed (archived/removed boards)
+ 
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 73f31393ed..1f22259314 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -1548,7 +1548,8 @@ def list_boards(include_archived: bool = Query(False)):
+     """Every board on disk with task counts and the active slug."""
+     boards = kanban_db.list_boards(include_archived=include_archived)
+     current = kanban_db.get_current_board()
+-    proj_map = _projects_by_id()
++    # The switcher polls this: open the projects db only when a listed board is project-scoped.
++    proj_map = _projects_by_id() if any(b.get("project_id") for b in boards) else {}
+     for b in boards:
+         b["is_current"] = (b["slug"] == current)
+         b["counts"] = _board_counts(b["slug"])
+diff --git a/tests/plugins/test_kanban_boards_poll_counts.py b/tests/plugins/test_kanban_boards_poll_counts.py
+new file mode 100644
+index 0000000000..630eff23b2
+--- /dev/null
++++ b/tests/plugins/test_kanban_boards_poll_counts.py
+@@ -0,0 +1,209 @@
++"""GET /boards: an unchanged poll reuses each board's counts and skips the projects db.
++
++The Desktop polls the board switcher continuously. Each board's counts are keyed on the
++retained observer's ``board_rows.version`` (generation, file identity, schema_version,
++data_version), so a poll with nothing committed opens no connection, and the next poll
++after any commit re-reads exactly the board that changed.
++"""
++from __future__ import annotations
++
++import sqlite3
++from contextlib import closing
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import projects_db as pdb
++from plugins.kanban.dashboard import board_counts, board_rows
++from tests.plugins.test_kanban_board_read_cache import _create
++
++pytest_plugins = ["tests.plugins.test_kanban_board_read_cache"]
++
++NAMED = ("alpha", "beta", "gamma", "delta", "epsilon")
++
++
++def _reset():
++    getattr(board_counts, "clear", lambda: None)()  # parent tree (RED run) has no counts cache
++    board_rows.clear()
++
++
++@pytest.fixture
++def boards(board):
++    _reset()
++    mod, _client, _reads = board
++    _create("default task")
++    for i, slug in enumerate(NAMED):
++        kb.create_board(slug)
++        with closing(kbc.connect(board=slug)) as conn:
++            for n in range(i + 1):
++                kb.create_task(conn, title=f"{slug}-{n}", assignee="w")
++    yield mod
++    _reset()
++
++
++@pytest.fixture
++def probe(monkeypatch):
++    """Count every SQLite open, every count-query connection (by board path) and every
++    statement it runs, and every projects db open."""
++    seen = {"sqlite": 0, "count_paths": [], "count_sql": [], "projects": 0}
++    real_sqlite = sqlite3.connect
++    real_open_ro = board_counts.open_ro
++    real_pconnect = pdb.connect
++
++    def sqlite_connect(*a, **k):
++        seen["sqlite"] += 1
++        return real_sqlite(*a, **k)
++
++    def open_ro(path, *a, **k):
++        seen["count_paths"].append(str(path))
++        conn = real_open_ro(path, *a, **k)
++        conn.set_trace_callback(seen["count_sql"].append)
++        return conn
++
++    def pconnect(*a, **k):
++        seen["projects"] += 1
++        return real_pconnect(*a, **k)
++
++    monkeypatch.setattr(sqlite3, "connect", sqlite_connect)
++    monkeypatch.setattr(board_counts, "open_ro", open_ro)
++    monkeypatch.setattr(pdb, "connect", pconnect)
++
++    def reset():
++        seen.update(sqlite=0, count_paths=[], count_sql=[], projects=0)
++    seen["reset"] = reset
++    return seen
++
++
++def _list(mod) -> dict:
++    return mod.list_boards(include_archived=False)
++
++
++def _counts(resp: dict) -> dict[str, dict]:
++    return {b["slug"]: b["counts"] for b in resp["boards"]}
++
++
++def _path(slug: str) -> str:
++    return str(kb.kanban_db_path(board=slug))
++
++
++def _expected() -> dict[str, dict]:
++    out = {"default": {"ready": 1}}
++    out.update({slug: {"ready": i + 1} for i, slug in enumerate(NAMED)})
++    return out
++
++
++def test_unchanged_poll_opens_nothing_and_runs_no_count_query(boards, probe):
++    mod = boards
++    first = _list(mod)
++    assert len(first["boards"]) == 6 and _counts(first) == _expected()
++    assert not any(b["project_id"] for b in first["boards"])
++    probe["reset"]()
++    second = _list(mod)
++    assert second == first
++    assert probe["count_paths"] == [] and probe["count_sql"] == []
++    assert probe["sqlite"] == 0
++    assert probe["projects"] == 0
++
++
++def test_commit_shows_on_next_poll_and_only_that_board_is_reread(boards, probe):
++    mod = boards
++    _list(mod)
++    with closing(kbc.connect(board="gamma")) as conn:
++        conn.execute("UPDATE tasks SET status = 'blocked' WHERE title = 'gamma-0'")
++        kb.create_task(conn, title="gamma-new", assignee="w")
++    probe["reset"]()
++    resp = _list(mod)
++    expected = _expected()
++    expected["gamma"] = {"ready": 3, "blocked": 1}
++    assert _counts(resp) == expected
++    assert probe["count_paths"] == [_path("gamma")]
++    probe["reset"]()
++    assert _counts(_list(mod)) == expected and probe["count_paths"] == []
++
++
++def test_replaced_board_file_reads_fresh_and_removed_board_is_dropped(boards, probe):
++    mod = boards
++    _list(mod)
++    old_ino = Path(_path("delta")).stat().st_ino
++    kb.remove_board("delta", archive=False)
++    kb.remove_board("beta", archive=False)
++    kb.create_board("delta")
++    with closing(kbc.connect(board="delta")) as conn:
++        tid = kb.create_task(conn, title="fresh", assignee="w")
++        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
++    assert Path(_path("delta")).stat().st_ino != old_ino
++    probe["reset"]()
++    counts = _counts(_list(mod))
++    assert "beta" not in counts
++    assert counts["delta"] == {"blocked": 1}
++    assert _path("delta") in probe["count_paths"]
++
++
++def test_unobservable_board_is_read_every_call(boards, probe, monkeypatch):
++    mod = boards
++    monkeypatch.setattr(board_rows, "version", lambda path: None)
++    assert _counts(_list(mod)) == _expected()
++    probe["reset"]()
++    assert _counts(_list(mod)) == _expected()
++    assert len(probe["count_paths"]) == 6
++    with closing(kbc.connect(board="alpha")) as conn:
++        conn.execute("UPDATE tasks SET status = 'done'")
++    expected = _expected()
++    expected["alpha"] = {"done": 1}
++    assert _counts(_list(mod)) == expected
++    assert not getattr(board_counts, "_cached", {})  # an unobservable board stores nothing
++
++
++def test_failed_count_query_is_not_remembered(boards, monkeypatch):
++    mod = boards
++    real = board_counts.open_ro
++    fail = {"left": 1}
++
++    def flaky(path, *a, **k):
++        if fail["left"] and str(path) == _path("epsilon"):
++            fail["left"] -= 1
++            raise sqlite3.OperationalError("database is locked")
++        return real(path, *a, **k)
++
++    monkeypatch.setattr(board_counts, "open_ro", flaky)
++    assert _counts(_list(mod))["epsilon"] == {}
++    assert _counts(_list(mod)) == _expected()
++
++
++def test_bookkeeping_commit_with_same_counts_still_rereads(boards, probe):
++    """data_version is in the key: any commit re-reads, never a stale count from an
++    older data_version even if a write left schema and file identity unchanged."""
++    mod = boards
++    _list(mod)
++    with closing(kbc.connect(board="alpha")) as conn:
++        conn.execute("UPDATE tasks SET status = 'running'")
++    probe["reset"]()
++    assert _counts(_list(mod))["alpha"] == {"running": 1}
++    assert probe["count_paths"] == [_path("alpha")]
++
++
++def test_project_scoped_board_still_gets_project_name(boards, probe):
++    mod = boards
++    with pdb.connect_closing() as pconn:
++        pid = pdb.create_project(pconn, name="Proj X")
++    kb.create_board("scoped", project_id=pid)
++    _list(mod)
++    probe["reset"]()
++    resp = _list(mod)
++    scoped = next(b for b in resp["boards"] if b["slug"] == "scoped")
++    assert scoped["project_id"] == pid and scoped["project_name"] == "Proj X"
++    assert probe["projects"] == 1
++    others = [b for b in resp["boards"] if b["slug"] != "scoped"]
++    assert all(b["project_id"] is None and b["project_name"] is None for b in others)
++
++
++def test_mutating_a_response_does_not_corrupt_the_next(boards):
++    mod = boards
++    for _ in range(2):  # miss, then hit
++        resp = _list(mod)
++        for b in resp["boards"]:
++            b["counts"]["ready"] = 999
++            b["counts"]["bogus"] = 1
++    assert _counts(_list(mod)) == _expected()
+-- 
+2.43.0
+

@@ -1,0 +1,852 @@
+From 7f90e373a010af8ec30795533c506bb3e9b458d9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 09:04:37 +0000
+Subject: [PATCH] [daveey] fix(kanban): record why the dispatcher passed over a
+ ready card; name it in ready-wait notices
+
+Defect kanban-dd62aef001 (hub, 2026-11-10): t_01a1c7a0c8139180 (bb-tuner, pinned claude-opus-5-5/anthropic)
+sat ready 33 min with free slots and no claimed/skipped_*/respawn_guarded event. The chat-wait and
+parent-unclaimed notices said "1 card(s) ahead of it, 4/7 worker slots busy" and advised a priority bump,
+which did nothing; the tick logs had rotated, so the skip site was lost.
+
+- New hermes_cli/kanban_dispatch_skip.py. record_tick (run from the observe_dispatch post-result seam,
+  non-dry ticks only) appends ONE `dispatch_skipped {reason, detail, until?}` event per card, reason and
+  ready episode for skipped_ineligible, capsule_refused, no_progress_held, per_profile_capped,
+  claim_deferred (Board/claim refusals), owner_down and pinned_quota_wall. A repeated reason adds nothing;
+  a changed reason appends; at most 16 per episode.
+- Lane admission holds a fresh card (no run yet) on the ready lane whose explicit concrete pin is
+  live-quota-walled (kanban_provider_walls.live_quota_wall): resolve_dispatch_tier routes such a card
+  straight to its pin, so a claim only spawned a worker into the wall. Reason pinned_quota_wall,
+  until = the reset; clock_held so the stuck warning names the deadline.
+- kanban_queue_position (local lane: `skip`), describe, kanban_parent_unclaimed _queue_words / notice_text
+  / ready_hint and kanban_chat_wait.notice_text name the latest skip of the ready episode plus its until
+  ("held: pinned model claude-opus-5-5 (anthropic) quota-walled until 10:00Z") and drop the priority
+  advice unless the skip is about ordering (claim_deferred capacity). A local card ready >= 30 min with
+  free slots and no recorded reason reads "dispatcher skip reason unrecorded", without priority advice.
+- Latest-event readers that dedupe their own audit rows (note_nonspawnable, note_unplaceable, capsule
+  refusal, goal_run_status changes_requested, guard-hold runs, the stranded diagnostic's hold reason)
+  ignore dispatch_skipped, so the new rows neither restart a guard hold nor re-trigger those writers.
+
+Proof: tests/hermes_cli/test_kanban_dispatch_skip.py (15 tests). On origin/main with only the new module
+present, 7 fail, including the incident shape (the walled fresh pin is spawned, no event). With the fix all
+pass; 168 test files importing the touched modules (kanban dispatch/notice/queue/walls/quota suites) pass
+after updating test_kanban_provider_walls' fresh walled exact pin, which is now held instead of spawned.
+---
+ hermes_cli/kanban_capacity_evidence.py        |   5 +-
+ hermes_cli/kanban_capsule_admission.py        |   2 +-
+ hermes_cli/kanban_chat_wait.py                |   2 +-
+ hermes_cli/kanban_db.py                       |   2 +-
+ hermes_cli/kanban_db_dispatch.py              |   6 +-
+ hermes_cli/kanban_db_dispatch_admission.py    |   6 +-
+ hermes_cli/kanban_db_dispatch_guard_notice.py |   2 +-
+ hermes_cli/kanban_db_dispatch_preclaim.py     |   4 +-
+ hermes_cli/kanban_diagnostics.py              |   2 +-
+ hermes_cli/kanban_dispatch_skip.py            | 230 +++++++++++++++
+ hermes_cli/kanban_parent_unclaimed.py         |  17 +-
+ hermes_cli/kanban_queue_position.py           |  18 +-
+ tests/hermes_cli/test_kanban_dispatch_skip.py | 261 ++++++++++++++++++
+ .../hermes_cli/test_kanban_provider_walls.py  |   5 +-
+ 14 files changed, 542 insertions(+), 20 deletions(-)
+ create mode 100644 hermes_cli/kanban_dispatch_skip.py
+ create mode 100644 tests/hermes_cli/test_kanban_dispatch_skip.py
+
+diff --git a/hermes_cli/kanban_capacity_evidence.py b/hermes_cli/kanban_capacity_evidence.py
+index bf3d9e95e2..7c534bfd28 100644
+--- a/hermes_cli/kanban_capacity_evidence.py
++++ b/hermes_cli/kanban_capacity_evidence.py
+@@ -71,7 +71,7 @@ def _task_reasons(result, tid, reference):
+         reasons.append(_reason("provider_limit", "rate_limited", reference, "post_claim"))
+     # Only explicit provider quota clocks; generic cooldowns are not provider limits.
+     held = result.clock_held.get(tid)
+-    if held and held[0] in {"subscription_quota_reset", "rate_limit_cooldown"}:
++    if held and held[0] in {"subscription_quota_reset", "rate_limit_cooldown", "pinned_quota_wall"}:
+         reasons.append(_reason("provider_limit", held[0], reference))
+     for task, native in result.respawn_guarded:
+         if task == tid and native in {"subscription_quota_reset", "rate_limit_cooldown"}:
+@@ -175,6 +175,9 @@ def observe_dispatch(conn, result, *, board, dry_run=False, update_drain=False):
+                dry_run=dry_run, update_drain=update_drain)
+     except Exception:  # health: allow BLE001 -- optional evidence cannot control admission
+         _log.warning("capacity observation unavailable", exc_info=True)
++    # One durable reason per passed-over card and ready episode (kanban-dd62aef001); never raises. [daveey]
++    from hermes_cli.kanban_dispatch_skip import record_tick
++    record_tick(conn, result, dry_run=dry_run)
+ 
+ 
+ def _unknown(reason, **fields):
+diff --git a/hermes_cli/kanban_capsule_admission.py b/hermes_cli/kanban_capsule_admission.py
+index b06d4ce4ac..1866acb843 100644
+--- a/hermes_cli/kanban_capsule_admission.py
++++ b/hermes_cli/kanban_capsule_admission.py
+@@ -314,7 +314,7 @@ def _record_refusal(conn: sqlite3.Connection, task_id: str, payload: dict) -> No
+     """Audit only (never authority): one event per distinct refusal, not one per tick."""
+     from hermes_cli import kanban_db as kb
+     with kb.write_txn(conn):
+-        last = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? "
++        last = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND kind != 'dispatch_skipped' "
+                             "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+         if last is None or last["kind"] != REFUSAL_EVENT or last["payload"] != kb._json_or_null(payload):
+             kb._append_event(conn, task_id, REFUSAL_EVENT, payload)
+diff --git a/hermes_cli/kanban_chat_wait.py b/hermes_cli/kanban_chat_wait.py
+index 2c5a04d75e..8e977ad386 100644
+--- a/hermes_cli/kanban_chat_wait.py
++++ b/hermes_cli/kanban_chat_wait.py
+@@ -108,7 +108,7 @@ def notice_text(payload: Any) -> str:
+         hold = f"; dispatcher hold {payload['hold_reason']} until {stamp}"
+     return (f"{named}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min with no "
+             f"worker ({payload.get('queue') or 'queue place unknown'}{hold}){pu._observation(payload)}. "
+-            + pu._options(tid, payload.get("priority_evidence")) + ".")
++            + pu._options(tid, payload.get("priority_evidence"), payload) + ".")
+ 
+ 
+ def _floor_kinds() -> str:
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 5812bddfca..ff20169ba9 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2222,7 +2222,7 @@ def goal_run_status(
+             return "superseded"
+     if task.status in {"ready", "todo"}:
+         event = conn.execute(
+-            "SELECT kind FROM task_events WHERE task_id = ? "
++            "SELECT kind FROM task_events WHERE task_id = ? AND kind != 'dispatch_skipped' "
+             "ORDER BY id DESC LIMIT 1", (task_id,),
+         ).fetchone()
+         if event and event["kind"] == "changes_requested":
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index cf9404bfa1..72635ae868 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -207,8 +207,8 @@ class DispatchResult:
+     crashed: list[str] = field(default_factory=list)
+     """Task ids reclaimed because their worker PID disappeared."""
+     capsule_refused: list[tuple[str, str]] = field(default_factory=list)  # (task_id, code): kanban_capsule_admission [daveey]
+-    remote_archived: list[str] = field(default_factory=list)
+-    """Task ids archived on a stop request from another gateway (``kanban_remote_stop``)."""
++    pinned_quota_held: list = field(default_factory=list)  # (task_id, model, provider, reset): kanban_dispatch_skip
++    remote_archived: list[str] = field(default_factory=list)  # archived on another gateway's stop (kanban_remote_stop)
+     auto_blocked: list[str] = field(default_factory=list)
+     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+     agent_block_escalated: list[str] = field(default_factory=list)
+@@ -1933,7 +1933,7 @@ def _dispatch_lane_task(
+     task_id = row["id"]
+     from hermes_cli.kanban_db_dispatch_admission import lane_admission_refused  # nonspawnable, capsule [daveey]
+     if lane_admission_refused(conn, task_id, assignee, result, profile_exists=_profile_exists_fn(),
+-                              spawn_fn=spawn_fn, dry_run=dry_run):
++                              spawn_fn=spawn_fn, dry_run=dry_run, lane=lane):
+         return False
+     # Per-profile cap: one profile's local model / API quota / browser pool
+     # must not be overwhelmed by a fan-out even with global headroom.
+diff --git a/hermes_cli/kanban_db_dispatch_admission.py b/hermes_cli/kanban_db_dispatch_admission.py
+index 3736669fad..8b7653bea9 100644
+--- a/hermes_cli/kanban_db_dispatch_admission.py
++++ b/hermes_cli/kanban_db_dispatch_admission.py
+@@ -11,7 +11,7 @@ import sqlite3
+ 
+ 
+ def lane_admission_refused(conn: sqlite3.Connection, task_id: str, assignee: str, result, *,
+-                           profile_exists, spawn_fn, dry_run: bool) -> bool:
++                           profile_exists, spawn_fn, dry_run: bool, lane: str = "ready") -> bool:
+     """True (recorded on ``result``) when the row is not admissible on this dispatcher."""
+     from hermes_cli.kanban_capsule_admission import dispatch_refusal
+ 
+@@ -33,7 +33,9 @@ def lane_admission_refused(conn: sqlite3.Connection, task_id: str, assignee: str
+     if not dry_run and (held := no_progress_hold(conn, task_id)) is not None:
+         result.no_progress_held.append((task_id, held))
+         return True
+-    return False
++    # A fresh card pinned to a quota-walled model would only spawn into the wall (kanban_dispatch_skip). [daveey]
++    from hermes_cli.kanban_dispatch_skip import hold_pinned_quota
++    return hold_pinned_quota(conn, task_id, result, lane=lane)
+ 
+ 
+ def capsule_claim_check(conn: sqlite3.Connection, task_id: str, assignee: str, spawn_fn):
+diff --git a/hermes_cli/kanban_db_dispatch_guard_notice.py b/hermes_cli/kanban_db_dispatch_guard_notice.py
+index 6cfe1d1d7a..ed6cf693f4 100644
+--- a/hermes_cli/kanban_db_dispatch_guard_notice.py
++++ b/hermes_cli/kanban_db_dispatch_guard_notice.py
+@@ -32,7 +32,7 @@ def _current_guard_hold(
+     comment_filter = (
+         "NOT (kind = 'commented' AND json_extract(payload, '$.author') = 'kanban-dispatcher')"
+         if include_replies else "kind != 'commented'"
+-    )
++    ) + " AND kind != 'dispatch_skipped'"  # a skip record neither starts nor ends a guard hold
+     events = sorted(
+         (stamp, row[0], row[1], row[2])
+         for row in conn.execute(
+diff --git a/hermes_cli/kanban_db_dispatch_preclaim.py b/hermes_cli/kanban_db_dispatch_preclaim.py
+index 9d11d1ff22..791bcad6ab 100644
+--- a/hermes_cli/kanban_db_dispatch_preclaim.py
++++ b/hermes_cli/kanban_db_dispatch_preclaim.py
+@@ -15,7 +15,7 @@ def note_nonspawnable(conn: sqlite3.Connection, task_id: str, assignee: str, *,
+     from hermes_cli import kanban_db as kb
+     with kb.write_txn(conn):
+         last = conn.execute(
+-            "SELECT kind, payload FROM task_events WHERE task_id = ? "
++            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind != 'dispatch_skipped' "
+             "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+         if (last is None or last["kind"] != "skipped_nonspawnable"
+                 or last["payload"] != kb._json_or_null({"assignee": assignee})):
+@@ -61,7 +61,7 @@ def note_unplaceable(conn: sqlite3.Connection, task_id: str) -> None:
+     payload = {"runs_on": place["runs_on"], "missing": place["missing"], "machines": place["machines"]}
+     with kb.write_txn(conn):
+         last = conn.execute(
+-            "SELECT kind, payload FROM task_events WHERE task_id = ? "
++            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind != 'dispatch_skipped' "
+             "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+         if last is None or last["kind"] != "skipped_unplaceable" or last["payload"] != kb._json_or_null(payload):
+             kb._append_event(conn, task_id, "skipped_unplaceable", payload)
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index bc5126d718..bae6e9b7a2 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -783,7 +783,7 @@ def _ready_hold_reason(task, events, cfg) -> Optional[str]:
+     Capacity checks can precede pickup/guard evaluation, leaving old guard history on a
+     replica-only card. A same-second clear must outrank the guard it retired.
+     """
+-    evs = list(events or [])
++    evs = [ev for ev in (events or []) if _event_kind(ev) != "dispatch_skipped"]  # skip records end no guard
+     latest = max(evs, key=lambda ev: (_event_ts(ev), _task_field(ev, "id", 0) or 0)) if evs else None
+     if latest is not None and _event_kind(latest) == "respawn_guarded":
+         return "respawn_guarded"
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+new file mode 100644
+index 0000000000..2b5c512920
+--- /dev/null
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -0,0 +1,230 @@
++"""Durable reasons for a ready/review card a dispatcher tick passed over without claiming it. [daveey]
++
++Defect kanban-dd62aef001 (hub, 2026-11-10): t_01a1c7a0c8139180 (bb-tuner, pinned claude-opus-5-5/anthropic) sat
++ready 33 min with free worker slots while another bb-tuner card was claimed. The card carried no ``claimed``,
++``skipped_*`` or ``respawn_guarded`` event, so the chat-wait and parent-unclaimed notices fell back to "no worker
++(1 card(s) ahead of it, 4/7 worker slots busy)" and suggested a priority bump. The bump did nothing; an agent
++guessed a quota wall and parked the card. The tick logs had rotated, so the real skip site was lost.
++
++* :func:`record_tick` (the dispatcher's post-result seam, ``kanban_capacity_evidence.observe_dispatch``) appends
++  ONE ``dispatch_skipped {reason, detail, until?}`` event per (card, reason, detail) per ready episode for every
++  row the tick passed over: ``skipped_ineligible``, ``capsule_refused``, ``no_progress_held``,
++  ``per_profile_capped``, ``claim_deferred`` (Board/claim refusals), ``owner_down`` and ``pinned_quota_wall``.
++  The same reason on later ticks adds nothing; a changed reason appends. At most :data:`MAX_PER_EPISODE` per
++  episode, so two dispatchers that disagree cannot grow a card's history without bound.
++* :func:`pinned_quota_hold` holds a fresh card (no run yet) on the ready lane whose explicit pin's provider pool
++  is quota-walled right now (``kanban_provider_walls.live_quota_wall``): its first worker would exit 75 into
++  the wall. Reason ``pinned_quota_wall``, ``until`` = the reset.
++* :func:`latest` is the newest skip of the current ready episode; ``kanban_queue_position``, the chat-wait and
++  the parent-unclaimed notices name it (:func:`words`) and drop the priority advice unless it is about ordering
++  (:func:`is_ordering`). A card ready :data:`UNRECORDED_AFTER_SECONDS` with free slots and no recorded reason
++  reads :data:`UNRECORDED` (:func:`unrecorded`), never a priority bump.
++
++Advisory, like every notice: the dispatcher's live verdict decides admission, and a failure here never stops a
++tick.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import time
++from typing import Any, Optional
++
++_log = logging.getLogger(__name__)
++
++EVENT = "dispatch_skipped"
++PINNED_QUOTA_WALL = "pinned_quota_wall"
++MAX_PER_EPISODE = 16
++DETAIL_CHARS = 200
++UNRECORDED_AFTER_SECONDS = 30 * 60
++UNRECORDED = "dispatcher skip reason unrecorded"
++# Events after which an earlier skip no longer describes the card (same set the recorded guard reads).
++_EPISODE_KINDS = ("continued", "scheduled", "reassigned", "reopened", "hold_released", "respawn_guarded")
++
++
++def _episode_kinds() -> set[str]:
++    from hermes_cli.kanban_diagnostics import _READY_WAIT_FLOOR_KINDS
++    return {*_READY_WAIT_FLOOR_KINDS, *_EPISODE_KINDS}
++
++
++def episode_skips(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
++    """``dispatch_skipped`` payloads of the current ready episode, newest first. A ``respawn_guarded`` event
++    ends the run of skips it follows: the guard is then the newer verdict (``kanban_queue_position``)."""
++    from hermes_cli import kanban_db as kb
++    kinds = sorted({*_episode_kinds(), EVENT})
++    slots = ",".join("?" for _ in kinds)
++    out: list[dict[str, Any]] = []
++    for kind, payload, created_at in conn.execute(
++            f"SELECT kind, payload, created_at FROM task_events WHERE task_id = ? AND kind IN ({slots}) "
++            "ORDER BY created_at DESC, id DESC LIMIT ?", (task_id, *kinds, MAX_PER_EPISODE + 1)):
++        if kind != EVENT:
++            break
++        out.append({**kb._json_dict(payload), "at": kb._to_epoch(created_at)})
++    return out
++
++
++def latest(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
++    """The newest skip of the current ready episode (``reason``, ``detail``, ``until`` when known, ``at``)."""
++    skips = episode_skips(conn, task_id)
++    return skips[0] if skips and isinstance(skips[0].get("reason"), str) else None
++
++
++def record(conn: sqlite3.Connection, task_id: str, reason: str, *, detail: Any = None,
++           until: Optional[float] = None, extra: Optional[dict[str, Any]] = None) -> bool:
++    """Append the skip unless the episode's latest skip already says the same; True when it appended."""
++    from hermes_cli import kanban_db as kb
++    detail = None if detail is None else str(detail)[:DETAIL_CHARS]
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        if row is None or row["status"] not in ("ready", "review"):
++            return False  # it left the lane this tick (no-progress park, claimed): nothing waits any more
++        skips = episode_skips(conn, task_id)
++        if skips and (skips[0].get("reason"), skips[0].get("detail")) == (reason, detail):
++            return False
++        if len(skips) >= MAX_PER_EPISODE:
++            return False
++        payload: dict[str, Any] = {"reason": reason, "detail": detail, **(extra or {})}
++        if until is not None:
++            payload["until"] = int(until)
++        kb._append_event(conn, task_id, EVENT, payload)
++    return True
++
++
++def _tick_skips(result: Any) -> list[tuple[str, str, Any, Optional[float], dict[str, Any]]]:
++    """``(task_id, reason, detail, until, extra)`` for every row ``result`` says the tick passed over."""
++    out: list[tuple[str, str, Any, Optional[float], dict[str, Any]]] = []
++    for name in ("skipped_ineligible", "capsule_refused", "no_progress_held", "claim_deferred"):
++        out += [(tid, name, code, None, {}) for tid, code in getattr(result, name, ())]
++    out += [(tid, "per_profile_capped", who, None, {"running": n})
++            for tid, who, n in getattr(result, "skipped_per_profile_capped", ())]
++    out += [(tid, "owner_down", f"{who}:{code}", None, {}) for tid, who, code in getattr(result, "owner_down", ())]
++    out += [(tid, PINNED_QUOTA_WALL, f"{model} ({provider})", until, {"model": model, "provider": provider})
++            for tid, model, provider, until in getattr(result, "pinned_quota_held", ())]
++    return out
++
++
++def record_tick(conn: sqlite3.Connection, result: Any, *, dry_run: bool = False) -> int:
++    """Record every skip of one finished tick; returns how many events were appended. Never raises."""
++    if dry_run or getattr(result, "skipped_locked", False) or getattr(result, "skipped_owned", False):
++        return 0
++    written = 0
++    for tid, reason, detail, until, extra in _tick_skips(result):
++        try:
++            written += record(conn, tid, reason, detail=detail, until=until, extra=extra)
++        except Exception:  # health: allow BLE001 -- the skip already happened; its evidence is advisory
++            _log.debug("kanban dispatch: skip record failed for %s (%s)", tid, reason, exc_info=True)
++    return written
++
++
++# --- fresh card on a quota-walled explicit pin --------------------------------------------------------------
++
++
++def pinned_quota_hold(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, str, float]]:
++    """``(model, provider, reset)`` when ``task_id`` has no run yet, an explicit concrete pin, and that pin's
++    provider pool is quota-walled for the model right now; else None.
++
++    Only a fresh card: once a run hit the wall its quota episode (``kanban_quota_episode``) and the in-class
++    reroute (``kanban_pin_reroute``) decide. A fresh pinned card is routed straight to its pin
++    (``kanban_model_tier.resolve_dispatch_tier``), so claiming it would only spawn a worker into the wall."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_pin_reroute import pin
++    from hermes_cli.kanban_provider_walls import live_quota_wall
++    if conn.execute("SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)).fetchone() is not None:
++        return None
++    pinned = pin(kb.get_task(conn, task_id))
++    if pinned is None:
++        return None
++    until = live_quota_wall(pinned[1], pinned[0])
++    if until is None or until <= time.time():
++        return None
++    return pinned[0], pinned[1], float(until)
++
++
++def hold_pinned_quota(conn: sqlite3.Connection, task_id: str, result: Any, *, lane: str) -> bool:
++    """Pre-claim lane admission: True (recorded on ``result``) when :func:`pinned_quota_hold` holds the row."""
++    if lane != "ready":
++        return False
++    held = pinned_quota_hold(conn, task_id)
++    if held is None:
++        return False
++    result.pinned_quota_held.append((task_id, *held))
++    result.clock_held[task_id] = (PINNED_QUOTA_WALL, int(held[2]))
++    return True
++
++
++# --- wording for queue places and notices ------------------------------------------------------------------
++
++
++def _stamp(epoch: Any, now: Optional[float] = None) -> str:
++    try:
++        when = time.gmtime(int(epoch))
++    except (TypeError, ValueError, OverflowError, OSError):
++        return "an unknown time"
++    today = time.gmtime(time.time() if now is None else now)
++    return time.strftime("%H:%MZ" if when[:3] == today[:3] else "%Y-%m-%d %H:%MZ", when)
++
++
++_WORDS = {
++    PINNED_QUOTA_WALL: "held: pinned model {detail} quota-walled",
++    "per_profile_capped": "skipped: assignee {detail} is at its per-profile worker cap",
++    "skipped_ineligible": "skipped: this machine cannot lease it ({detail})",
++    "capsule_refused": "skipped: capsule admission refused it ({detail})",
++    "no_progress_held": "held: no-progress budget spent ({detail})",
++    "claim_deferred": "skipped: the Board deferred its claim ({detail})",
++    "owner_down": "held: the assignee's gateway service is down ({detail})",
++}
++
++
++def words(skip: dict[str, Any], *, now: Optional[float] = None) -> str:
++    """The skip as one clause, e.g. ``held: pinned model claude-opus-5-5 (anthropic) quota-walled until 01:59Z``."""
++    reason = str(skip.get("reason") or "unknown")
++    detail = skip.get("detail") or "no detail"
++    text = _WORDS.get(reason, "skipped: {reason} ({detail})").format(reason=reason, detail=detail)
++    if skip.get("until"):
++        text += f" until {_stamp(skip['until'], now)}"
++    return text
++
++
++def is_ordering(skip: Optional[dict[str, Any]]) -> bool:
++    """True when the skip is about queue order or slots, where priority is a fair question."""
++    return bool(skip) and skip.get("reason") == "claim_deferred" and skip.get("detail") == "capacity"
++
++
++def advice(skip: dict[str, Any]) -> str:
++    """What to do about a non-ordering skip; never a priority change."""
++    if skip.get("reason") == PINNED_QUOTA_WALL:
++        return ("it starts on its own when that wall resets. Re-pin it (`hermes kanban set-model <id> ...`) only if it "
++                "cannot wait; priority changes do not clear a quota wall. Do not run its work outside the dispatcher")
++    return ("resolve that dispatcher skip reason; priority changes do not clear it. "
++            "Do not run its work outside the dispatcher")
++
++
++UNRECORDED_ADVICE = (f"{UNRECORDED}: slots are free, yet no tick recorded why it passed this card over. Read the live "
++                     "verdict (`hermes kanban dispatch --dry-run --json`) before changing anything; priority changes "
++                     "are not the fix. Do not run its work outside the dispatcher")
++
++
++def unrecorded(place: Optional[dict[str, Any]], ready_seconds: Optional[float]) -> bool:
++    """A local-lane card ready :data:`UNRECORDED_AFTER_SECONDS` or more, with free slots, and no recorded skip."""
++    place = place or {}
++    if place.get("lane") != "local" or place.get("skip") or ready_seconds is None:
++        return False
++    running, limit = place.get("running"), place.get("limit")
++    return (ready_seconds >= UNRECORDED_AFTER_SECONDS and isinstance(running, int) and isinstance(limit, int)
++            and running < limit)
++
++
++def notice_fields(place: Optional[dict[str, Any]], ready_seconds: Optional[float]) -> dict[str, Any]:
++    """Payload fields for a ready-wait notice: ``dispatch_skip`` or ``skip_unrecorded``; empty otherwise."""
++    skip = (place or {}).get("skip")
++    if skip:
++        return {"dispatch_skip": {k: skip.get(k) for k in ("reason", "detail", "until") if skip.get(k) is not None}}
++    return {"skip_unrecorded": True} if unrecorded(place, ready_seconds) else {}
++
++
++def notice_advice(payload: dict[str, Any]) -> Optional[str]:
++    """The advice for a notice payload carrying :func:`notice_fields`, or None for the ordinary capacity advice."""
++    skip = payload.get("dispatch_skip")
++    if isinstance(skip, dict) and skip and not is_ordering(skip):
++        return advice(skip)
++    return UNRECORDED_ADVICE if payload.get("skip_unrecorded") else None
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 3cf9e6dd57..9a5dd9db77 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -57,12 +57,15 @@ def _queue_words(place: dict[str, Any]) -> str:
+         from hermes_cli import kanban_queue_position as kqp
+         return kqp.headline(place) if place["lane"] == "machine" else str(kqp.describe(place))
+     from hermes_cli.kanban_queue_position import ahead_words
++    from hermes_cli import kanban_dispatch_skip as skips
+     ahead = place.get("ahead")
+     words = ahead_words(place, "{n} card(s) ahead of it") if ahead is not None else "queue place unknown"
+     if place.get("running") is not None and place.get("limit") is not None:
+         words += f", {place['running']}/{place['limit']} worker slots busy"
+     elif place.get("limit") is not None and "running" in place:
+         words += f", running count unknown (cap {place['limit']})"
++    if place.get("skip"):  # the recorded reason comes first: a bare queue place read as an ordering wait [daveey]
++        words = f"{skips.words(place['skip'])}; {words}"
+     return words
+ 
+ 
+@@ -77,9 +80,12 @@ def _observation(payload: dict[str, Any]) -> str:
+     return f" [board {payload.get('board') or 'unknown'}, observed {stamp}, admission reason {reason}]"
+ 
+ 
+-def _options(parent_id: str, evidence: Optional[dict[str, Any]] = None) -> str:
++def _options(parent_id: str, evidence: Optional[dict[str, Any]] = None,
++             payload: Optional[dict[str, Any]] = None) -> str:
++    """Capacity advice, or the recorded skip's (or the unrecorded skip's) advice without priority changes."""
++    from hermes_cli.kanban_dispatch_skip import notice_advice
+     from hermes_cli.kanban_priority import advice
+-    return f"{NO_FIX}: " + advice(parent_id, evidence)
++    return f"{NO_FIX}: " + (notice_advice(payload or {}) or advice(parent_id, evidence))
+ 
+ 
+ def notice_text(payload: Any) -> str:
+@@ -89,7 +95,7 @@ def notice_text(payload: Any) -> str:
+     title = str(payload.get("parent_title") or "").strip()[:120]
+     named = f"{parent} ({title})" if title else parent
+     advice = ("Check the current dispatcher verdict and resolve the recorded guard; priority changes do not clear it"
+-              if payload.get("respawn_guard") else _options(parent, payload.get("priority_evidence")))
++              if payload.get("respawn_guard") else _options(parent, payload.get("priority_evidence"), payload))
+     return (f"Waiting {payload.get('wait_minutes', '?')} min on parent {named}, which has been ready "
+             f"{payload.get('ready_minutes', '?')} min with no worker ({payload.get('queue') or 'queue place unknown'})"
+             + _observation(payload) + ". " + advice + ".")
+@@ -108,8 +114,9 @@ def ready_hint(conn, task, *, now: Optional[float] = None) -> Optional[str]:
+     place = _place(conn, task.id)
+     if place.get("lane") == "respawn_guard":
+         return f"Ready {_minutes(waited)} min, unclaimed; {kqp.describe(place)}."
++    from hermes_cli.kanban_dispatch_skip import notice_fields
+     return (f"Ready {_minutes(waited)} min, unclaimed; {_queue_words(place)}. "
+-            + _options(task.id, lane_evidence(conn, task.id)) + ".")
++            + _options(task.id, lane_evidence(conn, task.id), notice_fields(place, waited)) + ".")
+ 
+ 
+ _CANDIDATES = (
+@@ -181,6 +188,7 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+         still = conn.execute("SELECT status, claim_lock FROM tasks WHERE id = ?", (waiting_on,)).fetchone()
+         if still is None or still["status"] != "ready" or still["claim_lock"]:
+             return False
++        from hermes_cli.kanban_dispatch_skip import notice_fields
+         from hermes_cli.kanban_priority import lane_evidence
+         kb._append_event(conn, task_id, kind, {
+             "parent": waiting_on, "parent_title": parent_title, "wait_event_id": wait_key,
+@@ -188,5 +196,6 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+             "queue": kqp.describe(place) if guard else _queue_words(place), **observed, **(extra or {}),
+             "respawn_guard": guard,
+             "priority_evidence": lane_evidence(conn, waiting_on),
++            **({} if guard else notice_fields(place, ready_seconds)),
+         })
+     return True
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 0ccddfc83c..9fa4a7f0f1 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -137,7 +137,7 @@ def recorded_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+     from hermes_cli.kanban_diagnostics import _READY_WAIT_FLOOR_KINDS
+ 
+     kinds = {*_READY_WAIT_FLOOR_KINDS, "respawn_guarded", "continued", "scheduled", "reassigned", "reopened",
+-             "hold_released"}
++             "hold_released", "dispatch_skipped"}  # a later dispatcher skip is the newer verdict
+     slots = ",".join("?" for _ in kinds)
+     row = conn.execute(
+         f"SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ({slots}) "
+@@ -184,6 +184,10 @@ def position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Opt
+              "board": khc.board_of(conn) or board, "observed_at": int(time.time())}
+     if elsewhere:  # only when other boards' cards rank ahead: the single-board payload keeps its shape
+         place["ahead_other_boards"] = elsewhere
++    from hermes_cli import kanban_dispatch_skip as skips
++    skip = skips.latest(conn, task.id)
++    if skip:  # why the last tick passed it over (kanban-dd62aef001): no longer a bare slot wait [daveey]
++        place["skip"] = skip
+     return place
+ 
+ 
+@@ -264,6 +268,13 @@ def describe(place: Optional[dict[str, Any]]) -> Optional[str]:
+         return headline(place) + ". " + _NOT_STUCK
+     if lane == "worker_pool":
+         return f"waiting for a pool worker ({place.get('reason') or 'no reason recorded'}). " + _NOT_STUCK
++    return local_words(place)
++
++
++def local_words(place: dict[str, Any]) -> str:
++    """``describe`` for the ``local`` lane: the recorded dispatcher skip first, when there is one."""
++    from hermes_cli import kanban_dispatch_skip as skips
++    skip = place.get("skip")
+     ahead = place.get("ahead")
+     words = (ahead_words(place, "waiting for a local slot: ~{n} ahead") if ahead is not None
+              else "waiting for a local slot")
+@@ -271,7 +282,10 @@ def describe(place: Optional[dict[str, Any]]) -> Optional[str]:
+         words += f", {place['running']}/{place['limit']} running"
+     elif place.get("limit") is not None and "running" in place:
+         words += f", running count unknown (cap {place['limit']})"
+-    return words + ". " + _NOT_STUCK
++    if not skip:
++        return words + ". " + _NOT_STUCK
++    words = f"last dispatcher skip of this ready episode: {skips.words(skip)} ({words})"
++    return words + ". " + (_NOT_STUCK if skips.is_ordering(skip) else skips.advice(skip))
+ 
+ 
+ def read(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Optional[dict[str, Any]]:
+diff --git a/tests/hermes_cli/test_kanban_dispatch_skip.py b/tests/hermes_cli/test_kanban_dispatch_skip.py
+new file mode 100644
+index 0000000000..fa45efccc0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_skip.py
+@@ -0,0 +1,261 @@
++"""A ready card the dispatcher passes over carries ONE durable skip reason per ready episode (kanban-dd62aef001).
++
++Hub 2026-11-10: t_01a1c7a0c8139180 (pinned claude-opus-5-5/anthropic) sat ready 33 min with free slots and no
++``claimed``/``skipped_*``/``respawn_guarded`` event; the chat-wait notice said "1 card(s) ahead of it, 4/7 worker
++slots busy" and advised a priority bump, which did nothing.
++"""
++import pytest
++
++from hermes_cli import kanban_chat_wait as cw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_dispatch_guard_notice as guard_notice
++from hermes_cli import kanban_dispatch_skip as skips
++from hermes_cli import kanban_parent_unclaimed as pu
++from hermes_cli import kanban_provider_walls as walls
++from hermes_cli import kanban_queue_position as qp
++from hermes_cli import kanban_worker_node as kwn
++from tests.hermes_cli.test_kanban_quota_episode import board as board, routing  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
++
++START = 1_800_000_000  # 2027-01-15T08:00:00Z
++RESET = START + 2 * 3600  # 10:00Z the same day
++PIN = ("claude-opus-5-5", "anthropic")
++PRIORITY_WORDS = ("bump", "re-place on a capable gateway")
++
++
++def _clock(monkeypatch):
++    clock = [START]
++    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
++    return clock
++
++
++def _skips(conn, tid):
++    return [kb._json_dict(r[0]) for r in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id", (tid, skips.EVENT))]
++
++
++def _tick(conn, **kw):
++    seen = []
++    dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append(task.id), **kw)
++    return seen
++
++
++def _walled(monkeypatch, until=RESET):
++    calls = []
++
++    def wall(provider, model):
++        calls.append((provider, model))
++        return until if (model, provider) == PIN else None
++    monkeypatch.setattr(walls, "live_quota_wall", wall)
++    return calls
++
++
++def _notice(conn, tid):
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                       (tid, cw.NOTICE_KIND)).fetchone()
++    return kb._json_dict(row[0]) if row else None
++
++
++def test_fresh_pin_on_quota_wall_is_held_with_one_reason_and_the_notice_names_it(
++        board, monkeypatch, all_assignees_spawnable):
++    clock = _clock(monkeypatch)
++    routing(monkeypatch)
++    calls = _walled(monkeypatch)
++    monkeypatch.setattr(qp, "_running_and_limit", lambda *_a: (4, 7))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="bb-tuner pinned", assignee="a", model_override=PIN[0],
++                             provider_override=PIN[1], session_id="chat")
++        free = kb.create_task(conn, title="unpinned sibling", assignee="a")
++        spawned = []
++        for _ in range(4):
++            spawned += _tick(conn)
++            clock[0] += 60
++        assert tid not in spawned and free in spawned  # free slots: only the walled pin is held
++        assert ("anthropic", "claude-opus-5-5") in calls
++        assert _skips(conn, tid) == [{"reason": "pinned_quota_wall", "detail": "claude-opus-5-5 (anthropic)",
++                                      "model": PIN[0], "provider": PIN[1], "until": RESET}]
++        task = kb.get_task(conn, tid)
++        assert task.status == "ready" and not task.claim_lock
++        place = qp.position(conn, task)
++        assert place["lane"] == "local" and place["skip"]["reason"] == "pinned_quota_wall"
++        line = qp.describe(place)
++        assert "held: pinned model claude-opus-5-5 (anthropic) quota-walled until 10:00Z" in line
++        assert not any(w in line for w in PRIORITY_WORDS)
++
++        clock[0] = START + 31 * 60
++        assert cw.sweep(conn, now=clock[0]) == 1
++        payload = _notice(conn, tid)
++        assert payload["dispatch_skip"] == {"reason": "pinned_quota_wall", "detail": "claude-opus-5-5 (anthropic)",
++                                            "until": RESET}
++        for text in (cw.notice_text(payload), pu.notice_text(payload), pu.ready_hint(conn, task, now=clock[0])):
++            assert "held: pinned model claude-opus-5-5 (anthropic) quota-walled until 10:00Z" in text
++            assert not any(w in text for w in PRIORITY_WORDS), text
++            assert skips.UNRECORDED not in text
++
++
++def test_walled_pin_dry_run_holds_without_writing(board, monkeypatch, all_assignees_spawnable):
++    _clock(monkeypatch)
++    routing(monkeypatch)
++    _walled(monkeypatch)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="pinned", assignee="a", model_override=PIN[0], provider_override=PIN[1])
++        res = dispatch.dispatch_once(conn, spawn_fn=lambda *_a: None, dry_run=True)
++        assert res.pinned_quota_held == [(tid, PIN[0], PIN[1], float(RESET))]
++        assert res.clock_held[tid] == ("pinned_quota_wall", RESET)
++        assert res.spawned == [] and _skips(conn, tid) == []
++
++
++@pytest.mark.parametrize("case", ["wall_cleared", "wall_past", "unpinned", "has_run"])
++def test_pin_hold_only_for_a_fresh_pin_on_a_live_wall(board, monkeypatch, all_assignees_spawnable, case):
++    clock = _clock(monkeypatch)
++    routing(monkeypatch)
++    _walled(monkeypatch, until={"wall_cleared": None, "wall_past": START - 1}.get(case, RESET))
++    with kbc.connect() as conn:
++        pin = {} if case == "unpinned" else {"model_override": PIN[0], "provider_override": PIN[1]}
++        tid = kb.create_task(conn, title="pinned", assignee="a", **pin)
++        if case == "has_run":
++            assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None  # opens a run
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, current_run_id=NULL WHERE id=?",
++                             (tid,))
++            clock[0] += 1
++        assert skips.pinned_quota_hold(conn, tid) is None
++
++
++def test_per_profile_capped_row_gets_one_event(board, monkeypatch, all_assignees_spawnable):
++    clock = _clock(monkeypatch)
++    routing(monkeypatch)
++    _walled(monkeypatch, until=None)
++    with kbc.connect() as conn:
++        first = kb.create_task(conn, title="first", assignee="a", priority=5)
++        second = kb.create_task(conn, title="second", assignee="a")
++        for _ in range(3):
++            _tick(conn, max_in_progress_per_profile=1)
++            clock[0] += 60
++        assert kb.get_task(conn, first).status == "running"
++        assert _skips(conn, second) == [{"reason": "per_profile_capped", "detail": "a", "running": 1}]
++        place = qp.position(conn, kb.get_task(conn, second))
++        assert "skipped: assignee a is at its per-profile worker cap" in qp.describe(place)
++
++
++def test_ineligible_row_gets_one_event_per_reason(board, monkeypatch, all_assignees_spawnable):
++    clock = _clock(monkeypatch)
++    routing(monkeypatch)
++    _walled(monkeypatch, until=None)
++    refusal = {"code": "labels_mismatch"}
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="elsewhere", assignee="a")
++        monkeypatch.setattr(kwn, "dispatch_refusals",
++                            lambda _c, status: {tid: refusal["code"]} if status == "ready" else {})
++        for _ in range(3):
++            assert _tick(conn) == []
++            clock[0] += 60
++        refusal["code"] = "pinned_only"
++        _tick(conn)
++        _tick(conn)
++        assert [(p["reason"], p["detail"]) for p in _skips(conn, tid)] == [
++            ("skipped_ineligible", "labels_mismatch"), ("skipped_ineligible", "pinned_only")]
++        assert skips.latest(conn, tid)["detail"] == "pinned_only"
++
++
++def test_unknown_reason_ready_30_min_with_free_slots_says_unrecorded(board, monkeypatch):
++    clock = _clock(monkeypatch)
++    monkeypatch.setattr(qp, "_running_and_limit", lambda *_a: (4, 7))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="mystery wait", assignee="a", session_id="chat")
++        clock[0] = START + 31 * 60
++        assert cw.sweep(conn, now=clock[0]) == 1
++        payload = _notice(conn, tid)
++        assert payload["skip_unrecorded"] is True and "dispatch_skip" not in payload
++        for text in (cw.notice_text(payload), pu.notice_text(payload),
++                     pu.ready_hint(conn, kb.get_task(conn, tid), now=clock[0])):
++            assert skips.UNRECORDED in text, text
++            assert not any(w in text for w in PRIORITY_WORDS), text
++
++
++@pytest.mark.parametrize("running, minutes", [(7, 31), (4, 29)])
++def test_full_host_or_short_wait_keeps_the_capacity_advice(board, monkeypatch, running, minutes):
++    clock = _clock(monkeypatch)
++    monkeypatch.setattr(qp, "_running_and_limit", lambda *_a: (running, 7))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="queued", assignee="a", session_id="chat")
++        place = qp.position(conn, kb.get_task(conn, tid))
++        assert skips.notice_fields(place, minutes * 60) == {}
++        clock[0] = START + minutes * 60
++        hint = pu.ready_hint(conn, kb.get_task(conn, tid), now=clock[0])
++        assert hint is None or (skips.UNRECORDED not in hint and "re-place on a capable gateway" in hint)
++
++
++def test_ordering_skip_keeps_the_capacity_advice(board, monkeypatch):
++    _clock(monkeypatch)
++    monkeypatch.setattr(qp, "_running_and_limit", lambda *_a: (4, 7))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="deferred", assignee="a")
++        assert skips.record(conn, tid, "claim_deferred", detail="capacity")
++        place = qp.position(conn, kb.get_task(conn, tid))
++        payload = skips.notice_fields(place, 3600)
++        assert skips.is_ordering(payload["dispatch_skip"])
++        assert skips.notice_advice(payload) is None
++        assert "relative priority bump" in qp.describe(place)
++
++
++def test_review_lane_is_never_pin_held(board, monkeypatch):
++    _clock(monkeypatch)
++    _walled(monkeypatch)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="pinned", assignee="a", model_override=PIN[0], provider_override=PIN[1])
++        res = dispatch.DispatchResult()
++        assert not skips.hold_pinned_quota(conn, tid, res, lane="review")
++        assert skips.hold_pinned_quota(conn, tid, res, lane="ready") and res.pinned_quota_held
++
++
++def test_skip_records_do_not_hide_other_latest_event_readers(board, monkeypatch):
++    from hermes_cli import kanban_capsule_admission as capsule
++    from hermes_cli.kanban_db_dispatch_preclaim import note_nonspawnable
++    _clock(monkeypatch)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="noisy", assignee="ghost")
++        other = kb.create_task(conn, title="capsule", assignee="ghost")
++        for i in range(2):
++            note_nonspawnable(conn, tid, "ghost", dry_run=False)
++            skips.record(conn, tid, "claim_deferred", detail=f"d{i}")
++            capsule._record_refusal(conn, other, {"code": "capsule_runs_on"})
++            skips.record(conn, other, "capsule_refused", detail=f"c{i}")
++
++        def kinds(task_id):
++            return [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (task_id,))]
++        assert kinds(tid).count("skipped_nonspawnable") == 1
++        assert kinds(other).count(capsule.REFUSAL_EVENT) == 1
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "changes_requested", {})
++        skips.record(conn, tid, "per_profile_capped", detail="ghost")
++        assert kb.goal_run_status(conn, tid) == "changes_requested"
++        from hermes_cli.kanban_diagnostics import _ready_hold_reason
++        with kb.write_txn(conn):
++            kb._append_event(conn, other, "respawn_guarded", {"reason": "active_pr"})
++        skips.record(conn, other, "per_profile_capped", detail="ghost")
++        assert _ready_hold_reason(kb.get_task(conn, other), kb.list_events(conn, other), {}) == "respawn_guarded"
++
++
++def test_skip_records_neither_reset_a_guard_hold_nor_grow_without_bound(board, monkeypatch):
++    clock = _clock(monkeypatch)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="guarded", assignee="a")
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
++        started = guard_notice.guard_hold_started_at(conn, tid)
++        clock[0] += 10
++        assert skips.record(conn, tid, "per_profile_capped", detail="a")
++        assert guard_notice.guard_hold_reason(conn, tid) == "active_pr"
++        assert guard_notice.guard_hold_started_at(conn, tid) == started
++        assert qp.position(conn, kb.get_task(conn, tid))["skip"]["reason"] == "per_profile_capped"
++        for i in range(skips.MAX_PER_EPISODE + 5):
++            skips.record(conn, tid, "claim_deferred", detail=f"code{i}")
++        assert len(_skips(conn, tid)) == skips.MAX_PER_EPISODE
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "claimed", {})
++        assert skips.latest(conn, tid) is None  # a claim ends the ready episode
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
++        assert not skips.record(conn, tid, "per_profile_capped", detail="a")  # off the lane: nothing waits
+diff --git a/tests/hermes_cli/test_kanban_provider_walls.py b/tests/hermes_cli/test_kanban_provider_walls.py
+index 759bb78ce1..9d0f93b192 100644
+--- a/tests/hermes_cli/test_kanban_provider_walls.py
++++ b/tests/hermes_cli/test_kanban_provider_walls.py
+@@ -137,7 +137,10 @@ def test_live_pool_exhaustion_counts_as_wall_without_a_crash(board, monkeypatch)
+                             provider_override=CODEX)
+     seen = _dispatch(conn)
+     assert seen[tid][:2] == (OPUS, "anthropic")
+-    assert seen[pinned][:2] == ("gpt-6-astra", CODEX)  # exact pins keep their tuple
++    # Exact pins keep their tuple: never rewritten, and a fresh one on a live wall is held (kanban_dispatch_skip).
++    assert pinned not in seen
++    assert [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ? AND kind = 'dispatch_skipped'",
++                                       (pinned,))] == ["dispatch_skipped"]
+ 
+ 
+ def test_every_fallback_exhausted_leaves_task_on_its_route(board, monkeypatch):
+-- 
+2.43.0
+

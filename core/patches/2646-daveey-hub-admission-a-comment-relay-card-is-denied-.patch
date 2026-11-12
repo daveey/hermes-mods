@@ -1,0 +1,220 @@
+From 0a32dcb761b85552d57df1c34c57c11e60c47105 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:50:21 +0000
+Subject: [PATCH] [daveey] hub admission: a comment-relay card is denied with
+ the worker route, no model call
+
+Workers refused foreign_card/board_pinned by kanban_comment on a hub-owned card filed relay cards
+pinned machine:hub ("only the hub can post them") that queued in the hub lane just to post a
+comment (hub-pin sweep prevention slug foreign-comment-relay: t_01a1cdddf74bf702,
+t_01a1cf3e8deb41b4, t_01a1cf4778d6d1b1, t_01a1cf4799e84072; one was moved back to the hub).
+
+kanban_comment_relay.verdict is now admit()'s first rule: a card whose title writes a
+comment/note/evidence onto named cards, with relay wording (verbatim, hub-owned, foreign_card,
+replica, only the hub ...) and none of the allowlist's hub contexts (Chrome, admin key, SSM,
+user terminal, hub worktree), is denied with the operator-call / hub-comment route as its why.
+It covers create (explicit machine:hub refuses with that route), move and courier paths.
+Against the last 5000 Board cards it matches exactly 6, all comment relays.
+---
+ hermes_cli/kanban_comment_relay.py |  53 ++++++++++++++
+ hermes_cli/kanban_hub_admission.py |   4 ++
+ tests/test_kanban_comment_relay.py | 112 +++++++++++++++++++++++++++++
+ 3 files changed, 169 insertions(+)
+ create mode 100644 hermes_cli/kanban_comment_relay.py
+ create mode 100644 tests/test_kanban_comment_relay.py
+
+diff --git a/hermes_cli/kanban_comment_relay.py b/hermes_cli/kanban_comment_relay.py
+new file mode 100644
+index 0000000000..a88f0eb49f
+--- /dev/null
++++ b/hermes_cli/kanban_comment_relay.py
+@@ -0,0 +1,53 @@
++"""A card that only relays a comment onto another card never needs a hub slot. [daveey]
++
++Workers refused ``foreign_card`` (or ``board_pinned``) by ``kanban_comment`` on a hub-owned card filed relay cards
++pinned ``machine:hub`` ("only the hub can post them") that queued in the hub lane behind real hub work just to post
++one comment (hub-pin sweep prevention slug ``foreign-comment-relay``: t_01a1cdddf74bf702, t_01a1cf3e8deb41b4,
++t_01a1cf4778d6d1b1, t_01a1cf4799e84072). Any worker posts that comment itself: the operator call
++(``kanban_supervisor_request(ops=[{"op": "operator", "action": "comment", ...}])``) or, on a
++``capability:hub-write`` worker, ``hub-comment <card> --text|--file [--board B]``.
++
++:func:`verdict` is the hub admission judge's deterministic first rule: such a card is denied with that route and no
++model call, so the refusal the creating worker reads says what to do instead. A card that also names one of the
++admission allowlist's contexts (hub Chrome, Board admin key, instance-role SSM, user terminal, a hub worktree) is left
++to the judge.
++"""
++from __future__ import annotations
++
++import re
++from typing import Optional
++
++# The title opens with a write of something onto a card ("Post two correction comments on ...").
++_VERB = re.compile(r"^\W*(?:post|relay|leave|add|write|deliver|forward|copy)\b", re.IGNORECASE)
++_PAYLOAD = re.compile(r"\b(?:comments?|notes?|evidence|results?|receipts?|corrections?)\b", re.IGNORECASE)
++_COMMENT = re.compile(r"\b(?:comments?|kanban_comment|hub-comment)\b", re.IGNORECASE)
++_CARD = re.compile(r"\bt_[0-9a-f]{16}\b")
++# What makes it a relay rather than code that happens to touch comments.
++_RELAY = re.compile(r"verbatim|hub-owned|foreign_card|board_pinned|read_only_transport|replica|only the hub|"
++                    r"owner-only|created on (?:the )?hub", re.IGNORECASE)
++# The hub-admission-test allowlist's contexts: any mention goes to the judge instead.
++_HUB_CONTEXT = re.compile(r"chrome|cloudflare access|admin key|instance[- ]role|\bssm\b|run_in_user_terminal|"
++                          r"user terminal|_wt/|\.worktrees/|unpushed", re.IGNORECASE)
++
++WHY = ("comment relay: a card that only posts a comment on another card never needs the hub. Post it from your "
++       "own card: kanban_supervisor_request(ops=[{'op': 'operator', 'action': 'comment', 'task_id': <card>, "
++       "'text': ...}]) (its home gateway applies it), or on a capability:hub-write worker run "
++       "`hub-comment <card> --text '...'` (or `--file <path>`, `--board <slug>` for another board). Do not file a "
++       "relay card.")
++
++
++def is_relay(title: str, body: str, hub_reason: Optional[str] = None) -> bool:
++    """True when the card's only work is posting comment text onto other named cards."""
++    title, body, reason = title or "", body or "", hub_reason or ""
++    text = f"{title}\n{body}"
++    return bool(_VERB.search(title) and _PAYLOAD.search(title) and _COMMENT.search(text) and _CARD.search(text)
++                and _RELAY.search(f"{text}\n{reason}") and not _HUB_CONTEXT.search(f"{text}\n{reason}"))
++
++
++def verdict(fields: dict, hub_reason: Optional[str] = None):
++    """The deny :class:`~hermes_cli.kanban_hub_admission.Verdict` for a comment-relay card, else None."""
++    from hermes_cli.kanban_hub_admission import Verdict
++    title = str(fields.get("title") or "")
++    if not is_relay(title, str(fields.get("body") or ""), hub_reason):
++        return None
++    return Verdict(admit=False, need=None, evidence=title, why=WHY, model="rule:comment-relay")
+diff --git a/hermes_cli/kanban_hub_admission.py b/hermes_cli/kanban_hub_admission.py
+index 9ba4ad08b1..fa8b2cf3d0 100644
+--- a/hermes_cli/kanban_hub_admission.py
++++ b/hermes_cli/kanban_hub_admission.py
+@@ -91,6 +91,10 @@ def admit(card_fields, *, hub_reason=None) -> Verdict:
+     """Deny if the managed subscription pool, rubric or judge is unavailable."""
+     sha = ""
+     try:
++        from hermes_cli import kanban_comment_relay
++        relay = kanban_comment_relay.verdict(card_fields, hub_reason)
++        if relay is not None:
++            return relay  # a comment relay is denied with its worker route, no model call
+         from agent import auxiliary_client as aux
+         from agent.model_routing_managed import managed_config
+         if managed_config() is None:
+diff --git a/tests/test_kanban_comment_relay.py b/tests/test_kanban_comment_relay.py
+new file mode 100644
+index 0000000000..e0d275623d
+--- /dev/null
++++ b/tests/test_kanban_comment_relay.py
+@@ -0,0 +1,112 @@
++"""A comment-relay card is denied hub admission with the worker route, and no model is asked. [daveey]
++
++The four cards are the hub-pin sweep's ``foreign-comment-relay`` evidence (titles verbatim, bodies trimmed to the
++lines that made them relays). On the parent the judge's model is asked and, here, admits every one of them.
++"""
++if not __name__.startswith("tests."): raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")  # unittest-discovery guard
++import importlib
++import json
++from types import SimpleNamespace
++
++import pytest
++
++RELAYS = [
++    ("Post two correction comments on hub-owned cards (ship never needs hub custody; real owner of "
++     "kanban-04bdba70ac)",
++     "This card only posts comments. It needs the hub because both target cards are hub-owned, and this card's "
++     "creator, hermes-worker-3, is refused with `foreign_card` and holds only replica copies. Post each comment "
++     "verbatim with kanban_comment, then complete.\n\n1. On **t_01a1cdfe0d81e0f0** ...\n2. On "
++     "**t_01a1cce501c36450** ..."),
++    ("Post PR #1251 landing note on runners/t_01a1cdc7df9e82dd",
++     "Pool worker t_01a1ce87aadbea4d is pinned to board default and cannot write to the runners board: "
++     "kanban_comment returns board_pinned, and cross_task is a read-only replica. This card must run on the hub "
++     "because the hub can write to the runners board.\n\nAction: post this comment verbatim on task "
++     "t_01a1cdc7df9e82dd, board `runners`."),
++    ("Post five upkeep script-result comments on hub-owned target cards",
++     "Hub-local write needed: the five target cards below were created on hub. Worker-1's replica refuses "
++     "comments (`foreign_card` / `read_only_transport`), so only the hub can post them.\n\nFor each section, call "
++     "`kanban_comment(task_id=<heading id>, body=<section text verbatim>)`.\n\n## t_01a1cb8c76be80bb\n..."),
++    ("Post final chat-closeout fleet evidence to hub-owned gate card",
++     "Owner-only comment write required: worker-1 kanban_comment rejects foreign_card and cross_task rejects "
++     "read_only_transport. Post the following final result to hub-owned t_01a1ca65e8da5217 and read it back."),
++]
++
++
++@pytest.fixture
++def judge(tmp_path, monkeypatch):
++    """The real admit() with a model that admits everything (the old outcome for these cards)."""
++    gate = importlib.import_module("hermes_cli.kanban_hub_admission")
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
++    skill = tmp_path / "skills/devops/hub-admission-test/SKILL.md"
++    skill.parent.mkdir(parents=True)
++    skill.write_text("---\nname: hub-admission-test\n---\nJudge the card.")
++    from agent import auxiliary_client as aux
++    from agent import model_routing_managed as managed
++    monkeypatch.setattr(managed, "managed_config", lambda: {"managed": True})
++    calls = []
++
++    def fake(**kwargs):
++        calls.append(kwargs)
++        card = json.loads(kwargs["messages"][1]["content"])
++        kwargs["route_info"].update(provider="anthropic", model="claude-sonnet-5-5", billing_group="subscription")
++        reply = {"admit": True, "need": "hub_live_process", "evidence": card["title"], "why": "admits all"}
++        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(reply)))])
++
++    monkeypatch.setattr(aux, "call_llm", fake)
++    return gate, calls
++
++
++@pytest.mark.parametrize("title,body", RELAYS)
++def test_comment_relay_is_denied_without_a_model_call(judge, title, body):
++    gate, calls = judge
++    verdict = gate.admit({"title": title, "body": body}, hub_reason="only the hub can post them")
++    assert verdict.admit is False
++    assert verdict.need is None
++    assert verdict.why.startswith("comment relay:")
++    assert "kanban_supervisor_request" in verdict.why and "hub-comment" in verdict.why
++    assert calls == []
++
++
++@pytest.mark.parametrize("title,body", [
++    ("Add tests for the comment parser", "Cover t_01a1cdfe0d81e0f0's comment edge cases and push."),
++    ("Post the billing note on t_01a1cdfe0d81e0f0",
++     "Read it in the hub's signed-in Chrome first, then post the comment verbatim on the hub-owned card."),
++    ("Fix kanban_comment foreign_card refusal text", "The replica refuses comments on t_01a1cdfe0d81e0f0."),
++])
++def test_other_cards_still_go_to_the_judge(judge, title, body):
++    gate, calls = judge
++    assert gate.admit({"title": title, "body": body}).admit is True
++    assert len(calls) == 1
++
++
++@pytest.mark.parametrize("title,body", RELAYS)
++def test_worker_machine_hub_pin_for_a_relay_is_refused_with_the_route(judge, monkeypatch, title, body):
++    """kanban_create on a worker with ``runs_on=['machine:hub']`` (how all four were filed) is refused."""
++    from hermes_cli import kanban_hub_admission_placement as hap
++    _, calls = judge
++    cfg = {"worker_pools": {"hub": ["worker-1"]}}
++    args = {"title": title, "body": body, "runs_on": ["machine:hub"], "requires": ["kanban"]}
++    out = hap.apply(args, {"where": "local", "why": "explicit runs_on"}, "worker-1", cfg)
++    assert out["where"] == "refuse"
++    assert out["why"].startswith("comment relay:")
++    assert out["hub_admission"]["admit"] is False
++    assert calls == []
++
++
++def test_move_back_to_the_hub_for_a_relay_is_refused(judge, tmp_path):
++    """worker-3 moved t_01a1cf3e8deb41b4 back to machine:hub ('Only the hub can post them'): gate_move refuses."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_hub_admission_placement as hap
++    from hermes_cli.kanban_db_connect import connect_closing
++    _, calls = judge
++    title, body = RELAYS[2]
++    with connect_closing(tmp_path / "kanban.db") as conn:
++        tid = kb.create_task(conn, title=title, body=body, assignee="default")
++        out = hap.gate_move(conn, tid, ["machine:hub"], cfg={})
++        assert out is not None and out["reason_code"] == "hub_admission_denied"
++        assert "comment relay:" in out["error"]
++        latest = hap.latest_verdict(conn, tid) or {}
++        assert latest["why"].startswith("comment relay:")
++    assert calls == []
+-- 
+2.43.0
+

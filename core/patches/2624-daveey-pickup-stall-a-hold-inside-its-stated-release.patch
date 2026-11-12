@@ -1,0 +1,218 @@
+From 33cb6f908ebcae432960cdbac743bff63290235b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:38:04 +0000
+Subject: [PATCH] [daveey] pickup-stall: a hold inside its stated release
+ window files no "Pickup held" card
+
+hub-worker-core-rollout holds one worker at a time (owner rollout:worker-core-rollout@<host>,
+reason "...; release by HH:MMZ", released within 90 min) and each rollout filed a
+"Pickup held on worker-N" repair whose answer is always "expected" (t_01a1cec7cd7fe7ce).
+
+Mirror state's worker-claim-watch: a hold whose reason states `release by HH:MMZ`, or whose
+owner is the core rollout (implied release hold_at + 90 min), is expected until that release
+plus kanban.sync.pickup_stall_seconds. Past it, or with no known hold_at / no release and a
+non-rollout owner, the hold card is filed as before.
+
+Card: t_01a1cedb2faf7341
+---
+ hermes_cli/kanban_pickup_stall.py            | 65 ++++++++++++++-
+ tests/hermes_cli/test_kanban_pickup_stall.py | 86 ++++++++++++++++++++
+ 2 files changed, 150 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index 4ae0449569..5f9ecbafbc 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -18,7 +18,9 @@ read back: pickup kept no record of why a pass skipped a candidate.
+   whose pin is stranded is re-pinned. Its body carries this host's machine-local evidence (pickup skips, registry
+   entry, replica path). Host-wide causes share
+   ONE card per host naming the oldest card: ``budget_exhausted`` (the queue is simply full), ``hold`` and an
+-  unreadable machine registry. Missing evidence gets one additional stall interval of durable grace, then one
++  unreadable machine registry. A ``hold`` that states ``release by HH:MMZ`` (or is the core rollout's own,
++  :func:`expected_hold`) files nothing until that release plus the stall threshold has passed. Missing evidence gets
++  one additional stall interval of durable grace, then one
+   host alert (not a fabricated refusal); a failed pickup must not silence the detector forever.
+   ``budget_exhausted`` is recorded only for a card a slot would have started, so a
+   refusal is never hidden behind a full queue. No Inbox post, no human ask.
+@@ -26,6 +28,8 @@ read back: pickup kept no record of why a pass skipped a candidate.
+ from __future__ import annotations
+ 
+ import logging
++import math
++import re
+ import time
+ from typing import Any, Mapping, Optional
+ 
+@@ -357,6 +361,63 @@ def _registry_line(own: str) -> str:
+     return f"Registry entry for {own} at {_stamp(_now_ms())}: {fields}, active_card_runs={active!r}."
+ 
+ 
++# --- expected holds ------------------------------------------------------------------------------------------
++# t_01a1cedb2faf7341 (2026-11-12): hub-worker-core-rollout holds ONE worker at a time to drain it for a core update
++# (owner ``rollout:worker-core-rollout@<host>``, reason ``...; release by HH:MMZ``, released within 90 min), and each
++# rollout filed a "Pickup held on worker-N" repair (t_01a1cec7cd7fe7ce) whose answer is always "expected". Same rule
++# as state's worker-claim-watch: a hold that states its release, or is the rollout's own, is expected until that
++# release plus the stall threshold; past it, the hold outlived its word and alerts as before.
++ROLLOUT_OWNER_PREFIX = "rollout:worker-core-rollout@"
++ROLLOUT_MAX_SECONDS = 90 * 60  # the rollout's hard cap: its hold's implied release when the reason states none
++_RELEASE_RE = re.compile(r"release(?:d)?\s+(?:by|at)\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*Z", re.IGNORECASE)
++
++
++def _release_s(reason: Optional[str], held_at: float) -> Optional[float]:
++    """First UTC ``release by HH:MM[:SS]Z`` instant at/after the hold start (None: no valid stated release)."""
++    m = _RELEASE_RE.search(reason or "")
++    if not m:
++        return None
++    h, mi, sec = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
++    if h > 23 or mi > 59 or sec > 59:
++        return None
++    t = held_at - (held_at % 86400) + h * 3600 + mi * 60 + sec
++    return t if t >= held_at else t + 86400
++
++
++def expected_hold(entry: Optional[Mapping[str, Any]], *, now_ms: int, stall_s: int) -> Optional[float]:
++    """The release instant (epoch s) of ``entry``'s hold while it is still expected, else None (alert as usual).
++
++    Expected: a hold with a known start (``hold_at``, Board epoch ms) whose reason states ``release by HH:MMZ``,
++    or whose owner is the core rollout (implied release: start + :data:`ROLLOUT_MAX_SECONDS`), until that release
++    plus ``stall_s``. An unknown start, no release and no rollout owner, or a passed window fail toward alerting."""
++    if not isinstance(entry, Mapping) or entry.get("hold") is not True:
++        return None
++    at = entry.get("hold_at")
++    if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at) or at <= 0:
++        return None
++    held_at = at / 1000.0 if at > 1e11 else float(at)
++    reason = entry.get("hold_reason") if isinstance(entry.get("hold_reason"), str) else None
++    release = _release_s(reason, held_at)
++    if release is None and str(entry.get("hold_owner") or "").startswith(ROLLOUT_OWNER_PREFIX):
++        release = held_at + ROLLOUT_MAX_SECONDS
++    if release is None or now_ms > (release + stall_s) * 1000:
++        return None
++    return release
++
++
++def _hold_expected(own: str, now_ms: int) -> bool:
++    """``own``'s registry hold is inside its stated window (:func:`expected_hold`): file no hold repair now."""
++    from hermes_cli import kanban_worker_node as wn
++    entry = ((wn.registry() or {}).get("machines") or {}).get(own)
++    release = expected_hold(entry, now_ms=now_ms, stall_s=stall_seconds())
++    if release is None:
++        return False
++    _log.debug("pickup-stall: %s hold by %s is expected until %s + %ss; no repair", own,
++               (entry or {}).get("hold_owner") or (entry or {}).get("hold_by"), _stamp(int(release * 1000)),
++               stall_seconds())
++    return True
++
++
+ def _group(card: Mapping[str, Any]) -> Optional[str]:
+     skip = card["skip"] or {}
+     if skip.get("reason") == "other" and skip.get("detail") == "machine registry unavailable":
+@@ -413,6 +474,8 @@ def file_repairs(conn, own: str, cards: list[dict[str, Any]], *, now: Optional[f
+                   f"it.\n\nLast pickup skip recorded on {own}: {describe(card['skip'])}.")))
+     for group, members in groups.items():
+         slug, title, why = _HOST_GROUPS[group]
++        if group == "hold" and _hold_expected(own, now_ms):
++            continue
+         oldest = members[0]
+         listed = "\n".join(f"- {c['id']} ({c['title']}), ready {_minutes(c['since_ms'], now_ms)} min, "
+                            f"last skip {describe(c['skip'])}" for c in members[:20])
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall.py b/tests/hermes_cli/test_kanban_pickup_stall.py
+index b3887cdd78..c58afbce87 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall.py
+@@ -126,6 +126,92 @@ def test_a_held_machine_files_one_hold_card_not_one_per_card(gws):
+     assert "do not lift it" in card["body"] and card["priority"] == -1
+ 
+ 
++def _hold_worker(gws, **hold):
++    """Two stalled cards pinned to a worker the registry holds with ``hold`` fields; returns (worker, kps)."""
++    hub, worker = gws
++    a = _pinned(hub, title="a")
++    b = _pinned(hub, title="b")
++    worker.round()
++    worker.enter()
++    machines = {**support.MACHINES, WORKER: {**support.MACHINES[WORKER], "hold": True, **hold}}
++    wn.set_registry_fetch(lambda: {"me": WORKER, "machines": list(machines.values())})
++    wn._REGISTRY.update(at=None, value=None, retry=False)
++    wn.pickup(worker.conn, budget=4)
++    _age(worker, a, 900)
++    _age(worker, b, 700)
++    from hermes_cli import kanban_pickup_stall as kps
++    return worker, kps
++
++
++def _hhmmz(epoch):
++    import time
++    return time.strftime("%H:%MZ", time.gmtime(epoch))
++
++
++@pytest.mark.parametrize("owner,reason", [
++    # t_01a1cec7cd7fe7ce: hub-worker-core-rollout's own hold, filed during its 07:47-08:16Z window.
++    ("rollout:worker-core-rollout@hub", "worker-core-rollout: aaaaaaaaaaaa -> bbbbbbbbbbbb; idle tick applies; "
++                                        "release by {release}"),
++    ("ops@hub", "migrating the disk; release by {release}"),  # any hold stating its release, like worker-claim-watch
++])
++def test_a_hold_inside_its_stated_release_window_files_no_card_and_files_once_it_expires(gws, owner, reason):
++    import time
++    t0 = time.time()
++    release = t0 + 30 * 60
++    worker, kps = _hold_worker(gws, hold_owner=owner, hold_at=int(t0 * 1000),
++                               hold_reason=reason.format(release=_hhmmz(release)))
++    assert kps.sweep(worker.conn, now=t0) == []
++    assert kps.sweep(worker.conn, now=release + kps.stall_seconds() - 60) == []  # threshold grace past release
++    assert not _repairs(worker.conn)
++    kps.sweep(worker.conn, now=release + kps.stall_seconds() + 120)  # the hold outlived its release: alert
++    [card] = _repairs(worker.conn)
++    assert "held" in card["title"].lower()
++
++
++def test_a_rollout_hold_with_no_stated_release_is_expected_for_the_rollout_cap(gws):
++    import time
++    t0 = time.time()
++    worker, kps = _hold_worker(gws, hold_owner="rollout:worker-core-rollout@hub", hold_at=int(t0 * 1000),
++                               hold_reason="worker-core-rollout: aaaaaaaaaaaa -> bbbbbbbbbbbb")
++    assert kps.sweep(worker.conn, now=t0 + 60 * 60) == []
++    assert not _repairs(worker.conn)
++    kps.sweep(worker.conn, now=t0 + kps.ROLLOUT_MAX_SECONDS + kps.stall_seconds() + 120)
++    assert len(_repairs(worker.conn)) == 1
++
++
++def test_an_operator_hold_with_no_stated_release_still_files_a_card(gws):
++    import time
++    t0 = time.time()
++    worker, kps = _hold_worker(gws, hold_owner="ops@hub", hold_at=int(t0 * 1000), hold_reason="disk migration")
++    kps.sweep(worker.conn, now=t0)
++    assert len(_repairs(worker.conn)) == 1
++
++
++@pytest.mark.parametrize("reason,hold_at_off,now_off,want", [
++    ("release by 08:16Z", 0, 60, True),
++    ("release by 08:16Z", 0, 29 * 60 + 600, True),          # release + threshold, inclusive
++    ("release by 08:16Z", 0, 29 * 60 + 601, False),
++    ("release by 00:10Z", 0, 16 * 3600 + 600, True),        # past midnight: the next day's 00:10Z
++    ("released at 8:16:30 z", 0, 60, True),                 # worker-claim-watch's RELEASE_RE spelling
++    ("release by 25:00Z", 0, 60, False),                    # invalid time: no stated release
++    ("no release", 0, 60, False),
++])
++def test_expected_hold_release_rule(reason, hold_at_off, now_off, want):
++    from datetime import UTC, datetime
++    from hermes_cli import kanban_pickup_stall as kps
++    held_at = datetime(2026, 11, 12, 7, 47, tzinfo=UTC).timestamp() + hold_at_off
++    entry = {"hold": True, "hold_owner": "ops@hub", "hold_at": int(held_at * 1000), "hold_reason": reason}
++    assert (kps.expected_hold(entry, now_ms=int((held_at + now_off) * 1000), stall_s=600) is not None) is want
++
++
++def test_expected_hold_needs_a_known_start_and_an_actual_hold():
++    from hermes_cli import kanban_pickup_stall as kps
++    entry = {"hold": True, "hold_owner": "rollout:worker-core-rollout@hub", "hold_reason": "release by 08:16Z"}
++    assert kps.expected_hold(entry, now_ms=1, stall_s=600) is None            # no hold_at: cannot place the window
++    assert kps.expected_hold({**entry, "hold": False, "hold_at": 1000}, now_ms=2000, stall_s=600) is None
++    assert kps.expected_hold(None, now_ms=1, stall_s=600) is None
++
++
+ def test_a_refused_card_is_not_hidden_behind_a_full_queue(gws, monkeypatch):
+     """budget_exhausted only for cards a slot would start: a capped tick still names a profile refusal."""
+     hub, worker = gws
+-- 
+2.43.0
+

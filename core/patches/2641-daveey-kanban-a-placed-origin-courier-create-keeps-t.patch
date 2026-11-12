@@ -1,0 +1,142 @@
+From fb550dfb1b477376fea63476c87b40cc95593646 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:48:56 +0000
+Subject: [PATCH] [daveey] kanban: a placed (origin-courier) create keeps the
+ creator's idempotency_key
+
+create_with_origin dropped the key to NULL so the receipt request id, not
+legacy best-effort idempotency, owned the creation. Probes and guards that look
+a placed card up by its requested key (review:pr1305:<sha>) never matched, and
+a retry from another gateway could duplicate a card the owner board already had.
+
+Store the key on the new card. A live card that already holds it is a typed
+refusal (origin_idempotency_conflict, naming that card), never an adoption and
+never a duplicate; the owner adapter maps it to a terminal rejection. An exact
+retry is still answered by the request id. Transport keys (hub:placement:...)
+on plain creations are unchanged.
+---
+ hermes_cli/kanban_origin_creation.py          | 16 +++++++--
+ hermes_cli/kanban_origin_owner.py             |  2 +-
+ .../test_kanban_origin_create_tool.py         | 25 +++++++++++++
+ .../hermes_cli/test_kanban_origin_creation.py | 35 +++++++++++++++++++
+ 4 files changed, 74 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index 2cc983f320..c863f48db6 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -87,9 +87,19 @@ def create_with_origin(conn, intent: dict, options: dict) -> str:
+             if existing["intent_json"] != immutable:
+                 raise OriginError("origin_creation_conflict", "request ID reused with a different creation intent")
+             return existing["task_id"]
+-        # The receipt request ID, not legacy best-effort idempotency, owns this
+-        # creation. Never adopt an unrelated existing task by its legacy key.
+-        options["idempotency_key"] = None
++        # The receipt request ID, not legacy best-effort idempotency, owns this creation: never adopt an
++        # unrelated existing task by the creator's key. The key is still stored on the new card, so a guard or
++        # probe that looks the card up by it matches (it used to be dropped to NULL). [daveey] A live card that
++        # already holds it is a typed refusal naming that card, never a duplicate and never an adoption; an
++        # exact retry is answered by the request ID above. Checked inside this write txn, so no race.
++        key = options.get("idempotency_key")
++        if key:
++            held = conn.execute(
++                "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
++                "ORDER BY created_at DESC LIMIT 1", (key,)).fetchone()
++            if held:
++                raise OriginError("origin_idempotency_conflict",
++                                  f"idempotency_key {key!r} already names card {held['id']} on this board")
+         task_id = kb.create_task(conn, **options, placement_checked=True)  # courier retains owner placement
+         marker = {"binding_id": "binding-" + secrets.token_hex(16), "version": 1,
+                   "owner": {**intent["owner"], "task_id": task_id}, "origin": intent["origin"],
+diff --git a/hermes_cli/kanban_origin_owner.py b/hermes_cli/kanban_origin_owner.py
+index d76aea1598..20c356b24a 100644
+--- a/hermes_cli/kanban_origin_owner.py
++++ b/hermes_cli/kanban_origin_owner.py
+@@ -95,7 +95,7 @@ def _dispatch_result(raw_result):
+         # Dispatch catches exceptions itself. An untyped error may follow a
+         # committed write: keep the exact request retryable, never infer absence.
+         return {'status': 'pending', 'code': 'origin_dispatch_pending', 'handoff_complete': False}
+-    if result.get('code') in {'origin_creation_conflict', 'origin_already_bound'}:
++    if result.get('code') in {'origin_creation_conflict', 'origin_already_bound', 'origin_idempotency_conflict'}:
+         # Replaying an immutable conflicting envelope cannot repair it. Reject
+         # this request only; the original intent and its receipt remain intact.
+         return {**result, 'status': 'rejected'}
+diff --git a/tests/hermes_cli/test_kanban_origin_create_tool.py b/tests/hermes_cli/test_kanban_origin_create_tool.py
+index 0010c0ed92..473a01fd0d 100644
+--- a/tests/hermes_cli/test_kanban_origin_create_tool.py
++++ b/tests/hermes_cli/test_kanban_origin_create_tool.py
+@@ -90,3 +90,28 @@ def test_llm_cannot_supply_internal_creation_context(world):
+     assert 'unknown parameter' in result['error']
+     with kbc.connect_closing() as conn:
+         assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0
++
++
++def test_placed_create_keeps_creator_key_and_retry_returns_same_card(world):
++    key = 'review:pr1305:848af5adae9e29a2ac677f26c732c996997a26b2'
++    first = create(world, idempotency_key=key)
++    assert first.get('created') is True, first
++    again = create(world, idempotency_key=key)
++    assert again['task_id'] == first['task_id']
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, first['task_id']).idempotency_key == key
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++
++
++def test_placed_create_whose_key_names_another_card_is_rejected(world):
++    key = 'review:pr1305:848af5adae9e29a2ac677f26c732c996997a26b2'
++    with kbc.connect_closing() as conn:
++        local = kb.create_task(conn, title='Local review', idempotency_key=key)
++    result = create(world, idempotency_key=key)
++    assert result.get('code') == 'origin_idempotency_conflict', result
++    assert result['handoff_complete'] is False
++    assert local in result.get('error', ''), result
++    from hermes_cli.kanban_origin_owner import _dispatch_result
++    assert _dispatch_result(json.dumps(result))['status'] == 'rejected'
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
+diff --git a/tests/hermes_cli/test_kanban_origin_creation.py b/tests/hermes_cli/test_kanban_origin_creation.py
+index 99b840cd59..043e330be0 100644
+--- a/tests/hermes_cli/test_kanban_origin_creation.py
++++ b/tests/hermes_cli/test_kanban_origin_creation.py
+@@ -142,3 +142,38 @@ def test_retry_with_non_default_late_option_still_conflicts(board):
+         with pytest.raises(OriginError) as err:
+             kb.create_task(conn, title="Build", origin_intent=intent(), chat_origin="gw/prof/sess")
+         assert err.value.code == "origin_creation_conflict"
++
++
++# [daveey] A placed create (origin courier) used to store NULL: the creator's key was dropped, so a guard
++# looking the card up by it (`where idempotency_key='review:pr1305:…'`) never matched.
++KEY = "review:pr1305:848af5adae9e29a2ac677f26c732c996997a26b2"
++
++
++def test_creator_key_is_stored_and_retry_returns_same_card(board):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Build", idempotency_key=KEY, origin_intent=intent())
++        assert kb.get_task(conn, tid).idempotency_key == KEY
++        assert kb.create_task(conn, title="Build", idempotency_key=KEY, origin_intent=intent()) == tid
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++
++
++def test_key_held_by_another_card_is_a_typed_refusal_not_an_adoption(board):
++    with kbc.connect_closing() as conn:
++        local = kb.create_task(conn, title="Local review", idempotency_key=KEY)
++        with pytest.raises(OriginError) as err:
++            kb.create_task(conn, title="Build", idempotency_key=KEY, origin_intent=intent())
++        assert err.value.code == "origin_idempotency_conflict"
++        assert local in str(err.value)
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++        ledger = conn.execute("SELECT name FROM sqlite_master WHERE name='origin_creation_intents'").fetchone()
++        assert not ledger or conn.execute("SELECT COUNT(*) FROM origin_creation_intents").fetchone()[0] == 0
++
++
++def test_key_held_only_by_an_archived_card_is_reused(board):
++    with kbc.connect_closing() as conn:
++        old = kb.create_task(conn, title="Old", idempotency_key=KEY)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (old,))
++        tid = kb.create_task(conn, title="Build", idempotency_key=KEY, origin_intent=intent())
++        assert tid != old
++        assert kb.get_task(conn, tid).idempotency_key == KEY
+-- 
+2.43.0
+

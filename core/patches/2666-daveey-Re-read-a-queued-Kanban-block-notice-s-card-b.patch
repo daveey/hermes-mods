@@ -1,0 +1,305 @@
+From 9c97365f46f1f00ea46299a487567ee1c59f0bc6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 23:19:00 -0800
+Subject: [PATCH] [daveey] Re-read a queued Kanban block notice's card before
+ delivering its ask
+
+A Kanban wake is rendered when the card blocks and then waits in the chat's
+FIFO until the running turn ends. t_01a1cd4dbbc27e50 blocked at 19:26 PST,
+was unblocked at 20:08 and done at 20:25, yet its wake (admitted 19:26:31)
+reached Desktop chat 20261026_170127_f07c32 at 22:14 still saying "Next action
+for the user: Reply ...": a decision that no longer existed.
+
+execute_admission now refreshes the claimed row's text before it becomes a
+turn or a note (every gateway route: local Desktop, Slack, Telegram, API).
+hermes_cli/kanban_stale_ask.py re-reads the card read-only; when it moved past
+the notice's block, the "Next action for the user" / "Why only the user"
+lines (and the user-terminal hint) become one line, e.g.
+"Since then: unblocked 20:08, completed 20:25 PST. No action needed."
+A card still on the same block, a remote card and an unreadable board leave
+the text byte-identical. Completion results are never touched.
+---
+ gateway/session_ingress.py                   |   2 +
+ hermes_cli/kanban_stale_ask.py               | 127 +++++++++++++++++++
+ tests/gateway/test_kanban_stale_block_ask.py | 122 ++++++++++++++++++
+ 3 files changed, 251 insertions(+)
+ create mode 100644 hermes_cli/kanban_stale_ask.py
+ create mode 100644 tests/gateway/test_kanban_stale_block_ask.py
+
+diff --git a/gateway/session_ingress.py b/gateway/session_ingress.py
+index c392275654..b8a18a81ea 100644
+--- a/gateway/session_ingress.py
++++ b/gateway/session_ingress.py
+@@ -276,6 +276,8 @@ def row_turn_author(policy, row):
+ 
+ async def execute_admission(authority, ref, row):
+     busy_turn_started(row['admission_id'])
++    from hermes_cli.kanban_stale_ask import refresh_payload
++    refresh_payload(row['payload'])  # [daveey] a queued block notice re-reads its card before it is shown
+     from gateway.session_completion_notes import note_if_unviewed
+     noted = await note_if_unviewed(authority, ref, row)  # #134889 LC-7: no viewer, no turn
+     if noted is not None:
+diff --git a/hermes_cli/kanban_stale_ask.py b/hermes_cli/kanban_stale_ask.py
+new file mode 100644
+index 0000000000..e8f5f9d476
+--- /dev/null
++++ b/hermes_cli/kanban_stale_ask.py
+@@ -0,0 +1,127 @@
++"""Refresh a queued block notice's ask against the card's state at delivery time. [daveey]
++
++A Kanban wake is rendered when the card blocks, then waits in the chat's FIFO until the running
++turn ends, which can be hours. By then the card may be unblocked or done, yet the frozen text still
++said "Next action for the user: ...". ``refresh_stale_ask`` re-reads the card (read-only) when the
++text is delivered: a card that moved past the notice's block keeps the notice, with the
++"Next action for the user" / "Why only the user" lines (and the user-terminal hint) replaced by one
++``Since then: ...`` line. A card still blocked on the same block leaves the text byte-identical, and
++an unreadable board or a remote card (``@task:<board>@<gateway>/...``) leaves it unchanged too.
++"""
++from __future__ import annotations
++
++import contextlib
++import json
++import re
++import sqlite3
++from datetime import datetime
++from typing import Optional
++
++ASK_MARK = "Next action for the user: "
++TERMINAL_HINT = ("\nUse the owner Desktop session's user-terminal flow; opening this task or unblocking it does not "
++                 "execute a command or grant terminal authority.")
++_ASK = re.compile(
++    r"Next action for the user: (?P<action>.*?)\nWhy only the user: .*?\n"
++    r"(?P<rest>Scope: .*?\nOpen task: @task:(?P<board>[^/@\s]+)(?:@(?P<gw>[^/\s]+))?/(?P<tid>[A-Za-z0-9_-]+))"
++    r"(?P<hint>" + re.escape(TERMINAL_HINT) + r")?",
++    re.DOTALL)
++_PT = "America/Los_Angeles"
++# Transitions worth naming; claims, spawns, heartbeats and comments are noise here.
++_LABELS = {"unblocked": "unblocked", "blocked": "blocked again", "scheduled": "scheduled",
++           "review_requested": "sent to review", "completed": "completed", "archived": "archived",
++           "request_withdrawn": "ask withdrawn", "gave_up": "gave up"}
++_LAST_STATUS = {"completed": "done", "archived": "archived", "request_withdrawn": "archived",
++                "blocked": "blocked", "scheduled": "scheduled", "review_requested": "review"}
++
++
++def _norm(text) -> str:
++    return " ".join(str(text or "").split())
++
++
++def _payload(raw) -> dict:
++    with contextlib.suppress(TypeError, ValueError):
++        value = json.loads(raw or "{}")
++        return value if isinstance(value, dict) else {}
++    return {}
++
++
++def _read_card(board: str, task_id: str):
++    """``(status, [(id, kind, created_at, payload)])`` from a read-only board connection, else ``None``."""
++    from hermes_cli.kanban_db import kanban_db_path
++    path = kanban_db_path(board=board)
++    if not path.exists():
++        return None
++    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
++    try:
++        row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
++        if row is None:
++            return None
++        events = conn.execute("SELECT id, kind, created_at, payload FROM task_events WHERE task_id=? ORDER BY id",
++                              (task_id,)).fetchall()
++        return row[0], [(i, k, c, _payload(p)) for i, k, c, p in events]
++    finally:
++        conn.close()
++
++
++def _anchor(events, action: str) -> Optional[int]:
++    """Index of the newest ``blocked`` event carrying this notice's ask, else of the newest block."""
++    blocks = [i for i, ev in enumerate(events) if ev[1] == "blocked"]
++    for i in reversed(blocks):
++        request = events[i][3].get("human_request")
++        if isinstance(request, dict) and _norm(request.get("action")) == action:
++            return i
++    return blocks[-1] if blocks else None
++
++
++def _clock(ts: int, base_day) -> tuple[str, str]:
++    from zoneinfo import ZoneInfo
++    when = datetime.fromtimestamp(int(ts), ZoneInfo(_PT))
++    day = "" if when.date() == base_day else when.strftime("%b %-d ")
++    return f"{day}{when:%H:%M}", when.strftime("%Z")
++
++
++def since_line(status: str, events, anchor: int) -> Optional[str]:
++    """The replacement line, or ``None`` while the card still waits on the same block."""
++    from zoneinfo import ZoneInfo
++    later = [ev for ev in events[anchor + 1:] if ev[1] in _LABELS and not ev[3].get("metadata_only")]
++    if status in {"blocked", "triage"} and not later:
++        return None  # still the same block: the ask stands
++    base_day = datetime.fromtimestamp(int(events[anchor][2]), ZoneInfo(_PT)).date()
++    parts, zone = [], ""
++    for _id, kind, created_at, _p in later:
++        clock, zone = _clock(created_at, base_day)
++        parts.append(f"{_LABELS[kind]} {clock}")
++    text = ", ".join(parts) + (f" {zone}" if zone else "")
++    if not later or _LAST_STATUS.get(later[-1][1]) != status:
++        text = f"{text}; now {status}" if text else f"now {status}"
++    if status in {"blocked", "triage"}:
++        return f"Since then: {text}. This ask was replaced by a newer one; answer that, not this."
++    return f"Since then: {text}. No action needed."
++
++
++def refresh_stale_ask(text):
++    """``text`` with each stale ask swapped for a ``Since then:`` line; unchanged on any doubt."""
++    if not isinstance(text, str) or ASK_MARK not in text:
++        return text
++
++    def swap(match):
++        if match["gw"]:
++            return match[0]  # another gateway's card: this host cannot read its current state
++        try:
++            card = _read_card(match["board"], match["tid"])
++        except (sqlite3.Error, OSError, ValueError):
++            return match[0]
++        if card is None:
++            return match[0]
++        status, events = card
++        anchor = _anchor(events, _norm(match["action"]))
++        line = since_line(status, events, anchor) if anchor is not None else None
++        return match[0] if line is None else f"{line}\n{match['rest']}"
++
++    return _ASK.sub(swap, text)
++
++
++def refresh_payload(payload) -> None:
++    """Refresh a claimed FIFO admission's text in place, before it becomes a turn or a note."""
++    if isinstance(payload, dict) and isinstance(payload.get("text"), str) and ASK_MARK in payload["text"]:
++        payload["text"] = refresh_stale_ask(payload["text"])
+diff --git a/tests/gateway/test_kanban_stale_block_ask.py b/tests/gateway/test_kanban_stale_block_ask.py
+new file mode 100644
+index 0000000000..86d4eebc48
+--- /dev/null
++++ b/tests/gateway/test_kanban_stale_block_ask.py
+@@ -0,0 +1,122 @@
++"""A Kanban block notice queued in a chat's FIFO re-reads its card when it is delivered (t_01a1ce7ed2addb09).
++
++The wake text is rendered when the card blocks, then waits behind the running turn. Observed: the
++notice for t_01a1cd4dbbc27e50 (blocked 19:26, unblocked 20:08, done 20:25 PST) reached its Desktop
++chat at 22:14 still saying "Next action for the user: Reply ...".
++"""
++from types import SimpleNamespace
++
++import pytest
++
++from tests.gateway.test_session_end_delegations import _local
++
++REQUEST = dict(action="Reply 'accept offline coverage' or 'require disposable Docker proof'. Unblock = apply it; "
++                      "archive = drop the remaining acceptance work.",
++               why_human="Accepting offline coverage changes the acceptance criterion.", interaction="reply",
++               scope="Only the standalone Docker integration acceptance.", evidence="No Docker endpoint on either host.")
++BLOCKED_AT, UNBLOCKED_AT, DONE_AT = 1794453987, 1794456521, 1794457554  # 19:26:27, 20:08:41, 20:25:54 PST
++
++
++def _blocked_card():
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect_closing
++    kb.init_db()
++    with connect_closing() as conn:
++        tid = kb.create_task(conn, title="state CI fixture", assignee="default")
++        assert kb.block_task(conn, tid, kind="needs_input", reason="Choose coverage", human_request=dict(REQUEST))
++        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='blocked'", (BLOCKED_AT, tid))
++        conn.commit()
++        return tid, kb.get_task(conn, tid)
++
++
++def _finish(tid):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing() as conn:
++        assert kb.unblock_task(conn, tid)
++        assert kb.complete_task(conn, tid, result="fixed")
++        for kind, ts in (("unblocked", UNBLOCKED_AT), ("completed", DONE_AT)):
++            conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind=?", (ts, tid, kind))
++        conn.commit()
++
++
++def _wake_text(tid, task):
++    """The wake the gateway notifier renders at block time (``_fmt_blocked`` body under the wake header)."""
++    from gateway.kanban_watchers_notifier import _fmt_blocked
++    ev = SimpleNamespace(kind="blocked", payload={"reason": "Choose coverage", "actor": f"agent (task {tid})"})
++    _msg, handoff, _ = _fmt_blocked(ev, SimpleNamespace(task=task, task_id=tid, board_slug="default",
++                                                        head=f"Kanban {tid}"))
++    return (f"[kanban] Task {tid} blocked; needs attention.\nTitle: state CI fixture\n\n"
++            f"Check the result or decide the next step.\nResult: {handoff}\n\nThis is an automatic notification.")
++
++
++async def _deliver_later(tmp_path, monkeypatch, then):
++    """Admit the wake while the card is blocked, run ``then``, execute the queued row; return the turn's text."""
++    from gateway.session_ingress import execute_admission
++    from gateway.wake import deliver_wake
++    from hermes_state_runtime import list_session_admissions
++    runner, authority, ref, _ = await _local(tmp_path, monkeypatch)
++    tid, task = _blocked_card()
++    text = _wake_text(tid, task)
++    assert "Next action for the user: " in text
++    live = authority.sessions[ref.session_id]
++    await deliver_wake(runner._delivery_adapter_for(live.source), text=text, session_id=ref.session_id,
++                       source=live.source)
++    then(tid)
++    row = [r for r in list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
++           if tid in str(r['payload'])][-1]
++    seen = []
++
++    async def turn(event):
++        seen.append(event.text)
++        return 'ok'
++    monkeypatch.setattr(runner, '_handle_message', turn)
++    await execute_admission(authority, ref, row)
++    assert seen, 'the queued wake never ran as a turn'
++    return text, seen[0]
++
++
++@pytest.mark.asyncio
++async def test_blocked_wake_delivered_after_card_finished_drops_the_ask(tmp_path, monkeypatch):
++    original, delivered = await _deliver_later(tmp_path, monkeypatch, _finish)
++    assert "Next action for the user" not in delivered
++    assert "Why only the user" not in delivered
++    assert "Since then: unblocked 20:08, completed 20:25 PST. No action needed." in delivered
++    # The notice itself stays: header, scope and task link are unchanged.
++    head = original.split("Next action for the user")[0]
++    assert delivered.startswith(head)
++    assert "Scope: Only the standalone Docker integration acceptance." in delivered
++    assert "Open task: @task:default/" in delivered
++
++
++@pytest.mark.asyncio
++async def test_blocked_wake_for_card_still_blocked_keeps_the_full_ask(tmp_path, monkeypatch):
++    original, delivered = await _deliver_later(tmp_path, monkeypatch, lambda tid: None)
++    assert delivered == original
++    assert f"Next action for the user: {REQUEST['action']}" in delivered
++
++
++def test_reblocked_card_points_at_the_newer_ask(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect_closing
++    from hermes_cli.kanban_stale_ask import refresh_stale_ask
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    tid, task = _blocked_card()
++    text = _wake_text(tid, task)
++    with connect_closing() as conn:
++        assert kb.unblock_task(conn, tid)
++        assert kb.block_task(conn, tid, kind="needs_input", reason="New question",
++                             human_request=dict(REQUEST, action="Pick B. Unblock = do B; archive = drop."))
++    out = refresh_stale_ask(text)
++    assert "Next action for the user" not in out
++    assert "blocked again" in out and "replaced by a newer one" in out
++
++
++def test_remote_or_unreadable_cards_are_left_alone(tmp_path, monkeypatch):
++    from hermes_cli.kanban_stale_ask import refresh_stale_ask
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    remote = ("blocked — actor: user\nNext action for the user: Choose.\nWhy only the user: Policy.\n"
++              "Scope: One.\nOpen task: @task:default@hub-ec2/t_remote")
++    assert refresh_stale_ask(remote) == remote
++    missing = remote.replace("@hub-ec2", "")
++    assert refresh_stale_ask(missing) == missing
+-- 
+2.43.0
+

@@ -1,0 +1,194 @@
+From e471dbe1d79c210922e6f284d3400e9d3bcb8d8d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:27:08 -0800
+Subject: [PATCH] [daveey] Stale block-ask refresh: producer rows only, bounded
+ fields, never fail the wake
+
+Review t_01a1cea2d4e2aafd on PR1260: refresh only native_text_v1.automation /
+local_automation_v1 rows (a pasted notice stays as typed); temper every free-text
+field so a stray ask mark or a second joined notice cannot pull the text between
+them into one match; catch-all in refresh_payload; read the board off the event
+loop; per-time zone labels across DST; a re-block without a human ask no longer
+says 'answer that'.
+---
+ gateway/session_ingress.py                   |  3 +-
+ hermes_cli/kanban_stale_ask.py               | 49 ++++++++++++----
+ tests/gateway/test_kanban_stale_block_ask.py | 62 ++++++++++++++++++++
+ 3 files changed, 101 insertions(+), 13 deletions(-)
+
+diff --git a/gateway/session_ingress.py b/gateway/session_ingress.py
+index b8a18a81ea..9896c203a1 100644
+--- a/gateway/session_ingress.py
++++ b/gateway/session_ingress.py
+@@ -277,7 +277,8 @@ def row_turn_author(policy, row):
+ async def execute_admission(authority, ref, row):
+     busy_turn_started(row['admission_id'])
+     from hermes_cli.kanban_stale_ask import refresh_payload
+-    refresh_payload(row['payload'])  # [daveey] a queued block notice re-reads its card before it is shown
++    # [daveey] a queued producer block notice re-reads its card (read-only sqlite, off the loop) before it is shown
++    await asyncio.to_thread(refresh_payload, row['payload'])
+     from gateway.session_completion_notes import note_if_unviewed
+     noted = await note_if_unviewed(authority, ref, row)  # #134889 LC-7: no viewer, no turn
+     if noted is not None:
+diff --git a/hermes_cli/kanban_stale_ask.py b/hermes_cli/kanban_stale_ask.py
+index e8f5f9d476..a5ea341fc3 100644
+--- a/hermes_cli/kanban_stale_ask.py
++++ b/hermes_cli/kanban_stale_ask.py
+@@ -12,6 +12,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import json
++import logging
+ import re
+ import sqlite3
+ from datetime import datetime
+@@ -20,11 +21,18 @@ from typing import Optional
+ ASK_MARK = "Next action for the user: "
+ TERMINAL_HINT = ("\nUse the owner Desktop session's user-terminal flow; opening this task or unblocking it does not "
+                  "execute a command or grant terminal authority.")
++# Every free-text field is a tempered token: it may span lines (a human_request field can) but never
++# another notice's actor line or ask mark, so a stray "Next action for the user:" in prose or a second
++# joined notice cannot pull the text between them into one match. The ask mark must also sit at the
++# start of the line right under block_notice()'s own "blocked — actor:" line.
++_FIELD = r"(?:(?!Next action for the user: |\nblocked — actor: ).)*?"
+ _ASK = re.compile(
+-    r"Next action for the user: (?P<action>.*?)\nWhy only the user: .*?\n"
+-    r"(?P<rest>Scope: .*?\nOpen task: @task:(?P<board>[^/@\s]+)(?:@(?P<gw>[^/\s]+))?/(?P<tid>[A-Za-z0-9_-]+))"
++    r"(?P<head>blocked — actor: [^\n]*\n)Next action for the user: (?P<action>" + _FIELD + r")\n"
++    r"Why only the user: " + _FIELD + r"\n"
++    r"(?P<rest>Scope: " + _FIELD + r"\nOpen task: @task:(?P<board>[^/@\s]+)(?:@(?P<gw>[^/\s]+))?/(?P<tid>[A-Za-z0-9_-]+))"
+     r"(?P<hint>" + re.escape(TERMINAL_HINT) + r")?",
+     re.DOTALL)
++logger = logging.getLogger(__name__)
+ _PT = "America/Los_Angeles"
+ # Transitions worth naming; claims, spawns, heartbeats and comments are noise here.
+ _LABELS = {"unblocked": "unblocked", "blocked": "blocked again", "scheduled": "scheduled",
+@@ -87,15 +95,19 @@ def since_line(status: str, events, anchor: int) -> Optional[str]:
+     if status in {"blocked", "triage"} and not later:
+         return None  # still the same block: the ask stands
+     base_day = datetime.fromtimestamp(int(events[anchor][2]), ZoneInfo(_PT)).date()
+-    parts, zone = [], ""
+-    for _id, kind, created_at, _p in later:
+-        clock, zone = _clock(created_at, base_day)
+-        parts.append(f"{_LABELS[kind]} {clock}")
+-    text = ", ".join(parts) + (f" {zone}" if zone else "")
++    stamped = [(_LABELS[kind], *_clock(created_at, base_day)) for _id, kind, created_at, _p in later]
++    zones = {zone for _l, _c, zone in stamped}
++    if len(zones) > 1:  # the window crossed a DST change: label each time
++        text = ", ".join(f"{label} {clock} {zone}" for label, clock, zone in stamped)
++    else:
++        text = ", ".join(f"{label} {clock}" for label, clock, _z in stamped) + (f" {zones.pop()}" if zones else "")
+     if not later or _LAST_STATUS.get(later[-1][1]) != status:
+         text = f"{text}; now {status}" if text else f"now {status}"
+     if status in {"blocked", "triage"}:
+-        return f"Since then: {text}. This ask was replaced by a newer one; answer that, not this."
++        newest = next((ev for ev in reversed(events) if ev[1] == "blocked"), None)
++        if newest is not None and isinstance(newest[3].get("human_request"), dict):
++            return f"Since then: {text}. This ask was replaced by a newer one; answer that, not this."
++        return f"Since then: {text}. This ask no longer applies; the card is blocked on something else."
+     return f"Since then: {text}. No action needed."
+ 
+ 
+@@ -116,12 +128,25 @@ def refresh_stale_ask(text):
+         status, events = card
+         anchor = _anchor(events, _norm(match["action"]))
+         line = since_line(status, events, anchor) if anchor is not None else None
+-        return match[0] if line is None else f"{line}\n{match['rest']}"
++        return match[0] if line is None else f"{match['head']}{line}\n{match['rest']}"
+ 
+     return _ASK.sub(swap, text)
+ 
+ 
++def _is_producer_row(payload) -> bool:
++    """A producer wake (Kanban notifier, automation), never text a person typed or pasted."""
++    native = payload.get("native_text_v1")
++    return bool(payload.get("local_automation_v1")) or (isinstance(native, dict) and bool(native.get("automation")))
++
++
+ def refresh_payload(payload) -> None:
+-    """Refresh a claimed FIFO admission's text in place, before it becomes a turn or a note."""
+-    if isinstance(payload, dict) and isinstance(payload.get("text"), str) and ASK_MARK in payload["text"]:
+-        payload["text"] = refresh_stale_ask(payload["text"])
++    """Refresh a claimed producer wake's text in place, before it becomes a turn or a note.
++
++    Human-typed rows are never touched. Any failure leaves the text as it was: a refresh must never
++    cost the wake itself."""
++    try:
++        if (isinstance(payload, dict) and isinstance(payload.get("text"), str) and ASK_MARK in payload["text"]
++                and _is_producer_row(payload)):
++            payload["text"] = refresh_stale_ask(payload["text"])
++    except Exception:  # unchanged on any doubt
++        logger.warning("stale block-ask refresh failed; delivering the wake unchanged", exc_info=True)
+diff --git a/tests/gateway/test_kanban_stale_block_ask.py b/tests/gateway/test_kanban_stale_block_ask.py
+index 86d4eebc48..e16381930f 100644
+--- a/tests/gateway/test_kanban_stale_block_ask.py
++++ b/tests/gateway/test_kanban_stale_block_ask.py
+@@ -120,3 +120,65 @@ def test_remote_or_unreadable_cards_are_left_alone(tmp_path, monkeypatch):
+     assert refresh_stale_ask(remote) == remote
+     missing = remote.replace("@hub-ec2", "")
+     assert refresh_stale_ask(missing) == missing
++
++
++def _stale_notice(tmp_path, monkeypatch):
++    """A rendered wake for a card that has since finished, and the card id."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    tid, task = _blocked_card()
++    text = _wake_text(tid, task)
++    _finish(tid)
++    return tid, text
++
++
++def test_user_typed_row_quoting_a_stale_notice_is_left_alone(tmp_path, monkeypatch):
++    """David pasting an old notice ("what do I do with this?") must reach the agent as he typed it."""
++    from hermes_cli.kanban_stale_ask import refresh_payload
++    _tid, text = _stale_notice(tmp_path, monkeypatch)
++    typed = {"text": "what do I do with this?\n" + text, "native_text_v1": {"source": {"platform": "desktop"}}}
++    before = typed["text"]
++    refresh_payload(typed)
++    assert typed["text"] == before
++    wake = {"text": text, "native_text_v1": {"source": {}, "automation": {"identity": "x", "owner": "s"}}}
++    refresh_payload(wake)
++    assert "Next action for the user" not in wake["text"]
++    local = {"text": text, "local_automation_v1": {"owner": "s"}}
++    refresh_payload(local)
++    assert "Since then: unblocked 20:08, completed 20:25 PST. No action needed." in local["text"]
++
++
++def test_stray_ask_mark_before_a_stale_notice_keeps_the_text_between(tmp_path, monkeypatch):
++    from hermes_cli.kanban_stale_ask import refresh_stale_ask
++    _tid, text = _stale_notice(tmp_path, monkeypatch)
++    prose = "Result: the worker wrote Next action for the user: something.\nIMPORTANT OTHER CONTENT\n\n"
++    out = refresh_stale_ask(prose + text)
++    assert out.startswith(prose)
++    assert "IMPORTANT OTHER CONTENT" in out
++    assert out.count("Since then:") == 1 and "Why only the user" not in out
++    # A quoted notice line at line start, not preceded by the notice's own actor line, is not touched either.
++    quoted = "Next action for the user: quoted.\nIMPORTANT OTHER CONTENT\n" + text
++    out = refresh_stale_ask(quoted)
++    assert out.startswith("Next action for the user: quoted.\nIMPORTANT OTHER CONTENT\n")
++    assert out.count("Since then:") == 1
++
++
++def test_two_joined_notices_only_the_stale_one_changes(tmp_path, monkeypatch):
++    from hermes_cli.kanban_stale_ask import refresh_stale_ask
++    _tid, stale = _stale_notice(tmp_path, monkeypatch)
++    tid2, task2 = _blocked_card()
++    live = _wake_text(tid2, task2)
++    out = refresh_stale_ask(stale + "\n" + live)
++    assert out.endswith("\n" + live)  # the still-blocked notice is byte-identical
++    assert out.count("Next action for the user") == 1 and out.count("Since then:") == 1
++
++
++def test_unexpected_refresh_error_leaves_the_text_unchanged(tmp_path, monkeypatch):
++    from hermes_cli import kanban_stale_ask
++    _tid, text = _stale_notice(tmp_path, monkeypatch)
++
++    def boom(*_a, **_k):
++        raise RuntimeError("odd row")
++    monkeypatch.setattr(kanban_stale_ask, "_read_card", boom)
++    payload = {"text": text, "local_automation_v1": {"owner": "s"}}
++    kanban_stale_ask.refresh_payload(payload)
++    assert payload["text"] == text
+-- 
+2.43.0
+

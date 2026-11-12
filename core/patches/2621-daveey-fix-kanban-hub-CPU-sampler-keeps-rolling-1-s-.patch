@@ -1,0 +1,733 @@
+From cb1df17c2b7fec0913b747e4648c300f7f4f928a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 09:15:19 +0000
+Subject: [PATCH] [daveey] fix(kanban): hub CPU sampler keeps rolling 1 s
+ snapshots so every reported triple fits the Board's 2 s window
+
+The thread sampler (430a8d4464) took one ~1 s sample every 5 s and the report attached the newest one up to 10 s
+old. The Board keeps a triple only when at - 2000 <= cpu_busy_sample_end_ms <= at (hermes-hub mailbox.ts
+CPU_MAX_DELAY_MS, deployed d9e950ade108), so with independent sampler and reporter clocks only ~35-40 % of
+CPU-bearing reports were stored, and each rejected one erased the stored sample.
+
+AdvisorySampler now reads one /proc/stat snapshot per WINDOW_S on its own thread and forms each sample from
+(previous, new) with machine_cpu_metrics.between (the window bounds and arithmetic cpu.sample now shares). An
+out-of-bounds window drops that sample and restarts from the new snapshot; the next snapshot is scheduled from
+the previous one's read time, so an early wake never shortens a window. The advisory file is still written at
+most every 5 s, from the newest valid sample. take(limit) returns the newest unreported sample measured under the
+same limit only when its end stamp is 0..1500 ms before the take (REPORT_MAX_AGE_MS replaces REPORT_MAX_AGE_S=10).
+
+Tests: the real sampler thread and the real Reporter on a lockstep fake clock with 3-20 s sync rounds (every
+triple <= 1500 ms old at send, >= 9/10 due reports carry one, never reported twice, advisory never stale), and
+the Board rule with 0-400 ms send latency and sampler stalls (100 % accepted).
+
+Card t_01a1cf00956ad8b2.
+---
+ hermes_cli/machine_cpu_metrics.py            |  15 +-
+ hermes_cli/machine_cpu_sampler.py            | 120 +++++--
+ hermes_cli/machine_metrics.py                |   3 +-
+ tests/hermes_cli/test_hub_cpu_gate_budget.py |  27 +-
+ tests/hermes_cli/test_machine_cpu_sampler.py | 334 ++++++++++++++++---
+ 5 files changed, 396 insertions(+), 103 deletions(-)
+
+diff --git a/hermes_cli/machine_cpu_metrics.py b/hermes_cli/machine_cpu_metrics.py
+index 573dcde034..3140fe56e6 100644
+--- a/hermes_cli/machine_cpu_metrics.py
++++ b/hermes_cli/machine_cpu_metrics.py
+@@ -9,9 +9,9 @@ error, malformed line, counter decrease (reboot/reset), non-positive total, or a
+ [1000, 2000] ms yields ``None`` (unknown), which every caller treats as "refuse", never as idle.
+ 
+ Two callers sample:
+-- the sync loop's advisory sampler thread (``machine_cpu_sampler``), every 5 s and only while the
+-  installation-root config sets ``kanban.admission.cpu_busy_below_pct``; it feeds the lock-free advisory file and
+-  the metrics report (the Board uses the reported triple for hub overflow), and
++- the sync loop's advisory sampler thread (``machine_cpu_sampler``), one rolling snapshot per second and only while
++  the installation-root config sets ``kanban.admission.cpu_busy_below_pct``; it feeds the lock-free advisory file
++  and the metrics report (the Board uses the reported triple for hub overflow), and
+ - the final claim gate in ``kanban_admission.claim_transaction``, with an independent full sample taken while
+   ``admission.lock`` is held.
+ 
+@@ -86,7 +86,14 @@ def sample(window_s: float = WINDOW_S, *, read: Callable[[], str] = _read_proc_s
+         end_ms = int(wall() * 1000)
+     except (OSError, UnicodeError, ValueError):
+         return None
+-    window_ms = (t1 - t0) * 1000.0
++    return between(first, second, (t1 - t0) * 1000.0, end_ms)
++
++
++def between(first: Optional[tuple[int, int]], second: Optional[tuple[int, int]], window_ms: float,
++            end_ms: int) -> Optional[dict[str, Any]]:
++    """The triple for two parsed snapshots *window_ms* apart (monotonic), ending at wall *end_ms*; ``None`` when the
++    window is outside [MIN_WINDOW_MS, MAX_WINDOW_MS] or the delta is invalid. Shared by :func:`sample` and the
++    advisory sampler's rolling snapshots (``machine_cpu_sampler``)."""
+     if not math.isfinite(window_ms) or not MIN_WINDOW_MS <= round(window_ms, 6) <= MAX_WINDOW_MS:
+         return None
+     pct = busy_pct(first, second)
+diff --git a/hermes_cli/machine_cpu_sampler.py b/hermes_cli/machine_cpu_sampler.py
+index b3ed472c62..2d1da25790 100644
+--- a/hermes_cli/machine_cpu_sampler.py
++++ b/hermes_cli/machine_cpu_sampler.py
+@@ -6,11 +6,18 @@ loop: the split begin/finish sampler took snapshot A after one round and B after
+ 3-20 s (board pulls plus feed wakes) always put the window past ``MAX_WINDOW_MS``. Every sample was dropped, the
+ file aged, and the hub claimed nothing for minutes (2026-11-12).
+ 
+-This thread takes a full ``machine_cpu_metrics.sample`` (two snapshots ~1 s apart, blocking only itself) every
+-:func:`sample_every_s` (5 s) while the root limit is on, and writes each valid one to the advisory file. The sync loop
+-starts it and closes it when the loop ends, so a stopped loop still leaves the advisory to go stale (fail-closed).
+-The metrics report takes the newest sample with :meth:`AdvisorySampler.take`, at most once per sample (a report is
+-never replayed) and only while it is younger than :data:`REPORT_MAX_AGE_S`.
++This thread samples continuously with rolling ``/proc/stat`` snapshots while the root limit is on: every
++``WINDOW_S`` (1 s) it reads one new snapshot, forms a sample from (previous, new) with
++``machine_cpu_metrics.between`` (the same window bounds and arithmetic as ``sample``), and makes the new snapshot
++the previous one. A window outside the bounds drops that sample and restarts from the new snapshot. The advisory
++file is written at most every :func:`record_every_s` (5 s), always from the newest valid sample.
++
++The metrics report takes the newest sample with :meth:`AdvisorySampler.take`: at most once per sample (a report is
++never replayed), only under the same limit, and only while its end stamp is at most :data:`REPORT_MAX_AGE_MS`
++before the take. The Board keeps a triple only when ``at - 2000 <= end <= at`` (hermes-hub ``CPU_MAX_DELAY_MS``);
++the earlier one-sample-every-5-s cadence made the end up to 5 s old at send and the Board dropped most of them.
++The sync loop starts the thread and closes it when the loop ends, so a stopped loop still leaves the advisory to go
++stale (fail-closed).
+ """
+ from __future__ import annotations
+ 
+@@ -21,9 +28,10 @@ from typing import Any, Callable, Optional
+ 
+ _log = logging.getLogger(__name__)
+ 
+-# One ~1 s sample every 5 windows (5 s): a 20 % duty cycle of two /proc/stat reads, well inside the 15 s advisory.
+-SAMPLE_EVERY_WINDOWS = 5
+-REPORT_MAX_AGE_S = 10.0
++# The advisory file is rewritten every 5 windows (5 s), well inside its 15 s freshness limit.
++RECORD_EVERY_WINDOWS = 5
++# A reported triple ends at most 1.5 s before the take: the Board's 2 s window leaves 500 ms for the send.
++REPORT_MAX_AGE_MS = 1500
+ 
+ # The last state of this process's sampler, for the dispatcher's stale-advisory card (kanban_hub_cpu_alert).
+ _STATUS: dict[str, Any] = {}
+@@ -33,79 +41,119 @@ def status() -> dict[str, Any]:
+     return dict(_STATUS)
+ 
+ 
+-def sample_every_s() -> float:
++def record_every_s() -> float:
+     from hermes_cli import machine_cpu_metrics as cpu
+-    return SAMPLE_EVERY_WINDOWS * cpu.WINDOW_S
++    return RECORD_EVERY_WINDOWS * cpu.WINDOW_S
++
++
++def _snapshot_now(read: Callable[[], str], clock: Callable[[], float],
++                  wall: Callable[[], float]) -> Optional[tuple[tuple[int, int], float, int]]:
++    """``(counters, monotonic s, wall end ms)`` for one ``/proc/stat`` read, or None when it is unreadable."""
++    from hermes_cli import machine_cpu_metrics as cpu
++    try:
++        parsed = cpu.parse_proc_stat(read())
++        taken, end_ms = clock(), int(wall() * 1000)
++    except (OSError, UnicodeError, ValueError):
++        return None
++    return None if parsed is None else (parsed, taken, end_ms)
+ 
+ 
+ class AdvisorySampler:
+     def __init__(self, *, limit_fn: Optional[Callable[[], tuple]] = None,
+-                 sample_fn: Optional[Callable[[], Optional[dict]]] = None,
++                 read_fn: Optional[Callable[[], str]] = None,
+                  record_fn: Optional[Callable[[dict], None]] = None,
+-                 clock: Callable[[], float] = time.monotonic, every_s: Optional[float] = None) -> None:
+-        self.limit_fn, self.sample_fn, self.record_fn = limit_fn, sample_fn, record_fn
+-        self.clock = clock
+-        self.every_s = every_s
++                 clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time,
++                 wait_fn: Optional[Callable[[float], Any]] = None, linux: Optional[bool] = None) -> None:
++        import sys
++        self.limit_fn, self.read_fn, self.record_fn = limit_fn, read_fn, record_fn
++        self.clock, self.wall = clock, wall
++        self.linux = sys.platform.startswith("linux") if linux is None else linux
+         self.drops = 0
+         self.consecutive_drops = 0
+         self.records = 0
+         self._lock = Lock()
+-        self._latest: Optional[tuple[dict, Any, float]] = None  # (sample, limit, monotonic taken_at)
++        self._prev: Optional[tuple[tuple[int, int], float, int]] = None  # (counters, monotonic, wall end ms)
++        self._latest: Optional[tuple[dict, Any]] = None  # (sample, limit it was measured under)
+         self._taken: Optional[tuple] = None
++        self._recorded_at: Optional[float] = None  # monotonic time of the last advisory-file write
+         self._stop = Event()
++        self._wait = wait_fn or self._stop.wait
+         self._thread: Optional[Thread] = None
+ 
++    def _drop(self, why: str) -> None:
++        self.drops += 1
++        self.consecutive_drops += 1
++        _STATUS.update(drops=self.drops, consecutive_drops=self.consecutive_drops)
++        _log.info("machine metrics admission quality: cpu_sample_drops=%d (consecutive=%d, %s)",
++                  self.drops, self.consecutive_drops, why)
++
+     def run_once(self) -> Optional[dict]:
+-        """One measurement round. Returns the recorded sample, or None (gate off, or the sample was dropped)."""
++        """One rolling step: read a new snapshot and form a sample with the previous one.
++
++        Returns the new valid sample, or None (gate off, first snapshot, or the sample was dropped)."""
+         from hermes_cli import machine_cpu_metrics as cpu
+         from hermes_cli import machine_metrics as mm
+         state, limit = (self.limit_fn or cpu.root_limit)()
+         if state != cpu.ON:
+             with self._lock:
+-                self._latest = None
++                self._prev = self._latest = None
++            return None
++        read = self.read_fn or (cpu._read_proc_stat if self.linux else None)
++        snap = _snapshot_now(read, self.clock, self.wall) if read is not None else None
++        prev, self._prev = self._prev, snap  # the new snapshot is the next window's start, valid or not
++        if snap is None:
++            self._drop("unreadable /proc/stat" if read is not None else "not Linux")
+             return None
+-        started = self.clock()
+-        measured = self.sample_fn() if self.sample_fn else cpu.sample(cpu.WINDOW_S)
+-        if not measured or not all(k in measured for k in cpu.FIELDS):
+-            self.drops += 1
+-            self.consecutive_drops += 1
+-            _STATUS.update(drops=self.drops, consecutive_drops=self.consecutive_drops)
+-            _log.info("machine metrics admission quality: cpu_sample_drops=%d (consecutive=%d, round %.0f ms)",
+-                      self.drops, self.consecutive_drops, (self.clock() - started) * 1000.0)
++        if prev is None:
++            return None  # the first snapshot of a run: the next step forms the first sample
++        window_ms = (snap[1] - prev[1]) * 1000.0
++        measured = cpu.between(prev[0], snap[0], window_ms, snap[2])
++        if measured is None:
++            self._drop(f"window {window_ms:.0f} ms")
+             return None
+         self.consecutive_drops = 0
+-        try:
+-            (self.record_fn or mm.record_hub_cpu_sample)(measured)
+-        except OSError as exc:
+-            _log.debug("hub CPU advisory sample not recorded: %s", exc)
+         with self._lock:
+-            self._latest = (dict(measured), limit, self.clock())
++            self._latest = (dict(measured), limit)
+         self.records += 1
+         _STATUS.update(records=self.records, consecutive_drops=0, last_end_ms=measured["cpu_busy_sample_end_ms"])
++        now = self.clock()
++        if self._recorded_at is None or now - self._recorded_at >= record_every_s():
++            try:
++                (self.record_fn or mm.record_hub_cpu_sample)(measured)
++                self._recorded_at = now
++            except OSError as exc:
++                _log.debug("hub CPU advisory sample not recorded: %s", exc)
+         return measured
+ 
+     def take(self, limit: Any) -> Optional[dict]:
+-        """The newest sample for one metrics report: measured under *limit*, not yet reported, still fresh."""
++        """The newest sample for one metrics report: measured under *limit*, not yet reported, and ending at most
++        REPORT_MAX_AGE_MS before now (wall clock, like the Board's check). Otherwise None: no triple is sent."""
+         with self._lock:
+             latest = self._latest
+             if latest is None or latest is self._taken:
+                 return None
+-            sample, measured_limit, taken_at = latest
+-            if measured_limit != limit or self.clock() - taken_at > REPORT_MAX_AGE_S:
++            sample, measured_limit = latest
++            age_ms = int(self.wall() * 1000) - sample["cpu_busy_sample_end_ms"]
++            if measured_limit != limit or not 0 <= age_ms <= REPORT_MAX_AGE_MS:
+                 return None
+             self._taken = latest
+             return dict(sample)
+ 
+     def run(self) -> None:
+         # Only close() ends it (the loop's finally): the loop owns keep_running, whose callers may count calls.
++        from hermes_cli import machine_cpu_metrics as cpu
+         while not self._stop.is_set():
+             started = self.clock()
+             try:
+                 self.run_once()
+             except Exception as exc:  # health: allow BLE001 -- the advisory sampler must keep sampling
+                 _log.debug("hub CPU advisory sampler round failed (%s: %s)", type(exc).__name__, exc)
+-            every = sample_every_s() if self.every_s is None else self.every_s
+-            self._stop.wait(max(0.0, every - (self.clock() - started)))
++            # The next snapshot no earlier than one window after this one (its own read time, not the step's
++            # start): a wait that wakes early is resumed, so a window is never shorter than MIN_WINDOW_MS.
++            prev = self._prev
++            due = (prev[1] if prev is not None else started) + cpu.WINDOW_S
++            while not self._stop.is_set() and self.clock() < due:
++                self._wait(due - self.clock())
+ 
+     def start(self) -> Thread:
+         # health: allow HX012 -- reads only the installation-root config: there is no profile scope to carry
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index ab4b2c8d13..e09666f141 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -8,7 +8,8 @@ local run. Cards without ``placement_policy`` are still placed without it.
+ 
+ Hub overflow: on a host whose installation-root config sets ``kanban.admission.cpu_busy_below_pct`` the reporter
+ also attaches the complete triple ``cpu_busy_pct``/``cpu_busy_window_ms``/``cpu_busy_sample_end_ms`` measured by the
+-sync loop's advisory sampler thread (``machine_cpu_sampler``: a ~1 s window every 5 s, off the loop thread).
++sync loop's advisory sampler thread (``machine_cpu_sampler``: rolling ~1 s windows, off the loop thread; a triple
++ends at most 1.5 s before the report takes it, inside the Board's 2 s window).
+ ``collect()`` itself never samples CPU busy. A CPU-bearing report has a hard 2 s total transport budget and is never
+ replayed: each sample is reported at most once, and a failed round drops it.
+ """
+diff --git a/tests/hermes_cli/test_hub_cpu_gate_budget.py b/tests/hermes_cli/test_hub_cpu_gate_budget.py
+index 0c00101e4c..64e03416ec 100644
+--- a/tests/hermes_cli/test_hub_cpu_gate_budget.py
++++ b/tests/hermes_cli/test_hub_cpu_gate_budget.py
+@@ -4,8 +4,6 @@ The lock-free advisory refuses every hub claim when the sampler's latest sample
+ intended): so the advisory sampler must refresh it well inside that age whatever the sync loop's round time, a Board outage
+ must not starve it, and the root key must be a known, documented, off-by-default configuration key.
+ """
+-import time
+-
+ from hermes_cli import kanban_admission as ka
+ from hermes_cli import kanban_sync_client as ksc
+ from hermes_cli import machine_cpu_metrics as cm
+@@ -13,22 +11,31 @@ from hermes_cli import machine_cpu_sampler as cs
+ from hermes_cli import machine_metrics as mm
+ 
+ 
++BOARD_CPU_MAX_DELAY_MS = 2000  # hermes-hub worker/src/mailbox.ts CPU_MAX_DELAY_MS (deployed d9e950ade108)
++
++
+ def test_slowest_sampler_round_refreshes_the_advisory_inside_its_freshness_window():
+-    # The sampler's own cadence + the longest valid sample: the next record lands before the 15 s limit,
++    # The sampler's own write cadence + the longest valid window: the next record lands before the 15 s limit,
+     # whatever the sync loop's round time (the sampler runs on its own thread).
+-    slowest_s = cs.sample_every_s() + cm.MAX_WINDOW_MS / 1000
++    slowest_s = cs.record_every_s() + cm.MAX_WINDOW_MS / 1000
+     assert slowest_s < ka.ADVISORY_MAX_AGE_MS / 1000, slowest_s
+-    # A report attaches a sample at most REPORT_MAX_AGE_S old; +2 s POST budget stays inside the Board's 15 s.
+-    assert cs.REPORT_MAX_AGE_S + ksc.CPU_REPORT_BUDGET_S < ka.ADVISORY_MAX_AGE_MS / 1000
++    # A report attaches a sample ending at most REPORT_MAX_AGE_MS before the take, which leaves the send part of the
++    # Board's 2 s window; the advisory's 15 s freshness is unaffected by the report.
++    assert cs.REPORT_MAX_AGE_MS < BOARD_CPU_MAX_DELAY_MS
++    assert cs.REPORT_MAX_AGE_MS / 1000 + ksc.CPU_REPORT_BUDGET_S < ka.ADVISORY_MAX_AGE_MS / 1000
+ 
+ 
+ def test_advisory_is_recorded_without_any_send_so_a_board_outage_does_not_starve_local_claims(tmp_path, monkeypatch):
+     import hermes_constants
+     monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: tmp_path)
+-    end = int(time.time() * 1000)
+-    triple = {"cpu_busy_pct": 12.5, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": end}
+-    sampler = cs.AdvisorySampler(limit_fn=lambda: (cm.ON, 50.0), sample_fn=lambda: dict(triple))
+-    assert sampler.run_once() == triple  # the sampler thread's round: no Board call at all
++    now = [100.0]
++    stats = iter(["cpu 100 0 0 900 0 0 0 0\n", "cpu 150 0 0 1850 0 0 0 0\n"])  # 50 busy of 1000 ticks: 5 %
++    sampler = cs.AdvisorySampler(limit_fn=lambda: (cm.ON, 50.0), read_fn=lambda: next(stats), clock=lambda: now[0],
++                                 wall=lambda: 1_700_000_000 + now[0])
++    assert sampler.run_once() is None  # the first snapshot
++    now[0] += 1.0
++    triple = {"cpu_busy_pct": 5.0, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": 1_700_000_101_000}
++    assert sampler.run_once() == triple  # the sampler thread's step: no Board call at all
+     assert mm.read_hub_cpu_sample(tmp_path) == triple
+ 
+     def send(_sample):
+diff --git a/tests/hermes_cli/test_machine_cpu_sampler.py b/tests/hermes_cli/test_machine_cpu_sampler.py
+index 70f7783b76..238f282785 100644
+--- a/tests/hermes_cli/test_machine_cpu_sampler.py
++++ b/tests/hermes_cli/test_machine_cpu_sampler.py
+@@ -1,6 +1,9 @@
+-"""The hub CPU advisory sampler: its own cadence, at-most-once report hand-off, and fail-closed lifetime."""
++"""The hub CPU advisory sampler: rolling snapshots, at-most-once fresh report hand-off, fail-closed lifetime."""
++import itertools
+ import logging
++import random
+ import threading
++import time
+ 
+ import pytest
+ 
+@@ -8,115 +11,342 @@ from hermes_cli import machine_cpu_metrics as cpu
+ from hermes_cli import machine_cpu_sampler as cs
+ from hermes_cli import machine_metrics as mm
+ 
+-CPU = dict(cpu_busy_pct=12.5, cpu_busy_window_ms=1000, cpu_busy_sample_end_ms=1_700_000_000_000)
++WALL0 = 1_700_000_000.0  # fake wall clock = WALL0 + fake monotonic
++BOARD_CPU_MAX_DELAY_MS = 2000  # hermes-hub worker/src/mailbox.ts CPU_MAX_DELAY_MS (deployed d9e950ade108)
+ 
+ 
+-def _sampler(now, gate=None, samples=None, recorded=None):
++def _stat(busy, idle):
++    return f"cpu {busy} 0 0 {idle} 0 0 0 0\n"
++
++
++def _sampler(now, gate=None, stats=None, recorded=None):
++    """A sampler on a fake clock. *stats* is a list of /proc/stat texts consumed one per step; when it runs out each
++    read is 25 % busy over the elapsed fake time."""
+     gate = gate if gate is not None else [(cpu.ON, 50.0)]
+-    samples = samples if samples is not None else []
++    stats = stats if stats is not None else []
+     recorded = recorded if recorded is not None else []
+ 
+-    def sample():
+-        return samples.pop(0) if samples else dict(CPU)
+-    return cs.AdvisorySampler(limit_fn=lambda: gate[0], sample_fn=sample, record_fn=recorded.append,
+-                              clock=lambda: now[0])
++    def read():
++        if stats:
++            text = stats.pop(0)
++            if isinstance(text, Exception):
++                raise text
++            return text
++        ticks = int(now[0] * 400)
++        return _stat(ticks // 4, ticks - ticks // 4)
++    return cs.AdvisorySampler(limit_fn=lambda: gate[0], read_fn=read, record_fn=recorded.append,
++                              clock=lambda: now[0], wall=lambda: WALL0 + now[0])
++
++
++def _end_ms(t):
++    return int((WALL0 + t) * 1000)
+ 
+ 
+-def test_each_valid_sample_is_recorded_and_reported_at_most_once():
++def test_rolling_snapshots_form_one_sample_per_step_from_previous_and_new():
+     now, recorded = [100.0], []
+-    s = _sampler(now, recorded=recorded)
+-    assert s.run_once() == CPU and recorded == [CPU] and s.records == 1
+-    assert s.take(50.0) == CPU
+-    assert s.take(50.0) is None  # never replayed into a second report
+-    second = dict(CPU, cpu_busy_sample_end_ms=CPU["cpu_busy_sample_end_ms"] + 5000)
+-    s.sample_fn = lambda: dict(second)
++    s = _sampler(now, stats=[_stat(0, 0), _stat(25, 75), _stat(75, 125)], recorded=recorded)
++    assert s.run_once() is None  # the first snapshot only primes the window
++    now[0] += 1.0
++    first = s.run_once()
++    assert first == {"cpu_busy_pct": 25.0, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": _end_ms(101.0)}
++    now[0] += 1.2
++    second = s.run_once()  # (previous, new): the window starts where the last one ended
++    assert second == {"cpu_busy_pct": 50.0, "cpu_busy_window_ms": 1200, "cpu_busy_sample_end_ms": _end_ms(102.2)}
++    assert s.records == 2 and s.drops == 0
++
++
++def test_each_valid_sample_is_reported_at_most_once():
++    now = [100.0]
++    s = _sampler(now)
+     s.run_once()
+-    assert s.take(50.0) == second
++    now[0] += 1.0
++    sample = s.run_once()
++    assert s.take(50.0) == sample
++    assert s.take(50.0) is None  # never replayed into a second report
++    now[0] += 1.0
++    newer = s.run_once()
++    assert newer != sample and s.take(50.0) == newer
+ 
+ 
+-def test_take_refuses_a_stale_sample_or_one_measured_under_another_limit():
++def test_take_refuses_another_limit_a_stale_end_or_a_future_end():
+     now = [100.0]
+     s = _sampler(now)
+     s.run_once()
++    now[0] += 1.0
++    sample = s.run_once()
+     assert s.take(60.0) is None  # the limit changed since the measurement
+-    now[0] += cs.REPORT_MAX_AGE_S + 0.001
+-    assert s.take(50.0) is None
+-    now[0] = 100.0 + cs.REPORT_MAX_AGE_S
+-    assert s.take(50.0) == CPU  # the age bound is inclusive
++    now[0] += cs.REPORT_MAX_AGE_MS / 1000 + 0.001
++    assert s.take(50.0) is None  # ends more than 1.5 s before the take: the Board would drop it
++    now[0] = 101.0 + cs.REPORT_MAX_AGE_MS / 1000
++    assert s.take(50.0) == sample  # the age bound is inclusive
++    t2 = [100.0]
++    s2 = _sampler(t2)
++    s2.run_once()
++    t2[0] = 101.0
++    s2.run_once()
++    s2.wall = lambda: WALL0 + 100.5  # the wall clock stepped back past the end stamp
++    assert s2.take(50.0) is None
+ 
+ 
+-@pytest.mark.parametrize("bad", [None, {}, {"cpu_busy_pct": 1.0, "cpu_busy_window_ms": 1000}])
+-def test_a_dropped_sample_is_counted_logged_and_never_recorded(caplog, bad):
++@pytest.mark.parametrize("window_s", [0.999, 2.001])
++def test_a_window_out_of_bounds_drops_the_sample_and_restarts_from_the_new_snapshot(caplog, window_s):
+     now, recorded = [100.0], []
+-    s = _sampler(now, samples=[bad, bad], recorded=recorded)
++    s = _sampler(now, recorded=recorded)
++    s.run_once()
++    now[0] += window_s
+     with caplog.at_level(logging.INFO, logger=cs.__name__):
+         assert s.run_once() is None
+-        assert s.run_once() is None
+-    assert recorded == [] and s.drops == 2 and s.consecutive_drops == 2
+-    assert s.take(50.0) is None
++    assert recorded == [] and s.drops == 1 and s.consecutive_drops == 1 and s.take(50.0) is None
++    assert any("cpu_sample_drops=1 (consecutive=1" in m for m in caplog.messages)
++    assert cs.status()["consecutive_drops"] == 1
++    now[0] += 1.0  # the next window starts at the dropped one's end, not at the earlier snapshot
++    after = s.run_once()
++    assert after is not None and after["cpu_busy_window_ms"] == 1000
++    assert s.consecutive_drops == 0 and len(recorded) == 1 and cs.status()["consecutive_drops"] == 0
++
++
++def test_an_unreadable_snapshot_is_counted_and_never_recorded(caplog):
++    now, recorded = [100.0], []
++    s = _sampler(now, stats=[_stat(0, 0), OSError("gone"), "garbage\n"], recorded=recorded)
++    s.run_once()
++    with caplog.at_level(logging.INFO, logger=cs.__name__):
++        for _ in range(2):
++            now[0] += 1.0
++            assert s.run_once() is None
++    assert recorded == [] and s.drops == 2 and s.consecutive_drops == 2 and s.take(50.0) is None
+     assert any("cpu_sample_drops=2 (consecutive=2" in m for m in caplog.messages)
+-    assert cs.status()["consecutive_drops"] == 2
+-    s.run_once()  # a valid sample ends the run of drops
+-    assert s.consecutive_drops == 0 and recorded == [CPU] and cs.status()["consecutive_drops"] == 0
++    now[0] += 1.0
++    assert s.run_once() is None  # a fresh start after the unreadable ones: this snapshot primes the window
++    now[0] += 1.0
++    assert s.run_once() is not None and len(recorded) == 1
++
++
++def test_off_linux_the_default_reader_is_a_drop():
++    s = cs.AdvisorySampler(limit_fn=lambda: (cpu.ON, 50.0), record_fn=lambda _s: None, linux=False)
++    assert s.run_once() is None and s.drops == 1
+ 
+ 
+ @pytest.mark.parametrize("gate", [(cpu.OFF, None), (cpu.UNKNOWN, None)])
+-def test_gate_not_on_samples_nothing_and_forgets_the_last_sample(gate):
+-    now, recorded, calls = [100.0], [], []
++def test_gate_not_on_reads_nothing_and_forgets_the_last_sample_and_snapshot(gate):
++    now, reads = [100.0], []
+     g = [(cpu.ON, 50.0)]
+-    s = _sampler(now, gate=g, recorded=recorded)
++    s = _sampler(now, gate=g)
++    s.run_once()
++    now[0] += 1.0
+     s.run_once()
+     g[0] = gate
+-    s.sample_fn = lambda: calls.append(1)
+-    assert s.run_once() is None and calls == [] and s.drops == 0
++    real_read = s.read_fn
++    assert real_read is not None
++    s.read_fn = lambda: reads.append(1) or real_read()
++    now[0] += 1.0
++    assert s.run_once() is None and reads == [] and s.drops == 0
+     assert s.take(50.0) is None
++    g[0] = (cpu.ON, 50.0)
++    now[0] += 1.0
++    assert s.run_once() is None  # back on: a new first snapshot, never a window spanning the off period
+ 
+ 
+-def test_record_failure_still_hands_the_sample_to_the_report():
+-    now = [100.0]
++def test_advisory_file_is_written_at_most_every_five_seconds_from_the_newest_valid_sample():
++    now, recorded = [0.0], []
++    s = _sampler(now, recorded=recorded)
++    s.run_once()
++    for _ in range(11):
++        now[0] += 1.0
++        s.run_once()
++    assert [r["cpu_busy_sample_end_ms"] for r in recorded] == [_end_ms(1.0), _end_ms(6.0), _end_ms(11.0)]
++    assert s.records == 11  # every step still hands its sample to the report
++    # A dropped step at the 5 s mark: the next valid one is written at once.
++    now[0] += 4.0
++    s.run_once()  # 15.0: a 4 s window, dropped
++    now[0] += 1.0
++    s.run_once()  # 16.0: valid, 5 s after the last write
++    assert recorded[-1]["cpu_busy_sample_end_ms"] == _end_ms(16.0)
++
++
++def test_record_failure_still_hands_the_sample_to_the_report_and_retries_the_write():
++    now, calls = [100.0], []
+     s = _sampler(now)
+ 
+-    def fail(_sample):
++    def fail(sample):
++        calls.append(sample)
+         raise OSError("read-only cache")
+     s.record_fn = fail
+-    assert s.run_once() == CPU and s.take(50.0) == CPU
++    s.run_once()
++    now[0] += 1.0
++    sample = s.run_once()
++    assert s.take(50.0) == sample
++    now[0] += 1.0
++    s.run_once()
++    assert len(calls) == 2  # a failed write is not a write: the next step tries again
+ 
+ 
+ def test_default_record_writes_the_advisory_file(tmp_path, monkeypatch):
+     import hermes_constants
+     monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda *a, **k: tmp_path)
+-    s = cs.AdvisorySampler(limit_fn=lambda: (cpu.ON, 50.0), sample_fn=lambda: dict(CPU))
++    now = [100.0]
++    s = _sampler(now)
++    s.record_fn = None
+     s.run_once()
+-    assert mm.read_hub_cpu_sample(tmp_path) == CPU
++    now[0] += 1.0
++    assert mm.read_hub_cpu_sample(tmp_path) is None
++    sample = s.run_once()
++    assert mm.read_hub_cpu_sample(tmp_path) == sample
+ 
+ 
+-def test_thread_keeps_its_own_cadence_and_stops_on_close():
++def test_thread_keeps_its_own_cadence_and_stops_on_close(monkeypatch):
++    monkeypatch.setattr(cpu, "WINDOW_S", 0.01)
+     rounds = threading.Semaphore(0)
+-    s = cs.AdvisorySampler(limit_fn=lambda: (cpu.ON, 50.0), every_s=0.01,
+-                           sample_fn=lambda: rounds.release() or dict(CPU), record_fn=lambda _s: None)
++    s = cs.AdvisorySampler(limit_fn=lambda: (cpu.ON, 50.0), read_fn=lambda: rounds.release() or _stat(1, 1),
++                           record_fn=lambda _s: None)
+     thread = s.start()
+     assert thread.daemon and thread.name == "hub-cpu-advisory-sampler"
+-    for _ in range(3):  # several rounds without any caller driving it
++    for _ in range(3):  # several steps without any caller driving it
+         assert rounds.acquire(timeout=5)
+     s.close()
+     assert not thread.is_alive()
+-    idle = cs.AdvisorySampler(limit_fn=lambda: (cpu.OFF, None))  # mid-wait on the default 5 s cadence
++
++
++def test_close_wakes_the_wait_at_once():
++    idle = cs.AdvisorySampler(limit_fn=lambda: (cpu.OFF, None))  # mid-wait on the default 1 s window
+     t2 = idle.start()
++    started = time.monotonic()
+     idle.close()
+-    assert not t2.is_alive()  # close wakes the wait at once
++    assert not t2.is_alive() and time.monotonic() - started < cpu.WINDOW_S
++
++
++def test_a_wait_that_wakes_early_never_shortens_the_window():
++    now, waits, windows = [100.0], [], []
++    s = _sampler(now)
++
++    def early_wait(timeout):  # wakes 40 % early every time
++        waits.append(timeout)
++        now[0] += timeout * 0.6
++        if len(waits) > 40:
++            s._stop.set()
++    s._wait = early_wait
++    real = s.run_once
++
++    def step():
++        out = real()
++        if out:
++            windows.append(out["cpu_busy_window_ms"])
++        return out
++    s.run_once = step
++    s.run()
++    assert windows and all(w >= cpu.MIN_WINDOW_MS for w in windows) and s.drops == 0, (windows, s.drops)
+ 
+ 
+-def test_a_failing_round_does_not_end_the_thread():
++def test_a_failing_step_does_not_end_the_thread(monkeypatch):
++    monkeypatch.setattr(cpu, "WINDOW_S", 0.01)
+     rounds = threading.Semaphore(0)
+ 
+-    def sample():
++    def limit():
+         rounds.release()
+         raise RuntimeError("controlled")
+-    s = cs.AdvisorySampler(limit_fn=lambda: (cpu.ON, 50.0), every_s=0.01, sample_fn=sample)
++    s = cs.AdvisorySampler(limit_fn=limit)
+     s.start()
+     assert rounds.acquire(timeout=5) and rounds.acquire(timeout=5)
+     s.close()
+ 
+ 
+-def test_default_cadence_is_five_windows():
+-    assert cs.sample_every_s() == 5 * cpu.WINDOW_S == 5.0
++def test_advisory_write_cadence_is_five_windows():
++    assert cs.record_every_s() == 5 * cpu.WINDOW_S == 5.0
++
++
++# --- The real sampler thread + the real Reporter on one fake clock (sync rounds of 3-20 s) -------------------------
++
++class _LockstepClock:
++    """Two actors share one fake monotonic clock: the sampler's real ``run`` thread and the test's sync loop. Exactly
++    one runs at a time; the one that waits for the earliest time runs next, so the interleaving is deterministic."""
++
++    def __init__(self):
++        self.now = 0.0
++        self.cond = threading.Condition()
++        self.waiting: dict = {}
++        self.turn = "loop"
++        self.stopped = False
++
++    def clock(self):
++        return self.now
++
++    def wall(self):
++        return WALL0 + self.now
++
++    def sleep_until(self, actor, at):
++        with self.cond:
++            self.waiting[actor] = max(at, self.now)
++            if self.turn == actor:
++                self.turn = None
++            if self.turn is None and len(self.waiting) == 2:
++                nxt = min(self.waiting, key=lambda a: (self.waiting[a], a))
++                self.now = self.waiting.pop(nxt)
++                self.turn = nxt
++                self.cond.notify_all()
++            ok = self.cond.wait_for(lambda: self.stopped or self.turn == actor, timeout=30)
++            assert ok, "lockstep clock stalled"
++            self.waiting.pop(actor, None)
++
++    def stop(self):
++        with self.cond:
++            self.stopped = True
++            self.cond.notify_all()
++
++
++def _simulate(seed, *, rounds=200, stall_p=0.0):
++    """Run the real sampler thread and a sync loop of 3-20 s rounds that calls the real ``Reporter.report_due`` at each
++    round end. Returns (sent [(send start wall ms, metrics)], due count, advisory-file write times)."""
++    rng = random.Random(seed)
++    lock = _LockstepClock()
++    records = []
++
++    def read():  # 4 CPUs at 100 Hz, ~30 % busy: counters grow with the fake clock
++        ticks = int(lock.now * 400)
++        return _stat(int(ticks * 0.3), ticks - int(ticks * 0.3))
++
++    def sampler_wait(timeout):  # scheduling jitter up to 30 ms; with stall_p, a starved thread misses 2-4 s
++        late = rng.uniform(2.0, 4.0) if rng.random() < stall_p else rng.uniform(0.0, 0.03)
++        lock.sleep_until("sampler", lock.now + timeout + late)
++
++    sampler = cs.AdvisorySampler(limit_fn=lambda: (cpu.ON, 50.0), read_fn=read,
++                                 record_fn=lambda _s: records.append(lock.now), clock=lock.clock, wall=lock.wall,
++                                 wait_fn=sampler_wait)
++    sent = []
++    reporter = mm.Reporter(lambda m: sent.append((int(lock.wall() * 1000), dict(m))), collect_fn=lambda: {"cpus": 4},
++                           clock=lock.clock, cpu_limit_fn=lambda: (cpu.ON, 50.0), cpu_take_fn=sampler.take)
++    due = 0
++    lock.turn = "sampler"  # the sampler's first step runs before the first round ends
++    sampler.start()
++    try:
++        for _ in range(rounds):
++            lock.sleep_until("loop", lock.now + rng.uniform(3.0, 20.0))  # one sync round
++            due += reporter.report_due()
++    finally:
++        lock.stop()
++        sampler.close()
++    assert sampler._thread is not None and not sampler._thread.is_alive()
++    return sent, due, records
++
++
++@pytest.mark.parametrize("seed", range(5))
++def test_every_reported_triple_is_fresh_and_nearly_every_due_report_carries_one(seed):
++    sent, due, records = _simulate(seed)
++    assert due >= 100 and len(sent) == due
++    cpu_reports = [(at, m) for at, m in sent if all(k in m for k in cpu.FIELDS)]
++    ages = [at - m["cpu_busy_sample_end_ms"] for at, m in cpu_reports]
++    assert all(0 <= a <= cs.REPORT_MAX_AGE_MS for a in ages), max(ages)
++    assert len(cpu_reports) * 10 >= 9 * due, (len(cpu_reports), due)
++    assert len({m["cpu_busy_sample_end_ms"] for _at, m in cpu_reports}) == len(cpu_reports)  # never reported twice
++    gaps = [b - a for a, b in itertools.pairwise(records)]
++    assert records and max(gaps) < 15.0, max(gaps)  # 3-20 s rounds never stale the advisory past 15 s
++
++
++@pytest.mark.parametrize("seed", range(5))
++def test_the_board_window_accepts_every_triple_sent_even_when_the_sampler_stalls(seed):
++    rng = random.Random(1000 + seed)
++    for stall_p in (0.0, 0.2):
++        sent, _due, _records = _simulate(seed, stall_p=stall_p)
++        triples = [(at, m) for at, m in sent if all(k in m for k in cpu.FIELDS)]
++        assert triples
++        for send_start, m in triples:  # hermes-hub setOwnMetrics: at - CPU_MAX_DELAY_MS <= end <= at
++            at = send_start + rng.randint(0, 400)
++            assert at - BOARD_CPU_MAX_DELAY_MS <= m["cpu_busy_sample_end_ms"] <= at, (at, m)
+-- 
+2.43.0
+

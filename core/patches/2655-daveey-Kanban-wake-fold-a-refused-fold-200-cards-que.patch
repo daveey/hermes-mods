@@ -1,0 +1,116 @@
+From 8008d854b0c82ae4ff271d9da42afbe986f4f4d3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:22:55 +0000
+Subject: [PATCH] [daveey] Kanban wake fold: a refused fold (>200 cards) queues
+ the wake alone; relabel reads resolve pin-first like the notifier
+
+A fold past _MAX_CARDS distinct cards made card_metadata raise invalid_params, which
+_admit_route_wake_event re-raised, so deliver_wake raised WakeNotAccepted and every later
+wake to the chat was refused until the drain claimed the tail. A fold the store refuses
+now falls back to the unfolded admission, like stale_generation.
+
+_live_task now reads under kb.pin_first_board_resolution(), the context the notifier and
+_kanban_sub_op read in, so on a box that pins HERMES_KANBAN_DB the relabel reads the
+notifier's DB instead of creating a per-slug board DB.
+
+Follow-up of the PR #1305 review (t_01a1cf7adf592a71).
+---
+ gateway/kanban_wake_fold.py            |  6 +++--
+ gateway/session_automation.py          |  6 +++--
+ tests/gateway/test_kanban_wake_fold.py | 37 ++++++++++++++++++++++++++
+ 3 files changed, 45 insertions(+), 4 deletions(-)
+
+diff --git a/gateway/kanban_wake_fold.py b/gateway/kanban_wake_fold.py
+index f764b69f04..b63991bbad 100644
+--- a/gateway/kanban_wake_fold.py
++++ b/gateway/kanban_wake_fold.py
+@@ -124,10 +124,12 @@ def _merge(old_cards, new_cards):
+ 
+ 
+ def _live_task(card):
+-    """``(status, latest handoff summary)`` of the card on its board, or ``(None, '')``."""
++    """``(status, latest handoff summary)`` of the card on its board, or ``(None, '')``. The board slug
++    came from the notifier's board enumeration, so it resolves like the notifier read it
++    (``pin_first_board_resolution``): a ``HERMES_KANBAN_DB`` pin outranks it."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
+-    with contextlib.closing(kbc.connect(board=card.get('board') or None)) as conn:
++    with kb.pin_first_board_resolution(), contextlib.closing(kbc.connect(board=card.get('board') or None)) as conn:
+         task = kb.get_task(conn, card['task_id'])
+         if task is None:
+             return None, ''
+diff --git a/gateway/session_automation.py b/gateway/session_automation.py
+index d26647257b..d6e67a2634 100644
+--- a/gateway/session_automation.py
++++ b/gateway/session_automation.py
+@@ -905,7 +905,9 @@ async def _admit_route_wake_event(runner, authority, adapter, event, identity, e
+     """A Kanban wake carrying its cards folds into a Kanban wake still waiting at the FIFO tail
+     (``gateway.kanban_wake_fold``), so a busy chat runs ONE turn for every card event that piled up.
+     The waiting row is cancelled in this admission's own transaction (``_fold_queued``); when it was
+-    claimed first, or a prompt landed behind it meanwhile, this wake queues alone."""
++    claimed first, or a prompt landed behind it meanwhile, this wake queues alone. So does a fold the
++    store refuses (``invalid_params``: e.g. past ``kanban_wake_fold._MAX_CARDS`` cards) while the
++    wake alone is valid: refusing it would refuse every later wake to the chat."""
+     from gateway import kanban_wake_fold
+     if producer != kanban_wake_fold.PRODUCER or not event.metadata.get('kanban_cards'):
+         return await authority.admit_automation(adapter, event, identity)
+@@ -920,7 +922,7 @@ async def _admit_route_wake_event(runner, authority, adapter, event, identity, e
+                 return await authority.admit_automation(adapter, event, identity,
+                                                         replaces=waiting['admission_id'], fold=())
+             except RuntimeStoreError as exc:
+-                if exc.reason != 'stale_generation':
++                if exc.reason not in ('stale_generation', 'invalid_params'):
+                     raise
+                 event.text, event.metadata = unfolded
+         return await authority.admit_automation(adapter, event, identity)
+diff --git a/tests/gateway/test_kanban_wake_fold.py b/tests/gateway/test_kanban_wake_fold.py
+index 64f39d0fa0..696cdd124f 100644
+--- a/tests/gateway/test_kanban_wake_fold.py
++++ b/tests/gateway/test_kanban_wake_fold.py
+@@ -254,6 +254,43 @@ async def test_a_wake_queued_before_the_upgrade_still_folds(tmp_path, monkeypatc
+         authority.db.close()
+ 
+ 
++@pytest.mark.asyncio
++async def test_a_wake_past_the_card_cap_queues_alone_instead_of_being_refused(tmp_path, monkeypatch, board):
++    """A fold past ``_MAX_CARDS`` distinct cards was refused (``invalid_params``) and raised
++    ``WakeNotAccepted``, so the notifier rewound and every later wake to the chat was refused until
++    the drain claimed the tail (t_01a1cf7adf592a71). The unfolded wake admits."""
++    authority, adapter, source, queued, _human = await _local_chat(tmp_path, monkeypatch)
++    try:
++        cap = kanban_wake_fold._MAX_CARDS
++        for n in range(cap):  # completed wakes never read the board, so the ids need no cards
++            await _wake(adapter, source, f't_full{n:04d}', 'completed')
++        [full] = _automation(queued())
++        assert len(full['payload']['local_automation_v1']['kanban_cards']) == cap
++        await _wake(adapter, source, 't_overflow', 'completed')
++        await _wake(adapter, source, 't_after', 'completed')  # later wakes fold into the new tail
++        rows = _automation(queued())
++        assert rows[0]['admission_id'] == full['admission_id']
++        assert rows[0]['payload'] == full['payload']  # the full row is untouched
++        assert len(rows) == 2
++        assert [card['task_id'] for card in rows[1]['payload']['local_automation_v1']['kanban_cards']] == [
++            't_overflow', 't_after']
++    finally:
++        authority.db.close()
++
++
++def test_the_relabel_reads_the_notifiers_db_under_the_env_pin(tmp_path, monkeypatch, board):
++    """A card on a non-default board relabels from the DB the notifier read it from: on a box that pins
++    ``HERMES_KANBAN_DB`` that is the pinned file, never a per-slug DB the read would create."""
++    tid = board('waited on')
++    _claim(tid)
++    card = {'task_id': tid, 'board': 'side-board', 'kinds': ['chat_wait_unclaimed'],
++            'text': f'[kanban] Task {tid} is ready with no worker claiming it.\nBoard: side-board'}
++    side_db = kb.board_own_db_path('side-board')
++    refreshed = kanban_wake_fold.refresh_card(card)
++    assert refreshed['text'].startswith(f'[kanban] Task {tid} claimed by a worker (running).')
++    assert not side_db.exists() and not side_db.parent.exists()
++
++
+ def test_card_metadata_rejects_malformed_cards():
+     from hermes_state_runtime import RuntimeStoreError
+     assert kanban_wake_fold.card_metadata({}) == {}
+-- 
+2.43.0
+

@@ -1,0 +1,503 @@
+From bb57afa2f8c5a9b3aa6939fc4501f6b548848557 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 10:32:42 +0000
+Subject: [PATCH] [daveey] Ghost expiry keeps a remote chat link until its
+ owner row verifies the completion
+
+A reprovisioned Board worker restores its cards from the Board, but not
+kanban_notify_subs. The hub collector builds a task's `sessions` from
+that table only, so the worker republished every pre-reprovision card
+with `sessions: []`. `_legacy_remote_links` treated the dropped link on a
+present owner row as a ghost and expired the retained snapshot row, and
+the origin's chat-link reconcile then released the link. On the hub
+(2026-11-11 22:26:35Z) that released six shepherd links of one chat in a
+single batch. Three of those cards were still open (scheduled, todo,
+ready), and one done card had origin_observation.verified=false.
+
+Ghost expiry now needs the fresh owner record for the card's exact
+(gateway, profile, board, id) to be owner-attested terminal (fresh
+scope heartbeat, hash-bound observation) and verified, the
+`_verified_terminal` predicate. `_read_remote_links` (both the full
+and the incremental projection, and the memo) reports these records
+as `closed_out`. An open row, or a closed row without verified
+completion, keeps the retained row as a stale unfinished obligation, so
+the link stays wanted and unreleased. NULL profiles never match a
+qualified record. The receipt-backed terminal-carry predicates and the
+missing-open-obligation selector are unchanged. The producer side
+(sessions not restored) is a separate follow-up card.
+
+Proof:
+- RED: the new test_kanban_ghost_expiry_open_obligation.py had 18 of 20
+  failing on the unchanged base (open x5 and unverified done/archived,
+  each on the incremental and full-read paths, plus another profile's
+  verified row and reopen-then-verified). Verified done passed before
+  and after the fix.
+- GREEN: all 102 test files that import the touched modules pass, except
+  2 tests in test_web_links_stale.py that fail the same way on the
+  unmodified base.
+- 8/8 condition mutants are killed: the verified gate on both paths,
+  discard on row change, memo store and memo hit, exact profile key,
+  filter dropped, and the attest/fresh gate.
+---
+ hermes_cli/kanban_replica_projection.py       |  19 +-
+ hermes_cli/kanban_session_activity.py         |  29 +++-
+ ...est_kanban_ghost_expiry_open_obligation.py | 162 ++++++++++++++++++
+ .../test_kanban_remote_inventory_cache.py     |  20 ++-
+ .../test_kanban_replica_incremental.py        |  23 ++-
+ 5 files changed, 231 insertions(+), 22 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_ghost_expiry_open_obligation.py
+
+diff --git a/hermes_cli/kanban_replica_projection.py b/hermes_cli/kanban_replica_projection.py
+index 83f3ff1336..c7f3cfeed4 100644
+--- a/hermes_cli/kanban_replica_projection.py
++++ b/hermes_cli/kanban_replica_projection.py
+@@ -88,6 +88,7 @@ class _Stage:
+         't',
+         'tkey',
+         'unknown',
++        'verified',
+     )
+ 
+ 
+@@ -120,6 +121,9 @@ def _stage(row: tuple, me: str, origin_profile: str) -> _Stage:
+     st.seen = (updated or 0) / 1000.0
+     st.attest = ((gw, owner_profile, board) if record_attests_terminal(t, gw, owner_profile, board, evidence)
+                  else None)
++    # [daveey] Verified completion (``kanban_origin_ledger._verified_terminal``): only such a record expires a
++    # retained link it no longer carries (``_legacy_remote_links``).
++    st.verified = st.attest is not None and evidence.get('verified') is True
+     st.unknown = ({**t, 'reported_status': t.get('status'), 'status': 'unknown', 'unfinished': True}
+                   if owner_profile is None or t.get('status') not in LISTED_STATUSES else None)
+     created = t.get('created_at')
+@@ -152,6 +156,7 @@ class _State:
+     legacy_keys: set
+     linked: set
+     order: dict  # tkey -> its (gw, key) in ``stages``
++    closed: set  # released tkeys whose owner verified the completion
+ 
+ 
+ _lock = threading.Lock()
+@@ -160,7 +165,7 @@ stats = {"projected": 0, "rebuilt": 0, "historical": 0, "considered": 0}
+ 
+ 
+ def _new_state(tag: str, key: tuple) -> _State:
+-    return _State(tag, None, key, {}, {}, {}, {}, set(), {}, {}, set(), {}, {}, {}, {}, {}, set(), set(), {})
++    return _State(tag, None, key, {}, {}, {}, {}, set(), {}, {}, set(), {}, {}, {}, {}, {}, set(), set(), {}, set())
+ 
+ 
+ def _apply(s: _State, rk: tuple, st: _Stage) -> None:
+@@ -183,6 +188,8 @@ def _apply(s: _State, rk: tuple, st: _Stage) -> None:
+         s.seen[gw] = max(s.seen.get(gw, 0.0), st.seen)
+     if st.attest is not None and not stale and st.attest in fresh:
+         s.released.add(tk)
++        if st.verified:
++            s.closed.add(tk)
+         s.tasks[tk] = st.t
+     else:
+         s.tasks[tk] = st.unknown if st.unknown is not None else st.t
+@@ -204,6 +211,7 @@ def _unapply(s: _State, rk: tuple) -> None:
+     for d in (s.raw, s.order, s.tasks, s.legacy):
+         d.pop(tk, None)
+     s.released.discard(tk)
++    s.closed.discard(tk)
+     s.legacy_keys.discard(tk)
+     s.linked.discard(tk)
+     if st.legacy is None:
+@@ -276,7 +284,8 @@ def _rekeyed(old: _State, key: tuple) -> _State:
+ 
+ def project(view, now: float, me: str, info_rows: list, last_ok: float | None, offline: float | None, *,
+             fresh: frozenset, qualified_out: set | None = None, owners_out: set | None = None,
+-            seen_out: dict | None = None, moved_out: dict | None = None) -> list[dict[str, Any]]:
++            seen_out: dict | None = None, moved_out: dict | None = None,
++            closed_out: set | None = None) -> list[dict[str, Any]]:
+     """``_project_replica(path, now, me, view.rows(), info_rows, last_ok, offline, ...)``, incrementally.
+     ``fresh`` is ``fresh_scopes`` of ``info_rows``' heartbeats at ``now``: all the projection reads of them."""
+     from hermes_cli.profiles import get_active_profile_name
+@@ -299,7 +308,7 @@ def project(view, now: float, me: str, info_rows: list, last_ok: float | None, o
+         while len(_states) > 16:
+             _states.pop(next(iter(_states)))
+         return _emit(s, me, origin_profile, last_ok, stale, fresh, qualified_out=qualified_out,
+-                     owners_out=owners_out, seen_out=seen_out, moved_out=moved_out)
++                     owners_out=owners_out, seen_out=seen_out, moved_out=moved_out, closed_out=closed_out)
+ 
+ 
+ def _hub_stale_after() -> float:
+@@ -308,7 +317,7 @@ def _hub_stale_after() -> float:
+ 
+ 
+ def _emit(s: _State, me: str, origin_profile: str, last_ok, stale: bool, fresh: frozenset, *, qualified_out,
+-          owners_out, seen_out, moved_out) -> list[dict[str, Any]]:
++          owners_out, seen_out, moved_out, closed_out=None) -> list[dict[str, Any]]:
+     if s.errors:
+         raise s.errors[min(s.errors, key=lambda rk: s.errors[rk].order)].error
+     _settle_seen(s)
+@@ -316,6 +325,8 @@ def _emit(s: _State, me: str, origin_profile: str, last_ok, stale: bool, fresh:
+         seen_out.update(s.seen)
+     if owners_out is not None and not stale:
+         owners_out.update(s.owners)
++    if closed_out is not None:  # ``s.closed`` is empty on a stale replica (``_apply``)
++        closed_out.update(s.closed)
+     if moved_out is not None and not stale:
+         moved_out.update({'published': dict(s.published_out), 'live_scopes': fresh})
+     # Fold only the legacy records and every qualified record sharing their (gw, board, id): exactly the inputs
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 749831f53c..b99d2f1097 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -666,7 +666,8 @@ _REPLICA_PROBE = ("SELECT count(*), count(seq), max(seq), total(seq), total(vers
+ def _read_remote_links(path: Path, now: float | None = None, *,
+                        qualified_out: set | None = None,
+                        owners_out: set | None = None,
+-                       moved_out: dict | None = None) -> list[dict[str, Any]]:
++                       moved_out: dict | None = None,
++                       closed_out: set | None = None) -> list[dict[str, Any]]:
+     """Replica cards linked to a session on this gateway, one row per (session, card).
+ 
+     Open and unproven cards come back ``unfinished``; cards their owner attests closed
+@@ -711,6 +712,8 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+                     owners_out.update(memo[5])
+                 if moved_out is not None:
+                     moved_out.update(memo[9])
++                if closed_out is not None:
++                    closed_out.update(memo[10])
+                 return list(memo[3])  # cards are read-only, as in ``_links_cache``
+         if key is not None:  # [daveey] a miss reads and re-projects only the rows whose seq moved
+             view = _replica_rows.read(conn, path, version_column, probe, ident)
+@@ -724,24 +727,28 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+         conn.close()
+     if key is None:
+         return _project_replica(path, now, me, rows, info_rows, last_ok, offline,
+-                                qualified_out=qualified_out, owners_out=owners_out, moved_out=moved_out)
++                                qualified_out=qualified_out, owners_out=owners_out, moved_out=moved_out,
++                                closed_out=closed_out)
+     qualified: set = set()
+     owners: set = set()
+     moved: dict = {}
++    closed: set = set()
+     seen_at: dict[str, float] = {}
+     cards = _replica_projection.project(view, now, me, info_rows, last_ok, offline, fresh=key[3],
+                                         qualified_out=qualified, owners_out=owners, seen_out=seen_at,
+-                                        moved_out=moved)
++                                        moved_out=moved, closed_out=closed)
+     # Heartbeat cut-offs are the live verdicts in ``key``, hub staleness the ``stale`` check; a clock step back rereads.
+     _remote_read_memo = (key, now, None, list(cards),
+                          frozenset(qualified), frozenset(owners), stale, _replica_synced(seen_at, last_ok),
+-                         dict(seen_at), dict(moved))
++                         dict(seen_at), dict(moved), frozenset(closed))
+     if qualified_out is not None:
+         qualified_out.update(qualified)
+     if owners_out is not None:
+         owners_out.update(owners)
+     if moved_out is not None:
+         moved_out.update(moved)
++    if closed_out is not None:
++        closed_out.update(closed)
+     return cards
+ 
+ 
+@@ -758,7 +765,7 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+                      offline: float | None, *, qualified_out: set | None = None, owners_out: set | None = None,
+                      horizon_out: list[float] | None = None,
+                      seen_out: dict[str, float] | None = None,
+-                     moved_out: dict | None = None) -> list[dict[str, Any]]:
++                     moved_out: dict | None = None, closed_out: set | None = None) -> list[dict[str, Any]]:
+     """``_read_remote_links`` of rows already read. ``horizon_out`` collects every wall time after ``now`` at which
+     the same rows could project differently (hub-sync staleness, scope-heartbeat freshness)."""
+     stale = offline is not None or last_ok is None or now - last_ok > HUB_STALE_AFTER_S
+@@ -800,6 +807,8 @@ def _project_replica(path: Path, now: float, me: str, rows: list, info_rows: lis
+             raw[key] = t
+             if _owner_attests_terminal(t, str(gw), owner_profile, board, heartbeats, now, stale, evidence):
+                 released.add(key)
++                if closed_out is not None and evidence.get('verified') is True:
++                    closed_out.add(key)
+             elif owner_profile is None or t.get('status') not in LISTED_STATUSES:
+                 # Legacy links carry no authoritative release receipt. Preserve
+                 # terminal/unknown reports even on cold start; only owner-attested
+@@ -1162,9 +1171,9 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+         if path is None:
+             raise FileNotFoundError("no hub.db")
+         qualified: set[tuple[str, str, str]] = set()
+-        owners: set[tuple[str, str, str]] = set()
++        closed: set[tuple[str, str | None, str, str]] = set()
+         moved: dict[str, Any] = {}
+-        cards = _read_remote_links(path, qualified_out=qualified, owners_out=owners, moved_out=moved)
++        cards = _read_remote_links(path, qualified_out=qualified, closed_out=closed, moved_out=moved)
+     except Exception as exc:  # a broken replica must never break the sidebar
+         if previous is None:
+             if path is not None:
+@@ -1188,8 +1197,10 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+                  # Successful reads migrate graph-inferred cache entries only.
+                  # Receipt-backed obligations remain in the separate ledger.
+                  and c.get("via") != "descendant"
+-                 # Fresh replica + owner row present but this session's link gone: expire the ghost.
+-                 and (c.get("gateway"), c.get("board"), c.get("id")) not in owners
++                 # Fresh replica: the owner row (exact profile) dropped this session's link and verifies the
++                 # completion: expire the ghost. An open or unverified row keeps it: a reprovisioned owner
++                 # republishes its cards with ``sessions: []`` (hub, 2026-11-11). [daveey]
++                 and (c.get("gateway"), c.get("profile"), c.get("board"), c.get("id")) not in closed
+                  and not (c.get("ownership_state") == "unknown"
+                           and (c["session"], c.get("gateway"), c.get("board"), c.get("id")) in qualified_now)
+                  # Fresh replica: the named owner publishes the scope without it, another gateway owns the card.
+diff --git a/tests/hermes_cli/test_kanban_ghost_expiry_open_obligation.py b/tests/hermes_cli/test_kanban_ghost_expiry_open_obligation.py
+new file mode 100644
+index 0000000000..217307cebe
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ghost_expiry_open_obligation.py
+@@ -0,0 +1,162 @@
++"""A retained remote link whose owner republishes the card without it expires only on verified closure. [daveey]
++
++A reprovisioned Board worker restores its cards from the Board, but not ``kanban_notify_subs`` (the hub collector's
++only source of a card's ``sessions``), so it republishes every pre-reprovision card with ``sessions: []``. The
++origin's retained snapshot row is then the only copy of its obligation: expiring it as a ghost while the fresh owner
++row is open, or closed without verified completion, made the origin's chat-link reconcile release the link (hub,
++2026-11-11: six shepherd links of one chat in one batch, three of them on open cards).
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli.kanban_origin_ledger import _json
++from tests.hermes_cli import kanban_sync_support as support
++
++ME, OWNER = 'macbook', 'worker-1'
++LINK = {'gw': ME, 'profile': 'default', 'session': 's_human', 'rel': 'shepherd'}
++KEY = 'default/default/t_1'
++
++
++def observed(task, *, verified):
++    payload = {k: v for k, v in task.items() if k != 'origin_observation'}
++    evidence = {'schema': 1, 'task_hash': hashlib.sha256(_json(payload).encode()).hexdigest(), 'verified': verified}
++    return {**payload, 'origin_observation': evidence}
++
++
++def record(status, *, sessions, verified=False):
++    task = {'id': 't_1', 'board': 'default', 'gateway': OWNER, 'profile': 'default', 'status': status,
++            'created_at': 1, 'created_by': 'default', 'sessions': sessions, 'origin_bindings': [], 'title': 't_1'}
++    return observed(task, verified=verified)
++
++
++class Hub:
++    """hermes-hub's replica: a fresh pull, the owner's fresh scope heartbeat, optionally the feed's ``seq``."""
++
++    def __init__(self, path, *, seq):
++        self.path, self.seq, self.n = path, seq, 100
++        now = time.time()
++        with sqlite3.connect(path) as db:
++            extra = 'seq INTEGER,' if seq else ''
++            db.executescript('CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);'
++                             f'CREATE TABLE replica(gw TEXT, coll TEXT, key TEXT, version INTEGER, {extra} data TEXT,'
++                             ' updated_at INTEGER, PRIMARY KEY (gw, coll, key));')
++            db.executemany('INSERT INTO meta VALUES (?,?)', [('gateway', ME), ('last_ok', str(now))])
++            info = {'gateway': OWNER, 'task_scopes': [
++                {'profile': p, 'board': 'default', 'state': 'ok', 'observed_at': now} for p in ('default', 'work')]}
++            self._put(db, 'gateway', 'info', info)
++
++    def _put(self, db, coll, key, data):
++        self.n += 1
++        cols, vals = ('gw, coll, key, version, seq, data, updated_at', (OWNER, coll, key, 1, self.n)) if self.seq \
++            else ('gw, coll, key, version, data, updated_at', (OWNER, coll, key, 1))
++        marks = ','.join('?' * (len(vals) + 2))
++        upsert = ' ON CONFLICT(gw, coll, key) DO UPDATE SET version=version+1, data=excluded.data'
++        if self.seq:
++            upsert += ', seq=excluded.seq'
++        db.execute(f'INSERT INTO replica ({cols}) VALUES ({marks}){upsert}',
++                   (*vals, json.dumps(data), int(time.time() * 1000)))
++
++    def publish(self, data):
++        with sqlite3.connect(self.path) as db:
++            self._put(db, 'tasks', KEY, data)
++            db.execute("UPDATE meta SET v=? WHERE k='last_ok'", (str(time.time()),))
++
++
++@pytest.fixture(params=[True, False], ids=['incremental', 'full-read'])
++def world(request, tmp_path, monkeypatch):
++    from hermes_cli import profiles
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    hub = Hub(tmp_path / 'hub.db', seq=request.param)
++    snapshot: dict = {'rows': None}
++
++    def remote_snapshot(cards=None):
++        if cards is None:
++            return snapshot['rows']
++        snapshot['rows'] = [dict(c) for c in cards]
++        return cards
++
++    monkeypatch.setattr(ksa, '_hub_db_path', lambda: hub.path)
++    monkeypatch.setattr(ksa, '_remote_snapshot', remote_snapshot)
++    # The origin-ledger-free projection, read afresh on every reconcile (no inventory cache in between).
++    monkeypatch.setattr(ksa, '_remote_links', lambda stale_ok=False: ksa._legacy_remote_links())
++    conn = kbc.connect(home / 'kanban.db')
++    ksc.ensure_identity(conn, 'default', ME)
++    ksa._reset_cache_for_tests()
++    try:
++        yield hub, conn
++    finally:
++        conn.close()
++        ksa._reset_cache_for_tests()
++
++
++def shepherd(conn):
++    return [tuple(r) for r in conn.execute(
++        "SELECT task_id, chat_session, kind, released FROM task_chat_links WHERE kind='shepherd'")]
++
++
++def linked_then_republished(hub, conn, republished):
++    hub.publish(record('running', sessions=[LINK]))
++    links.reconcile(conn, 'default', ME)
++    assert shepherd(conn) == [('t_1', 's_human', 'shepherd', 0)]
++    hub.publish(republished)  # the reprovisioned owner lost the subscription, not the card
++    links.reconcile(conn, 'default', ME)
++    return [c for c in ksa._legacy_remote_links() if c['id'] == 't_1']
++
++
++@pytest.mark.parametrize('status', ['running', 'ready', 'todo', 'scheduled', 'blocked'])
++def test_open_owner_row_without_the_link_keeps_the_obligation(world, status):
++    hub, conn = world
++    rows = linked_then_republished(hub, conn, record(status, sessions=[]))
++    assert shepherd(conn) == [('t_1', 's_human', 'shepherd', 0)]
++    assert [(r['session'], r['unfinished'], r['released'], r['stale']) for r in rows] == [
++        ('s_human', True, False, True)]
++
++
++@pytest.mark.parametrize('status', ['done', 'archived'])
++def test_unverified_terminal_owner_row_keeps_the_obligation_unknown(world, status):
++    hub, conn = world
++    rows = linked_then_republished(hub, conn, record(status, sessions=[], verified=False))
++    assert shepherd(conn) == [('t_1', 's_human', 'shepherd', 0)]
++    assert [(r['session'], r['unfinished'], r['released']) for r in rows] == [('s_human', True, False)]
++
++
++def test_verified_terminal_owner_row_expires_the_ghost(world):
++    hub, conn = world
++    rows = linked_then_republished(hub, conn, record('done', sessions=[], verified=True))
++    assert rows == []
++    assert shepherd(conn) == [('t_1', 's_human', 'shepherd', 1)]
++
++
++def test_verified_terminal_row_of_another_profile_is_no_release(world):
++    """Exact identity: a closed record under another owner profile says nothing about this one."""
++    hub, conn = world
++    hub.publish(record('running', sessions=[LINK]))
++    links.reconcile(conn, 'default', ME)
++    plain = {k: v for k, v in record('done', sessions=[]).items() if k != 'origin_observation'}
++    other = observed({**plain, 'profile': 'work'}, verified=True)
++    hub.publish(record('ready', sessions=[]))
++    with sqlite3.connect(hub.path) as db:
++        hub._put(db, 'tasks', 'work/default/t_1', other)
++    links.reconcile(conn, 'default', ME)
++    assert shepherd(conn) == [('t_1', 's_human', 'shepherd', 0)]
++
++
++def test_obligation_released_once_the_open_owner_row_closes_verified(world):
++    hub, conn = world
++    linked_then_republished(hub, conn, record('ready', sessions=[]))
++    assert shepherd(conn) == [('t_1', 's_human', 'shepherd', 0)]
++    hub.publish(record('done', sessions=[], verified=True))
++    links.reconcile(conn, 'default', ME)
++    assert shepherd(conn) == [('t_1', 's_human', 'shepherd', 1)]
+diff --git a/tests/hermes_cli/test_kanban_remote_inventory_cache.py b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+index f8d0c0b53a..f231a2ab78 100644
+--- a/tests/hermes_cli/test_kanban_remote_inventory_cache.py
++++ b/tests/hermes_cli/test_kanban_remote_inventory_cache.py
+@@ -179,16 +179,30 @@ def test_unchanged_inventory_is_written_once(replica):
+ 
+ 
+ def test_dropped_link_on_fresh_replica_expires_ghost(replica, monkeypatch):
++    """Only an owner row (exact profile) that verifies the completion expires the retained link."""
+     _, _, card = replica
+-    card.update(gateway='owner', board='work', id='t_one')
++    card.update(gateway='owner', profile='work', board='build', id='t_one')
+     activity._legacy_remote_links()
+-    def read(path, owners_out=None, **kw):
+-        owners_out.add(('owner', 'work', 't_one'))
++    def read(path, *, closed_out, **kw):
++        closed_out.add(('owner', 'work', 'build', 't_one'))
+         return []
+     monkeypatch.setattr(activity, '_read_remote_links', read)
+     assert activity._legacy_remote_links() == []
+ 
+ 
++@pytest.mark.parametrize('closed', [set(), {('owner', None, 'build', 't_one')}, {('owner', 'other', 'build', 't_one')}])
++def test_dropped_link_without_verified_closure_keeps_stale_ghost(replica, monkeypatch, closed):
++    """An open/unverified owner row (or another profile's closed one) without this session's link keeps it."""
++    _, _, card = replica
++    card.update(gateway='owner', profile='work', board='build', id='t_one')
++    activity._legacy_remote_links()
++    def read(path, *, closed_out, **kw):
++        closed_out.update(closed)
++        return []
++    monkeypatch.setattr(activity, '_read_remote_links', read)
++    assert [(c['stale'], c['unfinished']) for c in activity._legacy_remote_links()] == [(True, True)]
++
++
+ def test_missing_owner_keeps_stale_ghost(replica, monkeypatch):
+     _, _, card = replica
+     card.update(gateway='owner', board='work', id='t_one')
+diff --git a/tests/hermes_cli/test_kanban_replica_incremental.py b/tests/hermes_cli/test_kanban_replica_incremental.py
+index 06e629fc37..95b79adc59 100644
+--- a/tests/hermes_cli/test_kanban_replica_incremental.py
++++ b/tests/hermes_cli/test_kanban_replica_incremental.py
+@@ -56,18 +56,20 @@ class World:
+ 
+     def both(self):
+         """(live, explicit, live outs, explicit outs) at one instant; the explicit read is the full path."""
+-        outs = [(set(), set(), {}), (set(), set(), {})]
++        outs = [(set(), set(), {}, set()), (set(), set(), {}, set())]
+         live = activity._read_remote_links(self.path, qualified_out=outs[0][0], owners_out=outs[0][1],
+-                                           moved_out=outs[0][2])
++                                           moved_out=outs[0][2], closed_out=outs[0][3])
+         full = activity._read_remote_links(self.path, now=self.clock['now'], qualified_out=outs[1][0],
+-                                           owners_out=outs[1][1], moved_out=outs[1][2])
++                                           owners_out=outs[1][1], moved_out=outs[1][2], closed_out=outs[1][3])
+         return live, full, outs[0], outs[1]
+ 
+-    def same(self):
++    def same(self, closed=None):
+         replica_rows.stats.update(dict.fromkeys(replica_rows.stats, 0))
+         projection.stats.update(dict.fromkeys(projection.stats, 0))
+         live, full, live_outs, full_outs = self.both()
+         assert live == full and live_outs == full_outs
++        if closed is not None:  # released records whose owner verified the completion (ghost expiry)
++            assert live_outs[3] == closed
+         return live
+ 
+ 
+@@ -117,13 +119,22 @@ def test_steps_through_inserts_updates_deletes_and_scope_changes_equal_the_full_
+ 
+     w.put('work/build/t_16', json.dumps(observed(card('t_16', status='done'))))  # owner attests it closed
+     w.tick(1015.0)
+-    rows = w.same()
++    rows = w.same(closed=set())  # closed, but its completion is not verified
+     assert {r['id']: r['released'] for r in rows}['t_16'] is True and projection.stats['projected'] == 1
++    verified = observed(card('t_17', status='done', sessions=[]))
++    verified['origin_observation']['verified'] = True  # not hashed: the observation covers the payload only
++    w.put('work/build/t_17', json.dumps(verified))
++    w.tick(1016.0)
++    w.same(closed={('owner', 'work', 'build', 't_17')})
++    w.same(closed={('owner', 'work', 'build', 't_17')})  # unchanged rows: the memo answers, closed included
++    w.put('work/build/t_17', json.dumps(card('t_17', status='ready', sessions=[])))  # reopened
++    w.tick(1017.0)
++    w.same(closed=set())
+ 
+     _scopes(w.path, [], seq=w.seq + 1)  # the owner scope goes away: the release no longer holds
+     w.seq += 1
+     w.tick(1020.0)
+-    rows = w.same()
++    rows = w.same(closed=set())
+     assert {r['id']: r['released'] for r in rows}['t_16'] is False
+     assert (projection.stats['projected'], projection.stats['rebuilt'], projection.stats['historical']) == (0, 1, 0)
+     assert replica_rows.stats['delta_rows'] == 0
+-- 
+2.43.0
+

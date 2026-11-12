@@ -1,0 +1,510 @@
+From 5c1353c84f11e64da243979411c537e6e843fdaf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:47:52 +0000
+Subject: [PATCH] fix(gateway): release idle headless wake leases after grace
+ [daveey]
+
+---
+ tests/tui_gateway/test_headless_wake_reap.py | 274 +++++++++++++++++++
+ tui_gateway/compute_host_bridge.py           |   2 +
+ tui_gateway/detached_turn_cleanup.py         |  92 +++++++
+ tui_gateway/kanban_unloaded.py               |   5 +-
+ tui_gateway/session_lifecycle.py             |   4 +
+ tui_gateway/session_notifications.py         |   2 +
+ tui_gateway/session_reaper.py                |   8 +-
+ tui_gateway/turn_admission.py                |   2 +
+ 8 files changed, 385 insertions(+), 4 deletions(-)
+ create mode 100644 tests/tui_gateway/test_headless_wake_reap.py
+ create mode 100644 tui_gateway/detached_turn_cleanup.py
+
+diff --git a/tests/tui_gateway/test_headless_wake_reap.py b/tests/tui_gateway/test_headless_wake_reap.py
+new file mode 100644
+index 0000000000..1c4cdddeb6
+--- /dev/null
++++ b/tests/tui_gateway/test_headless_wake_reap.py
+@@ -0,0 +1,274 @@
++"""Headless notice turns must not monopolize Desktop's writer slot."""
++from types import SimpleNamespace
++import threading
++
++import pytest
++
++from tui_gateway import server, turn_admission
++
++_REAL_SUBMIT = server._notif_submit
++_REAL_TEARDOWN = server._teardown_popped_session
++
++
++@pytest.fixture
++def wake(monkeypatch, tmp_path):
++    from hermes_cli.active_sessions import active_session_registry_snapshot
++    monkeypatch.setattr(server, "_sessions", {})
++    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_concurrent_sessions": 100})
++    monkeypatch.setattr(server, "_stdio_is_rpc_channel", False)
++    monkeypatch.setattr(server, "_readopt_wake_profiles", lambda: [None])
++    monkeypatch.setattr(server, "_start_agent_build", lambda *a: None)
++    monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *a: None)
++    monkeypatch.setattr(server, "_clear_inflight_turn", lambda *a: None)
++    monkeypatch.setattr(turn_admission, "owns", lambda s: True)
++    monkeypatch.setattr(server, "_notif_claim_turn", lambda s: s.update(running=True) or True)
++    monkeypatch.setattr(server, "_session_pending_kind", lambda sid: None)
++    monkeypatch.setattr(server, "_session_has_active_delegations", lambda *a: False)
++    monkeypatch.setattr(server, "_session_owns_live_wakeup_schedule", lambda s: False)
++    monkeypatch.setattr(server, "_session_owns_pending_process_notification", lambda s: False)
++    monkeypatch.setattr(server, "_session_owns_running_process", lambda s: False)
++    ready = threading.Event()
++    ready.set()
++    session = {"history_lock": threading.Lock(), "running": False, "agent_ready": ready,
++               "session_key": "headless-wake", "profile_home": str(tmp_path),
++               "transport": server._stdio_transport, "agent": SimpleNamespace()}
++    monkeypatch.setattr(server, "_find_live_session_by_key", lambda *a, **k:
++                        ("live", session) if "live" in server._sessions else None)
++    def resume(*args):
++        server._sessions["live"] = session
++        return {"result": {"session_id": "live"}}
++    monkeypatch.setitem(server._methods, "session.resume", resume)
++    def claim(sid, s):
++        if s.get("active_session_lease") is None:
++            lease, error = server._claim_active_session_slot(s["session_key"], live_session_id=sid,
++                                                           profile_home=tmp_path)
++            assert error is None
++            s["active_session_lease"] = lease
++    monkeypatch.setattr(server, "_ensure_active_session_slot", claim)
++    monkeypatch.setattr(server, "_notif_submit", lambda *a, **k: True)
++    closed = []
++    def teardown(s, *, end_reason):
++        if s is not None:
++            closed.append(end_reason)
++            server._release_active_session_slot(s)
++        return s is not None
++    monkeypatch.setattr(server, "_teardown_popped_session", teardown)
++    timers = []
++    class Timer:
++        def __init__(self, delay, fn):
++            self.delay, self.fn = delay, fn
++            timers.append(self)
++        def start(self):
++            pass
++        def cancel(self):
++            pass
++    # Patch only the cleanup scheduler, not process-global threading.
++    from tui_gateway import detached_turn_cleanup
++    monkeypatch.setattr(detached_turn_cleanup, "Timer", Timer)
++    clock = [100.0]
++    monkeypatch.setattr(detached_turn_cleanup, "monotonic", lambda: clock[0])
++    def finish():
++        turn_admission.settle_prompt_state(session, SimpleNamespace(agent=session["agent"], error_retained=False))
++    def snapshot():
++        return active_session_registry_snapshot(registry_home=tmp_path)
++    yield session, finish, timers, clock, closed, snapshot
++    server._release_active_session_slot(session)
++
++
++def test_headless_stdio_is_dead(monkeypatch):
++    monkeypatch.setattr(server, "_stdio_is_rpc_channel", False)
++    assert server._transport_is_dead(server._stdio_transport)
++    monkeypatch.setattr(server, "_stdio_is_rpc_channel", True)
++    assert not server._transport_is_dead(server._stdio_transport)
++
++
++def test_wake_releases_registry_after_grace(wake):
++    session, finish, timers, clock, closed, snapshot = wake
++    assert server._wake_session_turn("headless-wake", "notice") == "started"
++    assert session["active_session_lease"] is not None
++    finish()
++    assert not closed
++    clock[0] += 60
++    timers[-1].fn()
++    assert closed == ["ws_orphan_reap"]
++    assert snapshot() == []
++    import subprocess
++    import sys
++    from tools.environments.local import build_subprocess_env
++    child = subprocess.run(
++        [sys.executable, "-c", "from tui_gateway import server; "
++         "server._load_cfg = lambda: {}; "
++         "lease, error = server._claim_active_session_slot('headless-wake', "
++         "live_session_id='other-process', profile_home=__import__('sys').argv[1]); "
++         "assert error is None, error; lease.release()", session["profile_home"]],
++        env=build_subprocess_env(), capture_output=True, text=True, encoding="utf-8", timeout=30, check=False)
++    assert child.returncode == 0, child.stderr
++
++
++def test_rpc_stdio_keeps_lease(wake, monkeypatch):
++    session, finish, timers, _clock, closed, _snapshot = wake
++    monkeypatch.setattr(server, "_stdio_is_rpc_channel", True)
++    assert server._wake_session_turn("headless-wake", "notice") == "started"
++    finish()
++    assert not timers and not closed
++    assert session["active_session_lease"] is not None
++
++
++@pytest.mark.parametrize("guard", ["_session_owns_running_process", "_session_has_active_delegations",
++                                  "_session_owns_live_wakeup_schedule", "_session_pending_kind"])
++def test_live_work_keeps_session_but_releases_idle_slot(wake, monkeypatch, guard):
++    session, finish, timers, clock, closed, _snapshot = wake
++    monkeypatch.setattr(server, guard, lambda *a: True)
++    assert server._wake_session_turn("headless-wake", "notice") == "started"
++    finish()
++    assert session.get("active_session_lease") is None
++    clock[0] += 60
++    timers[-1].fn()
++    assert not closed and server._sessions["live"] is session
++
++
++def test_two_notices_ten_seconds_apart_reuse_session(wake):
++    session, finish, timers, clock, closed, _snapshot = wake
++    assert server._wake_session_turn("headless-wake", "first") == "started"
++    finish()
++    first = timers[-1]
++    clock[0] += 10
++    assert server._wake_session_turn("headless-wake", "second") == "started"
++    assert server._sessions["live"] is session
++    finish()
++    clock[0] += 50
++    first.fn()
++    assert not closed
++    clock[0] += 10
++    timers[-1].fn()
++    assert closed == ["ws_orphan_reap"]
++
++
++@pytest.mark.parametrize("change", ["running", "reattached", "removed"])
++def test_old_timer_cannot_close_changed_owner(wake, change):
++    session, finish, timers, clock, closed, _snapshot = wake
++    server._wake_session_turn("headless-wake", "first")
++    finish()
++    if change == "running":
++        session["running"] = True
++    elif change == "reattached":
++        session["transport"] = SimpleNamespace(_closed=False)
++    else:
++        server._sessions.pop("live")
++    clock[0] += 60
++    timers[-1].fn()
++    assert not closed
++
++
++def test_early_timer_grants_remaining_grace(wake):
++    _session, finish, timers, clock, closed, _snapshot = wake
++    server._wake_session_turn("headless-wake", "first")
++    finish()
++    clock[0] += 10
++    timers[-1].fn()
++    assert not closed and timers[-1].delay == 50
++    clock[0] += 50
++    timers[-1].fn()
++    assert closed == ["ws_orphan_reap"]
++
++
++def test_finished_background_work_eventually_reaps(wake, monkeypatch):
++    _session, finish, timers, clock, closed, _snapshot = wake
++    busy = [True]
++    monkeypatch.setattr(server, "_session_owns_running_process", lambda s: busy[0])
++    server._wake_session_turn("headless-wake", "first")
++    finish()
++    clock[0] += 60
++    timers[-1].fn()
++    assert not closed
++    busy[0] = False
++    clock[0] += 60
++    timers[-1].fn()
++    assert closed == ["ws_orphan_reap"]
++
++
++def test_ws_disconnect_policy_is_not_shortened(wake):
++    session, finish, timers, _clock, closed, _snapshot = wake
++    session["transport"] = server._detached_ws_transport
++    server._wake_session_turn("headless-wake", "first")
++    finish()
++    assert not timers and not closed
++
++
++def test_repair_arms_missing_timer_without_resetting_grace(wake):
++    from tui_gateway.detached_turn_cleanup import repair
++    session, _finish, timers, clock, closed, _snapshot = wake
++    server._wake_session_turn("headless-wake", "first")
++    session["running"] = False
++    repair()
++    assert len(timers) == 1
++    clock[0] += 10
++    repair()
++    assert len(timers) == 1
++    clock[0] += 50
++    timers[-1].fn()
++    assert closed == ["ws_orphan_reap"]
++
++
++def test_real_notice_turn_and_teardown_release_lease(wake, monkeypatch):
++    session, _finish, timers, clock, _closed, snapshot = wake
++    turns = []
++    session.update(history=[], history_version=0, attached_images=[], image_counter=0,
++                   cols=80, slash_worker=None, show_reasoning=False, tool_progress_mode="all")
++    session["agent"] = SimpleNamespace(
++        session_id="headless-wake", clear_interrupt=lambda: None,
++        run_conversation=lambda *a, **k: turns.append(a) or {"final_response": "done"})
++    monkeypatch.setattr(server, "_notif_submit", _REAL_SUBMIT)
++    monkeypatch.setattr(server, "_teardown_popped_session", _REAL_TEARDOWN)
++    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_ensure_session_db_row", lambda s: True)
++    monkeypatch.setattr(server, "_persist_branch_seed", lambda s: None)
++    assert server._wake_session_turn("headless-wake", "notice") == "started"
++    session["_run_thread"].join(10)
++    assert not session["_run_thread"].is_alive()
++    assert turns and not session["running"]
++    assert timers
++    clock[0] += 60
++    timers[-1].fn()
++    assert "live" not in server._sessions
++    assert snapshot() == []
++
++
++@pytest.mark.parametrize("callback", ["settle", "timer"])
++def test_cleanup_does_not_hold_registry_while_waiting_for_history(wake, callback):
++    from tui_gateway.detached_turn_cleanup import settled
++    session, finish, timers, clock, _closed, _snapshot = wake
++    server._wake_session_turn("headless-wake", "first")
++    finish()
++    clock[0] += 60
++    attempted = threading.Event()
++    lock = threading.Lock()
++    class ObservedLock:
++        def __enter__(self):
++            attempted.set()
++            lock.acquire()
++        def __exit__(self, *args):
++            lock.release()
++    session["history_lock"] = ObservedLock()
++    lock.acquire()
++    worker = threading.Thread(target=timers[-1].fn if callback == "timer" else lambda: settled(session))
++    worker.start()
++    try:
++        assert attempted.wait(2)
++        acquired = server._sessions_lock.acquire(timeout=2)
++        if acquired:
++            server._sessions_lock.release()
++        assert acquired, "cleanup inverted history -> sessions lock order"
++    finally:
++        lock.release()
++        worker.join(5)
++    assert not worker.is_alive()
++
++
++def test_notif_rejection_settles_clientless_lease(wake):
++    session, _finish, timers, clock, closed, _snapshot = wake
++    server._wake_session_turn("headless-wake", "first")
++    server._notif_release_turn(session)
++    clock[0] += 60
++    timers[-1].fn()
++    assert closed == ["ws_orphan_reap"]
+diff --git a/tui_gateway/compute_host_bridge.py b/tui_gateway/compute_host_bridge.py
+index 6ecb556833..d8c56de626 100644
+--- a/tui_gateway/compute_host_bridge.py
++++ b/tui_gateway/compute_host_bridge.py
+@@ -317,6 +317,8 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
+     if not frame.get("session_info_emitted"):
+         _emit("session.info", sid, info)
+     _drain_queued_prompt(rid, sid, session)
++    from tui_gateway.detached_turn_cleanup import settled
++    settled(session)
+ 
+ 
+ def _submit_prompt_to_compute_host(
+diff --git a/tui_gateway/detached_turn_cleanup.py b/tui_gateway/detached_turn_cleanup.py
+new file mode 100644
+index 0000000000..23e25dffd9
+--- /dev/null
++++ b/tui_gateway/detached_turn_cleanup.py
+@@ -0,0 +1,92 @@
++"""Bound headless notice turns without killing their background work.
++
++Websocket detachments retain their own reconnect/interrupt timer policy.
++"""
++from threading import Timer
++from time import monotonic
++import logging
++
++from tui_gateway._env import env_float
++
++GRACE_S = max(0.0, env_float("HERMES_TUI_DETACHED_TURN_GRACE_S", 60.0))
++logger = logging.getLogger(__name__)
++
++
++def _headless(session):
++    from tui_gateway import server
++    return session.get("transport") is server._stdio_transport and not server._stdio_is_rpc_channel
++
++
++def cancel(session):
++    """Caller holds history_lock (or has exclusively popped the session)."""
++    timer = session.pop("_detached_turn_timer", None)
++    if timer is not None:
++        timer.cancel()
++
++
++def settled(session: dict, *, only_if_missing=False) -> None:
++    """A new idle turn gets a fresh grace; protected agents keep pollers, not slots."""
++    from tui_gateway import server
++    # Match resume's history -> sessions order, never wait for history while
++    # holding the registry lock. A resumed/rebound record is revalidated here.
++    with session["history_lock"], server._sessions_lock:
++        sid = next((sid for sid, live in server._sessions.items() if live is session), None)
++        if sid is None or session.get("running") or not _headless(session):
++            return
++        if only_if_missing and session.get("_detached_turn_timer") is not None:
++            return
++        if not server._session_is_reapable(sid, session):
++            server._release_active_session_slot(session)
++        cancel(session)
++        _arm(sid, session, GRACE_S)
++
++
++def repair():
++    """Reaper safety net for failed dispatches and lost timer callbacks."""
++    from tui_gateway import server
++    with server._sessions_lock:
++        sessions = list(server._sessions.values())
++    for session in sessions:
++        if _headless(session):
++            settled(session, only_if_missing=True)
++
++
++def _arm(sid: str, session: dict, delay: float) -> None:
++    from tui_gateway import server
++    deadline = monotonic() + delay
++
++    def reap():
++        popped = None
++        # Same resume fence and pop/teardown split as WS orphan cleanup: slow
++        # finalization must run outside locks (agent.close can join a turn).
++        with server._session_resume_lock, session["history_lock"], server._sessions_lock:
++            if server._sessions.get(sid) is not session or session.get("_detached_turn_timer") is not timer:
++                return
++            session.pop("_detached_turn_timer", None)
++            if session.get("running") or not _headless(session):
++                return
++            remaining = deadline - monotonic()
++            if remaining > 0:
++                _arm(sid, session, remaining)
++            elif server._session_is_reapable(sid, session):
++                popped = server._pop_session_by_id(sid)
++            else:
++                server._release_active_session_slot(session)
++                _arm(sid, session, max(1.0, GRACE_S))
++        if popped is not None:
++            server._teardown_popped_session(popped, end_reason="ws_orphan_reap")
++
++    def guarded_reap():
++        try:
++            reap()
++        except Exception:
++            logger.exception("detached turn cleanup failed for %s", sid)
++            # repair() will retry a transient failure on the next reaper scan.
++            with session["history_lock"]:
++                if session.get("_detached_turn_timer") is timer:
++                    session.pop("_detached_turn_timer", None)
++
++    timer = Timer(delay, guarded_reap)
++    timer.daemon = True
++    session["_detached_turn_timer"] = timer
++    timer.start()
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 643fada2d5..3a5eb25ed4 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -23,8 +23,9 @@ A chat another live backend holds reaching the sweeper means that backend's poll
+ holder ("poller miss"). Claimed events always end as a turn or a row: any error after the claim falls back to the row,
+ and a failed row rewinds the claim. The claim is durable (holder pid + start) until that row or the started
+ turn is acked; a sweeper that dies in between is rewound by ``recover_orphaned_notify_claims`` on the next
+-pass, the same guarantee as the live poller. Once woken, the chat is live in that process, so later notices go through its live
+-poller like any open chat's. Residual: if submit raises after the turn thread already started, the row is written too.
++pass, the same guarantee as the live poller. A headless wake stays live only for the detached-turn grace
++(default 60 s) after settlement, so nearby notices reuse its poller; after cleanup later notices return here.
++Protected background work keeps its poller but releases the idle writer lease. Residual: if submit raises after the turn thread already started, the row is written too.
+ A chat mid-turn refuses the row (``SessionTurnLeaseLostError``): that is "busy, try later", so the claim is rewound
+ with one INFO line and the next pass retries; a notice still stalled after ``OVERDUE_S`` logs one WARNING per card
+ and chat with the reason (kanban-e5babca565).
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index 971324daad..4da24c6410 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -697,6 +697,8 @@ def _teardown_popped_session(session: dict | None, *, end_reason: str = "tui_clo
+     """Finish a close after the caller has atomically detached the session."""
+     if session is None:
+         return False
++    from tui_gateway.detached_turn_cleanup import cancel
++    cancel(session)
+     run_thread = session.get("_run_thread")
+     if end_reason != "tui_shutdown" and run_thread is not None and run_thread is not threading.current_thread():
+         try:
+@@ -1006,6 +1008,8 @@ def _rebind_live_transport(sid: str, session: dict, transport: Transport) -> Non
+                 _schedule_ws_orphan_reap(sid)
+         return
+     _attach_session_transport(session, transport)
++    from tui_gateway.detached_turn_cleanup import cancel
++    cancel(session)
+     # Every transport that showed this session (pop-outs resume the same sid); on disconnect the last
+     # viewer becomes the transport instead of the drop sentinel.
+     session.setdefault("viewers", {})[transport] = time.time()
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 77c2756efe..36828d2e94 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -237,6 +237,8 @@ def _notif_release_turn(session: dict) -> None:
+     with session["history_lock"]:
+         if settle(session):
+             session["running"] = False
++    from tui_gateway.detached_turn_cleanup import settled
++    settled(session)
+ 
+ 
+ def _notif_claim_turn(session: dict) -> bool:
+diff --git a/tui_gateway/session_reaper.py b/tui_gateway/session_reaper.py
+index 7754982649..8a2ac08362 100644
+--- a/tui_gateway/session_reaper.py
++++ b/tui_gateway/session_reaper.py
+@@ -209,8 +209,9 @@ def install_exit_flush_signal_handlers() -> bool:
+ 
+ 
+ def _transport_is_dead(transport) -> bool:
+-    # _detached_ws_transport is the post-disconnect drop sentinel. _stdio_transport is the REAL transport for
+-    # standalone `hermes --tui` and must NOT count as dead.
++    # Headless gateways share the stdio object but have no attached RPC client.
++    if transport is _stdio_transport:
++        return not _stdio_is_rpc_channel
+     if transport is _detached_ws_transport:
+         return True
+     if isinstance(transport, FanoutTransport):
+@@ -305,6 +306,8 @@ def _reap_idle_sessions() -> None:
+             sid, end_reason="idle_timeout",
+             predicate=lambda session, vs=sid: _session_is_evictable(vs, session, time.time()))
+     _repair_missing_ws_orphan_reaps()
++    from tui_gateway.detached_turn_cleanup import repair
++    repair()
+     _enforce_session_cap()
+     _reclaim_orphaned_leases()
+     # Long-lived processes: gen2 GC rarely runs at steady state and glibc retains freed pages as RSS, so trim
+@@ -336,6 +339,7 @@ def _repair_missing_ws_orphan_reaps() -> None:
+     with _sessions_lock:
+         closed_transports = [session.get("transport") for session in _sessions.values()
+                              if session.get("transport") is not _detached_ws_transport
++                             and session.get("transport") is not _stdio_transport
+                              and _transport_is_dead(session.get("transport"))]
+     for transport in closed_transports:
+         _close_sessions_for_transport(transport)
+diff --git a/tui_gateway/turn_admission.py b/tui_gateway/turn_admission.py
+index 1b207c29c4..c39ee4936e 100644
+--- a/tui_gateway/turn_admission.py
++++ b/tui_gateway/turn_admission.py
+@@ -173,6 +173,8 @@ def settle_prompt_state(session, st):
+         if not st.error_retained:
+             server._clear_inflight_turn(session)
+         server._release_hosted_room_turn_slot(session)
++    from tui_gateway.detached_turn_cleanup import settled
++    settled(session)
+ 
+ 
+ def start_build_work(session, target, *, delay=None):
+-- 
+2.43.0
+

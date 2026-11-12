@@ -1,0 +1,447 @@
+From 26bbe90a345f491bfdcb12f7217aee2055b992b9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:25:02 +0000
+Subject: [PATCH] [daveey] hub admission: keep create/show facades within
+ health caps; fixture aliases; BOM-tolerant rubric read
+
+---
+ hermes_cli/kanban.py                          | 44 +++++----------
+ hermes_cli/kanban_cli_body.py                 | 20 +++++++
+ hermes_cli/kanban_hub_admission.py            |  2 +-
+ hermes_cli/kanban_hub_admission_placement.py  | 39 +++++++++++++
+ .../test_kanban_worker_placement.py           |  4 +-
+ tests/test_kanban_hub_admission_audit.py      |  4 +-
+ tests/test_kanban_hub_admission_entry.py      |  3 +-
+ tests/tools/test_kanban_hub_admission_tool.py |  3 +-
+ tools/kanban_tools.py                         | 56 +++----------------
+ tools/kanban_tools_attach_url.py              | 44 +++++++++++++++
+ tools/kanban_tools_placement.py               | 22 ++++++++
+ 11 files changed, 157 insertions(+), 84 deletions(-)
+ create mode 100644 hermes_cli/kanban_cli_body.py
+ create mode 100644 tools/kanban_tools_attach_url.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index b7343a99e2..ec22a92111 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -416,16 +416,11 @@ def _print_overlap_refusal(args: argparse.Namespace, refused: str) -> int:
+ @publication_scope
+ def _cmd_create(args: argparse.Namespace) -> int:
+     from agent.delegation_context import is_dispatcher_owned_worker_context
++    from hermes_cli.kanban_cli_body import read_body
+ 
+-    body = args.body
+-    body_file = getattr(args, "body_file", None)
+-    if body is not None and body_file is not None:
+-        return _err("kanban: --body and --body-file are mutually exclusive", 2)
+-    if body_file is not None:
+-        try:
+-            body = sys.stdin.read() if body_file == "-" else Path(body_file).read_text(encoding="utf-8-sig")
+-        except OSError as exc:
+-            return _err(f"kanban: --body-file: {exc}", 2)
++    body, body_error = read_body(args)
++    if body_error:
++        return _err(body_error, 2)
+ 
+     try:
+         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+@@ -464,19 +459,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         return _err(f"kanban: {exc.code}: {exc}", 2)
+     origin_binding = None
+     # [daveey] Hub admission runs before any connection/write lock: the judge is a model call.
+-    from hermes_cli.kanban_hub_admission_placement import cli_plan
+-    plan = cli_plan(args, body, ws_kind, ws_path, getattr(args, "board", None) or kb.get_current_board(),
+-                    assignee=(args.assignee or (_profile_author() if in_worker or _agent_invoked() else None)
+-                              or _cli_default_assignee(args)))
+-    if plan.get("where") == "refuse":
+-        if getattr(args, "json", False):
+-            _print_json({"ok": False, "created": False, "code": "hub_admission_denied",
+-                         "error": plan.get("why", ""), "hub_admission": plan.get("hub_admission")})
+-            return 2
+-        verdict = plan.get("hub_admission") or {}
+-        return _err(f"kanban: hub_admission_denied: {plan.get('why', '')} (no card was created; "
+-                    f"need={verdict.get('need')!r}). Drop the hub pin, or give --hub-reason "
+-                    "quoting what only the hub can do.", 2)
++    from hermes_cli.kanban_hub_admission_placement import cli_preflight
++    assignee = (args.assignee or (_profile_author() if in_worker or _agent_invoked() else None)
++                or _cli_default_assignee(args))
++    plan, refused_rc = cli_preflight(args, body, ws_kind, ws_path, getattr(args, "board", None)
++                                     or kb.get_current_board(), assignee=assignee)
++    if refused_rc is not None:
++        return refused_rc
+     with kbc.connect_closing() as conn:
+         # An --idempotency-key hit returns an existing card: never re-stamp/re-subscribe it.
+         idem_hit = bool(idem_key) and conn.execute(
+@@ -504,8 +493,6 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         from hermes_cli.kanban_capabilities import RequiresDeclarationMissing, declaration_required
+         from hermes_cli.kanban_worker_node import MachinePinRefused, check_machine_pins
+         from hermes_cli.kanban_ask_resolved import AskFilingRefused, check_create_filing, create_context
+-        assignee = (args.assignee or (_profile_author() if in_worker or _agent_invoked() else None)
+-                    or _cli_default_assignee(args))
+         from hermes_cli.kanban_worker_placement import cli_audit, cli_runs_on
+         from hermes_cli.kanban_hub_admission_placement import with_admission as _with_admission
+         try:
+@@ -780,6 +767,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+         queue_reason = kqr.latest(conn, args.task_id)
+         # Same ``queue`` as kanban_show and the REST read (kanban-7d720d4ab8): a ready card says where it waits. [daveey]
+         from hermes_cli import kanban_queue_position as kqp
++        from hermes_cli import kanban_hub_admission_placement as _hub_admission_show
+         details = kqp.detail_fields(conn, task, getattr(args, "board", None))
+         queue = details.get("queue")
+         if not want_json:
+@@ -794,8 +782,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+             "wake_check": wake_check,
+             "queue_reason": queue_reason,
+             **details,
+-            **({"hub_admission": [e.payload for e in events if e.kind == "hub_admission"][-1]}
+-               if any(e.kind == "hub_admission" for e in events) else {}),
++            **_hub_admission_show.show_json(events),
+         })
+         return 0
+ 
+@@ -820,10 +807,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+         field("model", f"{task.model_override}{_prov}")
+     _print_max_retries(task)
+     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
+-    _verdicts = [e.payload for e in events if e.kind == "hub_admission" and isinstance(e.payload, dict)]
+-    if _verdicts:  # [daveey] why this card is (or is not) on the hub
+-        from hermes_cli.kanban_hub_admission_placement import describe as _describe_admission
+-        field("hub", _describe_admission(_verdicts[-1]))
++    _hub_admission_show.print_show_field(events, field)  # [daveey] why this card is (or is not) on the hub
+ 
+     # Diagnostics up top so CLI users see distress signals before scrolling.
+     from hermes_cli import kanban_diagnostics as kd
+diff --git a/hermes_cli/kanban_cli_body.py b/hermes_cli/kanban_cli_body.py
+new file mode 100644
+index 0000000000..b5b7f0d0e3
+--- /dev/null
++++ b/hermes_cli/kanban_cli_body.py
+@@ -0,0 +1,20 @@
++"""``hermes kanban create`` body input: ``--body`` or ``--body-file`` (``-`` = stdin). [daveey]"""
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++from typing import Optional
++
++
++def read_body(args) -> tuple[Optional[str], Optional[str]]:
++    """``(body, error)``: the two flags are mutually exclusive; a file read failure is an error."""
++    body = args.body
++    body_file = getattr(args, "body_file", None)
++    if body is not None and body_file is not None:
++        return None, "kanban: --body and --body-file are mutually exclusive"
++    if body_file is None:
++        return body, None
++    try:
++        return (sys.stdin.read() if body_file == "-" else Path(body_file).read_text(encoding="utf-8-sig")), None
++    except OSError as exc:
++        return None, f"kanban: --body-file: {exc}"
+diff --git a/hermes_cli/kanban_hub_admission.py b/hermes_cli/kanban_hub_admission.py
+index 65bd63db4b..08772db2ea 100644
+--- a/hermes_cli/kanban_hub_admission.py
++++ b/hermes_cli/kanban_hub_admission.py
+@@ -40,7 +40,7 @@ def _skill():
+     path = next((path for path in paths if path.is_file()), None)
+     if path is None:
+         raise FileNotFoundError("hub-admission-test skill is not installed")
+-    text = path.read_text(encoding="utf-8")
++    text = path.read_text(encoding="utf-8-sig")
+     body = text.split("---", 2)[-1].strip() if text.startswith("---\n") else text
+     return body, hashlib.sha256(text.encode()).hexdigest()
+ 
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index c31990bf5a..7171f981ad 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -70,6 +70,45 @@ def describe(verdict):
+     return f"hub admission: denied ({(verdict.get('why') or '')[:160]})"
+ 
+ 
++def _event_verdict(events):
++    verdicts = [e.payload for e in events if e.kind == "hub_admission" and isinstance(e.payload, dict)]
++    return verdicts[-1] if verdicts else None
++
++
++def show_json(events):
++    """``hermes kanban show --json`` fields: the newest verdict, when the card has one."""
++    verdict = _event_verdict(events)
++    return {"hub_admission": verdict} if verdict else {}
++
++
++def print_show_field(events, field):
++    """``hermes kanban show``: a ``hub:`` line saying why this card is (or is not) on the hub."""
++    verdict = _event_verdict(events)
++    if verdict:
++        field("hub", describe(verdict))
++
++
++def cli_preflight(args, body, workspace_kind, workspace_path, board, *, assignee):
++    """``hermes kanban create`` admission before any connection: ``(plan, exit code or None)``.
++
++    A refusal is printed here (``--json``: ``code hub_admission_denied``) and returns exit code 2.
++    """
++    import sys
++    from hermes_cli.kanban_output import _print_json
++    plan = cli_plan(args, body, workspace_kind, workspace_path, board, assignee=assignee)
++    if plan.get("where") != "refuse":
++        return plan, None
++    verdict = plan.get("hub_admission") or {}
++    if getattr(args, "json", False):
++        _print_json({"ok": False, "created": False, "code": "hub_admission_denied",
++                     "error": plan.get("why", ""), "hub_admission": plan.get("hub_admission")})
++    else:
++        print(f"kanban: hub_admission_denied: {plan.get('why', '')} (no card was created; "
++              f"need={verdict.get('need')!r}). Drop the hub pin, or give --hub-reason "
++              "quoting what only the hub can do.", file=sys.stderr)
++    return plan, 2
++
++
+ def gate_owner(conn, waiting_task_id, title, body, *, need):
+     """Judge a capability owner card bound for the hub; records the verdict on the waiting card.
+ 
+diff --git a/tests/hermes_cli/test_kanban_worker_placement.py b/tests/hermes_cli/test_kanban_worker_placement.py
+index 1a612d8509..c4b2a58921 100644
+--- a/tests/hermes_cli/test_kanban_worker_placement.py
++++ b/tests/hermes_cli/test_kanban_worker_placement.py
+@@ -2,7 +2,9 @@
+ import pytest
+ 
+ from hermes_cli import kanban_placement as placement
+-from tests.hermes_cli.hub_judge_support import hub_judge
++from tests.hermes_cli import hub_judge_support
++
++hub_judge = hub_judge_support.hub_judge
+ 
+ 
+ @pytest.mark.parametrize("title", ["Summarize a public paper", "Run the full test suite"])
+diff --git a/tests/test_kanban_hub_admission_audit.py b/tests/test_kanban_hub_admission_audit.py
+index 01a6295097..a951a09808 100644
+--- a/tests/test_kanban_hub_admission_audit.py
++++ b/tests/test_kanban_hub_admission_audit.py
+@@ -7,7 +7,9 @@ import pytest
+ from hermes_cli import kanban_db_creation as creation
+ from hermes_cli.kanban_hub_admission import Verdict
+ from tools import kanban_tools_placement as tools
+-from tests.hermes_cli.test_kanban_placement import mac
++from tests.hermes_cli import test_kanban_placement as placement_support
++
++mac = placement_support.mac
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/test_kanban_hub_admission_entry.py b/tests/test_kanban_hub_admission_entry.py
+index 12eed1ef5d..73147da668 100644
+--- a/tests/test_kanban_hub_admission_entry.py
++++ b/tests/test_kanban_hub_admission_entry.py
+@@ -17,10 +17,11 @@ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_placement as placement
+ from tests.hermes_cli import test_kanban_capability_routing as routing_support
+ from tests.hermes_cli import test_kanban_worker_policy_db as fixtures
+-from tests.hermes_cli.hub_judge_support import hub_judge
++from tests.hermes_cli import hub_judge_support
+ 
+ conn = fixtures.conn
+ env = routing_support.env
++hub_judge = hub_judge_support.hub_judge
+ MARKED = "Read ~/.hermes/logs/agent.log on the hub"
+ 
+ 
+diff --git a/tests/tools/test_kanban_hub_admission_tool.py b/tests/tools/test_kanban_hub_admission_tool.py
+index f2cb72d84c..d42d352e88 100644
+--- a/tests/tools/test_kanban_hub_admission_tool.py
++++ b/tests/tools/test_kanban_hub_admission_tool.py
+@@ -12,10 +12,11 @@ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_placement as placement
+ from tests.hermes_cli import test_kanban_portable_reason_audit as audit_support
+-from tests.hermes_cli.hub_judge_support import hub_judge
++from tests.hermes_cli import hub_judge_support
+ from tools import kanban_tools as kt
+ 
+ kanban_home = audit_support.kanban_home
++hub_judge = hub_judge_support.hub_judge
+ MARKED = "Read ~/.hermes/logs/agent.log on the hub"
+ 
+ 
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index fad56a97e8..4c3a05256e 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -25,7 +25,10 @@ from hermes_cli.kanban_capabilities import check_tool_create, declaration_requir
+ from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap, kanban_reason_comment as krc
+ from tools.kanban_tools_placement import (_local_placement, _machine_placement, _marker_placement_fields, _persisted_session_id,
+                                           _create_session_id, _placement_origin, _placement_refused, _runs_where,
+-                                          _effective_board_args, _origin_enrollment, _pinned_note)
++                                          _effective_board_args, _origin_enrollment, _pinned_note,
++                                          _admission_refused, _effective_requires, _with_admission)
++# SSRF-checked capped download lives in a sibling; tests monkeypatch it on this module.
++from tools.kanban_tools_attach_url import _download_url_with_cap
+ from tools.kanban_tools_db_hint import generic_tool_error
+ from tools.kanban_tools_park_args import (_blocker_id_arg, _clear_blocker_arg, _blocker_scope_args, _park_guard,
+                                           _wake_check_args, _wake_check_echo, _escalated)
+@@ -1400,47 +1403,6 @@ def _handle_attach(args: dict, **kw) -> str:
+     return _store_attachment(args.get("board"), tid, filename, data, args.get("content_type"))
+ 
+ 
+-_MAX_ATTACH_URL_REDIRECTS = 5
+-
+-
+-def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[str]]:
+-    """Fetch ``url`` over http(s) capped at ``max_bytes`` -> ``(data, content_type)``.
+-    Every hop is SSRF-checked (redirects followed manually) so a model-controlled URL, or a
+-    public host 302ing, cannot reach loopback/private/cloud-metadata ranges. ``ValueError``
+-    for bad scheme, blocked target, too many redirects, or a body over the cap (checked
+-    while streaming, so nothing oversize is buffered)."""
+-    from urllib.parse import urljoin, urlparse
+-    import httpx
+-    from tools.url_safety import is_safe_url
+-    current_url = url
+-    for _ in range(_MAX_ATTACH_URL_REDIRECTS + 1):
+-        scheme = (urlparse(current_url).scheme or "").lower()
+-        if scheme not in ("http", "https"):
+-            raise ValueError(f"unsupported URL scheme {scheme!r}; only http/https are allowed")
+-        if not is_safe_url(current_url):
+-            raise ValueError(
+-                f"URL blocked by SSRF protection (private/internal address): {current_url}")
+-        chunks: list[bytes] = []
+-        total = 0
+-        with httpx.stream("GET", current_url, headers={"User-Agent": "hermes-kanban/attach"},
+-                          timeout=30, follow_redirects=False) as resp:
+-            if resp.is_redirect:
+-                location = resp.headers.get("location")
+-                if not location:
+-                    raise ValueError(f"redirect without Location header from {current_url}")
+-                current_url = urljoin(current_url, location)
+-                continue
+-            resp.raise_for_status()
+-            content_type = (resp.headers.get("content-type") or "").split(";")[0].strip() or None
+-            for chunk in resp.iter_bytes(1024 * 1024):
+-                total += len(chunk)
+-                if total > max_bytes:
+-                    raise ValueError(f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit")
+-                chunks.append(chunk)
+-        return b"".join(chunks), content_type
+-    raise ValueError(f"too many redirects fetching {url}")
+-
+-
+ @_kanban_handler("kanban_attach_url")
+ def _handle_attach_url(args: dict, **kw) -> str:
+     """Attach a file fetched server-side from an http(s) URL (shared size cap)."""
+@@ -1661,9 +1623,7 @@ def _handle_create(args: dict, **kw) -> str:
+                 return _placement_refused(_pin, "an origin-bound card is created on this gateway")
+         marker_placement = _origin_enrollment(args, origin, marker_placement, assignee=assignee,
+                                                skills=skills, project_id=project_id)
+-        if marker_placement and marker_placement.get("where") == "refuse":
+-            return _placement_refused(marker_placement.get("pin", "hub"), marker_placement.get("why", ""),
+-                                      hub_admission=marker_placement.get("hub_admission"))
++        _admission_refused(marker_placement)  # raises the typed refusal for a denied hub pin
+         try:
+             new_tid = kb.create_task(
+                 conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+@@ -1678,7 +1638,7 @@ def _handle_create(args: dict, **kw) -> str:
+                 creator_task_id=self_tid,
+                 idempotency_key=args.get("idempotency_key"),
+                 max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+-                requires=(marker_placement or {}).get("requires", args.get("requires")),
++                requires=_effective_requires(marker_placement, args),
+                 runs_on=runs_on, max_retries=max_retries,
+                 placement_policy=(marker_placement or {}).get("placement_policy"),
+                 placement_checked=True,  # this front door already checked pins, origins and portability
+@@ -1728,9 +1688,7 @@ def _handle_create(args: dict, **kw) -> str:
+             # and a caller that archives and re-creates it makes a duplicate. [daveey]
+             extra["runs_on"] = runs_on
+             if pinned_machine:
+-                extra["placement"] = {**_machine_placement(pinned_machine, runs_on),
+-                                      **({"hub_admission": marker_placement["hub_admission"]}
+-                                         if marker_placement and marker_placement.get("hub_admission") else {})}
++                extra["placement"] = _with_admission(_machine_placement(pinned_machine, runs_on), marker_placement)
+                 extra["note"] = _pinned_note(conn, new_tid, pinned_machine, runs_on)  # + drain wait [daveey]
+         # Every result says where the card runs (a caller that can't tell re-creates it or never learns it is stranded)
+         extra.update(runs_where=_runs_where(runs_on, pinned_machine, marker_placement),  # + contract advisory [daveey]
+diff --git a/tools/kanban_tools_attach_url.py b/tools/kanban_tools_attach_url.py
+new file mode 100644
+index 0000000000..320dfbec6e
+--- /dev/null
++++ b/tools/kanban_tools_attach_url.py
+@@ -0,0 +1,44 @@
++"""SSRF-checked, size-capped URL download for ``kanban_attach_url`` (split from kanban_tools). [daveey]"""
++from __future__ import annotations
++
++from typing import Optional
++
++_MAX_ATTACH_URL_REDIRECTS = 5
++
++
++def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[str]]:
++    """Fetch ``url`` over http(s) capped at ``max_bytes`` -> ``(data, content_type)``.
++    Every hop is SSRF-checked (redirects followed manually) so a model-controlled URL, or a
++    public host 302ing, cannot reach loopback/private/cloud-metadata ranges. ``ValueError``
++    for bad scheme, blocked target, too many redirects, or a body over the cap (checked
++    while streaming, so nothing oversize is buffered)."""
++    from urllib.parse import urljoin, urlparse
++    import httpx
++    from tools.url_safety import is_safe_url
++    current_url = url
++    for _ in range(_MAX_ATTACH_URL_REDIRECTS + 1):
++        scheme = (urlparse(current_url).scheme or "").lower()
++        if scheme not in ("http", "https"):
++            raise ValueError(f"unsupported URL scheme {scheme!r}; only http/https are allowed")
++        if not is_safe_url(current_url):
++            raise ValueError(
++                f"URL blocked by SSRF protection (private/internal address): {current_url}")
++        chunks: list[bytes] = []
++        total = 0
++        with httpx.stream("GET", current_url, headers={"User-Agent": "hermes-kanban/attach"},
++                          timeout=30, follow_redirects=False) as resp:
++            if resp.is_redirect:
++                location = resp.headers.get("location")
++                if not location:
++                    raise ValueError(f"redirect without Location header from {current_url}")
++                current_url = urljoin(current_url, location)
++                continue
++            resp.raise_for_status()
++            content_type = (resp.headers.get("content-type") or "").split(";")[0].strip() or None
++            for chunk in resp.iter_bytes(1024 * 1024):
++                total += len(chunk)
++                if total > max_bytes:
++                    raise ValueError(f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit")
++                chunks.append(chunk)
++        return b"".join(chunks), content_type
++    raise ValueError(f"too many redirects fetching {url}")
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index 0f7a997d47..0f5c15159b 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -91,6 +91,28 @@ def _placement_refused(pin: str, why: str, *, hub_admission=None) -> str:
+         **({"hub_admission": hub_admission} if hub_admission else {}))
+ 
+ 
++def _admission_refused(marker_placement) -> None:
++    """[daveey] Raise the refusal for a denied hub admission found after origin enrollment.
++
++    ``_Reject`` carries the finished payload to ``_kanban_handler`` (no branch in ``_handle_create``)."""
++    if not marker_placement or marker_placement.get("where") != "refuse":
++        return
++    from tools.kanban_tools import _Reject
++    raise _Reject("", payload=_placement_refused(marker_placement.get("pin", "hub"), marker_placement.get("why", ""),
++                                                 hub_admission=marker_placement.get("hub_admission")))
++
++
++def _effective_requires(marker_placement, args: dict):
++    """[daveey] Requirements to persist: a denied hub card carries ``hub:write`` from the planner."""
++    return (marker_placement or {}).get("requires", args.get("requires"))
++
++
++def _with_admission(placement: dict, marker_placement) -> dict:
++    """[daveey] A machine-pin create reply keeps the hub admission verdict that let it through."""
++    verdict = (marker_placement or {}).get("hub_admission")
++    return {**placement, "hub_admission": verdict} if verdict else placement
++
++
+ def _local_placement(kp, view: dict, decision: dict, *, machine_ok, note_local_pin: bool) -> dict:
+     """``placement`` for a card ``kp.decide`` kept on this gateway; every local decision says why. [daveey]
+ 
+-- 
+2.43.0
+

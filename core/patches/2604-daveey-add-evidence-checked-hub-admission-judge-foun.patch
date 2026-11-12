@@ -1,0 +1,233 @@
+From 9b36687891f0f9b59268af1a5daf6ee9058ef07e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:01:43 +0000
+Subject: [PATCH] [daveey] add evidence-checked hub admission judge foundation
+
+---
+ hermes_cli/kanban_hub_admission.py | 102 ++++++++++++++++++++++++++++
+ tests/test_kanban_hub_admission.py | 104 +++++++++++++++++++++++++++++
+ 2 files changed, 206 insertions(+)
+ create mode 100644 hermes_cli/kanban_hub_admission.py
+ create mode 100644 tests/test_kanban_hub_admission.py
+
+diff --git a/hermes_cli/kanban_hub_admission.py b/hermes_cli/kanban_hub_admission.py
+new file mode 100644
+index 0000000000..cfa7db15d6
+--- /dev/null
++++ b/hermes_cli/kanban_hub_admission.py
+@@ -0,0 +1,102 @@
++"""Evidence-checked hub admission, using an exact subscription-only judge."""
++from __future__ import annotations
++
++import hashlib
++import json
++import sqlite3
++from contextlib import closing
++from dataclasses import asdict, dataclass, replace
++
++MODEL = "claude-sonnet-5-5"
++PROVIDER = "anthropic"
++TIMEOUT = 30
++NEEDS = frozenset({"hub_chrome", "board_admin_key", "instance_role_ssm", "user_terminal",
++                   "hub_worktree", "gateway_key_cli", "hub_live_process"})
++
++
++@dataclass(frozen=True)
++class Verdict:
++    admit: bool = False
++    need: str | None = None
++    evidence: str = ""
++    why: str = "admission unavailable"
++    model: str = MODEL
++    skill_sha: str = ""
++    cached: bool = False
++    forced: bool = False
++
++
++def _skill():
++    from hermes_cli.config import get_hermes_home
++    path = get_hermes_home() / "skills/devops/hub-admission-test/SKILL.md"
++    text = path.read_text(encoding="utf-8")
++    body = text.split("---", 2)[-1].strip() if text.startswith("---\n") else text
++    return body, hashlib.sha256(text.encode()).hexdigest()
++
++
++def _parse(text, fields, hub_reason, sha):
++    invalid = Verdict(why="invalid admission verdict", skill_sha=sha)
++    try:
++        result = json.loads(text)
++    except (ValueError, TypeError):
++        return invalid
++    if not isinstance(result, dict) or set(result) != {"admit", "need", "evidence", "why"}:
++        return invalid
++    if (type(result["admit"]) is not bool or not isinstance(result["evidence"], str)
++            or not isinstance(result["why"], str) or not result["why"].strip()):
++        return invalid
++    need = result["need"]
++    if need is not None and (not isinstance(need, str) or need not in NEEDS):
++        return invalid
++    if result["admit"]:
++        quote = result["evidence"]
++        inputs = (fields.get("title") or "", fields.get("body") or "", hub_reason or "")
++        if need is None or not quote.strip() or not any(quote in item for item in inputs):
++            return invalid
++    return Verdict(**result, skill_sha=sha)
++
++
++def _cache(key, verdict=None):
++    from hermes_cli.config import get_hermes_home
++    directory = get_hermes_home() / "kanban"
++    directory.mkdir(parents=True, exist_ok=True)
++    with closing(sqlite3.connect(directory / "hub-admission.sqlite", timeout=1)) as conn, conn:
++        conn.execute("CREATE TABLE IF NOT EXISTS verdicts (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
++        if verdict is None:
++            row = conn.execute("SELECT value FROM verdicts WHERE key=?", (key,)).fetchone()
++            return replace(Verdict(**json.loads(row[0])), cached=True) if row else None
++        conn.execute("INSERT OR REPLACE INTO verdicts VALUES (?, ?)", (key, json.dumps(asdict(verdict))))
++        conn.execute("DELETE FROM verdicts WHERE rowid NOT IN "
++                     "(SELECT rowid FROM verdicts ORDER BY rowid DESC LIMIT 1024)")
++    return None
++
++
++def admit(card_fields, *, hub_reason=None) -> Verdict:
++    """Deny if the managed subscription pool, rubric or judge is unavailable."""
++    sha = ""
++    try:
++        from agent import auxiliary_client as aux
++        from agent.model_routing_managed import managed_config
++        if managed_config() is None:
++            return Verdict()
++        body, sha = _skill()
++        key = hashlib.sha256(json.dumps([card_fields.get("title") or "", card_fields.get("body") or "",
++                                        hub_reason, sha], ensure_ascii=False).encode()).hexdigest()
++        cached = _cache(key)
++        if cached is not None:
++            return cached
++        route = {}
++        response = aux.call_llm(
++            task="hub_admission", provider=PROVIDER, model=MODEL, timeout=TIMEOUT,
++            max_tokens=1024, temperature=0, route_info=route,
++            messages=[{"role": "system", "content": body}, {"role": "user", "content": json.dumps({
++                "title": card_fields.get("title") or "", "body": card_fields.get("body") or "",
++                "hub_reason": hub_reason})}])
++        if (route.get("provider"), route.get("model"), route.get("billing_group")) != (
++                PROVIDER, MODEL, "subscription"):
++            return Verdict(skill_sha=sha)
++        verdict = _parse(response.choices[0].message.content, card_fields, hub_reason, sha)
++        _cache(key, verdict)
++        return verdict
++    except Exception:  # health: allow BLE001 -- a judge outage must deny placement, never fall back
++        return Verdict(skill_sha=sha)
+diff --git a/tests/test_kanban_hub_admission.py b/tests/test_kanban_hub_admission.py
+new file mode 100644
+index 0000000000..08ef947aa5
+--- /dev/null
++++ b/tests/test_kanban_hub_admission.py
+@@ -0,0 +1,104 @@
++"""The hub judge accepts only an evidenced, allowlisted subscription verdict."""
++import importlib
++import json
++from types import SimpleNamespace
++
++import pytest
++
++
++@pytest.fixture
++def judge(tmp_path, monkeypatch):
++    gate = importlib.import_module("hermes_cli.kanban_hub_admission")
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    skill = tmp_path / "skills/devops/hub-admission-test/SKILL.md"
++    skill.parent.mkdir(parents=True)
++    skill.write_text("---\nname: hub-admission-test\n---\nJudge the card.")
++    from agent import auxiliary_client as aux
++    from agent import model_routing_managed as managed
++    monkeypatch.setattr(managed, "managed_config", lambda: {"managed": True})
++    calls = []
++
++    reply = {"admit": True, "need": "hub_chrome", "evidence": "signed-in Chrome",
++             "why": "Needs the browser session."}
++
++    def fake(**kwargs):
++        calls.append(kwargs)
++        kwargs["route_info"].update(provider="anthropic", model="claude-sonnet-5-5",
++                                    billing_group="subscription")
++        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(reply)))])
++
++    monkeypatch.setattr(aux, "call_llm", fake)
++    return gate, calls, reply, skill
++
++
++def test_valid_admission(judge):
++    gate, calls, _, _ = judge
++    verdict = gate.admit({"title": "Use signed-in Chrome", "body": "Read the page"})
++    assert verdict.admit is True
++    assert verdict.need == "hub_chrome"
++    assert len(verdict.skill_sha) == 64
++    assert calls[0]["provider"] == "anthropic"
++    assert calls[0]["model"] == "claude-sonnet-5-5"
++    assert calls[0]["timeout"] == 30
++    assert "Judge the card." in calls[0]["messages"][0]["content"]
++
++
++@pytest.mark.parametrize("change", [
++    {"evidence": "invented quote"}, {"need": "hub_logs"}, {"evidence": ""},
++    {"admit": "true"}, {"need": None}, {"why": []},
++])
++def test_invalid_verdict_denied(judge, change):
++    gate, _, reply, _ = judge
++    reply.update(change)
++    result = gate.admit({"title": "Use signed-in Chrome"})
++    assert result.admit is False
++    assert result.why == "invalid admission verdict"
++
++
++def test_cache_and_skill_revision(judge):
++    gate, calls, _, skill = judge
++    fields = {"title": "Use signed-in Chrome"}
++    first = gate.admit(fields)
++    second = gate.admit(fields)
++    assert second.cached is True
++    assert len(calls) == 1
++    skill.write_text(skill.read_text() + "\nNew rubric rule.\n")
++    third = gate.admit(fields)
++    assert third.cached is False
++    assert third.skill_sha != first.skill_sha
++    assert len(calls) == 2
++
++
++@pytest.mark.parametrize("failure", [TimeoutError("timeout"), RuntimeError("unavailable")])
++def test_unavailable_denies_without_caching(judge, monkeypatch, failure):
++    gate, calls, _, _ = judge
++    from agent import auxiliary_client as aux
++    fake = aux.call_llm
++
++    def fail(**kwargs):
++        raise failure
++
++    monkeypatch.setattr(aux, "call_llm", fail)
++    fields = {"title": "Use signed-in Chrome"}
++    result = gate.admit(fields)
++    assert result.admit is False
++    assert result.why == "admission unavailable"
++    monkeypatch.setattr(aux, "call_llm", fake)
++    assert gate.admit(fields).admit is True
++    assert len(calls) == 1
++
++
++def test_malformed_json(judge, monkeypatch):
++    gate, _, _, _ = judge
++    from agent import auxiliary_client as aux
++    fake = aux.call_llm
++
++    def malformed(**kwargs):
++        response = fake(**kwargs)
++        response.choices[0].message.content = "```json not JSON```"
++        return response
++
++    monkeypatch.setattr(aux, "call_llm", malformed)
++    result = gate.admit({"title": "Use signed-in Chrome"})
++    assert result.admit is False
++    assert result.why == "invalid admission verdict"
+-- 
+2.43.0
+

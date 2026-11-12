@@ -25,6 +25,23 @@ def normalize_regex(data, substitutions):
                     for index, part in enumerate(parts))
 
 
+def _string_value(node, literals):
+    """A str built only from literals, earlier module-level names and ``+``; None otherwise.
+
+    Pure AST folding (no import or execution). The 2678 placement table names markers composed
+    with ``+`` (``DESKTOP_ACTION_MARKER``), which a constant-only reader cannot resolve.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return literals.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _string_value(node.left, literals), _string_value(node.right, literals)
+        if isinstance(left, str) and isinstance(right, str):
+            return left + right
+    return None
+
+
 def validate_markers(data):
     """Compile the literal default table without importing/executing source code."""
     tree = ast.parse(data)
@@ -35,8 +52,9 @@ def validate_markers(data):
             continue
         for target in node.targets:
             if isinstance(target, ast.Name):
-                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-                    literals[target.id] = node.value.value
+                value = _string_value(node.value, literals)
+                if isinstance(value, str):
+                    literals[target.id] = value
                 if target.id == 'DEFAULT_LOCAL_MARKERS':
                     table = node.value
     if not isinstance(table, (ast.Tuple, ast.List)) or not table.elts:
