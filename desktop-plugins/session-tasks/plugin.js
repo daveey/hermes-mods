@@ -159,6 +159,17 @@ const missingView = (reason, extra = {}) => ({
 
 const classOf = c => c || 'sidebar'
 
+/** No observations array. A hermes-hub replica row (current producer, but a replica is not source evidence) says so
+ *  and ages from the card's own last activity (source clock; never `synced_at`, a copy time). Anything else is an
+ *  older producer. Both are explicit unknown, never certain running. */
+export const REPLICA_REASON = 'hub_replica_not_source_evidence'
+export function unobservedView(chip, nowSec) {
+  const lastKnown = chip?.kind === 'kanban' ? str(chip.state) || null : null
+  if (!chip?.replica) return missingView('producer_sent_no_observations')
+  const at = Number(chip.activityAt)
+  return missingView(REPLICA_REASON, { lastKnown, ageSec: at > 0 && Number.isFinite(at) ? Math.max(0, nowSec - at) : null })
+}
+
 /** One record -> view. */
 export function projectView(record, nowSec, sourceClass = 'sidebar', sdk = observationSdk(), expectedIdentity) {
   if (!sdk) return missingView('sdk_projector_unavailable')
@@ -183,7 +194,7 @@ export function summaryView(records, nowSec, sourceClass = 'sidebar', sdk = obse
 export function chipObservation(chip, nowSec, { sdk = observationSdk(), sourceClass = 'sidebar' } = {}) {
   if (!sdk) return missingView('sdk_projector_unavailable')
   const split = splitObservations(chip?.observations)
-  if (!split.present) return missingView('producer_sent_no_observations')
+  if (!split.present) return unobservedView(chip, nowSec)
   const candidates = split.work.filter(r => {
     const id = obsOwn(r, 'identity')
     const kind = chip.kind === 'bg' ? 'process' : chip.kind === 'sub' ? 'subagent' : 'card'
@@ -436,7 +447,7 @@ export function hubLinkChips(tasks, liveKeys = new Set()) {
     if (liveKeys.has(k) || seen.has(k)) continue
     seen.add(k)
     const chip = taskChip(t, status)
-    out.push({ ...chip, key: `kb:${k}`, gateway, board, title: `${chip.title}\non ${gateway} · ${syncedAgo(t.synced_at)} (hermes-hub replica)` })
+    out.push({ ...chip, replica: true, key: `kb:${k}`, gateway, board, title: `${chip.title}\non ${gateway} · ${syncedAgo(t.synced_at)} (hermes-hub replica)` })
   }
   return byRank(out)
 }
@@ -1044,7 +1055,7 @@ export function Chip({ chip: rawChip, now }) {
   const chip = ev
     ? { ...rawChip, state: ev.state, title: `${rawChip.title}\n${observationLine(ev, now / 1000)}` }
     : legacyLiveCard(rawChip)
-      ? { ...rawChip, state: 'unknown', title: `${rawChip.title}\nstatus unknown (producer sent no observations) · last known: ${rawChip.state}` }
+      ? { ...rawChip, state: 'unknown', title: `${rawChip.title}\n${rawChip.replica ? `status ${observationLine(unobservedView(rawChip, now / 1000), now / 1000)}` : `status unknown (producer sent no observations) · last known: ${rawChip.state}`}` }
       : rawChip
   const color = chipColor(chip.look || chip.state)
   const showMachine = chip.kind === 'machine' && typeof window.__computeRentalsShow === 'function'
