@@ -3,6 +3,7 @@ honestly. Logic lives in core.py; this file only wires Hermes hooks."""
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
 import threading
@@ -19,6 +20,8 @@ except ImportError:  # pytest imports the hyphenated plugin dir without a parent
 logger = logging.getLogger(__name__)
 _lock = threading.Lock()
 _sends = core.SendTracker()
+MARK = "[follow-through]"
+FIELD = "follow_through"  # JSON-object results carry the steer here, so they stay valid JSON
 
 
 def _home() -> Path:
@@ -62,15 +65,31 @@ def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = N
     try:
         if tool_name in ("kanban_create", "kanban_comment"):
             hint = core.obligation_hint(tool_name, args if isinstance(args, dict) else {}, result)
-            if hint and "[follow-through]" not in result:
-                return result + "\n" + hint
-            return None
+            return decorate(result, hint) if hint else None
         with _lock:
             note = _sends.observe(session_id or "", tool_name or "", result)
         return result + note if note else None
     except Exception as exc:
         logger.debug("follow-through transform_tool_result failed: %s", exc)
         return None
+
+
+def decorate(result: str, hint: str) -> str | None:
+    """Add the steer without breaking a JSON-object result: machine readers (cron consumers calling
+    handle_function_call, e.g. kanban-drift's native_tool) json.loads the whole result, so prose after the object
+    raised "Extra data". An object result carries the steer in its FIELD (the model still reads it); any other
+    result (plain text, arrays, non-JSON) keeps the prose append. Already decorated either way -> None."""
+    try:
+        data = json.loads(result)
+    except (TypeError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        if FIELD in data or MARK in result:
+            return None
+        return json.dumps({**data, FIELD: hint}, ensure_ascii=False)
+    if MARK in result:
+        return None
+    return result + "\n" + hint
 
 
 def register(ctx) -> None:

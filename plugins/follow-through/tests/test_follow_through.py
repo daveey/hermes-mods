@@ -400,6 +400,41 @@ def test_plugin_hook_appends_the_steer_once():
     assert plugin.transform_tool_result("kanban_comment", {"task_id": CHILD, "body": COMMENT}, res, "s") is None
 
 
+# machine readers (kanban-drift's native_tool, cron consumers) json.loads the handle_function_call result
+def test_kanban_create_success_stays_valid_json_with_the_steer_in_a_named_field():
+    raw = json.dumps({"task_id": "t_5555ffff", "status": "ready"})
+    out = plugin.transform_tool_result("kanban_create", {"body": BODY}, raw, "s")
+    data = json.loads(out)  # must not raise "Extra data"
+    assert data["task_id"] == "t_5555ffff" and data["status"] == "ready"
+    assert data["follow_through"].startswith("[follow-through]") and "t_5555ffff" in data["follow_through"]
+    assert out.count("[follow-through]") == 1
+    assert plugin.transform_tool_result("kanban_create", {"body": BODY}, out, "s") is None  # no duplicate
+
+
+def test_kanban_comment_object_result_stays_valid_json_and_is_not_decorated_twice():
+    out = plugin.transform_tool_result("kanban_comment", {"task_id": CHILD, "body": COMMENT}, '{"ok": true}', "s")
+    data = json.loads(out)
+    assert data["ok"] is True and f"parents=['{CHILD}']" in data["follow_through"]
+    assert plugin.transform_tool_result("kanban_comment", {"task_id": CHILD, "body": COMMENT}, out, "s") is None
+
+
+def test_kanban_create_refusal_stays_valid_json_and_unchanged():
+    raw = json.dumps({"success": False, "error": "create_overlap: t_6666aaaa already covers this"})
+    out = plugin.transform_tool_result("kanban_create", {"body": BODY}, raw, "s")
+    assert out is None or json.loads(out) == json.loads(raw)
+
+
+def test_existing_follow_through_field_is_never_overwritten():
+    raw = json.dumps({"task_id": "t_5555ffff", "follow_through": "earlier steer"})
+    assert plugin.transform_tool_result("kanban_create", {"body": BODY}, raw, "s") is None
+
+
+def test_non_json_text_result_keeps_the_prose_append():
+    out = plugin.transform_tool_result("kanban_comment", {"task_id": CHILD, "body": COMMENT}, "Comment added.", "s")
+    assert out.startswith("Comment added.\n[follow-through]") and out.count("[follow-through]") == 1
+    assert plugin.transform_tool_result("kanban_comment", {"task_id": CHILD, "body": COMMENT}, out, "s") is None
+
+
 # 5. a question about the missed action triggers correction, not admission only
 @pytest.mark.parametrize("msg", ["did you send her a link?", "so, how am i supposed to onboard her mac without that?",
                                  "Have you messaged him yet", "why didn't you do it"])
