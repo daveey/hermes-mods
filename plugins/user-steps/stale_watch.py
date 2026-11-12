@@ -28,7 +28,8 @@ every non-dry run backfills that close for earlier retirements whose card still 
 Old-ask review (cron runs only, not run()'s default): at most one card a day (key
 `user-steps-old-asks:<PT date>`) lists undecided requests asked more than 72 h ago and not marked reviewed in the
 last 7 days, with the owner chat's title and last turn (PT) and its linked/named card states. It is created on this
-gateway's board through the kanban_create tool handler (placement='local', requires declared), never the CLI. The
+gateway's board through the kanban_create tool handler (placement='local', requires declared; on the hub
+placement='auto' with hub:write, see "the pool route on the hub"), never the CLI. The
 watcher decides and withdraws nothing. The reviewing worker uses the sanctioned CLI:
 `--withdraw ID --reason ... --evidence ...` (core.withdraw_request by=hygiene; refused for recorded decisions,
 card-bound requests and owners not on this gateway) or `--reviewed ID --reason ... [--evidence ...]` (side table
@@ -79,6 +80,40 @@ fence_evidence = placement_evidence.fence_evidence
 home_pin_note = placement_evidence.home_pin_note
 incident_title = placement_evidence.incident_title
 _PIN = "the repair reads and changes this gateway's own user-steps action store and chat state"
+
+# ── the pool route on the hub ─────────────────────────────────────────────────────────────────────────────────────
+# On a gateway whose state a pool worker reaches (placement_evidence.REMOTE_GATEWAYS: the hub), every card this
+# watcher files is pool work: it declares hub:write (core's Board places hub:write onto a capability:hub-write
+# worker; hub:read it cannot place) and carries no machine pin, and its brief replaces the home-pin sentence with
+# the hub-admin / ssh hermes-hub route, hub paths inside the evidence fence. A home-pin sentence was the very text
+# hub admission once admitted as a hub-only need (t_01a1cf7f8f211403). Other gateways keep the machine pin: a
+# Mac's action store has no remote route. Prevention card t_01a1d0e68acaba94.
+SCRIPT = '~/.hermes/plugins/user-steps/stale_watch.py'
+REMOTE_REQUIRES = ('terminal', 'file', 'git', 'hub:write')
+REMOTE_NOTE = ("This card runs on a pool worker. The user-steps action store, chats and logs it works on are on the "
+               "gateway that filed it: read them with `ssh hermes-hub <cat|tail|grep|ls|sqlite ...>` (`ssh hermes-hub "
+               "help` lists them), and run every step that reads or changes the action store or a chat (the "
+               "stale_watch.py commands, the /api/plugins/user-steps calls, `hermes ...`) as `hub-admin "
+               "'<command>'`, single-quoted so `~` expands there. Run locally they would act on this worker's own "
+               "store. The commands:")
+
+
+def _remote_commands(extra=()):
+    lines = [f"hub-admin 'python3 {SCRIPT} --dry-run'",
+             "ssh hermes-hub tail -n 200 ~/.hermes/logs/user-steps-stale-watch.log",
+             "ssh hermes-hub grep -n 'startup resume' ~/.hermes/logs/agent.log", *extra]
+    return fence_evidence('\n'.join(lines))
+
+
+def remote_home():
+    """True on a gateway whose cards go to the pool (the hub); False elsewhere and when the identity is unreadable
+    (the home pin path then fails the create closed)."""
+    return placement_evidence.remote_home()
+
+
+def remote_body(body, extra=()):
+    """``body`` for a pool worker: the home-pin sentence becomes :data:`REMOTE_NOTE` plus the fenced commands."""
+    return placement_evidence.remote_body(body, f"{REMOTE_NOTE}\n{_remote_commands(extra)}")
 
 
 def card(item):
@@ -323,16 +358,23 @@ def close_retired_cards(store, cards, local_gateway=None):
     return out
 
 
-def create_card(c):
-    # Every detector card is home-bound: pin it to this board's configured gateway (explicit machine label) and
-    # fail closed when a synced board's identity cannot be read: an unpinned card would silently become portable.
+def create_route(c):
+    """``(argv tail, body)`` for a detector card. On the hub: pool work declaring hub:write, no pin, the hub-admin
+    brief. Elsewhere: pinned to this board's configured gateway (explicit machine label), body unchanged. Fails
+    closed when a synced board's identity cannot be read: an unpinned card would silently become portable."""
+    if remote_home():
+        return [x for r in REMOTE_REQUIRES for x in ('--requires', r)], remote_body(c['body'])
     try:
-        pin = placement_evidence.home_runs_on_argv()
+        return placement_evidence.home_runs_on_argv(), c['body']
     except placement_evidence.HomePinUnresolved as exc:
         raise RuntimeError(f"refusing to file {c['idempotency_key']}: {exc}") from exc
+
+
+def create_card(c):
+    pin, body = create_route(c)
     cmd = ['hermes', 'kanban', 'create', c['title'], '--body-file', '-', '--assignee', c['assignee'],
            '--idempotency-key', c['idempotency_key'], *pin, '--json']
-    p = subprocess.run(cmd, input=c['body'], text=True, capture_output=True, timeout=120)
+    p = subprocess.run(cmd, input=body, text=True, capture_output=True, timeout=120)
     if p.returncode:
         raise RuntimeError(p.stderr.strip() or p.stdout.strip())
     return p.stdout.strip()
@@ -553,31 +595,43 @@ def _item_lines(it):
     return lines
 
 
-def review_card(items, now, gateway=None):
-    """``gateway`` (this host's hermes-hub name) goes in the title: each host reviews its own action store."""
-    script = '~/.hermes/plugins/user-steps/stale_watch.py'
+def review_card(items, now, gateway=None, remote=False):
+    """``gateway`` (this host's hermes-hub name) goes in the title: each host reviews its own action store.
+    ``remote`` (the hub, :func:`remote_home`): pool work declaring hub:write, no pin, its commands run through
+    hub-admin and fenced with the other hub paths; elsewhere a local card (placement='local')."""
     listing = '\n'.join(line for it in items for line in _item_lines(it)) or '- (none)'
+    withdraw = f'python3 {SCRIPT} --withdraw <id> --reason "<why>" --evidence "<card id / quote / date>"'
+    keep = f'python3 {SCRIPT} --reviewed <id> --reason "<why it is still a live ask>" --evidence "<what you checked>"'
+    if remote:
+        store = "the action store of the gateway that filed this card"
+        withdraw_step = "\n" + fence_evidence(f"hub-admin '{withdraw}'") + "\n"
+        keep_step = ":\n" + fence_evidence(f"hub-admin '{keep}'") + "\n"
+    else:
+        store = "action store on this host"
+        withdraw_step = f"\n   `{withdraw}`\n"
+        keep_step = f": `{keep}` "
     body = (f"User-steps requests still undecided more than 72 h after they were asked, not reviewed in the last "
-            f"7 days (action store on this host). The watcher withdrew and decided nothing.\n\n"
+            f"7 days ({store}). The watcher withdrew and decided nothing.\n\n"
             f"{fence_evidence(listing)}\n\n"
             f"For EACH request, read the owner chat and the cards above, then do exactly one:\n"
             f"1. Withdraw it only with evidence, one of: a linked or named card is done or archived and the ask was "
             f"about it; it was decided elsewhere (quote the user's words and where); its time window expired (say "
             f"when); it is a test fixture (say which); or it asks the user for agent work (then do that work or file "
-            f"a card for it first, and cite it).\n"
-            f"   `python3 {script} --withdraw <id> --reason \"<why>\" --evidence \"<card id / quote / date>\"`\n"
-            f"2. Otherwise keep it: `python3 {script} --reviewed <id> --reason \"<why it is still a live ask>\" "
-            f"--evidence \"<what you checked>\"` (hides it from this review for 7 days; it stays open for the user).\n"
+            f"a card for it first, and cite it).{withdraw_step}"
+            f"2. Otherwise keep it{keep_step}(hides it from this review for 7 days; it stays open for the user).\n"
             f"These python3 commands automatically re-exec through the installed Hermes launcher if needed. "
             f"A 503 gateway-identity error is an agent runtime problem: repair the launcher/runtime and retry; "
             f"do not record a kept review because of that error. "
             f"Never decide a request for the user. Withdrawal is refused for recorded decisions and card-bound "
             f"requests. A chat that is on another gateway, unknown or unreadable is not evidence: keep those.\n"
             f"Source: plugins/user-steps/stale_watch.py (old-ask review).\n\n{home_pin_note(_PIN)}")
+    if remote:
+        body = remote_body(body)
     where = f' ({gateway})' if gateway else ''
     return {'title': f'user-steps{where}: review {len(items)} undecided request(s) older than 72 h', 'body': body,
             'idempotency_key': REVIEW_KEY + _pt(now, '%Y-%m-%d'), 'assignee': 'default',
-            'placement': 'local', 'requires': list(REVIEW_REQUIRES), 'gateway': gateway}
+            'placement': 'auto' if remote else 'local',
+            'requires': list(REVIEW_REQUIRES) + (['hub:write'] if remote else []), 'gateway': gateway}
 
 
 # Any host's review card, with or without the gateway in its title (older hosts omit it).
@@ -628,7 +682,7 @@ def review_old_asks(core, store, now=None, create=None, *, local_gateway=None, o
     for it in items:
         it['chat'] = chat_facts(core, it['owner'], local_gateway=local_gateway, owner_db=owner_db)
         it['cards'], it['problems'] = linked_cards(core, it['request'], it['owner'], boards)
-    create(review_card(items, now, gateway=_self_gateway()))  # idempotent on the daily key
+    create(review_card(items, now, gateway=_self_gateway(), remote=remote_home()))  # idempotent on the daily key
     return [it['requestId'] for it in items]
 
 
