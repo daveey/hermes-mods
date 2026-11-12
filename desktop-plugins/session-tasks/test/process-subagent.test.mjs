@@ -27,20 +27,25 @@ const render = (chips, now) => {
 }
 const sourceRecords = () => JSON.parse(execFileSync(process.env.PYTHON || 'python3', ['-c', `
 import json
-from hermes_cli.turn_process_execution_observations import process, subagent
+from hermes_cli.turn_process_execution_observations import process, registry_subagent
 class Child:
+    session_id = \"child-session-a\"
+    _parent_session_id = \"owner\"
     def get_activity_summary(self): return {"last_activity_ts": 1000}
 p = process({"id":"proc-a", "pid":71, "host_start_time":81, "observed_at":1000, "source":"process.registry"}, gateway="edge", profile="work", session="owner", now=1001)
-s = subagent({"subagent_id":"child-a", "delegation_id":"batch-a", "owner_agent_session_id":"owner", "started_at":900, "status":"running", "agent":Child()}, gateway="edge", profile="work", now=1001)
+s = registry_subagent({"subagent_id":"child-a", "delegation_id":"batch-a", "owner_agent_session_id":"owner", "started_at":900, "status":"running", "agent":Child()}, gateway="edge", profile="work", now=1001)
 print(json.dumps([p,s]))
 `], { cwd: process.env.HERMES_CORE_SOURCE, encoding: 'utf8' }))
 
 test('real process/subagent adapter records survive RPC chips, both consumers and rendered expiry without a fetch', { skip }, () => {
   const [p, s] = sourceRecords()
   const procs = tasks.processChips([{ session_id: 'proc-a', status: 'running', command: 'test command', execution_observations: [p] }])
-  const subs = tasks.subagentChips([{ subagent_id: 'child-a', delegation_id: 'batch-a', started_at: 900, status: 'running', goal: 'test child', tool_count: 90, execution_observations: [s] }])
+  const subs = tasks.subagentChips([{ subagent_id: 'child-a', child_session_id: 'child-session-a', delegation_id: 'batch-a', started_at: 900, status: 'running', goal: 'test child', tool_count: 90, execution_observations: [s] }])
   assert.strictEqual(procs[0].observations[0], p)
   assert.strictEqual(subs[0].observations[0], s)
+  // The registry id is never the canonical identity: without the child session id the record cannot be adopted.
+  const legacy = tasks.subagentChips([{ subagent_id: 'child-a', started_at: 900, status: 'running', goal: 'old core', execution_observations: [s] }])
+  for (const m of [tasks, panel]) assert.equal(m.chipObservation(legacy[0], 1001).state, 'unknown')
   const chips = [...procs, ...subs]
   for (const m of [tasks, panel]) for (const chip of chips) {
     assert.equal(m.chipObservation(chip, 1001).state, 'running')
