@@ -40,8 +40,10 @@ class T(unittest.TestCase):
 
     def test_tool_result_on_login_page_focuses_and_notes_once(self):
         out = '{"output": "https://accounts.google.com/v3/signin/identifier?q | Sign in"}'
-        with mock.patch.object(bf, "focus", return_value={"focused": True, "tab": {"title": "Sign in"}}) as f:
+        with mock.patch.object(bf, "focus", return_value={"focused": True, "visible_to_user": True,
+                                                          "tab": {"title": "Sign in"}}) as f:
             r = bf.transform_tool_result("browser_exec", {}, out, session_id="s")
+            self.assertIn("is now in front", r)
             self.assertIn("[browser-focus]", r)
             f.assert_called_once_with("accounts.google.com", require_login=True)
             self.assertIsNone(bf.transform_tool_result("browser_exec", {}, out, session_id="s"))  # throttled
@@ -56,7 +58,7 @@ class T(unittest.TestCase):
     def test_reply_asking_user_in_chrome_focuses_only_after_browser_use(self):
         text = "Please sign in to Google in the Chrome window, then say done."
         tab = {"title": "Sign in - Google Accounts", "url": "https://accounts.google.com/v3/signin/identifier"}
-        with mock.patch.object(bf, "focus", return_value={"focused": True, "tab": tab}) as f:
+        with mock.patch.object(bf, "focus", return_value={"focused": True, "visible_to_user": True, "tab": tab}) as f:
             self.assertIsNone(bf.transform_llm_output(text, session_id="s"))  # session never used the browser
             bf.transform_tool_result("browser_exec", {}, "ok", session_id="s")
             r = bf.transform_llm_output(text, session_id="s")
@@ -280,6 +282,60 @@ class T(unittest.TestCase):
             miss = bf.focus("nothere.example")
             self.assertFalse(miss["focused"])
             self.assertEqual(len([c for c in calls if "activate" in c]), 1)
+
+    # agent-c8dc1f22d4 (2026-11-11): on the hub the agent Chrome lives on an Xvfb display; CDP switched the tab but
+    # no window reached David's screen, and the reply still said "I've brought the Chrome window to the front".
+    def _hub_focus(self):
+        hub_tabs = [{"id": "cf", "type": "page", "title": "Sign in - Cloudflare Access",
+                     "url": "https://x.cloudflareaccess.com/cdn-cgi/access/login/y"}]
+        with mock.patch.object(bf, "_quiet", return_value=False), \
+                mock.patch.object(bf, "agent_chromes", return_value=[(693608, 9333)]), \
+                mock.patch.object(bf, "remote_cdp", return_value="http://127.0.0.1:9333"), \
+                mock.patch.object(bf, "_chrome_agent", return_value=False), \
+                mock.patch.object(bf, "_chrome_agent_cli", return_value=None), \
+                mock.patch.object(bf, "_get",
+                                  side_effect=lambda u, timeout=3: hub_tabs if u.endswith("/json/list") else "ok"), \
+                mock.patch.object(bf, "activate_app", return_value=False):
+            return bf.focus("cloudflareaccess", require_login=True)
+
+    def test_virtual_display_tab_switch_is_not_visible_to_user(self):
+        r = self._hub_focus()
+        self.assertTrue(r["focused"])
+        self.assertFalse(r["visible_to_user"])
+
+    def test_reply_never_claims_front_when_not_visible(self):
+        text = "Ask Eve admin sign-in: the sign-in page is open in Chrome. Sign in once with Cloudflare."
+        res = {"focused": True, "visible_to_user": False, "shown_on_main_display": False,
+               "tab": {"title": "Sign in - Cloudflare Access",
+                       "url": "https://x.cloudflareaccess.com/cdn-cgi/access/login/y"}}
+        with mock.patch.object(bf, "focus", return_value=res):
+            bf.transform_tool_result("browser_exec", {}, "ok", session_id="hub")
+            self.assertIsNone(bf.transform_llm_output(text, session_id="hub"))
+
+    def test_tool_result_says_not_visible_instead_of_in_front(self):
+        out = '{"output": "https://x.cloudflareaccess.com/cdn-cgi/access/login/y | Sign in"}'
+        res = {"focused": True, "visible_to_user": False, "tab": {"title": "Sign in - Cloudflare Access"}}
+        with mock.patch.object(bf, "focus", return_value=res):
+            r = bf.transform_tool_result("browser_exec", {}, out, session_id="hub2")
+        self.assertNotIn("is now in front", r)
+        self.assertIn("can't see", r)
+
+    def test_tool_handle_explains_not_visible(self):
+        res = {"focused": True, "visible_to_user": False, "tab": {"title": "t", "url": "u"}}
+        with mock.patch.object(bf, "focus", return_value=res):
+            out = bf.json.loads(bf.handle({"match": "x"}, session_id="h"))
+        self.assertIn("not in front of the user", out["note"])
+
+    def test_visible_rules(self):
+        with mock.patch.object(bf, "_chrome_agent_cli", return_value=None):
+            self.assertTrue(bf._visible(101, False, True, "http://127.0.0.1:9333"))    # Mac Chrome raised
+            self.assertFalse(bf._visible(101, False, False, "http://127.0.0.1:9333"))  # Linux: no window raised
+        with mock.patch.object(bf, "_chrome_agent_cli", return_value="/x/cli"):
+            self.assertFalse(bf._visible(101, False, True, "http://127.0.0.1:9333"))   # still on virtual display
+            self.assertTrue(bf._visible(101, True, True, "http://127.0.0.1:9333"))
+        self.assertTrue(bf._visible(0, False, False, "http://mac:9333"))      # another machine's Chrome
+        self.assertFalse(bf._visible(0, False, False, "http://127.0.0.1:9333"))
+        self.assertFalse(bf._visible(0, False, False, "http://localhost:9333"))
 
 
 if __name__ == "__main__":

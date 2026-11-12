@@ -278,7 +278,29 @@ def focus(match: str | None = None, require_login: bool = False, kinds: tuple[st
     if shown and tab and port and _LOGIN_URL.search(str(tab.get("url", ""))):
         _watch_login(port, tab["id"])
     return {"focused": bool(app or tab), "app_activated": app, "pid": pid, "shown_on_main_display": shown,
+            "visible_to_user": bool(app or tab) and _visible(pid, shown, app, base),
             "tab": {"title": tab.get("title"), "url": str(tab.get("url", ""))[:200]} if tab else None}
+
+
+_LOOPBACK = ("127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0")
+
+
+def _visible(pid: int, shown: bool, app: bool, base: str) -> bool:
+    """Whether the raise put the window on a screen the user is looking at, not just switched a tab over CDP.
+    - local Chrome: an app window was activated (macOS) and, when the invisible-chrome-agent supervisor exists, it
+      was un-hidden from the virtual display. A Linux gateway (hub) has neither: its Chrome sits on Xvfb.
+    - no local process (pid 0): visible only when the CDP endpoint is another machine (a Mac Chrome the hub drives);
+      a loopback endpoint is this host's own headless/virtual-display Chrome (agent-c8dc1f22d4)."""
+    if pid:
+        return bool(app) and (bool(shown) or not _chrome_agent_cli())
+    host = re.sub(r"^https?://", "", base or "").rsplit(":", 1)[0].lower()
+    return bool(host) and host not in _LOOPBACK
+
+
+NOT_VISIBLE = ("the agent Chrome is not in front of the user: it runs on a display they can't see (a virtual "
+               "display or another host); only the tab was switched. Never say it is in front or open on their "
+               "screen. Give them a way to reach it (a live view/tunnel to that Chrome, or the URL to open in "
+               "their own browser) and say which.")
 
 
 def _throttled(key: str) -> bool:
@@ -338,6 +360,8 @@ def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = N
     if not res.get("focused"):
         return None
     _remember(session_id, res)
+    if not res.get("visible_to_user"):
+        return result + f"\n\n[browser-focus] The user can't see this page: {NOT_VISIBLE}"
     return result + NOTE.format(title=(res.get("tab") or {}).get("title") or "?")
 
 
@@ -371,6 +395,8 @@ def transform_llm_output(response_text: str = "", session_id: str = "", **_):
     tab = res.get("tab") if res.get("focused") else None
     if not tab:
         return None   # the page the reply asks about isn't open: never claim it is in front
+    if not res.get("visible_to_user"):
+        return None   # only a tab switched on a screen the user can't see: never claim it is in front
     title = str(tab.get("title") or tab.get("url") or "").strip()[:80]
     return response_text.rstrip() + f"\n\n_I've brought the Chrome window to the front for you, on \"{title}\"._"
 
@@ -438,7 +464,8 @@ SCHEMA = {
                     "hunt for the window. `match` picks the tab by URL/title substring; a match that hits no tab "
                     "raises nothing and returns focused=false with `open_tabs` (open the page first). Without "
                     "`match`: a sign-in tab, else the most recent tab. Tell the user it is in front only when the "
-                    "returned `tab` is the page you are asking them to use."),
+                    "returned `tab` is the page you are asking them to use AND `visible_to_user` is true; when it "
+                    "is false the Chrome is on a display they can't see (follow `note`)."),
     "parameters": {"type": "object", "properties": {
         "match": {"type": "string", "description": "Substring of the tab URL or title to show (optional)."},
         "hide": {"type": "boolean", "description": ("true = the user is finished: send a hidden (virtual-display) "
@@ -454,6 +481,8 @@ def handle(args: dict, session_id: str = "", **_) -> str:
             return json.dumps(hide())
         res = focus(args.get("match") or None)
         _remember(session_id, res)
+        if res.get("focused") and not res.get("visible_to_user"):
+            res["note"] = NOT_VISIBLE
         return json.dumps(res)
     except Exception as e:
         return json.dumps({"focused": False, "error": f"{type(e).__name__}: {e}"})
