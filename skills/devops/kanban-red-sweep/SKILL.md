@@ -38,6 +38,7 @@ credentials or enable a transport to evade an approval. Missing configuration an
 readers print `unreachable ...`; neither means zero cards. Replicas can lag and do not prove
 owner reachability. Check the roster against configured readers each sweep; an omitted gateway
 is a coverage gap. A live local non-red row takes precedence over its stale replica.
+For managed workers, check the monitor host's already-authorized instance-role SSM route before leaving a placeholder unreachable reader. Discover running instances by exact configured identity, require a unique match, and use GetCommandInvocation (ListCommandInvocations may be intentionally denied). A bounded read-only snapshot can ship a reviewed pinned collector when the worker's installed CLI is older. Keep the whole reader below the inventory caller timeout, bound delivery/execution too, compress stdout to stay within SSM's response cap, and fail closed on truncated output. Never grant new IAM access or restart a worker to make inventory green. Record gateway-local blocked-event IDs: replica event IDs are not owner event IDs.
 
 Classify decision-session items alongside cards. Re-test stale `us_*` premises and withdraw
 through the supported user-steps/action_request withdrawal route; never edit `state.db`.
