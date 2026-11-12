@@ -510,6 +510,141 @@ def machine_signal(final_reply: str, tool_log=None) -> Optional[dict]:
     return {**v, "fingerprint": fingerprint(v["component"], v["symptom"]), "source": "signal"}
 
 
+# Lifecycle-guard false refusals. Core's terminal guard (`tools/terminal_tool_guards.py`) and cron-create guard
+# (`cron/lifecycle_guard.py` check_gateway_lifecycle) fail CLOSED when a script the command executes cannot be scanned
+# (live SQLite, oversized, walk budget, cloud path, device...) and say so in a refusal that names the reason. The text
+# found no lifecycle command: such a refusal blocks work that is not known to be dangerous. A TRUE lifecycle refusal
+# ("cannot restart, stop, or uninstall the gateway" / "cron job contains a gateway lifecycle command") never matches.
+# 22 of them in one MacBook chat went unnoticed until a person counted by hand: each agent rewrote its command.
+GUARD_TOOLS = ("terminal", "cronjob_manage", "cronjob")  # cronjob_manage = core registry name; cronjob = legacy
+GUARD_REFUSAL_HEADS = {
+    "Blocked: the lifecycle guard could not scan this command or referenced script: ": "command",  # terminal
+    "Blocked: the lifecycle guard could not scan this cron job or referenced script: ": "cron job",  # cron create
+}
+GUARD_REFUSAL_TAIL_RE = re.compile(r"\.\s+Nothing in the (?:command|job) is known to contain a gateway lifecycle command")
+GUARD_REFUSAL_MARK = "the lifecycle guard could not scan this"  # the hook's cheap pre-check only
+GUARD_FP_PREFIX = "lifecycleguard-"
+GUARD_SCAN_CAP = 1 << 20  # core _MAX_REFERENCED_SCRIPT_BYTES: a file above it is oversized by itself
+GUARD_DEDUPE_S = 600  # one (session, command, shape) refused again within this long is one occurrence (#113944 loops)
+_GUARD_PATH_RE = re.compile(r"`([^`]+)`")
+_GUARD_BUDGET_RE = re.compile(r"scan budget was exhausted \(([a-z ]+?) at depth")
+
+
+def _guard_error(tool_name: str, result) -> Optional[str]:
+    """The refusal text when `result` IS the guard's own refusal, else None. Anchored to the producing envelope so a
+    tool that merely quotes the refusal (read_file of a test, kanban_show of a card, pytest output, a log grep) never
+    counts: terminal = core `_blocked_json` ({"output": "", "exit_code": 1, "error": <refusal>, ...}); cron create =
+    `tool_error(str(e))` ({"error": <refusal>, "success": false})."""
+    if tool_name not in GUARD_TOOLS:
+        return None
+    obj = result
+    if isinstance(result, str):
+        try:
+            obj = json.loads(result)
+        except ValueError:
+            return None
+    if not isinstance(obj, dict) or not isinstance(obj.get("error"), str):
+        return None
+    if tool_name == "terminal" and (obj.get("exit_code") != 1 or obj.get("output") not in ("", None)):
+        return None
+    err = obj["error"]
+    return err if any(err.startswith(h) for h in GUARD_REFUSAL_HEADS) else None
+
+
+def _oversized_kind(path: Optional[str]) -> str:
+    """`file` when the named file alone exceeds the scan cap, `walk` when it fit the cap but not the walk's remaining
+    bytes (one message, two causes, two fixes), `local` when it cannot be stat'ed here."""
+    try:
+        size = os.stat(os.path.expanduser(path)).st_size if path else None
+    except OSError:
+        size = None
+    return "local" if size is None else "file" if size > GUARD_SCAN_CAP else "walk"
+
+
+def guard_refusal_shape(reason: str, path_kind: Optional[str] = None) -> str:
+    """Reason class + subkind of a fail-closed refusal: sqlite | oversized/<file|walk|local|remote> |
+    budget/<text|paths|remote reads> | depth | other/<cloud|nonregular|unreadable|unknown>. The path is evidence, never
+    part of the shape (`path_kind` = _oversized_kind of it, read on the host that was refused)."""
+    r = reason or ""
+    if "is a SQLite database open" in r:
+        return "sqlite"
+    if "read from the backend exceeds the scan cap" in r:
+        return "oversized/remote"
+    if "larger than the scan cap" in r or "exceeds the scan cap" in r:
+        return "oversized/" + (path_kind or "local")
+    m = _GUARD_BUDGET_RE.search(r)
+    if m or "scan budget was exhausted" in r:
+        return "budget/" + (m.group(1).strip() if m else "unknown")
+    if "scan depth limit was reached" in r:  # core names the depth cap once its owner card lands (see the README)
+        return "depth"
+    if "cloud-synced" in r:
+        return "other/cloud"
+    if "is not a regular file" in r:
+        return "other/nonregular"
+    if "could not be read" in r:
+        return "other/unreadable"
+    return "other/unknown"
+
+
+def guard_occurrence_new(store, session_id: str, command: str, shape: str, now: Optional[float] = None) -> bool:
+    """False when this (session, command, shape) was refused within GUARD_DEDUPE_S: an agent retrying the same refused
+    command is one occurrence, not one card comment (and one hub forward) per retry. Fail-open (True)."""
+    now = time.time() if now is None else now
+    key = hashlib.sha1(f"{session_id}\0{command}\0{shape}".encode()).hexdigest()[:20]
+    path = Path(store.root) / "guard_refusals.json"
+    try:
+        seen = json.loads(path.read_text())
+    except Exception:
+        seen = {}
+    if not isinstance(seen, dict):
+        seen = {}
+    seen = {k: t for k, t in seen.items() if isinstance(t, (int, float)) and now - t < GUARD_DEDUPE_S}
+    fresh = key not in seen
+    seen[key] = now
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(seen))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return fresh
+
+
+def guard_refusal_signal(tool_name: str, args=None, result=None) -> Optional[dict]:
+    """A lifecycle-guard fail-closed refusal of a command whose scanned text held no lifecycle command, as a self-heal
+    hit (one fingerprint per shape, every occurrence reaches the lane), else None."""
+    err = _guard_error(tool_name, result)
+    if not err:
+        return None
+    head = next(h for h in GUARD_REFUSAL_HEADS if err.startswith(h))
+    where, rest = GUARD_REFUSAL_HEADS[head], err[len(head):]
+    tail = GUARD_REFUSAL_TAIL_RE.search(rest)
+    reason = " ".join((rest[:tail.start()] if tail else rest).split())
+    path = _GUARD_PATH_RE.search(reason)
+    oversized = "scan cap" in reason and "read from the backend" not in reason
+    shape = guard_refusal_shape(reason, _oversized_kind(path.group(1)) if path and oversized else None)
+    a = args if isinstance(args, dict) else {}
+    cmd = str(a.get("command") or a.get("script") or a.get("prompt") or "")
+    suffix = Path(path.group(1)).suffix.lower() if path else ""
+    refusal = " ".join(err.split())
+    details = (f"tool {tool_name or '?'} ({where}) refused: {refusal[:600]}\n"
+               f"shape {shape}; path {path.group(1) if path else 'none named'} (suffix {suffix or 'none'})\n"
+               f"command: {cmd[:600]}\n"
+               "The guard failed closed: it could not scan a file it thinks the command executes, and nothing it did "
+               "scan holds a lifecycle command. Source: core cron/lifecycle_guard.py `_unreadable_reason` / "
+               "`_budget_exhausted` / `_refuse_unreadable`, caller tools/terminal_tool_guards.py (terminal) or "
+               "check_gateway_lifecycle (cron create). Reproduce under the core interpreter with "
+               "`from cron.lifecycle_guard import scan_gateway_lifecycle; scan_gateway_lifecycle(<command>, cwd=<cwd>)`. "
+               "Decide whether the file is really executed (a false refusal: fix the reference walk) or the cap is "
+               "too tight; add a core regression test for this shape.")
+    sym = f"lifecycle guard fail-closed refusal ({shape})"
+    return {"p_defect": 0.9, "kind": "guard_refusal", "component": "gateway", "symptom": sym,
+            "fingerprint": GUARD_FP_PREFIX + hashlib.sha1(shape.encode()).hexdigest()[:12], "source": "signal",
+            "shape": shape, "tool": tool_name, "evidence": f"{tool_name or 'tool'}: {reason[:240]}",
+            "details": details, "every_occurrence": True, "comment_open_card": True}
+
+
 _TOOL_CALL_RE = re.compile(r"^\s*->\s*([\w.:-]+)\(")
 _ERR_NORM = [
     (re.compile(r"\bt_[0-9a-f]{6,}\b", re.I), " "),  # card ids
@@ -1449,7 +1584,9 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
         q = Path(store.root) / "selfheal_queue.jsonl"
         with open(q, "a") as fh:
             fh.write(json.dumps({**rec, "ts": time.time()}) + "\n")
-    if new and m in ("shadow", "live"):
+    # `every_occurrence` (lifecycle-guard refusals): each occurrence reaches the lane, which comments it on the open
+    # card or refiles once that card closed; the per-day fingerprint gate would drop every repeat before it got there.
+    if (new or hit.get("every_occurrence")) and m in ("shadow", "live"):
         d = {**hit, "session_id": session_id, "quote": (evidence or "")[:500], "host": host_name(),
              "platform": platform, "at": time.time(), "kind": hit.get("kind") or hit["source"]}
         try:
@@ -3092,7 +3229,9 @@ def decide(d: dict, st: dict, now: float, cfg: Optional[dict] = None) -> dict:
         return {"action": "skip", "why": "suppressed (Never)"}
     if (st.get("snooze_until") or 0) > now:
         return {"action": "skip", "why": f"snoozed until {_iso(st['snooze_until'])} (Not now)"}
-    if st.get("filed_day") == _utc_day(now) and status != "fixed":  # a post-fix recurrence is not a duplicate
+    # Its card ended without a fix (stale) or the fix was declined/reverted: a new card, the same UTC day too.
+    refile_closed = bool(d.get("every_occurrence")) and status in ("stale", "declined", "reverted")
+    if st.get("filed_day") == _utc_day(now) and status != "fixed" and not refile_closed:  # post-fix: not a duplicate
         return {"action": "skip", "why": "already filed today (<= 1 per fingerprint per UTC day)"}
     if status in ("filed", "proposed", "approved"):
         return {"action": "skip", "why": f"open: {status} {st.get('fix_card') or st.get('card') or ''}".strip()}
@@ -4043,6 +4182,10 @@ def _complaint_identity(d: dict) -> dict:
     fallback, so one re-file text shared by several fingerprints never merges their lanes (t_01a1cfc408527b07).
     An explicit `complaint_at` copied from the original filing still counts.
     """
+    if d.get("every_occurrence"):
+        # A machine signal counted per occurrence (lifecycle-guard refusals): one session can hit several shapes, each
+        # its own defect. It names no user turn, so it neither adopts nor lends a complaint-turn owner.
+        return {"complaint_at": None, "complaint_quote_hash": None}
     if d.get("filed_by"):
         quote, at = "", d.get("complaint_at")
     else:
@@ -4245,7 +4388,9 @@ def _corruption_comment(d: dict, st: dict, store, runner=None) -> dict:
 
 
 def _open_card_comment(d: dict, st: dict, store, runner=None) -> dict:
-    """A signal flagged ``comment_open_card`` (one occurrence of a defect whose card is open): add it there."""
+    """A signal flagged ``comment_open_card`` (one occurrence of a defect whose card is open): add it there.
+    `proposed` (the investigation finished, its fix card not filed yet; <= one 5-minute sync) still targets the done
+    investigation card, which links the fix card once sync files it: an accepted gap, the occurrence stays on record."""
     card = (st.get("card") if st.get("status") in ("filed", "proposed") else st.get("fix_card")) or st.get("card")
     if not card:
         return {"action": "skip", "why": "no open card"}
@@ -4354,6 +4499,15 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
             return adopted
     if st.get("status") == "fixed" and "fix_shas" not in st:  # fixed before fix_shas was stored: its note has them
         st = lane.update(fp, fix_shas=_logged_fix_shas(store, fp))
+    if d.get("every_occurrence") and m == "live" and hub and st.get("status") == "filed":
+        # Each occurrence comments on the open card; once that card is done/archived it opens a fresh one. Read the
+        # investigation card now instead of waiting for the 5-minute sync, so an occurrence never comments on a closed
+        # card. `filed` only: an approved owner's receipt recovery takes the admission lock this pass already holds.
+        try:
+            if _reconcile_fp(lane, store, fp, st, runner, now, via="occurrence"):
+                st = lane.get(fp)
+        except Exception as exc:  # health: allow BLE001 -- advisory; sync's reconcile still runs every 5 minutes
+            store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": f"occurrence reconcile: {exc}"[:300]})
     dec = decide(d, st, now, cfg)
     if dec["action"] == "stale_runtime":
         return _file_backport(d, fp, st, dec, store, m, runner, now, cfg, budget_fn)
@@ -5386,45 +5540,50 @@ def reconcile(store=None, runner=None, now: Optional[float] = None) -> list:
     lane = LaneState(store.root)
     done = []
     for fp, st in lane.read().items():
-        status = st.get("status")
-        card = st.get("card") if status == "filed" else st.get("fix_card") if status == "approved" else None
-        if not card:
-            continue
-        ks = _lane_owner_lookup(lane, store, fp, st, card, runner, now)
-        if ks == "done" and status == "approved" and not st.get("verify_card"):
-            # Legacy/non-split and adopted owners can finish without ever knowing this fingerprint.
-            # Preserve the generation while a budgeted verifier obtains the receipt (including create failure).
-            verify = _recover_completion_receipt(fp, store, runner, now)
-            if not verify and lane.get(fp).get("status") == "not_defect":
-                done.append((fp, "withdrawn (synthetic_tag): no receipt verification"))
-                continue
-            done.append((fp, f"receipt verification -> {verify or 'pending admission'}"))
-            continue
-        if ks == "done" and status == "approved" and st.get("verify_card"):
-            # A split fix ends at its VERIFY child (it records fixed): judge that card, not the finished fix card.
-            card = st["verify_card"]
-            ks = card_status(card, st.get("board"), runner)
-        if ks not in ENDED:
-            continue
-        proposal = Path(store.root) / "selfheal" / fp / "proposal.md"
-        try:
-            p_mtime = proposal.stat().st_mtime if status == "filed" and ks == "done" else 0.0
-        except OSError:
-            p_mtime = 0.0
-        if p_mtime and p_mtime >= (st.get("filed_at") or 0):
-            # The investigation finished and wrote this generation's proposal, but its `event proposed` never reached
-            # this lane (plugin-129c2f2518: an exported scratch HERMES_HOME sent it to a temp lane that reported
-            # success). The proposal is the evidence: record it as proposed so sync() files the fix card.
-            lane.update(fp, status="proposed", proposed_at=p_mtime)
-            store.log({"event": "selfheal_proposed", "fingerprint": fp, "card": card, "via": "reconcile",
-                       "note": f"card {ks} without reporting; proposal.md found", "component": st.get("component")})
-            done.append((fp, f"proposed (card {card} {ks}, proposal.md found)"))
-            continue
-        lane.update(fp, status="stale", closed_at=now)
-        store.log({"event": "selfheal_stale", "fingerprint": fp, "card": card, "was": status, "kanban": ks,
-                   "component": st.get("component")})
-        done.append((fp, f"stale ({status}, card {card} {ks})"))
+        what = _reconcile_fp(lane, store, fp, st, runner, now)
+        if what:
+            done.append((fp, what))
     return done
+
+
+def _reconcile_fp(lane, store, fp: str, st: dict, runner, now: float, via: str = "") -> Optional[str]:
+    """reconcile() for one fingerprint; -> what changed, or None. ``via`` tags the stale event when an occurrence
+    (an ``every_occurrence`` signal in _file_defect) reconciled it ahead of the 5-minute sync."""
+    status = st.get("status")
+    card = st.get("card") if status == "filed" else st.get("fix_card") if status == "approved" else None
+    if not card:
+        return None
+    ks = _lane_owner_lookup(lane, store, fp, st, card, runner, now)
+    if ks == "done" and status == "approved" and not st.get("verify_card"):
+        # Legacy/non-split and adopted owners can finish without ever knowing this fingerprint.
+        # Preserve the generation while a budgeted verifier obtains the receipt (including create failure).
+        verify = _recover_completion_receipt(fp, store, runner, now)
+        if not verify and lane.get(fp).get("status") == "not_defect":
+            return "withdrawn (synthetic_tag): no receipt verification"
+        return f"receipt verification -> {verify or 'pending admission'}"
+    if ks == "done" and status == "approved" and st.get("verify_card"):
+        # A split fix ends at its VERIFY child (it records fixed): judge that card, not the finished fix card.
+        card = st["verify_card"]
+        ks = card_status(card, st.get("board"), runner)
+    if ks not in ENDED:
+        return None
+    proposal = Path(store.root) / "selfheal" / fp / "proposal.md"
+    try:
+        p_mtime = proposal.stat().st_mtime if status == "filed" and ks == "done" else 0.0
+    except OSError:
+        p_mtime = 0.0
+    if p_mtime and p_mtime >= (st.get("filed_at") or 0):
+        # The investigation finished and wrote this generation's proposal, but its `event proposed` never reached
+        # this lane (plugin-129c2f2518: an exported scratch HERMES_HOME sent it to a temp lane that reported
+        # success). The proposal is the evidence: record it as proposed so sync() files the fix card.
+        lane.update(fp, status="proposed", proposed_at=p_mtime)
+        store.log({"event": "selfheal_proposed", "fingerprint": fp, "card": card, "via": "reconcile",
+                   "note": f"card {ks} without reporting; proposal.md found", "component": st.get("component")})
+        return f"proposed (card {card} {ks}, proposal.md found)"
+    lane.update(fp, status="stale", closed_at=now)
+    store.log({"event": "selfheal_stale", "fingerprint": fp, "card": card, "was": status, "kanban": ks,
+               "component": st.get("component"), **({"via": via} if via else {})})
+    return f"stale ({status}, card {card} {ks})"
 
 
 # The retired step in cards filed before 921830b (proposals) / 4f1c2a6 (results): both templates wrote
