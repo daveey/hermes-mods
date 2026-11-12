@@ -63,12 +63,21 @@ test('a cached running card flips to unknown on the next existing tick with no r
   assert.match(el().querySelector('[data-status-summary]').textContent, /1 evidence unknown/)
 })
 
-test('an older producer (no records) keeps its legacy section and shows explicit unknown evidence', { skip }, async () => {
+test('an older producer (no records): a legacy running card is explicit unknown with last known state, never In progress', { skip }, async () => {
   bridges({ chips: [card('task-a', 'running')] })
   at(10)
   await show(React.createElement(m.Panel, { key: 'b' }))
-  assert.equal(el().querySelector('[data-section="in-progress"]').textContent, 'In progress · 1')
+  assert.equal(el().querySelector('[data-section="in-progress"]'), null)
+  assert.equal(el().querySelector('[data-section="waiting"]').textContent, 'Waiting · 1')
+  assert.match(el().querySelector('[data-panel-row]').textContent, /status unknown \(producer sent no observations\) · last known: running/)
   assert.match(el().querySelector('[data-evidence]').textContent, /^evidence: unknown \(producer sent no observations\) · progress unknown$/)
+  assert.match(el().querySelector('[data-status-summary]').textContent, /1 evidence unknown/)
+})
+
+test('an older producer keeps a legacy blocked ask in its own section', { skip }, async () => {
+  const sorted = m.classify([card('task-b', 'blocked', { look: 'needs-you' })], { nowMs: (BASE_AT + 10) * 1000, evidence: c => m.chipObservation(c, BASE_AT + 10) })
+  assert.equal(sorted.unasked.length, 1)
+  assert.equal(sorted.waiting.length, 0)
 })
 
 test('a missing SDK projector is explicit unknown on every row, and never changes legacy sections', async () => {

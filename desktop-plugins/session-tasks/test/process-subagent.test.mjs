@@ -113,3 +113,15 @@ test('shared golden records traverse actual task chips, panel classification and
     if ('state' in t.expected) assert.equal(rows[0].evidenceState, t.expected.state, t.id)
   }
 })
+
+test('an older producer\'s legacy running card chip renders unknown, without the running pulse; a parked wait keeps its look', () => {
+  const legacy = { key: 'kb:a', kind: 'kanban', id: 't_a', label: 'legacy card', state: 'running', title: 't_a · running', observations: null, since: 0 }
+  const strip = renderToStaticMarkup(React.createElement(tasks.Chip, { chip: legacy, now: 1001000 }))
+  assert.doesNotMatch(strip, /session-tasks-pulse/)
+  assert.match(strip, /producer sent no observations/)
+  assert.match(strip, /last known: running/)
+  const current = renderToStaticMarkup(React.createElement(tasks.Chip, { chip: { ...legacy, observations: [] }, now: 1001000 }))
+  assert.match(current, /session-tasks-pulse/, 'a current producer keeps its own (card) rendering')
+  const parked = renderToStaticMarkup(React.createElement(tasks.Chip, { chip: { ...legacy, state: 'blocked', look: 'needs-you' }, now: 1001000 }))
+  assert.doesNotMatch(parked, /producer sent no observations/)
+})
