@@ -46,6 +46,9 @@ hidden by the old high-water cursor. Never claim those recovered without separat
 Inventory actual generators on every requested host/board, including low-frequency ones. Dedupe counters are not
 Tried/Lessons/Watch memory; finite project namespaces and human-action asks are not recurring repair families.
 Validate each changed slice with an actual worker read and subsequent update, not merely a prompt or historic harvest.
+A pool worker's transcript lives on that worker (`hermes-worker-N` in the run's `worker_bound` claim_lock), not
+the hub: read it there (hub role + SSM) before calling a run prompt-only. Re-run `harvest` with every key prefix in
+the slice's `harvest-v2` source (some families have two); a different prefix set fails `harvest source changed`.
 For interruptible collectors, checkpoint each external delivery and reconcile its durable receipt before retrying;
 test late completions, interruption and concurrent writers rather than only uninterrupted sequential runs.
 
