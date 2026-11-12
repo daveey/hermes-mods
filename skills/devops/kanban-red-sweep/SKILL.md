@@ -25,7 +25,25 @@ board, unblock what an agent can, and only then ask the user about the rest, in 
 The user's standing order for this skill: do not ask before sweeping. Clear first, decide what you can
 reasonably guess for him, and ask only about what you are really unsure of.
 
-## 1. Inventory (every board, read-only)
+## 1. Inventory (every gateway, board and decision chat, read-only)
+
+Run `scripts/red_cards.py list`. It includes local boards, Board `kanban/sync-shadow/*.db`
+replicas (the cross_task read source; explicitly not live owner authority), and unarchived
+`state.db` decision sessions with their open items, including non-card `us_*` asks.
+Configure the monitor host's private `state/red-sweep-sources.json` as a gateway-name mapping
+of `{"argv": ["approved-reader", "..."]}`. Each authorized unattended reader must return
+`red_cards.py list --local-json` from that gateway. Discover the full gateway roster before
+configuring it; include offline gateways, not only currently reachable ones. Never add SSH
+credentials or enable a transport to evade an approval. Missing configuration and failed
+readers print `unreachable ...`; neither means zero cards. Replicas can lag and do not prove
+owner reachability. Check the roster against configured readers each sweep; an omitted gateway
+is a coverage gap. A live local non-red row takes precedence over its stale replica.
+
+Classify decision-session items alongside cards. Re-test stale `us_*` premises and withdraw
+through the supported user-steps/action_request withdrawal route; never edit `state.db`.
+Operate remote cards on their owner gateway with supported tools/courier. Cross_task reads
+and (where live owner transport permits) comments; it does not unblock cards. Headless workers
+must route missing host access to a capability owner rather than shelling around tool fences.
 
 Boards: `$HERMES_HOME/kanban.db` plus `$HERMES_HOME/kanban/boards/*/kanban.db`.
 
@@ -166,8 +184,11 @@ sign-in steps and protected-file Allows are never guessed. A rejected guard is n
 
 ## 6. Unattended runs (cron `kanban-red-sweep`, hub, every 30 min)
 
-The cron's monitor is `red_cards.py list`: the agent wakes only when the set of red cards (or a card's blocked
-event) changed, so cards that keep waiting on the user cost nothing. Cron `monitor`/`script` paths must be
+The cron's monitor is `red_cards.py list`: the agent wakes when fleet cards, blocked events,
+decision-session open items or explicit coverage failures change. Its output is sorted and excludes
+read timestamps, so unchanged asks cost nothing. The same inventory and classifications apply to
+interactive and unattended runs. Before accepting a monitor deployment, run its actual wrapper and
+verify a remote card and a decision session appear; fixture tests alone are not deployment proof. Cron `monitor`/`script` paths must be
 a bare filename under `~/.hermes/scripts/`, so the job points at the thin wrapper `kanban_red_monitor.py`
 there, which execs the skill script.
 
