@@ -43,7 +43,7 @@ log = logging.getLogger("session-outcome")
 
 TOOL = "session_outcome"
 TOOLSET = "session_outcome"
-INTERACTIVE = frozenset({"desktop", "tui", "cli"})
+INTERACTIVE = frozenset({"desktop", "local", "tui", "cli"})
 WAIT_KINDS = ("card", "process", "cron", "time", "capacity", "subagent")
 JUDGE_BUDGET_S = 6.0  # thinking off, a standard-tier reason-then-verdict call measured 1.4-3.6 s on the hub
 # The gate runs inside a busy Desktop serve process (a 30 s pre_final_gate limit, reply already buffered), where the
@@ -152,10 +152,16 @@ def _row_source(session_id: str) -> str:
 def _interactive(platform: str = "", session_id: str = "") -> bool:
     if os.environ.get("HERMES_SESSION_OUTCOME_OFF") or os.environ.get("HERMES_KANBAN_TASK"):
         return False
-    if (platform or "").lower() == "subagent":
+    transport = platform or os.environ.get("HERMES_PLATFORM", "") or _session_env("HERMES_SESSION_PLATFORM")
+    if transport.strip().lower() == "subagent":
         return False
     row = _row_source(session_id)
-    return (row or _surface(platform)) in INTERACTIVE
+    # Native Desktop Local chats persist source=local. Only a stored row establishes
+    # that identity: the bare local transport also carries headless/unidentified runs.
+    if row:
+        return row in INTERACTIVE
+    surface = _surface(platform)
+    return surface != "local" and surface in INTERACTIVE
 
 
 def check_fn() -> bool:

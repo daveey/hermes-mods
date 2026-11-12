@@ -65,6 +65,84 @@ def real(tmp_path, monkeypatch):
     so._reset_hooks_for_tests()
 
 
+@pytest.mark.parametrize("source,allowed", [
+    ("local", True), ("desktop", True), ("tui", True), ("cli", True),
+    ("cron", False), ("kanban", False), ("subagent", False),
+    ("oneshot", False), ("slack", False), ("unknown", False),
+])
+def test_bound_local_transport_catalog_and_dispatch(real, tmp_path, source, allowed):
+    """Real session row + ContextVars + registry + writer; not a mocked source predicate."""
+    import contextvars
+    import json
+    from hermes_state import SessionDB
+    from gateway.session_context import set_session_vars
+    from tools.registry import ToolRegistry
+
+    so, plugin = real
+    sid = "local-" + "b" * 64
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(sid, source=source)
+        db.append_message(sid, role="user", content="Check the build")
+    finally:
+        db.close()
+    registry = ToolRegistry()
+    plugin.register(type("Ctx", (), {
+        "register_tool": lambda self, **kw: registry.register(**kw),
+        "register_hook": lambda *a: None,
+    })())
+    plugin._llm = lambda *a: "NO"
+
+    def run():
+        set_session_vars(platform="local", source="", session_id=sid)
+        assert plugin._row_source(sid) == source
+        definitions = registry.get_definitions({plugin.TOOL})
+        assert [d["function"]["name"] for d in definitions] == ([plugin.TOOL] if allowed else [])
+        held = plugin.pre_final_gate(session_id=sid, platform="local", final_response="Checking.")
+        assert bool(held and held.get("hold")) is allowed
+        raw = registry.dispatch(plugin.TOOL, {"kind": "done", "summary": SUMMARY}, session_id=sid)
+        assert isinstance(raw, str)
+        result = json.loads(raw)
+        assert result["ok"] is allowed, result
+        if allowed:
+            assert result["declared"]
+            assert so.get_outcome(sid)["summary"] == SUMMARY
+        else:
+            assert so.get_outcome(sid) is None
+    contextvars.copy_context().run(run)
+
+
+def test_native_local_exclusions(real, tmp_path, monkeypatch):
+    import contextvars
+    import json
+    from hermes_state import SessionDB
+    from gateway.session_context import set_session_vars
+
+    so, plugin = real
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("native", source="local")
+    finally:
+        db.close()
+
+    def run():
+        set_session_vars(platform="local", session_id="native")
+        for flag in ("HERMES_KANBAN_TASK", "HERMES_SESSION_OUTCOME_OFF"):
+            with monkeypatch.context() as m:
+                m.setenv(flag, "1")
+                assert not plugin.check_fn()
+                assert not json.loads(plugin.handle({"kind": "done", "summary": SUMMARY}, session_id="native"))["ok"]
+                assert plugin.pre_final_gate(session_id="native", platform="local", final_response="Checking.") is None
+        set_session_vars(platform="subagent", source="local", session_id="native")
+        assert not plugin.check_fn()
+        assert not json.loads(plugin.handle({"kind": "done", "summary": SUMMARY}, session_id="native"))["ok"]
+        assert plugin.pre_final_gate(session_id="native", platform="subagent", final_response="Checking.") is None
+        set_session_vars(platform="local", source="", session_id="missing")
+        assert not plugin.check_fn()  # transport alone is not evidence of an interactive chat
+        assert so.get_outcome("native") is None
+    contextvars.copy_context().run(run)
+
+
 def gate(plugin, reply, msgs=None, attempt=0):
     return plugin.pre_final_gate(session_id="chat", platform="desktop", final_response=reply,
                                  turn_messages=msgs or [], attempt=attempt, hold_budget=2)

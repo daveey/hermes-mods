@@ -27,8 +27,14 @@ not claimed by this plugin section.
 
 ## Behavior
 
-- **Tool `session_outcome`.** It is offered only in desktop, tui and cli chats (a no-cache `check_fn`; the handler
-  also refuses other session sources), and only when core has `hermes_state_outcome`.
+- **Tool `session_outcome`.** It is offered only in desktop (including native Local chats whose stored source
+  is `local`), tui and cli chats (a no-cache `check_fn`; the handler also refuses other session sources),
+  and only when core has `hermes_state_outcome`. A bare `local` transport with no session row is not enough.
+  Worker/off-switch and subagent exclusions take precedence over a stored interactive source.
+  `tests/test_real_core.py::test_bound_local_transport_catalog_and_dispatch` exercises real stored sources,
+  gateway ContextVars, registry catalog/dispatch, the gate and durable outcome readback;
+  `test_native_local_exclusions` checks workers, the off-switch, subagents and unidentified local transport.
+  These are isolated runtime integration tests, not live Desktop deployment proof.
   - `{"kind": "done", "summary": "..."}` declares completion. On a core with cron ownership lifecycle support,
     this releases ownership of live crons without stopping them or changing their schedules/delivery. The result
     names `released_crons`; `cron_release_error` reports partial failures. Add `"keep_crons": true` for a continuing
