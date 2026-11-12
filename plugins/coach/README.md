@@ -1035,6 +1035,16 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   session intentionally count as the same complaint. Tests: `tests/test_self_heal_complaint_turn.py` exercises the
   backstop/hook pair (red before the guard), distinct turns, legacy state, timestamp boundaries, quote normalization,
   cross-session isolation and closed-owner policies. Shadow mode remains non-mutating (no simulated lane state).
+- **Re-filing a fingerprint by hand** (an audit restores ownership a false adoption took): pipe the payload to
+  `self_heal.py file --mode live` on the hub with `"filed_by": "<your card id>"` in it (or `--filed-by <id>`; the CLI
+  falls back to `$HERMES_KANBAN_TASK`/`$HERMES_KANBAN_WORKER_TASK`, which hub-admin/ssh does not carry, so put it in
+  the payload). The filing card is then never adopted as the owner (signature or session adoption), and its `quote`
+  is the filer's text, not a user turn: a `filed_by` payload stores no quote hash and no detection-time
+  `complaint_at` (an explicit original `complaint_at` still counts). Independently, a card whose body instructs
+  `self_heal.py file` (a re-file, review or audit quoting the payload) never matches by error signature. Without
+  `filed_by`, the same long re-file quote on several fingerprints merges their lanes across sessions (the
+  agent-ea7ff00170 long-quote dedup, intended for detector payloads). Tests: `tests/test_self_heal_refile_adoption.py`
+  (t_01a1cfc408527b07).
 - **Already-landed fixes without a digest:** if a defect has no session ID or no readable session digest, a
   `fix…` commit on the core fork's `origin/main` can close it without an investigation. The search covers detection
   minus 24 hours through filing time. The diff must edit the last traceback frame's repository-relative file and

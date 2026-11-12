@@ -3518,7 +3518,7 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
     # match: one the complaint itself names (it existed before the complaint, so it is the subject, e.g. the stalled
     # card of a wait notice: kanban-04bdba70ac), and another fingerprint's investigation/VERIFY card (it judges
     # that lane's fix and implements nothing: desktop-727bbca8b8).
-    subject = _defect_subject_cards(d)
+    subject = _defect_subject_cards(d) | _filer_cards(d)
     process = _lane_process_cards(store, fp)
     named = [x for x in cards
              if x["id"] not in subject and card_names_defect(x, d, fp)
@@ -3591,8 +3591,21 @@ def signature_matches(sig: dict, text: str) -> bool:
     return exc_ok and loc_ok
 
 
+# A card that tells its worker to run `self_heal.py file` is filing defects, not investigating them: its body quotes
+# the payload (symptom verbatim), so signature matching alone would make it the owner (t_01a1cfc408527b07).
+_FILES_DEFECTS = re.compile(r"self_heal\.py[`'\"]?\s+file\b")
+
+
+def _filer_cards(d: dict) -> set:
+    """Cards filing this payload, never its owner: the payload's `filed_by` (a hand re-file run over hub-admin/ssh,
+    where the worker's env does not reach), plus this process's own Kanban task."""
+    ids = {d.get("filed_by"), os.environ.get("HERMES_KANBAN_TASK"), os.environ.get("HERMES_KANBAN_WORKER_TASK")}
+    return {str(i) for i in ids if i}
+
+
 def signature_owned_cards(sig: dict, home: Optional[Path] = None) -> list:
     """Open (not done/archived) cards on this host's boards whose title+body match `sig` (signature_matches).
+    A card whose body instructs `self_heal.py file` (a re-file, review or audit quoting the payload) never matches.
     -> [{id, title, status, created_at, board}], newest first. Opened read-only like session_owned_cards."""
     import sqlite3
     home = Path(home) if home else _kanban_home()
@@ -3620,6 +3633,8 @@ def signature_owned_cards(sig: dict, home: Optional[Path] = None) -> list:
                                and signature_matches(sig, r[1] or ""))
                 else:
                     matches = signature_matches(sig, f"{r[1] or ''}\n{r[2] or ''}")
+                if matches and _FILES_DEFECTS.search(r[2] or ""):
+                    matches = False
                 if matches:
                     rows.append({"id": r[0], "title": r[1], "status": r[3], "created_at": r[4], "board": board})
         except sqlite3.Error:
@@ -3742,6 +3757,11 @@ def _adopt_signature_card(d: dict, fp: str, store, now: float,
     except Exception as exc:
         store.log({"event": "selfheal_adopt_error", "fingerprint": fp, "via": "signature", "error": str(exc)[:200]})
         return None
+    filers = _filer_cards(d)
+    if any(c["id"] in filers for c in cards):
+        store.log({"event": "selfheal_adopt_skipped", "via": "signature", "why": "candidate is the filing card",
+                   "fingerprint": fp, "filer_cards": sorted(c["id"] for c in cards if c["id"] in filers)})
+        cards = [c for c in cards if c["id"] not in filers]
     if not cards:
         return None
     c = cards[0]
@@ -3855,9 +3875,15 @@ def _complaint_identity(d: dict) -> dict:
     Hook `at` is detection time; backstop `at` is the user-turn time. The quote bridges
     delayed detection. Use 300 normalized characters (the queue's evidence limit).
     Missing fields remain unknown: do not backfill legacy lanes from their filing time.
+    A hand re-file (`filed_by`) carries the filer's words, not the user's turn: no quote hash and no detection-time
+    fallback, so one re-file text shared by several fingerprints never merges their lanes (t_01a1cfc408527b07).
+    An explicit `complaint_at` copied from the original filing still counts.
     """
-    quote = re.sub(r"\s+", " ", clean_user(str(d.get("quote") or ""))).strip().casefold()[:300]
-    at = d.get("complaint_at", d.get("at"))
+    if d.get("filed_by"):
+        quote, at = "", d.get("complaint_at")
+    else:
+        quote = re.sub(r"\s+", " ", clean_user(str(d.get("quote") or ""))).strip().casefold()[:300]
+        at = d.get("complaint_at", d.get("at"))
     try:
         at = float(at) if at is not None else None
     except (TypeError, ValueError):
@@ -4097,7 +4123,8 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
                 cfg: Optional[dict] = None, budget_fn: Optional[Callable] = None,
                 owner_fn: Optional[Callable] = None, sig_owner_fn: Optional[Callable] = None) -> dict:
     """File one defect: {fingerprint, component, symptom, source, kind, p_defect, session_id, quote, host, at,
-    details}. Returns {"action": would_file|filed|skip|forwarded|error, ...}."""
+    details}. Returns {"action": would_file|filed|skip|forwarded|error, ...}.
+    Optional `filed_by`: the card doing a hand (re-)filing; never its owner, and its quote is no complaint turn."""
     store = _store(store)
     m = m or mode()
     now = now or time.time()
@@ -5495,6 +5522,8 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     f = sub.add_parser("file", help="file one defect JSON from stdin (hub side of an ssh forward)")
     f.add_argument("--mode", choices=("shadow", "live"))
+    f.add_argument("--filed-by", default="", help="card doing this (re-)filing; never adopted as the owner "
+                                                   "(default: the payload's filed_by, else $HERMES_KANBAN_TASK)")
     x = sub.add_parser("fix", help="Do it: create the fix card for a fingerprint")
     x.add_argument("fp")
     e = sub.add_parser("event", help="record a lifecycle event from a card")
@@ -5514,6 +5543,10 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if a.cmd == "file":
         d = json.loads(sys.stdin.read())
+        filer = (d.get("filed_by") or a.filed_by or os.environ.get("HERMES_KANBAN_TASK")
+                 or os.environ.get("HERMES_KANBAN_WORKER_TASK"))
+        if filer:
+            d["filed_by"] = filer
         print(json.dumps(file_defect(d, m=a.mode)))
     elif a.cmd == "fix":
         print(json.dumps(file_fix(a.fp)))
