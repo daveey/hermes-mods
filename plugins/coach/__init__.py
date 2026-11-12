@@ -193,6 +193,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             hint = coach.turn_start(session_id, user_message, platform=platform or "",
                                     parent_session_id=parent_session_id or "",
                                     replied_before=bool(_last_assistant(conversation_history)))
+            _wait_turn(session_id, user_message, platform, parent_session_id)
             # The fix-loop window survives process boundaries (`hermes chat -q --resume`, backend restarts): the
             # in-memory loop state is re-seeded from the session file, and windows count persistent user turns.
             st = coach.loop_state(session_id)
@@ -409,8 +410,23 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
 
     envelope_gate.assess_before_holds = True
 
+    # session -> this user turn's long_wait_pending_reply record (long_wait.py; self-heal agent-f1f8b24e9d)
+    wait_turns: dict = shared.setdefault("long_wait_turns", {})
+
+    def _wait_turn(session_id, user_message, platform="", parent_session_id=""):
+        try:
+            lw = _load("long_wait")
+            wait_turns[session_id] = {"turn": coach.turn_number(session_id), "replied": False, "held": False,
+                                      "live": lw.live_turn(platform or "", parent_session_id or ""),
+                                      "delay": lw.asks_delay(rules.request_text(user_message))}
+        except Exception as exc:
+            wait_turns.pop(session_id, None)  # unknown turn: the rule stays quiet
+            log.debug("coach long_wait turn: %s", exc)
+
     def on_interim_message(session_id="", text="", **_):
         coach.hint_report(session_id, text)
+        if isinstance(text, str) and text.strip() and session_id in wait_turns:
+            wait_turns[session_id]["replied"] = True
 
     def pre_tool_call(tool_name="", args=None, session_id="", **_):
         coach.hint_tool_start(session_id, _.get("tool_call_id"))
@@ -419,6 +435,13 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             store.log({"event": "agent_block", "rule": "profiler_safety", "tool": tool_name})
             return {"action": "block", "message": profiler.MESSAGE}
         msg = _future_clock(session_id, tool_name, args)
+        if msg:
+            return {"action": "block", "message": msg}
+        try:  # one long foreground wait while the live user has had no reply this turn (long_wait.py)
+            msg = _load("long_wait").check(wait_turns, session_id, tool_name, args, store.log)
+        except Exception as exc:
+            log.debug("coach long_wait: %s", exc)
+            msg = None
         if msg:
             return {"action": "block", "message": msg}
         try:  # frozen-rollout cap: a queue notice is not permission (root_cap.py)

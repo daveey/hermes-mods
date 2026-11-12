@@ -136,6 +136,19 @@ script contents and general shell evaluation are not covered; this is not a sand
 `tests/test_profiler_safety.py` exercises both tool entry paths and the registered hook,
 with safe/non-executing controls and redirection/wrapper regressions.
 
+## Long wait before the first reply
+
+`pre_tool_call` refuses (`agent_block rule=long_wait_pending_reply`, `long_wait.py`) one foreground wait of 60 s or
+more while the user of a live chat has had no reply this turn: a `terminal` call whose `sleep`s add up to ≥ 60 s
+(`background=true` is never refused), or a `process_manage` `wait` with `timeout` ≥ 60 (none = the terminal default).
+The message: reply now with what you know, then run the wait with `terminal(background=true, notify=true)`.
+"Replied" is an `on_interim_message` with text, or (that hook is queued, so it can lag the tool call) a persisted
+assistant row with text after the session's last user row in `state.db` (read-only, checked only on the block path).
+Quiet for cron, Kanban (`platform=kanban` or `HERMES_KANBAN_TASK`), subagents, a session whose turn start the coach
+did not see, and an ask that requests the delay (`wait`, `later`, `after`, `in N min`). Held once per turn: the same
+wait again goes through, logged `long_wait_repeat`. Origin: self-heal agent-f1f8b24e9d (a `sleep 135` "waiting for
+telemetry" after the update had already finished). Tests: `tests/test_agent_channel.py -k long_wait`.
+
 ## Traceback attribution
 
 Bug detection decodes JSON tool envelopes before inspecting frame paths and exception tails.

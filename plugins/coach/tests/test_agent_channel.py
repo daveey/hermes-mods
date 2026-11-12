@@ -875,3 +875,101 @@ def test_empty_wait_hint_lands_on_the_call_that_caused_it(tmp_path):
     # once per job: observe() after transform must not queue it again for the next result
     nxt = hooks["transform_tool_result"](tool_name="terminal", args={"command": "ls"}, result=OK, session_id="s1")
     assert nxt is None
+
+
+# ── long_wait_pending_reply: one long foreground wait while the user has had no reply this turn ──
+# Self-heal agent-f1f8b24e9d (Nov 10, MacBook): asked "ec2 gateway seems stuck", the agent already knew the update had
+# finished (exit 0, HTTP 200) and then ran this foreground sleep "waiting for telemetry" before saying anything.
+STUCK_ASK = "ec2 gateway seems stuck, it's been updating for 7 minutes"
+STUCK_SLEEP = {"command": "sleep 135; ssh ubuntu@hub 'tail -n 20 ~/.hermes/logs/core-update.log'", "timeout": 200}
+
+
+@pytest.fixture()
+def _interactive(tmp_path, monkeypatch):
+    for k in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_CRON_JOB_ID"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))  # no state.db: only the hook-tracked state counts
+    store = core.Store(tmp_path / "coach")
+    _, hooks = plugin.build(store=store, checkout=None)
+    return store, hooks
+
+
+def _wait_block(hooks, tool="terminal", args=None, sid="s1"):
+    out = hooks["pre_tool_call"](tool_name=tool, args=dict(args or STUCK_SLEEP), session_id=sid)
+    return out if out and out.get("action") == "block" else None
+
+
+def test_long_wait_pending_reply_blocks_the_incident_call(_interactive):
+    store, hooks = _interactive
+    hooks["pre_llm_call"](session_id="s1", user_message=STUCK_ASK, platform="desktop")
+    out = _wait_block(hooks)
+    assert out, "the incident's first foreground sleep 135 before any reply must be refused"
+    assert "The user is waiting" in out["message"] and "background=true" in out["message"]
+    rows = [json.loads(l) for l in (store.root / "log.jsonl").read_text().splitlines()]
+    assert any(r.get("event") == "agent_block" and r.get("rule") == "long_wait_pending_reply" for r in rows)
+    # held once per turn: the same call again goes through (logged), so it can never loop
+    assert _wait_block(hooks) is None
+
+
+def test_long_wait_pending_reply_blocks_a_long_process_wait(_interactive):
+    _, hooks = _interactive
+    hooks["pre_llm_call"](session_id="s1", user_message=STUCK_ASK, platform="desktop")
+    assert _wait_block(hooks, "process_manage", {"action": "wait", "session_id": "proc_1", "timeout": 300})
+
+
+def test_long_wait_pending_reply_quiet_cases(_interactive, monkeypatch):
+    _, hooks = _interactive
+    pre = hooks["pre_llm_call"]
+    # background=true is never blocked
+    pre(session_id="a", user_message=STUCK_ASK, platform="desktop")
+    assert _wait_block(hooks, args={**STUCK_SLEEP, "background": True}, sid="a") is None
+    # short sleep / short process wait
+    assert _wait_block(hooks, args={"command": "sleep 30; ssh hub uptime"}, sid="a") is None
+    assert _wait_block(hooks, "process_manage", {"action": "wait", "session_id": "p", "timeout": 30}, sid="a") is None
+    # after an interim message the user has an answer
+    pre(session_id="b", user_message=STUCK_ASK, platform="desktop")
+    hooks["on_interim_message"](session_id="b", text="The update finished and the gateway is back (HTTP 200).")
+    assert _wait_block(hooks, sid="b") is None
+    # the user asked for the delay
+    for i, ask in enumerate(("wait 2 minutes then check the hub", "check the gateway in 5 min",
+                             "tell me after the update finishes")):
+        pre(session_id=f"d{i}", user_message=ask, platform="desktop")
+        assert _wait_block(hooks, sid=f"d{i}") is None, ask
+    # cron and subagents are not live chats
+    pre(session_id="c", user_message=STUCK_ASK, platform="cron")
+    assert _wait_block(hooks, sid="c") is None
+    pre(session_id="sub", user_message=STUCK_ASK, platform="desktop", parent_session_id="p1")
+    assert _wait_block(hooks, sid="sub") is None
+    # a session the coach never saw start a turn (plugin reload mid-turn): fail open
+    assert _wait_block(hooks, sid="unknown") is None
+
+
+def test_long_wait_pending_reply_skips_kanban_workers(_interactive, monkeypatch):
+    _, hooks = _interactive
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_123")
+    hooks["pre_llm_call"](session_id="k", user_message=STUCK_ASK, platform="desktop")
+    assert _wait_block(hooks, sid="k") is None
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    hooks["pre_llm_call"](session_id="k2", user_message="work kanban task t_9", platform="kanban")
+    assert _wait_block(hooks, sid="k2") is None
+
+
+def test_long_wait_pending_reply_reads_the_persisted_reply_when_the_interim_hook_is_late(_interactive, tmp_path):
+    """on_interim_message is queued to a stream-hook thread, so text sent with the very tool call can arrive after
+    pre_tool_call. The block path rechecks state.db: an assistant row with text after the last user row is a reply."""
+    import sqlite3
+    _, hooks = _interactive
+    home = tmp_path / "home"
+    home.mkdir()
+    db = sqlite3.connect(home / "state.db")
+    db.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
+               "content TEXT, timestamp REAL)")
+    db.executemany("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)",
+                   [("s1", "user", STUCK_ASK, 1), ("s1", "assistant", "", 2), ("s1", "tool", "{}", 3),
+                    ("s2", "user", STUCK_ASK, 4), ("s1", "assistant", "Update finished; gateway is back.", 5)])
+    db.commit()
+    db.close()
+    hooks["pre_llm_call"](session_id="s1", user_message=STUCK_ASK, platform="desktop")
+    assert _wait_block(hooks) is None
+    hooks["pre_llm_call"](session_id="s2", user_message=STUCK_ASK, platform="desktop")
+    assert _wait_block(hooks, sid="s2")  # s2 has no reply after its user row
