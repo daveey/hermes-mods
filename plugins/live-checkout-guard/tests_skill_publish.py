@@ -560,6 +560,69 @@ printf '[{"headSha":"%s","status":"%s","conclusion":"%s","workflowName":"CI","cr
             self.assertTrue(self.wait_for(lambda: self.retry_worker_idle(pending)))
         self.assert_no_worktrees()
 
+    def retry_record(self):
+        pending = self.base / 'hermes-home/cache/skill-publish-pending'
+        publisher.defer(self.root, [self.path], session_id='s', task_id='c', spawn=False)
+        records = list(pending.glob('*.json'))
+        self.assertEqual(len(records), 1)
+        return pending, records[0]
+
+    def test_retry_keeps_record_while_publication_lock_busy_then_publishes(self):
+        """A retry that finds the publication lock held keeps the record for the next pass."""
+        import fcntl
+        pending, record = self.retry_record()
+        holder = os.open(self.root / '.git/skill-publish.lock', os.O_CREAT | os.O_RDWR)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        green = lambda *_: 'green'
+        with patch.object(publisher, 'LOCK_WAIT', 0.2):
+            counts = publisher.retry_pending(pending, interval=0, ci=green, passes=1)
+        self.assertTrue(record.exists(), 'record dropped while the publication lock was busy')
+        self.assertEqual(counts['kept'], 1)
+        self.assertEqual(counts['dropped'], 0)
+        self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
+        self.assertEqual(self.target.read_text(), 'published\n')
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        counts = publisher.retry_pending(pending, interval=0, ci=green, passes=1)
+        self.assertEqual(counts['published'], 1)
+        self.assertEqual(self.git(self.origin, 'show', 'main:' + self.path), 'published')
+        self.assertFalse(record.exists())
+        self.assertEqual(self.git(self.root, 'status', '--porcelain'), '')
+        self.assert_no_worktrees()
+
+    def test_retry_keeps_record_when_raced_tip_ci_pending_then_publishes(self):
+        """A push race onto a tip whose CI is still running keeps the record for the next pass."""
+        racer = self.base / 'racer'
+        self.git(self.base, 'clone', '-q', '-b', 'main', str(self.origin), str(racer))
+        self.git(racer, 'config', 'user.name', 'Fixture Racer')
+        self.git(racer, 'config', 'user.email', 'racer@example.com')
+        pending, record = self.retry_record()
+        tip_state = ['pending']
+        calls = []
+        def ci(root, sha):
+            calls.append(sha)
+            return 'green' if sha == self.head else tip_state[0]
+        with patch.dict(os.environ, {'PUBLISH_RACE_REPO': str(racer),
+                                    'PUBLISH_RACE_SENTINEL': str(self.base / 'raced')}):
+            counts = publisher.retry_pending(pending, interval=0, ci=ci, passes=1)
+            # The race really happened and its new tip was the one read as pending.
+            raced = self.git(self.origin, 'rev-parse', 'main')
+            self.assertEqual(calls, [self.head, raced])
+            self.assertEqual(self.git(self.origin, 'show', '-s', '--format=%s', 'main'), 'race')
+            self.assertEqual(self.git(self.origin, 'show', 'main:' + self.path), 'base')
+            self.assertTrue(record.exists(), 'record dropped while the raced tip CI was pending')
+            self.assertEqual(counts['kept'], 1)
+            self.assertEqual(counts['dropped'], 0)
+            tip_state[0] = 'green'
+            counts = publisher.retry_pending(pending, interval=0, ci=ci, passes=1)
+        self.assertEqual(counts['published'], 1)
+        self.assertEqual(self.git(self.origin, 'show', 'main:' + self.path), 'published')
+        self.assertEqual(self.git(self.origin, 'rev-parse', 'main^'), raced)
+        self.assertFalse(record.exists())
+        # Published, so reconcile retired the live dirt (the edit now arrives by fast-forward).
+        self.assertEqual(self.git(self.root, 'status', '--porcelain'), '')
+        self.assert_no_worktrees()
+
     def test_pending_ci_state_is_distinct_from_unknown(self):
         def gh(rows, code=0):
             out = json.dumps(rows).encode()
