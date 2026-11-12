@@ -2652,9 +2652,11 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
             if synthetic_user_row(d):  # before the cap-ordered pass: a denial stops that pass before late rows
                 with db:
                     db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
+                closed_lane = _close_synthetic_lane(store, fp, now)  # an owner adopted earlier must get no VERIFY
                 store.log({"event": "selfheal_withdrawn", "mode": "live", "fingerprint": fp, "why": "synthetic_tag",
                            "source": d.get("source"), "session_id": d.get("session_id"),
-                           "quote": str(d.get("quote") or "")[:200]})
+                           "quote": str(d.get("quote") or "")[:200],
+                           **({"lane_closed": closed_lane} if closed_lane else {})})
                 out.append({"action": "skip", "why": "synthetic_tag"})
                 continue
             closed = (_sqlite_incident_over(d, store, now)
@@ -3991,9 +3993,11 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
                    "session_id": d.get("session_id")})
         return {"action": "skip", "why": "probe"}
     if synthetic_user_row(d):  # queued before the classifier knew this tag: withdraw, never file (agent-b3f86b6bb7)
+        closed_lane = _close_synthetic_lane(store, fp, now) if m == "live" else None
         store.log({"event": "selfheal_withdrawn", "mode": m, "fingerprint": fp, "why": "synthetic_tag",
                    "source": d.get("source"), "session_id": d.get("session_id"),
-                   "quote": str(d.get("quote") or "")[:200]})
+                   "quote": str(d.get("quote") or "")[:200],
+                   **({"lane_closed": closed_lane} if closed_lane else {})})
         return {"action": "skip", "why": "synthetic_tag"}
     hub = is_hub(cfg)
     if m == "live" and not hub:
@@ -4624,6 +4628,25 @@ def _synthetic_fix_row(store, fp: str) -> bool:
     return synthetic_user_row({"source": rec.get("source"), "quote": rec.get("evidence") or rec.get("quote") or ""})
 
 
+# Lane statuses a synthetic withdrawal closes: an investigation, a proposal, or an (adopted) owner still awaiting its
+# receipt. fixed/not_defect/declined/stale/reverted/suppressed are already settled and keep their verdict.
+SYNTHETIC_CLOSE_STATUSES = ("filed", "proposed", "approved", "adopted")
+
+
+def _close_synthetic_lane(store, fp: str, now: float) -> Optional[str]:
+    """Close the open lane entry of a defect just withdrawn as synthetic (status not_defect, closed_at), so reconcile
+    never files a VERIFY for it (kanban-0c3cff01cc: an owner adopted before the classifier knew the quote's tag kept
+    the lane approved after its pending row was withdrawn). -> the status it closed, or None.
+    The lane closes only when its own detection record is synthetic too: a fingerprint is component+symptom, so a
+    synthetic row may share it with a real complaint's open lane, which must stay open."""
+    lane = LaneState(store.root)
+    was = lane.get(fp).get("status")
+    if was not in SYNTHETIC_CLOSE_STATUSES or not _synthetic_fix_row(store, fp):
+        return None
+    lane.update(fp, status="not_defect", closed_at=now)
+    return was
+
+
 def admission_negative(fp: str, st: dict, note: str = "", store=None, now: Optional[float] = None,
                        runner=None) -> Optional[dict]:
     """Detection for turn-end audit false alarms (agent-feed37636b): a `not_defect` verdict on an audit (`admission`)
@@ -4730,6 +4753,14 @@ def _recover_completion_receipt(fp: str, store, runner, now: float) -> Optional[
         st = LaneState(store.root).get(fp)  # another sync/event may have settled it while we waited
         if st.get("status") != "approved" or st.get("verify_card"):
             return st.get("verify_card")
+        if _synthetic_fix_row(store, fp):  # a Hermes-written detection never earns a verify run
+            rec = _detect_record(store, fp)
+            LaneState(store.root).update(fp, status="not_defect", closed_at=now)
+            store.log({"event": "selfheal_withdrawn", "mode": "live", "fingerprint": fp, "why": "synthetic_tag",
+                       "stage": "receipt", "lane_closed": "approved", "fix_card": st.get("fix_card"),
+                       "source": rec.get("source"), "session_id": rec.get("session_id"),
+                       "quote": str(rec.get("evidence") or rec.get("quote") or "")[:200]})
+            return None
         r = route({"component": st.get("component")})
         r["board"] = st.get("board") or r["board"]
         b = budget(r["board"], now)
@@ -4760,6 +4791,9 @@ def reconcile(store=None, runner=None, now: Optional[float] = None) -> list:
             # Legacy/non-split and adopted owners can finish without ever knowing this fingerprint.
             # Preserve the generation while a budgeted verifier obtains the receipt (including create failure).
             verify = _recover_completion_receipt(fp, store, runner, now)
+            if not verify and lane.get(fp).get("status") == "not_defect":
+                done.append((fp, "withdrawn (synthetic_tag): no receipt verification"))
+                continue
             done.append((fp, f"receipt verification -> {verify or 'pending admission'}"))
             continue
         if ks == "done" and status == "approved" and st.get("verify_card"):
