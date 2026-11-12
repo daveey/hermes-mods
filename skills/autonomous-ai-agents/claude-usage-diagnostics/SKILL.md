@@ -115,14 +115,14 @@ Test successful-probe recovery through select → persisted auth row → fresh p
     anchored timestamp regex such as `'^2026-10-26 (15:0[3-9]|15:1[0-7])'`.
   - `desktop.log` records backend events, not renderer requests, so there is no request log for `/api/model/set`.
 
-### 3e. Revoked-token burst on pool workers leaves false quota walls
+### 3e. Revoked-token burst leaves false quota walls
 
-The symptom is many cards crashing within a minute or two on several workers with `HTTP 401: OAuth access token has been revoked`, while every hub account answers `/api/oauth/profile`. The workers are holding hub-minted rows that the hub's refresh already rotated, and they only pull new rows on their own timer.
+The symptom is many cards crashing within a minute or two on several hosts with `HTTP 401: OAuth access token has been revoked`, while every hub account answers `/api/oauth/profile`; a Mac's chat turns and notice replays fail meanwhile with `Subscription OAuth credential is unavailable; no selected pool entry`. The workers are holding hub-minted rows that the hub's refresh already rotated, and they only pull new rows on their own timer.
 1. Force the pull on every worker now: over instance-role SSM, run `sudo -u ubuntu -H XDG_RUNTIME_DIR=/run/user/1000 systemctl --user start hermes-oauth-relay.service`. Don't wait for the timer.
 2. **Fresh tokens alone don't finish the fix.** Retries during that window fail at start with `SubscriptionQuotaUnavailable … resets at <days away>`, and that failure persists in two places:
-   - an `anthropic` entry in each worker's `~/.hermes/provider_walls.json`. If another provider is genuinely walled, that worker then runs no LLM work at all.
+   - an `anthropic` entry in each affected host's `~/.hermes/provider_walls.json`. If another provider is genuinely walled, that host then runs no LLM work at all.
    - a `quota_episode` event on each card, which holds it with the `subscription_quota_reset` guard even after it's unblocked to ready.
-   Read every worker's walls file, and query the hub DB for `quota_episode` events with provider `anthropic` from the window.
+   Read every gateway's walls file (Macs included), and query each board's DB (the hub's, and each Mac's local `kanban.db`) for `quota_episode` events with provider `anthropic` from the window.
 3. Disprove the wall before removing it:
    - `/api/oauth/usage` should show accounts under 100 on `seven_day`;
    - a one-shot `hermes chat --oneshot -m <model> --provider anthropic` on the worker should answer.
