@@ -36,8 +36,8 @@ offline, green = all fine). Click to expand its machines as before; which groups
 localStorage (`hermes-runners-ci-open`). Gateway workers stay a flat list. Each gateway machine is one line under a column header
 (Machine, Slots, Waiting, Can't run, CPU, RAM, Disk free, Busy): rows hold bare numbers and bars, the
 header carries the unit, and all rows share one column grid. Flags and reasons (pinned only, slots not set, on hold,
-not seen, load N min old, load not reported) are hover text on the row; a machine that has any gets a dotted
-underline on its name. A stale load greys its cells and an unreported one shows "–". The panel is up to 680 px wide.
+not seen, load N min old, load not reported) are hover text on a small ⓘ after the machine name,
+shown only on machines that have any. A stale load greys its cells and an unreported one shows "–". The panel is up to 680 px wide.
 
 Load: each gateway machine reports CPU load, RAM in use and disk space to the Board every 30 s (core
 `hermes_cli/machine_metrics.py` → `POST /v2/machines/me/metrics`, returned by `GET /v2/machines`). The row
@@ -89,6 +89,6 @@ python -m pytest plugins/runners/tests/test_fleet.py plugins/runners/tests/test_
 
 - CI groups: categories + counts + health, collapsed by default, expand/remember/collapse: `groups.test.mjs`,
   `test_fleet.py` `test_ci_machine_categories_for_the_panel_groups`
-- gateway rows are single grid lines under one column header (bare numbers, units in the header; flags and load age as hover text only), no Investigate control: "gateway rows: one grid line", "waiting: header counts", "load meters"
+- gateway rows are single grid lines under one column header (bare numbers, units in the header; flags and load age as hover text on an (i) marker only), no Investigate control: "gateway rows: one grid line", "waiting: header counts", "load meters"
 
 Not covered: native Desktop rendering (checked by hand after hermes-sync).

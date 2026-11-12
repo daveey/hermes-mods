@@ -422,7 +422,7 @@ function openCard(run) {
 
 // Column headers for the gateway grid: the unit of each number lives here, not in every row.
 const GW_COLS = [
-  ['name', 'Machine'], ['slots', 'Slots'],
+  ['name', 'Machine'], ['info', ''], ['slots', 'Slots'],
   ['waiting', 'Waiting', 'Unleased ready cards that match this machine and need a slot here'],
   ['ineligible', "Can't run", 'Unleased ready cards whose placement, skills or pins do not match this machine'],
   ['cpu', 'CPU', '1-min load ÷ cores'], ['ram', 'RAM', 'Memory in use'], ['disk', 'Disk free'],
@@ -456,9 +456,11 @@ function GatewayRow({ m, now }) {
     m.reason,
     v ? (v.stale ? `load ${v.stale}` : null) : 'load not reported'
   ].filter(Boolean).join(' · ')
-  // Flags and reasons are hover text on the row (and the dotted-underlined name), not a column.
-  return h('div', { className: `hermes-fleet-row is-${m.state}`, 'data-machine': m.name, title: meta || undefined },
-    h('span', { className: `hermes-fleet-name${meta ? ' has-note' : ''}`, title: meta ? `${text(m.name)}: ${meta}` : undefined }, text(m.name)),
+  // Flags and reasons are hover text on a small (i) next to the name, not a column.
+  return h('div', { className: `hermes-fleet-row is-${m.state}`, 'data-machine': m.name },
+    h('span', { className: 'hermes-fleet-name' }, text(m.name)),
+    meta ? h('span', { className: 'hermes-fleet-info', role: 'img', tabIndex: 0, title: meta, 'aria-label': `${text(m.name)}: ${meta}` }, 'i')
+      : h('span', { className: 'hermes-fleet-info is-empty', 'aria-hidden': 'true' }),
     h('span', { className: 'hermes-fleet-slots' },
       ...m.running.map((r) => h(Slot, {
         key: `${r.board}/${r.task}`, state: m.state === 'lost' ? 'lost' : 'busy',
@@ -754,24 +756,26 @@ const CSS = `
 .hermes-fleet-group-meta{font-size:11px;color:var(--ui-text-tertiary);white-space:nowrap}
 .hermes-fleet-chev{color:var(--ui-text-tertiary);font-size:10px}
 .hermes-fleet-group>.hermes-fleet-row{padding-left:18px}
-.hermes-fleet-gw{display:grid;grid-template-columns:repeat(7,max-content) minmax(max-content,1fr);row-gap:3px}
+.hermes-fleet-gw{display:grid;grid-template-columns:repeat(8,max-content) minmax(max-content,1fr);row-gap:3px}
 .hermes-fleet-gw>.hermes-fleet-row,.hermes-fleet-cols{display:grid;grid-column:1/-1;grid-template-columns:subgrid;column-gap:16px;align-items:center;white-space:nowrap}
 .hermes-fleet-gw>.hermes-fleet-row>*{grid-row:1}
 .hermes-fleet-cols{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--ui-text-tertiary)}
 .hermes-fleet-cols>[data-col=waiting],.hermes-fleet-cols>[data-col=ineligible],.hermes-fleet-cols>[data-col=count]{text-align:right}
 .hermes-fleet-gw .hermes-fleet-name{grid-column:1;max-width:150px}
-.hermes-fleet-gw .hermes-fleet-slots{grid-column:2;flex-wrap:nowrap}
+.hermes-fleet-gw .hermes-fleet-slots{grid-column:3;flex-wrap:nowrap}
 .hermes-fleet-gw .hermes-fleet-cell{font-size:11px;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary)}
-.hermes-fleet-gw .hermes-fleet-waiting{grid-column:3;margin:0;text-align:right}
-.hermes-fleet-gw .hermes-fleet-ineligible{grid-column:4;margin:0;text-align:right}
+.hermes-fleet-gw .hermes-fleet-waiting{grid-column:4;margin:0;text-align:right}
+.hermes-fleet-gw .hermes-fleet-ineligible{grid-column:5;margin:0;text-align:right}
 .hermes-fleet-gw .hermes-fleet-meter{display:flex;gap:6px}
-.hermes-fleet-gw .hermes-fleet-meter[data-meter=cpu]{grid-column:5}
-.hermes-fleet-gw .hermes-fleet-meter[data-meter=ram]{grid-column:6}
-.hermes-fleet-gw .hermes-fleet-meter[data-meter=disk]{grid-column:7}
+.hermes-fleet-gw .hermes-fleet-meter[data-meter=cpu]{grid-column:6}
+.hermes-fleet-gw .hermes-fleet-meter[data-meter=ram]{grid-column:7}
+.hermes-fleet-gw .hermes-fleet-meter[data-meter=disk]{grid-column:8}
 .hermes-fleet-gw .hermes-fleet-meter.is-stale,.hermes-fleet-gw .hermes-fleet-meter.is-none{color:var(--ui-text-tertiary)}
 .hermes-fleet-gw .hermes-fleet-num{flex:1;text-align:right}
-.hermes-fleet-gw .hermes-fleet-name.has-note{text-decoration:underline dotted var(--ui-text-tertiary);text-underline-offset:3px;cursor:help}
-.hermes-fleet-gw .hermes-fleet-count{grid-column:8}
+.hermes-fleet-gw .hermes-fleet-info{grid-column:2;margin-left:-10px;box-sizing:border-box;width:13px;height:13px;border:1px solid var(--ui-text-tertiary);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font:italic 600 9px/1 Georgia,serif;color:var(--ui-text-secondary);cursor:help}
+.hermes-fleet-gw .hermes-fleet-info.is-empty{visibility:hidden}
+.hermes-fleet-gw .hermes-fleet-info:hover,.hermes-fleet-gw .hermes-fleet-info:focus-visible{border-color:var(--ui-text-secondary);color:inherit;outline:none}
+.hermes-fleet-gw .hermes-fleet-count{grid-column:9}
 .hermes-fleet-note,.hermes-fleet-foot{font-size:11px;color:var(--ui-text-tertiary)}
 .hermes-fleet-foot{margin-top:8px}
 .hermes-fleet-pop{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:2px 0 4px;padding:6px;border:1px solid var(--ui-stroke-secondary);border-radius:6px;background:var(--ui-bg)}
