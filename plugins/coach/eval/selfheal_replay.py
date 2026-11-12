@@ -72,6 +72,10 @@ def main(argv=None, llm=None, confirm_llm=None):
     ap.add_argument("--confirm", action="store_true",
                     help="admission: the production cascade (audit_verdict: judge, then the coach_defect_confirm "
                          "model on an admission >= GATE), not the first-stage judge alone")
+    ap.add_argument("--confirm-model", default=os.environ.get("COACH_DEFECT_CONFIRM_MODEL", ""),
+                    help="pin the confirm stage (class routing picks claude-sonnet-5-5 or gpt-6.1-sol per call, and "
+                         "the two score the same row 0.0 vs 0.96): replay the model a live detection logged")
+    ap.add_argument("--confirm-provider", default=os.environ.get("COACH_DEFECT_CONFIRM_PROVIDER", ""))
     a = ap.parse_args(argv)
     if a.hermes_root:
         sys.path.insert(0, a.hermes_root)
@@ -80,6 +84,10 @@ def main(argv=None, llm=None, confirm_llm=None):
         os.environ["COACH_DEFECT_MODEL"] = a.model
     if a.provider:
         os.environ["COACH_DEFECT_PROVIDER"] = a.provider
+    if a.confirm_model:
+        os.environ["COACH_DEFECT_CONFIRM_MODEL"] = a.confirm_model
+    if a.confirm_provider:
+        os.environ["COACH_DEFECT_CONFIRM_PROVIDER"] = a.confirm_provider
     sh = load_self_heal()
     th = a.threshold if a.threshold is not None else (sh.AUDIT_THRESHOLD if a.mode == "admission" else sh.THRESHOLD)
     rows = [json.loads(x) for x in open(a.data) if x.strip()]
@@ -99,20 +107,27 @@ def main(argv=None, llm=None, confirm_llm=None):
     lock = threading.Lock()
     model_tag = f"{a.provider}/{a.model}" if a.model else "aux:coach_defect"
     calls = {"n": 0, "err": 0}
+    models: dict = {}  # stage -> {resolved model: calls}: what the replay actually ran on
 
     def judge(system, prompt, tag="", fn=None):
         """`tag` keeps samples and cascade stages apart in the cache (an empty tag keeps the old keys)."""
-        k = hashlib.sha1(f"{model_tag}{tag}\n{system}\n{prompt}".encode()).hexdigest()
+        stage_tag = (f"@{a.confirm_provider}/{a.confirm_model}" if "#confirm" in tag and a.confirm_model else "")
+        k = hashlib.sha1(f"{model_tag}{tag}{stage_tag}\n{system}\n{prompt}".encode()).hexdigest()
         if k in cache:
             return cache[k]
         try:
+            if hasattr(sh, "_MODEL_TL"):
+                sh._MODEL_TL.model = ""
             raw = (fn or llm or sh.aux_judge)(system, prompt)
         except Exception as exc:
             with lock:
                 calls["err"] += 1
             raise exc
+        resolved = getattr(getattr(sh, "_MODEL_TL", None), "model", "") or "(unreported)"
         with lock:
             calls["n"] += 1
+            stage = models.setdefault("confirm" if "#confirm" in tag else "judge", {})
+            stage[resolved] = stage.get(resolved, 0) + 1
             cache[k] = raw
             with open(cache_path, "a") as fh:
                 fh.write(json.dumps({"k": k, "raw": raw}) + "\n")
@@ -169,7 +184,7 @@ def main(argv=None, llm=None, confirm_llm=None):
     for r in rows:
         r["pre_pred"] = r["prefilter"]
     rep = {"threshold": th, "model": model_tag, "judge_calls": calls, "no_prev": a.no_prev,
-           "samples": max(1, a.samples), "confirm": bool(confirm),
+           "samples": max(1, a.samples), "confirm": bool(confirm), "models": models,
            "per_row": {r["id"]: {"label": r["label"], "sample_hits": r["sample_hits"], "ps": r["ps"]} for r in rows},
            "all": metrics(rows), "prefilter_only": metrics(rows, "pre_pred"),
            "splits": {s: metrics([r for r in rows if r.get("split") == s]) for s in ("dev", "test")},
@@ -204,6 +219,9 @@ def main(argv=None, llm=None, confirm_llm=None):
           line("random turns only", rep["random_sample"]), line("with prev reply", rep["with_prev"]),
           line("without prev reply", rep["without_prev"]), line("prefilter alone", rep["prefilter_only"]), "",
           f"Judge calls this run: {calls['n']} (errors {calls['err']}); unjudged after retry: {rep['errors']}.", "",
+          "Resolved models (stage: model x calls; compare with the live detection's judge_model/confirm_model): "
+          + ("; ".join(f"{s}: " + ", ".join(f"{m} x{n}" for m, n in sorted(d.items())) for s, d in models.items())
+             or "none called (all cached)"), "",
           "## Per component", "", "| component | defects | caught |", "|---|---|---|"]
     md += [f"| {c} | {v['pos']} | {v['caught']} |" for c, v in rep["components"].items()]
     md += ["", f"## Misses ({len(misses)})", ""]

@@ -434,6 +434,71 @@ def test_replay_admission_samples_with_the_production_confirm_cascade(tmp_path):
     assert not calls
 
 
+class _Resp:
+    def __init__(self, model):
+        self.model = model
+
+
+def test_admission_detect_logs_the_model_each_audit_stage_resolved_to(tmp_path):
+    """t_01a1d01a9a9bb5db: the three not_defect admissions (agent-ad20c8a5f7 etc.) were confirmed live by gpt-6.1-sol
+    (class:standard picks it or claude-sonnet-5-5 per session), but their replay ran only on claude-sonnet-5-5 and
+    scored 0.0, and the detection row could not say which. It now names each stage's resolved model."""
+    reply = "I was wrong earlier: I stopped the worker before you answered."
+
+    def s1(system, prompt):
+        sh.note_model(_Resp("gpt-6-luna"))
+        return json.dumps({"p_defect": 0.7, "kind": "admission", "component": "agent", "symptom": "a"})
+
+    def c(system, prompt):
+        sh.note_model(_Resp("gpt-6.1-sol"))
+        return json.dumps({"p_defect": 0.95, "kind": "admission", "component": "agent", "symptom": "b"})
+    v = sh.audit_verdict(reply, s1, confirm=c)
+    assert (v["judge_model"], v["confirm_model"]) == ("gpt-6-luna", "gpt-6.1-sol")
+    hit = sh.detect_admission(reply, s1, confirm=c)
+    store = core.Store(tmp_path / "coach")
+    sh.handle(hit, "s1", store, evidence=reply, m="shadow", filer=lambda d, store=None, m=None: None)
+    (det,) = [e for e in events(tmp_path) if e["event"] == "selfheal_detect"]
+    assert (det["stages"], det["judge_model"], det["confirm_model"]) == ("judge+confirm", "gpt-6-luna", "gpt-6.1-sol")
+    # a judge that reports no model (an injected test judge) leaves no stale name from the call before
+    quiet = lambda s, p: json.dumps({"p_defect": 0.7, "kind": "admission", "component": "agent", "symptom": "a"})
+    v = sh.audit_verdict(reply, quiet, confirm=quiet)
+    assert "judge_model" not in v and "confirm_model" not in v
+
+
+def test_replay_reports_resolved_models_and_pins_the_confirm_stage(tmp_path, monkeypatch):
+    replay = load("selfheal_replay_models_test", ROOT / "eval" / "selfheal_replay.py")
+    monkeypatch.setattr(replay, "load_self_heal", lambda: sh)
+    for k in ("COACH_DEFECT_CONFIRM_MODEL", "COACH_DEFECT_CONFIRM_PROVIDER"):
+        monkeypatch.setenv(k, "")  # restored after the test: main() writes the pin into os.environ
+    data = tmp_path / "rows.jsonl"
+    data.write_text(json.dumps({"id": "neg", "label": 0, "text": "That was my mistake in my scratch script; fixed it.",
+                                "ask": "x", "tool_log": []}) + "\n")
+
+    def llm(system, prompt):
+        sh.note_model(_Resp("claude-haiku-5-5"))
+        return json.dumps({"p_defect": 0.85, "kind": "admission", "component": "agent", "symptom": "x"})
+    conf = []
+
+    def confirm(system, prompt):
+        conf.append(1)
+        sh.note_model(_Resp("claude-sonnet-5-5"))
+        return json.dumps({"p_defect": 0.0, "kind": "admission", "component": "agent", "symptom": "y"})
+    out = tmp_path / "out"
+    replay.main(["--data", str(data), "--out", str(out), "--mode", "admission", "--samples", "2", "--confirm",
+                 "--workers", "1"], llm=llm, confirm_llm=confirm)
+    rep = json.loads((out / "report.json").read_text())
+    assert rep["models"] == {"judge": {"claude-haiku-5-5": 2}, "confirm": {"claude-sonnet-5-5": 2}}
+    assert "confirm: claude-sonnet-5-5 x2" in (out / "report.md").read_text()
+    # pinning another confirm model is a new cache key: the confirm stage runs again, the judge stays cached
+    replay.main(["--data", str(data), "--out", str(out), "--mode", "admission", "--samples", "2", "--confirm",
+                 "--confirm-provider", "openai-codex", "--confirm-model", "gpt-6.1-sol", "--workers", "1"],
+                llm=llm, confirm_llm=confirm)
+    assert len(conf) == 4
+    assert json.loads((out / "report.json").read_text())["models"] == {"confirm": {"claude-sonnet-5-5": 2}}
+    import os
+    assert os.environ["COACH_DEFECT_CONFIRM_MODEL"] == "gpt-6.1-sol"  # what sh.confirm_judge() reads
+
+
 def test_complaint_cascade_gate_second_opinion_and_confirm():
     first, c1 = judge(0.8, kind="agent_fault")
     no, c2 = judge(0.2, kind="none")

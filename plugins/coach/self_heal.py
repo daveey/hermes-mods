@@ -1154,18 +1154,43 @@ def skip_reason(platform: str = "", parent_session_id: str = "") -> Optional[str
     return None
 
 
+_MODEL_TL = threading.local()  # the model the last aux judge call on this thread resolved to (note_model)
+
+
+def note_model(resp) -> None:
+    """Remember the model a judge response came from: `class:` routing picks a provider per session (gpt-6.1-sol or
+    claude-sonnet-5-5 for class:standard), and the three not_defect admissions were all confirmed by gpt-6.1-sol while
+    their replay ran on claude-sonnet-5-5 (t_01a1d01a9a9bb5db)."""
+    _MODEL_TL.model = str(getattr(resp, "model", "") or "")
+
+
+def _tracked(fn: Callable[[str, str], str]) -> Callable[[str, str], str]:
+    def call(system: str, prompt: str) -> str:
+        _MODEL_TL.model = ""
+        return fn(system, prompt)
+    return call
+
+
+def _resolved(key: str) -> dict:
+    """{key: model} when the judge just called reported one (production aux judges do; injected test judges don't)."""
+    m = getattr(_MODEL_TL, "model", "")
+    return {key: m} if m else {}
+
+
 def audit_verdict(final_reply: str, llm: Callable[[str, str], str], tool_log=None, ask="",
                   confirm: Optional[Callable[[str, str], str]] = None) -> Optional[dict]:
     """The turn-end audit, before the threshold: judge; an admission at >= GATE goes to the confirm model (when
     configured), whose verdict replaces it. Only AUDIT_KINDS count; other kinds score 0. The verdict carries `stages`
     (judge, or judge+confirm) and, when confirmed, the judge's own `stage1_p`/`stage1_kind`, so a filed detection
-    shows which stage filed it."""
+    shows which stage filed it; `judge_model`/`confirm_model` name the model each stage resolved to (class routing
+    picks one per session)."""
     system, prompt = _with_profile(AUDIT_SYS), admission_prompt(final_reply, tool_log, ask)
-    v = parse(llm(system, prompt))
-    stages = {"stages": "judge"}
+    v = parse(_tracked(llm)(system, prompt))
+    stages = {"stages": "judge", **_resolved("judge_model")}
     if v and confirm and v.get("kind") in AUDIT_KINDS and v["p_defect"] >= GATE:
-        stages = {"stages": "judge+confirm", "stage1_p": v["p_defect"], "stage1_kind": v.get("kind")}
-        v = parse(confirm(system, prompt))
+        stages = {**stages, "stages": "judge+confirm", "stage1_p": v["p_defect"], "stage1_kind": v.get("kind")}
+        v = parse(_tracked(confirm)(system, prompt))
+        stages.update(_resolved("confirm_model"))
     if not v:
         return None
     v = {**v, **stages}
@@ -1215,6 +1240,7 @@ def confirm_judge() -> Optional[Callable[[str, str], str]]:
         resp = call_llm(task="coach_defect_confirm", provider=provider or None, model=model,
                         messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
                         max_tokens=400, temperature=0, timeout=60)
+        note_model(resp)
         return (getattr(resp.choices[0].message, "content", None) or "").strip()
     return judge
 
@@ -1264,6 +1290,7 @@ def aux_judge(system: str, prompt: str) -> str:
     resp = call_llm(task="coach_defect", messages=[{"role": "system", "content": system},
                                                   {"role": "user", "content": prompt}],
                     max_tokens=1500, temperature=0, timeout=30, **kw)
+    note_model(resp)
     return (getattr(resp.choices[0].message, "content", None) or "").strip()
 
 
@@ -1332,7 +1359,8 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
     if hit_ev and not str(evidence or "").startswith(hit_ev[:60]):
         evidence = f"{hit_ev[:300]} | reply: {str(evidence or '')[-180:]}"
     stop = {k: hit[k] for k in ("stop_cause", "stop_evidence", "stop_host") if k in hit}
-    stop.update({k: hit[k] for k in ("stages", "stage1_p", "stage1_kind") if k in hit})  # which audit stage filed it
+    stop.update({k: hit[k] for k in ("stages", "stage1_p", "stage1_kind", "judge_model", "confirm_model")
+                 if k in hit})  # which audit stage filed it, on which model
     if probe_session(session_id, ask):
         rec = {"event": "selfheal_detect", "mode": m, "session_id": session_id, "source": hit["source"],
                "p": hit["p_defect"], "component": hit["component"], "symptom": hit["symptom"],
