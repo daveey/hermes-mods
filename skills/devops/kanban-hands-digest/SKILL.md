@@ -63,6 +63,11 @@ and read `core_update_drain_hold`, `at_capacity` and `skipped_ineligible` reason
 `waiting_for_worker_capacity`). Reach an EC2 worker that has no ssh/tailnet name via hub instance-role SSM:
 `aws --region us-west-2 ec2 describe-instances` filtered on tag `Name=hermes-worker-N`, then `ssm send-command`
 (`AWS-RunShellScript`) with a base64'd script run as `sudo -iu ubuntu bash`, so `hermes` and `~/.hermes` resolve.
+A card pinned `machine:worker-N` that sits `ready` with no worker: on that worker, `hermes kanban show <id>` prints
+"not imported here; last pickup skip: <reason>" (`hold`, `budget_exhausted`). For `hold`, read the Board registry
+(`python3 -c "from hermes_cli import kanban_worker_node as w; print(w.registry()['machines']['worker-N'])"` from
+`~/.hermes/hermes-agent`): `hold_reason` names the owner card and its release deadline (often a core-rollout
+drain). Don't move a card whose worktree lives on that worker; report the hold's owner and release time instead.
 The fleet panel's header "waiting" counts unleased `ready` cards whose assignee is a dispatchable profile. Each machine
 row splits them into the cards it can take and those it can't (labels, pins), so read the row, not the header, to see
 whether that machine has real demand. Verify it live by fetching `/api/plugins/runners/v1/fleet` on the dashboard port
