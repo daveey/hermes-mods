@@ -239,3 +239,26 @@ test('status bar: one meter for the hub, one for worker gateways; track = capaci
     assert.match(chip.textContent, /Hub.*Workers/)
   } finally { await ui.close() }
 })
+
+test('gateway rows: one grid line each in a shared column grid, no Investigate control', async () => {
+  const body = fleet()
+  body.gateways.machines = body.gateways.machines.map((m) => ({ ...m, waiting: 1, ineligible: 2, load: { cpu_load1: 1, cpus: 8, mem_used_pct: 10, disk_free_gb: 5, disk_total_gb: 50, at: NOW, stale: false } }))
+  const ui = await render(P.merge([{ route, body, at: NOW }], NOW))
+  const rows = [...ui.container.querySelectorAll('.hermes-fleet-gw > .hermes-fleet-row')]
+  assert.deepEqual(rows.map((r) => r.dataset.machine), ['hub', 'worker-1', 'mini'])
+  for (const r of rows) {
+    assert.deepEqual([...r.children].map((c) => c.className.split(' ')[0]),
+      ['hermes-fleet-name', 'hermes-fleet-slots', 'hermes-fleet-count', 'hermes-fleet-meta', 'hermes-fleet-load'])
+    assert.ok(r.querySelector('.hermes-fleet-slots > .hermes-fleet-gap + .hermes-fleet-waiting'))
+  }
+  // CI rows keep their own layout outside the gateway grid.
+  assert.equal(ui.container.querySelector('.hermes-fleet-gw [data-machine="ec2-gwgen"]'), null)
+  assert.doesNotMatch(ui.container.textContent, /Investigat/)
+  assert.equal(ui.container.querySelector('[data-investigate]'), null)
+  // The shared columns come from the stylesheet: rows are subgrids of one gateway grid, on one grid row.
+  const css = (await import('node:fs')).readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
+  assert.match(css, /\n\.hermes-fleet-gw\{display:grid;/)
+  assert.match(css, /\n\.hermes-fleet-gw>\.hermes-fleet-row\{[^}]*grid-template-columns:subgrid[^}]*white-space:nowrap/)
+  assert.match(css, /\n\.hermes-fleet-gw>\.hermes-fleet-row>\*\{grid-row:1\}/)
+  await ui.close()
+})

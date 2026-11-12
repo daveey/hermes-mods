@@ -3,7 +3,7 @@ import sqlite3
 
 import pytest
 
-from plugins.runners import fleet, investigate, receipts
+from plugins.runners import fleet, receipts
 from plugins.runners.tests.test_fleet import NOW, MIN, _shadow
 from plugins.runners.tests.test_receipts import OP, make_store, verify
 
@@ -19,7 +19,7 @@ def ro_fails(monkeypatch):
     monkeypatch.setattr(sqlite3, 'connect', connect)
 
 
-@pytest.mark.parametrize('mod', [fleet, investigate, receipts])
+@pytest.mark.parametrize('mod', [fleet, receipts])
 def test_helper_reads_but_cannot_write_and_never_creates(mod, tmp_path, ro_fails):
     db = tmp_path / 'x.db'
     c = sqlite3.connect(db); c.execute('create table t(x)'); c.execute('insert into t values (42)'); c.commit(); c.close()
@@ -38,16 +38,6 @@ def test_helper_reads_but_cannot_write_and_never_creates(mod, tmp_path, ro_fails
 def test_fleet_live_leases_survive_ro_failure(tmp_path, ro_fails):
     _shadow(tmp_path, 'default', [('t_a', 'Card A', 'running', 100, 'hub', NOW + MIN)])
     assert [r['task'] for r in fleet.live_leases(tmp_path, NOW)] == ['t_a']
-
-
-def test_investigate_latest_survives_ro_failure(tmp_path, ro_fails):
-    db = sqlite3.connect(tmp_path / 'default.db')
-    db.execute('CREATE TABLE tasks (id TEXT, status TEXT, result TEXT, title TEXT, created_at INTEGER, '
-               'completed_at INTEGER, human_request TEXT, idempotency_key TEXT)')
-    db.execute('INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?)',
-               ('t_1', 'done', None, investigate.TITLE + ' mini', 5, 6, None, investigate.KEY_PREFIX + 'mini:5'))
-    db.commit(); db.close()
-    assert investigate.latest([tmp_path])['mini']['task'] == 't_1'
 
 
 def test_receipts_verify_survives_ro_failure(tmp_path, ro_fails):

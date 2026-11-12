@@ -33,7 +33,9 @@ rule for older gateways): **Macs** (macOS label or `mac` in the name), **EC2 Lin
 other Linux), **Metta** (`metta*`), **Ephemeral** (per-instance runners), **Other**. Each group is one collapsed
 row: `▸ ● EC2 Linux (9) · 2 offline · ⚠ 1 … 5/14` (slots busy/total; dot red = a readiness warning, amber = some
 offline, green = all fine). Click to expand its machines as before; which groups are open is remembered in
-localStorage (`hermes-runners-ci-open`). Gateway workers stay a flat list.
+localStorage (`hermes-runners-ci-open`). Gateway workers stay a flat list. Each gateway machine is one line (name, slots,
+waiting counts, CPU/RAM/Disk, flags, busy count) and the lines share one column grid, so every field sits flush
+with the same field on the other rows; the panel is up to 1000 px wide to fit.
 
 Load: each gateway machine reports CPU load, RAM in use and disk space to the Board every 30 s (core
 `hermes_cli/machine_metrics.py` → `POST /v2/machines/me/metrics`, returned by `GET /v2/machines`). The row
@@ -41,15 +43,6 @@ shows `CPU 50% · RAM 61% · Disk 57 GB free` with small bars (CPU = 1-min load 
 orange), "load not reported" until the machine's core has the reporter, and "(N min old)" in grey after 2 min.
 CI machines show load and free disk only when the runners collector probes their host (no RAM there); the
 others have no meter line.
-
-Investigate: each gateway row has an **Investigate** button. It posts the machine and its current numbers to
-`POST /v1/investigations` on the gateway that served the gateway section; that gateway creates a Kanban card
-with `placement=<machine>` (so the card runs ON that machine; a cross-gateway create for machines without
-pickup) and the `machine-investigate` skill, or returns the one already open or blocked (never a duplicate).
-The row then shows `Investigating · t_…` (click opens the card), `Needs you · <ask>` while the card is blocked,
-or `Investigated 12m ago · <verdict>` (click opens the result; the button starts a new one). Status comes from
-the fleet response: each gateway row carries `investigation` (newest card titled `Investigate machine load: <name>`
-in the board replicas; a create not yet replicated shows as queued for 15 min).
 
 Slot styles: filled = busy, outline = free, dotted = offline/unknown, hatched = draining (registry `hold`),
 red = lost (machine holds cards but the Board has not seen it for 10 min). An asleep machine with nothing
@@ -94,9 +87,6 @@ python -m pytest plugins/runners/tests/test_fleet.py plugins/runners/tests/test_
 
 - CI groups: categories + counts + health, collapsed by default, expand/remember/collapse: `groups.test.mjs`,
   `test_fleet.py` `test_ci_machine_categories_for_the_panel_groups`
-- Investigate: start / already running / queued / needs you / done / error / old host:
-  `investigate.test.mjs`; route create with placement, reuse of open/blocked, restart after done, refusals,
-  fleet rows carry the latest: `test_api.py` `test_investigation_route_*`, `test_fleet_rows_carry_their_latest_investigation`;
-  what the card runs: `skills/devops/machine-investigate/tests/test_collect.py`
+- gateway rows are single grid lines in one shared grid, no Investigate control: "gateway rows: one grid line"
 
 Not covered: native Desktop rendering (checked by hand after hermes-sync).
