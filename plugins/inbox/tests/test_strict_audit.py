@@ -67,6 +67,17 @@ def test_legitimate_open_asks_are_not_junk(poster, title, actions):
     assert res["strict_counts"]["junk_items"] == 0
 
 
+@pytest.mark.parametrize("actions", [[], [{"kind": "resolve"}]])
+def test_hub_pin_digest_poster_is_shipped_registered(actions):
+    # The owner-requested hub-pin digest was registered only in the hub's local extras, which the strict audit
+    # cannot see, so every digest read as an unregistered poster. It ships in posters.yaml now.
+    row = item(state="open", outcome=None, poster="kanban-hub-pin-sweep", key="hub-pin-digest:453",
+               title="Hub pin check: 8 of 14 cards moved to workers", actions=actions)
+    res = audit.audit([row], NOW)
+    assert res["strict_counts"]["unregistered_posters"] == 0
+    assert res["strict_counts"]["status_cards"] == 0
+
+
 def test_repeated_audit_across_midnight_reuses_family_owner():
     from audit_fixtures import BoardRunner
     runner = BoardRunner()
