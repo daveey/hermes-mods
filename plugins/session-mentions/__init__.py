@@ -246,11 +246,24 @@ def handle_task(args: dict, session_id: str | None = None, *, timeout_seconds: f
     if action == "comment" and rh.requested(args):
         # kanban-d1b921f32e: this gateway holds the chat's transcript, so it proves the relay here.
         relayed, refusal = rh.stamp(str(args["target"]), session_id, base=rf.root(),
-                                    state_db=rf._hermes_home() / "state.db", write=rf.atomic_write)
+                                    state_db=rf._hermes_home() / "state.db")
         if refusal:
             return _err(refusal)
         args["relayed_human"] = relayed
     out = _relay(f"task_{action}", args, session_id, 0, **({"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}))
+    if args.get("relayed_human"):
+        # The ledger records a relay only once the card's gateway stored it: a failed delivery leaves the
+        # user message relayable. That core's own refusal (replay, pre-ask) is a refusal, not a transport error.
+        try:
+            data = json.loads(out)
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and data.get("ok") is True:
+            rh.record(str(args["target"]), args["relayed_human"], base=rf.root(), write=rf.atomic_write)
+        elif (refused := rh.refusal_of(data)) is not None:
+            return json.dumps({"ok": False, "rejection": "relayed_human_refused",
+                               "error": f"relays_user_message refused by the card's gateway: {refused}. "
+                                        "Post it without the flag if it is not the user's reply."})
     return out
 
 def _devices_note(base) -> str:
