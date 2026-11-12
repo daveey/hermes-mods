@@ -75,16 +75,21 @@ test('waiting: header counts dispatched cards; rows split placement fit with too
   assert.match(ui.container.querySelector('.hermes-fleet-head [title]').title, /gateway-dispatched profiles.*counted once/)
   const hub = ui.container.querySelector('[data-machine="hub"]')
   assert.equal(hub.querySelector('.hermes-fleet-count').textContent, '1/4')
-  const fit = hub.querySelector('.hermes-fleet-slots > .hermes-fleet-waiting')
-  assert.equal(fit.textContent, '18 waiting')
+  const fit = hub.querySelector(':scope > .hermes-fleet-waiting')
+  assert.equal(fit.textContent, '18')
   assert.match(fit.title, /Need a slot here.*other machines/)
   const excluded = hub.querySelector('.hermes-fleet-ineligible')
-  assert.equal(excluded.textContent, "72 can't run here")
+  assert.equal(excluded.textContent, '72')
   assert.match(excluded.title, /placement labels, skill labels, machine pins or pinned-only/)
-  assert.match(ui.container.querySelector('[data-machine="mini"]').textContent, /0 waiting90 can't run here/)
+  const mini = ui.container.querySelector('[data-machine="mini"]')
+  assert.deepEqual(['waiting', 'ineligible'].map((k) => mini.querySelector(`.hermes-fleet-${k}`).textContent), ['0', '90'])
+  // The units are in the column header, once.
+  assert.deepEqual([...ui.container.querySelectorAll('.hermes-fleet-cols > span')].map((e) => e.textContent),
+    ['Machine', 'Slots', 'Waiting', "Can't run", 'CPU', 'RAM', 'Disk free', '', 'Busy'])
   await ui.close()
   const old = await render(P.merge([{ route, body: fleet(), at: NOW }], NOW))  // older gateway: no count
   assert.doesNotMatch(old.container.textContent, /waiting/)
+  assert.equal(old.container.querySelector('[data-machine="hub"] > .hermes-fleet-waiting').textContent, '')
   await old.close()
 })
 
@@ -108,14 +113,17 @@ test('load meters: reported, absent and stale', async () => {
   body.gateways.machines[1].load = { cpu_load1: 1, cpus: 8, at: NOW - 10 * 60000, stale: true }
   body.ci.machines[1].load = { cpu_load1: 30.35, disk_free_gb: 24, at: NOW, stale: false }
   const ui = await render(P.merge([{ route, body, at: NOW }], NOW))
-  const hub = ui.container.querySelector('[data-machine="hub"] .hermes-fleet-load')
-  assert.equal(hub.textContent, 'CPU  50%RAM  95%Disk  57 GB free')
+  const cells = (name) => [...ui.container.querySelectorAll(`[data-machine="${name}"] > .hermes-fleet-meter`)]
+  const hub = ui.container.querySelector('[data-machine="hub"]')
+  assert.deepEqual(cells('hub').map((c) => [c.dataset.meter, c.textContent]), [['cpu', '50%'], ['ram', '95%'], ['disk', '57 GB']])
+  assert.equal(cells('hub')[2].title, 'Disk 57 GB free')
   assert.equal(hub.querySelectorAll('.hermes-fleet-bar').length, 3)
   assert.equal(hub.querySelectorAll('.is-high').length, 1, 'RAM ≥ 90% is highlighted')
-  const w1 = ui.container.querySelector('[data-machine="worker-1"] .hermes-fleet-load')
-  assert.ok(w1.classList.contains('is-stale'))
-  assert.match(w1.textContent, /CPU  13%\(10m old\)/)
-  assert.equal(ui.container.querySelector('[data-machine="mini"] .hermes-fleet-load').textContent, 'load not reported')
+  assert.deepEqual(cells('worker-1').map((c) => c.textContent), ['13%', '–', '–'])
+  assert.ok(cells('worker-1').every((c) => c.classList.contains('is-stale')))
+  assert.match(ui.container.querySelector('[data-machine="worker-1"] .hermes-fleet-meta').textContent, /load 10m old/)
+  assert.deepEqual(cells('mini').map((c) => c.textContent), ['–', '–', '–'])
+  assert.match(ui.container.querySelector('[data-machine="mini"] .hermes-fleet-meta').textContent, /load not reported/)
   assert.equal(P.loadParts({ cpus: 16, at: NOW }), null, 'a report with no readable values is "not reported"')
   // CI: the collector's probe has load (no core count) and disk; machines without a probe show no meter line.
   assert.match(ui.container.querySelector('[data-machine="mac-mini"] .hermes-fleet-load').textContent, /load\s+30.35.*24 GB free/)
@@ -248,8 +256,8 @@ test('gateway rows: one grid line each in a shared column grid, no Investigate c
   assert.deepEqual(rows.map((r) => r.dataset.machine), ['hub', 'worker-1', 'mini'])
   for (const r of rows) {
     assert.deepEqual([...r.children].map((c) => c.className.split(' ')[0]),
-      ['hermes-fleet-name', 'hermes-fleet-slots', 'hermes-fleet-count', 'hermes-fleet-meta', 'hermes-fleet-load'])
-    assert.ok(r.querySelector('.hermes-fleet-slots > .hermes-fleet-gap + .hermes-fleet-waiting'))
+      ['hermes-fleet-name', 'hermes-fleet-slots', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-meta', 'hermes-fleet-count'])
+    assert.equal(r.children.length, ui.container.querySelectorAll('.hermes-fleet-cols > span').length, 'one cell per header column')
   }
   // CI rows keep their own layout outside the gateway grid.
   assert.equal(ui.container.querySelector('.hermes-fleet-gw [data-machine="ec2-gwgen"]'), null)
@@ -258,7 +266,7 @@ test('gateway rows: one grid line each in a shared column grid, no Investigate c
   // The shared columns come from the stylesheet: rows are subgrids of one gateway grid, on one grid row.
   const css = (await import('node:fs')).readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
   assert.match(css, /\n\.hermes-fleet-gw\{display:grid;/)
-  assert.match(css, /\n\.hermes-fleet-gw>\.hermes-fleet-row\{[^}]*grid-template-columns:subgrid[^}]*white-space:nowrap/)
+  assert.match(css, /\n\.hermes-fleet-gw>\.hermes-fleet-row,\.hermes-fleet-cols\{[^}]*grid-template-columns:subgrid[^}]*white-space:nowrap/)
   assert.match(css, /\n\.hermes-fleet-gw>\.hermes-fleet-row>\*\{grid-row:1\}/)
   await ui.close()
 })

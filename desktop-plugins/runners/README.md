@@ -33,14 +33,15 @@ rule for older gateways): **Macs** (macOS label or `mac` in the name), **EC2 Lin
 other Linux), **Metta** (`metta*`), **Ephemeral** (per-instance runners), **Other**. Each group is one collapsed
 row: `▸ ● EC2 Linux (9) · 2 offline · ⚠ 1 … 5/14` (slots busy/total; dot red = a readiness warning, amber = some
 offline, green = all fine). Click to expand its machines as before; which groups are open is remembered in
-localStorage (`hermes-runners-ci-open`). Gateway workers stay a flat list. Each gateway machine is one line (name, slots,
-waiting counts, CPU/RAM/Disk, flags, busy count) and the lines share one column grid, so every field sits flush
-with the same field on the other rows; the panel is up to 1000 px wide to fit.
+localStorage (`hermes-runners-ci-open`). Gateway workers stay a flat list. Each gateway machine is one line under a column header
+(Machine, Slots, Waiting, Can't run, CPU, RAM, Disk free, flags, Busy): rows hold bare numbers and bars, the
+header carries the unit, and all rows share one column grid. A stale load greys its cells and adds "load N min old"
+to the flags; a machine with no report shows "–" and "load not reported". The panel is up to 1000 px wide.
 
 Load: each gateway machine reports CPU load, RAM in use and disk space to the Board every 30 s (core
 `hermes_cli/machine_metrics.py` → `POST /v2/machines/me/metrics`, returned by `GET /v2/machines`). The row
-shows `CPU 50% · RAM 61% · Disk 57 GB free` with small bars (CPU = 1-min load ÷ cores; a bar at 90 % or more is
-orange), "load not reported" until the machine's core has the reporter, and "(N min old)" in grey after 2 min.
+shows a bar and a number under the CPU, RAM and Disk free headers (CPU = 1-min load ÷ cores; a bar at 90 % or more is
+orange), "load not reported" until the machine's core has the reporter, and "load N min old" in grey after 2 min.
 CI machines show load and free disk only when the runners collector probes their host (no RAM there); the
 others have no meter line.
 
@@ -87,6 +88,6 @@ python -m pytest plugins/runners/tests/test_fleet.py plugins/runners/tests/test_
 
 - CI groups: categories + counts + health, collapsed by default, expand/remember/collapse: `groups.test.mjs`,
   `test_fleet.py` `test_ci_machine_categories_for_the_panel_groups`
-- gateway rows are single grid lines in one shared grid, no Investigate control: "gateway rows: one grid line"
+- gateway rows are single grid lines under one column header (bare numbers, units in the header), no Investigate control: "gateway rows: one grid line", "waiting: header counts", "load meters"
 
 Not covered: native Desktop rendering (checked by hand after hermes-sync).

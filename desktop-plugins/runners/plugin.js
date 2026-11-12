@@ -420,12 +420,41 @@ function openCard(run) {
   host.navigate?.('/kanban')
 }
 
+// Column headers for the gateway grid: the unit of each number lives here, not in every row.
+const GW_COLS = [
+  ['name', 'Machine'], ['slots', 'Slots'],
+  ['waiting', 'Waiting', 'Unleased ready cards that match this machine and need a slot here'],
+  ['ineligible', "Can't run", 'Unleased ready cards whose placement, skills or pins do not match this machine'],
+  ['cpu', 'CPU', '1-min load ÷ cores'], ['ram', 'RAM', 'Memory in use'], ['disk', 'Disk free'],
+  ['meta', ''], ['count', 'Busy']
+]
+
+function GatewayHead() {
+  return h('div', { className: 'hermes-fleet-cols' },
+    ...GW_COLS.map(([k, label, title]) => h('span', { key: k, 'data-col': k, title }, label)))
+}
+
+// One grid cell per meter, so the bars and numbers line up under their header whatever the value.
+function MeterCell({ k, v }) {
+  const p = v?.parts.find((x) => x.key === k)
+  const cls = `hermes-fleet-cell hermes-fleet-meter${v?.stale ? ' is-stale' : ''}`
+  if (!p) return h('span', { className: `${cls} is-none`, 'data-meter': k, title: v ? undefined : 'load not reported' }, '–')
+  const value = k === 'disk' ? p.text.replace(' free', '') : p.text
+  return h('span', { className: cls, 'data-meter': k, title: `${p.label} ${p.text}${v.stale ? ` (${v.stale})` : ''}` },
+    p.pct == null ? null : h('span', { className: `hermes-fleet-bar${p.pct >= 90 ? ' is-high' : ''}` },
+      h('span', { style: { width: `${p.pct}%` } })),
+    h('span', { className: 'hermes-fleet-num' }, value))
+}
+
 function GatewayRow({ m, now }) {
   const free = m.slots == null ? 0 : Math.max(0, m.slots - m.running.length)
   const freeState = m.state === 'active' ? 'idle' : m.state === 'draining' ? 'draining' : 'unknown'
+  const v = loadParts(m.load, now)
   const meta = [
     m.pinned_only ? 'pinned only' : null,
-    m.slots == null ? 'slots not set' : m.slots_source === 'local' ? 'slots from local cap' : null
+    m.slots == null ? 'slots not set' : m.slots_source === 'local' ? 'slots from local cap' : null,
+    m.reason,
+    v ? (v.stale ? `load ${v.stale}` : null) : 'load not reported'
   ].filter(Boolean).join(' · ')
   return h('div', { className: `hermes-fleet-row is-${m.state}`, 'data-machine': m.name },
     h('span', { className: 'hermes-fleet-name' }, text(m.name)),
@@ -435,14 +464,13 @@ function GatewayRow({ m, now }) {
         title: `${r.task} · ${text(r.title)}\nboard ${r.board}${r.started_at ? ` · running ${ago(now - r.started_at * 1000)}` : ''}`,
         onClick: () => openCard(r)
       })),
-      ...Array.from({ length: free }, (_, i) => h(Slot, { key: `free-${i}`, state: freeState, title: freeState === 'draining' ? 'draining: takes no new cards' : SLOT_TITLE[freeState] })),
-      h('span', { key: 'gap', className: 'hermes-fleet-gap' }),
-      m.waiting != null ? h('span', { className: 'hermes-fleet-waiting', title: `${m.waiting} unleased ready card(s) for gateway-dispatched profiles match placement labels (including skill labels) on ${m.name}. Need a slot here; portable cards can also fit other machines. Does not include transient admission limits or machine availability.` }, `${m.waiting} waiting`) : null,
-      m.ineligible != null ? h('span', { className: 'hermes-fleet-waiting hermes-fleet-ineligible', title: `${m.ineligible} unleased ready card(s) for gateway-dispatched profiles cannot run here: placement labels, skill labels, machine pins or pinned-only policy do not match ${m.name}, or the card is another gateway's default-placement card that ${m.name} never picks up.` }, `${m.ineligible} can't run here`) : null),
+      ...Array.from({ length: free }, (_, i) => h(Slot, { key: `free-${i}`, state: freeState, title: freeState === 'draining' ? 'draining: takes no new cards' : SLOT_TITLE[freeState] }))),
+    h('span', { className: 'hermes-fleet-cell hermes-fleet-waiting', title: m.waiting != null ? `${m.waiting} unleased ready card(s) for gateway-dispatched profiles match placement labels (including skill labels) on ${m.name}. Need a slot here; portable cards can also fit other machines. Does not include transient admission limits or machine availability.` : undefined }, m.waiting != null ? `${m.waiting}` : ''),
+    h('span', { className: 'hermes-fleet-cell hermes-fleet-ineligible', title: m.ineligible != null ? `${m.ineligible} unleased ready card(s) for gateway-dispatched profiles cannot run here: placement labels, skill labels, machine pins or pinned-only policy do not match ${m.name}, or the card is another gateway's default-placement card that ${m.name} never picks up.` : undefined }, m.ineligible != null ? `${m.ineligible}` : ''),
+    h(MeterCell, { k: 'cpu', v }), h(MeterCell, { k: 'ram', v }), h(MeterCell, { k: 'disk', v }),
+    h('span', { className: 'hermes-fleet-meta', title: meta || undefined }, meta),
     h('span', { className: 'hermes-fleet-count' },
-      m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`),
-    h('span', { className: 'hermes-fleet-meta' }, [meta, m.reason].filter(Boolean).join(' · ')),
-    h(Meters, { load: m.load, now })
+      m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`)
   )
 }
 
@@ -604,6 +632,7 @@ export function Panel({ view, now, repairClient }) {
         s.gWaiting != null ? h('span', { title: 'Unleased ready cards assigned to gateway-dispatched profiles, counted once across board replicas. Excludes non-dispatched assignees; some cards cannot run on every machine.' }, ` · ${s.gWaiting} waiting`) : null)),
     h(SectionNote, { section: view.gateways }),
     h('div', { className: 'hermes-fleet-gw' },
+      h(GatewayHead),
       ...view.gateways.machines.map((m) => h(GatewayRow, { key: m.name, m, now }))),
     h('div', { className: 'hermes-fleet-head' },
       h('span', null, 'CI workers (GitHub Actions)'),
@@ -725,20 +754,24 @@ const CSS = `
 .hermes-fleet-group-meta{font-size:11px;color:var(--ui-text-tertiary);white-space:nowrap}
 .hermes-fleet-chev{color:var(--ui-text-tertiary);font-size:10px}
 .hermes-fleet-group>.hermes-fleet-row{padding-left:18px}
-.hermes-fleet-gw{display:grid;grid-template-columns:max-content max-content max-content minmax(0,1fr) max-content;row-gap:3px}
-.hermes-fleet-gw>.hermes-fleet-row{grid-column:1/-1;grid-template-columns:subgrid;column-gap:14px;white-space:nowrap}
+.hermes-fleet-gw{display:grid;grid-template-columns:repeat(7,max-content) minmax(0,1fr) max-content;row-gap:3px}
+.hermes-fleet-gw>.hermes-fleet-row,.hermes-fleet-cols{display:grid;grid-column:1/-1;grid-template-columns:subgrid;column-gap:16px;align-items:center;white-space:nowrap}
 .hermes-fleet-gw>.hermes-fleet-row>*{grid-row:1}
+.hermes-fleet-cols{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--ui-text-tertiary)}
+.hermes-fleet-cols>[data-col=waiting],.hermes-fleet-cols>[data-col=ineligible],.hermes-fleet-cols>[data-col=count]{text-align:right}
 .hermes-fleet-gw .hermes-fleet-name{grid-column:1;max-width:150px}
 .hermes-fleet-gw .hermes-fleet-slots{grid-column:2;flex-wrap:nowrap}
-.hermes-fleet-gw .hermes-fleet-gap{flex:1}
-.hermes-fleet-gw .hermes-fleet-waiting{min-width:64px;text-align:right}
-.hermes-fleet-gw .hermes-fleet-ineligible{min-width:98px}
-.hermes-fleet-gw .hermes-fleet-load{grid-column:3;flex-wrap:nowrap}
-.hermes-fleet-gw .hermes-fleet-meter[data-meter=cpu]{min-width:94px}
-.hermes-fleet-gw .hermes-fleet-meter[data-meter=ram]{min-width:90px}
-.hermes-fleet-gw .hermes-fleet-meter[data-meter=disk]{min-width:128px}
-.hermes-fleet-gw .hermes-fleet-meta{grid-column:4;overflow:hidden;text-overflow:ellipsis}
-.hermes-fleet-gw .hermes-fleet-count{grid-column:5}
+.hermes-fleet-gw .hermes-fleet-cell{font-size:11px;font-variant-numeric:tabular-nums;color:var(--ui-text-secondary)}
+.hermes-fleet-gw .hermes-fleet-waiting{grid-column:3;margin:0;text-align:right}
+.hermes-fleet-gw .hermes-fleet-ineligible{grid-column:4;margin:0;text-align:right}
+.hermes-fleet-gw .hermes-fleet-meter{display:flex;gap:6px}
+.hermes-fleet-gw .hermes-fleet-meter[data-meter=cpu]{grid-column:5}
+.hermes-fleet-gw .hermes-fleet-meter[data-meter=ram]{grid-column:6}
+.hermes-fleet-gw .hermes-fleet-meter[data-meter=disk]{grid-column:7}
+.hermes-fleet-gw .hermes-fleet-meter.is-stale,.hermes-fleet-gw .hermes-fleet-meter.is-none{color:var(--ui-text-tertiary)}
+.hermes-fleet-gw .hermes-fleet-num{flex:1;text-align:right}
+.hermes-fleet-gw .hermes-fleet-meta{grid-column:8;overflow:hidden;text-overflow:ellipsis}
+.hermes-fleet-gw .hermes-fleet-count{grid-column:9}
 .hermes-fleet-note,.hermes-fleet-foot{font-size:11px;color:var(--ui-text-tertiary)}
 .hermes-fleet-foot{margin-top:8px}
 .hermes-fleet-pop{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:2px 0 4px;padding:6px;border:1px solid var(--ui-stroke-secondary);border-radius:6px;background:var(--ui-bg)}
