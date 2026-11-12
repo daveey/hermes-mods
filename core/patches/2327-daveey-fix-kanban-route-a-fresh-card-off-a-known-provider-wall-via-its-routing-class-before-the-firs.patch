@@ -1,0 +1,130 @@
+From 79e700a586f86b027068931325cbdd9785e08817 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:29:39 -0800
+Subject: [PATCH] [daveey] fix(kanban): route a fresh card off a known provider
+ wall via its routing class before the first spawn
+
+With kanban.default_model on walled openai-codex and strong_model a class selector
+(provider auto), retier_for_walls had no fallback, so every fresh claim spawned into
+the wall (exit 75) and only the card's new quota episode rerouted it: 11 wasted
+rate_limited runs/hour on laptop-1 (t_01a1c9057bfe5395). Use the episode path's
+alternate_route class probe pre-claim too, skipping require_model cards and any
+alternate the live pool shows walled.
+---
+ hermes_cli/kanban_model_tier.py               | 28 ++++++++-
+ .../test_kanban_quota_episode_walls.py        | 58 +++++++++++++++++++
+ 2 files changed, 85 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 17b12f7974f..d039c9795b8 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -328,12 +328,38 @@ def resolve_dispatch_tier(conn, task, *, lane, cfg=None):
+         from copy import copy
+         probe = copy(task)
+         probe.model_override, probe.provider_override = base[:2]
+-        moved = retier_for_walls(probe, load_tier_config() if cfg is None else cfg)
++        moved = _class_alternate_off_wall(conn, task, base) or retier_for_walls(
++            probe, load_tier_config() if cfg is None else cfg)
+         if moved:
+             return moved[0], moved[1], f'{base[2]}+wall:{moved[2]}'
+     return base
+ 
+ 
++def _class_alternate_off_wall(conn, task, base):
++    """``(model, provider, walled_provider)`` from the assignee's routing class when *base*'s provider is walled
++    right now (provider file or live pool), else None. [daveey]
++
++    Same eligibility probe a card's own quota episode uses (``alternate_route``). Without it a fresh card on a
++    walled default provider had no fallback when the strong tier is a class selector (``retier_for_walls``
++    skips ``auto``): every first claim spawned into the wall, exited 75, and only its new episode rerouted."""
++    import time
++    from hermes_cli import kanban_provider_walls as pw
++    from hermes_cli.kanban_quota_episode import alternate_route
++    model, provider = base[0], pw._norm(base[1])
++    if pw.REQUIRE_MODEL_MARKER in f"{getattr(task, 'title', '') or ''}\n{getattr(task, 'body', '') or ''}":
++        return None
++    if not model or not provider or provider == 'auto':
++        return None
++    now = time.time()
++    until = pw.active_walls(now=now).get(provider) or pw.live_quota_wall(provider, model)
++    if not until:
++        return None
++    route = alternate_route(conn, task, {provider: until}, base, now)
++    if not route or pw.live_quota_wall(route[1], route[0]):
++        return None
++    return route[0], route[1], provider
++
++
+ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Optional[dict[str, Any]] = None) -> str:
+     implementer_model = _str(getattr(task, "model_override", None)) or None
+     is_review = lane == "review" or REVIEW_SKILL in (getattr(task, "skills", None) or [])
+diff --git a/tests/hermes_cli/test_kanban_quota_episode_walls.py b/tests/hermes_cli/test_kanban_quota_episode_walls.py
+index 38b0ab069a4..a99d2ecfec8 100644
+--- a/tests/hermes_cli/test_kanban_quota_episode_walls.py
++++ b/tests/hermes_cli/test_kanban_quota_episode_walls.py
+@@ -265,3 +265,61 @@ def test_class_with_every_route_walled_falls_back_to_strong_tier(board, monkeypa
+         seen = []
+         dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
+         assert seen == [('claude-opus-5-5', 'anthropic')]
++
++
++LIVE_CFG = {'default_model': 'gpt-6-astra', 'default_provider': 'openai-codex',
++            'strong_model': 'class:deep', 'strong_provider': 'auto'}
++
++
++@pytest.mark.parametrize('evidence', ['provider_file', 'live_pool'])
++def test_fresh_card_skips_a_known_wall_before_its_first_spawn(board, monkeypatch, all_assignees_spawnable, evidence):
++    """A card with no quota episode of its own, default tier on walled codex, strong tier a class selector
++    (the live MacBook config, 2026-11-10): the class alternate must place it before any worker spawns.
++    Before the fix every fresh claim spawned into the codex wall once (exit 75) and only the second claim,
++    judged by the card's own new episode, rerouted: 11 wasted rate_limited runs per hour."""
++    clock = _clock(monkeypatch)
++    config, _ = routing(monkeypatch)
++    route = config['model_routing']['routes']['standard'][0]
++    config['model_routing']['routes'] = {'deep': [dict(route, model='claude-opus-5-5'),
++                                                   dict(route, provider='openai-codex', model='gpt-6-astra')]}
++    monkeypatch.setattr(tier, 'load_tier_config', lambda: LIVE_CFG)
++    codex_reset = float(clock[0] + 5000)
++    if evidence == 'provider_file':
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': codex_reset})
++        monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
++    else:
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {})
++        monkeypatch.setattr(walls, 'live_quota_wall',
++                            lambda provider, model: codex_reset if provider == 'openai-codex' else None)
++    with kbc.connect() as conn:
++        pinned = kb.create_task(conn, title='needs astra', body=f'{walls.REQUIRE_MODEL_MARKER}', assignee='a')
++        assert tier.resolve_dispatch_tier(conn, kb.get_task(conn, pinned), lane='ready')[:2] == (
++            'gpt-6-astra', 'openai-codex')  # a require_model card is never moved off its model
++        conn.execute("DELETE FROM tasks WHERE id=?", (pinned,))
++        conn.commit()
++        tid = kb.create_task(conn, title='fresh default card', assignee='a')
++        seen = []
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
++        assert seen == [('claude-opus-5-5', 'anthropic')]
++        receipt = kb._json_dict(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='run_route' "
++                                             "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0])
++        assert receipt['tier_reason'] == 'default+wall:openai-codex'
++
++
++def test_fresh_card_class_alternate_never_lands_on_another_wall(board, monkeypatch, all_assignees_spawnable):
++    """Control: the class alternate is walled too (live pool); with no usable route the card keeps its
++    default route rather than being sent into a second wall."""
++    clock = _clock(monkeypatch)
++    config, _ = routing(monkeypatch)
++    route = config['model_routing']['routes']['standard'][0]
++    config['model_routing']['routes'] = {'deep': [dict(route, model='claude-opus-5-5'),
++                                                   dict(route, provider='openai-codex', model='gpt-6-astra')]}
++    monkeypatch.setattr(tier, 'load_tier_config', lambda: LIVE_CFG)
++    monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': float(clock[0] + 5000)})
++    monkeypatch.setattr(walls, 'live_quota_wall',
++                        lambda provider, model: float(clock[0] + 900) if provider == 'anthropic' else None)
++    with kbc.connect() as conn:
++        kb.create_task(conn, title='both walled', assignee='a')
++        seen = []
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
++        assert seen == [('gpt-6-astra', 'openai-codex')]
+-- 
+2.55.0
+

@@ -1,0 +1,101 @@
+From 7b1af6575287aeb64687321d562e235a481bb29a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 22:15:56 -0800
+Subject: [PATCH] [daveey] upstream_sync gate: find the landing PR by head ref,
+ not the origin slug's owner
+
+origin daveey/hermes redirects to example-org/hermes; the head=<slug owner>:<branch>
+filter never matched the open PR, so every run re-ran gh pr create and failed 'already exists'
+(PR #1064 stuck, blocking every later --head). Regression test reproduces it RED without the fix.
+---
+ scripts/ci/upstream_sync.py            | 12 ++++++++----
+ tests/hermes_cli/upstream_gate_fake.py |  4 ++--
+ tests/scripts/ci/test_upstream_sync.py | 19 +++++++++++++++++--
+ 3 files changed, 27 insertions(+), 8 deletions(-)
+
+diff --git a/scripts/ci/upstream_sync.py b/scripts/ci/upstream_sync.py
+index 8b6d2ab66a5..c20b1851ad5 100644
+--- a/scripts/ci/upstream_sync.py
++++ b/scripts/ci/upstream_sync.py
+@@ -221,11 +221,15 @@ def _land_pr(repo, cand: Candidate, gh_repo, request, gh) -> dict:
+         raise GateError(f"{branch} now points at {remote[:10]}, not the tested head {cand.head[:10]}")
+     if not remote:  # the staged branch went away: put the tested head back (same sha, same evidence)
+         _push(repo, cand.head, f"refs/heads/{branch}", "stage")
+-    owner = gh_repo.split("/", 1)[0]
+-    pulls = [pr for page in request(f"repos/{gh_repo}/pulls?state=open&head={owner}:{branch}&per_page=100")
+-             for pr in page if isinstance(pr, dict) and (pr.get("base") or {}).get("ref") == "main"]
++    # Match the head ref, not ``head=<owner>:<branch>``: origin's slug may name a renamed/transferred repo
++    # (daveey/hermes -> example-org/hermes), so the owner filter missed the open PR and
++    # ``gh pr create`` then failed with "already exists" on every run.
++    pulls = [pr for page in request(f"repos/{gh_repo}/pulls?state=open&base=main&per_page=100")
++             for pr in page if isinstance(pr, dict) and (pr.get("base") or {}).get("ref") == "main"
++             and (pr.get("head") or {}).get("ref") == branch]
+     if pulls:
+-        pr = max(pulls, key=lambda p: p["number"])
++        exact = [p for p in pulls if p["head"].get("sha") == cand.head]
++        pr = max(exact or pulls, key=lambda p: p["number"])
+         if pr["head"]["sha"] != cand.head:
+             raise GateError(f"PR #{pr['number']} head is {pr['head']['sha'][:10]}, not the tested head {cand.head[:10]}")
+         return pr
+diff --git a/tests/hermes_cli/upstream_gate_fake.py b/tests/hermes_cli/upstream_gate_fake.py
+index bf75027900e..e310a211e20 100644
+--- a/tests/hermes_cli/upstream_gate_fake.py
++++ b/tests/hermes_cli/upstream_gate_fake.py
+@@ -64,8 +64,8 @@ if "/jobs" in endpoint:
+             for n in [f"Run tests ({{i}}/8)" for i in range(1, 9)] + ["e2e"]]
+     print(json.dumps([{{"jobs": jobs}}]))
+ elif "/pulls?" in endpoint:
+-    branch = endpoint.split("head=", 1)[1].split("&", 1)[0].split(":", 1)[1]
+-    print(json.dumps([[p for p in pulls if p["state"] == "open" and p["head"]["ref"] == branch]]))
++    branch = endpoint.split("head=", 1)[1].split("&", 1)[0].split(":", 1)[1] if "head=" in endpoint else None
++    print(json.dumps([[p for p in pulls if p["state"] == "open" and branch in (None, p["head"]["ref"])]]))
+ elif "/check-runs?" in endpoint:
+     sha = endpoint.split("/commits/", 1)[1].split("/", 1)[0]
+     verdict = checks.get(sha) if any(p["head"]["sha"] == sha for p in pulls) else None
+diff --git a/tests/scripts/ci/test_upstream_sync.py b/tests/scripts/ci/test_upstream_sync.py
+index cde06e00e0b..d6126544e35 100644
+--- a/tests/scripts/ci/test_upstream_sync.py
++++ b/tests/scripts/ci/test_upstream_sync.py
+@@ -91,6 +91,7 @@ class FakeActions:
+         self.gh_calls: list[tuple] = []
+         self.gh_fail: dict[str, str] = {}  # "comment" / "close" -> stderr of a failing gh pr <verb>
+         self.on_close: Callable[[dict], None] | None = None
++        self.canonical_owner = "example"  # a transferred repo: origin's slug owner != GitHub's real owner
+ 
+     def ci(self):
+         """Run 'CI' for every staged branch that has no run yet (status pending until finish())."""
+@@ -136,8 +137,9 @@ class FakeActions:
+             open_prs = [p for p in self.pulls if p["state"] == "open"]
+             if "head=" not in endpoint:
+                 return [open_prs]
+-            branch = endpoint.split("head=", 1)[1].split("&", 1)[0].split(":", 1)[1]
+-            return [[p for p in open_prs if p["head"]["ref"] == branch]]
++            owner, branch = endpoint.split("head=", 1)[1].split("&", 1)[0].split(":", 1)
++            # GitHub filters by the PR's real (canonical) owner, not the slug origin happens to name
++            return [[p for p in open_prs if p["head"]["ref"] == branch and owner == self.canonical_owner]]
+         if "/check-runs?" in endpoint:
+             assert f"check_name={sync.REQUIRED_CHECK.replace(' ', '%20')}" in endpoint
+             return [{"check_runs": self.check_runs(endpoint.split("/commits/", 1)[1].split("/", 1)[0])}]
+@@ -424,6 +426,19 @@ def test_landing_pr_merges_only_on_a_green_required_check_at_the_exact_head(worl
+         assert landed_by_merge(root, head, before) and len(actions.pulls) == 1
+ 
+ 
++def test_an_open_landing_pr_is_reused_when_origin_names_a_transferred_repo(world, capsys):
++    """origin daveey/hermes redirects to example-org/hermes: an ``head=<slug owner>:`` filter misses
++    the open PR, and re-creating it fails with "already exists" on every run, so nothing ever lands."""
++    root, checkout, head, actions, before = green_candidate(world)
++    actions.aggregate = ("in_progress", None)
++    assert gate(checkout, head, actions) == sync.NOT_YET  # opens the landing PR
++    actions.canonical_owner = "new-owner"  # the repo moved; origin's URL still says example/fork
++    actions.aggregate = ("completed", "success")
++    assert gate(checkout, head, actions) == sync.LANDED, capsys.readouterr().out
++    assert landed_by_merge(root, head, before) and len(actions.pulls) == 1
++    assert len([c for c in actions.gh_calls if c[:2] == ("pr", "create")]) == 1
++
++
+ GH006 = ("remote: error: GH006: Protected branch update failed for refs/heads/main.\n"
+          "remote: error: Required status check \"All required checks pass (v2)\" is expected.")
+ 
+-- 
+2.55.0
+

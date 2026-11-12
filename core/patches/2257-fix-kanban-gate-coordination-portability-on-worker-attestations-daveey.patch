@@ -1,0 +1,359 @@
+From 96f79a7de5e0aa49b6a9f7b3710241e9c82112f8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:08:57 +0000
+Subject: [PATCH] fix(kanban): gate coordination portability on worker
+ attestations [daveey]
+
+Require current operator Board labels for every pool member before exempting reader/broker markers. Revalidate the actual policy destination at pickup and execution; retain legacy automatic-pin exclusion. Proof: main regression 14 failed; focused 360 passed; all 16 scripts/check gates pass. Historical replay and live rollout remain required before shipping.
+---
+ hermes_cli/kanban_placement.py                |  15 +-
+ hermes_cli/kanban_placement_coordination.py   | 127 +++++++++++++++++
+ hermes_cli/kanban_runs_on_capabilities.py     |   3 +
+ hermes_cli/kanban_worker_placement.py         |   3 +-
+ .../test_kanban_coordination_placement.py     | 132 ++++++++++++++++++
+ 5 files changed, 274 insertions(+), 6 deletions(-)
+ create mode 100644 hermes_cli/kanban_placement_coordination.py
+ create mode 100644 tests/hermes_cli/test_kanban_coordination_placement.py
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index b231594fd03..fd47b611ddb 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -435,16 +435,20 @@ def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+     title, body = args.get("title") or "", without_evidence(without_placement_note(args.get("body") or ""))
+     if _local_marker(title, body, args.get("skills"), c):
+         return "local marker"
++    from hermes_cli import kanban_placement_coordination as coordination
+     from hermes_cli.kanban_carried_evidence import without_carried_inputs
+     from hermes_cli.kanban_published_worktree import without_published_worktrees
+ 
+     full = without_carried_inputs(f"{title}\n{body}", c.raw)
++    if refusal := coordination.check(full, c.raw, skills=args.get("skills")):
++        return refusal
++    marker_full = coordination.marker_text(full)
+     extra = c.raw.get("extra_home_markers")
+-    pats = [p for p in HOME_GATEWAY_MARKERS if p != HOST_WORKTREE_PATH]
+-    pats += list(extra) if isinstance(extra, list) else []
+-    for p in pats:
++    pats = [(p, marker_full) for p in HOME_GATEWAY_MARKERS if p != HOST_WORKTREE_PATH]
++    pats += [(p, full) for p in extra] if isinstance(extra, list) else []
++    for p, text in pats:
+         try:
+-            if re.search(p, full, re.IGNORECASE):
++            if re.search(p, text, re.IGNORECASE):
+                 return "home gateway marker"
+         except re.error:
+             continue
+@@ -458,8 +462,9 @@ def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+ def _routeless_heavy(args: dict, c: _Cfg, self_gw: Optional[str],
+                      machine_ok: Optional[Callable[[str], bool]], *, skip: bool = False) -> Optional[dict]:
+     """Legacy heavy routing; worker pools reuse portability without changing this opt-out path."""
++    from hermes_cli.kanban_placement_coordination import legacy_refusal
+     worker = c.heavy_target(self_gw)
+-    if skip or not worker or portable_reason(args, c.raw):
++    if skip or not worker or legacy_refusal(args) or portable_reason(args, c.raw):
+         return None
+     title, body = args.get("title") or "", args.get("body") or ""
+     heavy = _heavy_marker(title, body, c)
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+new file mode 100644
+index 00000000000..e6df7ec5c29
+--- /dev/null
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -0,0 +1,127 @@
++"""Conservative coordination-tool portability, backed by operator Board attestations.
++
++Labels are rollout attestations, not credentials or permission grants. Only publish them
++once the installed tool has passed an actual worker proof. Unknown actions stay home.
++The pickup gate checks the actual destination again, including after a pool changes.
++"""
++from __future__ import annotations
++
++import math
++import re
++import time
++
++REASON = "needs worker coordination capability"
++ACTION_REASON = "needs home coordination action"
++# Intentionally narrower than the CLI: status and pull are the reader install's proof.
++_HUB = re.compile(r"\bhermes-hub\b(?!\s+client\b)(?:\s+([\w-]+))?", re.IGNORECASE)
++_CROSS = re.compile(r"\bcross_task\b(?:\s+(read|list)\b)?", re.IGNORECASE)
++_TOOLS = {
++    "token-broker": "capability:token-broker",
++    "hermes-core-wt": "capability:core-ship",
++    "tailnet_exec": "capability:tailnet-exec",
++}
++
++
++def requirements(text):
++    """Return required labels and an unsupported-action refusal, without changing text."""
++    labels = set()
++    for match in _HUB.finditer(text):
++        if (match.group(1) or "").lower() not in ("status", "pull"):
++            return labels, ACTION_REASON
++        labels.add("capability:coordination-read")
++    for match in _CROSS.finditer(text):
++        if not match.group(1):
++            return labels, ACTION_REASON
++        labels.add("capability:coordination-read")
++    if re.search(r"\b(?:parent|sibling)[ -]card (?:lookup|read)|\bkanban_show\b", text, re.IGNORECASE):
++        labels.add("capability:coordination-read")
++    for tool, label in _TOOLS.items():
++        if re.search(r"\b" + re.escape(tool) + r"\b", text, re.IGNORECASE):
++            labels.add(label)
++    return labels, None
++
++
++def destinations(cfg, target=None):
++    """No pool inference for an explicit legacy heavy destination."""
++    if target:
++        return [target]
++    from hermes_cli import kanban_capability_registry as reg
++    pools = cfg.get("worker_pools")
++    names = pools.get(reg.self_gateway()) if isinstance(pools, dict) else None
++    if (not isinstance(names, list) or not names or len(names) > 64
++            or not all(isinstance(n, str) and n.strip() for n in names)):
++        return []
++    return names
++
++
++def attested(names, required):
++    """Every possible destination needs a recent operator label; cached records age out."""
++    from hermes_cli import kanban_worker_node as wn
++    if not names:
++        return False
++    snapshot = wn.registry()
++    machines = snapshot.get("machines") if isinstance(snapshot, dict) else None
++    if not isinstance(machines, dict):
++        return False
++    now = time.time()
++    for name in names:
++        entry = machines.get(name)
++        if not isinstance(entry, dict):
++            return False
++        labels = entry.get("labels")
++        if (entry.get("state") != "active" or entry.get("hold") or not wn.advertises_pickup(entry)
++                or not isinstance(labels, list) or not all(isinstance(v, str) for v in labels)
++                or not required.issubset(labels)):
++            return False
++        try:
++            age = now - float(entry.get("last_seen")) / 1000
++        except (TypeError, ValueError, OverflowError):
++            return False
++        if not math.isfinite(age) or not 0 <= age <= 300:
++            return False
++    return True
++
++
++def check(text, cfg, *, target=None, skills=None):
++    required, refusal = requirements(text)
++    required.update(skill_requirements(skills))
++    if refusal or not required:
++        return refusal
++    return None if attested(destinations(cfg, target), required) else REASON
++
++
++def marker_text(text):
++    """Only called after check succeeds. Extra operator markers use ORIGINAL text."""
++    text = _HUB.sub("", text)
++    return re.sub(r"\btoken-broker\b", "", text, flags=re.IGNORECASE)
++
++
++def claim_refusal(card, me):
++    """Revalidate actual destination of enrolled cards, never override explicit pins."""
++    if card.get("placement_policy") != "worker-first-v1":
++        return None
++    from hermes_cli.kanban_placement import without_evidence, without_placement_note
++    text = f"{card.get('title') or ''}\n{without_evidence(without_placement_note(card.get('body') or ''))}"
++    from hermes_cli.kanban_runs_on_capabilities import _loads
++    return check(text, {}, target=me, skills=_loads(card.get("skills"), []))
++
++
++def legacy_refusal(args):
++    """Legacy automatic pins have no policy fence; do not apply coordination exemptions."""
++    from hermes_cli.kanban_placement import without_evidence, without_placement_note
++    text = f"{args.get('title') or ''}\n{without_evidence(without_placement_note(args.get('body') or ''))}"
++    required, refusal = requirements(text)
++    return bool(refusal or required or skill_requirements(args.get("skills")))
++
++
++def skill_requirements(skills):
++    """Known workflow pins whose runtime tools are part of this rollout."""
++    if isinstance(skills, str):
++        skills = [skills]
++    labels = set()
++    for skill in skills or []:
++        if skill == "token-broker":
++            labels.add("capability:token-broker")
++        elif skill in ("hermes-mods-repo-core-dev", "patching-local-hermes-workflow"):
++            labels.add("capability:core-ship")
++    return labels
+diff --git a/hermes_cli/kanban_runs_on_capabilities.py b/hermes_cli/kanban_runs_on_capabilities.py
+index e74a7d32bc1..0cdf45a1723 100644
+--- a/hermes_cli/kanban_runs_on_capabilities.py
++++ b/hermes_cli/kanban_runs_on_capabilities.py
+@@ -234,6 +234,9 @@ def claim_refusal(card: Mapping[str, Any], *, me: str = "") -> Optional[str]:
+     card and reason so a card no machine can take is visible in the worker's log. Pinned skills are not a
+     pickup gate: a worker that cannot load one runs with the missing-skill note (``missing_pin_note``), so a
+     remote card whose create skipped the skill check is never stranded on the Board. [daveey]"""
++    from hermes_cli.kanban_placement_coordination import claim_refusal as coordination_refusal
++    if refusal := coordination_refusal(card, me):
++        return refusal
+     assignee = card.get("assignee")
+     if not assignee:
+         return None
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index a97e9e2fcd3..c1838b97dd9 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -174,7 +174,8 @@ def execution_refusal(conn, row):
+     own = state.get("gateway_id")
+     if not own or labels != [f"machine:{own}"]:
+         return WAITING
+-    return None
++    from hermes_cli.kanban_placement_coordination import claim_refusal
++    return claim_refusal(row, own)
+ 
+ 
+ def local_refusals(conn, status):
+diff --git a/tests/hermes_cli/test_kanban_coordination_placement.py b/tests/hermes_cli/test_kanban_coordination_placement.py
+new file mode 100644
+index 00000000000..6ef754735fb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_coordination_placement.py
+@@ -0,0 +1,132 @@
++"""Coordination tooling is portable only to attested worker destinations."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_placement as kp
++from hermes_cli import kanban_worker_node as wn
++
++
++@pytest.fixture
++def fleet(monkeypatch):
++    cfg = {"worker_pools": {"hub": ["worker"]}, "assignees": ["default"]}
++    entry = {"state": "active", "pickup": "explicit", "last_seen": time.time() * 1000,
++             "labels": ["capability:coordination-read", "capability:token-broker",
++                        "capability:core-ship", "capability:tailnet-exec"]}
++    machines = {"worker": entry}
++    monkeypatch.setattr(kp.reg, "self_gateway", lambda: "hub")
++    monkeypatch.setattr(wn, "registry", lambda: {"machines": machines})
++    return cfg, entry, machines
++
++
++def reason(body, cfg):
++    return kp.portable_reason({"title": "Read coordination evidence", "body": body}, cfg)
++
++
++def test_attested_reader_and_broker_are_portable(fleet):
++    cfg, _, _ = fleet
++    assert reason("cross_task read; hermes-hub status; token-broker exec for gh read", cfg) is None
++
++
++def test_missing_reader_is_named_before_enrollment(fleet):
++    cfg, entry, _ = fleet
++    entry["labels"] = []
++    assert reason("cross_task read", cfg) == "needs worker coordination capability"
++
++
++@pytest.mark.parametrize("field,value", [
++    ("state", "disabled"), ("pickup", None), ("hold", True),
++    ("last_seen", 0), ("last_seen", float("inf")), ("last_seen", "invalid"),
++    ("last_seen", (time.time() + 3600) * 1000), ("labels", "capability:coordination-read"),
++])
++def test_unusable_attestation_fails_closed(fleet, field, value):
++    cfg, entry, _ = fleet
++    entry[field] = value
++    assert reason("cross_task read", cfg) == "needs worker coordination capability"
++
++
++def test_every_member_must_carry_the_capability(fleet):
++    cfg, _, machines = fleet
++    cfg["worker_pools"]["hub"].append("other")
++    machines["other"] = {"labels": []}
++    assert reason("cross_task read", cfg) == "needs worker coordination capability"
++
++
++@pytest.mark.parametrize("body", [
++    "hermes-hub status; hermes-hub create-task other title", "hermes-hub sync",
++    "cross_task comment", "cross_task", "hermes-hub unknown-command",
++])
++def test_write_or_ambiguous_actions_stay_home(fleet, body):
++    cfg, _, _ = fleet
++    assert reason(body, cfg) is not None
++
++
++@pytest.mark.parametrize("body", [
++    "hermes-hub status; systemctl restart service", "hermes-hub status; ssh server",
++    "hermes-hub status; ~/code/_wt/existing", "hermes-hub status; ~/.hermes/state.db",
++])
++def test_independent_host_markers_remain(fleet, body):
++    cfg, _, _ = fleet
++    assert reason(body, cfg) is not None
++
++
++def test_extra_marker_cannot_be_exempted(fleet):
++    cfg, _, _ = fleet
++    cfg["extra_home_markers"] = [r"hermes-hub"]
++    assert reason("hermes-hub status", cfg) == "home gateway marker"
++
++
++def test_no_pool_cannot_borrow_another_origins_attestation(fleet):
++    cfg, _, _ = fleet
++    cfg["worker_pools"] = {"another": ["worker"]}
++    assert reason("hermes-hub status", cfg) is not None
++
++
++def test_actual_claim_rechecks_changed_labels(fleet, monkeypatch):
++    from hermes_cli import kanban_runs_on_capabilities as rc
++    cfg, entry, _ = fleet
++    card = {"title": "cross_task read", "placement_policy": "worker-first-v1"}
++    assert reason(card["title"], cfg) is None
++    assert rc.claim_refusal(card, me="worker") is None
++    entry["labels"] = []
++    assert rc.claim_refusal(card, me="worker") == "needs worker coordination capability"
++    card["placement_policy"] = None
++    assert rc.claim_refusal(card, me="worker") is None
++
++
++def test_legacy_target_cannot_borrow_pool_labels(fleet):
++    cfg, _, _ = fleet
++    args = {"title": "Run pytest", "body": "hermes-hub status"}
++    assert kp.portable_reason(args, cfg) is None
++    cfg["heavy_route"] = {"hub": "worker"}
++    assert kp._routeless_heavy(args, kp._Cfg(cfg), "hub", lambda _: True) is None
++    # Legacy pins cannot retain a requirement; even the capable target stays excluded.
++    cfg["heavy_route"]["hub"] = "other"
++    assert kp._routeless_heavy(args, kp._Cfg(cfg), "hub", lambda _: True) is None
++
++
++@pytest.mark.parametrize("pool", [None, [], "worker", [1]])
++def test_malformed_pool_is_not_attested(fleet, pool):
++    cfg, _, _ = fleet
++    cfg["worker_pools"]["hub"] = pool
++    assert reason("cross_task read", cfg) is not None
++
++
++def test_missing_registry_fails_closed(fleet, monkeypatch):
++    cfg, _, _ = fleet
++    monkeypatch.setattr(wn, "registry", lambda: None)
++    assert reason("cross_task read", cfg) is not None
++
++
++@pytest.mark.parametrize("skill", ["token-broker", "hermes-mods-repo-core-dev", "patching-local-hermes-workflow"])
++def test_skill_pin_requires_attestation(fleet, skill):
++    cfg, entry, _ = fleet
++    args = {"title": "Implement a fix", "skills": [skill]}
++    assert kp.portable_reason(args, cfg) is None
++    entry["labels"] = []
++    assert kp.portable_reason(args, cfg) == "needs worker coordination capability"
++
++
++def test_development_title_is_not_cli_execution(fleet):
++    cfg, _, _ = fleet
++    assert reason("hermes-hub client: retry a 409 from the Board", cfg) is None
+-- 
+2.55.0
+

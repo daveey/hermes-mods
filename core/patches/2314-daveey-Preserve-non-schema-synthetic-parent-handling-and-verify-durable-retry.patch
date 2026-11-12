@@ -1,0 +1,190 @@
+From 98d049c8234bbf266fd0349dea7c7cb9be357e6a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 07:34:13 -0800
+Subject: [PATCH] [daveey] Preserve non-schema synthetic parent handling and
+ verify durable retry
+
+---
+ hermes_cli/kanban_sync_client.py              | 10 +--
+ hermes_cli/kanban_sync_compat.py              | 13 ++--
+ .../test_kanban_sync_forbidden_field.py       | 76 +++++++++++++++++++
+ .../test_kanban_sync_repair_history_cost.py   |  3 +-
+ 4 files changed, 91 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 7f07afa7e83..96c3e526fb4 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -622,10 +622,9 @@ def _unacked_parents(conn: sqlite3.Connection, rows: list[dict], gateway: str) -
+     if not any(r["table_name"] != "tasks" for r in rows):
+         return []
+     in_batch = {r["row_uid"] for r in rows if r["table_name"] == "tasks"}
+-    # A persisted parent (including a failed compatibility retry) already owns delivery.
+-    # Resynthesizing it for its diagnostic child would reset the one-retry bound.
++    # Only omission custody suppresses resynthesis; ordinary parent backoff retains its old path.
+     in_batch.update(r[0] for r in conn.execute(
+-        "SELECT row_uid FROM kanban_sync_outbox WHERE table_name='tasks' AND state IN ('pending', 'rejected')"))
++        "SELECT row_uid FROM kanban_sync_omissions WHERE table_name='tasks' AND state!='delivered'"))
+     wanted: list[str] = []
+     for r in rows:
+         if r["table_name"] == "tasks":
+@@ -680,9 +679,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+             break
+         with write_txn(conn):
+             wire = [translate(_full_row_if_unseen(conn, r), _next_hlc(conn, gateway)) for r in rows]
+-            from hermes_cli.kanban_sync_compat import persist_parents
+             parents = _unacked_parents(conn, rows, gateway)
+-            rows = persist_parents(conn, parents) + rows
+             wire = [op for op, _tid in parents] + wire
+         try:
+             resp = hub.ops(board, wire)
+@@ -697,6 +694,9 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+             for res in resp.get("results", []):
+                 status, op_id = res.get("status"), res.get("client_op_id")
+                 row = next((r for r in rows if r["op_id"] == op_id), None)
++                if row is None:
++                    from hermes_cli.kanban_sync_compat import rejected_parent
++                    row = rejected_parent(conn, parents, res)
+                 if row is None:
+                     continue
+                 if status in ("applied", "merged"):
+diff --git a/hermes_cli/kanban_sync_compat.py b/hermes_cli/kanban_sync_compat.py
+index f3e9f200756..a426c9f07e9 100644
+--- a/hermes_cli/kanban_sync_compat.py
++++ b/hermes_cli/kanban_sync_compat.py
+@@ -9,16 +9,19 @@ import time
+ from hermes_cli import kanban_db_sync as sync
+ 
+ 
+-def persist_parents(conn: sqlite3.Connection, parents: list[tuple[dict, str]]) -> list[dict]:
+-    """Synthetic parents need the same durable acknowledgement/retry path as captured rows."""
+-    rows = []
++def rejected_parent(conn: sqlite3.Connection, parents: list[tuple[dict, str]], result: dict) -> dict | None:
++    """Persist only schema-refused parents; every other synthetic verdict keeps its existing path."""
++    if result.get("status") != "rejected" or result.get("reason") != "forbidden_field":
++        return None
+     for op, tid in parents:
++        if op["client_op_id"] != result.get("client_op_id"):
++            continue
+         conn.execute(
+             "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, hlc, created_at) "
+             "VALUES (?, 'tasks', ?, 'upsert', ?, ?, ?)",
+             (op["client_op_id"], tid, json.dumps(op["fields"]), op["hlc"], int(time.time() * 1000)))
+-        rows.append(dict(conn.execute("SELECT * FROM kanban_sync_outbox WHERE op_id=?", (op["client_op_id"],)).fetchone()))
+-    return rows
++        return dict(conn.execute("SELECT * FROM kanban_sync_outbox WHERE op_id=?", (op["client_op_id"],)).fetchone())
++    return None
+ 
+ 
+ def record_rejection(conn: sqlite3.Connection, row: dict, reason: str) -> None:
+diff --git a/tests/hermes_cli/test_kanban_sync_forbidden_field.py b/tests/hermes_cli/test_kanban_sync_forbidden_field.py
+index 52a809778df..9e4692bbc90 100644
+--- a/tests/hermes_cli/test_kanban_sync_forbidden_field.py
++++ b/tests/hermes_cli/test_kanban_sync_forbidden_field.py
+@@ -80,6 +80,82 @@ def test_other_rejections_do_not_get_compatibility_retries(live, reason, detail,
+     assert [(r[0], r[1]) for r in rows] == [("upsert", state)]
+ 
+ 
++@pytest.mark.parametrize("reason", ["live_claim", "not_found", "storage_error"])
++def test_synthetic_parent_non_schema_rejections_retain_existing_retry_handling(live, reason):
++    kb.create_task(live, title="synthetic parent", assignee="worker")
++    live.execute("DELETE FROM kanban_sync_outbox WHERE table_name='tasks'")
++    live.commit()
++    def ops(board, batch):
++        return {"results": [{"client_op_id": op["client_op_id"], "status": "rejected",
++                             "reason": reason, "detail": "no task missing"} for op in batch]}
++    client.push(live, SimpleNamespace(ops=ops), "default", "macbook", primary=True, max_batches=1)
++    assert live.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE table_name='tasks'").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("state", ["pending", "rejected"])
++def test_ordinary_parent_outside_batch_does_not_suppress_prepend(live, svc, state):
++    tid = kb.create_task(live, title="parent outside batch", assignee="worker")
++    live.execute("UPDATE kanban_sync_outbox SET state=?,retry_after=9999999999 WHERE table_name='tasks'", (state,))
++    live.commit()
++    calls = []
++    hub = svc.hub("macbook")
++    def ops(board, batch):
++        calls.extend(copy.deepcopy(batch))
++        return hub.ops(board, batch)
++    client.push(live, SimpleNamespace(ops=ops), "default", "macbook", primary=True, max_batches=1)
++    assert calls[0]["table"] == "tasks" and calls[0]["uid"] == tid
++    assert tid in svc.board("default")["rows"]["tasks"]
++
++
++@pytest.mark.parametrize("importing", [False, True])
++def test_compat_retry_survives_reconnect_and_transport_loss_without_rehydration(live, svc, kanban_home, importing):
++    from hermes_cli import kanban_db_connect as kbc
++    tid = kb.create_task(live, title="durable downgrade", assignee="worker")
++    live.execute("UPDATE tasks SET model_pin_mandatory=1 WHERE id=?", (tid,))
++    live.execute("DELETE FROM kanban_sync_outbox WHERE table_name!='tasks' OR rowid NOT IN "
++                 "(SELECT MIN(rowid) FROM kanban_sync_outbox WHERE table_name='tasks')")
++    if importing:
++        live.execute("UPDATE kanban_sync_outbox SET op='import'")
++    live.commit()
++    calls = []
++    hub = svc.hub("macbook")
++    lost = False
++    def ops(board, batch):
++        nonlocal lost
++        results = []
++        for op in batch:
++            if op["table"] == "tasks":
++                calls.append(copy.deepcopy(op))
++                if "model_pin_mandatory" in op["fields"]:
++                    results.append({"client_op_id": op["client_op_id"], "status": "rejected",
++                                    "reason": "forbidden_field", "detail": "not writable on tasks: model_pin_mandatory"})
++                    continue
++                if not lost:
++                    lost = True
++                    raise OSError("reply unavailable")
++            results.extend(hub.ops(board, [op])["results"])
++        return {"results": results}
++    compat_hub = SimpleNamespace(ops=ops)
++    client.push(live, compat_hub, "default", "macbook", primary=True, max_batches=1)
++    reconnect = kbc.connect(kanban_home / "kanban.db")
++    try:
++        with pytest.raises(OSError, match="reply unavailable"):
++            client.push(reconnect, compat_hub, "default", "macbook", primary=True, max_batches=1)
++    finally:
++        reconnect.close()
++    reconnect = kbc.connect(kanban_home / "kanban.db")
++    try:
++        client.push(reconnect, compat_hub, "default", "macbook", primary=True, max_batches=1)
++        assert reconnect.execute("SELECT model_pin_mandatory FROM tasks WHERE id=?", (tid,)).fetchone()[0] == 1
++    finally:
++        reconnect.close()
++    assert len(calls) == 3
++    assert calls[0]["client_op_id"] != calls[1]["client_op_id"] == calls[2]["client_op_id"]
++    assert "model_pin_mandatory" not in calls[1]["fields"] and "model_pin_mandatory" not in calls[2]["fields"]
++    assert all(bool(op.get("import")) == importing for op in calls)
++    assert tid in svc.board("default")["rows"]["tasks"]
++
++
+ def test_a_second_forbidden_column_is_final_not_an_unbounded_downgrade(live):
+     kb.create_task(live, title="two unsupported fields", assignee="worker")
+     live.execute("DELETE FROM kanban_sync_outbox WHERE table_name!='tasks'")
+diff --git a/tests/hermes_cli/test_kanban_sync_repair_history_cost.py b/tests/hermes_cli/test_kanban_sync_repair_history_cost.py
+index b9659cfec02..769009cbf77 100644
+--- a/tests/hermes_cli/test_kanban_sync_repair_history_cost.py
++++ b/tests/hermes_cli/test_kanban_sync_repair_history_cost.py
+@@ -4,7 +4,7 @@ from contextlib import closing
+ 
+ import pytest
+ 
+-from hermes_cli import kanban_placement
++from hermes_cli import kanban_db_sync, kanban_placement
+ from hermes_cli import kanban_sync_client as client
+ 
+ 
+@@ -21,6 +21,7 @@ def _db():
+             fields TEXT, base_version INTEGER, hlc TEXT, created_at INTEGER, state TEXT DEFAULT 'pending');
+         INSERT INTO tasks VALUES ('parent', 1, 'macbook'), ('child', 1, 'macbook');
+     """)
++    conn.executescript(kanban_db_sync.SYNC_SCHEMA_SQL)
+     return conn
+ 
+ 
+-- 
+2.55.0
+

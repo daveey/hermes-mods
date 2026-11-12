@@ -1,0 +1,170 @@
+From a04fc817db24f5ab1b5fcce2535f512a009f66ca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:19:52 +0000
+Subject: [PATCH] [daveey] Exercise real cron tick reservation handoff into
+ checkpoint admission
+
+---
+ .../test_update_checkpoint_tick_handoff.py    | 150 ++++++++++++++++++
+ 1 file changed, 150 insertions(+)
+ create mode 100644 tests/cron/test_update_checkpoint_tick_handoff.py
+
+diff --git a/tests/cron/test_update_checkpoint_tick_handoff.py b/tests/cron/test_update_checkpoint_tick_handoff.py
+new file mode 100644
+index 00000000000..a29c8ef5306
+--- /dev/null
++++ b/tests/cron/test_update_checkpoint_tick_handoff.py
+@@ -0,0 +1,150 @@
++"""Real cron tick(sync=False) handoff versus the guarded update checkpoint.
++
++The checkpoint tolerates only *published* cron run reservations (``known_cron_reservations``).
++These tests drive the production tick/register/release path (no synthetic registry, no patched
++inventory) and check that a tick's own pending reservation is never waived, only the run's.
++"""
++import json
++import os
++import threading
++import time
++from concurrent.futures import ThreadPoolExecutor
++from datetime import UTC, datetime
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from cron import jobs, scheduler
++from gateway import update_checkpoint as checkpoint
++from hermes_cli import admission_fence
++
++
++def _root():
++    from hermes_constants import get_default_hermes_root
++
++    return get_default_hermes_root(home=scheduler._get_hermes_home())
++
++
++@pytest.fixture
++def episode(tmp_path, monkeypatch):
++    home = scheduler._get_hermes_home()
++    root = _root()
++    for name in ("_maybe_run_worktree_maintenance", "_sweep_mcp_orphans", "_maybe_reap_dead_owners"):
++        monkeypatch.setattr(scheduler, name, lambda: None)
++    monkeypatch.setattr(scheduler, "_should_yield_tick_to_fresh_gateway", lambda: None)
++    monkeypatch.setattr(checkpoint, "get_hermes_home", lambda: home)
++    monkeypatch.setattr(checkpoint, "kanban_managed_count", lambda runner: 0)
++    monkeypatch.setattr(checkpoint, "preserve_cron_slots", Mock())
++    runner = SimpleNamespace(
++        config=object(), request_restart=Mock(return_value=True),
++        _active_work_count=lambda: 1, _active_cron_job_count=lambda: 1)
++    (root / "core-update").mkdir(parents=True, exist_ok=True)
++    now = time.time()
++    intent = {"pid": os.getpid(), "kind": "unfenced", "checkpoint": True, "cron_cut": True,
++              "created_at": now, "expires_at": now + 120, "nonce": "episode-one"}
++    (root / "core-update/intent").write_text(json.dumps(intent))
++    script = tmp_path / "job.py"
++    script.write_text("print('x')\n")
++    job = jobs.create_job(prompt=None, schedule=datetime.now(UTC).isoformat(),
++                          script=str(script), no_agent=True)
++    yield SimpleNamespace(root=root, runner=runner, job=job)
++    admission_fence.clear_hold(root)
++
++
++def _negotiate(runner):
++    runner.request_restart.reset_mock()
++    return checkpoint.checkpoint_for_update(
++        runner, SimpleNamespace(call_soon_threadsafe=lambda cb: cb()), {"nonce": "episode-one"})
++
++
++def _ids(root):
++    return set(admission_fence.state(root, details=True)["reservation_ids"])
++
++
++def test_sync_false_run_reservation_is_published_and_crosses_checkpoint(episode, monkeypatch):
++    root, runner, job = episode.root, episode.runner, episode.job
++    running, release = threading.Event(), threading.Event()
++
++    def process_job(*args):
++        running.set()
++        assert release.wait(10)
++        return True
++
++    monkeypatch.setattr(scheduler, "_process_due_job", process_job)
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda *a: pool)
++        try:
++            assert scheduler.tick(verbose=False, sync=False) == 1
++            assert running.wait(10)
++            ids = _ids(root)
++            assert len(ids) == 1  # the tick's own pending reservation is already closed
++            assert checkpoint.known_cron_reservations() == ids  # exact, not a blanket
++            assert checkpoint.checkpoint_inventory()["reservation_ids"] == sorted(ids)
++            admission_fence.set_hold(root)
++            assert _negotiate(runner)["pausing"] is True
++            runner.request_restart.assert_called_once()
++        finally:
++            release.set()
++            for _ in range(200):
++                if not scheduler.get_running_job_ids():
++                    break
++                threading.Event().wait(0.05)
++    # release cleanup: nothing left published or on disk
++    assert job["id"] not in scheduler.get_running_job_ids()
++    assert checkpoint.known_cron_reservations() == set()
++    assert _ids(root) == set()
++    directory = root / "reservations"
++    assert not directory.exists() or not list(directory.iterdir())
++
++
++def test_tick_pending_reservation_is_not_waived_before_publication(episode, monkeypatch):
++    """Inside the tick (scan/advance/submit) the reservation is the tick's, not a published run's."""
++    root, runner = episode.root, episode.runner
++    seen = {}
++    real_due = scheduler.get_due_jobs
++
++    def due_jobs_under_tick_reservation(*a, **kw):
++        seen["ids"] = _ids(root)
++        seen["known"] = checkpoint.known_cron_reservations()
++        admission_fence.set_hold(root)  # the updater sets its hold while the tick is mid-flight
++        seen["result"] = _negotiate(runner)
++        return []
++
++    monkeypatch.setattr(scheduler, "get_due_jobs", due_jobs_under_tick_reservation)
++    assert scheduler.tick(verbose=False, sync=False) == 0
++    assert len(seen["ids"]) == 1 and seen["known"] == set()
++    assert seen["result"]["pausing"] is False
++    runner.request_restart.assert_not_called()
++    assert _ids(root) == set()  # tick reservation released on exit
++    monkeypatch.setattr(scheduler, "get_due_jobs", real_due)
++
++
++def test_run_reservation_does_not_waive_a_second_unpublished_reservation(episode, monkeypatch):
++    root, runner = episode.root, episode.runner
++    running, release = threading.Event(), threading.Event()
++    monkeypatch.setattr(scheduler, "_process_due_job",
++                        lambda *a: running.set() or release.wait(10) or True)
++    other = None
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda *a: pool)
++        try:
++            assert scheduler.tick(verbose=False, sync=False) == 1
++            assert running.wait(10)
++            run_ids = _ids(root)
++            other = admission_fence.extend(root)  # e.g. a session admission in this same process
++            admission_fence.set_hold(root)
++            assert _ids(root) - run_ids == {other.path.name}
++            assert checkpoint.known_cron_reservations() == run_ids
++            assert _negotiate(runner)["pausing"] is False
++            runner.request_restart.assert_not_called()
++        finally:
++            if other is not None:
++                other.close()
++            release.set()
++            for _ in range(200):
++                if not scheduler.get_running_job_ids():
++                    break
++                threading.Event().wait(0.05)
++    assert checkpoint.known_cron_reservations() == set()
++    assert _ids(root) == set()
+-- 
+2.55.0
+

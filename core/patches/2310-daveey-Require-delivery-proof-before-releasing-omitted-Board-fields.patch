@@ -1,0 +1,205 @@
+From 8e5d9ca96d6065f29bb799a51d219ce3dcb87eda Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 07:00:16 -0800
+Subject: [PATCH] [daveey] Require delivery proof before releasing omitted
+ Board fields
+
+---
+ hermes_cli/kanban_db_sync.py                  |  2 +-
+ hermes_cli/kanban_sync_client.py              |  3 +-
+ hermes_cli/kanban_sync_compat.py              |  8 ++-
+ hermes_cli/kanban_sync_omissions.py           | 34 +++++++----
+ .../hermes_cli/test_kanban_sync_omissions.py  | 56 ++++++++++++++++++-
+ 5 files changed, 86 insertions(+), 17 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 19213ad3ecb..d614e6e1b9a 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1346,7 +1346,7 @@ def _local_row_is_newer(conn: sqlite3.Connection, table: str, ch: RemoteChange,
+     gone) or the Board's lease-grant copy, pulled after the run ended here, reopened it as ``running`` and the next
+     push sent that back to the Board."""
+     if conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name = ? AND row_uid = ? AND state = 'pending' "
+-                    "LIMIT 1", (table, ch.uid)).fetchone():
++                    "AND op != 'restore' LIMIT 1", (table, ch.uid)).fetchone():
+         return True
+     if table != "task_runs" or not ch.version:
+         return False
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 106ee6a989a..77f3a94b72f 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -701,7 +701,8 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                     continue
+                 if status in ("applied", "merged"):
+                     from hermes_cli.kanban_sync_omissions import acknowledge
+-                    acknowledge(conn, op_id, res.get("row") if status == "merged" else None)
++                    sent = next(op['fields'] for op in wire if op['client_op_id'] == op_id)
++                    acknowledge(conn, op_id, res.get("row") if status == "merged" else sent, sent=sent)
+                     conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id = ?", (op_id,))
+                     if row["table_name"] == "tasks" and res.get("version"):
+                         conn.execute("UPDATE tasks SET sync_version = MAX(COALESCE(sync_version, 0), ?) WHERE id = ?",
+diff --git a/hermes_cli/kanban_sync_compat.py b/hermes_cli/kanban_sync_compat.py
+index a38cdbb5b58..f3e9f200756 100644
+--- a/hermes_cli/kanban_sync_compat.py
++++ b/hermes_cli/kanban_sync_compat.py
+@@ -52,10 +52,12 @@ def enqueue_retry(conn: sqlite3.Connection, row: dict, wire: dict, result: dict)
+         return False
+     reduced = {k: v for k, v in fields.items() if k != match[2]}
+     retry_id = sync.uuid7()
+-    conn.execute(
+-        "INSERT INTO kanban_sync_omissions (original_op_id, table_name, row_uid, field, compat_op_id) "
++    inserted = conn.execute(
++        "INSERT OR IGNORE INTO kanban_sync_omissions (original_op_id, table_name, row_uid, field, compat_op_id) "
+         "VALUES (?, ?, ?, ?, ?)",
+-        (row["op_id"], row["table_name"], row["row_uid"], match[2], retry_id))
++        (row["op_id"], row["table_name"], row["row_uid"], match[2], retry_id)).rowcount
++    if not inserted:
++        return False
+     conn.execute(
+         "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
+         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+diff --git a/hermes_cli/kanban_sync_omissions.py b/hermes_cli/kanban_sync_omissions.py
+index 8a666870d11..1f07457cbea 100644
+--- a/hermes_cli/kanban_sync_omissions.py
++++ b/hermes_cli/kanban_sync_omissions.py
+@@ -39,28 +39,42 @@ def _queue_restore(conn, table, uid, authoritative, held):
+         if any(r[1] for r in receipts) or field not in current:
+             continue
+         op_id = sync.uuid7()
++        payload = {field: current[field]}
++        if table != 'tasks':
++            routing = ('parent_id', 'child_id') if table == 'task_links' else ('task_id',)
++            payload.update({key: current[key] for key in routing if key in current})
+         conn.execute(
+             "INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) "
+-            "VALUES (?,?,?,'restore',?,'',?)", (op_id, table, uid, json.dumps({field: current[field]}), int(time.time()*1000)))
++            "VALUES (?,?,?,'restore',?,'',?)", (op_id, table, uid, json.dumps(payload), int(time.time()*1000)))
+         conn.execute("UPDATE kanban_sync_omissions SET restore_op_id=?,state='restoring' "
+                      "WHERE table_name=? AND row_uid=? AND field=? AND state!='delivered'", (op_id, table, uid, field))
+ 
+ 
+-def acknowledge(conn, op_id, authoritative=None):
+-    """Release only a delivered current value, not an older concurrent edit or a losing merge."""
++def acknowledge(conn, op_id, authoritative, *, sent=None):
++    """Release only fields whose actual delivery matches their current local value."""
+     import json
+     from hermes_cli import kanban_sync_client as client
+     from hermes_cli.kanban_sync_rejections import _local
+-    op = conn.execute("SELECT * FROM kanban_sync_outbox WHERE op_id=? AND op='restore'", (op_id,)).fetchone()
+-    if op is None:
++    op = conn.execute("SELECT * FROM kanban_sync_outbox WHERE op_id=?", (op_id,)).fetchone()
++    if op is None or not isinstance(authoritative, dict):
+         return
+     row = _local(conn, op['table_name'], op['row_uid'])
+     current = client._row_fields(conn, op['table_name'], row) if row else {}
+-    sent = json.loads(op['fields'])
+-    delivered = all(k in current and current[k] == v and
+-                    (authoritative is None or (k in authoritative and authoritative[k] == v)) for k, v in sent.items())
+-    conn.execute("UPDATE kanban_sync_omissions SET state=? WHERE restore_op_id=?",
+-                 ('delivered' if delivered else 'held', op_id))
++    sent = json.loads(op['fields']) if sent is None else sent
++    for field in held_fields(conn, op['table_name'], op['row_uid']) & sent.keys():
++        value = sent[field]
++        if field not in authoritative or authoritative[field] != value or field not in current:
++            continue
++        if current[field] == value:
++            conn.execute("UPDATE kanban_sync_omissions SET state='delivered' "
++                         "WHERE table_name=? AND row_uid=? AND field=?",
++                         (op['table_name'], op['row_uid'], field))
++        else:
++            # Proven delivery of an older local value permits one attempt at the newer value.
++            # A losing merge or a missing row must never reset the bound.
++            conn.execute("UPDATE kanban_sync_omissions SET state='held',restore_op_id=NULL "
++                         "WHERE restore_op_id=? AND field=? AND state!='delivered'", (op_id, field))
++            _queue_restore(conn, op['table_name'], op['row_uid'], authoritative, {field})
+ 
+ 
+ def remap(conn, old_id, new_id):
+diff --git a/tests/hermes_cli/test_kanban_sync_omissions.py b/tests/hermes_cli/test_kanban_sync_omissions.py
+index 956cdbeb6d5..ba4437fd33a 100644
+--- a/tests/hermes_cli/test_kanban_sync_omissions.py
++++ b/tests/hermes_cli/test_kanban_sync_omissions.py
+@@ -79,6 +79,11 @@ def test_restore_feed_echo_acknowledges_only_current_value(live, svc, newer_edit
+     unresolved = live.execute("SELECT COUNT(*) FROM kanban_sync_omissions WHERE state!='delivered'").fetchone()[0]
+     assert bool(unresolved) is newer_edit
+     assert live.execute("SELECT model_pin_mandatory FROM tasks WHERE id=?", (tid,)).fetchone()[0] == (0 if newer_edit else 1)
++    if newer_edit:
++        pending = live.execute("SELECT fields FROM kanban_sync_outbox WHERE op='restore' AND state='pending'").fetchall()
++        assert [json.loads(r[0]) for r in pending] == [{'model_pin_mandatory': 0}]
++        client.push(live, svc.hub('macbook'), 'default', 'macbook', primary=True)
++        assert not live.execute("SELECT 1 FROM kanban_sync_omissions WHERE state!='delivered'").fetchone()
+ 
+ 
+ def test_omitted_child_payload_survives_authoritative_row(live, svc):
+@@ -97,11 +102,14 @@ def test_omitted_child_payload_survives_authoritative_row(live, svc):
+         return {'results': results}
+     for _ in range(3):
+         client.push(live, SimpleNamespace(ops=ops), 'default', 'macbook', primary=True)
+-    change = sync.RemoteChange(100, 'task_events', uid, 'upsert', {'task_id': tid, 'payload': None}, 20, '', 'other')
++    change = sync.RemoteChange(100, 'task_events', uid, 'upsert',
++                               {'task_id': tid, 'payload': None, 'kind': 'remote_kind'}, 20, '', 'other')
+     sync.apply_remote_changes(live, [change], new_cursor=100, board='default')
+     assert live.execute('SELECT payload FROM task_events WHERE uid=?', (uid,)).fetchone()[0] == payload
++    assert live.execute('SELECT kind FROM task_events WHERE uid=?', (uid,)).fetchone()[0] == 'remote_kind'
+     restore = live.execute("SELECT fields FROM kanban_sync_outbox WHERE op='restore' AND row_uid=?", (uid,)).fetchone()
+-    assert json.loads(restore[0]) == {'payload': payload}
++    # rows.ts rowCard needs task_id even when upsertChild can recover it from an existing row.
++    assert json.loads(restore[0]) == {'payload': payload, 'task_id': tid}
+ 
+ 
+ def test_omission_does_not_hold_unrelated_divergence_repair(live, svc):
+@@ -123,6 +131,50 @@ def test_omission_does_not_hold_unrelated_divergence_repair(live, svc):
+         shadow.close()
+ 
+ 
++@pytest.mark.parametrize('merged', [False, True])
++def test_ordinary_delivery_releases_custody_only_with_authoritative_proof(live, svc, merged):
++    tid = omit_pin(live, svc)
++    # A later ordinary captured edit can deliver the held field too.
++    live.execute('UPDATE tasks SET model_pin_mandatory=0 WHERE id=?', (tid,))
++    live.commit()
++    hub = svc.hub('macbook')
++    def ops(board, batch):
++        response = hub.ops(board, batch)
++        if merged:
++            for result in response['results']:
++                result.update(status='merged')
++                result.pop('row', None)
++        return response
++    client.push(live, SimpleNamespace(ops=ops), 'default', 'macbook', primary=True)
++    unresolved = live.execute("SELECT COUNT(*) FROM kanban_sync_omissions WHERE state!='delivered'").fetchone()[0]
++    assert bool(unresolved) is merged, 'merged without a row is not delivery proof'
++
++
++def test_merged_restore_without_row_keeps_custody(live, svc):
++    tid = omit_pin(live, svc)
++    version = live.execute('SELECT sync_version FROM tasks WHERE id=?', (tid,)).fetchone()[0]
++    sync.apply_remote_changes(live, [sync.RemoteChange(100, 'tasks', tid, 'upsert',
++        {'model_pin_mandatory': None}, version+1, '', 'other')], new_cursor=100, board='default')
++    def ops(board, batch):
++        return {'results': [{'client_op_id': op['client_op_id'], 'status': 'merged'} for op in batch]}
++    client.push(live, SimpleNamespace(ops=ops), 'default', 'macbook', primary=True)
++    assert live.execute("SELECT 1 FROM kanban_sync_omissions WHERE state!='delivered'").fetchone()
++
++
++def test_duplicate_original_verdict_cannot_grant_another_retry(live, svc):
++    import json
++    from hermes_cli.kanban_sync_compat import enqueue_retry
++    tid = omit_pin(live, svc)
++    receipt = live.execute('SELECT * FROM kanban_sync_omissions WHERE row_uid=? LIMIT 1', (tid,)).fetchone()
++    original = dict(live.execute('SELECT * FROM kanban_sync_outbox WHERE op_id=?', (receipt['original_op_id'],)).fetchone())
++    count = live.execute('SELECT COUNT(*) FROM kanban_sync_omissions').fetchone()[0]
++    assert not enqueue_retry(live, original, {'fields': json.loads(original['fields']), 'hlc': original['hlc']},
++        {'reason': 'forbidden_field', 'detail': 'not writable on tasks: model_pin_mandatory'})
++    assert live.execute('SELECT COUNT(*) FROM kanban_sync_omissions').fetchone()[0] == count
++    assert live.execute('SELECT compat_op_id FROM kanban_sync_omissions WHERE original_op_id=?',
++                        (original['op_id'],)).fetchone()[0] == receipt['compat_op_id']
++
++
+ def test_transient_restore_identity_change_still_releases_custody(live, svc):
+     tid = omit_pin(live, svc)
+     version = live.execute('SELECT sync_version FROM tasks WHERE id=?', (tid,)).fetchone()[0]
+-- 
+2.55.0
+

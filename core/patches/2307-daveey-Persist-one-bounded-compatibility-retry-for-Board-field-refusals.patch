@@ -1,0 +1,286 @@
+From eee181cf02771cc0bab5e2bfb39b72e62b9c067c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 05:39:29 -0800
+Subject: [PATCH] [daveey] Persist one bounded compatibility retry for Board
+ field refusals
+
+---
+ hermes_cli/kanban_sync_client.py              |  36 +++---
+ hermes_cli/kanban_sync_compat.py              |  60 ++++++++++
+ .../test_kanban_sync_forbidden_field.py       | 104 ++++++++++++++++++
+ 3 files changed, 183 insertions(+), 17 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_compat.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_forbidden_field.py
+
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index f33a4c8b212..f1f89891805 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -565,7 +565,7 @@ def translate(row: dict, hlc: str) -> dict:
+         return {**op, "op": "delete"}
+     fields = row["fields"] if isinstance(row["fields"], dict) else json.loads(row["fields"])
+     out = {**op, "op": "upsert", "fields": _wire_fields(row["table_name"], fields)}
+-    if row["op"] == "import" and row["table_name"] == "tasks":
++    if row["op"] in ("import", "compat_import") and row["table_name"] == "tasks":
+         out["import"] = True
+     return out
+ 
+@@ -578,6 +578,10 @@ def _full_row_if_unseen(conn: sqlite3.Connection, row: dict) -> dict:
+     Child rows (runs, comments, events, attachments, chat links) are small and always go whole: an update captured
+     for a row whose insert the service refused earlier (a deploy still rolling out) would otherwise reach it with no
+     ``task_id`` and be refused ``not_found``."""
++    if row["op"] in ("compat", "compat_import") and row["table_name"] == "tasks":
++        from hermes_cli.kanban_worker_placement import acknowledged_outbox
++        task = conn.execute("SELECT * FROM tasks WHERE id = ?", (row["row_uid"],)).fetchone()
++        return acknowledged_outbox(row, task)
+     if row["op"] != "upsert":
+         return row
+     if row["table_name"] in sync._UID_TABLES:
+@@ -618,6 +622,10 @@ def _unacked_parents(conn: sqlite3.Connection, rows: list[dict], gateway: str) -
+     if not any(r["table_name"] != "tasks" for r in rows):
+         return []
+     in_batch = {r["row_uid"] for r in rows if r["table_name"] == "tasks"}
++    # A persisted parent (including a failed compatibility retry) already owns delivery.
++    # Resynthesizing it for its diagnostic child would reset the one-retry bound.
++    in_batch.update(r[0] for r in conn.execute(
++        "SELECT row_uid FROM kanban_sync_outbox WHERE table_name='tasks' AND state IN ('pending', 'rejected')"))
+     wanted: list[str] = []
+     for r in rows:
+         if r["table_name"] == "tasks":
+@@ -645,15 +653,8 @@ def _unacked_parents(conn: sqlite3.Connection, rows: list[dict], gateway: str) -
+ 
+ 
+ def _record_live_claim_rejection(conn: sqlite3.Connection, row: dict, reason: str) -> None:
+-    """A card write the Board refused because another gateway holds the card's live lease leaves a
+-    ``sync_rejected`` event on the card (inside the push txn), so ``kanban show`` says the write never happened
+-    instead of the card silently reverting to the service's row. [daveey]"""
+-    from hermes_cli import kanban_db as kb
+-    fields = row["fields"] if isinstance(row["fields"], dict) else json.loads(row["fields"] or "{}")
+-    if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (row["row_uid"],)).fetchone() is None:
+-        return
+-    kb._append_event(conn, row["row_uid"], "sync_rejected",
+-                     {"reason": reason[:300], "fields": sorted(fields), "op_id": row["op_id"]})
++    from hermes_cli.kanban_sync_compat import record_rejection
++    record_rejection(conn, row, reason)
+ 
+ 
+ @dataclass
+@@ -679,7 +680,9 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+             break
+         with write_txn(conn):
+             wire = [translate(_full_row_if_unseen(conn, r), _next_hlc(conn, gateway)) for r in rows]
++            from hermes_cli.kanban_sync_compat import persist_parents
+             parents = _unacked_parents(conn, rows, gateway)
++            rows = persist_parents(conn, parents) + rows
+             wire = [op for op, _tid in parents] + wire
+         try:
+             resp = hub.ops(board, wire)
+@@ -690,15 +693,9 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+             raise
+         out.sent += len(rows)
+         authoritative: list[sync.RemoteChange] = []
+-        parent_ops = {op["client_op_id"]: tid for op, tid in parents}
+         with write_txn(conn):
+             for res in resp.get("results", []):
+                 status, op_id = res.get("status"), res.get("client_op_id")
+-                if op_id in parent_ops:
+-                    if status in ("applied", "merged") and res.get("version"):
+-                        conn.execute("UPDATE tasks SET sync_version = MAX(COALESCE(sync_version, 0), ?) WHERE id = ?",
+-                                     (res["version"], parent_ops[op_id]))
+-                    continue
+                 row = next((r for r in rows if r["op_id"] == op_id), None)
+                 if row is None:
+                     continue
+@@ -731,7 +728,12 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                                  "WHERE op_id = ?", (reason[:500], op_id))
+                     out.rejected += 1
+                     _log.warning("kanban sync: %s %s %s rejected (%s)", board, row["table_name"], row["row_uid"], reason)
+-                    if row["table_name"] == "tasks" and res.get("reason") in ("live_claim", "forbidden_field"):
++                    if res.get("reason") == "forbidden_field":
++                        from hermes_cli.kanban_sync_compat import enqueue_retry, record_rejection
++                        sent_op = next(op for op in wire if op["client_op_id"] == op_id)
++                        enqueue_retry(conn, row, sent_op, res)
++                        record_rejection(conn, row, reason)
++                    elif row["table_name"] == "tasks" and res.get("reason") == "live_claim":
+                         _record_live_claim_rejection(conn, row, reason)
+                     if primary and res.get("row"):
+                         authoritative.append(_row_change(row["table_name"], res["row"]))
+diff --git a/hermes_cli/kanban_sync_compat.py b/hermes_cli/kanban_sync_compat.py
+new file mode 100644
+index 00000000000..d5176c194e1
+--- /dev/null
++++ b/hermes_cli/kanban_sync_compat.py
+@@ -0,0 +1,60 @@
++"""Bounded, durable wire downgrade for an older Board's column allowlist."""
++from __future__ import annotations
++
++import json
++import re
++import sqlite3
++import time
++
++from hermes_cli import kanban_db_sync as sync
++
++
++def persist_parents(conn: sqlite3.Connection, parents: list[tuple[dict, str]]) -> list[dict]:
++    """Synthetic parents need the same durable acknowledgement/retry path as captured rows."""
++    rows = []
++    for op, tid in parents:
++        conn.execute(
++            "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, hlc, created_at) "
++            "VALUES (?, 'tasks', ?, 'upsert', ?, ?, ?)",
++            (op["client_op_id"], tid, json.dumps(op["fields"]), op["hlc"], int(time.time() * 1000)))
++        rows.append(dict(conn.execute("SELECT * FROM kanban_sync_outbox WHERE op_id=?", (op["client_op_id"],)).fetchone()))
++    return rows
++
++
++def record_rejection(conn: sqlite3.Connection, row: dict, reason: str) -> None:
++    """Keep schema and lease refusals visible on the owning local card."""
++    from hermes_cli import kanban_db as kb
++    fields = row["fields"] if isinstance(row["fields"], dict) else json.loads(row["fields"] or "{}")
++    tid = row["row_uid"] if row["table_name"] == "tasks" else fields.get("task_id")
++    if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (tid,)).fetchone() is None:
++        return
++    # A diagnostic event must not recursively generate diagnostic events on an older Board.
++    if row["table_name"] == "task_events" and fields.get("kind") == "sync_rejected":
++        return
++    kb._append_event(conn, tid, "sync_rejected",
++                     {"reason": reason[:300], "fields": sorted(fields), "op_id": row["op_id"]})
++
++
++def enqueue_retry(conn: sqlite3.Connection, row: dict, wire: dict, result: dict) -> bool:
++    """Retain the rejected original; one fresh, non-hydrated upsert carries the reduced payload.
++
++    The local-only op kind survives crashes and transient retries. The retained original prevents
++    divergence repair from repeatedly requeueing the deliberately omitted local value and keeps
++    the schema mismatch visible until the Board is deployed and reconciliation retries it.
++    """
++    if result.get("reason") != "forbidden_field" or row["op"] not in ("upsert", "import"):
++        return False
++    match = re.fullmatch(r"not writable on ([a-z_]+): ([a-z_]+)", str(result.get("detail") or ""))
++    if match is None or match[1] != row["table_name"]:
++        return False
++    fields = wire.get("fields", {})
++    if match[2] not in fields:
++        return False
++    reduced = {k: v for k, v in fields.items() if k != match[2]}
++    conn.execute(
++        "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
++        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
++        (sync.uuid7(), row["table_name"], row["row_uid"],
++         "compat_import" if wire.get("import") else "compat", json.dumps(reduced),
++         row.get("base_version"), wire["hlc"], row["created_at"]))
++    return True
+diff --git a/tests/hermes_cli/test_kanban_sync_forbidden_field.py b/tests/hermes_cli/test_kanban_sync_forbidden_field.py
+new file mode 100644
+index 00000000000..52a809778df
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_forbidden_field.py
+@@ -0,0 +1,104 @@
++"""A newer core can publish a card to an older Board without losing local fields."""
++from __future__ import annotations
++
++import copy
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_sync_run_rows as helpers
++
++kanban_home = helpers.kanban_home
++svc = helpers.svc
++live = helpers.live
++
++
++@pytest.mark.parametrize("synthetic_parent", [False, True])
++def test_forbidden_column_retries_once_with_fresh_identity_and_preserves_local_value(live, svc, synthetic_parent):
++    tid = kb.create_task(live, title="new core card", assignee="worker")
++    live.execute("UPDATE tasks SET model_pin_mandatory=1 WHERE id=?", (tid,))
++    if synthetic_parent:
++        live.execute("DELETE FROM kanban_sync_outbox WHERE table_name='tasks'")
++    live.commit()
++    calls = []
++    hub = svc.hub("macbook")
++    def ops(board, batch):
++        calls.extend(copy.deepcopy(batch))
++        results = []
++        for op in batch:
++            if op["table"] == "tasks" and "model_pin_mandatory" in op.get("fields", {}):
++                results.append({"client_op_id": op["client_op_id"], "status": "rejected",
++                                "reason": "forbidden_field", "detail": "not writable on tasks: model_pin_mandatory"})
++            else:
++                results.extend(hub.ops(board, [op])["results"])
++        return {"results": results}
++    compat_hub = SimpleNamespace(ops=ops)
++    for _ in range(3):
++        client.push(live, compat_hub, "default", "macbook", primary=True)
++    task_ops = [op for op in calls if op["table"] == "tasks"]
++    stripped = [op for op in task_ops if "model_pin_mandatory" not in op["fields"]]
++    assert stripped, "rejected task must be resent without the unsupported column"
++    assert not {op["client_op_id"] for op in stripped} & {op["client_op_id"] for op in task_ops if op not in stripped}
++    assert tid in svc.board("default")["rows"]["tasks"]
++    assert live.execute("SELECT model_pin_mandatory FROM tasks WHERE id=?", (tid,)).fetchone()[0] == 1
++    reasons = [json.loads(r[0])["reason"] for r in live.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='sync_rejected'", (tid,))]
++    assert any("model_pin_mandatory" in reason for reason in reasons)
++
++
++@pytest.mark.parametrize("kind", ["compat", "compat_import"])
++def test_compat_snapshot_does_not_replay_acknowledged_placement(live, kind):
++    tid = kb.create_task(live, title="assigned elsewhere", assignee="worker")
++    live.execute("UPDATE tasks SET sync_version=10 WHERE id=?", (tid,))
++    row = {"op": kind, "table_name": "tasks", "row_uid": tid,
++           "fields": {"title": "assigned elsewhere", "placement_policy": "worker-pool", "runs_on": '["old"]'}}
++    fields = client._full_row_if_unseen(live, row)["fields"]
++    assert "runs_on" not in fields and "placement_policy" not in fields
++    assert "model_pin_mandatory" not in fields  # no rehydration
++
++
++@pytest.mark.parametrize("reason,detail,state", [
++    ("live_claim", "held by other", "rejected"),
++    ("not_found", "no task missing", "pending"),
++    ("storage_error", "busy", "pending"),
++    ("forbidden_field", "not writable on other: model_pin_mandatory", "rejected"),
++    ("forbidden_field", "not writable on tasks: absent", "rejected"),
++    ("forbidden_field", "not writable on tasks: model_pin_mandatory, priority", "rejected"),
++])
++def test_other_rejections_do_not_get_compatibility_retries(live, reason, detail, state):
++    tid = kb.create_task(live, title="refused", assignee="worker")
++    live.execute("DELETE FROM kanban_sync_outbox WHERE table_name!='tasks'")
++    live.commit()
++    def ops(board, batch):
++        return {"results": [{"client_op_id": op["client_op_id"], "status": "rejected",
++                             "reason": reason, "detail": detail} for op in batch]}
++    client.push(live, SimpleNamespace(ops=ops), "default", "macbook", primary=True, max_batches=1)
++    rows = live.execute("SELECT op,state FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=?", (tid,)).fetchall()
++    assert [(r[0], r[1]) for r in rows] == [("upsert", state)]
++
++
++def test_a_second_forbidden_column_is_final_not_an_unbounded_downgrade(live):
++    kb.create_task(live, title="two unsupported fields", assignee="worker")
++    live.execute("DELETE FROM kanban_sync_outbox WHERE table_name!='tasks'")
++    live.commit()
++    calls = []
++    def ops(board, batch):
++        results = []
++        for op in batch:
++            if op["table"] == "tasks":
++                calls.append(copy.deepcopy(op))
++                column = "model_pin_mandatory" if "model_pin_mandatory" in op["fields"] else "priority"
++                results.append({"client_op_id": op["client_op_id"], "status": "rejected",
++                                "reason": "forbidden_field", "detail": f"not writable on tasks: {column}"})
++            else:
++                results.append({"client_op_id": op["client_op_id"], "status": "applied"})
++        return {"results": results}
++    hub = SimpleNamespace(ops=ops)
++    for _ in range(4):
++        client.push(live, hub, "default", "macbook", primary=True, max_batches=1)
++    assert len(calls) == 2
++    assert calls[0]["client_op_id"] != calls[1]["client_op_id"]
++    assert live.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE table_name='tasks' AND state='rejected'").fetchone()[0] == 2
+-- 
+2.55.0
+

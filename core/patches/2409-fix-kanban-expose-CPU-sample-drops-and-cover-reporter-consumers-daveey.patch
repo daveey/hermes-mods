@@ -1,0 +1,249 @@
+From 10a929b4a93d10921b7a16a40bd699e5507ffd8e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:18:23 +0000
+Subject: [PATCH] fix(kanban): expose CPU sample drops and cover reporter
+ consumers [daveey]
+
+---
+ docs/split-phase-cpu-reporting.md             | 42 ++++++++
+ hermes_cli/machine_metrics.py                 |  5 +-
+ .../test_kanban_sync_connected_feed.py        |  2 +-
+ .../test_kanban_sync_connections.py           |  2 +-
+ .../test_machine_metrics_drop_quality.py      | 95 +++++++++++++++++++
+ .../test_machine_metrics_split_finish.py      | 10 ++
+ 6 files changed, 152 insertions(+), 4 deletions(-)
+ create mode 100644 docs/split-phase-cpu-reporting.md
+ create mode 100644 tests/hermes_cli/test_machine_metrics_drop_quality.py
+
+diff --git a/docs/split-phase-cpu-reporting.md b/docs/split-phase-cpu-reporting.md
+new file mode 100644
+index 00000000000..867974236be
+--- /dev/null
++++ b/docs/split-phase-cpu-reporting.md
+@@ -0,0 +1,42 @@
++# Split-phase registry CPU reporting
++
++When the installation-root CPU gate is ON, the sync reporter holds one snapshot,
++then finishes it on the same thread after the one-second window. The existing
++wait is clamped only while a snapshot is pending; polling, the 0.5-second outbox
++tick, ten-second report cadence and locked admission sample are unchanged.
++
++## Quality diagnostic
++
++The existing `hermes_cli.machine_metrics` INFO logger emits
++`machine metrics admission quality: cpu_sample_drops=N` whenever a consumed
++pending finish returns no sample (including an invalid/late window or a changed
++root limit). N is cumulative for that Reporter instance and resets with it.
++It is emitted before transport, including when that transport subsequently fails.
++No Board wire fields or timing JSON schema fields are added.
++
++This is **not all lost reports**: an exception before the counter increment or
++a send failure after a valid sample is not included. It is an admission-quality
++observation, not a latency verdict. Valid samples and OFF single-phase reports
++do not emit this diagnostic. Compare only counts from the same instance/lifetime.
++
++On non-Linux with the root gate ON, the unknown initial CPU snapshot still gets
++one pending wake and finishes without a triple. This compatibility limitation
++is retained: no made-up CPU value, admission fail-open, or native-platform
++verification is claimed. OFF remains single phase. The current window remains
++one second; wake and finish share `WINDOW_S` rather than independent literals.
++
++## Regression evidence and limits
++
++The initial interface migration missed two substituted Reporter test doubles
++in connection and connected-feed tests. A metrics-focused test slice did not
++include those callers. Both doubles now implement the no-pending method without
++changing their assertions; canonical reproduction failed three cases before the
++repair. The rollout's inventory-derived consumer regression gate includes those
++callers as well as metrics and loop tests.
++
++The new external-quality regression failed on the private-counter-only source;
++its behavior asserts two cumulative log emissions and unchanged CPU-less wire
++samples. Window-consistency coverage rejects a due pending snapshot left behind
++by a separately hardcoded finish window. All actual live latency acceptance is
++separate from these unit contracts and must follow the rollout's frozen review,
++CI, installation and capture gates.
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 87e4e335bd4..89307344a95 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -217,10 +217,11 @@ class Reporter:
+         return sample
+ 
+     def report_due(self) -> bool:
++        from hermes_cli import machine_cpu_metrics as cpu
+         now = self.clock()
+         pending = self._pending
+         if pending is not None:
+-            if now < pending[0] + 1.0:
++            if now < pending[0] + cpu.WINDOW_S:
+                 return False
+             # Consume before any fallible finish work: no stale A survives an exception.
+             self._pending = None
+@@ -230,7 +231,6 @@ class Reporter:
+             self.next_at = now + REPORT_EVERY_S
+         try:
+             from hermes_cli import kanban_sync_timing as timing
+-            from hermes_cli import machine_cpu_metrics as cpu
+             from hermes_cli.machine_drain_metrics import send_compatible
+             with timing.span("limit"):
+                 state, limit = (self.cpu_limit_fn or cpu.root_limit)()
+@@ -251,6 +251,7 @@ class Reporter:
+                         measured = (self.cpu_finish_fn or cpu.finish)(pending[2], clock=self.clock)
+                 if measured is None:
+                     self.cpu_sample_drops += 1
++                    _log.info("machine metrics admission quality: cpu_sample_drops=%d", self.cpu_sample_drops)
+             sample = self._sample(sample, measured)
+             with timing.span("send"):  # preserve the transport's existing hard 2 s budget
+                 send_compatible(self.send, sample)
+diff --git a/tests/hermes_cli/test_kanban_sync_connected_feed.py b/tests/hermes_cli/test_kanban_sync_connected_feed.py
+index 484b87d2461..c8de51bf0d3 100644
+--- a/tests/hermes_cli/test_kanban_sync_connected_feed.py
++++ b/tests/hermes_cli/test_kanban_sync_connected_feed.py
+@@ -91,7 +91,7 @@ def test_connected_feed_skips_unchanged_poll_and_observes_next_change(monkeypatc
+     monkeypatch.setattr(client, 'outbox_pending', lambda paths: any(p in pending for p in paths))
+     monkeypatch.setattr(client, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None))
+     from hermes_cli import machine_metrics
+-    monkeypatch.setattr(machine_metrics, 'Reporter', lambda _: SimpleNamespace(report_due=lambda: None))
++    monkeypatch.setattr(machine_metrics, 'Reporter', lambda _: SimpleNamespace(report_due=lambda: None, pending_wake_in=lambda: None))
+ 
+     class Watcher:
+         def __init__(self, ident, board, wake, keep_running, **kwargs):
+diff --git a/tests/hermes_cli/test_kanban_sync_connections.py b/tests/hermes_cli/test_kanban_sync_connections.py
+index 998f3a8157f..c098ccbd3c5 100644
+--- a/tests/hermes_cli/test_kanban_sync_connections.py
++++ b/tests/hermes_cli/test_kanban_sync_connections.py
+@@ -270,7 +270,7 @@ def test_run_forever_owns_and_closes_connections(board, opened, monkeypatch, fai
+     monkeypatch.setattr(client.sync, "set_lease_client", lambda value: None)
+     monkeypatch.setattr(client, "board_paths", list)
+     monkeypatch.setattr(client, "reconcile_links", lambda *args, **kwargs: None)
+-    monkeypatch.setattr(machine_metrics, "Reporter", lambda *args: SimpleNamespace(report_due=lambda: None))
++    monkeypatch.setattr(machine_metrics, "Reporter", lambda *args: SimpleNamespace(report_due=lambda: None, pending_wake_in=lambda: None))
+     # FakeHub has no metrics transport; the loop only needs this for Reporter construction.
+     monkeypatch.setattr(hub, "report_metrics", lambda *args: None, raising=False)
+ 
+diff --git a/tests/hermes_cli/test_machine_metrics_drop_quality.py b/tests/hermes_cli/test_machine_metrics_drop_quality.py
+new file mode 100644
+index 00000000000..e8fddc64b1f
+--- /dev/null
++++ b/tests/hermes_cli/test_machine_metrics_drop_quality.py
+@@ -0,0 +1,95 @@
++"""A missing CPU triple is observable quality data, never an admission sample."""
++import logging
++
++import pytest
++
++from hermes_cli import machine_cpu_metrics as cpu
++from hermes_cli import machine_metrics as mm
++
++
++def test_drops_report_cumulative_quality_without_changing_wire_sample(caplog):
++    now, sent = [100.0], []
++    rep = mm.Reporter(sent.append, clock=lambda: now[0],
++                      collect_fn=lambda: {'cpus': 4},
++                      cpu_limit_fn=lambda: (cpu.ON, 50.0),
++                      cpu_begin_fn=lambda **kw: (now[0], (100, 50)),
++                      cpu_finish_fn=lambda *a, **kw: None)
++    with caplog.at_level(logging.INFO, logger=mm.__name__):
++        for start in (100.0, 110.0):
++            now[0] = start
++            assert rep.report_due() is False
++            now[0] += 3.0
++            assert rep.report_due() is True
++            assert rep.pending_wake_in() is None
++            assert rep.report_due() is False
++    assert sent == [{'cpus': 4}, {'cpus': 4}]
++    assert [r.getMessage() for r in caplog.records if r.name == mm.__name__] == [
++        'machine metrics admission quality: cpu_sample_drops=1',
++        'machine metrics admission quality: cpu_sample_drops=2',
++    ]
++    assert rep.cpu_sample_drops == 2
++
++
++def test_drop_quality_survives_send_failure(caplog):
++    now = [100.0]
++    def fail_send(sample):
++        raise OSError('controlled transport failure')
++    rep = mm.Reporter(fail_send, clock=lambda: now[0], collect_fn=dict,
++                      cpu_limit_fn=lambda: (cpu.ON, 50.0),
++                      cpu_begin_fn=lambda **kw: (now[0], (100, 50)),
++                      cpu_finish_fn=lambda *a, **kw: None)
++    with caplog.at_level(logging.INFO, logger=mm.__name__):
++        assert rep.report_due() is False
++        now[0] += 3
++        assert rep.report_due() is False
++    assert rep.pending_wake_in() is None
++    assert 'machine metrics admission quality: cpu_sample_drops=1' in caplog.messages
++
++
++@pytest.mark.parametrize('failure_site', ['limit', 'collect', 'finish'])
++def test_exceptions_before_cpu_decision_are_not_counted_as_drops(caplog, failure_site):
++    now, sent, reached = [100.0], [], []
++
++    def controlled(site, result):
++        reached.append(site)
++        if now[0] > 100.0 and failure_site == site:
++            raise OSError('controlled excluded exception')
++        return result
++
++    rep = mm.Reporter(sent.append, clock=lambda: now[0],
++                      collect_fn=lambda: controlled('collect', {'cpus': 4}),
++                      cpu_limit_fn=lambda: controlled('limit', (cpu.ON, 50.0)),
++                      cpu_begin_fn=lambda **kw: (now[0], (100, 50)),
++                      cpu_finish_fn=lambda *a, **kw: controlled('finish', None))
++    with caplog.at_level(logging.INFO, logger=mm.__name__):
++        assert rep.report_due() is False
++        assert rep.pending_wake_in() == cpu.WINDOW_S
++        reached.clear()
++        now[0] += cpu.WINDOW_S
++        assert rep.report_due() is False
++    assert reached[-1] == failure_site
++    assert rep.pending_wake_in() is None
++    assert rep.cpu_sample_drops == 0
++    assert sent == []
++    assert not [r for r in caplog.records if r.name == mm.__name__]
++
++
++def test_successful_sample_and_off_report_do_not_log_drops(caplog, monkeypatch):
++    now, sent = [100.0], []
++    gate: list[tuple[str, float | None]] = [(cpu.ON, 50.0)]
++    triple = dict(cpu_busy_pct=12.5, cpu_busy_window_ms=1000, cpu_busy_sample_end_ms=1700000000000)
++    monkeypatch.setattr(mm, 'record_hub_cpu_sample', lambda sample: None)
++    rep = mm.Reporter(sent.append, clock=lambda: now[0], collect_fn=lambda: {'cpus': 4},
++                      cpu_limit_fn=lambda: gate[0],
++                      cpu_begin_fn=lambda **kw: (now[0], (100, 50)),
++                      cpu_finish_fn=lambda *a, **kw: dict(triple))
++    with caplog.at_level(logging.INFO, logger=mm.__name__):
++        assert rep.report_due() is False
++        now[0] += 1
++        assert rep.report_due() is True
++        now[0] = 110
++        gate[0] = (cpu.OFF, None)
++        assert rep.report_due() is True
++    assert sent == [dict(cpus=4, **triple), {'cpus': 4}]
++    assert rep.cpu_sample_drops == 0
++    assert not [r for r in caplog.records if r.name == mm.__name__]
+diff --git a/tests/hermes_cli/test_machine_metrics_split_finish.py b/tests/hermes_cli/test_machine_metrics_split_finish.py
+index f39346dd5ad..8cdb5976d04 100644
+--- a/tests/hermes_cli/test_machine_metrics_split_finish.py
++++ b/tests/hermes_cli/test_machine_metrics_split_finish.py
+@@ -76,6 +76,16 @@ def test_unsupported_finish_uses_600s_retry(harness, status):
+     assert rep.next_at == 701 and rep.pending_wake_in() is None
+ 
+ 
++def test_pending_wake_and_finish_use_same_window(harness, monkeypatch):
++    rep, now, _gate, _sent, _finishes = harness
++    monkeypatch.setattr(cpu, 'WINDOW_S', 0.5)
++    assert rep.report_due() is False
++    now[0] += 0.5
++    assert rep.pending_wake_in() == 0
++    assert rep.report_due() is True
++    assert rep.pending_wake_in() is None
++
++
+ def test_slow_begin_cannot_return_a_due_pending_snapshot(harness):
+     rep, now, _gate, sent, _finishes = harness
+     def slow_begin(**kwargs):
+-- 
+2.55.0
+

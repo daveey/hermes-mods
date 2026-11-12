@@ -1,0 +1,1989 @@
+From 10a060ea32ba1e5d5fff92937f859363509d79e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 14:12:11 +0000
+Subject: [PATCH] ci: ingest metadata-only flaky Actions artifacts without
+ checks permission (#1111)
+
+* wip(ci): metadata-only flaky artifacts (recovered worktree, t_01a1ca41b9346814)
+
+* wip(ci): bound and validate flaky run listing (fixes worker OOM), t_01a1ca41b9346814
+
+* docs: flaky artifact metadata design (t_01a1ca41b9346814)
+
+* fix(ci): validate flaky artifact provenance and preserve unavailable retries
+
+* ci: make flaky metadata upload advisory; allow its run-provenance SHA
+
+---------
+
+Co-authored-by: Build worker <build-worker@example.com>
+---
+ .github/workflows/tests.yml                   |  36 +-
+ docs/plans/flaky-artifact-metadata-design.md  |  29 ++
+ scripts/ci/flaky_artifact.py                  | 305 ++++++++++++++
+ scripts/ci/flaky_artifact_poll.py             | 155 +++++++
+ scripts/ci/flaky_kanban.py                    | 127 ++++--
+ tests/ci/flaky_artifact_fakes.py              |  94 +++++
+ tests/ci/test_flaky_artifact.py               | 384 ++++++++++++++++++
+ tests/ci/test_flaky_artifact_poll.py          | 344 ++++++++++++++++
+ tests/ci/test_flaky_kanban.py                 |  84 ++--
+ tests/ci/test_flaky_kanban_overlap.py         |  15 +-
+ tests/ci/test_flaky_protocol_boundaries.py    | 178 ++++++++
+ .../test_stable_release_commit_threading.py   |   1 +
+ 12 files changed, 1644 insertions(+), 108 deletions(-)
+ create mode 100644 docs/plans/flaky-artifact-metadata-design.md
+ create mode 100644 scripts/ci/flaky_artifact.py
+ create mode 100644 scripts/ci/flaky_artifact_poll.py
+ create mode 100644 tests/ci/flaky_artifact_fakes.py
+ create mode 100644 tests/ci/test_flaky_artifact.py
+ create mode 100644 tests/ci/test_flaky_artifact_poll.py
+ create mode 100644 tests/ci/test_flaky_protocol_boundaries.py
+
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index d0ffa5219e5..23cc3b44c28 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -189,14 +189,36 @@ jobs:
+           OPENAI_API_KEY: ""
+           NOUS_API_KEY: ""
+ 
++      - name: Export flaky metadata
++        # Runs after a green AND a red test step: a red slice can still carry flakes in other
++        # files. scripts/ci/flaky_artifact.py keeps only each pass-on-retry test's canonical id
++        # (no failure output, no parameters) plus run provenance; a missing/malformed runner report
++        # becomes an explicit complete=false record, never an empty success. The hub's
++        # ci-flaky-cards cron (scripts/ci/flaky_kanban.py --from-github) downloads these artifacts
++        # and files one deflake card per test id.
++        if: ${{ !cancelled() }}
++        env:
++          REPORT: ${{ runner.temp }}/flaky-tests/slice-${{ matrix.slice }}.json
++          OUTPUT: ${{ runner.temp }}/flaky-metadata/flaky-metadata.json
++          FLAKY_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
++          SLICE: ${{ matrix.slice }}
++          SLICES: ${{ strategy.job-total }}
++        run: python3 scripts/ci/flaky_artifact.py --report "$REPORT" --output "$OUTPUT" --slice "$SLICE" --slices "$SLICES"
++
++      - name: Upload flaky metadata
++        if: ${{ !cancelled() }}
++        # Advisory: a quota failure must not fail the slice; the poller reports a missing artifact
++        # as an unavailable run (left unprocessed for retry), never as "no flakes".
++        continue-on-error: true
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
++        with:
++          name: flaky-metadata-v1-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slice }}
++          path: ${{ runner.temp }}/flaky-metadata/flaky-metadata.json
++          if-no-files-found: error
++          retention-days: 3
++
+       - name: Report flaky tests
+-        # Runs after a green AND a red test step: a red slice can still carry
+-        # flakes in other files. Each pass-on-retry test becomes one warning
+-        # annotation titled "FLAKY (passed only on retry)": first message line
+-        # = test id, then the first attempt's failure tail. The hub's
+-        # ci-flaky-cards cron (scripts/ci/flaky_kanban.py --from-github) reads
+-        # these annotations and files one deflake card per test id.
+-        # Annotations, not artifacts: artifact storage is not reliable here.
++        # Local warning annotations for a human reading the run; the cron reads the artifact above.
+         if: ${{ !cancelled() }}
+         env:
+           REPORT: ${{ runner.temp }}/flaky-tests/slice-${{ matrix.slice }}.json
+diff --git a/docs/plans/flaky-artifact-metadata-design.md b/docs/plans/flaky-artifact-metadata-design.md
+new file mode 100644
+index 00000000000..9b7dbf94ad2
+--- /dev/null
++++ b/docs/plans/flaky-artifact-metadata-design.md
+@@ -0,0 +1,29 @@
++# Metadata-only flaky artifacts
++
++## Design
++Replace only the GitHub annotations reader in scripts/ci/flaky_kanban.py with Actions artifacts. Leave local --report/--annotate behavior intact. No token scope changes, checks endpoint or logs fallback. Existing file_cards remains owner/dedupe authority.
++
++Each Python slice in .github/workflows/tests.yml runs a stdlib exporter after tests (!cancelled()) and uploads one pinned actions/upload-artifact artifact named flaky-metadata-v1-<run_id>-<attempt>-<slice>. Single member flaky-metadata.json, small bounded JSON. Exporter reads existing local runner report (not uploaded), discards excerpts and parameter suffixes, retaining only ASCII tests/<safe path>.py[::Class::test_function] identities (no arbitrary parameter content). Entries contain test_id, status=passed_on_retry, retried=tests|file. Strict exact-key schema includes version=1, repository, run_id, run_attempt, head_sha (event PR head or github.sha), source_sha (checkout HEAD), slice, slices, complete boolean, flaky list. Numeric ranges and sha/identity grammar are bounded. Missing/malformed local report produces complete=false and empty list, never successful empty. Source report version 1 and flaky list are mandatory. Exporter rejects unrepresentable identities rather than truncating them silently (complete=false). Parametrized cases collapse to their parent test. Runner report is only written at normal completion; no report implies incomplete.
++
++Consumer pages Actions attempt jobs and run artifacts; matches only non-skipped Python jobs whose names end in Run tests ([affected, ]N/M), requires unique slice indices and consistent M (1..64). Every expected job must have exactly one matching nonexpired artifact for this run attempt. Validate all artifact JSON and run_id/attempt/repo/head_sha/slice/slices before any card side effect. source_sha is bounded provenance, not equated to API head_sha (PR merge checkout and explicit workflow inputs differ). No test jobs means not applicable. Skipped/cancelled/unrecognized partial jobs do not mean no flakes; missing data remains unavailable and run unprocessed. Artifact absence, expired/denied access, malformed ZIP/JSON, unknown fields/version, incomplete reports log fixed FAILED/unavailable codes without payload/exception strings. Complete empty reports are processed as no flakes. Existing run/attempt dedupe remains; failed card filing retries without duplicating delivered entries.
++
++Download via canonical API /actions/artifacts/<id>/zip, authenticated only to api.github.com. Redirects to signed HTTPS object URLs drop authorization; reject other protocols and bound download size. ZIP is read in memory, never extracted; exactly one regular expected member, size/compression/encryption limits, bounded JSON. Do not trust API archive_download_url. Fixed aggregate polling receipt distinguishes complete runs/empty results from unavailable data for natural cron proof; no raw logs retrieved.
++
++### Concrete contract
++Exact schema scalar types: version integer 1 (bool rejected), repository ASCII owner/name grammar [A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}, run_id and run_attempt integers 1..2^63-1, head_sha and source_sha lowercase 40-hex, slice/slices integers 1..64 with slice<=slices, complete actual boolean. flaky list <=10000 items, each exact keys test_id/status/retried; status passed_on_retry, retried tests|file. test_id <=512 ASCII chars: tests/ followed by slash-separated [A-Za-z0-9_-]+ components ending .py, optionally ::[A-Za-z_][A-Za-z0-9_]* nodes. No dot traversal, parameters or whitespace. Exporter strips first [ and following text from raw node IDs before grammar validation; dedupes canonical identities. Wire JSON maximum 2 MiB, ZIP maximum 2 MiB, exactly one nonencrypted nonsymlink regular file flaky-metadata.json of maximum 2 MiB (compression ratio <=200); no additional members. Invalid data returns a fixed code, never the offending content.
++
++Consumer requires observed non-skipped Python slice indices equal 1..M, all jobs completed and not cancelled, one job per slice; any job name containing Run tests but failing anchored suffix grammar is unavailable. All-skipped Python jobs (including unexpanded matrix names with Run tests) are not_applicable, distinct from complete empty; no matching or Run tests-like jobs is also not_applicable. Cancelled runs remain unavailable and unprocessed, never no flakes: this intentionally keeps polling non-green for their lookback window because some completed slices may contain flakes, and the upload is not guaranteed. This conservative known operational cost is preferred over losing data. Newly observed means not already in processed run-attempt state, including retryable unavailable attempts. Run attempts with only a partial rerun remain unavailable (no mixing artifacts from earlier attempts). All metadata list pages are read up to 100 pages, reject overflow; list failures leave run retryable, continue other runs when possible. Completed-runs listing failure returns FAILED runs_unavailable and no state changes. No automatic binary-download retry inside the poll: transient failure is retried by next cron with run unprocessed. Two-hop API request explicitly disables redirect; signed HTTPS fetch follows no further redirects and carries no Authorization. Allowed signed destinations are *.blob.core.windows.net or *.actions.githubusercontent.com, no userinfo; reject all other hosts. Receipt: POLL complete=<n> empty=<n> unavailable=<n> not_applicable=<n>; emit only when a newly observed run exists. Per unavailable run emit FAILED run=<id>/<attempt> code=<fixed enum: jobs_unavailable|artifacts_unavailable|missing|expired|invalid|incomplete|download_unavailable>. Existing main exits 1 on FAILED. Avoid branch text from API in new artifact card path: use bounded head_sha as branch context; construct job URL from validated numeric ids/repo.
++
++Exporter CLI: python3 scripts/ci/flaky_artifact.py --report PATH --output PATH --slice N --slices M; GitHub env GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, FLAKY_HEAD_SHA supplied by workflow; source_sha via git rev-parse HEAD. Metadata failure exits nonzero; source report unavailable writes complete=false and exits zero so upload preserves explicit unavailable evidence. Upload action if !cancelled(), if-no-files-found error, retention-days 3, path only generated metadata file outside checkout. Export source report read max 16 MiB; oversize/malformed means incomplete. No mutation of runner/raw report format required.
++
++## Implementation plan
++New scripts/ci/flaky_artifact.py owns strict schema, exporter CLI and ZIP decoding/download. Existing poll_github imports helper and obtains jobs/artifact metadata through _gh, preserving API retry behavior and card delivery. Update workflow upload and exporter steps without permission changes. New tests/ci/test_flaky_artifact.py and test_flaky_artifact_poll.py exercise producer privacy, strict rejection, permission-independent ingestion, denied/missing/incomplete archives, all-or-nothing validation, pagination, duplicate/rerun mismatch, zero vs unavailable, and delivery retries. Adapt existing annotation-poll fixtures to artifact protocol; keep annotation/local tests unchanged. Run targeted suites and normal checks. Independent exact-head code review before normal PR/green exact-head CI/merge. Verify natural main CI artifacts and installed cron success using only safe aggregates; coordinate t_01a1ca20aaa3fc79. No duplicate workflow dispatch or cancellation for proof.
++
++## Code review follow-up
++Independent cumulative review deleg_7e2f726c approved with a medium card-flood concern. Consumer now rejects more than 200 aggregate flaky entries across a run before any card side effects (wire schema remains capped at 10000 per slice). Synthetic tests cover exactly 200 and 201 across slices. Explicit earlier, later or malformed job attempts fail closed; cancelled runs and incomplete reports remain FAILED/unprocessed as required, rather than the recovered WIP's terminal SKIPPED behavior. Protocol input is validated before API URL construction and all list pages are size bounded.
++
++## Source reading list
++/home/ubuntu/code/_wt/flaky-artifact-metadata/scripts/ci/flaky_kanban.py
++/home/ubuntu/code/_wt/flaky-artifact-metadata/scripts/run_tests_parallel.py (_write_flaky_report, _report_flaky, main)
++/home/ubuntu/code/_wt/flaky-artifact-metadata/.github/workflows/tests.yml
++/home/ubuntu/code/_wt/flaky-artifact-metadata/tests/ci/test_flaky_kanban.py
+diff --git a/scripts/ci/flaky_artifact.py b/scripts/ci/flaky_artifact.py
+new file mode 100644
+index 00000000000..21cf260d542
+--- /dev/null
++++ b/scripts/ci/flaky_artifact.py
+@@ -0,0 +1,305 @@
++#!/usr/bin/env python3
++"""Metadata-only flaky-test artifact: strict schema, CI exporter, safe download/decoding.
++
++Each Python CI slice runs this exporter after the tests (``--report`` is the runner's local flaky
++report, never uploaded) and uploads the single small ``flaky-metadata.json`` it writes. The hub cron
++(``flaky_kanban.py --from-github``) downloads those artifacts instead of reading check-run annotations.
++
++Only a bounded canonical test identity (``tests/<path>.py[::Class::test]``) plus safe provenance
++(repository, run id/attempt, head/source sha, slice) ever enters the artifact. Failure excerpts,
++parameter suffixes and every other report field are discarded. Every rejection here carries a fixed
++code (``ArtifactError.code``), never the offending content.
++
++    python3 scripts/ci/flaky_artifact.py --report PATH --output PATH --slice N --slices M
++
++Environment (workflow-supplied): GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, FLAKY_HEAD_SHA.
++A missing/oversize/malformed source report writes ``complete=false`` with an empty list and exits 0 so
++the upload preserves explicit "unavailable" evidence; any other metadata failure exits non-zero.
++"""
++from __future__ import annotations
++
++import argparse
++import http.client
++import io
++import json
++import os
++import re
++import stat
++import subprocess
++import sys
++import urllib.error
++import urllib.request
++import zipfile
++import zlib
++from pathlib import Path
++from typing import Any
++from urllib.parse import urlsplit
++
++VERSION = 1
++MEMBER = "flaky-metadata.json"
++ARTIFACT_PREFIX = "flaky-metadata-v1"
++MAX_JSON = 2 * 1024 * 1024
++MAX_ZIP = 2 * 1024 * 1024
++MAX_RATIO = 200
++MAX_SOURCE_REPORT = 16 * 1024 * 1024
++MAX_FLAKY = 10000
++MAX_TEST_ID = 512
++MAX_SLICES = 64
++MAX_INT = 2**63 - 1
++ALLOWED_HOST_SUFFIXES = (".blob.core.windows.net", ".actions.githubusercontent.com")
++API_HOST = "api.github.com"
++
++KEYS = frozenset({"version", "repository", "run_id", "run_attempt", "head_sha", "source_sha", "slice", "slices",
++                  "complete", "flaky"})
++ENTRY_KEYS = frozenset({"test_id", "status", "retried"})
++STATUS = "passed_on_retry"
++RETRIED = ("tests", "file")
++
++_REPO = re.compile(r"[A-Za-z0-9_.\-]{1,100}/[A-Za-z0-9_.\-]{1,100}", re.ASCII)
++_SHA = re.compile(r"[0-9a-f]{40}", re.ASCII)
++_TEST_ID = re.compile(r"tests/(?:[A-Za-z0-9_\-]+/)*[A-Za-z0-9_\-]+\.py(?:::[A-Za-z_][A-Za-z0-9_]*)*", re.ASCII)
++
++
++class ArtifactError(Exception):
++    """Fixed-code failure: missing|expired|invalid|incomplete|download_unavailable. Never carries content."""
++
++    def __init__(self, code: str) -> None:
++        super().__init__(code)
++        self.code = code
++
++
++def artifact_name(run_id: int, attempt: int, slice_no: int) -> str:
++    return f"{ARTIFACT_PREFIX}-{run_id}-{attempt}-{slice_no}"
++
++
++# --- schema ---------------------------------------------------------------------
++
++
++def _int_in(value: Any, low: int, high: int) -> bool:
++    return type(value) is int and low <= value <= high
++
++
++def canonical_test_id(raw: Any) -> str | None:
++    """Raw runner node id -> canonical identity, or None when it cannot be represented exactly."""
++    if not isinstance(raw, str):
++        return None
++    test_id = raw.split("[", 1)[0]
++    if len(test_id) > MAX_TEST_ID or not test_id.isascii() or _TEST_ID.fullmatch(test_id) is None:
++        return None
++    return test_id
++
++
++def _valid_entry(entry: Any) -> bool:
++    return (isinstance(entry, dict) and set(entry) == ENTRY_KEYS and entry["status"] == STATUS
++            and entry["retried"] in RETRIED and isinstance(entry["test_id"], str)
++            and canonical_test_id(entry["test_id"]) == entry["test_id"])
++
++
++def _valid_header(data: Any) -> bool:
++    ok = isinstance(data, dict) and set(data) == KEYS
++    ok = ok and data["version"] == VERSION and type(data["version"]) is int
++    ok = ok and isinstance(data["repository"], str) and _REPO.fullmatch(data["repository"]) is not None
++    ok = ok and _int_in(data["run_id"], 1, MAX_INT) and _int_in(data["run_attempt"], 1, MAX_INT)
++    ok = ok and all(isinstance(data[k], str) and _SHA.fullmatch(data[k]) for k in ("head_sha", "source_sha"))
++    ok = ok and _int_in(data["slices"], 1, MAX_SLICES) and _int_in(data["slice"], 1, MAX_SLICES)
++    return ok and data["slice"] <= data["slices"] and type(data["complete"]) is bool
++
++
++def validate_metadata(data: Any) -> dict[str, Any]:
++    """Strict exact-key schema check; returns ``data`` or raises ``ArtifactError('invalid')``."""
++    flaky = data.get("flaky") if isinstance(data, dict) else None
++    ok = _valid_header(data) and isinstance(flaky, list) and len(flaky) <= MAX_FLAKY
++    flaky = flaky if isinstance(flaky, list) else []
++    ok = ok and all(_valid_entry(e) for e in flaky) and (data["complete"] or not flaky)
++    ok = ok and len({e["test_id"] for e in flaky}) == len(flaky)
++    if not ok:
++        raise ArtifactError("invalid")
++    return data
++
++
++def check_expected(meta: dict[str, Any], *, repo: str, run_id: int, attempt: int, head_sha: str,
++                   slice_no: int, slices: int) -> None:
++    """The artifact belongs to exactly this run attempt/slice; ``source_sha`` is provenance only."""
++    same = (meta["repository"].lower() == repo.lower() and meta["run_id"] == run_id
++            and meta["run_attempt"] == attempt and meta["head_sha"] == head_sha
++            and meta["slice"] == slice_no and meta["slices"] == slices)
++    if not same:
++        raise ArtifactError("invalid")
++    if not meta["complete"]:
++        raise ArtifactError("incomplete")
++
++
++# --- exporter -------------------------------------------------------------------
++
++
++def _read_source_report(path: Path) -> list[dict[str, str]] | None:
++    """Canonical entries from the runner report, or None when it is missing/oversize/malformed/unrepresentable."""
++    try:
++        with open(path, "rb") as fh:
++            raw = fh.read(MAX_SOURCE_REPORT + 1)
++        if len(raw) > MAX_SOURCE_REPORT:
++            return None
++        report = json.loads(raw.decode("utf-8-sig"))
++    except (OSError, ValueError, RecursionError):
++        return None
++    if not isinstance(report, dict) or report.get("version") != 1 or type(report.get("version")) is not int:
++        return None
++    flaky = report.get("flaky")
++    if not isinstance(flaky, list):
++        return None
++    found: dict[str, str] = {}
++    for item in flaky:
++        test_id = canonical_test_id(item.get("test_id")) if isinstance(item, dict) else None
++        retried = item.get("retried") if isinstance(item, dict) else None
++        if test_id is None or retried not in RETRIED:
++            return None
++        found.setdefault(test_id, retried)
++    if len(found) > MAX_FLAKY:
++        return None
++    return [{"test_id": t, "status": STATUS, "retried": found[t]} for t in sorted(found)]
++
++
++def build_metadata(report: Path, *, env: dict[str, str], source_sha: str, slice_no: int, slices: int) -> dict[str, Any]:
++    entries = _read_source_report(report)
++    try:
++        run_id, attempt = int(env["GITHUB_RUN_ID"]), int(env["GITHUB_RUN_ATTEMPT"])
++        repo, head_sha = env["GITHUB_REPOSITORY"], env["FLAKY_HEAD_SHA"]
++    except (KeyError, ValueError):
++        raise ArtifactError("invalid") from None
++    meta = {"version": VERSION, "repository": repo, "run_id": run_id, "run_attempt": attempt,
++            "head_sha": head_sha, "source_sha": source_sha, "slice": slice_no, "slices": slices,
++            "complete": entries is not None, "flaky": entries or []}
++    return validate_metadata(meta)
++
++
++def _git_head() -> str:
++    proc = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=False)
++    return proc.stdout.strip() if proc.returncode == 0 else ""
++
++
++def export_main(argv: list[str] | None = None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--report", type=Path, required=True)
++    ap.add_argument("--output", type=Path, required=True)
++    ap.add_argument("--slice", type=int, required=True, dest="slice_no")
++    ap.add_argument("--slices", type=int, required=True)
++    args = ap.parse_args(argv)
++    try:
++        meta = build_metadata(args.report, env=dict(os.environ), source_sha=_git_head(),
++                              slice_no=args.slice_no, slices=args.slices)
++        payload = json.dumps(meta, sort_keys=True, separators=(",", ":")) + "\n"
++        if len(payload.encode("utf-8")) > MAX_JSON:
++            meta.update(complete=False, flaky=[])
++            payload = json.dumps(meta, sort_keys=True, separators=(",", ":")) + "\n"
++        args.output.parent.mkdir(parents=True, exist_ok=True)
++        tmp = args.output.with_name(args.output.name + ".tmp")
++        tmp.write_text(payload, encoding="utf-8")
++        tmp.replace(args.output)
++    except (ArtifactError, OSError):
++        print("flaky_artifact: FAILED metadata export")
++        return 1
++    state = "complete" if meta["complete"] else "incomplete (source report unavailable)"
++    print(f"flaky_artifact: slice {args.slice_no}/{args.slices} {state}, {len(meta['flaky'])} flaky test id(s)")
++    return 0
++
++
++# --- consumer: ZIP decoding -----------------------------------------------------
++
++
++def _reject_dup_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
++    out: dict[str, Any] = {}
++    for key, value in pairs:
++        if key in out:
++            raise ValueError("duplicate")
++        out[key] = value
++    return out
++
++
++def _no_constants(_name: str) -> Any:
++    raise ValueError("constant")
++
++
++def decode_zip(data: bytes) -> dict[str, Any]:
++    """The validated metadata from an in-memory artifact ZIP. Nothing is extracted to disk."""
++    if len(data) > MAX_ZIP:
++        raise ArtifactError("invalid")
++    try:
++        with zipfile.ZipFile(io.BytesIO(data)) as zf:
++            infos = zf.infolist()
++            if len(infos) != 1:
++                raise ArtifactError("invalid")
++            info = infos[0]
++            mode = info.external_attr >> 16
++            bad = (info.filename != MEMBER or info.is_dir() or info.flag_bits & 0x1
++                   or stat.S_IFMT(mode) not in (0, stat.S_IFREG) or info.file_size > MAX_JSON
++                   or info.file_size > MAX_RATIO * max(info.compress_size, 1))
++            if bad:
++                raise ArtifactError("invalid")
++            with zf.open(info) as member:
++                raw = member.read(MAX_JSON + 1)
++        if len(raw) > MAX_JSON:
++            raise ArtifactError("invalid")
++        parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_dup_keys, parse_constant=_no_constants)
++    except ArtifactError:
++        raise
++    except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, ValueError, RuntimeError, EOFError, RecursionError,
++            NotImplementedError, zlib.error):
++        raise ArtifactError("invalid") from None
++    return validate_metadata(parsed)
++
++
++# --- consumer: download ---------------------------------------------------------
++
++
++class _NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
++        return None
++
++
++def _fetch(url: str, headers: dict[str, str], limit: int) -> tuple[int, str | None, bytes]:
++    """One HTTP GET without following redirects: ``(status, Location, body up to limit + 1 bytes)``."""
++    opener = urllib.request.build_opener(_NoRedirect)
++    try:
++        with opener.open(urllib.request.Request(url, headers=headers), timeout=60) as resp:
++            return resp.status, resp.headers.get("Location"), resp.read(limit + 1)
++    except urllib.error.HTTPError as exc:
++        return exc.code, exc.headers.get("Location") if exc.headers else None, b""
++
++
++def _signed_url_ok(url: Any) -> bool:
++    if not isinstance(url, str) or not url.isascii():
++        return False
++    try:
++        parts = urlsplit(url)
++        host, port = parts.hostname, parts.port
++    except ValueError:
++        return False
++    return (parts.scheme == "https" and "@" not in parts.netloc and host is not None
++            and host.endswith(ALLOWED_HOST_SUFFIXES) and port in (None, 443))
++
++
++def download_zip(repo: str, artifact_id: int, token: str) -> bytes:
++    """Artifact ZIP bytes through the canonical API URL (authenticated) and its signed redirect (not)."""
++    if not (_REPO.fullmatch(repo) and _int_in(artifact_id, 1, MAX_INT)):
++        raise ArtifactError("invalid")
++    api_url = f"https://{API_HOST}/repos/{repo}/actions/artifacts/{artifact_id}/zip"
++    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
++               "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "hermes-ci-flaky-cards"}
++    try:
++        status, location, _ = _fetch(api_url, headers, 0)
++        if status == 410:
++            raise ArtifactError("expired")
++        if status not in (301, 302, 303, 307, 308) or location is None or not _signed_url_ok(location):
++            raise ArtifactError("download_unavailable")
++        status, _, body = _fetch(location, {"User-Agent": "hermes-ci-flaky-cards"}, MAX_ZIP)
++    except (OSError, ValueError, http.client.HTTPException):
++        raise ArtifactError("download_unavailable") from None
++    if status != 200:
++        raise ArtifactError("download_unavailable")
++    if len(body) > MAX_ZIP:
++        raise ArtifactError("invalid")
++    return body
++
++
++if __name__ == "__main__":
++    sys.exit(export_main())
+diff --git a/scripts/ci/flaky_artifact_poll.py b/scripts/ci/flaky_artifact_poll.py
+new file mode 100644
+index 00000000000..0f820b1056d
+--- /dev/null
++++ b/scripts/ci/flaky_artifact_poll.py
+@@ -0,0 +1,155 @@
++"""Assemble one run attempt's flaky entries from its metadata artifacts (hub cron side).
++
++``assess_run`` pages the attempt's jobs and the run's artifacts, requires exactly one unexpired
++``flaky-metadata-v1-<run>-<attempt>-<slice>`` artifact per expected Python test job, downloads and
++validates ALL of them, and only then returns entries. Nothing here touches the Kanban board, so a bad
++artifact can never cause a partial card side effect. Failures are fixed codes, never payload or
++exception text.
++
++Unavailable data stays unprocessed and keeps the cron non-green throughout the lookback window.
++Even an interrupted attempt may contain flakes in a completed slice; never mistake it for no flakes.
++"""
++from __future__ import annotations
++
++import http.client
++import re
++from dataclasses import dataclass, field
++from typing import Any, Callable
++
++try:
++    from scripts.ci import flaky_artifact as fa
++except ImportError:  # run as a script: scripts/ci is sys.path[0]
++    import flaky_artifact as fa  # type: ignore[no-redef]
++
++MAX_PAGES = 100
++MAX_RUN_FLAKY = 200
++PER_PAGE = 100
++_JOB_SUFFIX = re.compile(r"Run tests \((?:affected, )?([1-9][0-9]*)/([1-9][0-9]*)\)", re.ASCII)
++_FINISHED = {"success", "failure"}
++
++
++class Unavailable(Exception):
++    """The run's flake data cannot be read; ``code`` is a fixed receipt code."""
++
++    def __init__(self, code: str) -> None:
++        super().__init__(code)
++        self.code = code
++
++
++@dataclass
++class RunResult:
++    kind: str                       # complete | not_applicable
++    jobs: list[tuple[int, list[dict[str, str]]]] = field(default_factory=list)   # (job id, entries) by slice
++
++
++FetchJson = Callable[[str], Any]
++
++
++def _pages(fetch: FetchJson, url: str, key: str, code: str) -> list[dict[str, Any]]:
++    """Every item of a paged GitHub list (up to MAX_PAGES full pages; overflow is rejected)."""
++    items: list[dict[str, Any]] = []
++    for page in range(1, MAX_PAGES + 1):
++        try:
++            body = fetch(f"{url}{'&' if '?' in url else '?'}per_page={PER_PAGE}&page={page}")
++        except (OSError, ValueError, http.client.HTTPException):
++            raise Unavailable(code) from None
++        batch = body.get(key) if isinstance(body, dict) else None
++        if not isinstance(batch, list) or len(batch) > PER_PAGE or not all(isinstance(i, dict) for i in batch):
++            raise Unavailable(code)
++        items += batch
++        if len(batch) < PER_PAGE:
++            return items
++    raise Unavailable(code)
++
++
++def _job_slice(job: dict[str, Any]) -> tuple[int, int] | None:
++    """``(slice, slices)`` of a non-skipped Python test job; None when it is not a test job or was skipped."""
++    name = job.get("name")
++    if not isinstance(name, str) or "Run tests" not in name or job.get("conclusion") == "skipped":
++        return None
++    match = _JOB_SUFFIX.search(name)
++    if match is None or match.end() != len(name):
++        raise Unavailable("jobs_unavailable")
++    slice_no, slices = int(match.group(1)), int(match.group(2))
++    if not (slice_no <= slices <= fa.MAX_SLICES and job.get("status") == "completed"
++            and fa._int_in(job.get("id"), 1, fa.MAX_INT)):
++        raise Unavailable("jobs_unavailable")
++    if job.get("conclusion") not in _FINISHED:      # cancelled, timed_out, ...: its upload never ran
++        raise Unavailable("jobs_unavailable")
++    return slice_no, slices
++
++
++def _job_attempt(job: dict[str, Any], attempt: int) -> int:
++    """Only jobs produced by this exact attempt may supply its metadata."""
++    own = job.get("run_attempt", attempt)
++    if not fa._int_in(own, 1, fa.MAX_INT) or own != attempt:
++        raise Unavailable("jobs_unavailable")
++    return attempt
++
++
++def expected_jobs(jobs: list[dict[str, Any]], attempt: int = 1, *,
++                  cancelled: bool = False) -> tuple[int, dict[int, tuple[int, int]]]:
++    """``(slices, {slice: (job id, producing attempt)})``; no Python jobs means not applicable."""
++    if cancelled:
++        raise Unavailable("jobs_unavailable")
++    by_slice: dict[int, tuple[int, int]] = {}
++    totals: set[int] = set()
++    for job in jobs:
++        found = _job_slice(job)
++        if found is None:
++            continue
++        if found[0] in by_slice:
++            raise Unavailable("jobs_unavailable")
++        by_slice[found[0]] = (job["id"], _job_attempt(job, attempt))
++        totals.add(found[1])
++    if not by_slice:
++        return 0, {}
++    if len(totals) != 1 or set(by_slice) != set(range(1, next(iter(totals)) + 1)):
++        raise Unavailable("jobs_unavailable")
++    return totals.pop(), by_slice
++
++
++def _artifact_id(artifacts: list[dict[str, Any]], name: str) -> int:
++    """The one unexpired artifact called ``name``; missing/expired/ambiguous are fixed codes."""
++    named = [a for a in artifacts if a.get("name") == name]
++    live = [a for a in named if a.get("expired") is False]
++    if not live:
++        raise Unavailable("expired" if named else "missing")
++    if len(live) != 1 or not fa._int_in(live[0].get("id"), 1, fa.MAX_INT):
++        raise Unavailable("invalid")
++    return live[0]["id"]
++
++
++def _entries(meta: dict[str, Any]) -> list[dict[str, str]]:
++    return [{"test_id": e["test_id"], "retried": e["retried"], "first_attempt_excerpt": ""} for e in meta["flaky"]]
++
++
++def assess_run(repo: str, run: dict[str, Any], fetch: FetchJson, token: str) -> RunResult:
++    """Validated entries for every slice of this run attempt, or ``Unavailable``."""
++    run_id, attempt, head_sha = run.get("id"), run.get("run_attempt", 1), run.get("head_sha")
++    if not (isinstance(repo, str) and fa._REPO.fullmatch(repo)
++            and fa._int_in(run_id, 1, fa.MAX_INT) and fa._int_in(attempt, 1, fa.MAX_INT)
++            and isinstance(head_sha, str) and fa._SHA.fullmatch(head_sha)):
++        raise Unavailable("invalid")
++    api = f"https://api.github.com/repos/{repo}"
++    jobs = _pages(fetch, f"{api}/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs", "jobs_unavailable")
++    slices, job_ids = expected_jobs(jobs, attempt, cancelled=run.get("conclusion") == "cancelled")
++    if not job_ids:
++        return RunResult("not_applicable")
++    if not (isinstance(head_sha, str) and fa._SHA.fullmatch(head_sha)):
++        raise Unavailable("invalid")
++    artifacts = _pages(fetch, f"{api}/actions/runs/{run_id}/artifacts", "artifacts", "artifacts_unavailable")
++    wanted = {s: _artifact_id(artifacts, fa.artifact_name(run_id, made, s)) for s, (_, made) in job_ids.items()}
++    result = RunResult("complete")
++    for slice_no in sorted(job_ids):
++        try:
++            meta = fa.decode_zip(fa.download_zip(repo, wanted[slice_no], token))
++            fa.check_expected(meta, repo=repo, run_id=run_id, attempt=job_ids[slice_no][1], head_sha=head_sha,
++                              slice_no=slice_no, slices=slices)
++        except fa.ArtifactError as exc:
++            raise Unavailable(exc.code) from None
++        result.jobs.append((job_ids[slice_no][0], _entries(meta)))
++        # PR-controlled artifacts must not turn one run into an unbounded card flood.
++        if sum(len(entries) for _, entries in result.jobs) > MAX_RUN_FLAKY:
++            raise Unavailable("invalid")
++    return result
+diff --git a/scripts/ci/flaky_kanban.py b/scripts/ci/flaky_kanban.py
+index 8d5d892c992..1b5bff816be 100644
+--- a/scripts/ci/flaky_kanban.py
++++ b/scripts/ci/flaky_kanban.py
+@@ -4,10 +4,10 @@
+ scripts/run_tests_parallel.py retries a failed test once in the same job. A
+ test that passes only on that retry keeps the job green but must never pass
+ silently: the runner writes it to ``--flaky-report`` JSON, the CI step
+-``flaky_kanban.py --annotate <report>`` turns each entry into a warning
+-annotation titled ``FLAKY (passed only on retry)`` (first message line = test
+-id, then the failure tail), and the hub cron reads those annotations back and
+-files one card per test id.
++``flaky_artifact.py`` exports a metadata-only artifact (bounded test identity plus
++run provenance, no failure output; scripts/ci/flaky_artifact.py) and the hub cron
++downloads those artifacts and files one card per test id. ``--annotate`` still prints
++local warning annotations (``FLAKY (passed only on retry)``) for a report.
+ 
+ * first flake of a test id: create a card (idempotency key ``deflake:<id>``)
+ * later flakes while that card is open: append a comment to it
+@@ -28,7 +28,7 @@ Modes:
+ 
+   flaky_kanban.py --annotate flaky.json               # CI step: emit annotations
+   flaky_kanban.py --report flaky.json [--report ...] --run-url URL [--branch B]
+-  flaky_kanban.py --from-github --repo OWNER/NAME     # hub cron: poll annotations
++  flaky_kanban.py --from-github --repo OWNER/NAME     # hub cron: poll metadata artifacts
+ 
+ ``--from-github`` reads ``GH_TOKEN``/``GITHUB_TOKEN``, walks recently completed
+ workflow runs, and remembers processed run attempts in ``--state`` so each run
+@@ -39,6 +39,7 @@ from __future__ import annotations
+ 
+ import argparse
+ import hashlib
++import http.client
+ import json
+ import os
+ import re
+@@ -51,6 +52,11 @@ import urllib.request
+ from pathlib import Path
+ from typing import Any, Iterable, Protocol
+ 
++try:
++    from scripts.ci import flaky_artifact_poll as fap
++except ImportError:  # run as a script: scripts/ci is sys.path[0]
++    import flaky_artifact_poll as fap  # type: ignore[no-redef]
++
+ ANNOTATION_TITLE = "FLAKY (passed only on retry)"
+ CLOSED = {"done", "archived"}
+ OPEN = {"todo", "ready", "running", "scheduled", "blocked", "review", "triage"}
+@@ -263,7 +269,8 @@ def _card_body(entry: dict[str, str], run_url: str, branch: str, previous: str |
+         lines += ["", f"An earlier deflake card {previous} was closed, but the test flaked again."]
+     if entry.get("retried") == "file":
+         lines += ["", "The failure could not be pinned to test ids (collection error or crash), so the whole file was retried."]
+-    lines += ["", "First-attempt output (tail):", "```", excerpt, "```"]
++    if excerpt:
++        lines += ["", "First-attempt output (tail):", "```", excerpt, "```"]
+     return "\n".join(lines)
+ 
+ 
+@@ -379,7 +386,8 @@ class _Flake:
+         self.test_id, self.run_url, self.board, self.state, self.relay, self.self_gw = (
+             test_id, run_url, board, state, relay, self_gw)
+         # The test id and job URL lead the comment: a cross-gateway read-back sees only the first 500 chars.
+-        self.comment = f"Flaked again: `{test_id}` in {run_url} (branch `{branch}`).\n\n```\n{excerpt[-1500:]}\n```"
++        self.comment = f"Flaked again: `{test_id}` in {run_url} (branch `{branch}`)." + (
++            f"\n\n```\n{excerpt[-1500:]}\n```" if excerpt else "")
+ 
+     def noted(self, comments: Iterable[str]) -> bool:
+         return any(self.run_url in c and self.test_id in c for c in comments)
+@@ -493,12 +501,7 @@ def annotations(entries: Iterable[dict[str, str]], excerpt_limit: int = 1500) ->
+     return lines
+ 
+ 
+-def parse_annotation(message: str) -> dict[str, str]:
+-    test_id, _, excerpt = message.partition("\n")
+-    return {"test_id": test_id.strip(), "first_attempt_excerpt": excerpt, "retried": "tests" if "::" in test_id else "file"}
+-
+-
+-# --- Hub side: annotations -> cards (cron) ---------------------------------------
++# --- Hub side: metadata artifacts -> cards (cron) ---------------------------------------
+ 
+ 
+ def _gh(url: str, token: str) -> Any:
+@@ -511,7 +514,7 @@ def _gh(url: str, token: str) -> Any:
+         try:
+             with urllib.request.urlopen(req, timeout=60) as resp:
+                 return json.loads(resp.read())
+-        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
++        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
+             if (isinstance(exc, urllib.error.HTTPError) and exc.code < 500) or attempt == attempts - 1:
+                 raise
+             time.sleep(2 ** attempt)
+@@ -525,50 +528,92 @@ def _completed_runs(api: str, token: str, *, since: float, per_page: int = 100)
+     (it used to be the newest 40) silently skipped exactly the long test runs that carry
+     FLAKY annotations. A creation-time window, paged out, keeps them in view until they
+     complete; ``state["runs"]`` dedupes across polls.
++
++    Bounded and validated: at most ``fap.MAX_PAGES`` pages (a listing that is still full after
++    that is rejected, never followed forever), each page a list of at most ``per_page`` run
++    objects with in-range integer ``id``/``run_attempt``. Any other shape raises ``ValueError``,
++    which ``poll_github`` reports as the fixed ``runs_unavailable`` receipt.
+     """
+     created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
+     runs: list[dict[str, Any]] = []
+-    page = 1
+-    while True:
+-        batch = _gh(f"{api}/actions/runs?status=completed&created=%3E%3D{created}"
+-                    f"&per_page={per_page}&page={page}", token).get("workflow_runs", [])
++    for page in range(1, fap.MAX_PAGES + 1):
++        body = _gh(f"{api}/actions/runs?status=completed&created=%3E%3D{created}"
++                   f"&per_page={per_page}&page={page}", token)
++        batch = body.get("workflow_runs") if isinstance(body, dict) else None
++        if not isinstance(batch, list) or len(batch) > per_page:
++            raise ValueError("runs_unavailable")
++        for run in batch:
++            if not (isinstance(run, dict) and fap.fa._int_in(run.get("id"), 1, fap.fa.MAX_INT)
++                    and fap.fa._int_in(run.get("run_attempt", 1), 1, fap.fa.MAX_INT)):
++                raise ValueError("runs_unavailable")
+         runs += batch
+         if len(batch) < per_page:
+             return runs
+-        page += 1
++    raise ValueError("runs_unavailable")
++
++
++def _filing(result: Any, run: dict[str, Any], repo: str, board: Board, state: dict[str, Any],
++            relay: HubRelay | None) -> list[str]:
++    """Card lines for every slice of a fully validated run. Job URLs come from validated numeric ids only."""
++    lines: list[str] = []
++    for job_id, entries in result.jobs:
++        if entries:
++            url = f"https://github.com/{repo}/actions/runs/{run['id']}/job/{job_id}"
++            lines += file_cards(entries, run_url=url, branch=run["head_sha"], board=board, state=state, relay=relay)
++    return lines
++
++
++def _poll_run(repo: str, token: str, run: dict[str, Any], board: Board, state: dict[str, Any],
++              relay: HubRelay | None) -> tuple[str, list[str]]:
++    """``(outcome, log lines)``; outcome is complete|empty|not_applicable|unavailable (unavailable = retry later)."""
++    key = f"{run['id']}/{run.get('run_attempt', 1)}"
++    try:
++        result = fap.assess_run(repo, run, lambda url: _gh(url, token), token)
++    except fap.Unavailable as exc:
++        return "unavailable", [f"FAILED run={key} code={exc.code}"]
++    if result.kind == "not_applicable":
++        state["runs"].append(key)
++        return "not_applicable", []
++    lines = _filing(result, run, repo, board, state, relay)
++    if any(line.startswith("FAILED") for line in lines):
++        return "unavailable", lines
++    state["runs"].append(key)
++    return ("complete" if any(entries for _, entries in result.jobs) else "empty"), lines
+ 
+ 
+ def poll_github(repo: str, token: str, board: Board, state: dict[str, Any], *,
+                 lookback_hours: float = 6.0, relay: HubRelay | None = None) -> list[str]:
+-    """File cards for FLAKY annotations on recently completed runs not seen before.
++    """File cards from the metadata artifacts of recently completed runs not seen before.
+ 
+     ``lookback_hours`` must outlast the slowest workflow plus any cron outage, and stay
+     well under ``save_state``'s 1000-run dedupe memory (the repo sees ~50 runs/hour).
+-    A run with a ``FAILED`` line stays unprocessed, so the next poll retries it (filed ids
+-    are not filed twice: a comment already on the card for this job is not repeated).
++    A run whose artifacts are unavailable, or whose card filing failed, stays unprocessed
++    (``FAILED`` line) so the next poll retries it; filed ids are not filed twice.
++    Cancelled/timed-out jobs and incomplete reports also remain unavailable and unprocessed.
++    Every
++    expected slice must supply a valid artifact before any card is touched. When a run was newly
++    observed the log ends with ``POLL complete=<n> empty=<n> unavailable=<n> not_applicable=<n>``
++    (``complete`` counts every run with readable data, ``empty`` the subset with no flakes).
+     """
++    if not isinstance(repo, str) or fap.fa._REPO.fullmatch(repo) is None:
++        return ["FAILED runs_unavailable"]
+     api = f"https://api.github.com/repos/{repo}"
+-    log: list[str] = []
+     done = set(state["runs"])
+     since = time.time() - lookback_hours * 3600
+-    for run in sorted(_completed_runs(api, token, since=since), key=lambda r: r["id"]):
+-        key = f"{run['id']}/{run.get('run_attempt', 1)}"
+-        if key in done:
+-            continue
+-        jobs = _gh(f"{api}/actions/runs/{run['id']}/attempts/{run.get('run_attempt', 1)}/jobs?per_page=100", token)
+-        filed: list[str] = []
+-        for job in jobs.get("jobs", []):
+-            if "Run tests" not in job.get("name", ""):
+-                continue
+-            entries = [parse_annotation(a.get("message", ""))
+-                       for a in _gh(f"{api}/check-runs/{job['id']}/annotations?per_page=100", token)
+-                       if a.get("title") == ANNOTATION_TITLE]
+-            if entries:
+-                filed += file_cards(entries, run_url=job.get("html_url") or run["html_url"],
+-                                    branch=run.get("head_branch") or "?", board=board, state=state, relay=relay)
+-        log += filed
+-        if not any(line.startswith("FAILED") for line in filed):
+-            state["runs"].append(key)
++    try:
++        runs = _completed_runs(api, token, since=since)
++    except (OSError, ValueError, http.client.HTTPException):
++        return ["FAILED runs_unavailable"]
++    log: list[str] = []
++    counts = {"complete": 0, "empty": 0, "unavailable": 0, "not_applicable": 0}
++    fresh = [r for r in sorted(runs, key=lambda r: r["id"]) if f"{r['id']}/{r.get('run_attempt', 1)}" not in done]
++    for run in fresh:
++        outcome, lines = _poll_run(repo, token, run, board, state, relay)
++        log += lines
++        counts[outcome] += 1
++        counts["complete"] += outcome == "empty"    # an empty result is a complete one
++    if fresh:
++        log.append("POLL " + " ".join(f"{k}={v}" for k, v in counts.items()))
+     return log
+ 
+ 
+diff --git a/tests/ci/flaky_artifact_fakes.py b/tests/ci/flaky_artifact_fakes.py
+new file mode 100644
+index 00000000000..200c6cb61d3
+--- /dev/null
++++ b/tests/ci/flaky_artifact_fakes.py
+@@ -0,0 +1,94 @@
++"""Fake GitHub Actions API + metadata artifacts for the flaky-card poll tests."""
++from __future__ import annotations
++
++import io
++import json
++import zipfile
++from typing import Any
++
++from scripts.ci import flaky_artifact as fa
++
++API = "https://api.github.com/repos/o/r"
++SHA = "a" * 40
++SRC = "b" * 40
++
++
++def meta(run_id: int = 5, attempt: int = 1, slice_no: int = 1, slices: int = 1, tests: tuple[str, ...] = (),
++         complete: bool = True, head_sha: str = SHA, **over: Any) -> dict[str, Any]:
++    data = {"version": 1, "repository": "o/r", "run_id": run_id, "run_attempt": attempt, "head_sha": head_sha,
++            "source_sha": SRC, "slice": slice_no, "slices": slices, "complete": complete,
++            "flaky": [{"test_id": t, "status": "passed_on_retry", "retried": "tests" if "::" in t else "file"}
++                      for t in tests]}
++    data.update(over)
++    return data
++
++
++def make_zip(payload: Any, member: str = fa.MEMBER, compression: int = zipfile.ZIP_DEFLATED) -> bytes:
++    raw = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
++    buf = io.BytesIO()
++    with zipfile.ZipFile(buf, "w", compression) as zf:
++        zf.writestr(member, raw)
++    return buf.getvalue()
++
++
++def job(job_id: int, slice_no: int = 1, slices: int = 1, conclusion: str = "success", status: str = "completed",
++        name: str | None = None) -> dict[str, Any]:
++    return {"id": job_id, "name": name or f"Python tests / Run tests ({slice_no}/{slices})",
++            "status": status, "conclusion": conclusion, "html_url": "https://example.invalid/untrusted"}
++
++
++def artifact(art_id: int, run_id: int = 5, attempt: int = 1, slice_no: int = 1, expired: bool = False,
++             name: str | None = None) -> dict[str, Any]:
++    return {"id": art_id, "name": name or fa.artifact_name(run_id, attempt, slice_no), "expired": expired,
++            "archive_download_url": "https://evil.invalid/zip"}
++
++
++class FakeGitHub:
++    """Runs, jobs, artifacts and ZIP bodies keyed by id. ``fail`` maps a URL substring to an exception."""
++
++    def __init__(self) -> None:
++        self.runs: list[dict[str, Any]] = []
++        self.jobs: dict[tuple[int, int], list[dict[str, Any]]] = {}
++        self.artifacts: dict[int, list[dict[str, Any]]] = {}
++        self.zips: dict[int, bytes | Exception] = {}
++        self.fail: dict[str, Exception] = {}
++        self.urls: list[str] = []
++        self.downloads: list[int] = []
++
++    def run(self, run_id: int = 5, attempt: int = 1, head_sha: str = SHA) -> dict[str, Any]:
++        run = {"id": run_id, "run_attempt": attempt, "head_sha": head_sha, "head_branch": "evil branch text",
++               "html_url": "https://example.invalid/run"}
++        self.runs.append(run)
++        return run
++
++    def simple(self, run_id: int = 5, tests: tuple[str, ...] = (), art_id: int = 100) -> None:
++        """One run, one slice, one complete artifact."""
++        self.run(run_id)
++        self.jobs[(run_id, 1)] = [job(9)]
++        self.artifacts[run_id] = [artifact(art_id, run_id)]
++        self.zips[art_id] = make_zip(meta(run_id, tests=tests))
++
++    def gh(self, url: str, token: str) -> Any:
++        self.urls.append(url)
++        for needle, exc in self.fail.items():
++            if needle in url:
++                raise exc
++        base, _, query = url.partition("?")
++        params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
++        per_page, page = int(params.get("per_page", 100)), int(params.get("page", 1))
++        window = slice((page - 1) * per_page, page * per_page)
++        if base == f"{API}/actions/runs":
++            return {"workflow_runs": sorted(self.runs, key=lambda r: -r["id"])[window]}
++        parts = base.removeprefix(f"{API}/actions/runs/").split("/")
++        if parts[1:2] == ["attempts"] and parts[-1] == "jobs":
++            return {"jobs": self.jobs.get((int(parts[0]), int(parts[2])), [])[window]}
++        if parts[1:] == ["artifacts"]:
++            return {"artifacts": self.artifacts.get(int(parts[0]), [])[window]}
++        raise AssertionError("unexpected API call")
++
++    def download(self, repo: str, artifact_id: int, token: str) -> bytes:
++        self.downloads.append(artifact_id)
++        body = self.zips[artifact_id]
++        if isinstance(body, Exception):
++            raise body
++        return body
+diff --git a/tests/ci/test_flaky_artifact.py b/tests/ci/test_flaky_artifact.py
+new file mode 100644
+index 00000000000..65ce011372e
+--- /dev/null
++++ b/tests/ci/test_flaky_artifact.py
+@@ -0,0 +1,384 @@
++"""scripts/ci/flaky_artifact.py: metadata-only flaky artifact schema, exporter, ZIP decoding and download."""
++from __future__ import annotations
++
++import http.server
++import io
++import json
++import os
++import subprocess
++import sys
++import threading
++import zipfile
++from pathlib import Path
++
++import pytest
++
++from scripts.ci import flaky_artifact as fa
++from tests.ci.flaky_artifact_fakes import SHA, SRC, make_zip, meta
++
++_ROOT = Path(__file__).resolve().parents[2]
++SECRET = "SECRET-excerpt-9f3a"
++
++
++def _env(**over):
++    env = {"GITHUB_REPOSITORY": "o/r", "GITHUB_RUN_ID": "5", "GITHUB_RUN_ATTEMPT": "2", "FLAKY_HEAD_SHA": SHA}
++    env.update(over)
++    return env
++
++
++def _source(tmp_path, flaky, version=1):
++    path = tmp_path / "slice-1.json"
++    path.write_text(json.dumps({"version": version, "flaky": flaky}))
++    return path
++
++
++def _build(path, **env):
++    return fa.build_metadata(path, env=_env(**env), source_sha=SRC, slice_no=1, slices=2)
++
++
++# --- exporter -------------------------------------------------------------------
++
++
++def test_export_keeps_only_canonical_identity_and_provenance(tmp_path):
++    path = _source(tmp_path, [
++        {"test_id": f"tests/a/test_x.py::TestC::test_a[{SECRET}-param]", "retried": "tests",
++         "first_attempt_excerpt": f"E   {SECRET}", "extra": SECRET},
++        {"test_id": "tests/a/test_x.py::TestC::test_a[other]", "retried": "tests", "first_attempt_excerpt": SECRET},
++        {"test_id": "tests/b/test_y.py", "retried": "file"},
++    ])
++    out = _build(path)
++    assert out == {"version": 1, "repository": "o/r", "run_id": 5, "run_attempt": 2, "head_sha": SHA,
++                   "source_sha": SRC, "slice": 1, "slices": 2, "complete": True,
++                   "flaky": [{"test_id": "tests/a/test_x.py::TestC::test_a", "status": "passed_on_retry", "retried": "tests"},
++                             {"test_id": "tests/b/test_y.py", "status": "passed_on_retry", "retried": "file"}]}
++    assert SECRET not in json.dumps(out) and "param" not in json.dumps(out)
++
++
++@pytest.mark.parametrize("test_id", [
++    "tests/../x.py", "tests/a b/x.py", "src/x.py", "tests/x.txt", "tests/x.py::bad name", "tests/é.py",
++    "tests/" + "a" * 600 + ".py", "tests/x.py::", "tests//x.py", "/tests/x.py", "tests/x.py\n",
++    "tests/x.py::test_a/../b", "tests/.hidden/x.py", 7, None,
++])
++def test_unrepresentable_identity_makes_the_report_incomplete_not_truncated(tmp_path, test_id):
++    path = _source(tmp_path, [{"test_id": "tests/ok.py", "retried": "file"}, {"test_id": test_id, "retried": "tests"}])
++    out = _build(path)
++    assert out["complete"] is False and out["flaky"] == []
++
++
++def _write_bytes(tmp, name, data):
++    (tmp / name).write_bytes(data)
++    return tmp / name
++
++
++@pytest.mark.parametrize("make", [
++    lambda tmp: tmp / "absent.json",
++    lambda tmp: _source(tmp, [], version=2),
++    lambda tmp: _source(tmp, {"not": "a list"}),
++    lambda tmp: _source(tmp, [{"test_id": "tests/x.py", "retried": "sometimes"}]),
++    lambda tmp: _write_bytes(tmp, "bad.json", b"{nope"),
++    lambda tmp: _write_bytes(tmp, "list.json", b"[]"),
++    lambda tmp: _write_bytes(tmp, "nokey.json", b'{"version": 1}'),
++])
++def test_missing_or_malformed_source_report_is_incomplete_never_empty_success(tmp_path, make):
++    out = _build(make(tmp_path))
++    assert out["complete"] is False and out["flaky"] == []
++    fa.validate_metadata(out)
++
++
++def test_oversize_source_report_is_incomplete(tmp_path, monkeypatch):
++    path = _source(tmp_path, [])
++    monkeypatch.setattr(fa, "MAX_SOURCE_REPORT", 4)
++    assert _build(path)["complete"] is False
++
++
++def test_empty_flaky_list_is_a_complete_empty_report(tmp_path):
++    out = _build(_source(tmp_path, []))
++    assert out["complete"] is True and out["flaky"] == []
++
++
++@pytest.mark.parametrize("env", [{"GITHUB_REPOSITORY": "no-slash"}, {"GITHUB_RUN_ID": "x"}, {"GITHUB_RUN_ID": "0"},
++                                 {"FLAKY_HEAD_SHA": "ABC"}, {"GITHUB_RUN_ATTEMPT": "-1"}])
++def test_bad_provenance_env_is_a_metadata_failure(tmp_path, env):
++    with pytest.raises(fa.ArtifactError):
++        _build(_source(tmp_path, []), **env)
++
++
++def test_cli_writes_metadata_and_exits_zero_for_an_unavailable_report(tmp_path):
++    out = tmp_path / "meta" / "flaky-metadata.json"
++    proc = subprocess.run([sys.executable, str(_ROOT / "scripts/ci/flaky_artifact.py"), "--report",
++                           str(tmp_path / "absent.json"), "--output", str(out), "--slice", "2", "--slices", "3"],
++                          capture_output=True, text=True, cwd=_ROOT, env={**os.environ, **_env()}, check=False)
++    assert proc.returncode == 0, proc.stderr
++    data = fa.validate_metadata(json.loads(out.read_text()))
++    assert data["complete"] is False and data["slice"] == 2 and data["slices"] == 3
++
++
++def test_cli_marks_oversize_serialized_metadata_incomplete(tmp_path):
++    entries = [{"test_id": f"tests/{i:05d}_" + "a" * 490 + ".py", "retried": "file"}
++               for i in range(fa.MAX_FLAKY)]
++    assert all(fa.canonical_test_id(e["test_id"]) for e in entries)
++    report = _source(tmp_path, entries)
++    out = tmp_path / fa.MEMBER
++    proc = subprocess.run([sys.executable, str(_ROOT / "scripts/ci/flaky_artifact.py"), "--report",
++                           str(report), "--output", str(out), "--slice", "1", "--slices", "1"],
++                          capture_output=True, text=True, cwd=_ROOT, env={**os.environ, **_env()}, check=False)
++    assert proc.returncode == 0, proc.stderr
++    assert len(out.read_bytes()) <= fa.MAX_JSON
++    data = fa.decode_zip(make_zip(out.read_bytes()))
++    assert data["complete"] is False and data["flaky"] == []
++
++
++def test_cli_exits_nonzero_on_metadata_failure(tmp_path, capsys, monkeypatch):
++    for key, value in _env().items():
++        monkeypatch.setenv(key, value)
++    monkeypatch.setattr(fa, "_git_head", lambda: SRC)
++    path = _source(tmp_path, [{"test_id": "tests/x.py", "retried": "file"}])
++    rc = fa.export_main(["--report", str(path), "--output", str(tmp_path / "o.json"), "--slice", "3", "--slices", "2"])
++    assert rc == 1 and not (tmp_path / "o.json").exists()
++    assert "FAILED" in capsys.readouterr().out
++    rc = fa.export_main(["--report", str(path), "--output", str(tmp_path / "o.json"), "--slice", "1", "--slices", "2"])
++    assert rc == 0 and json.loads((tmp_path / "o.json").read_text())["flaky"][0]["test_id"] == "tests/x.py"
++
++
++# --- schema ---------------------------------------------------------------------
++
++
++def test_valid_metadata_passes():
++    assert fa.validate_metadata(meta(tests=("tests/x.py::test_a", "tests/y.py"), slices=64, slice_no=64))
++
++
++@pytest.mark.parametrize("change", [
++    {"version": 2}, {"version": True}, {"version": 1.0}, {"extra": 1}, {"repository": "bad repo/x"},
++    {"repository": "o/r/z"}, {"run_id": True}, {"run_id": 0}, {"run_id": 2**63}, {"run_id": "5"},
++    {"run_attempt": 0}, {"head_sha": "A" * 40}, {"head_sha": "a" * 39}, {"source_sha": None},
++    {"slice": 0}, {"slice": 3, "slices": 2}, {"slices": 65, "slice": 1}, {"slice": True},
++    {"complete": 1}, {"complete": "true"}, {"flaky": None}, {"flaky": "x"},
++    {"complete": False, "flaky": [{"test_id": "tests/x.py", "status": "passed_on_retry", "retried": "file"}]},
++    {"flaky": [{"test_id": "tests/x.py", "status": "failed", "retried": "file"}]},
++    {"flaky": [{"test_id": "tests/x.py", "status": "passed_on_retry", "retried": "all"}]},
++    {"flaky": [{"test_id": "tests/x.py", "status": "passed_on_retry", "retried": "file", "excerpt": "x"}]},
++    {"flaky": [{"test_id": "tests/x.py", "status": "passed_on_retry"}]},
++    {"flaky": [{"test_id": "tests/x.py[p]", "status": "passed_on_retry", "retried": "file"}]},
++    {"flaky": [{"test_id": "tests/x.py", "status": "passed_on_retry", "retried": "file"}] * 2},
++    {"flaky": ["tests/x.py"]},
++])
++def test_schema_rejects_with_a_fixed_code_and_no_content(change):
++    with pytest.raises(fa.ArtifactError) as err:
++        fa.validate_metadata({**meta(), **change})
++    assert err.value.code == "invalid" and str(err.value) == "invalid"
++
++
++def test_schema_rejects_missing_keys_and_non_objects():
++    short = meta()
++    del short["slice"]
++    for bad in (short, [], "x", None, 5):
++        with pytest.raises(fa.ArtifactError):
++            fa.validate_metadata(bad)
++
++
++def test_flaky_list_bound():
++    tests = tuple(f"tests/t{i}.py" for i in range(fa.MAX_FLAKY + 1))
++    assert len(fa.validate_metadata(meta(tests=tests[:-1]))["flaky"]) == fa.MAX_FLAKY
++    with pytest.raises(fa.ArtifactError):
++        fa.validate_metadata(meta(tests=tests))
++
++
++def test_check_expected_binds_run_attempt_slice_and_head_but_not_source_sha():
++    base = dict(repo="O/R", run_id=5, attempt=1, head_sha=SHA, slice_no=1, slices=2)
++    fa.check_expected(meta(slices=2, source_sha="c" * 40), **base)       # source_sha is provenance only
++    for change in ({"run_id": 6}, {"attempt": 2}, {"head_sha": "d" * 40}, {"slice_no": 2}, {"slices": 3}, {"repo": "o/x"}):
++        with pytest.raises(fa.ArtifactError) as err:
++            fa.check_expected(meta(slices=2), **{**base, **change})
++        assert err.value.code == "invalid"
++    with pytest.raises(fa.ArtifactError) as err:
++        fa.check_expected(meta(slices=2, complete=False), **base)
++    assert err.value.code == "incomplete"
++
++
++# --- ZIP ------------------------------------------------------------------------
++
++
++def test_corrupt_deflate_data_is_a_fixed_invalid_code():
++    body = bytearray(make_zip(meta()))
++    with zipfile.ZipFile(io.BytesIO(body)) as zf:
++        info = zf.infolist()[0]
++        start = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
++    body[start] = 0x07  # final block with reserved BTYPE=3: decompression, not CRC, fails
++    with pytest.raises(fa.ArtifactError) as err:
++        fa.decode_zip(bytes(body))
++    assert err.value.code == "invalid" and str(err.value) == "invalid"
++
++
++def test_decode_zip_round_trip():
++    assert fa.decode_zip(make_zip(meta(tests=("tests/x.py",))))["flaky"][0]["test_id"] == "tests/x.py"
++
++
++def _zip_with(infos):
++    buf = io.BytesIO()
++    with zipfile.ZipFile(buf, "w") as zf:
++        for info, data in infos:
++            zf.writestr(info, data)
++    return buf.getvalue()
++
++
++def _encrypted(body):
++    """The same archive with the encryption bit set in its central directory (zipfile rewrites it on write)."""
++    at = body.index(b"PK\x01\x02") + 8
++    return body[:at] + bytes([body[at] | 1]) + body[at + 1:]
++
++
++def _info(name, mode=0o100644, flags=0):
++    info = zipfile.ZipInfo(name)
++    info.external_attr = mode << 16
++    info.flag_bits |= flags
++    return info
++
++
++@pytest.mark.parametrize("body", [
++    b"not a zip",
++    b"",
++    make_zip(meta(), member="other.json"),
++    make_zip(meta(), member="dir/flaky-metadata.json"),
++    make_zip(meta(), member="../flaky-metadata.json"),
++    make_zip(b"{not json"),
++    make_zip(b'{"version": 1, "version": 1}'),
++    make_zip(b"[NaN]"),
++    make_zip(b"\xff\xfe"),
++    make_zip(b"[" * 200000),
++    make_zip({**meta(), "extra": SECRET}),
++    _zip_with([(_info("flaky-metadata.json"), json.dumps(meta())), (_info("second.json"), "{}")]),
++    _zip_with([(_info("flaky-metadata.json", mode=0o120777), "target")]),
++    _zip_with([(_info("flaky-metadata.json", mode=0o040755), "")]),
++    _encrypted(make_zip(meta())),
++    _zip_with([(_info("flaky-metadata.json/"), "")]),
++    _zip_with([]),
++])
++def test_decode_zip_rejects_with_a_fixed_code(body):
++    with pytest.raises(fa.ArtifactError) as err:
++        fa.decode_zip(body)
++    assert err.value.code == "invalid" and SECRET not in str(err.value)
++
++
++def test_decode_zip_size_and_ratio_limits(monkeypatch):
++    body = make_zip(meta())
++    with monkeypatch.context() as m:
++        m.setattr(fa, "MAX_ZIP", len(body) - 1)
++        with pytest.raises(fa.ArtifactError):
++            fa.decode_zip(body)
++    with monkeypatch.context() as m:
++        m.setattr(fa, "MAX_JSON", 10)
++        with pytest.raises(fa.ArtifactError):
++            fa.decode_zip(body)
++    with monkeypatch.context() as m:
++        m.setattr(fa, "MAX_RATIO", 1)
++        with pytest.raises(fa.ArtifactError):
++            fa.decode_zip(make_zip(b"[" + b" " * 5000 + b"]"))                   # compresses far past ratio 1
++
++
++# --- download -------------------------------------------------------------------
++
++
++class Hops:
++    def __init__(self, *responses):
++        self.responses, self.calls = list(responses), []
++
++    def __call__(self, url, headers, limit):
++        self.calls.append((url, dict(headers), limit))
++        reply = self.responses.pop(0)
++        if isinstance(reply, Exception):
++            raise reply
++        return reply
++
++
++SIGNED = "https://productionresultssa0.blob.core.windows.net/a/b?sig=x"
++
++
++def test_download_authenticates_only_the_canonical_api_hop(monkeypatch):
++    hops = Hops((302, SIGNED, b""), (200, None, b"ZIPBYTES"))
++    monkeypatch.setattr(fa, "_fetch", hops)
++    assert fa.download_zip("o/r", 77, "tok") == b"ZIPBYTES"
++    (api_url, api_headers, _), (blob_url, blob_headers, limit) = hops.calls
++    assert api_url == "https://api.github.com/repos/o/r/actions/artifacts/77/zip"
++    assert api_headers["Authorization"] == "Bearer tok"
++    assert blob_url == SIGNED and "Authorization" not in blob_headers and limit == fa.MAX_ZIP
++
++
++@pytest.mark.parametrize("location", [
++    None, "http://productionresultssa0.blob.core.windows.net/x", "https://evil.example/x",
++    "https://user:pw@productionresultssa0.blob.core.windows.net/x", "https://api.github.com/x",
++    "https://blob.core.windows.net.evil.example/x", "ftp://a.blob.core.windows.net/x", "file:///etc/passwd",
++    "https://a.blob.core.windows.net:8443/x", "https://evil.example@a.blob.core.windows.net/x",
++    "https://a.blob.core.windows.net\\@evil.example/x", "//a.blob.core.windows.net/x",
++])
++def test_download_rejects_unsafe_redirect_targets_without_calling_them(monkeypatch, location):
++    hops = Hops((302, location, b""))
++    monkeypatch.setattr(fa, "_fetch", hops)
++    with pytest.raises(fa.ArtifactError) as err:
++        fa.download_zip("o/r", 77, "tok")
++    assert err.value.code == "download_unavailable" and len(hops.calls) == 1
++
++
++def test_download_accepts_the_actions_host(monkeypatch):
++    monkeypatch.setattr(fa, "_fetch", Hops((302, "https://pipelines.actions.githubusercontent.com/x", b""),
++                                           (200, None, b"z")))
++    assert fa.download_zip("o/r", 1, "t") == b"z"
++
++
++@pytest.mark.parametrize("responses,code", [
++    ([(410, None, b"")], "expired"),
++    ([(404, None, b"")], "download_unavailable"),
++    ([(403, None, b"")], "download_unavailable"),
++    ([(200, None, b"direct body")], "download_unavailable"),
++    ([(302, SIGNED, b""), (302, SIGNED, b"")], "download_unavailable"),     # no second redirect is followed
++    ([(302, SIGNED, b""), (403, None, b"")], "download_unavailable"),
++    ([(302, SIGNED, b""), (200, None, b"x" * (fa.MAX_ZIP + 1))], "invalid"),
++    ([OSError(SECRET)], "download_unavailable"),
++    ([(302, SIGNED, b""), TimeoutError(SECRET)], "download_unavailable"),
++])
++def test_download_failures_are_fixed_codes(monkeypatch, responses, code):
++    monkeypatch.setattr(fa, "_fetch", Hops(*responses))
++    with pytest.raises(fa.ArtifactError) as err:
++        fa.download_zip("o/r", 77, "tok")
++    assert err.value.code == code and SECRET not in str(err.value) and err.value.__cause__ is None
++
++
++@pytest.mark.parametrize("repo,art_id", [("bad", 1), ("o/r", 0), ("o/r", True), ("o/r/x", 1)])
++def test_download_refuses_malformed_inputs_before_any_request(monkeypatch, repo, art_id):
++    hops = Hops()
++    monkeypatch.setattr(fa, "_fetch", hops)
++    with pytest.raises(fa.ArtifactError):
++        fa.download_zip(repo, art_id, "tok")
++    assert hops.calls == []
++
++
++def test_fetch_never_follows_a_redirect():
++    seen = []
++
++    class Handler(http.server.BaseHTTPRequestHandler):
++        def do_GET(self):
++            seen.append(self.path)
++            if self.path == "/start":
++                self.send_response(302)
++                self.send_header("Location", "/followed")
++                self.end_headers()
++            else:
++                self.send_response(200)
++                self.end_headers()
++                self.wfile.write(b"x" * 100)
++
++        def log_message(self, *args):
++            pass
++
++    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    try:
++        base = f"http://127.0.0.1:{server.server_port}"
++        assert fa._fetch(f"{base}/start", {"Authorization": "Bearer t"}, 10) == (302, "/followed", b"")
++        status, _, body = fa._fetch(f"{base}/other", {}, 10)
++        assert status == 200 and len(body) == 11                                  # limit + 1: oversize is detectable
++    finally:
++        server.shutdown()
++        server.server_close()
++        thread.join(5)
++    assert seen == ["/start", "/other"]
+diff --git a/tests/ci/test_flaky_artifact_poll.py b/tests/ci/test_flaky_artifact_poll.py
+new file mode 100644
+index 00000000000..2d5e91f02da
+--- /dev/null
++++ b/tests/ci/test_flaky_artifact_poll.py
+@@ -0,0 +1,344 @@
++"""flaky_kanban.poll_github reads metadata artifacts: validation before side effects, fixed unavailable codes."""
++from __future__ import annotations
++
++import urllib.error
++from pathlib import Path
++
++import pytest
++
++from scripts.ci import flaky_artifact as fa
++from scripts.ci import flaky_artifact_poll as fap
++from scripts.ci import flaky_kanban as fk
++from tests.ci.flaky_artifact_fakes import SHA, FakeGitHub, artifact, job, make_zip, meta
++from tests.ci.test_flaky_kanban import FakeBoard
++
++SECRET = "SECRET-payload-77c1"
++A, B = "tests/x.py::test_a", "tests/y.py"
++
++
++@pytest.fixture
++def gh(monkeypatch):
++    fake = FakeGitHub()
++    monkeypatch.setattr(fk, "_gh", fake.gh)
++    monkeypatch.setattr(fa, "download_zip", fake.download)
++    return fake
++
++
++def _poll(board=None, state=None):
++    board = board if board is not None else FakeBoard()
++    state = state if state is not None else fk.load_state(Path("/nonexistent/state.json"))
++    return fk.poll_github("o/r", "tok", board, state), board, state
++
++
++def _two_slices(gh, bodies=None, run_id=5):
++    gh.run(run_id)
++    gh.jobs[(run_id, 1)] = [job(9, 1, 2), job(10, 2, 2)]
++    gh.artifacts[run_id] = [artifact(100, run_id, 1, 1), artifact(101, run_id, 1, 2)]
++    gh.zips[100], gh.zips[101] = bodies or (make_zip(meta(run_id, slices=2, tests=(A,))),
++                                            make_zip(meta(run_id, slice_no=2, slices=2, tests=(B,))))
++
++
++def test_artifacts_become_cards_per_job_with_safe_context(gh):
++    _two_slices(gh)
++    log, board, state = _poll()
++    assert [line.split()[0] for line in log] == ["opened", "opened", "POLL"]
++    assert log[-1] == "POLL complete=1 empty=0 unavailable=0 not_applicable=0"
++    assert state["runs"] == ["5/1"]
++    card = board.cards[state["cards"][A]["card"]]
++    assert "https://github.com/o/r/actions/runs/5/job/9" in card["body"] and f"branch `{SHA}`" in card["body"]
++    assert "First-attempt output" not in card["body"]
++    assert "https://github.com/o/r/actions/runs/5/job/10" in board.cards[state["cards"][B]["card"]]["body"]
++    assert "evil branch text" not in str(board.cards) and "example.invalid" not in str(board.cards)
++    # Only metadata endpoints are read: never check-runs/annotations or logs.
++    assert all("/actions/runs" in u for u in gh.urls) and not any(("check-runs" in u or "logs" in u) for u in gh.urls)
++    assert sorted(gh.downloads) == [100, 101]
++
++
++def test_a_processed_run_attempt_is_not_read_again(gh):
++    gh.simple(tests=(A,))
++    _, board, state = _poll()
++    gh.urls.clear()
++    gh.downloads.clear()
++    log, _, _ = _poll(board, state)
++    assert log == [] and gh.downloads == [] and len(board.cards) == 1
++    assert not any("/artifacts" in u or "/jobs" in u for u in gh.urls)
++
++
++def test_complete_empty_report_is_processed_as_no_flakes(gh):
++    gh.simple()
++    log, board, state = _poll()
++    assert log == ["POLL complete=1 empty=1 unavailable=0 not_applicable=0"]
++    assert state["runs"] == ["5/1"] and not board.cards
++
++
++@pytest.mark.parametrize("jobs", [
++    [],
++    [{"id": 1, "name": "Lint", "status": "completed", "conclusion": "success"}],
++    [job(9, 1, 2, conclusion="skipped"), job(10, 2, 2, conclusion="skipped")],
++    [job(9, name="Python tests / Run tests (${{ matrix.slice }}/${{ strategy.job-total }})", conclusion="skipped")],
++    [{"id": 3, "name": "Run e2e tests", "status": "completed", "conclusion": "success"}],
++])
++def test_no_python_test_jobs_is_not_applicable_and_distinct_from_empty(gh, jobs):
++    gh.run()
++    gh.jobs[(5, 1)] = jobs
++    log, board, state = _poll()
++    assert log == ["POLL complete=0 empty=0 unavailable=0 not_applicable=1"]
++    assert state["runs"] == ["5/1"] and gh.downloads == [] and not board.cards
++
++
++def test_affected_job_names_are_recognised(gh):
++    gh.simple()
++    gh.jobs[(5, 1)] = [job(9, name="Python tests / Run tests (affected, 1/1)")]
++    log, _, state = _poll()
++    assert state["runs"] == ["5/1"] and log[-1].startswith("POLL complete=1")
++
++
++def _set_zip(gh, body):
++    gh.zips[100] = body
++
++
++_BREAKS = {
++    "missing": lambda gh: gh.artifacts.update({5: []}),
++    "expired": lambda gh: gh.artifacts.update({5: [artifact(100, expired=True)]}),
++    "duplicate": lambda gh: (gh.artifacts.update({5: [artifact(100), artifact(102)]}), gh.zips.update({102: gh.zips[100]})),
++    "other_attempt_only": lambda gh: gh.artifacts.update({5: [artifact(100, attempt=2)]}),
++    "incomplete": lambda gh: _set_zip(gh, make_zip(meta(complete=False))),
++    "wrong_run": lambda gh: _set_zip(gh, make_zip(meta(run_id=6))),
++    "wrong_attempt": lambda gh: _set_zip(gh, make_zip(meta(attempt=2))),
++    "wrong_head": lambda gh: _set_zip(gh, make_zip(meta(head_sha="c" * 40))),
++    "wrong_repo": lambda gh: _set_zip(gh, make_zip(meta(repository="o/other"))),
++    "wrong_slices": lambda gh: _set_zip(gh, make_zip(meta(slices=2))),
++    "unknown_field": lambda gh: _set_zip(gh, make_zip(meta(extra=SECRET))),
++    "not_zip": lambda gh: _set_zip(gh, b"nope"),
++    "denied": lambda gh: _set_zip(gh, fa.ArtifactError("download_unavailable")),
++    "run_without_sha": lambda gh: gh.runs[0].pop("head_sha"),
++}
++
++
++@pytest.mark.parametrize("how,code", [
++    ("missing", "missing"), ("expired", "expired"), ("duplicate", "invalid"), ("other_attempt_only", "missing"),
++    ("incomplete", "incomplete"), ("wrong_run", "invalid"), ("wrong_attempt", "invalid"), ("wrong_head", "invalid"),
++    ("wrong_repo", "invalid"), ("wrong_slices", "invalid"), ("unknown_field", "invalid"), ("not_zip", "invalid"),
++    ("denied", "download_unavailable"), ("run_without_sha", "invalid"),
++])
++def test_unavailable_data_is_a_fixed_failed_code_and_leaves_the_run_unprocessed(gh, how, code):
++    gh.simple(tests=(A,))
++    _BREAKS[how](gh)
++    log, board, state = _poll()
++    assert log == [f"FAILED run=5/1 code={code}", "POLL complete=0 empty=0 unavailable=1 not_applicable=0"]
++    assert state["runs"] == [] and not board.cards
++    assert SECRET not in "\n".join(log)
++
++
++def test_unavailable_run_is_retried_next_poll_and_then_filed_once(gh):
++    gh.simple(tests=(A,))
++    good = gh.zips[100]
++    gh.zips[100] = fa.ArtifactError("download_unavailable")
++    log, board, state = _poll()
++    assert log[0] == "FAILED run=5/1 code=download_unavailable" and state["runs"] == []
++    gh.zips[100] = good
++    log, board, state = _poll(board, state)
++    assert log[0].startswith("opened") and state["runs"] == ["5/1"]
++    assert _poll(board, state)[0] == [] and len(board.cards) == 1
++
++
++def test_all_artifacts_are_validated_before_any_card_side_effect(gh):
++    _two_slices(gh)
++    gh.zips[101] = make_zip(meta(slice_no=2, slices=2, complete=False))
++    log, board, state = _poll()
++    assert log[0] == "FAILED run=5/1 code=incomplete" and not board.cards and state["cards"] == {}
++    assert gh.downloads == [100, 101]                  # slice 1 was read and valid, yet nothing was filed
++
++
++@pytest.mark.parametrize("jobs,code", [
++    ([job(9, 1, 2)], "jobs_unavailable"),                                          # partial rerun: slice 2 absent
++    ([job(9, 1, 2), job(10, 2, 2, conclusion="cancelled")], "jobs_unavailable"),
++    ([job(9, 1, 2), job(10, 2, 2, status="in_progress", conclusion=None)], "jobs_unavailable"),
++    ([job(9, 1, 2), job(10, 2, 2, conclusion="timed_out")], "jobs_unavailable"),
++    ([job(9, 1, 2), job(10, 1, 2)], "jobs_unavailable"),                           # duplicate slice
++    ([job(9, 1, 2), job(10, 2, 3)], "jobs_unavailable"),                           # inconsistent M
++    ([job(9, 2, 2), job(10, 3, 3)], "jobs_unavailable"),
++    ([job(9, name="Run tests (x/y)")], "jobs_unavailable"),                        # Run-tests-like, unrecognised
++    ([job(9, name="Run tests (1/1) extra")], "jobs_unavailable"),
++    ([job(9, name="Python tests / Run tests (${{ matrix.slice }})")], "jobs_unavailable"),   # unexpanded, not skipped
++    ([job(9, 1, 65)], "jobs_unavailable"),
++    ([job(9, name="Run tests (0/1)")], "jobs_unavailable"),
++    ([job(9, name="Run tests (٣/٤)")], "jobs_unavailable"),                        # non-ASCII digits
++    ([job(9, 1, 1), job(10, name="Run tests (garbage)")], "jobs_unavailable"),
++    ([{"id": True, "name": "Run tests (1/1)", "status": "completed", "conclusion": "success"}], "jobs_unavailable"),
++])
++def test_incomplete_or_unrecognised_jobs_never_mean_no_flakes(gh, jobs, code):
++    gh.simple()
++    gh.jobs[(5, 1)] = jobs
++    log, _board, state = _poll()
++    assert log == [f"FAILED run=5/1 code={code}", "POLL complete=0 empty=0 unavailable=1 not_applicable=0"]
++    assert state["runs"] == [] and gh.downloads == []
++
++
++def test_a_failed_test_job_still_supplies_its_artifact(gh):
++    gh.simple(tests=(A,))
++    gh.jobs[(5, 1)] = [job(9, conclusion="failure")]
++    log, _, state = _poll()
++    assert log[0].startswith("opened") and state["runs"] == ["5/1"]
++
++
++def test_skipped_slices_do_not_count_toward_the_expected_set(gh):
++    gh.simple()
++    gh.jobs[(5, 1)] = [job(9, 1, 1), job(10, 2, 2, conclusion="skipped")]
++    assert _poll()[0] == ["POLL complete=1 empty=1 unavailable=0 not_applicable=0"]
++
++
++def test_listing_failures_leave_that_run_retryable_and_other_runs_proceed(gh):
++    gh.simple(run_id=5, tests=(A,))
++    gh.simple(run_id=6, tests=(B,), art_id=200)
++    gh.fail["runs/5/artifacts"] = urllib.error.URLError(SECRET)
++    log, board, state = _poll()
++    assert log[0] == "FAILED run=5/1 code=artifacts_unavailable"
++    assert log[1].startswith("opened") and log[-1] == "POLL complete=1 empty=0 unavailable=1 not_applicable=0"
++    assert state["runs"] == ["6/1"] and SECRET not in "\n".join(log)
++    gh.fail.clear()
++    gh.fail["runs/6/attempts/1/jobs"] = ValueError(SECRET)       # processed run 6 must not even be listed again
++    log, board, state = _poll(board, state)
++    assert log[0].startswith("opened") and state["runs"] == ["6/1", "5/1"]
++
++
++def test_jobs_listing_failure_is_jobs_unavailable(gh):
++    gh.simple()
++    gh.fail["/attempts/1/jobs"] = TimeoutError(SECRET)
++    log, _, state = _poll()
++    assert log[0] == "FAILED run=5/1 code=jobs_unavailable" and state["runs"] == [] and SECRET not in str(log)
++
++
++def test_completed_runs_listing_failure_changes_no_state(gh):
++    gh.simple(tests=(A,))
++    gh.fail["actions/runs?"] = urllib.error.URLError(SECRET)
++    log, board, state = _poll()
++    assert log == ["FAILED runs_unavailable"] and state["runs"] == [] and not board.cards and gh.downloads == []
++
++
++def test_main_exits_one_on_a_failed_unavailable_line(gh, tmp_path, monkeypatch, capsys):
++    gh.simple()
++    gh.artifacts[5] = []
++    monkeypatch.setenv("GH_TOKEN", "tok")
++    monkeypatch.setattr(fk, "CliBoard", lambda *a, **k: FakeBoard())
++    monkeypatch.setattr(fk, "HubRelay", lambda *a, **k: None)
++    rc = fk.main(["--from-github", "--repo", "o/r", "--state", str(tmp_path / "s.json")])
++    out = capsys.readouterr().out
++    assert rc == 1 and "FAILED run=5/1 code=missing" in out and "POLL complete=0" in out
++    assert fk.load_state(tmp_path / "s.json")["runs"] == []
++
++
++def test_jobs_and_artifacts_are_paged_past_one_hundred(gh):
++    gh.run()
++    filler = [job(1000 + i, name=f"Lint {i}") for i in range(130)]
++    gh.jobs[(5, 1)] = filler + [job(9, 1, 2), job(10, 2, 2)]
++    noise = [artifact(2000 + i, name=f"other-{i}") for i in range(130)]
++    gh.artifacts[5] = noise + [artifact(100, slice_no=1), artifact(101, slice_no=2)]
++    gh.zips[100], gh.zips[101] = make_zip(meta(slices=2, tests=(A,))), make_zip(meta(slice_no=2, slices=2))
++    log, _, state = _poll()
++    assert log[0].startswith("opened") and state["runs"] == ["5/1"]
++    assert any("page=2" in u and "/jobs" in u for u in gh.urls) and any("page=2" in u and "/artifacts" in u for u in gh.urls)
++
++
++def test_exactly_one_hundred_items_needs_the_next_page_to_end(gh):
++    gh.simple()
++    gh.jobs[(5, 1)] = [job(1000 + i, name=f"Lint {i}") for i in range(99)] + [job(9)]
++    assert _poll()[0] == ["POLL complete=1 empty=1 unavailable=0 not_applicable=0"]
++    assert any("/jobs" in u and "page=2" in u for u in gh.urls)
++
++
++def test_page_overflow_is_rejected(gh, monkeypatch):
++    gh.simple()
++    monkeypatch.setattr(fap, "MAX_PAGES", 2)
++    gh.artifacts[5] = [artifact(3000 + i, name=f"other-{i}") for i in range(250)] + [artifact(100)]
++    log, _, state = _poll()
++    assert log[0] == "FAILED run=5/1 code=artifacts_unavailable" and state["runs"] == []
++
++
++def test_rerun_attempt_does_not_mix_in_earlier_attempt_artifacts(gh):
++    gh.run(5, attempt=2)
++    gh.jobs[(5, 2)] = [job(19)]
++    gh.artifacts[5] = [artifact(100, attempt=1)]
++    gh.zips[100] = make_zip(meta(attempt=1, tests=(A,)))
++    log, board, state = _poll()
++    assert log[0] == "FAILED run=5/2 code=missing" and not board.cards
++    gh.artifacts[5].append(artifact(110, attempt=2))
++    gh.zips[110] = make_zip(meta(attempt=2, tests=(B,)))
++    log, board, state = _poll(board, state)
++    assert state["runs"] == ["5/2"] and list(state["cards"]) == [B]
++
++
++def test_hostile_api_text_and_exception_text_never_reach_cards_or_logs(gh):
++    gh.simple(tests=(A,))
++    gh.runs[0]["head_branch"] = f"{SECRET} branch"
++    gh.jobs[(5, 1)][0]["html_url"] = f"https://example.invalid/{SECRET}"
++    gh.artifacts[5][0]["archive_download_url"] = f"https://evil.invalid/{SECRET}"
++    log, board, _ = _poll()
++    assert SECRET not in "\n".join(log) + str(board.cards)
++    gh.simple(run_id=6)
++    gh.zips[100] = fa.ArtifactError("download_unavailable")
++    log, _, _ = _poll()
++    assert SECRET not in "\n".join(log)
++
++
++def test_card_filing_failure_leaves_the_run_unprocessed_and_a_retry_does_not_duplicate(gh):
++    gh.simple(tests=(A,))
++
++    class FlakyBoard(FakeBoard):
++        failing = True
++
++        def comment(self, card, body, board=None):
++            if self.failing:
++                raise RuntimeError(SECRET)
++            super().comment(card, body, board)
++
++    board = FlakyBoard()
++    board.add_foreign("t_open", "ready", f"Flaky test: `{A}`", title=f"Deflake {A}")
++    log, board, state = _poll(board)
++    assert log[0].startswith("FAILED") and log[-1] == "POLL complete=0 empty=0 unavailable=1 not_applicable=0"
++    assert state["runs"] == [] and board.cards["t_open"]["comments"] == []
++    board.failing = False
++    log, board, state = _poll(board, state)
++    assert log[0].startswith("appended") and state["runs"] == ["5/1"]
++    assert len(board.cards["t_open"]["comments"]) == 1 and len(board.cards) == 1
++    assert _poll(board, state)[0] == []
++
++
++def test_assess_run_results_are_card_free(gh):
++    """The assembly module returns entries only; it has no access to a board."""
++    _two_slices(gh)
++    result = fap.assess_run("o/r", gh.runs[0], lambda url: gh.gh(url, "tok"), "tok")
++    assert result.kind == "complete" and [j for j, _ in result.jobs] == [9, 10]
++    assert result.jobs[0][1] == [{"test_id": A, "retried": "tests", "first_attempt_excerpt": ""}]
++    assert fap.Unavailable("missing").code == "missing"
++
++
++@pytest.mark.parametrize("own", [1, 3, True, None, "2"])
++def test_explicit_other_or_malformed_job_attempt_is_unavailable(gh, own):
++    gh.run(5, attempt=2)
++    gh.jobs[(5, 2)] = [{**job(19), "run_attempt": own}]
++    log, board, state = _poll()
++    assert log[0] == "FAILED run=5/2 code=jobs_unavailable"
++    assert not state["runs"] and not board.cards and not gh.downloads
++
++
++@pytest.mark.parametrize("jobs", [[], [job(9, conclusion="skipped")], [job(9)]])
++def test_cancelled_run_never_means_no_flakes(gh, jobs):
++    gh.run()["conclusion"] = "cancelled"
++    gh.jobs[(5, 1)] = jobs
++    log, board, state = _poll()
++    assert log[0] == "FAILED run=5/1 code=jobs_unavailable"
++    assert not state["runs"] and not board.cards
++
++
++@pytest.mark.parametrize("total", [200, 201])
++def test_run_flake_limit_is_aggregate_and_precedes_all_side_effects(gh, total):
++    tests = tuple(f"tests/x.py::test_{i}" for i in range(total))
++    _two_slices(gh, bodies=(make_zip(meta(slices=2, tests=tests[:100])),
++                           make_zip(meta(slice_no=2, slices=2, tests=tests[100:]))))
++    log, board, state = _poll()
++    if total == 200:
++        assert len(board.cards) == total and state["runs"] == ["5/1"]
++    else:
++        assert log[0] == "FAILED run=5/1 code=invalid"
++        assert not board.cards and not state["runs"]
+diff --git a/tests/ci/test_flaky_kanban.py b/tests/ci/test_flaky_kanban.py
+index 32fc4b8697e..e1b0eca7378 100644
+--- a/tests/ci/test_flaky_kanban.py
++++ b/tests/ci/test_flaky_kanban.py
+@@ -175,39 +175,33 @@ def test_open_foreign_card_for_the_test_id_is_commented_not_duplicated():
+     assert state["cards"][a]["card"] == "t_other"
+ 
+ 
+-def test_annotations_round_trip_through_the_github_poll(monkeypatch):
+-    """CI prints FLAKY annotations; the hub poll reads them back into one card per id."""
++def test_annotations_still_render_locally_with_escaping():
++    """--annotate keeps printing FLAKY warnings for a local report (the cron no longer reads them)."""
+     excerpt = "E   AssertionError: 100% starved\nline two"
+     lines = fk.annotations([_entry("tests/x.py::test_a", excerpt), _entry("tests/y.py")])
+     assert lines[0].startswith("::warning title=FLAKY (passed only on retry)::tests/x.py::test_a%0A")
+     assert "100%25 starved" in lines[0]                      # workflow-command escaping
+-    messages = [line.split("::", 2)[2].replace("%0A", "\n").replace("%25", "%") for line in lines]
+-
+-    api = "https://api.github.com/repos/o/r"
+-    calls = []
+-
+-    def fake_gh(url, token):
+-        calls.append(url)
+-        if url.startswith(f"{api}/actions/runs?"):
+-            return {"workflow_runs": [{"id": 5, "run_attempt": 1, "head_branch": "main",
+-                                       "html_url": "https://github.com/o/r/actions/runs/5"}]}
+-        if url.startswith(f"{api}/actions/runs/5/attempts/1/jobs"):
+-            return {"jobs": [{"id": 9, "name": "Python tests / Run tests (1/2)", "html_url": "https://job/9"},
+-                             {"id": 10, "name": "Lint", "html_url": "https://job/10"}]}
+-        if url.startswith(f"{api}/check-runs/9/annotations"):
+-            return [{"title": "FLAKY (passed only on retry)", "message": m} for m in messages] + [
+-                {"title": "other warning", "message": "tests/z.py::nope"}]
+-        raise AssertionError(url)
+-
+-    monkeypatch.setattr(fk, "_gh", fake_gh)
++    assert lines[1] == "::warning title=FLAKY (passed only on retry)::tests/y.py%0AAssertionError: boom"
++
++
++def test_artifacts_round_trip_through_the_github_poll(monkeypatch):
++    """CI uploads metadata artifacts; the hub poll reads them back into one card per id."""
++    from scripts.ci import flaky_artifact as fa
++    from tests.ci.flaky_artifact_fakes import FakeGitHub, job, meta
++
++    gh = FakeGitHub()
++    gh.simple(run_id=5, tests=("tests/x.py::test_a", "tests/y.py"), art_id=100)
++    gh.jobs[(5, 1)] = [job(9, 1, 1), job(10, name="Lint")]
++    monkeypatch.setattr(fk, "_gh", gh.gh)
++    monkeypatch.setattr(fa, "download_zip", gh.download)
+     board, state = FakeBoard(), fk.load_state(Path("/nonexistent/state.json"))
+     log = fk.poll_github("o/r", "tok", board, state)
+-    assert [line.split()[0] for line in log] == ["opened", "opened"]
++    assert [line.split()[0] for line in log] == ["opened", "opened", "POLL"]
+     assert sorted(c["title"] for c in board.cards.values()) == ["Deflake tests/x.py::test_a", "Deflake tests/y.py"]
+     card_a = board.cards[state["cards"]["tests/x.py::test_a"]["card"]]
+-    assert "100% starved" in card_a["body"] and "https://job/9" in card_a["body"]
++    assert "https://github.com/o/r/actions/runs/5/job/9" in card_a["body"]
+     assert state["cards"]["tests/y.py"] and state["runs"] == ["5/1"]
+-    assert not any("check-runs/10" in u for u in calls)      # only test jobs are read
++    assert not any("check-runs" in u or "logs" in u for u in gh.urls)          # annotations are not read
+ 
+     # The same run attempt is never filed twice.
+     assert fk.poll_github("o/r", "tok", board, state) == []
+@@ -218,38 +212,26 @@ def test_poll_pages_past_newer_runs_to_reach_a_long_test_run(monkeypatch):
+     """A long test run completes after more newer runs than one page holds.
+ 
+     Regression: PR run 40764402730 (37 min of tests) finished behind 53 newer
+-    completed runs; the poll read only the newest 40, so its three FLAKY
+-    annotations never became cards.
++    completed runs; the poll read only the newest 40, so its flakes never became cards.
+     """
+-    api = "https://api.github.com/repos/o/r"
+-    # Newest first, as GitHub orders them; the slow test run is the oldest.
+-    runs = [{"id": 1000 - i, "run_attempt": 1, "head_branch": "b", "html_url": f"https://r/{1000 - i}"}
+-            for i in range(150)]
+-    slow = runs[-1]["id"]
+-    seen_urls = []
+-
+-    def fake_gh(url, token):
+-        seen_urls.append(url)
+-        if url.startswith(f"{api}/actions/runs?"):
+-            query = dict(part.split("=", 1) for part in url.split("?", 1)[1].split("&"))
+-            per_page, page = int(query["per_page"]), int(query.get("page", 1))
+-            return {"workflow_runs": runs[(page - 1) * per_page: page * per_page]}
+-        if url.startswith(f"{api}/actions/runs/{slow}/attempts/1/jobs"):
+-            return {"jobs": [{"id": 7, "name": "Python tests / Run tests (1/2)", "html_url": "https://job/7"}]}
+-        if "/attempts/" in url:
+-            return {"jobs": []}
+-        if url.startswith(f"{api}/check-runs/7/annotations"):
+-            return [{"title": fk.ANNOTATION_TITLE, "message": "tests/slow.py::test_flaky\nE  boom"}]
+-        raise AssertionError(url)
+-
+-    monkeypatch.setattr(fk, "_gh", fake_gh)
++    from scripts.ci import flaky_artifact as fa
++    from tests.ci.flaky_artifact_fakes import FakeGitHub
++
++    gh = FakeGitHub()
++    for i in range(149):                                # newer runs without Python test jobs
++        gh.run(1000 - i)
++    slow = 1000 - 149                                   # the slow test run is the oldest
++    gh.simple(run_id=slow, tests=("tests/slow.py::test_flaky",), art_id=7)
++    monkeypatch.setattr(fk, "_gh", gh.gh)
++    monkeypatch.setattr(fa, "download_zip", gh.download)
+     board, state = FakeBoard(), fk.load_state(Path("/nonexistent/state.json"))
+     log = fk.poll_github("o/r", "tok", board, state)
+ 
+-    assert log == [f"opened {state['cards']['tests/slow.py::test_flaky']['card']} tests/slow.py::test_flaky"]
+-    assert f"{slow}/1" in state["runs"] and len(state["runs"]) == len(runs)
++    assert log[0] == f"opened {state['cards']['tests/slow.py::test_flaky']['card']} tests/slow.py::test_flaky"
++    assert f"{slow}/1" in state["runs"] and len(state["runs"]) == len(gh.runs)
++    assert log[-1] == "POLL complete=1 empty=0 unavailable=0 not_applicable=149"
+     # Bounded by a creation window, not by a page count.
+-    assert all("created=%3E%3D" in u for u in seen_urls if u.startswith(f"{api}/actions/runs?"))
++    assert all("created=%3E%3D" in u for u in gh.urls if "/actions/runs?" in u)
+ 
+ 
+ def test_annotate_mode_tolerates_a_missing_report(tmp_path, capsys):
+diff --git a/tests/ci/test_flaky_kanban_overlap.py b/tests/ci/test_flaky_kanban_overlap.py
+index 0eceb87aecd..cd1970e3a2e 100644
+--- a/tests/ci/test_flaky_kanban_overlap.py
++++ b/tests/ci/test_flaky_kanban_overlap.py
+@@ -236,16 +236,13 @@ def test_failed_delivery_leaves_the_github_run_unprocessed_for_the_next_poll(env
+     env.remote("macbook", "default/hermes/t_remote", "ready", f"Deflake {TEST}", f"`{TEST}`")
+     env.refuse({"id": "t_remote", "gateway": "macbook", "board": "hermes", "status": "ready", "title": "z"})
+     monkeypatch.setenv("FAKE_HUB_MODE", "reject")
+-    api = "https://api.github.com/repos/o/r"
++    from scripts.ci import flaky_artifact as fa
++    from tests.ci.flaky_artifact_fakes import FakeGitHub
+ 
+-    def fake_gh(url, token):
+-        if url.startswith(f"{api}/actions/runs?"):
+-            return {"workflow_runs": [{"id": 5, "run_attempt": 1, "head_branch": "main", "html_url": "u"}]}
+-        if "/jobs" in url:
+-            return {"jobs": [{"id": 9, "name": "Run tests (1/2)", "html_url": RUN}]}
+-        return [{"title": fk.ANNOTATION_TITLE, "message": f"{TEST}\nboom"}]
+-
+-    monkeypatch.setattr(fk, "_gh", fake_gh)
++    gh = FakeGitHub()
++    gh.simple(tests=(TEST,))
++    monkeypatch.setattr(fk, "_gh", gh.gh)
++    monkeypatch.setattr(fa, "download_zip", gh.download)
+     state = fk.load_state(env.tmp / "absent.json")
+     log = fk.poll_github("o/r", "tok", fk.CliBoard(env.hermes), state, relay=fk.HubRelay())
+     assert log[0].startswith("FAILED") and state["runs"] == []
+diff --git a/tests/ci/test_flaky_protocol_boundaries.py b/tests/ci/test_flaky_protocol_boundaries.py
+new file mode 100644
+index 00000000000..bed8f9d4d7e
+--- /dev/null
++++ b/tests/ci/test_flaky_protocol_boundaries.py
+@@ -0,0 +1,178 @@
++"""Regressions for transport reads and untrusted Actions list boundaries."""
++from __future__ import annotations
++
++import http.client
++import json
++import pytest
++
++from scripts.ci import flaky_artifact as fa
++from scripts.ci import flaky_artifact_poll as fap
++from scripts.ci import flaky_kanban as fk
++from tests.ci.flaky_artifact_fakes import FakeGitHub
++from tests.ci.test_flaky_kanban import FakeBoard
++
++SECRET = b"SECRET-partial-response"
++
++
++class ReadResponse:
++    status = 200
++    headers = {}
++
++    def __init__(self, result):
++        self.result = result
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *args):
++        return False
++
++    def read(self, *args):
++        if isinstance(self.result, Exception):
++            raise self.result
++        return self.result
++
++
++def _read_error(kind):
++    return http.client.IncompleteRead(SECRET, 100) if kind == "partial" else http.client.HTTPException(SECRET.decode())
++
++
++@pytest.mark.parametrize("kind", ["partial", "protocol"])
++def test_api_get_retries_http_read_failures(monkeypatch, kind):
++    replies = [ReadResponse(_read_error(kind)), ReadResponse(b'{"jobs": []}')]
++    calls = []
++
++    def open_response(req, **kwargs):
++        calls.append(req.get_method())
++        return replies.pop(0)
++
++    monkeypatch.setattr(fk.urllib.request, "urlopen", open_response)
++    monkeypatch.setattr(fk.time, "sleep", lambda _: None)
++    assert fk._gh("https://api.github.com/repos/o/r/actions/runs", "tok") == {"jobs": []}
++    assert calls == ["GET", "GET"]
++
++
++@pytest.mark.parametrize("kind", ["partial", "protocol"])
++@pytest.mark.parametrize("stage,receipt", [("runs", "FAILED runs_unavailable"),
++                                           ("jobs", "FAILED run=5/1 code=jobs_unavailable"),
++                                           ("artifacts", "FAILED run=5/1 code=artifacts_unavailable")])
++def test_exhausted_http_reads_have_fixed_receipts_and_persist_retryable_state(tmp_path, monkeypatch, capsys,
++                                                                           kind, stage, receipt):
++    fake = FakeGitHub()
++    fake.simple()
++    failures = []
++
++    def open_response(req, **kwargs):
++        url = req.full_url
++        match = (stage == "runs" and "/actions/runs?" in url
++                 or stage == "jobs" and "/jobs?" in url
++                 or stage == "artifacts" and "/artifacts?" in url)
++        if match:
++            failures.append(url)
++            return ReadResponse(_read_error(kind))
++        return ReadResponse(json.dumps(fake.gh(url, "tok")).encode())
++
++    monkeypatch.setattr(fk.urllib.request, "urlopen", open_response)
++    monkeypatch.setattr(fk.time, "sleep", lambda _: None)
++    monkeypatch.setattr(fk, "CliBoard", lambda *a, **k: FakeBoard())
++    monkeypatch.setattr(fk, "HubRelay", lambda *a, **k: None)
++    monkeypatch.setenv("GH_TOKEN", "tok")
++    path = tmp_path / "state.json"
++    initial = {"cards": {"tests/old.py": {"card": "t_old", "generation": 0}}, "runs": ["4/1"]}
++    fk.save_state(path, initial)
++    assert fk.main(["--from-github", "--repo", "o/r", "--state", str(path)]) == 1
++    out = capsys.readouterr()
++    assert receipt in out.out and SECRET.decode() not in out.out + out.err
++    assert len(failures) == 4
++    assert fk.load_state(path) == initial
++
++
++@pytest.mark.parametrize("kind", ["partial", "protocol"])
++@pytest.mark.parametrize("hop", ["api", "signed"])
++def test_download_http_read_failure_is_fixed_and_not_retried(monkeypatch, kind, hop):
++    calls = []
++
++    class Opener:
++        def open(self, req, **kwargs):
++            calls.append(req)
++            if hop == "api" or len(calls) == 2:
++                return ReadResponse(_read_error(kind))
++            response = ReadResponse(b"")
++            response.status = 302
++            response.headers = {"Location": "https://a.blob.core.windows.net/zip?sig=private"}
++            return response
++
++    monkeypatch.setattr(fa.urllib.request, "build_opener", lambda *a: Opener())
++    with pytest.raises(fa.ArtifactError) as err:
++        fa.download_zip("o/r", 100, "tok")
++    assert str(err.value) == "download_unavailable" and err.value.__cause__ is None
++    assert len(calls) == (1 if hop == "api" else 2)
++
++
++@pytest.mark.parametrize("kind", ["partial", "protocol"])
++def test_pages_maps_protocol_failure_without_raw_content(kind):
++    def fetch(url):
++        return ReadResponse(_read_error(kind)).read()
++
++    with pytest.raises(fap.Unavailable) as err:
++        fap._pages(fetch, "https://api.github.com/jobs", "jobs", "jobs_unavailable")
++    assert str(err.value) == "jobs_unavailable" and err.value.__cause__ is None
++
++
++@pytest.mark.parametrize("repo,change", [
++    ("bad/repo/extra", {}), (None, {}), ("o/r", {"id": "5/" + SECRET.decode()}),
++    ("o/r", {"id": True}), ("o/r", {"id": 0}), ("o/r", {"id": fa.MAX_INT + 1}),
++    ("o/r", {"run_attempt": "1/" + SECRET.decode()}), ("o/r", {"run_attempt": True}),
++    ("o/r", {"run_attempt": 0}), ("o/r", {"run_attempt": fa.MAX_INT + 1}),
++    ("o/r", {"head_sha": SECRET.decode()}), ("o/r", {"head_sha": None}),
++])
++def test_assess_validates_provenance_before_api_requests(repo, change):
++    fake = FakeGitHub()
++    run = {**fake.run(), **change}
++    with pytest.raises(fap.Unavailable) as err:
++        fap.assess_run(repo, run, lambda url: fake.gh(url, "tok"), "tok")
++    assert str(err.value) == "invalid" and fake.urls == []
++
++
++@pytest.mark.parametrize("body", [None, [], {}, {"workflow_runs": None}, {"workflow_runs": {}},
++                                 {"workflow_runs": [SECRET.decode()]}, {"workflow_runs": [{}]},
++                                 {"workflow_runs": [{"id": SECRET.decode()}]},
++                                 {"workflow_runs": [{"id": True}]},
++                                 {"workflow_runs": [{"id": fa.MAX_INT + 1}]},
++                                 {"workflow_runs": [{"id": 5, "run_attempt": SECRET.decode()}]},
++                                 {"workflow_runs": [{"id": 5, "run_attempt": False}]},
++                                 {"workflow_runs": [{"id": 5}] * 101}])
++def test_malformed_run_listing_has_fixed_receipt_and_no_state_change(monkeypatch, body):
++    monkeypatch.setattr(fk, "_gh", lambda *a: body)
++    state = {"cards": {}, "runs": ["4/1"]}
++    board = FakeBoard()
++    assert fk.poll_github("o/r", "tok", board, state) == ["FAILED runs_unavailable"]
++    assert state == {"cards": {}, "runs": ["4/1"]} and not board.cards
++
++
++def test_completed_run_listing_is_page_bounded(monkeypatch):
++    urls = []
++
++    def fetch(url, token):
++        urls.append(url)
++        assert len(urls) <= 2, "completed-runs pagination exceeded its bound"
++        return {"workflow_runs": [{"id": i + 1} for i in range(100)]}
++
++    monkeypatch.setattr(fk, "_gh", fetch)
++    monkeypatch.setattr(fap, "MAX_PAGES", 2)
++    assert fk.poll_github("o/r", "tok", FakeBoard(), {"cards": {}, "runs": []}) == ["FAILED runs_unavailable"]
++    assert len(urls) == 2
++
++
++def test_invalid_repo_is_rejected_before_run_listing(monkeypatch):
++    calls = []
++    monkeypatch.setattr(fk, "_gh", lambda *a: calls.append(a) or {"workflow_runs": []})
++    assert fk.poll_github("o/r/" + SECRET.decode(), "tok", FakeBoard(), {"cards": {}, "runs": []}) == ["FAILED runs_unavailable"]
++    assert calls == []
++
++
++@pytest.mark.parametrize("key", ["jobs", "artifacts"])
++def test_metadata_page_cannot_exceed_requested_page_size(key):
++    with pytest.raises(fap.Unavailable) as err:
++        fap._pages(lambda url: {key: [{}] * 101}, "https://api.github.com/list", key, key + "_unavailable")
++    assert str(err.value) == key + "_unavailable"
+diff --git a/tests/ci/test_stable_release_commit_threading.py b/tests/ci/test_stable_release_commit_threading.py
+index f91a003bdfb..ff881e79df2 100644
+--- a/tests/ci/test_stable_release_commit_threading.py
++++ b/tests/ci/test_stable_release_commit_threading.py
+@@ -120,6 +120,7 @@ CONTROLLER_REFERENCES = (
+     ("-${{ github.sha }}", "artifact display name, unique per run"),
+     ("description:", "input documentation"),
+     ("HEAD_REF:", "label on the lint summary"),
++    ("FLAKY_HEAD_SHA:", "flaky-artifact provenance matched against the runs API head_sha; the tested commit is source_sha"),
+     ("key: visual-baselines-${{ github.ref_name }}", "restores main's baselines and never writes them for a stable run"),
+     ("inputs.ref == github.sha", "saves candidates only for the triggering commit, so a stable claim never writes"),
+     ("inputs.channel-build != '' && inputs.controller-sha", "smoke tests the staged artifact with the dispatched ref's scripts"),
+-- 
+2.55.0
+

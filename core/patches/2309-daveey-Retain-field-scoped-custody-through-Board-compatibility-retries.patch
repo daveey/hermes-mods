@@ -1,0 +1,483 @@
+From 0912ac554ab41053eaf1eeddbe8f4877fed2a045 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:48:30 -0800
+Subject: [PATCH] [daveey] Retain field-scoped custody through Board
+ compatibility retries
+
+---
+ hermes_cli/kanban_db_sync.py                  |  19 ++-
+ hermes_cli/kanban_sync_client.py              |  55 +------
+ hermes_cli/kanban_sync_compat.py              |  13 +-
+ hermes_cli/kanban_sync_divergence.py          |  62 ++++++++
+ hermes_cli/kanban_sync_omissions.py           |  77 ++++++++++
+ .../hermes_cli/test_kanban_sync_omissions.py  | 138 ++++++++++++++++++
+ 6 files changed, 311 insertions(+), 53 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_divergence.py
+ create mode 100644 hermes_cli/kanban_sync_omissions.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_omissions.py
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 5db7e6dfa24..19213ad3ecb 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -187,6 +187,16 @@ CREATE TABLE IF NOT EXISTS kanban_sync_outbox (
+     state        TEXT NOT NULL DEFAULT 'pending'
+ );
+ CREATE INDEX IF NOT EXISTS idx_outbox_pending ON kanban_sync_outbox(state, created_at);
++CREATE TABLE IF NOT EXISTS kanban_sync_omissions (
++    original_op_id TEXT PRIMARY KEY,
++    table_name TEXT NOT NULL,
++    row_uid TEXT NOT NULL,
++    field TEXT NOT NULL,
++    compat_op_id TEXT NOT NULL,
++    restore_op_id TEXT,
++    state TEXT NOT NULL DEFAULT 'held'
++);
++CREATE INDEX IF NOT EXISTS idx_sync_omissions_row ON kanban_sync_omissions(table_name, row_uid);
+ CREATE TABLE IF NOT EXISTS kanban_sync_remote_parents (
+     parent_id    TEXT PRIMARY KEY,
+     status       TEXT NOT NULL,
+@@ -1164,6 +1174,9 @@ def apply_remote_changes(
+ def _apply_one(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: ApplyResult) -> None:
+     if ch.table not in SYNCED_COLUMNS:
+         raise ValueError(f"apply_remote_changes: unknown table {ch.table!r}")
++    if ch.client_op_id:
++        from hermes_cli.kanban_sync_omissions import acknowledge
++        acknowledge(conn, ch.client_op_id, ch.fields)
+     if ch.client_op_id and conn.execute(
+             "DELETE FROM kanban_sync_outbox WHERE op_id = ?", (ch.client_op_id,)).rowcount:
+         if ch.table == "tasks":
+@@ -1219,7 +1232,8 @@ def _upsert_task(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: A
+     if old is not None and old["sync_version"] is not None and ch.version < old["sync_version"]:  # equal = the same row (a re-send or a revert)
+         return False
+     fields = _without_unacked_fields(conn, ch) if result.local_pending_wins else ch.fields
+-    cols = _local_fields(conn, "tasks", fields, ch.uid)
++    from hermes_cli.kanban_sync_omissions import without_held
++    cols = _local_fields(conn, "tasks", without_held(conn, "tasks", ch.uid, fields), ch.uid)
+     if old is None:
+         names = ["id", *cols, "sync_version"]
+         conn.execute(f"INSERT INTO tasks ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+@@ -1294,7 +1308,8 @@ def _upsert_row(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: Ap
+     task_id = ch.fields.get("task_id") or ch.fields.get("parent_id")
+     if _tombstoned(conn, "tasks", task_id) or (table != "task_links" and _tombstoned(conn, table, ch.uid)):
+         return False
+-    cols = _local_fields(conn, table, ch.fields, task_id)
++    from hermes_cli.kanban_sync_omissions import without_held
++    cols = _local_fields(conn, table, without_held(conn, table, ch.uid, ch.fields), task_id)
+     if table == "task_links":
+         return conn.execute("INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                             (cols["parent_id"], cols["child_id"])).rowcount == 1
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index f1f89891805..106ee6a989a 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -700,6 +700,8 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                 if row is None:
+                     continue
+                 if status in ("applied", "merged"):
++                    from hermes_cli.kanban_sync_omissions import acknowledge
++                    acknowledge(conn, op_id, res.get("row") if status == "merged" else None)
+                     conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id = ?", (op_id,))
+                     if row["table_name"] == "tasks" and res.get("version"):
+                         conn.execute("UPDATE tasks SET sync_version = MAX(COALESCE(sync_version, 0), ?) WHERE id = ?",
+@@ -718,9 +720,12 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                     reason = f"{res.get('reason')}: {res.get('detail') or ''}".strip(": ")
+                     # A fresh op id: the service remembers every answer by op id (idempotency), so a retry under the
+                     # old id would get the same rejection back forever.
++                    from hermes_cli.kanban_sync_omissions import remap
++                    new_id = sync.uuid7()
++                    remap(conn, op_id, new_id)
+                     conn.execute("UPDATE kanban_sync_outbox SET op_id = ?, attempts = attempts + 1, last_error = ?, "
+                                  "retry_after = ? WHERE op_id = ?",
+-                                 (sync.uuid7(), f"retrying: {reason}"[:500], int(time.time()) + _backoff_s(row["attempts"]), op_id))
++                                 (new_id, f"retrying: {reason}"[:500], int(time.time()) + _backoff_s(row["attempts"]), op_id))
+                     out.deferred += 1
+                 else:
+                     reason = f"{res.get('reason')}: {res.get('detail') or ''}".strip(": ")
+@@ -1851,52 +1856,8 @@ def retire_lost_placeholder_links(live: sqlite3.Connection, shadow: sqlite3.Conn
+ 
+ 
+ def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) -> dict[str, list[str]]:
+-    """Queue the local values of this gateway's cards that the service never received.
+-
+-    A card whose live ``sync_version`` equals the replica's, with no outbox op in flight, has seen every service
+-    write. Any synced field that still differs was then written locally with no capture trigger, e.g. in the
+-    window while another process re-installed the triggers. The install heal only finds NULL-uid children;
+-    ``repair_missing_children`` handles settled missing links. A task row has no missing-row marker, so this
+-    field comparison is the only place that finds its uncaptured edits.
+-    Hub incident 2026-10-28: a ``scheduled -> ready`` wake reached the service as its event but not as its
+-    status, and the service refused every lease as ``not_claimable`` for 3 h. Returns {task id: fields queued}."""
+-    from hermes_cli.kanban_db_connect import write_txn
+-    held = {r[0] for r in live.execute(
+-        "SELECT DISTINCT row_uid FROM kanban_sync_outbox WHERE table_name = 'tasks' AND state IN ('pending', 'rejected')")}
+-    seen = {r[0]: r[1] for r in shadow.execute(
+-        "SELECT id, sync_version FROM tasks WHERE (created_on = ? OR created_on IS NULL) AND sync_version IS NOT NULL",
+-        (gateway,))}
+-    repaired: dict[str, list[str]] = {}
+-    rows = live.execute("SELECT * FROM tasks WHERE sync_version IS NOT NULL").fetchall()
+-    for row in rows:
+-        tid = row["id"]
+-        if tid in held or seen.get(tid) != row["sync_version"]:
+-            continue
+-        theirs = shadow.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+-        mine, remote = _row_fields(live, "tasks", row), _row_fields(shadow, "tasks", theirs)
+-        fields = {k: v for k, v in mine.items() if k in remote and remote[k] != v}
+-        if not fields:
+-            continue
+-        runs = _diverged_runs(live, shadow, tid)
+-        with write_txn(live):
+-            # [daveey] The same uncaptured transaction usually ended the card's run too (``complete_task`` writes
+-            # both). Queue those run rows FIRST: a card arriving ``done`` before its run makes the Board end the
+-            # lease's run generically (rows.ts ``endLeaseRun``: ``released``, "card left running (done)"), and
+-            # with no later holder write that row came back over the real ``done/completed`` run. The owner then
+-            # published the card unverified, and no origin ever released it (hub t_01a185075c59bd52, 10-29).
+-            for run_uid, run_fields, run_version in runs:
+-                live.execute(
+-                    "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, "
+-                    "created_at) VALUES (?, 'task_runs', ?, 'upsert', ?, ?, '', ?)",
+-                    (sync.uuid7(), run_uid, json.dumps(run_fields), None, int(time.time() * 1000)))
+-            live.execute(
+-                "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
+-                "VALUES (?, 'tasks', ?, 'upsert', ?, ?, '', ?)",
+-                (sync.uuid7(), tid, json.dumps(fields), row["sync_version"], int(time.time() * 1000)))
+-        repaired[tid] = sorted(fields) + [f"task_runs:{uid}" for uid, _f, _v in runs]
+-        _log.warning("kanban sync: %s %s differed from the service with nothing in flight (an uncaptured write); "
+-                     "re-queued", tid, ", ".join(repaired[tid]))
+-    return repaired
++    from hermes_cli.kanban_sync_divergence import repair_divergence as repair
++    return repair(live, shadow, gateway)
+ 
+ 
+ def _diverged_runs(live: sqlite3.Connection, shadow: sqlite3.Connection, tid: str) -> list[tuple[str, dict, Any]]:
+diff --git a/hermes_cli/kanban_sync_compat.py b/hermes_cli/kanban_sync_compat.py
+index d5176c194e1..a38cdbb5b58 100644
+--- a/hermes_cli/kanban_sync_compat.py
++++ b/hermes_cli/kanban_sync_compat.py
+@@ -38,9 +38,9 @@ def record_rejection(conn: sqlite3.Connection, row: dict, reason: str) -> None:
+ def enqueue_retry(conn: sqlite3.Connection, row: dict, wire: dict, result: dict) -> bool:
+     """Retain the rejected original; one fresh, non-hydrated upsert carries the reduced payload.
+ 
+-    The local-only op kind survives crashes and transient retries. The retained original prevents
+-    divergence repair from repeatedly requeueing the deliberately omitted local value and keeps
+-    the schema mismatch visible until the Board is deployed and reconciliation retries it.
++    The local-only op kind survives crashes and transient retries. The durable omission ledger
++    protects the local value while allowing unrelated fields to converge; a fresh authoritative
++    field appearance can queue a current-value restore, never replay the rejected historical row.
+     """
+     if result.get("reason") != "forbidden_field" or row["op"] not in ("upsert", "import"):
+         return False
+@@ -51,10 +51,15 @@ def enqueue_retry(conn: sqlite3.Connection, row: dict, wire: dict, result: dict)
+     if match[2] not in fields:
+         return False
+     reduced = {k: v for k, v in fields.items() if k != match[2]}
++    retry_id = sync.uuid7()
++    conn.execute(
++        "INSERT INTO kanban_sync_omissions (original_op_id, table_name, row_uid, field, compat_op_id) "
++        "VALUES (?, ?, ?, ?, ?)",
++        (row["op_id"], row["table_name"], row["row_uid"], match[2], retry_id))
+     conn.execute(
+         "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
+         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+-        (sync.uuid7(), row["table_name"], row["row_uid"],
++        (retry_id, row["table_name"], row["row_uid"],
+          "compat_import" if wire.get("import") else "compat", json.dumps(reduced),
+          row.get("base_version"), wire["hlc"], row["created_at"]))
+     return True
+diff --git a/hermes_cli/kanban_sync_divergence.py b/hermes_cli/kanban_sync_divergence.py
+new file mode 100644
+index 00000000000..e6fa6f67e8e
+--- /dev/null
++++ b/hermes_cli/kanban_sync_divergence.py
+@@ -0,0 +1,62 @@
++"""Field-scoped repair of uncaptured local writes."""
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++import time
++from hermes_cli import kanban_db_sync as sync
++
++_log = logging.getLogger(__name__)
++
++
++def repair_divergence(live: sqlite3.Connection, shadow: sqlite3.Connection, gateway: str) -> dict[str, list[str]]:
++    """Queue the local values of this gateway's cards that the service never received.
++
++    A card whose live ``sync_version`` equals the replica's, with no outbox op in flight, has seen every service
++    write. Any synced field that still differs was then written locally with no capture trigger, e.g. in the
++    window while another process re-installed the triggers. The install heal only finds NULL-uid children;
++    ``repair_missing_children`` handles settled missing links. A task row has no missing-row marker, so this
++    field comparison is the only place that finds its uncaptured edits.
++    Hub incident 2026-10-28: a ``scheduled -> ready`` wake reached the service as its event but not as its
++    status, and the service refused every lease as ``not_claimable`` for 3 h. Returns {task id: fields queued}."""
++    from hermes_cli.kanban_sync_client import _row_fields, _diverged_runs
++    from hermes_cli.kanban_db_connect import write_txn
++    from hermes_cli.kanban_sync_omissions import held_fields, repair_holds
++    held = repair_holds(live, "tasks")
++    seen = {r[0]: r[1] for r in shadow.execute(
++        "SELECT id, sync_version FROM tasks WHERE (created_on = ? OR created_on IS NULL) AND sync_version IS NOT NULL",
++        (gateway,))}
++    repaired: dict[str, list[str]] = {}
++    rows = live.execute("SELECT * FROM tasks WHERE sync_version IS NOT NULL").fetchall()
++    for row in rows:
++        tid = row["id"]
++        if tid in held or seen.get(tid) != row["sync_version"]:
++            continue
++        theirs = shadow.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++        mine, remote = _row_fields(live, "tasks", row), _row_fields(shadow, "tasks", theirs)
++        omitted = held_fields(live, "tasks", tid)
++        fields = {k: v for k, v in mine.items() if k in remote and remote[k] != v and k not in omitted}
++        if not fields:
++            continue
++        runs = _diverged_runs(live, shadow, tid)
++        with write_txn(live):
++            # [daveey] The same uncaptured transaction usually ended the card's run too (``complete_task`` writes
++            # both). Queue those run rows FIRST: a card arriving ``done`` before its run makes the Board end the
++            # lease's run generically (rows.ts ``endLeaseRun``: ``released``, "card left running (done)"), and
++            # with no later holder write that row came back over the real ``done/completed`` run. The owner then
++            # published the card unverified, and no origin ever released it (hub t_01a185075c59bd52, 10-29).
++            for run_uid, run_fields, run_version in runs:
++                live.execute(
++                    "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, "
++                    "created_at) VALUES (?, 'task_runs', ?, 'upsert', ?, ?, '', ?)",
++                    (sync.uuid7(), run_uid, json.dumps(run_fields), None, int(time.time() * 1000)))
++            live.execute(
++                "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
++                "VALUES (?, 'tasks', ?, 'upsert', ?, ?, '', ?)",
++                (sync.uuid7(), tid, json.dumps(fields), row["sync_version"], int(time.time() * 1000)))
++        repaired[tid] = sorted(fields) + [f"task_runs:{uid}" for uid, _f, _v in runs]
++        _log.warning("kanban sync: %s %s differed from the service with nothing in flight (an uncaptured write); "
++                     "re-queued", tid, ", ".join(repaired[tid]))
++    return repaired
++
+diff --git a/hermes_cli/kanban_sync_omissions.py b/hermes_cli/kanban_sync_omissions.py
+new file mode 100644
+index 00000000000..8a666870d11
+--- /dev/null
++++ b/hermes_cli/kanban_sync_omissions.py
+@@ -0,0 +1,77 @@
++"""Local custody of fields omitted for an older Board, independent of outbox retirement."""
++from __future__ import annotations
++
++import sqlite3
++from typing import Any, Mapping
++
++
++def held_fields(conn: sqlite3.Connection, table: str, uid: str) -> set[str]:
++    return {r[0] for r in conn.execute(
++        "SELECT field FROM kanban_sync_omissions WHERE table_name=? AND row_uid=? AND state!='delivered'",
++        (table, uid))}
++
++
++def without_held(conn: sqlite3.Connection, table: str, uid: str, fields: Mapping[str, Any]) -> dict[str, Any]:
++    """Run under the authoritative-apply write lock, including merged replies without pending-wins."""
++    held = held_fields(conn, table, uid)
++    _queue_restore(conn, table, uid, fields, held)
++    return {k: v for k, v in fields.items() if k not in held}
++
++
++def _queue_restore(conn, table, uid, authoritative, held):
++    """Presence is a capability hint, not an acknowledgement; try once per omission."""
++    import json
++    import time
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_sync_rejections import _local
++    wanted = held & authoritative.keys()
++    if not wanted:
++        return
++    row = _local(conn, table, uid)
++    if row is None:
++        return
++    current = client._row_fields(conn, table, row)
++    for field in wanted:
++        receipts = conn.execute(
++            "SELECT original_op_id,restore_op_id FROM kanban_sync_omissions "
++            "WHERE table_name=? AND row_uid=? AND field=? AND state!='delivered'", (table, uid, field)).fetchall()
++        if any(r[1] for r in receipts) or field not in current:
++            continue
++        op_id = sync.uuid7()
++        conn.execute(
++            "INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) "
++            "VALUES (?,?,?,'restore',?,'',?)", (op_id, table, uid, json.dumps({field: current[field]}), int(time.time()*1000)))
++        conn.execute("UPDATE kanban_sync_omissions SET restore_op_id=?,state='restoring' "
++                     "WHERE table_name=? AND row_uid=? AND field=? AND state!='delivered'", (op_id, table, uid, field))
++
++
++def acknowledge(conn, op_id, authoritative=None):
++    """Release only a delivered current value, not an older concurrent edit or a losing merge."""
++    import json
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_sync_rejections import _local
++    op = conn.execute("SELECT * FROM kanban_sync_outbox WHERE op_id=? AND op='restore'", (op_id,)).fetchone()
++    if op is None:
++        return
++    row = _local(conn, op['table_name'], op['row_uid'])
++    current = client._row_fields(conn, op['table_name'], row) if row else {}
++    sent = json.loads(op['fields'])
++    delivered = all(k in current and current[k] == v and
++                    (authoritative is None or (k in authoritative and authoritative[k] == v)) for k, v in sent.items())
++    conn.execute("UPDATE kanban_sync_omissions SET state=? WHERE restore_op_id=?",
++                 ('delivered' if delivered else 'held', op_id))
++
++
++def remap(conn, old_id, new_id):
++    """Follow the existing bounded transient retry's fresh Board verdict identity."""
++    for column in ('compat_op_id', 'restore_op_id'):
++        conn.execute(f"UPDATE kanban_sync_omissions SET {column}=? WHERE {column}=?", (new_id, old_id))
++
++
++def repair_holds(conn, table):
++    """An omission owns only its field; unrelated or failed compatibility ops still hold the row."""
++    return {r[0] for r in conn.execute(
++        "SELECT row_uid FROM kanban_sync_outbox o WHERE table_name=? AND state IN ('pending','rejected') "
++        "AND NOT (state='rejected' AND EXISTS (SELECT 1 FROM kanban_sync_omissions m "
++        "WHERE m.original_op_id=o.op_id AND m.table_name=o.table_name AND m.row_uid=o.row_uid))", (table,))}
+diff --git a/tests/hermes_cli/test_kanban_sync_omissions.py b/tests/hermes_cli/test_kanban_sync_omissions.py
+new file mode 100644
+index 00000000000..956cdbeb6d5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_omissions.py
+@@ -0,0 +1,138 @@
++"""Omitted wire fields remain locally owned until their delivery is proven."""
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_sync_run_rows as helpers
++
++kanban_home = helpers.kanban_home
++svc = helpers.svc
++live = helpers.live
++
++
++def omit_pin(live, svc):
++    tid = kb.create_task(live, title="custody", assignee="worker")
++    live.execute("UPDATE tasks SET model_pin_mandatory=1 WHERE id=?", (tid,))
++    live.commit()
++    hub = svc.hub("macbook")
++    def ops(board, batch):
++        results = []
++        for op in batch:
++            if op["table"] == "tasks" and "model_pin_mandatory" in op.get("fields", {}):
++                results.append({"client_op_id": op["client_op_id"], "status": "rejected",
++                                "reason": "forbidden_field", "detail": "not writable on tasks: model_pin_mandatory"})
++            else:
++                results.extend(hub.ops(board, [op])["results"])
++        return {"results": results}
++    for _ in range(3):
++        client.push(live, SimpleNamespace(ops=ops), "default", "macbook", primary=True)
++    return tid
++
++
++@pytest.mark.parametrize("pending_wins", [False, True])
++def test_authoritative_default_does_not_clobber_omitted_local_value(live, svc, pending_wins):
++    tid = omit_pin(live, svc)
++    version = live.execute("SELECT sync_version FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++    change = sync.RemoteChange(seq=100, table="tasks", uid=tid, op="upsert",
++                               fields={"model_pin_mandatory": None, "title": "remote title"},
++                               version=version + 1, hlc="", origin_gateway="other")
++    sync.apply_remote_changes(live, [change], new_cursor=100, board="default", local_pending_wins=pending_wins)
++    row = live.execute("SELECT model_pin_mandatory,title FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert row[0] == 1, "omitted field is still locally owned after successful stripped retry"
++    assert row[1] == "remote title", "custody must be field-scoped, not hold the whole row"
++
++
++def test_upgrade_queues_current_field_only_and_releases_after_ack(live, svc):
++    tid = omit_pin(live, svc)
++    version = live.execute("SELECT sync_version FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++    change = sync.RemoteChange(seq=100, table="tasks", uid=tid, op="upsert",
++                               fields={"model_pin_mandatory": None}, version=version + 1,
++                               hlc="", origin_gateway="other")
++    sync.apply_remote_changes(live, [change], new_cursor=100, board="default")
++    restores = live.execute("SELECT * FROM kanban_sync_outbox WHERE op='restore'").fetchall()
++    assert len(restores) == 1, "fresh authoritative field appearance should trigger one restoration"
++    import json
++    assert json.loads(restores[0]["fields"]) == {"model_pin_mandatory": 1}
++    client.push(live, svc.hub("macbook"), "default", "macbook", primary=True)
++    assert svc.board("default")["rows"]["tasks"][tid]["model_pin_mandatory"] == 1
++    assert not live.execute("SELECT 1 FROM kanban_sync_omissions WHERE state!='delivered'").fetchone()
++
++
++@pytest.mark.parametrize("newer_edit", [False, True])
++def test_restore_feed_echo_acknowledges_only_current_value(live, svc, newer_edit):
++    import json
++    tid = omit_pin(live, svc)
++    version = live.execute("SELECT sync_version FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++    change = sync.RemoteChange(100, "tasks", tid, "upsert", {"model_pin_mandatory": None}, version+1, "", "other")
++    sync.apply_remote_changes(live, [change], new_cursor=100, board="default")
++    op = live.execute("SELECT * FROM kanban_sync_outbox WHERE op='restore'").fetchone()
++    if newer_edit:
++        live.execute("UPDATE tasks SET model_pin_mandatory=0 WHERE id=?", (tid,))
++        live.commit()
++    echo = sync.RemoteChange(101, "tasks", tid, "upsert", json.loads(op['fields']), version+2, "", "macbook", op['op_id'])
++    sync.apply_remote_changes(live, [echo], new_cursor=101, board="default")
++    unresolved = live.execute("SELECT COUNT(*) FROM kanban_sync_omissions WHERE state!='delivered'").fetchone()[0]
++    assert bool(unresolved) is newer_edit
++    assert live.execute("SELECT model_pin_mandatory FROM tasks WHERE id=?", (tid,)).fetchone()[0] == (0 if newer_edit else 1)
++
++
++def test_omitted_child_payload_survives_authoritative_row(live, svc):
++    import json
++    tid = kb.create_task(live, title="child custody", assignee="worker")
++    uid, payload = live.execute("SELECT uid,payload FROM task_events WHERE task_id=? LIMIT 1", (tid,)).fetchone()
++    hub = svc.hub("macbook")
++    def ops(board, batch):
++        results = []
++        for op in batch:
++            if op['table'] == 'task_events' and op['uid'] == uid and 'payload' in op.get('fields', {}):
++                results.append({'client_op_id': op['client_op_id'], 'status': 'rejected',
++                                'reason': 'forbidden_field', 'detail': 'not writable on task_events: payload'})
++            else:
++                results.extend(hub.ops(board, [op])['results'])
++        return {'results': results}
++    for _ in range(3):
++        client.push(live, SimpleNamespace(ops=ops), 'default', 'macbook', primary=True)
++    change = sync.RemoteChange(100, 'task_events', uid, 'upsert', {'task_id': tid, 'payload': None}, 20, '', 'other')
++    sync.apply_remote_changes(live, [change], new_cursor=100, board='default')
++    assert live.execute('SELECT payload FROM task_events WHERE uid=?', (uid,)).fetchone()[0] == payload
++    restore = live.execute("SELECT fields FROM kanban_sync_outbox WHERE op='restore' AND row_uid=?", (uid,)).fetchone()
++    assert json.loads(restore[0]) == {'payload': payload}
++
++
++def test_omission_does_not_hold_unrelated_divergence_repair(live, svc):
++    import sqlite3
++    tid = omit_pin(live, svc)
++    shadow = sqlite3.connect(':memory:')
++    shadow.row_factory = sqlite3.Row
++    live.backup(shadow)
++    try:
++        shadow.execute('UPDATE kanban_sync_state SET applying=1')
++        shadow.execute('UPDATE tasks SET model_pin_mandatory=NULL WHERE id=?', (tid,))
++        shadow.commit()
++        live.execute('UPDATE kanban_sync_state SET applying=1')
++        live.execute("UPDATE tasks SET title='uncaptured' WHERE id=?", (tid,))
++        live.execute('UPDATE kanban_sync_state SET applying=0')
++        live.commit()
++        assert client.repair_divergence(live, shadow, 'macbook') == {tid: ['title']}
++    finally:
++        shadow.close()
++
++
++def test_transient_restore_identity_change_still_releases_custody(live, svc):
++    tid = omit_pin(live, svc)
++    version = live.execute('SELECT sync_version FROM tasks WHERE id=?', (tid,)).fetchone()[0]
++    change = sync.RemoteChange(100, 'tasks', tid, 'upsert', {'model_pin_mandatory': None}, version+1, '', 'other')
++    sync.apply_remote_changes(live, [change], new_cursor=100, board='default')
++    def reject(board, batch):
++        return {'results': [{'client_op_id': op['client_op_id'], 'status': 'rejected',
++                             'reason': 'storage_error', 'detail': 'busy'} for op in batch]}
++    client.push(live, SimpleNamespace(ops=reject), 'default', 'macbook', primary=True)
++    live.execute("UPDATE kanban_sync_outbox SET retry_after=0 WHERE op='restore'")
++    live.commit()
++    client.push(live, svc.hub('macbook'), 'default', 'macbook', primary=True)
++    assert not live.execute("SELECT 1 FROM kanban_sync_omissions WHERE state!='delivered'").fetchone()
+-- 
+2.55.0
+

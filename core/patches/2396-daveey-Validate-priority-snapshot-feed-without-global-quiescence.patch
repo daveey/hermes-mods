@@ -1,0 +1,302 @@
+From 8dc9f2e13a91c68a22a22b4580543daf7cbc14ad Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:11:25 +0000
+Subject: [PATCH] [daveey] Validate priority snapshot feed without global
+ quiescence
+
+---
+ docs/kanban-priority-rollout.md               |  16 ++-
+ hermes_cli/kanban_priority_feed.py            |  53 +++++++++
+ hermes_cli/kanban_priority_prepare.py         |  12 +-
+ tests/hermes_cli/test_kanban_priority_feed.py | 110 ++++++++++++++++++
+ .../test_kanban_priority_prepare.py           |   6 +
+ 5 files changed, 188 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_cli/kanban_priority_feed.py
+ create mode 100644 tests/hermes_cli/test_kanban_priority_feed.py
+
+diff --git a/docs/kanban-priority-rollout.md b/docs/kanban-priority-rollout.md
+index d68c9e5b45a..360e7504f85 100644
+--- a/docs/kanban-priority-rollout.md
++++ b/docs/kanban-priority-rollout.md
+@@ -64,7 +64,11 @@ grant or expiry. Implementation tests do not establish live operator authorizati
+    Open exceptions reserve the top bands (at most 900); their old values are in
+    the manifest. Ordinary positive values keep order/ties; nonpositive ordinary
+    values are unchanged. Terminal rows are not rewritten. Snapshot pagination
+-   requires one unchanged feed head. This is an observation, not a global lease.
++   retains the first feed head, then scans changes through a finite final observed
++   head. Heartbeats, events, runs and unrelated task fields may advance normally;
++   open-status transitions are replayed. Changes to task membership, openness,
++   ownership or priority refuse capture/verification and require a fresh attempt.
++   This observation is not a global lease; no all-origin dispatcher freeze is required.
+ 
+ 2. Secure the resulting original backup and attachment before doing anything that
+    might clip values. Copy the **exact original bytes** to every other origin,
+@@ -76,8 +80,10 @@ grant or expiry. Implementation tests do not establish live operator authorizati
+      --backup /absolute/fresh-origin-backup.json
+    ```
+ 
+-   Each JSON receipt gives `attachment_id`, `manifest_sha256`, `writer`, and
+-   `backup`. All origins must report the same digest. Keep all receipts and verify
++   Each JSON receipt gives `attachment_id`, `manifest_sha256`, `writer`,
++   `backup`, and `origins` (every required writer with its open-row count).
++   Use that map, not a hard-coded host list, to arrange operator sessions and
++   stage/apply on every listed origin. All origins must report the same digest. Keep all receipts and verify
+    every original backup is secured **before any apply or cap-aware install**.
+    Staging preserves bytes exactly; it never overwrites a backup. It changes no
+    priority. If attachment storage fails, retain the original backup and retry
+@@ -108,8 +114,8 @@ grant or expiry. Implementation tests do not establish live operator authorizati
+      --writer ORIGIN --manifest /absolute/fresh-original.json --digest SHA256
+    ```
+ 
+-   It requires exact global open membership, ownership and target values at one
+-   stable head; no local import or write occurs. Use `verify-restore` to compare
++   It requires exact global open membership, ownership and target values through
++   the final observed feed head; no local import or write occurs. Use `verify-restore` to compare
+    original values after rollback. A local command receipt is not publication
+    proof. Only after all origins match may the rollout
+    owner install through the normal drain/update route. Verify no open stored
+diff --git a/hermes_cli/kanban_priority_feed.py b/hermes_cli/kanban_priority_feed.py
+new file mode 100644
+index 00000000000..b60a851de65
+--- /dev/null
++++ b/hermes_cli/kanban_priority_feed.py
+@@ -0,0 +1,53 @@
++"""Validate the finite feed interval covering a raw paged priority inventory."""
++from __future__ import annotations
++
++
++def check_interval(hub, board: str, rows: list[dict], first: int, target: int) -> None:
++    """Ignore unrelated traffic; refuse changed task membership or migration inputs.
++
++    The snapshot is not transactional. Replay from its FIRST head through the
++    final observed head, not through a moving head that could starve forever.
++    No import or priority clipping occurs. Local apply still requires atomic CAS.
++    """
++    inventory = {row['id']: row for row in rows}
++    cursor = first
++    for _ in range(10000):
++        if cursor >= target:
++            return
++        page = hub.changes(board, cursor)
++        batch, nxt = page.get('changes'), page.get('next')
++        if (not isinstance(batch, list) or not batch or type(nxt) is not int
++                or type(page.get('more')) is not bool):
++            raise ValueError('invalid canonical feed page')
++        previous = cursor
++        for change in batch:
++            if (not isinstance(change, dict) or type(change.get('seq')) is not int
++                    or change['seq'] <= previous or not isinstance(change.get('table'), str)):
++                raise ValueError('invalid canonical feed ordering')
++            previous = change['seq']
++            if previous <= target and change['table'] == 'tasks':
++                _check_task(inventory, change)
++        if nxt != previous:
++            raise ValueError('invalid canonical feed cursor')
++        cursor = nxt
++        if cursor < target and not page['more']:
++            raise ValueError('canonical feed ended before observed head')
++    raise ValueError('canonical feed page limit exceeded')
++
++
++def _check_task(inventory: dict, change: dict) -> None:
++    row = inventory.get(change.get('uid'))
++    fields = change.get('fields')
++    if row is None or change.get('op') != 'upsert' or not isinstance(fields, dict):
++        raise ValueError('canonical inventory changed; capture a new manifest')
++    # Full-row and patch-shaped feed entries are both accepted. Open-status
++    # transitions do not change ranks; replay them for exception audit evidence.
++    from hermes_cli.kanban_priority_manifest import STATUSES
++    status = fields.get('status', row['status'])
++    if (status not in STATUSES
++            or (status in ('done', 'archived')) != (row['status'] in ('done', 'archived'))):
++        raise ValueError('canonical inventory changed; capture a new manifest')
++    row['status'] = status
++    for key in ('id', 'created_on', 'priority'):
++        if key in fields and (type(fields[key]) is not type(row.get(key)) or fields[key] != row.get(key)):
++            raise ValueError('canonical inventory changed; capture a new manifest')
+diff --git a/hermes_cli/kanban_priority_prepare.py b/hermes_cli/kanban_priority_prepare.py
+index 4c3f5d495e8..af70bf006b3 100644
+--- a/hermes_cli/kanban_priority_prepare.py
++++ b/hermes_cli/kanban_priority_prepare.py
+@@ -31,7 +31,7 @@ def verify(hub, manifest: dict, *, undo: bool = False) -> dict:
+ 
+ 
+ def _inventory(hub, board_id: str) -> list[dict]:
+-    """Read raw Board pages at one feed head, without importing/clipping values."""
++    """Read raw pages and validate their finite feed interval without clipping."""
+     rows = []
+     after = ""
+     head = None
+@@ -41,7 +41,7 @@ def _inventory(hub, board_id: str) -> list[dict]:
+             raise ValueError("invalid canonical snapshot page")
+         if head is None:
+             head = page["head"]
+-        if page["head"] != head:
++        if page["head"] < head:
+             raise ValueError("canonical inventory changed; capture a new manifest")
+         batch = page.get("rows")
+         if not isinstance(batch, list) or type(page.get("more")) is not bool:
+@@ -63,8 +63,10 @@ def _inventory(hub, board_id: str) -> list[dict]:
+     # A final read closes the final-page/return gap at an observed head. Apply
+     # still has local CAS; this is not a distributed transaction or a lease.
+     final = hub.snapshot_page(board_id, "tasks", limit=1)
+-    if type(final.get("head")) is not int or final.get("head") != head:
++    if type(final.get("head")) is not int or final["head"] < page["head"]:
+         raise ValueError("canonical inventory changed; capture a new manifest")
++    from hermes_cli.kanban_priority_feed import check_interval
++    check_interval(hub, board_id, rows, head, final["head"])
+     return rows
+ 
+ 
+@@ -111,5 +113,7 @@ def stage(conn, manifest: dict, *, path: Path, task_id: str, writer: str,
+     attachment = kb.get_attachment(conn, attachment_id)
+     if attachment is None or Path(attachment.stored_path).read_bytes() != data:
+         raise ValueError("attached manifest readback mismatch; retain original backup")
++    from collections import Counter
++    origins = dict(sorted(Counter(row['origin'] for row in manifest['rows']).items()))
+     return {"attachment_id": attachment_id, "manifest_sha256": digest,
+-            "writer": writer, "backup": str(path)}
++            "writer": writer, "backup": str(path), "origins": origins}
+diff --git a/tests/hermes_cli/test_kanban_priority_feed.py b/tests/hermes_cli/test_kanban_priority_feed.py
+new file mode 100644
+index 00000000000..ec8e23702e6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_feed.py
+@@ -0,0 +1,110 @@
++"""Snapshot/feed reconciliation tolerates unrelated Board traffic."""
++import pytest
++
++from hermes_cli import kanban_priority_prepare as prepare
++from tests.hermes_cli.test_kanban_priority_prepare import Pages
++from hermes_cli.kanban_priority_feed import check_interval
++
++
++class Feed:
++    def __init__(self, page):
++        self.page = page
++
++    def changes(self, board, since):
++        return self.page
++
++
++def entry(**kwargs):
++    return {'seq': 2, 'table': 'tasks', 'uid': 'a', 'op': 'upsert', 'fields': {}, **kwargs}
++
++
++def one_page(change=None, **kwargs):
++    return {'changes': [entry() if change is None else change], 'next': 2, 'more': False, **kwargs}
++
++
++def raw_rows():
++    return [{'id': 'a', 'status': 'ready', 'created_on': 'one', 'priority': 10000}]
++
++
++@pytest.mark.parametrize('page', [
++    one_page(changes=None), one_page(changes=[]), one_page(next=True), one_page(more=1),
++    one_page(changes=[None]), one_page(entry(seq=True)), one_page(entry(seq=1)),
++    one_page(entry(table=None)), one_page(next=3),
++    one_page(entry(fields=None)), one_page(entry(fields={'priority': 10000.0})),
++    one_page(entry(fields={'id': 'different'})), one_page(entry(fields={'status': 'invalid'})),
++])
++def test_feed_malformed_refuses(page):
++    with pytest.raises(ValueError):
++        check_interval(Feed(page), 'board', raw_rows(), 1, 2)
++
++
++def test_feed_premature_end_refuses():
++    with pytest.raises(ValueError, match='ended'):
++        check_interval(Feed(one_page()), 'board', raw_rows(), 1, 3)
++
++
++def test_feed_replays_open_status_and_ignores_after_fixed_target():
++    rows = raw_rows()
++    changes = [entry(fields={**rows[0], 'status': 'running'}),
++               entry(seq=3, op='delete')]
++    check_interval(Feed(one_page(changes=changes, next=3)), 'board', rows, 1, 2)
++    assert rows[0]['status'] == 'running'
++
++
++def test_feed_checks_first_change_after_first_head():
++    class Churn:
++        def changes(self, board, since):
++            assert since == 1
++            return one_page(entry(fields={'priority': 2}))
++    with pytest.raises(ValueError, match='changed'):
++        check_interval(Churn(), 'board', raw_rows(), 1, 2)
++
++
++def test_feed_page_limit_is_bounded():
++    class Endless:
++        def changes(self, board, since):
++            return one_page(entry(seq=since + 1, table='task_events'), next=since + 1, more=True)
++    with pytest.raises(ValueError, match='page limit'):
++        check_interval(Endless(), 'board', raw_rows(), 1, 10002)
++
++
++class Busy(Pages):
++    def snapshot_page(self, *args, **kwargs):
++        page = super().snapshot_page(*args, **kwargs)
++        page['head'] = 4 if kwargs.get('limit') == 1 else 3 if kwargs.get('after') else 1
++        return page
++
++    def changes(self, board, since):
++        changes = [
++            {'seq': 2, 'table': 'task_events', 'uid': 'event', 'op': 'upsert', 'fields': {}},
++            {'seq': 3, 'table': 'tasks', 'uid': 'a', 'op': 'upsert', 'fields': {'title': 'updated'}},
++            {'seq': 4, 'table': 'task_runs', 'uid': 'run', 'op': 'upsert', 'fields': {}},
++        ]
++        batch = [c for c in changes if c['seq'] > since][:2]
++        return {'changes': batch, 'next': batch[-1]['seq'], 'more': batch[-1]['seq'] < 4}
++
++
++def test_busy_capture_and_verify_ignore_unrelated_changes():
++    manifest = prepare.capture(Busy(), board_id='board', exceptions=['b'])
++    assert manifest['rows'][0]['old'] == 10000
++    assert prepare.verify(Busy(), manifest, undo=True)['verified'] == 1
++
++
++@pytest.mark.parametrize('fields', [{'priority': 2}, {'created_on': 'other'}, {'status': 'done'}])
++def test_relevant_task_change_refuses(fields):
++    class Changed(Busy):
++        def changes(self, board, since):
++            return {'changes': [{'seq': 4, 'table': 'tasks', 'uid': 'a', 'op': 'upsert', 'fields': fields}],
++                    'next': 4, 'more': False}
++    with pytest.raises(ValueError, match='changed'):
++        prepare.capture(Changed(), board_id='board', exceptions=[])
++
++
++@pytest.mark.parametrize('uid,op', [('a', 'delete'), ('new', 'upsert')])
++def test_membership_change_refuses(uid, op):
++    class Changed(Busy):
++        def changes(self, board, since):
++            return {'changes': [{'seq': 4, 'table': 'tasks', 'uid': uid, 'op': op, 'fields': {}}],
++                    'next': 4, 'more': False}
++    with pytest.raises(ValueError, match='changed'):
++        prepare.capture(Changed(), board_id='board', exceptions=[])
+diff --git a/tests/hermes_cli/test_kanban_priority_prepare.py b/tests/hermes_cli/test_kanban_priority_prepare.py
+index e2a6811c5ee..abc6b8d7760 100644
+--- a/tests/hermes_cli/test_kanban_priority_prepare.py
++++ b/tests/hermes_cli/test_kanban_priority_prepare.py
+@@ -47,6 +47,7 @@ def test_stage_requires_local_owner_and_preserves_original(conn, tmp_path):
+     plan = migration.plan_global(rows, board_id=sync_helpers.BOARD, exceptions=[ids[2]])
+     path = tmp_path / "original.json"
+     result = prepare.stage(conn, plan, path=path, task_id=ids[0], writer=sync_helpers.ME)
++    assert result['origins'] == {sync_helpers.ME: 2, 'two': 1}
+     original = path.read_bytes()
+     assert result["manifest_sha256"] == hashlib.sha256(original).hexdigest()
+     attachment = kb.get_attachment(conn, result["attachment_id"])
+@@ -91,6 +92,11 @@ def test_capture_rejects_malformed_pages(patch):
+ def test_capture_rechecks_final_head():
+     from hermes_cli import kanban_priority_prepare as prepare
+     class Changed(Pages):
++        def changes(self, board, since):
++            return {'changes': [{'seq': 5, 'table': 'tasks', 'uid': 'a',
++                                 'op': 'upsert', 'fields': {'priority': 12}}],
++                    'next': 5, 'more': False}
++
+         def snapshot_page(self, *args, **kwargs):
+             page = super().snapshot_page(*args, **kwargs)
+             if kwargs.get('limit') == 1:
+-- 
+2.55.0
+

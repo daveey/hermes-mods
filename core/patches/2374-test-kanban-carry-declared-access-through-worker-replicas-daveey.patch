@@ -1,0 +1,123 @@
+From 036c6b2365c0f66602403cb59a2ed4c9edfa2f2d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:59:45 +0000
+Subject: [PATCH] test(kanban): carry declared access through worker replicas
+ [daveey]
+
+---
+ .../hermes_cli/test_kanban_declared_access.py | 93 +++++++++++++++++++
+ 1 file changed, 93 insertions(+)
+
+diff --git a/tests/hermes_cli/test_kanban_declared_access.py b/tests/hermes_cli/test_kanban_declared_access.py
+index fd7d9f4f280..de75e0fc2d7 100644
+--- a/tests/hermes_cli/test_kanban_declared_access.py
++++ b/tests/hermes_cli/test_kanban_declared_access.py
+@@ -1,8 +1,19 @@
+ """Remote access is a declared contract, never inferred from arbitrary prose."""
++import json
++
+ import pytest
+ 
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_placement as kp
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_node as node
++from hermes_cli import kanban_worker_placement as wp
+ from tests.hermes_cli import test_kanban_coordination_placement as helpers
++from tests.hermes_cli.test_kanban_worker_policy_db import conn
++
++__all__ = ["conn"]
+ 
+ fleet = helpers.fleet
+ 
+@@ -97,3 +108,85 @@ def test_preflight_keeps_enrolled_access_with_worker(monkeypatch, policy, expect
+     monkeypatch.setattr(routing, "route", route)
+     assert routing.preflight(None, "test") == {"test": True}
+     assert observed == expected
++
++
++@pytest.mark.parametrize("requirement,label,body", [
++    ("hub:read", "capability:hub-read", "read the log on the hub"),
++    ("ssh:mbp", "capability:ssh-mbp", "ssh to the MacBook for a read"),
++    ("ssh:mini", "capability:ssh-mini", "ssh mini diag"),
++])
++def test_db_access_contract_survives_replica_import_and_revocation(
++        conn, fleet, tmp_path, monkeypatch, requirement, label, body):
++    cfg, entry, _ = fleet
++    entry["labels"].append(label)
++    monkeypatch.setattr(kp, "config", lambda: cfg)
++    needs = ["terminal", requirement]
++    tid = kb.create_task(conn, title="Check remote evidence", body=body,
++                         assignee="default", requires=needs)
++    task = kb.get_task(conn, tid)
++    assert task is not None
++    assert task.requires == needs
++    assert task.placement_policy == wp.POLICY
++    captured = conn.execute(
++        "SELECT fields FROM kanban_sync_outbox WHERE table_name='tasks' "
++        "AND row_uid=? ORDER BY rowid LIMIT 1", (tid,)).fetchone()
++    fields = json.loads(captured["fields"])
++    assert json.loads(fields["requires"]) == needs
++    assert fields["placement_policy"] == wp.POLICY
++    # The Board assigns the destination; creation itself must not manufacture one.
++    assert fields["runs_on"] is None
++    fields.update(runs_on=json.dumps(["machine:worker"]), created_on="hub")
++    change = sync.RemoteChange(1, "tasks", tid, "upsert", fields, 1, "", "hub")
++    replica_path = tmp_path / "replica.db"
++    with kbc.connect(replica_path) as replica:
++        client.ensure_identity(replica, "default", "worker")
++        sync.apply_remote_changes(replica, [change], new_cursor=1, observers=False)
++        replicated = kb.get_task(replica, tid)
++        assert replicated is not None and replicated.requires == needs
++    # Reopen the replica so pickup consumes persisted bytes, not the creator's objects.
++    with kbc.connect(replica_path) as replica, kbc.connect(tmp_path / "worker.db") as worker:
++        client.ensure_identity(worker, "default", "worker")
++        sync.set_mode(worker, "primary")
++        assert node.import_cards(worker, replica, [tid]) == [tid]
++        imported = kb.get_task(worker, tid)
++        assert imported is not None
++        assert imported.requires == needs
++        assert imported.placement_policy == wp.POLICY
++        row = worker.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++        assert json.loads(row["runs_on"]) == ["machine:worker"]
++        assert wp.execution_refusal(worker, row) is None
++        assert worker.execute("SELECT count(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++        entry["labels"].remove(label)
++        assert wp.execution_refusal(worker, row) == "needs worker coordination capability"
++        assert wp.local_refusals(worker, "ready")[tid] == "needs worker coordination capability"
++        assert kb.claim_task(worker, tid) is None
++        refused = kb.get_task(worker, tid)
++        assert refused is not None and refused.status == "ready"
++        assert worker.execute("SELECT count(*) FROM task_runs").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("requirement,label,body", [
++    ("hub:read", "capability:hub-read", "read the log on the hub"),
++    ("ssh:mbp", "capability:ssh-mbp", "ssh to the MacBook for a read"),
++    ("ssh:mini", "capability:ssh-mini", "ssh mini diag"),
++])
++@pytest.mark.parametrize("declared", [False, True], ids=["undeclared", "second-destination-unattested"])
++def test_db_creation_does_not_enroll_without_full_access_contract(
++        conn, fleet, monkeypatch, requirement, label, body, declared):
++    cfg, entry, machines = fleet
++    entry["labels"].append(label)
++    if declared:
++        cfg["worker_pools"]["hub"].append("other")
++        machines["other"] = dict(entry, labels=[])
++    monkeypatch.setattr(kp, "config", lambda: cfg)
++    needs = [requirement] if declared else []
++    tid = kb.create_task(conn, title="Check remote evidence", body=body,
++                         assignee="default", requires=needs)
++    task = kb.get_task(conn, tid)
++    assert task is not None
++    assert task.placement_policy is None
++    assert (task.requires or []) == needs
++    captured = conn.execute(
++        "SELECT fields FROM kanban_sync_outbox WHERE table_name='tasks' "
++        "AND row_uid=? ORDER BY rowid LIMIT 1", (tid,)).fetchone()
++    assert json.loads(captured["fields"])["placement_policy"] is None
+-- 
+2.55.0
+

@@ -1,0 +1,252 @@
+From dda0a143104981532d7ad97b633e0baab2246a4a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 12:58:47 +0000
+Subject: [PATCH] [daveey] cover database and journal paths in SQLite open
+ guard
+
+---
+ hermes_cli/backup.py                          |  8 ++---
+ hermes_cli/kanban_transfer.py                 |  1 +
+ hermes_state_repair.py                        |  2 ++
+ scripts/check_sqlite_sidecar_opens.py         | 35 +++++++++++++------
+ tests/hermes_cli/test_backup_stability.py     | 25 +++++++++++++
+ .../test_check_sqlite_sidecar_opens.py        | 16 ++++++++-
+ 6 files changed, 72 insertions(+), 15 deletions(-)
+
+diff --git a/hermes_cli/backup.py b/hermes_cli/backup.py
+index ed6d22dbefc..3c7ccd010fb 100644
+--- a/hermes_cli/backup.py
++++ b/hermes_cli/backup.py
+@@ -1327,10 +1327,8 @@ def _create_quick_snapshot_locked(
+             continue
+ 
+         if src.is_dir():
+-            # Walk the directory and record each file individually in the
+-            # manifest so restore can treat them uniformly.  Empty dirs are
+-            # skipped (nothing to snapshot).
+-            for sub in src.rglob("*"):
++            # Record each file; SQLite backup captures sidecars, which must never be raw-copied.
++            for sub in filter(lambda p: not p.name.endswith(_SQLITE_SIDECAR_SUFFIXES), src.rglob("*")):
+                 if not sub.is_file():
+                     continue
+                 sub_rel = sub.relative_to(home).as_posix()
+@@ -1363,6 +1361,7 @@ def _create_quick_snapshot_locked(
+                                 )
+                             continue
+                     else:
++                        # sqlite-sidecar-open: ok — sidecars skipped above; .db uses _safe_copy_db.
+                         shutil.copy2(sub, dst)
+                     manifest[sub_rel] = dst.stat().st_size
+                 except (OSError, PermissionError) as exc:
+@@ -1395,6 +1394,7 @@ def _create_quick_snapshot_locked(
+                         )
+                     continue
+             else:
++                # sqlite-sidecar-open: ok — _QUICK_STATE_FILES has no sidecars; .db uses _safe_copy_db.
+                 shutil.copy2(src, dst)
+             manifest[rel] = dst.stat().st_size
+         except (OSError, PermissionError) as exc:
+diff --git a/hermes_cli/kanban_transfer.py b/hermes_cli/kanban_transfer.py
+index 2a1efe3e05b..e0eda383864 100644
+--- a/hermes_cli/kanban_transfer.py
++++ b/hermes_cli/kanban_transfer.py
+@@ -324,6 +324,7 @@ def import_board(
+ 
+         board_root = kb.board_dir(target)
+         board_root.mkdir(parents=True, exist_ok=True)
++        # sqlite-sidecar-open: ok — detached archive extract, new board slug, no open connection.
+         shutil.move(str(staged_db), str(board_root / "kanban.db"))
+         for tree in ("attachments", "logs"):
+             src = extracted / tree
+diff --git a/hermes_state_repair.py b/hermes_state_repair.py
+index e1ec033394b..6dba2a837c7 100644
+--- a/hermes_state_repair.py
++++ b/hermes_state_repair.py
+@@ -361,6 +361,7 @@ def _backup_content_identity(db_path: Path) -> Optional[str]:
+             # Length-delimit every member (main file included) so the concatenation is prefix-free; otherwise a
+             # main-file tail could coincide with a main+sidecar split and dedupe two images together.
+             hasher.update(f"\0{label}:{path.stat().st_size}\0".encode())
++            # sqlite-sidecar-open: ok — _read_offline fences this callback against live connections.
+             with open(path, "rb") as fh:
+                 for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                     hasher.update(chunk)
+@@ -474,6 +475,7 @@ def _publish_backup_bundle(db_path: Path, staging: Path, backup_path: Path) -> N
+     published: list[Path] = []
+     try:
+         for src, staged, _dst in (main, *sidecars):
++            # sqlite-sidecar-open: ok — _backup_db_file refuses while this database has a live connection.
+             shutil.copy2(src, staged)
+         for _src, staged, dst in (*sidecars, main):
+             os.replace(staged, dst)
+diff --git a/scripts/check_sqlite_sidecar_opens.py b/scripts/check_sqlite_sidecar_opens.py
+index be326b36eb8..78e8972522b 100644
+--- a/scripts/check_sqlite_sidecar_opens.py
++++ b/scripts/check_sqlite_sidecar_opens.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-"""Fail when production code opens a SQLite ``-shm``/``-wal`` sidecar with a plain file call.
++"""Fail when production code opens a SQLite database or sidecar with a plain file call.
+ 
+ POSIX cancels every advisory lock a process holds on a file when that process closes ANY
+ descriptor for it. SQLite keeps its WAL locks (the writer lock included) as POSIX locks on
+@@ -21,10 +21,11 @@ opens, reads, writes or copies a file
+   (``os``, ``io``, ``shutil`` under any alias, a ``Path``; the method name alone decides)
+ 
+ when it names a sidecar: ANY argument (or the receiver, unless that is ``os``/``io``/``shutil``) contains a
+-``str``/``bytes`` literal ending in ``-shm`` or ``-wal`` (each f-string fragment counts, so do
++``str``/``bytes`` literal ending in ``.db``, ``-shm``, ``-wal`` or ``-journal`` (f-string fragments count, so do
+ ``name + "-wal"`` and ``"%s-wal" % db``), or a name assigned from such an expression. A literal
+ that is only tested (``name.endswith("-wal")``, ``x == "-shm"``) does not count.
+ 
++Read/write text/bytes methods inspect only the receiver, not content or encoding arguments.
+ Names are tracked without flow, and err toward flagging (rename the variable or mark the line):
+ 
+   variables      per function: assignment, ``for``/comprehension target, ``with ... as``,
+@@ -38,8 +39,8 @@ Names are tracked without flow, and err toward flagging (rename the variable or
+ 
+ Not caught: a sidecar path built in another file, by a helper defined elsewhere, or passed in
+ as a parameter; one stored under a subscript (``d["wal"] = ...; open(d["wal"])``); an aliased
+-import (``from os import open as os_open``); a plain open of the main database file (no
+-literal names it); ``open`` under another name (``op = open``); a global one function writes
++import (``from os import open as os_open``); a database path with no identifying literal;
++``open`` under another name (``op = open``); a global one function writes
+ and another opens; a copy made by a child process; and descriptors opened from C extensions. The runtime side of this rule is ``hermes_state``'s WAL
+ lock guard; a review still has to catch those.
+ 
+@@ -71,10 +72,10 @@ MARKER = "sqlite-sidecar-open: ok"
+ # The lock-safe readers themselves: the one place a raw descriptor on a sidecar is the point.
+ HELPER_FILES = {"hermes_cli/sqlite_safe_read.py"}
+ SCAN_TREES = ("agent", "cron", "gateway", "hermes_cli", "plugins", "tools", "tui_gateway", "acp_adapter", "pm")
+-SCAN_ROOT_FILES = ("cli.py", "run_agent.py", "hermes_state.py", "utils.py", "hermes_constants.py")
++SCAN_ROOT_FILES = (":(top,glob)*.py",)
+ SKIP_PARTS = {"tests", "__pycache__", "evals", "node_modules"}
+-_SUFFIXES = ("-shm", "-wal")
+-_BYTE_SUFFIXES = (b"-shm", b"-wal")
++_SUFFIXES = (".db", "-shm", "-wal", "-journal")
++_BYTE_SUFFIXES = tuple(suffix.encode("ascii") for suffix in _SUFFIXES)
+ # Cheap text prefilter: only files mentioning a sidecar suffix are parsed.
+ _NEEDLES = _SUFFIXES
+ _TEST_METHODS = {"endswith", "startswith", "removesuffix", "removeprefix", "count", "find", "index"}
+@@ -176,6 +177,8 @@ def _file_call_paths(node: ast.Call) -> list[ast.AST]:
+     if not isinstance(func, ast.Attribute):
+         return []
+     owner = func.value.id if isinstance(func.value, ast.Name) else None
++    if func.attr in {"read_bytes", "read_text", "write_bytes", "write_text"}:
++        return [func.value]  # payload/encoding are not paths
+     if func.attr in _FILE_METHODS or func.attr in _SHUTIL_FUNCS:
+         # os.open(path, ...), shutil.copyfile(src, dst): only the arguments are paths. For
+         # Path(path).open(), path.read_bytes(), path.copy(dst) the receiver is one too.
+@@ -193,7 +196,19 @@ def sidecar_open_lines(text: str) -> list[int]:
+         return []
+     # Attribute names (``self.shm = db + "-shm"``) are shared by the whole file: the method that
+     # sets one is rarely the method that opens it.
+-    attrs = frozenset(n for n in _tainted_names(list(ast.walk(tree)), frozenset()) if n.startswith("."))
++    attrs: frozenset[str] = frozenset()
++    while True:
++        found_attrs = set(attrs)
++        pending: list[tuple[ast.AST, frozenset[str]]] = [(tree, attrs)]
++        while pending:
++            scope, inherited = pending.pop()
++            nodes = _scope_nodes(scope)
++            tainted = _tainted_names(nodes, inherited)
++            found_attrs.update(n for n in tainted if n.startswith("."))
++            pending.extend((node, tainted) for node in nodes if isinstance(node, _SCOPES))
++        if found_attrs == attrs:
++            break
++        attrs = frozenset(found_attrs)
+     lines: set[int] = set()
+     scopes: list[tuple[ast.AST, frozenset[str]]] = [(tree, attrs)]
+     while scopes:
+@@ -301,10 +316,10 @@ def main(argv: list[str] | None = None) -> int:
+     if args.strict_baseline:
+         problems.extend(advisories)
+     if not problems:
+-        print("no plain file calls on SQLite -shm/-wal sidecars outside sqlite_safe_read")
++        print("no plain file calls on SQLite .db/-shm/-wal/-journal paths outside sqlite_safe_read")
+         return 0
+     print("\n".join(problems))
+-    print(f"\n{len(problems)} plain file call(s) on a SQLite -shm/-wal sidecar. Closing any descriptor on a "
++    print(f"\n{len(problems)} plain file call(s) on a SQLite database or sidecar. Closing any descriptor on a "
+           "sidecar cancels this process's SQLite locks on it (a write transaction's writer lock included), "
+           "so another process can write the same WAL. Read it with hermes_cli.sqlite_safe_read "
+           "(pread_lock_safe / read_header_lock_safe / sha256_lock_safe, copy_file_out_of_process), or mark a "
+diff --git a/tests/hermes_cli/test_backup_stability.py b/tests/hermes_cli/test_backup_stability.py
+index e7ba0f070e8..75d03463153 100644
+--- a/tests/hermes_cli/test_backup_stability.py
++++ b/tests/hermes_cli/test_backup_stability.py
+@@ -118,6 +118,31 @@ def test_quick_snapshot_tree_is_owner_only_under_permissive_umask(tmp_path) -> N
+     assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in files)
+ 
+ 
++@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
++def test_quick_snapshot_never_raw_copies_board_sidecars(tmp_path, monkeypatch, suffix):
++    from hermes_cli import backup
++
++    home = tmp_path / "home"
++    board = home / "kanban" / "boards" / "example"
++    board.mkdir(parents=True)
++    sidecar = board / ("kanban.db" + suffix)
++    sidecar.write_bytes(b"sidecar sentinel")
++    metadata = board / "board.json"
++    metadata.write_text("{}", encoding="utf-8")
++    original_copy = backup.shutil.copy2
++
++    def copy_without_sidecars(src, dst, *args, **kwargs):
++        assert Path(src) != sidecar, "must not open a live SQLite sidecar"
++        return original_copy(src, dst, *args, **kwargs)
++
++    monkeypatch.setattr(backup.shutil, "copy2", copy_without_sidecars)
++    snapshot_id = create_quick_snapshot(hermes_home=home)
++    assert snapshot_id
++    copied_board = home / "state-snapshots" / snapshot_id / "kanban" / "boards" / "example"
++    assert (copied_board / "board.json").read_text(encoding="utf-8") == "{}"
++    assert not (copied_board / sidecar.name).exists()
++
++
+ def test_quick_snapshot_listing_ignores_partial_directories(tmp_path) -> None:
+     home = tmp_path / ".hermes"
+     partial = home / "state-snapshots" / ".unfinished.1.partial"
+diff --git a/tests/scripts/test_check_sqlite_sidecar_opens.py b/tests/scripts/test_check_sqlite_sidecar_opens.py
+index d6951ad78e2..d9402506700 100644
+--- a/tests/scripts/test_check_sqlite_sidecar_opens.py
++++ b/tests/scripts/test_check_sqlite_sidecar_opens.py
+@@ -22,6 +22,13 @@ def _load():
+         # hermes-hub 2026-11-11: this exact line released the WAL writer lock on every session-list call.
+         'with open(f"{db}-shm", "rb") as f: head = f.read(96)',
+         'open(str(db) + "-wal", "rb")',
++        'open("state.db", "rb")',
++        'os.open("kanban.db", os.O_RDONLY)',
++        'Path("cache.db").open("rb")',
++        'Path("state.db").read_bytes()',
++        'open(f"{db}-journal", "rb")',
++        'open(b"state.db", "rb")',
++        'db = root / "state.db"\nopen(db)',
+         'fd = os.open(f"{db}-shm", os.O_RDONLY)',
+         'io.open(db_path + "-wal")',
+         'Path(f"{db}-shm").read_bytes()',
+@@ -39,7 +46,7 @@ def _load():
+     ],
+ )
+ def test_sidecar_file_calls_are_flagged(src):
+-    assert _load().sidecar_open_lines(src) == [1]
++    assert _load().sidecar_open_lines(src) == [src.count("\n") + 1]
+ 
+ 
+ def test_a_variable_assigned_from_a_sidecar_path_is_followed():
+@@ -108,6 +115,13 @@ def test_names_are_tracked_per_function_without_flow_and_any_argument_counts():
+         'pread_lock_safe(f"{db}-shm", 0, 96)',
+         'copy_file_out_of_process(f"{db}-wal", dest)',
+         'os.stat(f"{db}-wal")',
++        'os.stat("state.db")',
++        'Path("kanban.db").stat()',
++        'os.stat(f"{db}-journal")',
++        'sqlite3.connect("state.db")',
++        'Path("report.txt").write_text("state.db")',
++        'Path("report.txt").write_bytes(b"-journal")',
++        'def a():\n    path = "state.db"\ndef b(path):\n    self.output = path\n    Path(self.output).write_text("x")',
+         'Path(f"{db}-shm").exists()',
+         'os.unlink(str(db) + "-wal")',
+         'open(db_path, "rb")',
+-- 
+2.55.0
+

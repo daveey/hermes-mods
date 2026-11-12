@@ -1,0 +1,139 @@
+From 9f24f005e36ae71a44865fb7a7f1228ec879a9d3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:14:35 +0000
+Subject: [PATCH] [daveey] Fix reaped-descendant race in Termux verifier
+ cleanup
+
+---
+ scripts/termux/validate_installed.py   | 12 +++++-
+ tests/scripts/test_termux_cleanup.py   | 57 ++++++++++++++++++++++++++
+ tests/scripts/test_termux_launchers.py | 10 +++--
+ 3 files changed, 75 insertions(+), 4 deletions(-)
+ create mode 100644 tests/scripts/test_termux_cleanup.py
+
+diff --git a/scripts/termux/validate_installed.py b/scripts/termux/validate_installed.py
+index efcdf1a6c1c..8548a8d9101 100644
+--- a/scripts/termux/validate_installed.py
++++ b/scripts/termux/validate_installed.py
+@@ -20,6 +20,16 @@ def run(argv: list[str], env: dict[str, str], cwd: Path) -> subprocess.Completed
+     return result
+ 
+ 
++def _still_running(process) -> bool:
++    import psutil
++
++    try:
++        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
++    except psutil.NoSuchProcess:
++        # Reaping between the liveness and status probes is successful cleanup.
++        return False
++
++
+ def stop_child_tree(child: subprocess.Popen) -> None:
+     import psutil
+     from agent.deadline import kill_process_tree
+@@ -31,7 +41,7 @@ def stop_child_tree(child: subprocess.Popen) -> None:
+     child.wait(timeout=10)
+     deadline = time.monotonic() + 10
+     while descendants and time.monotonic() < deadline:
+-        descendants = [p for p in descendants if p.is_running() and p.status() != psutil.STATUS_ZOMBIE]
++        descendants = [p for p in descendants if _still_running(p)]
+         if descendants:
+             time.sleep(0.05)
+     if descendants:
+diff --git a/tests/scripts/test_termux_cleanup.py b/tests/scripts/test_termux_cleanup.py
+new file mode 100644
+index 00000000000..30d250d5465
+--- /dev/null
++++ b/tests/scripts/test_termux_cleanup.py
+@@ -0,0 +1,57 @@
++"""Process disappearance is successful verifier cleanup, not a polling error."""
++from unittest.mock import Mock
++
++import psutil
++import pytest
++
++from scripts.termux import validate_installed
++
++
++@pytest.mark.parametrize("state", ["reaped", psutil.STATUS_ZOMBIE, "gone", "running"])
++def test_cleanup_accepts_descendant_exit_during_status_probe(monkeypatch, state):
++    from agent import deadline
++
++    child = Mock(pid=123)
++    child.poll.return_value = None
++    descendant = Mock(pid=456)
++    descendant.is_running.return_value = state != "gone"
++    if state == "reaped":
++        # The kernel can reap it after is_running(), before status().
++        descendant.status.side_effect = psutil.NoSuchProcess(descendant.pid)
++    else:
++        descendant.status.return_value = state
++    parent = Mock()
++    parent.children.return_value = [descendant]
++    monkeypatch.setattr(psutil, "Process", Mock(return_value=parent))
++    kill = Mock()
++    monkeypatch.setattr(deadline, "kill_process_tree", kill)
++
++    if state == "running":
++        monkeypatch.setattr(validate_installed.time, "monotonic", Mock(side_effect=[0, 0, 11]))
++        monkeypatch.setattr(validate_installed.time, "sleep", Mock())
++        with pytest.raises(RuntimeError, match=r"TUI children still alive: \[456\]"):
++            validate_installed.stop_child_tree(child)
++    else:
++        validate_installed.stop_child_tree(child)
++
++    kill.assert_called_once_with(child.pid)
++    child.wait.assert_called_once_with(timeout=10)
++    if state == "gone":
++        descendant.status.assert_not_called()
++
++
++def test_cleanup_does_not_hide_unobservable_descendant(monkeypatch):
++    from agent import deadline
++
++    child = Mock(pid=123)
++    child.poll.return_value = None
++    descendant = Mock(pid=456)
++    descendant.is_running.return_value = True
++    descendant.status.side_effect = psutil.AccessDenied(descendant.pid)
++    parent = Mock()
++    parent.children.return_value = [descendant]
++    monkeypatch.setattr(psutil, "Process", Mock(return_value=parent))
++    monkeypatch.setattr(deadline, "kill_process_tree", Mock())
++
++    with pytest.raises(psutil.AccessDenied):
++        validate_installed.stop_child_tree(child)
+diff --git a/tests/scripts/test_termux_launchers.py b/tests/scripts/test_termux_launchers.py
+index ee727793473..0b9449a3d1e 100644
+--- a/tests/scripts/test_termux_launchers.py
++++ b/tests/scripts/test_termux_launchers.py
+@@ -1,6 +1,7 @@
+ """Run generated launchers with a real interpreter and captured entrypoint."""
+ from __future__ import annotations
+ 
++from contextlib import suppress
+ import json
+ import os
+ from pathlib import Path
+@@ -94,11 +95,14 @@ def test_verifier_stops_detached_descendants_before_cleanup(tmp_path):
+     try:
+         stop_child_tree(child)
+         assert child.poll() is not None
+-        assert not descendant.is_running() or descendant.status() == psutil.STATUS_ZOMBIE
++        # Reaping between these probes also proves the descendant stopped.
++        with suppress(psutil.NoSuchProcess):
++            assert not descendant.is_running() or descendant.status() == psutil.STATUS_ZOMBIE
+     finally:
+         if child.poll() is None:
+             child.kill()
+-        if descendant.is_running() and descendant.status() != psutil.STATUS_ZOMBIE:
+-            descendant.kill()
++        with suppress(psutil.NoSuchProcess):
++            if descendant.is_running() and descendant.status() != psutil.STATUS_ZOMBIE:
++                descendant.kill()
+         child.wait(timeout=10)
+         child.stdout.close()
+-- 
+2.55.0
+

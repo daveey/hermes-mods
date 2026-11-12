@@ -1,0 +1,265 @@
+From 120101d7fa2496deed3d64c1f51f0da4e1ea5018 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:17:14 +0000
+Subject: [PATCH] fix(delegation): harden provenance reservation retry [daveey]
+
+---
+ agent/runtime_session_child.py               |  12 +-
+ agent/runtime_session_store.py               |  31 ++--
+ tests/gateway/test_child_model_provenance.py | 146 +++++++++++++++++++
+ tools/delegate_tool.py                       |   3 +-
+ 4 files changed, 168 insertions(+), 24 deletions(-)
+
+diff --git a/agent/runtime_session_child.py b/agent/runtime_session_child.py
+index 60e02bcf70a..7f275752f98 100644
+--- a/agent/runtime_session_child.py
++++ b/agent/runtime_session_child.py
+@@ -8,7 +8,7 @@ child persists through the ordinary ``worker.persist`` path under its own claim.
+ import secrets
+ from functools import partial
+ 
+-from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError, call_off_event_loop
++from agent.runtime_session_store import RuntimeSessionStore, call_off_event_loop
+ 
+ _REFUSALS = {
+     'delegation_capacity': 'the gateway owner refused another subagent: this execution already runs '
+@@ -48,15 +48,7 @@ def reserve_child_store(parent, *, model_provenance=None):
+     payload = {'secret': secret}
+     if model_provenance is not None:
+         payload['model_provenance'] = model_provenance
+-    try:
+-        result = call_off_event_loop(parent._apply, 'child.reserve', payload)
+-    except WorkerPersistenceError as exc:
+-        # Version skew: an owner older than this worker accepts only {'secret'} and answers a bare
+-        # ``invalid_params`` (no field). Spawn the child unrecorded rather than fail every delegation, once;
+-        # any other refusal, and a second refusal, propagate unchanged.
+-        if model_provenance is None or str(exc) != 'invalid_params' or (getattr(exc, 'data', None) or {}).get('field'):
+-            raise
+-        result = call_off_event_loop(parent.reissue_pending_without, 'child.reserve', ('model_provenance',))
++    result = call_off_event_loop(parent._apply, 'child.reserve', payload)
+     if 'refused' in result:
+         raise ValueError(_REFUSALS.get(result['refused'], 'the gateway owner refused a subagent: ' + result['refused']))
+     child = result['child']
+diff --git a/agent/runtime_session_store.py b/agent/runtime_session_store.py
+index da6b39f5d40..6000b8e3c19 100644
+--- a/agent/runtime_session_store.py
++++ b/agent/runtime_session_store.py
+@@ -407,19 +407,22 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+             self.journal = candidate
+             return self.retry_pending()[0]
+ 
+-    def reissue_pending_without(self, operation, keys):
+-        """Re-send the one refused pending ``operation`` without payload ``keys``, once (same sequence: the owner
+-        committed nothing for a refusal). Anything else pending is refused, and the owner's answer propagates."""
+-        with self.lock:
+-            pending = self.journal['pending']
+-            if len(pending) != 1 or pending[0]['operation'] != operation:
+-                raise WorkerPersistenceError(self.failure or 'pending_receipt')
+-            entry = dict(pending[0], payload={k: v for k, v in pending[0]['payload'].items() if k not in keys})
+-            candidate = dict(self.journal, pending=[entry])
+-            self._save(candidate)
+-            self.journal = candidate
+-            self.failure = None
+-            return self.retry_pending()[0]
++    def _strip_refused_child_provenance(self, entry, error):
++        """Version skew fallback at the actual refused receipt, shared by live writes and replay.
++
++        An old owner accepts only {'secret'}. Retain the sequence (nothing committed), and
++        durably remove provenance before re-sending; its absence bounds fallback across crashes.
++        Sticky failures from a later caller never reach this boundary or reissue another secret.
++        """
++        if (entry['operation'] != 'child.reserve' or entry['payload'].get('model_provenance') is None
++                or str(error) != 'invalid_params' or (getattr(error, 'data', None) or {}).get('field')):
++            return False
++        stripped = dict(entry, payload={k: v for k, v in entry['payload'].items() if k != 'model_provenance'})
++        candidate = dict(self.journal, pending=[stripped, *self.journal['pending'][1:]])
++        self._save(candidate)
++        self.journal = candidate
++        logger.warning('%s: provenance dropped because the owner refused it', entry['operation'])
++        return True
+ 
+     def _persist(self, entry):
+         return self.rpc('worker.persist', **self.scope, **entry)
+@@ -461,6 +464,8 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
+                     try:
+                         result = self._persist(entry)
+                     except WorkerPersistenceError as exc:
++                        if self._strip_refused_child_provenance(entry, exc):
++                            continue
+                         if not self._resend_gap(exc, entry):
+                             raise
+                         continue  # the gap is committed now; send this entry again
+diff --git a/tests/gateway/test_child_model_provenance.py b/tests/gateway/test_child_model_provenance.py
+index 146abf19aa5..e6e0d50d04a 100644
+--- a/tests/gateway/test_child_model_provenance.py
++++ b/tests/gateway/test_child_model_provenance.py
+@@ -42,6 +42,152 @@ def test_reservation_refuses_malformed_or_authority_bearing_provenance(ledger, p
+ PROVENANCE = {"model_source": "caller_pin", "requested_model": "pinned-model"}
+ 
+ 
++def test_a_later_reservation_cannot_reissue_another_secrets_pending_entry(tmp_path, monkeypatch):
++    calls = []
++
++    def rpc(method, **params):
++        calls.append(dict(params["payload"]))
++        failure = WorkerPersistenceError("invalid_params")
++        failure.data = {"field": "model_provenance"}
++        raise failure
++
++    parent = RuntimeSessionStore(rpc, {"session_id": "parent"}, tmp_path / "outbox")
++    secrets = iter(["first-synthetic-secret", "second-synthetic-secret"])
++    monkeypatch.setattr("agent.runtime_session_child.secrets.token_urlsafe", lambda _: next(secrets))
++    try:
++        with pytest.raises(WorkerPersistenceError, match="^invalid_params$"):
++            reserve_child_store(parent, model_provenance=PROVENANCE)
++        before = parent.path.read_bytes()
++        with pytest.raises(WorkerPersistenceError, match="^invalid_params$"):
++            reserve_child_store(parent, model_provenance=PROVENANCE)
++        assert calls == [{"secret": "first-synthetic-secret", "model_provenance": PROVENANCE}]
++        assert parent.path.read_bytes() == before
++    finally:
++        parent._outbox_owner.close()
++
++
++def test_restart_replays_a_provenance_reservation_against_a_strict_old_owner(ledger, tmp_path):
++    db, epoch = ledger
++    calls = []
++    parent = _worker_parent(db, epoch, tmp_path, old_owner=False, calls=calls)
++    payload = {"secret": "replay-synthetic-secret", "model_provenance": PROVENANCE}
++    # Crash boundary: durably journaled, but no owner response or live fallback yet.
++    entry = {"sequence": 1, "operation": "child.reserve", "payload": payload}
++    parent._save(dict(parent.journal, next_sequence=2, pending=[entry]))
++    parent._outbox_owner.close()
++    replayed = _worker_parent(db, epoch, tmp_path, old_owner=True, calls=calls)
++    try:
++        assert calls == [payload, {"secret": payload["secret"]}]
++        journal = json.loads(replayed.path.read_text())
++        assert journal["pending"] == []
++        assert journal["acked"][0] == dict(entry, payload={"secret": payload["secret"]})
++        with db._read_ctx() as conn:
++            assert conn.execute("SELECT COUNT(*) FROM sessions WHERE source='subagent'").fetchone()[0] == 1
++    finally:
++        replayed.close()
++
++
++@pytest.mark.parametrize("replay", [False, True], ids=["live", "replay"])
++def test_dropped_provenance_warns_once_without_secrets(tmp_path, caplog, replay):
++    calls = []
++    secret = "warning-synthetic-secret"
++
++    def rpc(method, **params):
++        calls.append(dict(params["payload"]))
++        if "model_provenance" in params["payload"]:
++            raise WorkerPersistenceError("invalid_params")
++        return {"refused": "delegation_capacity"}
++
++    parent = RuntimeSessionStore(rpc, {"session_id": "parent"}, tmp_path / "outbox")
++    payload = {"secret": secret, "model_provenance": PROVENANCE}
++    try:
++        with caplog.at_level("WARNING", logger="agent.runtime_session_store"):
++            if replay:
++                entry = {"sequence": 1, "operation": "child.reserve", "payload": payload}
++                parent._save(dict(parent.journal, next_sequence=2, pending=[entry]))
++                parent._outbox_owner.close()
++                parent = RuntimeSessionStore(rpc, parent.scope, parent.path.parent)
++            else:
++                parent._apply("child.reserve", payload)
++        warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
++        assert len(warnings) == 1
++        assert "child.reserve" in warnings[0]
++        assert "provenance" in warnings[0] and "dropped" in warnings[0] and "owner refused" in warnings[0]
++        assert secret not in warnings[0]
++        assert [set(c) for c in calls] == [{"secret", "model_provenance"}, {"secret"}]
++    finally:
++        parent._outbox_owner.close()
++
++
++@pytest.mark.parametrize("replay", [False, True], ids=["live", "replay"])
++def test_second_refusal_propagates_without_another_retry(tmp_path, caplog, replay):
++    calls = []
++    failures = [WorkerPersistenceError("invalid_params"), WorkerPersistenceError("invalid_params")]
++
++    def rpc(method, **params):
++        calls.append(dict(params["payload"]))
++        assert len(calls) <= 2, "a stripped reservation must not be retried again"
++        raise failures[len(calls) - 1]
++
++    parent = RuntimeSessionStore(rpc, {"session_id": "parent"}, tmp_path / "outbox")
++    try:
++        if replay:
++            entry = {"sequence": 1, "operation": "child.reserve",
++                     "payload": {"secret": "second-refusal-secret", "model_provenance": PROVENANCE}}
++            parent._save(dict(parent.journal, next_sequence=2, pending=[entry]))
++            parent._outbox_owner.close()
++        with caplog.at_level("WARNING", logger="agent.runtime_session_store"):
++            with pytest.raises(WorkerPersistenceError, match="^invalid_params$") as caught:
++                if replay:
++                    RuntimeSessionStore(rpc, parent.scope, parent.path.parent)
++                else:
++                    reserve_child_store(parent, model_provenance=PROVENANCE)
++        assert caught.value is failures[1]
++        assert [set(c) for c in calls] == [{"secret", "model_provenance"}, {"secret"}]
++        journal = json.loads(parent.path.read_text())
++        assert journal["pending"][0]["payload"] == calls[1]
++        assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
++        # Another restart sends only the durable stripped entry, with no renewed fallback.
++        parent._outbox_owner.close()
++        calls.clear()
++        with pytest.raises(WorkerPersistenceError, match="^invalid_params$"):
++            RuntimeSessionStore(rpc, parent.scope, parent.path.parent)
++        assert len(calls) == 1 and set(calls[0]) == {"secret"}
++    finally:
++        parent._outbox_owner.close()
++
++
++@pytest.mark.parametrize("refusal,data,operation,provenance", [
++    ("permission_denied", {}, "child.reserve", PROVENANCE),
++    ("invalid_params", {"field": "model_provenance"}, "child.reserve", PROVENANCE),
++    ("invalid_params", {}, "transcript.append", PROVENANCE),
++    ("invalid_params", {}, "child.reserve", None),
++], ids=["other-reason", "specific-field", "other-operation", "no-provenance"])
++def test_unrelated_replay_refusal_is_not_stripped(tmp_path, refusal, data, operation, provenance, caplog):
++    calls = []
++    failure = WorkerPersistenceError(refusal)
++    failure.data = data
++
++    def rpc(method, **params):
++        calls.append(dict(params["payload"]))
++        raise failure
++
++    parent = RuntimeSessionStore(rpc, {"session_id": "parent"}, tmp_path / "outbox")
++    payload = {"secret": "control-synthetic-secret"}
++    if provenance is not None:
++        payload["model_provenance"] = provenance
++    entry = {"sequence": 1, "operation": operation, "payload": payload}
++    parent._save(dict(parent.journal, next_sequence=2, pending=[entry]))
++    parent._outbox_owner.close()
++    before = parent.path.read_bytes()
++    with pytest.raises(WorkerPersistenceError, match=f"^{refusal}$") as caught:
++        RuntimeSessionStore(rpc, parent.scope, parent.path.parent)
++    assert caught.value is failure
++    assert calls == [payload]
++    assert parent.path.read_bytes() == before
++    assert not [r for r in caplog.records if r.levelname == "WARNING"]
++
++
+ def _worker_parent(db, epoch, tmp_path, *, old_owner, calls):
+     """A worker's parent store whose RPC reaches the real receipt transaction; ``old_owner`` swaps in the
+     reservation check origin/main shipped (payload must be exactly ``{'secret'}``)."""
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index b9d7b7eb77e..7d9d5516272 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -340,7 +340,8 @@ def _build_child_agent(
+     _apply_child_cache_ttl(child)
+     if child_session_db is not None:
+         child._owns_session_db = True  # released by the child's close(), never by the parent
+-    child._session_init_model_config.update(provenance)
++    if getattr(child, "_session_init_model_config", None) is not None:
++        child._session_init_model_config.update(provenance)
+     _reserve_child_transcript(child)
+     # Ownership transfer for the dedicated handle: the child's close() must release it (nothing else holds a
+     # reference), and no parent teardown can close it out from under a background child (#81267).
+-- 
+2.55.0
+

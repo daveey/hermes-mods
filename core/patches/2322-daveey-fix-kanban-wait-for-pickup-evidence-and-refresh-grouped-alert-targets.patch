@@ -1,0 +1,132 @@
+From 6f5fad1053bf02479e022cec06cb384ce141b562 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:12:52 +0000
+Subject: [PATCH] [daveey] fix(kanban): wait for pickup evidence and refresh
+ grouped alert targets
+
+---
+ hermes_cli/kanban_pickup_stall.py            | 24 +++++++++
+ tests/hermes_cli/test_kanban_pickup_stall.py | 51 ++++++++++++++++++++
+ 2 files changed, 75 insertions(+)
+
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index df5ea56462b..d8e831f0389 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -221,6 +221,24 @@ def _group(card: Mapping[str, Any]) -> Optional[str]:
+     return skip.get("reason") if skip.get("reason") in ("budget_exhausted", "hold") else None
+ 
+ 
++def _refresh_targets(conn, task_id: str, members: list[dict[str, Any]], now_ms: int) -> None:
++    """Append newly affected targets only; unchanged ticks must not churn the thread."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_comment_ids import add_comment
++    with kb.write_txn(conn):
++        task = kb.get_task(conn, task_id)
++        if task is None or task.status in ("done", "archived"):
++            return
++        seen = (task.body or "") + "\n" + "\n".join(
++            c.body for c in kb.list_comments(conn, task_id) if c.author == DETECTOR)
++        added = [c for c in members if f"- {c['id']} (" not in seen]
++        if added:
++            lines = "\n".join(f"- {c['id']} ({c['title']}), ready {_minutes(c['since_ms'], now_ms)} min"
++                              for c in added)
++            add_comment(conn, task_id, DETECTOR, "Additional targets for this pickup cause:\n\n" + lines)
++            _log.info("pickup-stall refreshed card=%s added_targets=%d", task_id, len(added))
++
++
+ def file_repairs(conn, own: str, cards: list[dict[str, Any]], *, now: Optional[float] = None) -> list[str]:
+     """One repair per stalled card with a card-specific last reason; one per host per host-wide cause
+     (:data:`_HOST_GROUPS`), naming the oldest card. Returns the covering repair ids."""
+@@ -228,6 +246,11 @@ def file_repairs(conn, own: str, cards: list[dict[str, Any]], *, now: Optional[f
+     ids: list[str] = []
+     groups: dict[str, list[dict[str, Any]]] = {}
+     for card in cards:
++        # The sweep precedes pickup/note_capped. A first post-drain tick may
++        # have old ready rows but no observation yet: missing evidence is not
++        # a target-specific cause. Let this tick record it before filing.
++        if not card["skip"]:
++            continue
+         group = _group(card)
+         if group is not None:
+             groups.setdefault(group, []).append(card)
+@@ -253,6 +276,7 @@ def file_repairs(conn, own: str, cards: list[dict[str, Any]], *, now: Optional[f
+             body=(f"{len(members)} card(s) pinned to machine:{own} have waited past {stall_seconds()} s, and {why}"
+                   f"\n\nOldest: {oldest['id']} ({oldest['title']}), last skip {describe(oldest['skip'])}."
+                   f"\n\n{listed}")))
++        _refresh_targets(conn, ids[-1], members, now_ms)
+     return ids
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall.py b/tests/hermes_cli/test_kanban_pickup_stall.py
+index 8072c4817ad..7dbd82dcf2d 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall.py
+@@ -161,6 +161,20 @@ def test_a_card_pinned_to_another_host_raises_nothing_here(gws, monkeypatch):
+     assert kps.latest(worker.conn, tid) is None  # nothing recorded for a card pinned elsewhere
+ 
+ 
++def test_first_tick_after_drain_waits_for_skip_evidence_before_filing(gws):
++    hub, worker = gws
++    targets = [_pinned(hub, title=f"old-{i}") for i in range(4)]
++    worker.round()
++    for tid in targets:
++        _age(worker, tid, 900)
++    worker.tick(max_spawn=0)  # sweep precedes note_capped on the first post-drain tick
++    assert not _repairs(worker.conn)
++    worker.tick(max_spawn=0)
++    [repair] = _repairs(worker.conn)
++    assert "queue" in repair["title"].lower()
++    assert all(tid in repair["body"] for tid in targets)
++
++
+ def test_a_full_queue_files_one_card_per_host_naming_the_oldest(gws):
+     hub, worker = gws
+     old = _pinned(hub, title="oldest")
+@@ -179,6 +193,43 @@ def test_a_full_queue_files_one_card_per_host_naming_the_oldest(gws):
+     assert "budget_exhausted" in card["body"] and new in card["body"]
+ 
+ 
++@pytest.mark.parametrize("reason", ["budget_exhausted", "hold", "other"])
++@pytest.mark.parametrize("initial", [2, 25])
++def test_same_cause_burst_refreshes_all_targets_without_comment_churn(gws, reason, initial):
++    from hermes_cli import kanban_pickup_stall as kps
++    _, worker = gws
++    worker.enter()
++    cards = [{"id": f"target-{i:03}", "title": "waiting", "tenant": None, "since_ms": 1,
++              "skip": {"reason": reason, "first_at": 1, "last_at": 1, "passes": 1,
++                       "detail": "machine registry unavailable" if reason == "other" else None}}
++             for i in range(25)]
++    [tid] = kps.file_repairs(worker.conn, WORKER, cards[:initial])
++    assert kps.file_repairs(worker.conn, WORKER, cards) == [tid]
++    comments = kb.list_comments(worker.conn, tid)
++    repair = kb.get_task(worker.conn, tid)
++    assert repair is not None
++    text = (repair.body or "") + "\n".join(c.body for c in comments)
++    assert all(c["id"] in text for c in cards)
++    kps.file_repairs(worker.conn, WORKER, cards)
++    assert len(kb.list_comments(worker.conn, tid)) == len(comments)
++    other = {**cards[0], "skip": {**cards[0]["skip"], "reason": "capability_missing"}}
++    assert kps.file_repairs(worker.conn, WORKER, [other]) != [tid]
++    assert len(_repairs(worker.conn)) == 2
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++def test_refresh_does_not_append_to_closed_repairs(gws, status):
++    from hermes_cli import kanban_pickup_stall as kps
++    _, worker = gws
++    worker.enter()
++    tid = kb.create_task(worker.conn, title="closed repair", assignee="default")
++    with kb.write_txn(worker.conn):
++        worker.conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
++    kps._refresh_targets(worker.conn, tid, [{"id": "target-new", "title": "new", "since_ms": 1}], 1000)
++    assert not kb.list_comments(worker.conn, tid)
++    kps._refresh_targets(worker.conn, "missing-repair", [], 1000)
++
++
+ def test_a_stall_with_another_last_reason_gets_its_own_card_beside_the_queue_card(gws):
+     hub, worker = gws
+     full = _pinned(hub, title="waits for a slot")
+-- 
+2.55.0
+

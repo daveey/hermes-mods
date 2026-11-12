@@ -1,0 +1,273 @@
+From e8ad66a5399c483d9ea7eae9c05651ee7a1edb5c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:16:23 +0000
+Subject: [PATCH] fix(desktop): instant archive keeps offline owner isolation
+ and pin edits [daveey]
+
+Review of PR #1143 (t_01a1cc80dc419f65) found three regressions:
+- offline-cached rows were tombstoned by bare id, hiding another owner's
+  cached chat with the same id: offline rows are no longer pre-hidden
+  (their owner-scoped queue path hides them, as on main);
+- Cancel restored the whole pin snapshot, dropping pin edits made while
+  the dialog was open: restore re-inserts only the pins archive removed;
+- rollback inserted a cache-only row into the live list: restore puts
+  back only the row a live slice actually held.
+Each has a test that fails on 83d1d367eb1d and passes here.
+---
+ .../archive-linked-confirm.test.tsx           | 54 +++++++++++----
+ .../use-session-actions/archive-soft-hide.ts  | 68 +++++++++++--------
+ .../hooks/use-session-actions/index.ts        |  7 +-
+ 3 files changed, 83 insertions(+), 46 deletions(-)
+
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+index 247f73d1482..3b8f3468942 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-linked-confirm.test.tsx
+@@ -10,6 +10,7 @@ import { type SessionInfo, setSessionArchived } from '@/hermes'
+ import { registerArchiveGuard, resetArchiveGuardsForTests } from '@/store/archive-guards'
+ import { $confirmRequest, settleConfirm } from '@/store/confirm'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
++import { $pinnedSessionIds } from '@/store/layout'
+ import { $offlineSessions, _resetOfflineSessionsForTests } from '@/store/offline-sessions'
+ import { $projectTree } from '@/store/project-tree'
+ import { $sessions, _resetSessionOwnerHintsForTests, setSessionOwnerHint, setSessions } from '@/store/session'
+@@ -275,6 +276,29 @@ describe('archiveSession linked-work confirmation', () => {
+     expect($sessions.get().map(session => session.id)).toEqual(['s-1'])
+   })
+ 
++  it('Cancel puts back only the archived pin, keeping pin edits made meanwhile', async () => {
++    setSessions([row({ kanban_active: 1 })])
++    $pinnedSessionIds.set(['s-1', 'old'])
++    const handle = await mountHarness()
++
++    let done: Promise<void> | undefined
++    act(() => {
++      done = handle.archiveSession('s-1')
++    })
++
++    expect($pinnedSessionIds.get()).toEqual(['old'])
++    await waitFor(() => expect($confirmRequest.get()).not.toBeNull())
++    $pinnedSessionIds.set(['new'])
++
++    await act(async () => {
++      settleConfirm(false)
++      await done
++    })
++
++    expect($pinnedSessionIds.get()).toEqual(['s-1', 'new'])
++    $pinnedSessionIds.set([])
++  })
++
+   it('skipLinkedConfirm archives without asking', async () => {
+     setSessions([row({ kanban_active: 3 })])
+     const handle = await mountHarness()
+@@ -288,6 +312,7 @@ describe('archiveSession linked-work confirmation', () => {
+ 
+ describe('offline archive owner isolation', () => {
+   beforeEach(() => {
++    $removedSessionIds.set(new Set())
+     _resetOfflineSessionsForTests()
+     hubRequest.mockClear()
+     setSessions([])
+@@ -333,25 +358,25 @@ describe('offline archive owner isolation', () => {
+     expect(hubRequest).not.toHaveBeenCalled()
+     expect(setSessionArchived).toHaveBeenCalledWith('s-1', true, { connectionId: 'mini', profile: 'work' })
+   })
+-  it('hides an offline row at once and brings it back when the queue fails', async () => {
++  // Offline rows keep main's owner-scoped flow: no bare-id tombstone, no live-slice copy.
++  it('does not tombstone another owner\'s cached chat with the same id', async () => {
++    const selectedRow = cached('cloud', 'work')
++    const otherOwnerRow = cached('mini', 'personal')
++    $offlineSessions.set([selectedRow, otherOwnerRow])
++    const handle = await mountHarness()
++    await act(() => handle.archiveSession('s-1', { selectedRow }))
++    expect($offlineSessions.get()).toEqual([otherOwnerRow])
++    expect($removedSessionIds.get().has('s-1')).toBe(false)
++  })
++  it('keeps a failed offline queue row cached and out of the live list', async () => {
+     const selectedRow = cached()
+     $offlineSessions.set([selectedRow])
+-
+-    let rejectQueue: (error: Error) => void = () => {}
+-    hubRequest.mockImplementationOnce(() => new Promise((_resolve, reject) => (rejectQueue = reject)))
++    hubRequest.mockRejectedValueOnce(new Error('hub down'))
+     const handle = await mountHarness()
+-    let done: Promise<void> | undefined
+-    act(() => {
+-      done = handle.archiveSession('s-1', { selectedRow })
+-    })
+-    expect($removedSessionIds.get().has('s-1')).toBe(true)
+-    await act(async () => {
+-      await waitFor(() => expect(hubRequest).toHaveBeenCalled())
+-      rejectQueue(new Error('hub down'))
+-      await done
+-    })
++    await act(() => handle.archiveSession('s-1', { selectedRow }))
+     expect($removedSessionIds.get().has('s-1')).toBe(false)
+     expect($offlineSessions.get()).toEqual([selectedRow])
++    expect($sessions.get()).toEqual([])
+   })
+   it('keeps linked-work confirmation for an offline row', async () => {
+     const selectedRow = { ...cached(), kanban_active: 2 }
+@@ -368,6 +393,7 @@ describe('offline archive owner isolation', () => {
+     })
+     expect(hubRequest).not.toHaveBeenCalled()
+     expect($offlineSessions.get()).toEqual([selectedRow])
++    expect($sessions.get()).toEqual([])
+   })
+ })
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts
+index 8b6d170e800..7b4d677c2be 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-soft-hide.ts
+@@ -3,7 +3,6 @@ import type { Translations } from '@/i18n/types'
+ import { $pinnedSessionIds } from '@/store/layout'
+ import { notifyError } from '@/store/notifications'
+ import { archiveIfOfflineCached } from '@/store/offline-session-actions'
+-import { $offlineSessions, offlineIdentity } from '@/store/offline-sessions'
+ import { $profiles } from '@/store/profile'
+ import { sessionPinId } from '@/store/session'
+ import {
+@@ -21,59 +20,72 @@ import { dropListedSession, type findListedSession, resolveSessionProfile, resto
+  * linked-work preflight (ancestry + task reads, plugin guards: up to ~14 s on a
+  * busy or remote backend) and the archive RPC. A cancelled confirmation, an
+  * unresolved owner or a failed RPC puts the row back via `restore()`.
++ *
++ * Offline-cached rows are not pre-hidden (`hid` false): tombstones and the
++ * live-slice drop are keyed by bare id, which would also hide another owner's
++ * cached chat with the same id; their owner-scoped queue path hides them.
+  */
+ export function softHideArchivedRow(
+   storedSessionId: string,
+   archived: SessionInfo | undefined,
+-  listed: ReturnType<typeof findListedSession>,
+-  listedRow: SessionInfo | undefined
++  listed: ReturnType<typeof findListedSession>
+ ) {
+-  const previousPinned = $pinnedSessionIds.get()
++  const ids = [storedSessionId, archived?.id, archived?._lineage_root_id]
++
++  if (archived?.offline_cached) {
++    return { end: () => {}, hid: false, ids, restore: () => {} }
++  }
++
++  const before = $pinnedSessionIds.get()
+   // Pins are keyed on the durable lineage-root id; the stored id may be the
+   // live tip after compression. Drop both so the pin can't linger.
+   const pinId = archived ? sessionPinId(archived) : storedSessionId
+-  const ids = [storedSessionId, archived?.id, archived?._lineage_root_id]
++  const removedPins = before.flatMap((id, index) => (id === storedSessionId || id === pinId ? [{ id, index }] : []))
+ 
+   dropListedSession(storedSessionId)
+   tombstoneSessions(ids)
+   beginSessionMutation(ids)
+-  $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== pinId))
+ 
+-  const hidden = {
++  if (removedPins.length) {
++    $pinnedSessionIds.set(before.filter(id => id !== storedSessionId && id !== pinId))
++  }
++
++  return {
+     end: () => endSessionMutation(ids),
++    hid: true,
+     ids,
+-    /** A queued offline archive drops its cached row; a failed queue leaves it, so it comes back. */
+-    settleOffline: () => {
+-      const queued =
+-        !archived || !$offlineSessions.get().some(row => offlineIdentity(row) === offlineIdentity(archived))
+-
+-      if (queued) {
+-        hidden.end()
+-      } else {
+-        hidden.restore()
+-      }
+-    },
+     restore: () => {
+-      // Only a row the sidebar actually listed comes back; an owner resolved
+-      // from the project tree or a hint was never in that slice.
+-      if (listedRow) {
+-        restoreListedSession(listedRow, listed?.slice)
++      // Only the row a live sidebar slice actually held comes back, to that
++      // slice; a row resolved from the project tree or a hint never was there.
++      if (listed) {
++        restoreListedSession(listed.session, listed.slice)
+       }
+ 
+       untombstoneSessions(ids)
+-      $pinnedSessionIds.set(previousPinned)
++
++      // Put back only the pins this archive removed; keep pin edits made meanwhile.
++      if (removedPins.length) {
++        const pins = [...$pinnedSessionIds.get()]
++
++        for (const { id, index } of removedPins) {
++          if (!pins.includes(id)) {
++            pins.splice(Math.min(index, pins.length), 0, id)
++          }
++        }
++
++        $pinnedSessionIds.set(pins)
++      }
++
+       endSessionMutation(ids)
+     }
+   }
+-
+-  return hidden
+ }
+ 
+ type HiddenRow = ReturnType<typeof softHideArchivedRow>
+ 
+ /**
+  * Owner resolution, linked-work confirmation and the offline-queue path, run
+- * while the row is already hidden. Returns the profile to archive under, or
++ * while a live row is already hidden. Returns the profile to archive under, or
+  * false when archive is over: cancelled/failed (row restored) or queued offline.
+  */
+ export async function archivePreflight(
+@@ -101,9 +113,9 @@ export async function archivePreflight(
+   }
+ 
+   try {
+-    // Offline-or-live was decided before the hide dropped the live row.
++    // Offline-or-live is decided from the pre-hide row: once a live row is
++    // dropped, re-resolving could land on another cached copy.
+     if (archived?.offline_cached && (await archiveIfOfflineCached(storedSessionId, copy, archived))) {
+-      hidden.settleOffline()
+ 
+       return false
+     }
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index 0a5257d50aa..4f81296cdaa 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -3444,10 +3444,9 @@ export function useSessionActions({
+ 
+       const listed = findListedSession(storedSessionId)
+       let archived: SessionInfo | undefined
+-      let listedRow: SessionInfo | undefined
+ 
+       try {
+-        archived = listedRow = sessionActionRow(storedSessionId, options?.selectedRow) ?? listed?.session
++        archived = sessionActionRow(storedSessionId, options?.selectedRow) ?? listed?.session
+ 
+         // A selected row is the user's explicit owner; every other door
+         // (hotkey, tile menu, plugins) resolves it like resume does, so a
+@@ -3463,10 +3462,10 @@ export function useSessionActions({
+       }
+ 
+       // Hide first: the preflight below can take seconds; cancel/failure restores.
+-      const hidden = softHideArchivedRow(storedSessionId, archived, listed, listedRow)
++      const hidden = softHideArchivedRow(storedSessionId, archived, listed)
+       const archivedIds = hidden.ids
+ 
+-      if (selectedStoredSessionIdRef.current === storedSessionId) {
++      if (hidden.hid && selectedStoredSessionIdRef.current === storedSessionId) {
+         if (options?.onDeselect) {
+           options.onDeselect()
+         } else {
+-- 
+2.55.0
+

@@ -1,0 +1,127 @@
+From 16e2f7f9b5a15445de9e8bf751d207a1ae0250b9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:01:44 +0000
+Subject: [PATCH] [daveey] bound missing pickup evidence grace and group
+ failed-pass alerts
+
+---
+ hermes_cli/kanban_pickup_stall.py            | 20 ++++++++---
+ tests/hermes_cli/test_kanban_pickup_stall.py | 35 +++++++++++++++++++-
+ 2 files changed, 50 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index d8e831f0389..624135b6604 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -14,7 +14,9 @@ read back: pickup kept no record of why a pass skipped a candidate.
+   ``ready_since`` is older than ``kanban.sync.pickup_stall_seconds`` (default 600) gets ONE agent repair card on this
+   host (an open one, or one closed less than :data:`REPLACE_AFTER_SECONDS` ago, is reused). Host-wide causes share
+   ONE card per host naming the oldest card: ``budget_exhausted`` (the queue is simply full), ``hold`` and an
+-  unreadable machine registry. ``budget_exhausted`` is recorded only for a card a slot would have started, so a
++  unreadable machine registry. Missing evidence gets one additional stall interval of durable grace, then one
++  host alert (not a fabricated refusal); a failed pickup must not silence the detector forever.
++  ``budget_exhausted`` is recorded only for a card a slot would have started, so a
+   refusal is never hidden behind a full queue. No Inbox post, no human ask.
+ """
+ from __future__ import annotations
+@@ -26,7 +28,8 @@ from typing import Any, Mapping, Optional
+ _log = logging.getLogger(__name__)
+ 
+ TABLE = "kanban_pickup_skips"
+-REASONS = ("budget_exhausted", "profile_ineligible", "capability_missing", "parents_incomplete", "hold", "other")
++REASONS = ("budget_exhausted", "profile_ineligible", "capability_missing", "parents_incomplete", "hold", "other",
++           "evidence_missing")
+ DEFAULT_STALL_SECONDS = 600
+ REFRESH_SECONDS = 60
+ RETENTION_SECONDS = 7 * 86400
+@@ -201,6 +204,10 @@ def _create(conn, *, key: str, title: str, body: str, tenant: Optional[str], own
+ 
+ # Host-wide causes: one card per host, never one per pinned card. ``hold`` is an operator's deliberate state.
+ _HOST_GROUPS = {
++    "evidence_missing": ("evidence-missing", "Pickup evidence missing on {own}",
++                         "the detector has observed missing pickup evidence for an additional stall interval. "
++                         "This is not a recorded pickup refusal: inspect pickup exceptions/timeouts and the "
++                         "dispatcher logs before attributing a cause."),
+     "budget_exhausted": (QUEUE_FULL, "Pickup queue full on {own}",
+                          "the last pickup skip of each is budget_exhausted (no spawn slot on this host). Decide "
+                          "whether the queue drains on its own (running cards near done) or work must move to a "
+@@ -218,7 +225,7 @@ def _group(card: Mapping[str, Any]) -> Optional[str]:
+     skip = card["skip"] or {}
+     if skip.get("reason") == "other" and skip.get("detail") == "machine registry unavailable":
+         return "registry"
+-    return skip.get("reason") if skip.get("reason") in ("budget_exhausted", "hold") else None
++    return skip.get("reason") if skip.get("reason") in ("budget_exhausted", "hold", "evidence_missing") else None
+ 
+ 
+ def _refresh_targets(conn, task_id: str, members: list[dict[str, Any]], now_ms: int) -> None:
+@@ -248,8 +255,13 @@ def file_repairs(conn, own: str, cards: list[dict[str, Any]], *, now: Optional[f
+     for card in cards:
+         # The sweep precedes pickup/note_capped. A first post-drain tick may
+         # have old ready rows but no observation yet: missing evidence is not
+-        # a target-specific cause. Let this tick record it before filing.
++        # a target-specific cause. Persist the first observation so a crashing
++        # pickup cannot suppress alerts forever (including across restarts).
+         if not card["skip"]:
++            record(conn, {card["id"]: ("evidence_missing", "detector observation; no pickup skip recorded")}, now=now)
++            continue
++        if (card["skip"]["reason"] == "evidence_missing"
++                and now_ms - card["skip"]["first_at"] < stall_seconds() * 1000):
+             continue
+         group = _group(card)
+         if group is not None:
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall.py b/tests/hermes_cli/test_kanban_pickup_stall.py
+index 7dbd82dcf2d..b3887cdd78a 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall.py
+@@ -175,6 +175,39 @@ def test_first_tick_after_drain_waits_for_skip_evidence_before_filing(gws):
+     assert all(tid in repair["body"] for tid in targets)
+ 
+ 
++@pytest.mark.parametrize("failure", [OSError, TimeoutError])
++def test_missing_evidence_after_failed_pickup_escalates_once_after_grace(gws, monkeypatch, failure):
++    from hermes_cli import kanban_pickup_stall as kps
++    hub, worker = gws
++    targets = [_pinned(hub, title=f"failed-{i}") for i in range(4)]
++    worker.round()
++    for tid in targets:
++        _age(worker, tid, 900)
++    clock = [kps._now_ms()]
++    monkeypatch.setattr(kps, "_now_ms", lambda now=None: clock[0])
++
++    def broken(conn, replica, ids):
++        raise failure("pickup failed before skip recording")
++
++    monkeypatch.setattr(wn, "import_cards", broken)
++    worker.tick()
++    assert not _repairs(worker.conn)  # first post-drain pass still gets grace
++    clock[0] += 599_000
++    worker.tick()
++    assert not _repairs(worker.conn)
++    clock[0] += 1_000
++    worker.tick()
++    [repair] = _repairs(worker.conn)
++    assert "evidence" in repair["title"].lower()
++    assert all(tid in repair["body"] for tid in targets)
++    worker.tick()
++    assert len(_repairs(worker.conn)) == 1
++    # A real target-specific observation remains separate, not hidden by the host alert.
++    kps.record(worker.conn, {targets[0]: ("capability_missing", "labels_mismatch")})
++    worker.tick()
++    assert len(_repairs(worker.conn)) == 2
++
++
+ def test_a_full_queue_files_one_card_per_host_naming_the_oldest(gws):
+     hub, worker = gws
+     old = _pinned(hub, title="oldest")
+@@ -193,7 +226,7 @@ def test_a_full_queue_files_one_card_per_host_naming_the_oldest(gws):
+     assert "budget_exhausted" in card["body"] and new in card["body"]
+ 
+ 
+-@pytest.mark.parametrize("reason", ["budget_exhausted", "hold", "other"])
++@pytest.mark.parametrize("reason", ["budget_exhausted", "hold", "other", "evidence_missing"])
+ @pytest.mark.parametrize("initial", [2, 25])
+ def test_same_cause_burst_refreshes_all_targets_without_comment_churn(gws, reason, initial):
+     from hermes_cli import kanban_pickup_stall as kps
+-- 
+2.55.0
+

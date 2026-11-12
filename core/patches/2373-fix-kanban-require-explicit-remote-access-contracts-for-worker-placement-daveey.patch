@@ -1,0 +1,339 @@
+From a0165cd086e927b7d25dbac8f291662526c63a45 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:37:24 +0000
+Subject: [PATCH] fix(kanban): require explicit remote-access contracts for
+ worker placement [daveey]
+
+---
+ hermes_cli/kanban_capability_routing.py       |  5 +
+ hermes_cli/kanban_placement.py                | 10 +-
+ hermes_cli/kanban_placement_coordination.py   | 40 ++++----
+ .../test_kanban_coordination_placement.py     | 18 ++--
+ .../hermes_cli/test_kanban_declared_access.py | 99 +++++++++++++++++++
+ tools/kanban_tools_schemas.py                 |  5 +
+ 6 files changed, 147 insertions(+), 30 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_declared_access.py
+
+diff --git a/hermes_cli/kanban_capability_routing.py b/hermes_cli/kanban_capability_routing.py
+index 02a449ddff2..06d764d3eab 100644
+--- a/hermes_cli/kanban_capability_routing.py
++++ b/hermes_cli/kanban_capability_routing.py
+@@ -575,6 +575,11 @@ def preflight(conn, task_id: str, *, board: Optional[str] = None, **lookup) -> O
+         if task is None:
+             return None
+         needs = needs_from_requires(task.requires)
++        if getattr(task, "placement_policy", None) == "worker-first-v1":
++            # Enrollment checked the pool; pickup/execution recheck the actual
++            # worker. Do not create an origin-side owner for its remote access.
++            from hermes_cli.kanban_placement_coordination import ACCESS_LABELS
++            needs = [need for need in needs if need not in ACCESS_LABELS]
+         if not needs:
+             return None
+         if task.status != "ready":
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 71b24ec8797..0362b665979 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -434,9 +434,11 @@ def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+         return "uncarried option"
+     reqs = args.get("requires") or []
+     reqs = [reqs] if isinstance(reqs, str) else list(reqs)
+-    if any(reg.is_gateway_need(r) for r in reqs):
++    from hermes_cli import kanban_placement_coordination as coordination
++    ordinary = [r for r in reqs if r not in coordination.ACCESS_LABELS]
++    if any(reg.is_gateway_need(r) for r in ordinary):
+         return "gateway-scoped requirement"
+-    if any(str(r) not in c.carried_requires() for r in reqs):
++    if any(str(r) not in c.carried_requires() for r in ordinary):
+         return "uncarried requirement"
+     title, body = args.get("title") or "", without_evidence(without_placement_note(args.get("body") or ""))
+     if _local_marker(title, body, args.get("skills"), c):
+@@ -446,9 +448,9 @@ def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+     from hermes_cli.kanban_published_worktree import without_published_worktrees
+ 
+     full = without_carried_inputs(f"{title}\n{body}", c.raw)
+-    if refusal := coordination.check(full, c.raw, skills=args.get("skills")):
++    if refusal := coordination.check(full, c.raw, skills=args.get("skills"), requires=reqs):
+         return refusal
+-    marker_full = coordination.access_text(coordination.marker_text(full), c.raw)
++    marker_full = coordination.access_text(coordination.marker_text(full), c.raw, requires=reqs)
+     extra = c.raw.get("extra_home_markers")
+     exemptible = (HUB_CLI_COMMAND, r"\btoken-broker\b", r"\bssh\b", r"\bon the hub\b", r"\bthe hub's\b",
+                   r"\bjournalctl\b", r"\bkanban\.db\b")  # coordination.check() proved the worker attests each
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index 3230fc5d7b5..6cc78fb1b83 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -57,15 +57,14 @@ _TOOLS = {
+ }
+ 
+ 
+-# Remote access a worker holds through a restricted key, attested on its Board labels by the operator (the keys
+-# are installed by hand: a worker-2 key in the MacBook's and mini's authorized_keys, and a forced-command
+-# read-only `hub-read` login on the hub). A bare mention is conservative: a card that wants more than the key
+-# gives blocks with needs=[...] and capability routing opens the owner card. Other home markers (launchd, cron,
+-# systemctl, gateway restart, hub paths) stay binding either way.
++# Explicit task contracts, not authority inferred from prose. These declarations
++# describe existing restricted access; they never install credentials or grant writes.
++ACCESS_LABELS = {"ssh:mbp": "capability:ssh-mbp", "ssh:mini": "capability:ssh-mini",
++                 "hub:read": "capability:hub-read"}
+ _ACCESS = (
+-    (re.compile(r"\bssh\b", re.IGNORECASE), ("capability:ssh-mbp", "capability:ssh-mini")),
++    (re.compile(r"\bssh\b", re.IGNORECASE), {"ssh:mbp", "ssh:mini"}),
+     (re.compile(r"\bon the hub\b|\bthe hub's\b|\bjournalctl\b|\bkanban\.db\b", re.IGNORECASE),
+-     ("capability:hub-read",)),
++     {"hub:read"}),
+ )
+ 
+ 
+@@ -93,9 +92,9 @@ def requirements(text):
+     return labels, None
+ 
+ 
+-def access_requirements(text):
+-    """Labels the ssh / hub-read mentions in ``text`` would need; never a refusal (unmet = markers keep binding)."""
+-    return {label for rx, needed in _ACCESS if rx.search(text) for label in needed}
++def access_requirements(requires):
++    """Labels for declared access; unknown names remain gateway-scoped."""
++    return {ACCESS_LABELS[r] for r in requires or [] if r in ACCESS_LABELS}
+ 
+ 
+ def destinations(cfg, target=None):
+@@ -139,12 +138,11 @@ def attested(names, required):
+     return True
+ 
+ 
+-def check(text, cfg, *, target=None, skills=None, access=False):
+-    """``access`` adds the ssh / hub-read labels (claim revalidation); placement leaves them to :func:`access_text`."""
++def check(text, cfg, *, target=None, skills=None, requires=None):
++    """Revalidate coordination tools and explicitly declared remote access."""
+     required, refusal = requirements(text)
+     required.update(skill_requirements(skills))
+-    if access:
+-        required.update(access_requirements(text))
++    required.update(access_requirements(requires))
+     if refusal or not required:
+         return refusal
+     return None if attested(destinations(cfg, target), required) else REASON
+@@ -158,13 +156,17 @@ def marker_text(text):
+     return re.sub(r"\btoken-broker\b", "", text, flags=re.IGNORECASE)
+ 
+ 
+-def access_text(text, cfg, *, target=None):
++def access_text(text, cfg, *, target=None, requires=None):
+     """``text`` minus the remote-access mentions (ssh, hub reads) whose labels EVERY destination attests.
+ 
+     An unattested mention stays in the text, so its home marker still pins the card exactly as before.
+     Kept apart from :func:`marker_text` so a card that never needed the attestation keeps its markers."""
++    declared = set(requires or [])
++    labels = access_requirements(declared)
++    if not labels or not attested(destinations(cfg, target), labels):
++        return text
+     for rx, needed in _ACCESS:
+-        if rx.search(text) and attested(destinations(cfg, target), set(needed)):
++        if declared & needed:
+             text = rx.sub("", text)
+     return text
+ 
+@@ -176,7 +178,8 @@ def claim_refusal(card, me):
+     from hermes_cli.kanban_placement import without_evidence, without_placement_note
+     text = f"{card.get('title') or ''}\n{without_evidence(without_placement_note(card.get('body') or ''))}"
+     from hermes_cli.kanban_runs_on_capabilities import _loads
+-    return check(text, {}, target=me, skills=_loads(card.get("skills"), []), access=True)
++    return check(text, {}, target=me, skills=_loads(card.get("skills"), []),
++                 requires=_loads(card.get("requires"), []))
+ 
+ 
+ def legacy_refusal(args):
+@@ -184,7 +187,8 @@ def legacy_refusal(args):
+     from hermes_cli.kanban_placement import without_evidence, without_placement_note
+     text = f"{args.get('title') or ''}\n{without_evidence(without_placement_note(args.get('body') or ''))}"
+     required, refusal = requirements(text)
+-    return bool(refusal or required or skill_requirements(args.get("skills")))
++    return bool(refusal or required or skill_requirements(args.get("skills"))
++                or access_requirements(args.get("requires")))
+ 
+ 
+ def skill_requirements(skills):
+diff --git a/tests/hermes_cli/test_kanban_coordination_placement.py b/tests/hermes_cli/test_kanban_coordination_placement.py
+index 419b9b5e12b..93227374601 100644
+--- a/tests/hermes_cli/test_kanban_coordination_placement.py
++++ b/tests/hermes_cli/test_kanban_coordination_placement.py
+@@ -19,8 +19,9 @@ def fleet(monkeypatch):
+     return cfg, entry, machines
+ 
+ 
+-def reason(body, cfg):
+-    return kp.portable_reason({"title": "Read coordination evidence", "body": body}, cfg)
++def reason(body, cfg, requires=None):
++    return kp.portable_reason({"title": "Read coordination evidence", "body": body,
++                               "requires": requires}, cfg)
+ 
+ 
+ def test_independent_broker_state_path_stays_home(fleet):
+@@ -272,13 +273,13 @@ def test_ssh_card_needs_mac_ssh_attestation(fleet):
+     cfg, entry, _ = fleet
+     assert reason("ssh mini and check the watcher output", cfg) == "home gateway marker"
+     entry["labels"] += ACCESS
+-    assert reason("ssh mini and check the watcher output", cfg) is None
++    assert reason("ssh mini and check the watcher output", cfg, ["ssh:mini"]) is None
+ 
+ 
+-def test_ssh_attestation_needs_both_mac_keys(fleet):
++def test_ssh_attestation_needs_the_declared_mac_key(fleet):
+     cfg, entry, _ = fleet
+     entry["labels"] += ["capability:ssh-mini"]
+-    assert reason("SSH to the MacBook for the log", cfg) == "home gateway marker"
++    assert reason("SSH to the MacBook for the log", cfg, ["ssh:mbp"]) is not None
+ 
+ 
+ @pytest.mark.parametrize("body", ["read the log on the hub", "the hub's log output", "journalctl -u x",
+@@ -287,7 +288,7 @@ def test_hub_reads_need_hub_read_attestation(fleet, body):
+     cfg, entry, _ = fleet
+     assert reason(body, cfg) == "home gateway marker"
+     entry["labels"] += ["capability:hub-read"]
+-    assert reason(body, cfg) is None
++    assert reason(body, cfg, ["hub:read"]) is None
+ 
+ 
+ def test_access_labels_do_not_exempt_other_home_markers(fleet):
+@@ -301,7 +302,8 @@ def test_access_labels_do_not_exempt_other_home_markers(fleet):
+ def test_claim_refusal_revalidates_access_labels(fleet):
+     from hermes_cli.kanban_placement_coordination import claim_refusal
+     _, entry, _ = fleet
+-    card = {"placement_policy": "worker-first-v1", "title": "t", "body": "ssh mini then read the log"}
++    card = {"placement_policy": "worker-first-v1", "title": "t", "body": "ssh mini then read the log",
++            "requires": '["ssh:mini"]'}
+     assert claim_refusal(card, "worker") == "needs worker coordination capability"
+     entry["labels"] += ACCESS
+     assert claim_refusal(card, "worker") is None
+@@ -311,4 +313,4 @@ def test_unattested_access_leaves_cards_home_as_before(fleet):
+     cfg, entry, _ = fleet
+     entry["labels"] += ["capability:hub-read"]  # hub reads attested, ssh not
+     assert reason("ssh mini and read the log on the hub", cfg) == "home gateway marker"
+-    assert reason("read the log on the hub", cfg) is None
++    assert reason("read the log on the hub", cfg, ["hub:read"]) is None
+diff --git a/tests/hermes_cli/test_kanban_declared_access.py b/tests/hermes_cli/test_kanban_declared_access.py
+new file mode 100644
+index 00000000000..fd7d9f4f280
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_declared_access.py
+@@ -0,0 +1,99 @@
++"""Remote access is a declared contract, never inferred from arbitrary prose."""
++import pytest
++
++from hermes_cli import kanban_placement as kp
++from tests.hermes_cli import test_kanban_coordination_placement as helpers
++
++fleet = helpers.fleet
++
++
++def card(body, requires=()):
++    return {"title": "Check remote evidence", "body": body, "requires": list(requires)}
++
++
++@pytest.mark.parametrize("body", [
++    "on the hub, kill the stuck dispatcher pid",
++    "delete the stale rows from kanban.db",
++    "ssh hermes-hub and sudo reboot",
++    "ssh worker-1",
++    "read the log on the hub",
++])
++def test_undeclared_access_never_exempts_markers(fleet, body):
++    cfg, entry, _ = fleet
++    entry["labels"] += helpers.ACCESS
++    assert kp.portable_reason(card(body), cfg) == "home gateway marker"
++
++
++@pytest.mark.parametrize("requirement,label,body", [
++    ("hub:read", "capability:hub-read", "read the log on the hub"),
++    ("ssh:mbp", "capability:ssh-mbp", "ssh to the MacBook for a read"),
++    ("ssh:mini", "capability:ssh-mini", "ssh mini diag"),
++])
++def test_declared_access_requires_every_destination(fleet, requirement, label, body):
++    cfg, entry, machines = fleet
++    args = card(body, [requirement])
++    assert kp.portable_reason(args, cfg) is not None
++    entry["labels"].append(label)
++    assert kp.portable_reason(args, cfg) is None
++    cfg["worker_pools"]["hub"].append("other")
++    machines["other"] = dict(entry, labels=[])
++    assert kp.portable_reason(args, cfg) is not None
++
++
++def test_access_contract_is_rechecked_at_execution(fleet, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_placement as wp
++    cfg, entry, _ = fleet
++    args = card("read the log on the hub", ["hub:read"])
++    entry["labels"] += helpers.ACCESS
++    assert kp.portable_reason(args, cfg) is None
++    monkeypatch.setattr(sync, "board_mode", lambda _: "primary")
++    monkeypatch.setattr(sync, "sync_state", lambda _: {"gateway_id": "worker"})
++    args.update(placement_policy="worker-first-v1", runs_on='["machine:worker"]')
++    assert wp.execution_refusal(None, args) is None
++    entry["labels"] = []
++    assert wp.execution_refusal(None, args) is not None
++
++
++@pytest.mark.parametrize("body", ["read ~/.hermes/state.db on the hub", "systemctl restart x on the hub"])
++def test_independent_markers_survive_declared_access(fleet, body):
++    cfg, entry, _ = fleet
++    entry["labels"] += helpers.ACCESS
++    assert kp.portable_reason(card(body, ["hub:read"]), cfg) is not None
++
++
++def test_operator_extra_marker_survives_declared_access(fleet):
++    cfg, entry, _ = fleet
++    entry["labels"] += helpers.ACCESS
++    cfg["extra_home_markers"] = [r"on the hub"]
++    assert kp.portable_reason(card("read logs on the hub", ["hub:read"]), cfg) is not None
++
++
++def test_legacy_routing_does_not_drop_access_contract(fleet):
++    cfg, entry, _ = fleet
++    entry["labels"] += helpers.ACCESS
++    cfg["heavy_route"] = {"hub": "worker"}
++    args = card("read logs on the hub", ["hub:read"])
++    args["title"] = "Run pytest"
++    assert kp._routeless_heavy(args, kp._Cfg(cfg), "hub", lambda _: True) is None
++
++
++@pytest.mark.parametrize("policy,expected", [
++    ("worker-first-v1", ["aws:example:read"]),
++    (None, ["hub:read", "aws:example:read"]),
++])
++def test_preflight_keeps_enrolled_access_with_worker(monkeypatch, policy, expected):
++    from types import SimpleNamespace
++    from hermes_cli import kanban_capability_routing as routing
++    from hermes_cli import kanban_db as kb
++    task = SimpleNamespace(requires=["hub:read", "aws:example:read"],
++                           placement_policy=policy, status="ready", body="read", title="read")
++    monkeypatch.setattr(kb, "get_task", lambda *_: task)
++    monkeypatch.setattr(routing, "_previous_routes", lambda *_: False)
++    observed = []
++    def route(conn, task_id, needs, **kwargs):
++        observed.extend(needs)
++        return {"test": True}
++    monkeypatch.setattr(routing, "route", route)
++    assert routing.preflight(None, "test") == {"test": True}
++    assert observed == expected
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 32b35b5c933..7b1e023cea2 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -719,6 +719,11 @@ KANBAN_CREATE_SCHEMA = _schema(
+                      "(requires_declaration_missing; nothing is created). "
+                      "Worktree/dir workspaces and pinned skills' declared toolsets add their needs even to []; "
+                      "git means terminal access, not an executable probe. "
++                     "Declare remote reads explicitly: 'hub:read' for restricted read-only hub state, "
++                     "'ssh:mbp' or 'ssh:mini' for the corresponding installed SSH access. Worker pools "
++                     "may carry these only when every destination attests the matching capability; "
++                     "prose mentions alone never exempt host markers. Never declare hub:read for writes, "
++                     "restarts or administrative SQL, and never use Mac SSH declarations for other hosts. "
+                      "Gateway capabilities the plan needs (namespaced, e.g. 'aws:767406518141:ec2-describe', "
+                      "'ssh:mini', 'github:daveey:admin', 'sudo:nopasswd') are placement needs: if this "
+                      "gateway lacks one and another holds it, an owner card is opened there first and "
+-- 
+2.55.0
+

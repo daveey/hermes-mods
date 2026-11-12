@@ -1,0 +1,359 @@
+From 2b67c71676d20e5f4c06517a3123c5f488988f16 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:33:24 +0000
+Subject: [PATCH] fix(delegation): record child model source at reservation
+ [daveey]
+
+---
+ agent/runtime_session_child.py                |   7 +-
+ agent/subagent_lifecycle.py                   |   5 +-
+ gateway/session_worker_child.py               |  10 +-
+ tests/gateway/test_child_model_provenance.py  |  31 +++++
+ tests/tools/test_delegate_class_routing.py    |   2 +
+ tests/tools/test_delegate_model_source.py     | 109 ++++++++++++++++++
+ .../test_delegate_transcript_readiness.py     |   6 +-
+ tools/delegate_tool.py                        |  18 ++-
+ tools/delegate_tool_child_run.py              |   8 +-
+ 9 files changed, 183 insertions(+), 13 deletions(-)
+ create mode 100644 tests/gateway/test_child_model_provenance.py
+ create mode 100644 tests/tools/test_delegate_model_source.py
+
+diff --git a/agent/runtime_session_child.py b/agent/runtime_session_child.py
+index 68d9dec723b..7f275752f98 100644
+--- a/agent/runtime_session_child.py
++++ b/agent/runtime_session_child.py
+@@ -41,11 +41,14 @@ class ChildSessionStore(RuntimeSessionStore):
+             super().close()
+ 
+ 
+-def reserve_child_store(parent):
++def reserve_child_store(parent, *, model_provenance=None):
+     """A ``ChildSessionStore`` the owner reserved under ``parent``'s verified execution."""
+     secret = secrets.token_urlsafe(32)
+     # Reached from delegate_task's tool callback, which can run on Relay's loop (#139029).
+-    result = call_off_event_loop(parent._apply, 'child.reserve', {'secret': secret})
++    payload = {'secret': secret}
++    if model_provenance is not None:
++        payload['model_provenance'] = model_provenance
++    result = call_off_event_loop(parent._apply, 'child.reserve', payload)
+     if 'refused' in result:
+         raise ValueError(_REFUSALS.get(result['refused'], 'the gateway owner refused a subagent: ' + result['refused']))
+     child = result['child']
+diff --git a/agent/subagent_lifecycle.py b/agent/subagent_lifecycle.py
+index 658654717f8..3342bfcd2d4 100644
+--- a/agent/subagent_lifecycle.py
++++ b/agent/subagent_lifecycle.py
+@@ -303,7 +303,10 @@ class SubagentLifecycleService:
+             task_index=0, goal=request.goal, context=request.context,
+             toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
+             model=request.model or creds["model"], max_iterations=DEFAULT_MAX_ITERATIONS,
+-            task_count=1, parent_agent=parent, role=request.role, **_credential_overrides(creds, routing_cfg),
++            task_count=1, parent_agent=parent, role=request.role,
++            model_source=("caller_pin" if request.model or request.provider else
++                          "delegation_default" if routing_cfg.get("model") or routing_cfg.get("provider")
++                          else "parent_inherit"), **_credential_overrides(creds, routing_cfg),
+         )
+         subagent_id = str(getattr(child, "_subagent_id", "") or "")
+         if not subagent_id:
+diff --git a/gateway/session_worker_child.py b/gateway/session_worker_child.py
+index 9918bd49dff..d22da7a81ab 100644
+--- a/gateway/session_worker_child.py
++++ b/gateway/session_worker_child.py
+@@ -45,7 +45,13 @@ def reserve_child_execution(db, conn, session_id, payload, *, epoch, execution_i
+     from hermes_state_runtime import _secret_digest
+     from hermes_state_worker_lifecycle import insert_session_row_in_transaction
+     secret = payload.get('secret') if isinstance(payload, dict) else None
+-    if set(payload) != {'secret'} or not isinstance(secret, str) or not 16 <= len(secret) <= 256:
++    if set(payload) - {'secret', 'model_provenance'} or not isinstance(secret, str) or not 16 <= len(secret) <= 256:
++        raise RuntimeStoreError('invalid_params')
++    provenance = payload.get('model_provenance', {})
++    if not isinstance(provenance, dict) or (provenance and (
++            set(provenance) != {'model_source', 'requested_model'} or
++            provenance['model_source'] not in ('caller_pin', 'delegation_default', 'parent_inherit') or
++            not isinstance(provenance['requested_model'], str))):
+         raise RuntimeStoreError('invalid_params')
+     max_children, max_depth = limits
+     prefix = execution_id + CHILD_SEPARATOR
+@@ -60,7 +66,7 @@ def reserve_child_execution(db, conn, session_id, payload, *, epoch, execution_i
+         return {'refused': refused}
+     parent = conn.execute('SELECT profile_name FROM sessions WHERE id=?', (session_id,)).fetchone()
+     child_sid, child_eid = new_session_id(), prefix + secrets.token_hex(8)
+-    insert_session_row_in_transaction(db, conn, child_sid, 'subagent', model_config={'_delegate_from': session_id},
++    insert_session_row_in_transaction(db, conn, child_sid, 'subagent', model_config={'_delegate_from': session_id, **provenance},
+                                       parent_session_id=session_id, profile_name=parent['profile_name'])
+     scope = dict(identity, session_id=child_sid, execution_id=child_eid, generation=0, secret=secret)
+     claim = admission_fingerprint(canonical_target=child_sid, payload=scope | {'principal': principal})
+diff --git a/tests/gateway/test_child_model_provenance.py b/tests/gateway/test_child_model_provenance.py
+new file mode 100644
+index 00000000000..71ab4a7bd45
+--- /dev/null
++++ b/tests/gateway/test_child_model_provenance.py
+@@ -0,0 +1,31 @@
++"""Child model provenance is diagnostic data, never worker authority over lineage or routing."""
++from functools import partial
++
++import pytest
++
++import hermes_state_runtime as rt
++from gateway.session_worker_child import reserve_child_execution
++from tests.hermes_state import test_runtime_worker_children as children
++
++ledger = children.ledger
++
++
++@pytest.mark.parametrize("provenance", [
++    None,
++    "caller_pin",
++    {"model_source": "made_up", "requested_model": "class:standard"},
++    {"model_source": "caller_pin", "requested_model": 42},
++    {"model_source": "caller_pin"},
++    {"model_source": "caller_pin", "requested_model": "class:standard", "_delegate_from": "other"},
++])
++def test_reservation_refuses_malformed_or_authority_bearing_provenance(ledger, provenance):
++    db, epoch = ledger
++    handler = partial(reserve_child_execution, epoch=epoch, execution_id="worker",
++                      identity={}, principal="local", limits=(2, 1), refused=None)
++    with pytest.raises(rt.RuntimeStoreError, match="^invalid_params$"):
++        rt.apply_worker_receipt(db, epoch=epoch, execution_id="worker", session_id="parent", generation=0,
++                                sequence=1, operation="child.reserve",
++                                payload={"secret": "synthetic-child-secret", "model_provenance": provenance},
++                                handlers={"child.reserve": handler})
++    with db._read_ctx() as conn:
++        assert conn.execute("SELECT COUNT(*) FROM sessions WHERE source='subagent'").fetchone()[0] == 0
+diff --git a/tests/tools/test_delegate_class_routing.py b/tests/tools/test_delegate_class_routing.py
+index 8d54ce27897..f137d5a861b 100644
+--- a/tests/tools/test_delegate_class_routing.py
++++ b/tests/tools/test_delegate_class_routing.py
+@@ -35,6 +35,8 @@ def test_delegated_class_reaches_native_wire(routing_home, streaming_route, nati
+                                    model=creds["model"], max_iterations=2, task_count=1,
+                                    parent_agent=parent, **_credential_overrides(creds, cfg))
+         assert child.model_routing["requested_class"] == "deep"
++        assert child._session_init_model_config["requested_model"] == "class:deep"
++        assert child._session_init_model_config["model_routing"] == child.model_routing
+         assert child.session_id != parent.session_id
+         assert child._credential_pool.current().auth_type == "oauth"
+         assert child._fallback_chain == []
+diff --git a/tests/tools/test_delegate_model_source.py b/tests/tools/test_delegate_model_source.py
+new file mode 100644
+index 00000000000..9daad3ca3c3
+--- /dev/null
++++ b/tests/tools/test_delegate_model_source.py
+@@ -0,0 +1,109 @@
++"""Model provenance survives both local and owner-reserved worker child persistence."""
++import json
++import os
++from functools import partial
++
++import psutil
++import pytest
++
++import hermes_state_runtime as rt
++from agent.runtime_session_store import RuntimeSessionStore
++from gateway.session_worker_child import reserve_child_execution
++from hermes_cli.process_identity import worker_birth
++from hermes_state import SessionDB
++from tests.tools import test_delegate_transcript_readiness as readiness
++from tools import delegate_tool as delegate
++
++
++offline_children = readiness.offline_children
++
++
++@pytest.mark.parametrize("entry", ["delegate", "lifecycle"])
++@pytest.mark.parametrize("worker", [False, True], ids=["desktop", "kanban-worker"])
++@pytest.mark.parametrize("case,expected,requested", [
++    ("pin", "caller_pin", "pinned-model"),
++    ("default", "delegation_default", "default-model"),
++    ("inherit", "parent_inherit", "synthetic-model"),
++    ("provider-pin", "caller_pin", "default-model"),
++])
++def test_child_model_source_at_publication_and_first_turn(
++    tmp_path, monkeypatch, offline_children, entry, worker, case, expected, requested
++):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    db.create_session("parent", source="kanban" if worker else "desktop")
++    store = db
++    if worker:
++        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
++        rt.register_worker_execution(db, epoch=epoch, execution_id="worker", session_id="parent",
++                                     generation=0, kind="compute", adoption_secret="fixture-secret")
++        reserve = partial(reserve_child_execution, epoch=epoch, execution_id="worker",
++                          identity={"profile_id": "home", "pid": os.getpid(),
++                                    "birth": worker_birth(psutil.Process())},
++                          principal="local", limits=(2, 1), refused=None)
++
++        def rpc(method, **params):
++            fields = {k: params[k] for k in (
++                "epoch", "execution_id", "session_id", "generation", "sequence", "operation", "payload")}
++            if fields["operation"] == "child.reserve":
++                return rt.apply_worker_receipt(db, **fields, handlers={"child.reserve": reserve})
++            return rt.mutate_worker_execution(db, **fields)
++
++        store = RuntimeSessionStore(rpc, dict(epoch=epoch, execution_id="worker", session_id="parent",
++                                             generation=0), tmp_path / "outbox")
++    published = []
++
++    def progress(event, *args, **payload):
++        if event == "subagent.spawn_requested":
++            published.append(json.loads(db.get_session(payload["child_session_id"])["model_config"]))
++
++    parent = readiness._parent(store, "parent", progress)
++    config = {} if case == "inherit" else {
++        "model": "default-model", "provider": "custom", "base_url": parent.base_url,
++        "api_key": "synthetic-unused-key"}
++    monkeypatch.setattr(delegate, "_load_config", lambda: config)
++    task = {"goal": "Inspect synthetic input"}
++    if case == "pin":
++        task["model"] = "pinned-model"
++    if case == "provider-pin":
++        task["provider"] = "custom"
++    routes, error = delegate._routes_for([task], config, None, parent)
++    assert error is None
++    children = []
++    try:
++        if entry == "lifecycle":
++            from agent import subagent_lifecycle as lifecycle
++            from concurrent.futures import Future
++            monkeypatch.setattr(lifecycle._EXECUTOR, "submit", lambda *a: Future())
++            if case == "provider-pin":
++                monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw: {
++                    "provider": "custom", "model": "default-model", "base_url": parent.base_url,
++                    "api_key": parent.api_key, "api_mode": parent.api_mode})
++            handle = lifecycle.SubagentLifecycleService(lambda: parent).launch(
++                lifecycle.SubagentLaunchRequest(goal=task["goal"], model=task.get("model"),
++                                                provider=task.get("provider")))
++            record = lifecycle._REGISTRY.records.pop(handle.subagent_id)
++            child = record.agent
++            children = [(0, task, child)]
++        else:
++            children, error = delegate._build_children([task], [None], routes, top_role="leaf",
++                                                      max_iterations=2, parent_agent=parent,
++                                                      live_deleg_id=None, live_writers=[])
++            assert error is None
++            child = children[0][2]
++        assert len(published) == 1
++        assert published[0]["model_source"] == expected
++        assert published[0]["requested_model"] == requested
++        assert published[0]["_delegate_from"] == "parent"
++        assert child.model == requested  # recording cannot change routing
++        child._cached_system_prompt = "Synthetic prompt"
++        child._ensure_db_session()
++        persisted = json.loads(db.get_session(child.session_id)["model_config"])
++        assert persisted["model_source"] == expected
++        assert persisted["requested_model"] == requested
++        assert persisted["_delegate_from"] == "parent"
++    finally:
++        for _, _, child in children:
++            child.close()
++        if worker:
++            store.close()
++        db.close()
+diff --git a/tests/tools/test_delegate_transcript_readiness.py b/tests/tools/test_delegate_transcript_readiness.py
+index 804950e7956..4181dec0dd9 100644
+--- a/tests/tools/test_delegate_transcript_readiness.py
++++ b/tests/tools/test_delegate_transcript_readiness.py
+@@ -97,8 +97,10 @@ async def test_published_children_open_before_any_child_starts(
+             assert row is not None
+             assert row["source"] == "subagent"
+             assert row["parent_session_id"] == parent_ref.session_id
+-            # Only the lineage marker: the rest of the constructor config lands on the first turn.
+-            assert json.loads(row["model_config"]) == {"_delegate_from": parent_ref.session_id}
++            # Lineage and model provenance are available while queued; other constructor facts wait.
++            assert json.loads(row["model_config"]) == {
++                "_delegate_from": parent_ref.session_id, "model_source": "parent_inherit",
++                "requested_model": "synthetic-model"}
+             assert not child._session_db_created
+             reply = await connection.dispatch(
+                 {
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index e301fbdbfcd..b52e6031f44 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -121,7 +121,7 @@ def check_delegate_requirements() -> bool:
+     return True
+ 
+ 
+-def _open_child_session_db(parent_agent) -> Any:
++def _open_child_session_db(parent_agent, model_provenance=None) -> Any:
+     """DEDICATED SessionDB handle for the child, or None: the parent's handle can be closed by its own lifecycle while
+     a background child still flushes (transcript silently dropped). It MUST open the same db FILE as the parent's
+     handle (non-launch profiles), else lineage / session_search break; released by the child's close() via
+@@ -143,7 +143,7 @@ def _open_child_session_db(parent_agent) -> Any:
+         if not isinstance(parent_session_db, RuntimeSessionStore):
+             raise WorkerPersistenceError('worker_child_registration_required')
+         from agent.runtime_session_child import reserve_child_store
+-        return reserve_child_store(parent_session_db)
++        return reserve_child_store(parent_session_db, model_provenance=model_provenance)
+     if parent_session_db is None:
+         return None
+     with _quiet("subagent: failed to open dedicated SessionDB; child persistence disabled", exc_info=True):
+@@ -229,6 +229,7 @@ def _build_child_agent(
+     # effort that beats delegation.reasoning_effort, and the profile home the child runs as.
+     override_reasoning_effort: Any = None,
+     profile_home: Optional[Path] = None,
++    model_source: Optional[str] = None,  # recording only; selected before route resolution loses caller pins
+     override_service_tier: Optional[str] = None,  # a route's checked speed tier (tools/delegate_tool_tuning.py)
+ ):
+     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
+@@ -288,7 +289,13 @@ def _build_child_agent(
+             request_overrides = ({} if rt["provider"] == "auto" or override_provider  # [daveey] auto: no parent overrides
+                                  else dict(getattr(parent_agent, "request_overrides", {}) or {}))
+         parent_sid = getattr(parent_agent, "session_id", None)
+-        child_session_db = _open_child_session_db(parent_agent)
++        provenance = {
++            "model_source": model_source or ("delegation_default" if routing_cfg and (
++                routing_cfg.get("model") or routing_cfg.get("provider")) else
++                "caller_pin" if model or override_provider else "parent_inherit"),
++            "requested_model": rt["model"],
++        }
++        child_session_db = _open_child_session_db(parent_agent, model_provenance=provenance)
+         # Children run provider-less. Under compression.checkpoint_required the child arms the same gate
+         # (read inside the delegated profile scope, as the child reads it) and would die at its first
+         # compaction, so it inherits the provider, scoped as a fork. Cost: one initialize() per spawn.
+@@ -332,6 +339,7 @@ def _build_child_agent(
+     _apply_child_cache_ttl(child)
+     if child_session_db is not None:
+         child._owns_session_db = True  # released by the child's close(), never by the parent
++    child._session_init_model_config.update(provenance)
+     _reserve_child_transcript(child)
+     # Ownership transfer for the dedicated handle: the child's close() must release it (nothing else holds a
+     # reference), and no parent teardown can close it out from under a background child (#81267).
+@@ -557,6 +565,10 @@ def _build_children(
+                 task_index=i, goal=t["goal"], context=_child_context,
+                 toolsets=None,  # always inherit the parent's toolsets
+                 model=route.creds["model"], max_iterations=max_iterations, task_count=len(task_list),
++                model_source=("caller_pin" if route.profile_home is None and any(
++                    isinstance(t.get(k), str) and t[k].strip() for k in ("model", "provider")) else
++                    "delegation_default" if route.routing_cfg.get("model") or route.routing_cfg.get("provider")
++                    else "parent_inherit"),
+                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **_route_overrides(route),
+             )
+         except ValueError as exc:
+diff --git a/tools/delegate_tool_child_run.py b/tools/delegate_tool_child_run.py
+index 0570090130e..0a77d947f29 100644
+--- a/tools/delegate_tool_child_run.py
++++ b/tools/delegate_tool_child_run.py
+@@ -36,15 +36,17 @@ def _reserve_child_transcript(child: Any) -> None:
+         # children retain their existing no-transcript behavior.
+         return
+     try:
+-        # Only the lineage marker: every marker-keyed reader (pickers, resume tip
+-        # walk, FTS, cascade delete) must see a subagent, not a continuation, from
++        # Lineage and model provenance must be visible even while queued. Every
++        # marker-keyed reader must see a subagent, not a continuation, from
+         # the moment its id is published. The first turn merges the rest of the
+         # constructor config in (``AIAgent._ensure_db_session``); the prompt stays unset.
+         parent_sid = child._parent_session_id
+         db.create_session(
+             session_id=child.session_id, source="subagent",
+             parent_session_id=parent_sid,
+-            model_config={"_delegate_from": parent_sid} if parent_sid else None,
++            model_config={**({"_delegate_from": parent_sid} if parent_sid else {}),
++                          **{key: child._session_init_model_config[key]
++                             for key in ("model_source", "requested_model")}},
+         )
+         child._session_db_reserved = True
+     except BaseException:
+-- 
+2.55.0
+

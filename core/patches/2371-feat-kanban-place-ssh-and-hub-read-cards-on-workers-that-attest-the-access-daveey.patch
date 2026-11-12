@@ -1,0 +1,137 @@
+From b9693e0cc713b92806c4e7ebdb2caf6650ef3529 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 19:52:56 +0000
+Subject: [PATCH] feat(kanban): place ssh and hub-read cards on workers that
+ attest the access [daveey]
+
+A worker's Board labels can attest capability:ssh-mbp, capability:ssh-mini and capability:hub-read (restricted keys
+the operator installed). A card mentioning ssh or hub reads (on the hub, the hub's, journalctl, kanban.db) is now
+portable to a pool whose every member carries the labels, instead of always pinning home. All other home markers
+(launchd, cron, systemctl, gateway restart, hub paths) still bind.
+---
+ hermes_cli/kanban_placement.py                |  5 ++-
+ hermes_cli/kanban_placement_coordination.py   | 25 +++++++++++
+ .../test_kanban_coordination_placement.py     | 43 +++++++++++++++++++
+ 3 files changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 914133bf8d9..097eda3226c 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -448,9 +448,10 @@ def portable_reason(args: dict, cfg: Optional[dict] = None) -> Optional[str]:
+     full = without_carried_inputs(f"{title}\n{body}", c.raw)
+     if refusal := coordination.check(full, c.raw, skills=args.get("skills")):
+         return refusal
+-    marker_full = coordination.marker_text(full)
++    marker_full = coordination.access_text(coordination.marker_text(full))
+     extra = c.raw.get("extra_home_markers")
+-    exemptible = (HUB_CLI_COMMAND, r"\btoken-broker\b")
++    exemptible = (HUB_CLI_COMMAND, r"\btoken-broker\b", r"\bssh\b", r"\bon the hub\b", r"\bthe hub's\b",
++                  r"\bjournalctl\b", r"\bkanban\.db\b")  # coordination.check() proved the worker attests each
+     pats = [(p, marker_full if p in exemptible else full)
+             for p in HOME_GATEWAY_MARKERS if p != HOST_WORKTREE_PATH]
+     pats += [(p, full) for p in extra] if isinstance(extra, list) else []
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index 2530f2a9b1b..bd6b2a37c02 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -57,6 +57,18 @@ _TOOLS = {
+ }
+ 
+ 
++# Remote access a worker holds through a restricted key, attested on its Board labels by the operator (the keys
++# are installed by hand: a worker-2 key in the MacBook's and mini's authorized_keys, and a forced-command
++# read-only `hub-read` login on the hub). A bare mention is conservative: a card that wants more than the key
++# gives blocks with needs=[...] and capability routing opens the owner card. Other home markers (launchd, cron,
++# systemctl, gateway restart, hub paths) stay binding either way.
++_ACCESS = (
++    (re.compile(r"\bssh\b", re.IGNORECASE), ("capability:ssh-mbp", "capability:ssh-mini")),
++    (re.compile(r"\bon the hub\b|\bthe hub's\b|\bjournalctl\b|\bkanban\.db\b", re.IGNORECASE),
++     ("capability:hub-read",)),
++)
++
++
+ def requirements(text):
+     """Return required labels and an unsupported-action refusal, without changing text."""
+     labels = set()
+@@ -78,6 +90,9 @@ def requirements(text):
+     for tool, label in _TOOLS.items():
+         if re.search(r"\b" + re.escape(tool) + r"\b", text, re.IGNORECASE):
+             labels.add(label)
++    for rx, needed in _ACCESS:
++        if rx.search(text):
++            labels.update(needed)
+     return labels, None
+ 
+ 
+@@ -138,6 +153,16 @@ def marker_text(text):
+     return re.sub(r"\btoken-broker\b", "", text, flags=re.IGNORECASE)
+ 
+ 
++def access_text(text):
++    """``text`` minus the remote-access mentions :func:`check` required an attestation for (ssh, hub reads).
++
++    Only called after check succeeds, so every destination holds the labels; kept apart from
++    :func:`marker_text` so a card that never needed the attestation keeps its markers."""
++    for rx, _ in _ACCESS:
++        text = rx.sub("", text)
++    return text
++
++
+ def claim_refusal(card, me):
+     """Revalidate actual destination of enrolled cards, never override explicit pins."""
+     if card.get("placement_policy") != "worker-first-v1":
+diff --git a/tests/hermes_cli/test_kanban_coordination_placement.py b/tests/hermes_cli/test_kanban_coordination_placement.py
+index 219b4fb20e7..bc677d3c2b5 100644
+--- a/tests/hermes_cli/test_kanban_coordination_placement.py
++++ b/tests/hermes_cli/test_kanban_coordination_placement.py
+@@ -262,3 +262,46 @@ def test_ordinary_work_does_not_read_registry(monkeypatch):
+     monkeypatch.setattr(wn, "registry", unexpected)
+     assert coord.check("Fix cross_task comments in the endpoint", {}) is None
+     assert coord.legacy_refusal({"title": "Fix cross_task comments"}) is False
++
++
++# --- remote access capabilities (operator attestations on the worker's Board labels) -------------------------
++ACCESS = ["capability:ssh-mbp", "capability:ssh-mini", "capability:hub-read"]
++
++
++def test_ssh_card_needs_mac_ssh_attestation(fleet):
++    cfg, entry, _ = fleet
++    assert reason("ssh mini and check the watcher output", cfg) == "needs worker coordination capability"
++    entry["labels"] += ACCESS
++    assert reason("ssh mini and check the watcher output", cfg) is None
++
++
++def test_ssh_attestation_needs_both_mac_keys(fleet):
++    cfg, entry, _ = fleet
++    entry["labels"] += ["capability:ssh-mini"]
++    assert reason("SSH to the MacBook for the log", cfg) == "needs worker coordination capability"
++
++
++@pytest.mark.parametrize("body", ["read the log on the hub", "the hub's log output", "journalctl -u x",
++                                    "query kanban.db for the run"])
++def test_hub_reads_need_hub_read_attestation(fleet, body):
++    cfg, entry, _ = fleet
++    assert reason(body, cfg) == "needs worker coordination capability"
++    entry["labels"] += ["capability:hub-read"]
++    assert reason(body, cfg) is None
++
++
++def test_access_labels_do_not_exempt_other_home_markers(fleet):
++    cfg, entry, _ = fleet
++    entry["labels"] += ACCESS
++    for body in ("ssh mini then launchctl via launchd", "on the hub: systemctl restart x",
++                 "ssh mini and edit hermes-sync state", "read the log on the hub, then restart the gateway"):
++        assert reason(body, cfg) in ("home gateway marker", "local marker"), body
++
++
++def test_claim_refusal_revalidates_access_labels(fleet):
++    from hermes_cli.kanban_placement_coordination import claim_refusal
++    _, entry, _ = fleet
++    card = {"placement_policy": "worker-first-v1", "title": "t", "body": "ssh mini then read the log"}
++    assert claim_refusal(card, "worker") == "needs worker coordination capability"
++    entry["labels"] += ACCESS
++    assert claim_refusal(card, "worker") is None
+-- 
+2.55.0
+

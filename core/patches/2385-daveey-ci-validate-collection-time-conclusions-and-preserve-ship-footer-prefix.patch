@@ -1,0 +1,149 @@
+From a6bc38172d80c9b39005d75ea98aa8a9a0e0c1e8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:38:16 +0000
+Subject: [PATCH] [daveey] ci: validate collection-time conclusions and
+ preserve ship footer prefix
+
+---
+ scripts/ci/batch_review_comments.py    |  4 +--
+ scripts/ci/live_comment.py             | 11 ++++++
+ tests/ci/test_batch_review_comments.py | 49 +++++++++++++++++++++++---
+ 3 files changed, 57 insertions(+), 7 deletions(-)
+
+diff --git a/scripts/ci/batch_review_comments.py b/scripts/ci/batch_review_comments.py
+index 6d905ad4c07..08ccbd4c952 100644
+--- a/scripts/ci/batch_review_comments.py
++++ b/scripts/ci/batch_review_comments.py
+@@ -84,14 +84,14 @@ def snapshot_commit_info(pr: dict, run: dict, repo: str, now: datetime, *, compl
+     stamp = now.strftime("%Y-%m-%d %H:%M UTC")
+     phase = "ran on" if completed else "running on"
+     return (
+-        f"<sub>snapshot of CI; {phase} [{sha[:7]}]({url}){tail} · taken {stamp}; "
++        f"<sub>{phase} [{sha[:7]}]({url}){tail} · snapshot of CI taken {stamp}; "
+         f"refreshed hourly, not live</sub>"
+     )
+ 
+ 
+ def build_snapshot(token: str, repo: str, pr: dict, run: dict, now: datetime) -> str:
+     watch = lc.parse_watch_workflows(os.environ.get("WATCH_WORKFLOWS", "")) or DEFAULT_WATCH_WORKFLOWS
+-    jobs, runs_completed = lc.collect_run_jobs(token, repo, str(run["id"]), watch)
++    jobs, runs_completed = lc.collect_run_jobs(token, repo, str(run["id"]), watch, strict=True)
+     completed, pending, job_urls = lc.classify_jobs(jobs)
+     by_check, check_urls = lc.split_failed_steps(jobs, completed, job_urls)
+     statuses = lc.fetch_all_review_statuses(token, repo, str(run["id"]), strict=True)
+diff --git a/scripts/ci/live_comment.py b/scripts/ci/live_comment.py
+index b2a55c26b07..272634ea6fe 100644
+--- a/scripts/ci/live_comment.py
++++ b/scripts/ci/live_comment.py
+@@ -260,8 +260,15 @@ def runs_all_completed(runs: list[dict]) -> bool:
+     return bool(runs) and all(str(r.get("status", "")) == "completed" for r in runs)
+ 
+ 
++def validate_snapshot_run(run: dict) -> None:
++    """Do not turn a cancelled or indeterminate run into a clean snapshot."""
++    if run.get("status") == "completed" and run.get("conclusion") not in {"success", "failure"}:
++        raise RuntimeError(f"Run {run.get('id')} has incomplete conclusion: {run.get('conclusion')}")
++
++
+ def collect_run_jobs(
+     token: str, repo: str, run_id: str, watch_workflows: list[str] | None = None,
++    *, strict: bool = False,
+ ) -> tuple[list[dict], bool]:
+     """Collect all jobs in the CI run + any watched sibling runs.
+ 
+@@ -278,6 +285,8 @@ def collect_run_jobs(
+     """
+     owner, repo_name = repo.split("/")
+     run_info = _api_request(f"{API_BASE}/repos/{owner}/{repo_name}/actions/runs/{run_id}", token)
++    if strict:
++        validate_snapshot_run(run_info)
+     head_sha = run_info.get("head_sha", "")
+ 
+     # CI run jobs (includes every reusable-workflow job).
+@@ -307,6 +316,8 @@ def collect_run_jobs(
+     )
+     relevant_runs = [run_info]
+     for watched in select_watched_runs(sibling_runs, watch_workflows, exclude_run_id=run_id):
++        if strict:
++            validate_snapshot_run(watched)
+         relevant_runs.append(watched)
+         watched_jobs = _api_get_paginated(
+             f"{API_BASE}/repos/{owner}/{repo_name}/actions/runs/{watched['id']}/jobs",
+diff --git a/tests/ci/test_batch_review_comments.py b/tests/ci/test_batch_review_comments.py
+index 56aa62c8a5e..0b3384e4b48 100644
+--- a/tests/ci/test_batch_review_comments.py
++++ b/tests/ci/test_batch_review_comments.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import importlib.util
++import re
+ import sys
+ from datetime import UTC, datetime
+ from pathlib import Path
+@@ -56,7 +57,8 @@ class Fake:
+             n = int(url.rsplit("/", 1)[1])
+             return self.fresh[n]
+ 
+-        def collect(token, repo, run_id, watch=None):
++        def collect(token, repo, run_id, watch=None, *, strict=False):
++            assert strict
+             self.collected.append(run_id)
+             if run_id in self.fail_collect:
+                 raise RuntimeError("boom")
+@@ -159,11 +161,48 @@ def test_incomplete_run_never_overwrites_comment(monkeypatch, conclusion):
+ 
+ 
+ def test_final_snapshot_preserves_ship_footer_contract(monkeypatch):
+-    prs = [_pr(1, "a")]
+-    run = _run(1, "a", "t") | {"status": "completed", "conclusion": "success"}
+-    f = Fake(monkeypatch, prs, {"a": [run]}, fresh=_fresh(prs))
++    sha = "a" * 40
++    prs = [_pr(1, sha)]
++    run = _run(1, sha, "t") | {"status": "completed", "conclusion": "success"}
++    f = Fake(monkeypatch, prs, {sha: [run]}, fresh=_fresh(prs))
+     assert b.run_batch("t", REPO, NOW) == 0
+-    assert "ran on [a]" in f.posted["1"]
++    # Consumer contract from hermes-core-wt-land's BOT_HEAD parser.
++    match = re.search(r"<sub>(running|ran) on \[[0-9a-f]+\]\([^)]*/commits/([0-9a-f]{40})\)", f.posted["1"])
++    assert match and match.groups() == ("ran", sha)
++
++
++@pytest.mark.parametrize("cancelled_id", [1, 2])
++@pytest.mark.parametrize("conclusion", ["cancelled", "timed_out", "action_required", None])
++def test_collection_time_incomplete_run_cannot_publish(monkeypatch, cancelled_id, conclusion):
++    sha = "a" * 40
++    pr = _pr(1, sha)
++    initial = _run(1, sha, "t") | {"status": "in_progress", "conclusion": None}
++    primary = initial | {"status": "completed", "conclusion": "success"}
++    sibling = _run(2, sha, "t", name=b.DEFAULT_WATCH_WORKFLOWS[0]) | {
++        "status": "completed", "conclusion": "success"}
++    (primary if cancelled_id == 1 else sibling)["conclusion"] = conclusion
++    posted = []
++
++    def request(url, token):
++        if "/pulls/" in url:
++            return pr
++        return primary
++
++    def pages(url, token, list_key=None):
++        if "/pulls?" in url:
++            return [pr]
++        if "event=pull_request" in url:
++            return [initial]
++        if url.endswith("/jobs"):
++            return [{"name": "test", "status": "completed", "conclusion": "cancelled"}]
++        return [sibling]
++
++    monkeypatch.setattr(b.lc, "_api_request", request)
++    monkeypatch.setattr(b.lc, "_api_get_paginated", pages)
++    monkeypatch.setattr(b.lc, "fetch_all_review_statuses", lambda *a, **k: [])
++    monkeypatch.setattr(b.lc, "upsert_comment", lambda *a: posted.append(a) or 1)
++    assert b.run_batch("t", REPO, NOW) == 1
++    assert posted == []
+ 
+ 
+ def test_artifact_listing_error_is_not_clean_snapshot(monkeypatch):
+-- 
+2.55.0
+

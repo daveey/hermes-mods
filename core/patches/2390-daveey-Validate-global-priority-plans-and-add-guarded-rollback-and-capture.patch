@@ -1,0 +1,424 @@
+From 85d232f62955ca432ce7cdb76ff1666c9d06e145 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 23:55:07 +0000
+Subject: [PATCH] [daveey] Validate global priority plans and add guarded
+ rollback and capture
+
+---
+ hermes_cli/kanban_priority_executor.py        | 27 ++++--
+ hermes_cli/kanban_priority_manifest.py        | 63 ++++++++++++
+ hermes_cli/kanban_priority_prepare.py         | 85 ++++++++++++++++
+ .../test_kanban_priority_executor.py          | 97 +++++++++++++++++++
+ .../test_kanban_priority_prepare.py           | 72 ++++++++++++++
+ 5 files changed, 336 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_priority_manifest.py
+ create mode 100644 hermes_cli/kanban_priority_prepare.py
+ create mode 100644 tests/hermes_cli/test_kanban_priority_prepare.py
+
+diff --git a/hermes_cli/kanban_priority_executor.py b/hermes_cli/kanban_priority_executor.py
+index b072013afd8..4d7c022e658 100644
+--- a/hermes_cli/kanban_priority_executor.py
++++ b/hermes_cli/kanban_priority_executor.py
+@@ -8,7 +8,8 @@ from pathlib import Path
+ from hermes_cli import kanban_db as kb
+ 
+ 
+-def apply_attached(conn, attachment_id: int, digest: str, *, writer: str) -> dict:
++def apply_attached(conn, attachment_id: int, digest: str, *, writer: str,
++                   undo: bool = False, allow_legacy_rollback: bool = False) -> dict:
+     """Apply only this origin's rows from an already attached global manifest."""
+     from hermes_cli.kanban_db_sync import sync_state
+     from hermes_cli.kanban_supervisor_requests import _non_worker_refusal
+@@ -29,26 +30,36 @@ def apply_attached(conn, attachment_id: int, digest: str, *, writer: str) -> dic
+         data = Path(attachment.stored_path).read_bytes()
+         if hashlib.sha256(data).hexdigest() != digest:
+             raise ValueError("manifest digest mismatch")
+-        manifest = json.loads(data)
++        from hermes_cli.kanban_priority_manifest import validate
++        from hermes_cli.kanban_priority import PRIORITY_CAP
++        manifest = validate(json.loads(data))
+         if manifest["board_id"] != identity.get("board_id"):
+             raise ValueError("manifest belongs to a different board")
+         rows = [r for r in manifest["rows"] if r["origin"] == writer]
++        if undo and any(r["old"] > PRIORITY_CAP for r in rows) and not allow_legacy_rollback:
++            raise ValueError("restoring above-cap values requires explicit legacy policy rollback")
++        source, target = ("new", "old") if undo else ("old", "new")
++        unknown = conn.execute("SELECT id FROM tasks WHERE status NOT IN ('done','archived') "
++                               "AND (created_on IS NULL OR created_on='') LIMIT 1").fetchone()
++        if unknown is not None:
++            raise ValueError("missing origin in live inventory")
+         live = {r["id"]: r["priority"] for r in conn.execute(
+             "SELECT id,priority FROM tasks WHERE created_on=? AND status NOT IN ('done','archived')", (writer,))}
+         if set(live) != {r["id"] for r in rows}:
+             raise ValueError("ownership or membership changed; capture a new manifest")
+-        if all(live[r["id"]] == r["new"] for r in rows):
++        if all(live[r["id"]] == r[target] for r in rows):
+             return {"changed": 0, "writer": writer, "manifest_sha256": digest}
+-        if any(live[r["id"]] != r["old"] for r in rows):
++        if any(live[r["id"]] != r[source] for r in rows):
+             raise ValueError("priorities changed; capture a new manifest")
+         for row in rows:
+             current = live[row["id"]]
+-            if current == row["new"]:
++            if current == row[target]:
+                 continue
+-            conn.execute("UPDATE tasks SET priority=? WHERE id=?", (row["new"], row["id"]))
++            conn.execute("UPDATE tasks SET priority=? WHERE id=?", (row[target], row["id"]))
+             kb._append_event(conn, row["id"], "reprioritized", {
+-                "priority": row["new"], "previous_priority": current,
+-                "reason": "priority normalization v2", "manifest_sha256": digest,
++                "priority": row[target], "previous_priority": current,
++                "reason": "priority normalization rollback" if undo else "priority normalization v2",
++                "manifest_sha256": digest,
+             })
+             changes.append(row["id"])
+     for task_id in changes:
+diff --git a/hermes_cli/kanban_priority_manifest.py b/hermes_cli/kanban_priority_manifest.py
+new file mode 100644
+index 00000000000..ae1454a2a6c
+--- /dev/null
++++ b/hermes_cli/kanban_priority_manifest.py
+@@ -0,0 +1,63 @@
++"""Strict validation of attachment-backed global normalization plans."""
++from __future__ import annotations
++
++from hermes_cli.kanban_priority_migration import plan_global
++
++
++STATUSES = frozenset({"todo", "ready", "running", "review", "blocked", "scheduled", "triage", "done", "archived"})
++
++
++def validate(manifest: dict) -> dict:
++    """Recompute the plan from originals; attachment integrity is not validation."""
++    try:
++        return _validate(manifest)
++    except (KeyError, TypeError, ValueError) as exc:
++        raise ValueError(f"invalid priority manifest: {exc}") from exc
++
++
++def _validate(manifest: dict) -> dict:
++    if not isinstance(manifest, dict) or set(manifest) != {
++        "version", "cap", "board_id", "ceiling", "exceptions", "rows"
++    }:
++        raise ValueError("unknown fields")
++    if not isinstance(manifest["board_id"], str) or not manifest["board_id"]:
++        raise ValueError("missing board identity")
++    if any(type(manifest[key]) is not int for key in ("version", "cap", "ceiling")):
++        raise ValueError("noninteger policy version")
++    if not isinstance(manifest["rows"], list) or not isinstance(manifest["exceptions"], list):
++        raise ValueError("rows and exceptions must be lists")
++    inventory = []
++    for row in manifest["rows"]:
++        if not isinstance(row, dict) or set(row) != {"id", "origin", "old", "new"}:
++            raise ValueError("invalid row")
++        if any(not isinstance(row[k], str) or not row[k] for k in ("id", "origin")):
++            raise ValueError("missing row identity")
++        if any(type(row[k]) is not int for k in ("old", "new")):
++            raise ValueError("noninteger priority")
++        inventory.append({"id": row["id"], "created_on": row["origin"],
++                          "priority": row["old"], "status": "ready"})
++    indexed = {row["id"]: row for row in inventory}
++    exceptions = []
++    for row in manifest["exceptions"]:
++        if not isinstance(row, dict) or set(row) != {"id", "origin", "old", "status"}:
++            raise ValueError("invalid exception")
++        if any(not isinstance(row[k], str) or not row[k] for k in ("id", "origin", "status")):
++            raise ValueError("missing exception identity")
++        if type(row["old"]) is not int or row["status"] not in STATUSES:
++            raise ValueError("invalid exception value or status")
++        original = {"id": row["id"], "created_on": row["origin"],
++                    "priority": row["old"], "status": row["status"]}
++        if row["status"] in ("done", "archived"):
++            if row["id"] in indexed:
++                raise ValueError("terminal exception is in open inventory")
++            inventory.append(original)
++        else:
++            active = indexed.get(row["id"])
++            if active is None or active["created_on"] != row["origin"] or active["priority"] != row["old"]:
++                raise ValueError("exception differs from open inventory")
++            active["status"] = row["status"]
++        exceptions.append(row["id"])
++    expected = plan_global(inventory, board_id=manifest["board_id"], exceptions=exceptions)
++    if expected != manifest:
++        raise ValueError("plan differs from canonical global ranking")
++    return manifest
+diff --git a/hermes_cli/kanban_priority_prepare.py b/hermes_cli/kanban_priority_prepare.py
+new file mode 100644
+index 00000000000..3e403f6591f
+--- /dev/null
++++ b/hermes_cli/kanban_priority_prepare.py
+@@ -0,0 +1,85 @@
++"""Raw canonical capture and immutable staging for operator priority migration."""
++from __future__ import annotations
++
++import hashlib
++import os
++from pathlib import Path
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_priority_manifest import STATUSES, validate
++from hermes_cli.kanban_priority_migration import plan_global, save_manifest
++
++
++def capture(hub, *, board_id: str, exceptions: list[str]) -> dict:
++    """Read raw Board pages at one feed head, without importing/clipping values."""
++    rows = []
++    after = ""
++    head = None
++    for _ in range(10000):
++        page = hub.snapshot_page(board_id, "tasks", after=after)
++        if page.get("table") != "tasks" or type(page.get("head")) is not int:
++            raise ValueError("invalid canonical snapshot page")
++        if head is None:
++            head = page["head"]
++        if page["head"] != head:
++            raise ValueError("canonical inventory changed; capture a new manifest")
++        batch = page.get("rows")
++        if not isinstance(batch, list) or type(page.get("more")) is not bool:
++            raise ValueError("invalid canonical inventory")
++        for row in batch:
++            if not isinstance(row, dict) or row.get("status") not in STATUSES:
++                raise ValueError("invalid canonical task status")
++            key = row.get("id")
++            if not isinstance(key, str) or key <= after:
++                raise ValueError("invalid snapshot cursor ordering")
++            after = key
++            rows.append(row)
++        if not page["more"]:
++            break
++        if not batch or page.get("next") != after:
++            raise ValueError("snapshot cursor failed to advance")
++    else:
++        raise ValueError("snapshot page limit exceeded")
++    # A final read closes the final-page/return gap at an observed head. Apply
++    # still has local CAS; this is not a distributed transaction or a lease.
++    final = hub.snapshot_page(board_id, "tasks", limit=1)
++    if final.get("head") != head:
++        raise ValueError("canonical inventory changed; capture a new manifest")
++    return validate(plan_global(rows, board_id=board_id, exceptions=exceptions))
++
++
++def stage(conn, manifest: dict, *, path: Path, task_id: str, writer: str) -> dict:
++    """Save a fresh immutable backup and attach identical bytes on the local owner."""
++    from hermes_cli.kanban_db_sync import sync_state
++    from hermes_cli.kanban_supervisor_requests import _non_worker_refusal
++
++    refusal = _non_worker_refusal()
++    if refusal:
++        raise PermissionError(refusal)
++    validate(manifest)
++    identity = sync_state(conn) or {}
++    if identity.get("mode") != "primary" or identity.get("gateway_id") != writer:
++        raise ValueError("staging requires this primary writer")
++    if identity.get("board_id") != manifest["board_id"]:
++        raise ValueError("manifest belongs to a different board")
++    owner = conn.execute("SELECT created_on FROM tasks WHERE id=?", (task_id,)).fetchone()
++    if owner is None or owner[0] != writer:
++        raise ValueError("attachment owner must belong to this writer")
++    save_manifest(path, manifest)
++    # Preserve the backup even if attachment storage subsequently fails. The
++    # existing attachment writer owns its transaction; staging changes no priority.
++    # Apply revalidates writer, attachment and complete owned inventory atomically.
++    directory = os.open(path.parent, os.O_RDONLY)
++    try:
++        os.fsync(directory)
++    finally:
++        os.close(directory)
++    data = path.read_bytes()
++    digest = hashlib.sha256(data).hexdigest()
++    attachment_id = kb.store_attachment_bytes(conn, task_id, path.name, data,
++                                               content_type="application/json")
++    attachment = kb.get_attachment(conn, attachment_id)
++    if attachment is None or Path(attachment.stored_path).read_bytes() != data:
++        raise ValueError("attached manifest readback mismatch; retain original backup")
++    return {"attachment_id": attachment_id, "manifest_sha256": digest,
++            "writer": writer, "backup": str(path)}
+diff --git a/tests/hermes_cli/test_kanban_priority_executor.py b/tests/hermes_cli/test_kanban_priority_executor.py
+index a0f13c76042..3997072aa6e 100644
+--- a/tests/hermes_cli/test_kanban_priority_executor.py
++++ b/tests/hermes_cli/test_kanban_priority_executor.py
+@@ -81,6 +81,103 @@ def test_executor_refuses_whole_origin_atomically(conn, case, reason):
+     assert [tuple(r) for r in conn.execute("SELECT * FROM kanban_sync_outbox")] == outbox_before
+ 
+ 
++@pytest.mark.parametrize("mutation", ["rank", "version", "boolean", "duplicate", "exception", "origin", "ceiling", "extra"])
++def test_attached_manifest_is_validated_not_trusted(conn, mutation):
++    from pathlib import Path
++    from hermes_cli import kanban_priority_executor as executor
++    ids, attachment, _ = setup_plan(conn)
++    stored = kb.get_attachment(conn, attachment)
++    assert stored is not None
++    manifest = json.loads(Path(stored.stored_path).read_bytes())
++    if mutation == "rank":
++        manifest["rows"][0]["new"] = 123
++    elif mutation == "version":
++        manifest["version"] = 1
++    elif mutation == "boolean":
++        manifest["rows"][0]["old"] = True
++    elif mutation == "duplicate":
++        manifest["rows"].append(manifest["rows"][0])
++    elif mutation == "exception":
++        manifest["exceptions"] = [{"id": "unknown", "status": "running", "origin": "two", "old": 1}]
++    elif mutation == "origin":
++        manifest["rows"][0]["origin"] = None
++    elif mutation == "ceiling":
++        manifest["ceiling"] = 999
++    else:
++        manifest["arbitrary"] = "ignored?"
++    data = json.dumps(manifest).encode()
++    attachment = kb.store_attachment_bytes(conn, ids[0], "invalid.json", data, content_type="application/json")
++    before = helpers.priorities(conn, ids)
++    with pytest.raises(ValueError, match="manifest"):
++        executor.apply_attached(conn, attachment, hashlib.sha256(data).hexdigest(), writer=sync_helpers.ME)
++    assert helpers.priorities(conn, ids) == before
++
++
++def test_restore_requires_explicit_policy_rollback_and_cas(conn):
++    from hermes_cli import kanban_priority_executor as executor
++    ids, attachment, digest = setup_plan(conn)
++    executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)
++    with pytest.raises(ValueError, match="explicit legacy policy rollback"):
++        executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME, undo=True)
++    assert helpers.priorities(conn, ids) == [450, 10000, 900]
++    result = executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME,
++                                     undo=True, allow_legacy_rollback=True)
++    assert result["changed"] == 2
++    assert helpers.priorities(conn, ids) == [10000, 10000, 50000]
++    assert executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME,
++                                   undo=True, allow_legacy_rollback=True)["changed"] == 0
++    conn.execute("UPDATE tasks SET priority=123 WHERE id=?", (ids[0],))
++    conn.commit()
++    with pytest.raises(ValueError, match="priorities changed"):
++        executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME,
++                                undo=True, allow_legacy_rollback=True)
++    assert helpers.priorities(conn, ids) == [123, 10000, 50000]
++
++
++def test_unknown_live_origin_refuses_normalization(conn):
++    from hermes_cli import kanban_priority_executor as executor
++    ids, attachment, digest = setup_plan(conn)
++    conn.execute("UPDATE tasks SET created_on=NULL WHERE id=?", (ids[1],))
++    conn.commit()
++    with pytest.raises(ValueError, match="missing origin"):
++        executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)
++    assert helpers.priorities(conn, ids) == [10000, 10000, 50000]
++
++
++def test_two_origins_share_ranks_and_publish_only_their_own_rows(conn, tmp_path):
++    from hermes_cli import kanban_priority_executor as executor
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_sync_client as ksc
++    from tests.hermes_cli.kanban_sync_fake_board import FakeService
++    ids, attachment, digest = setup_plan(conn)
++    svc = FakeService()
++    for task, origin, priority in zip(ids, [sync_helpers.ME, "two", sync_helpers.ME], [10000, 10000, 50000]):
++        svc.hub(origin).ops(sync_helpers.BOARD, [{
++            "client_op_id": f"seed-{task}", "op": "upsert", "table": "tasks", "uid": task,
++            "hlc": f"0000000000001-0000-{origin}",
++            "fields": {"title": task, "status": "ready", "priority": priority, "created_at": 1},
++        }])
++    other = kbc.connect(tmp_path / "other-origin.db")
++    try:
++        conn.backup(other)
++        other.execute("UPDATE kanban_sync_state SET gateway_id='two'")
++        other.commit()
++        assert executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)["changed"] == 2
++        assert executor.apply_attached(other, attachment, digest, writer="two")["changed"] == 1
++        assert helpers.priorities(other, ids) == [10000, 450, 50000]
++        for db, origin, own in [(conn, sync_helpers.ME, {ids[0], ids[2]}), (other, "two", {ids[1]})]:
++            task_ops = {r[0] for r in db.execute("SELECT row_uid FROM kanban_sync_outbox WHERE table_name='tasks'")}
++            assert task_ops == own
++            result = ksc.push(db, svc.hub(origin), sync_helpers.BOARD, origin, primary=True)
++            assert result.rejected == 0 and result.sent > 0
++            assert not sync_helpers._pending(db)
++        canonical = svc.hub(sync_helpers.ME).snapshot_page(sync_helpers.BOARD, "tasks")
++        values = {r["id"]: r["priority"] for r in canonical["rows"]}
++        assert [values[task] for task in ids] == [450, 450, 900]
++    finally:
++        other.close()
++
++
+ @pytest.mark.parametrize("context", ["worker", "descendant"])
+ def test_worker_boundary_is_not_an_executor(conn, monkeypatch, tmp_path, context):
+     from pathlib import Path
+diff --git a/tests/hermes_cli/test_kanban_priority_prepare.py b/tests/hermes_cli/test_kanban_priority_prepare.py
+new file mode 100644
+index 00000000000..d453eb33a7c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_prepare.py
+@@ -0,0 +1,72 @@
++"""Canonical raw capture and immutable attachment staging (never cap-import)."""
++import hashlib
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_priority_migration as migration
++from tests.hermes_cli import test_kanban_priority_executor as helpers
++from tests.hermes_cli import test_kanban_sync_client as sync_helpers
++
++kanban_home = sync_helpers.kanban_home
++conn = sync_helpers.live
++
++
++class Pages:
++    def __init__(self, changed=False, stalled=False):
++        self.changed = changed
++        self.stalled = stalled
++
++    def snapshot_page(self, board, table, after="", limit=1000):
++        rows = [{"id": "a", "priority": 10000, "created_on": "one", "status": "ready"},
++                {"id": "b", "priority": 50000, "created_on": "two", "status": "done"}]
++        return {"table": "tasks", "head": 2 if after and self.changed else 1,
++                "rows": rows[1:] if after else rows[:1], "more": not bool(after),
++                "next": after if self.stalled else "b" if after else "a"}
++
++
++def test_raw_capture_resolves_terminal_exception_without_clipping():
++    from hermes_cli import kanban_priority_prepare as prepare
++    plan = prepare.capture(Pages(), board_id="board", exceptions=["b"])
++    assert plan["rows"] == [{"id": "a", "origin": "one", "old": 10000, "new": 900}]
++    assert plan["exceptions"] == [{"id": "b", "origin": "two", "old": 50000, "status": "done"}]
++
++
++@pytest.mark.parametrize("hub, message", [(Pages(changed=True), "changed"), (Pages(stalled=True), "cursor")])
++def test_capture_refuses_nonatomic_or_stalled_inventory(hub, message):
++    from hermes_cli import kanban_priority_prepare as prepare
++    with pytest.raises(ValueError, match=message):
++        prepare.capture(hub, board_id="board", exceptions=[])
++
++
++def test_stage_requires_local_owner_and_preserves_original(conn, tmp_path):
++    from hermes_cli import kanban_priority_prepare as prepare
++    ids, _, _ = helpers.setup_plan(conn)
++    rows = [dict(r) for r in conn.execute("SELECT id,priority,created_on,status FROM tasks")]
++    plan = migration.plan_global(rows, board_id=sync_helpers.BOARD, exceptions=[ids[2]])
++    path = tmp_path / "original.json"
++    result = prepare.stage(conn, plan, path=path, task_id=ids[0], writer=sync_helpers.ME)
++    original = path.read_bytes()
++    assert result["manifest_sha256"] == hashlib.sha256(original).hexdigest()
++    attachment = kb.get_attachment(conn, result["attachment_id"])
++    assert attachment is not None
++    from pathlib import Path
++    assert Path(attachment.stored_path).read_bytes() == original
++    assert json.loads(original) == plan
++    with pytest.raises(FileExistsError):
++        prepare.stage(conn, plan, path=path, task_id=ids[0], writer=sync_helpers.ME)
++    assert path.read_bytes() == original
++    with pytest.raises(ValueError, match="attachment owner"):
++        prepare.stage(conn, plan, path=tmp_path / "foreign.json", task_id=ids[1], writer=sync_helpers.ME)
++    assert not (tmp_path / "foreign.json").exists()
++
++
++def test_stage_refuses_worker_before_writing_file(conn, monkeypatch, tmp_path):
++    from hermes_cli import kanban_priority_prepare as prepare
++    ids, _, _ = helpers.setup_plan(conn)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", ids[0])
++    path = tmp_path / "blocked.json"
++    with pytest.raises(PermissionError):
++        prepare.stage(conn, {}, path=path, task_id=ids[0], writer=sync_helpers.ME)
++    assert not path.exists()
+-- 
+2.55.0
+

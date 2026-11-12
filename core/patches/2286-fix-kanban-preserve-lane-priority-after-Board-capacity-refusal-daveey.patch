@@ -1,0 +1,199 @@
+From 4ad26e5a173608973bbe041ec0b3641eeb6634df Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 17:55:16 +0000
+Subject: [PATCH] fix(kanban): preserve lane priority after Board capacity
+ refusal [daveey]
+
+---
+ hermes_cli/kanban_db_dispatch.py              |  17 ++-
+ hermes_cli/kanban_db_dispatch_limits.py       |  11 ++
+ .../hermes_cli/test_kanban_capacity_order.py  | 104 ++++++++++++++++++
+ 3 files changed, 123 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_cli/kanban_db_dispatch_limits.py
+ create mode 100644 tests/hermes_cli/test_kanban_capacity_order.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 9d0cf68c292..e0e1a6d8192 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2104,7 +2104,7 @@ def _dispatch_lane_task(
+     claimed = admitted_claim(conn, task_id, assignee, lane, ttl_seconds, spawn_fn, result)
+     if claimed is None:
+         deferral = _kb._sync.pop_claim_deferral(task_id)
+-        if deferral is not None:  # the Board said no this tick: the caller moves on to the next candidate
++        if deferral is not None:  # the lane decides whether this refusal permits later candidates
+             result.claim_deferred.append((task_id, deferral))
+         return False
+     try:
+@@ -2486,8 +2486,8 @@ def _dispatch_once_locked(
+     next_ready = 0
+ 
+     def _run_ready(limit: Optional[int]) -> None:
+-        # Resumable: a deferred or refused claim never ends the tick, the loop moves on to the next row, and
+-        # a second call after the review lane continues where this one stopped.
++        # Resume after review unless Board capacity refused a higher-priority row. A slot can free mid-pass;
++        # retry from DISPATCH_ORDER next tick rather than hand it to whichever lower row we reach afterward.
+         nonlocal spawned, next_ready
+         while next_ready < len(ready_rows):
+             if limit is not None and spawned >= limit:
+@@ -2507,6 +2507,8 @@ def _dispatch_once_locked(
+                 result.auto_assigned_default.append(row["id"])
+             if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
+                 spawned += 1
++            elif (row["id"], "capacity") in result.claim_deferred:
++                next_ready = len(ready_rows)  # also fence the post-review resume in this tick
+ 
+     _run_ready(ready_budget)
+ 
+@@ -2522,18 +2524,15 @@ def _dispatch_once_locked(
+             continue
+         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
+             spawned += 1
++        elif (row["id"], "capacity") in result.claim_deferred:
++            break  # preserve priority within the review lane too
+     # The review reservation is only a hold: a slot no review took (its claim deferred, guarded, capped) goes
+     # back to the ready rows still waiting this tick.
+     _run_ready(spawn_budget)
+     return result
+ 
+ 
+-def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
+-    try:
+-        parsed = int(value)
+-    except (TypeError, ValueError):
+-        return default
+-    return parsed if parsed >= minimum else default
++from hermes_cli.kanban_db_dispatch_limits import _positive_int  # re-export for ops and worker logs
+ 
+ 
+ def _module_hermes_argv() -> list[str]:
+diff --git a/hermes_cli/kanban_db_dispatch_limits.py b/hermes_cli/kanban_db_dispatch_limits.py
+new file mode 100644
+index 00000000000..54a7312340e
+--- /dev/null
++++ b/hermes_cli/kanban_db_dispatch_limits.py
+@@ -0,0 +1,11 @@
++"""Configuration coercion for dispatcher concurrency and worker limits."""
++
++from typing import Any
++
++
++def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
++    try:
++        parsed = int(value)
++    except (TypeError, ValueError):
++        return default
++    return parsed if parsed >= minimum else default
+diff --git a/tests/hermes_cli/test_kanban_capacity_order.py b/tests/hermes_cli/test_kanban_capacity_order.py
+new file mode 100644
+index 00000000000..4e7931e725c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_capacity_order.py
+@@ -0,0 +1,104 @@
++"""A mid-pass slot release must not let lower-priority work jump a capacity refusal."""
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_runs_on_dispatch as support
++
++gws = support.gws
++svc = support.svc
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++@pytest.mark.parametrize("inherited", [False, True])
++def test_capacity_release_restarts_in_priority_order(gws, monkeypatch, lane, inherited):
++    hub, _ = gws
++    hub.enter()
++    cards = {}
++    for priority in (0, 530, 150, 900, 460):
++        tid = kb.create_task(hub.conn, title=f"priority {priority}", assignee="default",
++                             priority=0 if inherited and priority == 900 else priority)
++        cards[priority] = tid
++        if lane == "review":
++            assert kb.request_review(hub.conn, tid, summary="review")
++    if inherited:
++        kb.create_task(hub.conn, title="urgent waiter", assignee="default", priority=900, parents=[cards[900]])
++    hub.round()
++    acquire = client.HubLeaseClient.acquire
++    attempts = []
++
++    def release_after_refusal(self, **kwargs):
++        attempts.append(kwargs["task_uid"])
++        if len(attempts) == 1:
++            # The slot frees just after the highest-priority row was refused.
++            return sync.Lease(granted=False, run_uid=kwargs["run_uid"], reason="capacity")
++        return acquire(self, **kwargs)
++
++    monkeypatch.setattr(client.HubLeaseClient, "acquire", release_after_refusal)
++    first = hub.tick(max_in_progress=3)
++    assert first.claim_deferred == [(cards[900], "capacity")]
++    assert support._spawned(first) == []
++    assert attempts == [cards[900]]
++    # Reopen persistent state as after restart: no in-memory lane cursor is retained.
++    hub.conn.close()
++    hub.conn = kbc.connect(hub.home / "kanban.db")
++    second = hub.tick(max_in_progress=3)
++    assert support._spawned(second) == [cards[p] for p in (900, 530, 460)]
++    assert attempts == [cards[900], cards[900], cards[530], cards[460]]
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++@pytest.mark.parametrize("reason", ["held", "labels_mismatch", "not_claimable", "offline"])
++def test_card_specific_refusals_do_not_fence_other_candidates(gws, monkeypatch, lane, reason):
++    hub, _ = gws
++    hub.enter()
++    high = kb.create_task(hub.conn, title="higher", assignee="default", priority=900)
++    low = kb.create_task(hub.conn, title="lower", assignee="default", priority=100)
++    if lane == "review":
++        for tid in (high, low):
++            assert kb.request_review(hub.conn, tid, summary="review")
++    hub.round()
++    acquire = client.HubLeaseClient.acquire
++
++    def refuse_high(self, **kwargs):
++        if kwargs["task_uid"] == high:
++            return sync.Lease(granted=False, run_uid=kwargs["run_uid"], reason=reason)
++        return acquire(self, **kwargs)
++
++    monkeypatch.setattr(client.HubLeaseClient, "acquire", refuse_high)
++    result = hub.tick(max_in_progress=1)
++    assert result.claim_deferred == [(high, reason)]
++    assert support._spawned(result) == [low]
++
++
++@pytest.mark.parametrize("refused_lane", ["ready", "review"])
++def test_capacity_fence_is_lane_local_and_survives_review_resume(gws, monkeypatch, refused_lane):
++    hub, _ = gws
++    hub.enter()
++    ready = [kb.create_task(hub.conn, title=f"ready {p}", assignee="default", priority=p)
++             for p in (900, 530, 100)]
++    review = kb.create_task(hub.conn, title="reserved review", assignee="default")
++    assert kb.request_review(hub.conn, review, summary="review")
++    hub.round()
++    acquire = client.HubLeaseClient.acquire
++    refused = ready[0] if refused_lane == "ready" else review
++    attempts = []
++
++    def refuse_once(self, **kwargs):
++        attempts.append(kwargs["task_uid"])
++        if kwargs["task_uid"] == refused:
++            return sync.Lease(granted=False, run_uid=kwargs["run_uid"], reason="capacity")
++        return acquire(self, **kwargs)
++
++    monkeypatch.setattr(client.HubLeaseClient, "acquire", refuse_once)
++    result = hub.tick(max_in_progress=3)
++    assert result.claim_deferred == [(refused, "capacity")]
++    if refused_lane == "ready":
++        assert support._spawned(result) == [review]
++        assert attempts == [ready[0], review]
++    else:
++        assert support._spawned(result) == ready
++        assert attempts == [ready[0], ready[1], review, ready[2]]
+-- 
+2.55.0
+

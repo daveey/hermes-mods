@@ -1,0 +1,1240 @@
+From ae54bbc60d4ba888a37555a3f297f1d1838cac03 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 23:40:23 +0000
+Subject: [PATCH] [daveey] Archive complete scratch trees before guarded
+ garbage collection
+
+---
+ hermes_cli/kanban_scratch_archive.py          | 434 +++++++++++++-
+ hermes_cli/kanban_scratch_custody.py          |  18 +-
+ hermes_cli/kanban_worktree_gc.py              |  44 +-
+ .../hermes_cli/test_kanban_scratch_custody.py |  75 +++
+ .../test_kanban_scratch_gc_archive.py         | 531 ++++++++++++++++++
+ 5 files changed, 1049 insertions(+), 53 deletions(-)
+
+diff --git a/hermes_cli/kanban_scratch_archive.py b/hermes_cli/kanban_scratch_archive.py
+index 59f0c4321e1..73f68174510 100644
+--- a/hermes_cli/kanban_scratch_archive.py
++++ b/hermes_cli/kanban_scratch_archive.py
+@@ -12,13 +12,27 @@ unique work under ``<kanban home>/archive/scratch/<board>/<task>/<relpath>/``:
+   empty);
+ * ``meta.json``: remotes, HEAD, branch, task id, completed_at.
+ 
++Alongside those (layout v1 unchanged) every archive also carries a complete,
++versioned filesystem payload under ``.hermes-complete-archive-v1/``:
++``tree.tar.gz`` (every file, empty directory, mode and symlink of the
++workspace, ignored and sibling files and ``.git`` included, symlinks stored as
++links and never dereferenced) and ``manifest.json`` (per-entry type, mode,
++size, link target, sha256, plus the payload hash). The payload is verified
++against the manifest and the source tree is re-scanned for mutation before the
++archive is published. Trees with no git repository are archived by the payload
++alone. That directory name is reserved: a workspace entry with that name is
++refused so the metadata can never collide with archived content.
++
+ Anything it cannot prove safe keeps the workspace: a linked worktree or
+ submodule (a ``.git`` FILE: the worktree GC owns those), a bare repository,
+-any scan error, or any failed archive step. Symlinks are recorded, never
++a special file (fifo/socket/device), any scan error, source mutation during
++the archive, or any failed archive step. Symlinks are recorded, never
+ followed.
+ """
+ from __future__ import annotations
+ 
++import gzip
++import hashlib
+ import json
+ import logging
+ import os
+@@ -43,33 +57,31 @@ def find_repos(root: Path) -> list[Path]:
+     """Standalone repos (a ``.git`` directory) below *root*, *root* included.
+ 
+     Raises :class:`ArchiveRefused` for a linked worktree/submodule, a bare
+-    repository, a non-directory root, or any scan error. Never follows
+-    symlinks and never descends into a ``.git`` directory.
++    repository, a non-directory root, or any scan error. Traverses by directory
++    descriptor (never follows symlinks, ancestors included).
+     """
++    found = _scan(root)
++    kids: dict[str, set[str]] = {".": set()}
++    for rel, st in found.items():
++        if rel == ".":
++            continue
++        parent, _, name = rel.rpartition("/")
++        kids.setdefault(parent or ".", set()).add(name)
++        if stat.S_ISDIR(st.st_mode):
++            kids.setdefault(rel, set())
+     repos: list[Path] = []
+-    pending = [root]
+-    try:
+-        if not stat.S_ISDIR(root.lstat().st_mode):
+-            raise ArchiveRefused(f"{root} is not a directory")
+-        while pending:
+-            directory = pending.pop()
+-            names: set[str] = set()
+-            with os.scandir(directory) as entries:
+-                for entry in entries:
+-                    names.add(entry.name)
+-                    mode = entry.stat(follow_symlinks=False).st_mode
+-                    if entry.name == ".git":
+-                        if stat.S_ISDIR(mode):
+-                            repos.append(Path(directory))
+-                            continue
+-                        raise ArchiveRefused(
+-                            f"linked worktree or submodule at {entry.path} (left to the worktree GC)")
+-                    if stat.S_ISDIR(mode):
+-                        pending.append(Path(entry.path))
+-            if ".git" not in names and {"HEAD", "objects"} <= names and names & {"refs", "reftable"}:
+-                raise ArchiveRefused(f"bare repository at {directory}")
+-    except OSError as exc:
+-        raise ArchiveRefused(f"scan uncertain: {exc!r}") from exc
++    for rel, names in kids.items():
++        if rel == ".git" or rel.endswith("/.git") or rel.startswith(".git/") or "/.git/" in rel:
++            continue  # never descend into repository metadata
++        directory = root if rel == "." else root / rel
++        if ".git" in names:
++            gitrel = ".git" if rel == "." else f"{rel}/.git"
++            if stat.S_ISDIR(found[gitrel].st_mode):
++                repos.append(directory)
++                continue
++            raise ArchiveRefused(f"linked worktree or submodule at {directory / '.git'} (left to the worktree GC)")
++        if {"HEAD", "objects"} <= names and names & {"refs", "reftable"}:
++            raise ArchiveRefused(f"bare repository at {directory}")
+     return sorted(repos)
+ 
+ 
+@@ -146,17 +158,364 @@ def archive_repo(repo: Path, dest: Path, *, task_id: str, completed_at: Optional
+     return meta
+ 
+ 
++PAYLOAD_DIR = ".hermes-complete-archive-v1"
++PAYLOAD_VERSION = 1
++_TREE = "tree.tar.gz"
++_MANIFEST = "manifest.json"
++
++
++def _kind(mode: int) -> str:
++    if stat.S_ISREG(mode):
++        return "file"
++    if stat.S_ISDIR(mode):
++        return "dir"
++    if stat.S_ISLNK(mode):
++        return "symlink"
++    raise ArchiveRefused("special file in workspace (fifo/socket/device)")
++
++
++def _signature(st: os.stat_result) -> list[int]:
++    return [st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_dev,
++            st.st_uid, st.st_gid, st.st_nlink]
++
++
++_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
++
++
++def _open_root(root: Path) -> int:
++    """Anchor at / (or cwd), opening every path component without following links."""
++    root = Path(root)
++    fd = os.open(root.anchor or ".", _DIR_FLAGS)
++    try:
++        for part in root.parts[1:] if root.is_absolute() else root.parts:
++            if part == "..":
++                raise ArchiveRefused("workspace path contains parent traversal")
++            child = os.open(part, _DIR_FLAGS, dir_fd=fd)
++            os.close(fd)
++            fd = child
++        return fd
++    except BaseException:
++        os.close(fd)
++        raise
++
++
++class _HashingReader:
++    def __init__(self, fh):
++        self.fh, self.digest, self.count = fh, hashlib.sha256(), 0
++
++    def read(self, n=-1):
++        data = self.fh.read(n)
++        self.digest.update(data)
++        self.count += len(data)
++        return data
++
++
++def _scan(root: Path, tar: Optional[tarfile.TarFile] = None,
++          entries: Optional[dict] = None) -> dict[str, os.stat_result]:
++    """lstat of every entry below *root* (``"."`` is the root), by directory descriptor.
++
++    Every directory is opened ``O_DIRECTORY|O_NOFOLLOW`` relative to its parent
++    descriptor and every stat/open/readlink is relative to a descriptor, so a
++    symlink swapped in for any ancestor is refused rather than followed. With
++    *tar*/*entries* the content is archived during the same traversal.
++    """
++    found: dict[str, os.stat_result] = {}
++    seen_inodes: dict[tuple[int, int], str] = {}
++
++    def visit(dfd: int, rel: str) -> None:
++        for name in sorted(os.listdir(dfd)):
++            erel = name if rel == "." else f"{rel}/{name}"
++            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
++            kind = _kind(st.st_mode)
++            found[erel] = st
++            info = rec = None
++            if tar is not None:
++                info = tarfile.TarInfo(erel)
++                info.mode, info.uid, info.gid = stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid
++                info.mtime = int(st.st_mtime)
++                rec = {"type": kind, "mode": info.mode}
++            if kind == "dir":
++                if info is not None:
++                    info.type = tarfile.DIRTYPE
++                    tar.addfile(info)
++                    entries[erel] = rec
++                cfd = os.open(name, _DIR_FLAGS, dir_fd=dfd)
++                try:
++                    cst = os.fstat(cfd)
++                    if (cst.st_ino, cst.st_dev) != (st.st_ino, st.st_dev):
++                        raise ArchiveRefused(f"{erel} changed during scan")
++                    visit(cfd, erel)
++                finally:
++                    os.close(cfd)
++            elif kind == "symlink":
++                if info is not None:
++                    info.type, info.linkname = tarfile.SYMTYPE, os.readlink(name, dir_fd=dfd)
++                    tar.addfile(info)
++                    rec["link"] = info.linkname
++                    entries[erel] = rec
++            elif info is not None:
++                key = (st.st_dev, st.st_ino)
++                if st.st_nlink > 1 and key in seen_inodes:
++                    info.type, info.linkname = tarfile.LNKTYPE, seen_inodes[key]
++                    tar.addfile(info)
++                    rec.update(type="hardlink", link=info.linkname)
++                    entries[erel] = rec
++                    continue
++                # A regular file may have become a FIFO since lstat. Never block
++                # opening it, and reject its actual descriptor type before reading.
++                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
++                with os.fdopen(fd, "rb") as fh:
++                    fst = os.fstat(fh.fileno())
++                    if not stat.S_ISREG(fst.st_mode) or _signature(fst) != _signature(st):
++                        raise ArchiveRefused(f"{erel} changed during archive")
++                    info.type, info.size = tarfile.REGTYPE, fst.st_size
++                    reader = _HashingReader(fh)
++                    tar.addfile(info, reader)
++                if reader.count != info.size:
++                    raise ArchiveRefused(f"{erel} changed size during archive")
++                rec.update(size=info.size, sha256=reader.digest.hexdigest())
++                entries[erel] = rec
++                if st.st_nlink > 1:
++                    seen_inodes[key] = erel
++
++    try:
++        rfd = _open_root(root)
++    except OSError as exc:
++        raise ArchiveRefused(f"{root} is not a plain directory: {exc!r}") from exc
++    try:
++        rst = os.fstat(rfd)
++        found["."] = rst
++        if tar is not None:
++            info = tarfile.TarInfo(".")
++            info.type, info.mode, info.uid, info.gid = tarfile.DIRTYPE, stat.S_IMODE(rst.st_mode), rst.st_uid, rst.st_gid
++            info.mtime = int(rst.st_mtime)
++            tar.addfile(info)
++            entries["."] = {"type": "dir", "mode": info.mode}
++        visit(rfd, ".")
++    except OSError as exc:
++        raise ArchiveRefused(f"scan uncertain: {exc!r}") from exc
++    finally:
++        os.close(rfd)
++    return found
++
++
++def _signatures(found: dict[str, os.stat_result]) -> dict[str, list[int]]:
++    return {k: _signature(v) for k, v in found.items()}
++
++
++def check_snapshot(workspace: Path, snapshot: dict[str, list[int]], *, renamed: bool = False) -> None:
++    """Raise :class:`ArchiveRefused` unless *workspace* still matches the archived *snapshot*.
++
++    ``renamed`` is for a tree just moved aside: the root's own ctime/nlink may
++    change with the rename, every descendant (and the root's mtime) still must not.
++
++    This is mutation detection, not a filesystem snapshot or writer exclusion:
++    an open descriptor can modify an already visited entry even after rename.
++    Callers must retain live-job/session/custody exclusion independently.
++    """
++    now = _signatures(_scan(workspace))
++    want = {k: list(v) for k, v in snapshot.items()}
++    if renamed:
++        for sig in (now["."], want["."]):
++            sig[3] = sig[8] = 0
++    if now != want:
++        raise ArchiveRefused("workspace changed after it was archived")
++
++
++def _write_payload(workspace: Path, dest: Path) -> dict[str, list[int]]:
++    """Write ``tree.tar.gz`` + ``manifest.json`` into *dest*; return the source signatures."""
++    entries: dict[str, dict] = {}
++    tree = dest / _TREE
++    with open(tree, "wb") as raw:
++        # mtime=0 keeps the gzip header deterministic.
++        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
++            with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
++                before = _scan(workspace, tar, entries)
++    manifest = {
++        "version": PAYLOAD_VERSION, "tree": _TREE, "tree_sha256": _sha256_file(tree),
++        "entries": entries,
++    }
++    (dest / _MANIFEST).write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n", encoding="utf-8")
++    snapshot = _signatures(before)
++    if _signatures(_scan(workspace)) != snapshot:
++        raise ArchiveRefused("workspace changed while it was being archived")
++    return snapshot
++
++
++def _sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with open(path, "rb") as fh:
++        for block in iter(lambda: fh.read(1 << 20), b""):
++            digest.update(block)
++    return digest.hexdigest()
++
++
++def verify_complete_archive(archive: Path) -> dict:
++    """Re-read the payload and prove it matches its manifest; raise :class:`ArchiveRefused` if not."""
++    base = Path(archive) / PAYLOAD_DIR
++    try:
++        manifest = json.loads((base / _MANIFEST).read_text(encoding="utf-8"))
++        if manifest.get("version") != PAYLOAD_VERSION:
++            raise ArchiveRefused(f"unsupported payload version {manifest.get('version')!r}")
++        if _sha256_file(base / _TREE) != manifest["tree_sha256"]:
++            raise ArchiveRefused("payload hash mismatch")
++        want, seen = manifest["entries"], set()
++        with tarfile.open(base / _TREE, "r:gz") as tar:
++            for m in tar:
++                rec = want.get(m.name)
++                if rec is None or m.name in seen:
++                    raise ArchiveRefused(f"unexpected payload member {m.name!r}")
++                seen.add(m.name)
++                kind = "hardlink" if m.islnk() else "file" if m.isreg() else "dir" if m.isdir() \
++                    else "symlink" if m.issym() else "other"
++                if kind != rec["type"] or stat.S_IMODE(m.mode) != rec["mode"]:
++                    raise ArchiveRefused(f"payload type/mode mismatch for {m.name!r}")
++                if kind in ("symlink", "hardlink") and m.linkname != rec["link"]:
++                    raise ArchiveRefused(f"payload link mismatch for {m.name!r}")
++                if kind == "file":
++                    digest = hashlib.sha256()
++                    fh = tar.extractfile(m)
++                    for block in iter(lambda: fh.read(1 << 20), b""):
++                        digest.update(block)
++                    if digest.hexdigest() != rec["sha256"] or m.size != rec["size"]:
++                        raise ArchiveRefused(f"payload content mismatch for {m.name!r}")
++        if seen != set(want):
++            raise ArchiveRefused("payload is missing members")
++    except (OSError, ValueError, KeyError, tarfile.TarError, EOFError) as exc:
++        raise ArchiveRefused(f"payload unreadable: {exc!r}") from exc
++    return manifest
++
++
++def _fsync_path(path: Path, *, directory: bool) -> None:
++    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | (getattr(os, "O_DIRECTORY", 0) if directory else 0)
++    fd = os.open(path, flags)
++    try:
++        os.fsync(fd)
++    finally:
++        os.close(fd)
++
++
++def _fsync_tree(root: Path) -> None:
++    """Flush every file, then every directory, bottom-up; any failure propagates (fail closed)."""
++    for current, dirs, files in os.walk(root, topdown=False, followlinks=False):
++        for name in files:
++            full = Path(current) / name
++            if not full.is_symlink():
++                _fsync_path(full, directory=False)
++        _fsync_path(Path(current), directory=True)
++
++
++def _rename_noreplace(source: Path, target: Path) -> None:
++    """Atomic rename which cannot replace a recreated original, even an empty dir."""
++    import ctypes
++    import errno
++    import sys
++
++    libc = ctypes.CDLL(None, use_errno=True)
++    symbol = "renameat2" if sys.platform == "linux" else "renamex_np" if sys.platform == "darwin" else ""
++    rename = getattr(libc, symbol, None) if symbol else None
++    if rename is None:
++        raise OSError(errno.ENOTSUP, "atomic no-replace directory rename unavailable")
++    if sys.platform == "linux":
++        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
++        result = rename(-100, os.fsencode(source), -100, os.fsencode(target), 1)  # RENAME_NOREPLACE
++    else:
++        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
++        result = rename(os.fsencode(source), os.fsencode(target), 4)  # RENAME_EXCL
++    if result:
++        error = ctypes.get_errno()
++        raise OSError(error, os.strerror(error), str(target))
++
++
++def remove_archived(conn, path: Path, archive: ArchivedPath, guard, finalize) -> int:
++    """Scan outside short Board detach/finalize fences, retaining a recovery intent.
++
++    guard(tree) checks current ownership/custody and known live jobs using the
++    original path, but checks existence at tree. The durable intent names both
++    locations and the verified archive before rename. Interrupted operations
++    leave it for manual recovery; it NEVER authorizes automatic retry deletion.
++    No recursive scan or rmtree holds the Board writer lock. Known-job exclusion
++    remains independent: an unregistered writer with an open FD can write after
++    the last scan. This is mutation detection, not a perfect filesystem snapshot.
++    """
++    import uuid
++    from hermes_cli import kanban_db as kb
++
++    if not guard(path):
++        return 0
++    check_snapshot(path, archive.snapshot)
++    token = uuid.uuid4().hex
++    trash = path.with_name(f".{path.name}.gc-{token}")
++    intent = archive / f"detach-{token}.json"
++    record = {"version": 1, "original": str(path), "detached": str(trash),
++              "archive": str(archive), "root_identity": archive.snapshot["."]}
++    with intent.open("x", encoding="utf-8") as fh:
++        json.dump(record, fh, sort_keys=True)
++        fh.flush()
++        os.fsync(fh.fileno())
++    # Flush the receipt's directory and the archive's published name before detach.
++    for directory in (archive, archive.parent):
++        afd = _open_root(directory)
++        try:
++            os.fsync(afd)
++        finally:
++            os.close(afd)
++
++    def identity(tree, renamed=False):
++        now, want = _signature(tree.lstat()), list(archive.snapshot["."])
++        if renamed:
++            for sig in (now, want):
++                sig[3] = sig[8] = 0
++        return now == want and stat.S_ISDIR(now[0])
++
++    detached = False
++    try:
++        with kb.write_txn(conn):
++            if not guard(path) or not identity(path):
++                return 0
++            _rename_noreplace(path, trash)
++            detached = True
++        check_snapshot(trash, archive.snapshot, renamed=True)
++        with kb.write_txn(conn):
++            if os.path.lexists(path) or not guard(trash) or not identity(trash, renamed=True):
++                raise ArchiveRefused("ownership, live-job guard or tree identity changed after detach")
++            finalize()
++    except BaseException:
++        if detached:
++            try:
++                _rename_noreplace(trash, path)
++            except OSError as exc:
++                log.error("Scratch detached tree preserved at %s; recovery intent=%s; restore failed: %s",
++                          trash, intent, exc)
++        raise
++    # A later pickup gets a new tree. Keep intent on partial rmtree failures.
++    shutil.rmtree(trash)
++    intent.unlink()
++    return 1
++
++
++class ArchivedPath(type(Path())):
++    """The final archive directory, carrying the source ``snapshot`` it was built from."""
++
++    snapshot: dict
++
++
+ def archive_workspace(workspace: Path, archive_dir: Path, *, task_id: str,
+-                      completed_at: Optional[int]) -> Path:
+-    """Archive every standalone repo in *workspace* to *archive_dir*; return the final dir.
++                      completed_at: Optional[int]) -> ArchivedPath:
++    """Archive every standalone repo in *workspace* to *archive_dir*; return the final dir (an :class:`ArchivedPath`
++    whose ``snapshot`` the caller must re-check at detach with :func:`check_snapshot`).
+ 
+     Built in a ``.partial`` sibling and renamed into place, so a failure leaves
+     no half archive that looks complete. Raises :class:`ArchiveRefused` (or
+     ``OSError``) on any failure; the caller then keeps the workspace.
+     """
+     repos = find_repos(workspace)
+-    if not repos:
+-        raise ArchiveRefused("no standalone git repository found")
++    try:
++        reserved = os.path.lexists(workspace / PAYLOAD_DIR)
++    except OSError as exc:
++        raise ArchiveRefused(f"scan uncertain: {exc!r}") from exc
++    if reserved:
++        raise ArchiveRefused(f"workspace entry {PAYLOAD_DIR} collides with archive metadata")
+     partial = archive_dir.with_name(archive_dir.name + f".partial-{os.getpid()}")
+     shutil.rmtree(partial, ignore_errors=True)
+     try:
+@@ -165,11 +524,24 @@ def archive_workspace(workspace: Path, archive_dir: Path, *, task_id: str,
+             rel = repo.relative_to(workspace)
+             archive_repo(repo, partial / rel if rel.parts else partial,
+                          task_id=task_id, completed_at=completed_at)
++        payload = partial / PAYLOAD_DIR
++        payload.mkdir()
++        # Last, so nothing (including git's own index refresh) mutates the tree after the scan.
++        snapshot = _write_payload(workspace, payload)
++        verify_complete_archive(partial)
++        _fsync_tree(partial)  # payload, manifest, repo bundles and all directories, before publication
+         final = archive_dir
+         if final.exists():
+             final = archive_dir.with_name(f"{archive_dir.name}-{int(time.time())}")
+         partial.rename(final)
+-        return final
++        try:
++            _fsync_path(final.parent, directory=True)  # publication name durable before any detach
++        except BaseException:
++            shutil.rmtree(final, ignore_errors=True)
++            raise
++        out = ArchivedPath(final)
++        out.snapshot = snapshot
++        return out
+     except BaseException:
+         shutil.rmtree(partial, ignore_errors=True)
+         raise
+diff --git a/hermes_cli/kanban_scratch_custody.py b/hermes_cli/kanban_scratch_custody.py
+index bff65ac8ac7..c164eaac3c7 100644
+--- a/hermes_cli/kanban_scratch_custody.py
++++ b/hermes_cli/kanban_scratch_custody.py
+@@ -172,12 +172,13 @@ def _legacy_unchanged(receipt):
+     return matches == [(Path(evidence["state_db"]), evidence["session"], evidence["runs"][0]["id"])]
+ 
+ 
+-def _safe(conn, receipt, path):
++def _safe(conn, receipt, path, *, tree=None):
+     tid = receipt["task_id"]
+     current = conn.execute(f"SELECT * FROM {_TABLE} WHERE task_id=?", (tid,)).fetchone()
+     if current is None or dict(current) != receipt or conn.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone():
+         return False
+-    if path.is_symlink() or not path.is_dir() or not ws._is_managed_scratch_path(path):
++    tree = path if tree is None else tree
++    if tree.is_symlink() or not tree.is_dir() or not ws._is_managed_scratch_path(path):
+         return False
+     if ws._has_active_children(conn, tid):
+         return False
+@@ -193,7 +194,8 @@ def _safe(conn, receipt, path):
+     if ws._workspace_in_use_by_other(conn, tid, path) is not None:
+         return False
+     from hermes_cli.kanban_workspace_jobs import defer_owned_job_cleanup
+-    return _sessions_idle(path) and not defer_owned_job_cleanup(tid, path)
++    return (_sessions_idle(path) and _sessions_idle(tree)
++            and not defer_owned_job_cleanup(tid, tree))
+ 
+ 
+ class _DetachUncommitted(Exception):
+@@ -236,6 +238,16 @@ def _remove(conn, receipt, owner, days, board):
+     if not ws._scratch_tree_removable(path):
+         archive = sa.archive_workspace(path, kb.kanban_home() / "archive" / "scratch" / board / tid,
+                                        task_id=tid, completed_at=owner["completed_at"])
++    if archive is not None:
++        ws.release_lsp_clients(str(path))
++
++        def guard(tree):
++            return _safe(conn, receipt, path, tree=tree)
++
++        def finalize():
++            conn.execute(f"DELETE FROM {_TABLE} WHERE task_id=?", (tid,))
++
++        return sa.remove_archived(conn, path, archive, guard, finalize)
+     # Remote resumption does not use this tree. Local pickup does, and shares this lock.
+     trash = path.with_name(f".{path.name}.gc-{os.getpid()}")
+     renamed = False
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index 1e603b6906d..1cb06b284c5 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -168,12 +168,13 @@ def _archive_and_remove_scratch(conn: sqlite3.Connection, task_id: str, path: Pa
+     re-checked under the write lock after archiving, and the tree is renamed
+     away inside that lock so a resumed card can never see it half-deleted.
+     """
+-    import shutil
+     import subprocess
+ 
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_scratch_archive as sa
+ 
++    owner = conn.execute("SELECT workspace_kind, workspace_path, completed_at FROM tasks WHERE id=?",
++                         (task_id,)).fetchone()
+     archive_dir = kb.kanban_home() / "archive" / "scratch" / _board_slug(conn) / task_id
+     try:
+         final = sa.archive_workspace(path, archive_dir, task_id=task_id, completed_at=completed_at)
+@@ -181,26 +182,31 @@ def _archive_and_remove_scratch(conn: sqlite3.Connection, task_id: str, path: Pa
+         log.info("Keeping aged scratch workspace for task %s: %s (%s)", task_id, path, exc)
+         return 0
+     ws.release_lsp_clients(str(path))
+-    trash = path.with_name(f".{path.name}.gc-{os.getpid()}")
+-    with kb.write_txn(conn):
+-        if (not ws._is_terminal_task(conn, task_id) or ws._has_active_children(conn, task_id)
+-                or ws._defer_shared_workspace_cleanup(conn, task_id, path)
+-                or defer_owned_job_cleanup(task_id, path)):
+-            log.info("Keeping scratch workspace for task %s after archiving it to %s: "
+-                     "the card is live again or shares the path: %s", task_id, final, path)
+-            return 0
+-        try:
+-            path.rename(trash)
+-        except OSError as exc:
+-            log.info("Keeping aged scratch workspace for task %s: cannot move %s away (%s); "
+-                     "archive at %s", task_id, path, exc, final)
+-            return 0
++
++    def _row_path(row):
++        # Same expression as candidate selection; raw-row equality below still fences mutation.
++        return Path(row["workspace_path"] or (kb.workspaces_root() / task_id)).expanduser()
++
++    def guard(tree):
++        current = conn.execute("SELECT workspace_kind, workspace_path, completed_at FROM tasks WHERE id=?",
++                               (task_id,)).fetchone()
++        return (owner is not None and current is not None and tuple(current) == tuple(owner)
++                and owner["workspace_kind"] == "scratch" and _row_path(owner) == path
++                and owner["completed_at"] == completed_at
++                and ws._is_terminal_task(conn, task_id) and not ws._has_active_children(conn, task_id)
++                and not ws._defer_shared_workspace_cleanup(conn, task_id, path)
++                and not defer_owned_job_cleanup(task_id, tree))
++
++    def finalize():
+         kb._append_event(conn, task_id, "workspace_archived", {"path": str(path), "archive": str(final)})
+         ws._log_scratch_removal(conn, task_id, path, "scratch workspace (aged, git archived)")
+-    shutil.rmtree(trash, ignore_errors=True)
+-    if trash.exists():
+-        log.warning("Archived scratch workspace for task %s was not fully removed: %s", task_id, trash)
+-    return 1
++
++    try:
++        return sa.remove_archived(conn, path, final, guard, finalize)
++    except (sa.ArchiveRefused, OSError) as exc:
++        log.info("Keeping archived scratch workspace for task %s (or detached recovery tree): %s (%s)",
++                 task_id, path, exc)
++        return 0
+ 
+ 
+ def gc_task_worktrees(conn: sqlite3.Connection, *, older_than_days: int = 7,
+diff --git a/tests/hermes_cli/test_kanban_scratch_custody.py b/tests/hermes_cli/test_kanban_scratch_custody.py
+index 759ffe9d999..68176f386f3 100644
+--- a/tests/hermes_cli/test_kanban_scratch_custody.py
++++ b/tests/hermes_cli/test_kanban_scratch_custody.py
+@@ -915,3 +915,78 @@ def test_post_detach_cleanup_failure_is_reported_accurately(env, monkeypatch, ca
+     assert _receipt(env, tid) is None
+     assert "detached but not removed" in caplog.text and "receipt=consumed" in caplog.text
+     assert str(_trash(path)) in caplog.text and "Scratch custody preserved" not in caplog.text
++
++
++@pytest.mark.parametrize("when", [0, 1], ids=["pre_detach", "detached_before_rmtree"])
++def test_archived_tree_changed_at_detach_keeps_tree_and_receipt(env, remote, monkeypatch, when):
++    tid, path, _ = evicted(env)
++    helpers._run("clone", "-q", str(remote), str(path / "repo"))
++    real, calls = archive.check_snapshot, []
++
++    def wrapper(p, snapshot, **kw):
++        if len(calls) == when:
++            (Path(p) / "repo" / "late.txt").write_text("late")
++        calls.append(p)
++        return real(p, snapshot, **kw)
++
++    monkeypatch.setattr(archive, "check_snapshot", wrapper)
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
++    assert len(calls) == when + 1
++    assert (path / "repo" / "late.txt").read_text() == "late"
++    assert env.conn.execute("SELECT 1 FROM kanban_scratch_custody WHERE task_id=?", (tid,)).fetchone()
++    assert not [p for p in path.parent.iterdir() if ".gc-" in p.name]
++
++
++@pytest.mark.parametrize("race", ["none", "pickup", "receipt", "reoccupied", "job"])
++def test_custody_archive_unlocked_scans_and_final_fence(env, remote, monkeypatch, race):
++    from hermes_cli import kanban_workspace_jobs as jobs
++    tid, path, _ = evicted(env)
++    helpers._run("clone", "-q", str(remote), str(path / "repo"))
++    original_receipt = _receipt(env, tid)
++    scan, check = archive._scan, archive.check_snapshot
++    calls, busy = [], []
++
++    def unlocked(*args, **kwargs):
++        assert not env.conn.in_transaction, "recursive archive scan holds Board writer lock"
++        return scan(*args, **kwargs)
++
++    def after_scan(tree, snapshot, **kwargs):
++        assert not env.conn.in_transaction
++        check(tree, snapshot, **kwargs)
++        calls.append(tree)
++        if kwargs.get("renamed"):
++            # Custody must still be durable throughout the unlocked postscan.
++            assert _receipt(env, tid) == original_receipt
++            def pickup():
++                sync.apply_remote_changes(env.conn, [sync.RemoteChange(
++                    1, "tasks", tid, "upsert", {"title": "picked up", "status": "ready",
++                    "created_on": "other", "created_at": OLD, "workspace_kind": "scratch",
++                    "workspace_path": None}, 1, "", "")], new_cursor=1, observers=False)
++                assert kb.get_task(env.conn, tid) is not None  # prove import actually committed
++
++            def change_receipt():
++                with kb.write_txn(env.conn):
++                    env.conn.execute("UPDATE kanban_scratch_custody SET evidence=json_set(evidence, '$.changed', 1) "
++                                     "WHERE task_id=?", (tid,))
++
++            actions = {"none": lambda: None, "pickup": pickup, "receipt": change_receipt,
++                       "reoccupied": path.mkdir, "job": lambda: busy.append(True)}
++            actions[race]()
++
++    monkeypatch.setattr(archive, "_scan", unlocked)
++    monkeypatch.setattr(archive, "check_snapshot", after_scan)
++    monkeypatch.setattr(jobs, "defer_owned_job_cleanup", lambda *_: bool(busy))
++    assert gc.gc_task_scratch(env.conn, older_than_days=7) == (race == "none")
++    assert len(calls) == 2
++    if race == "none":
++        assert not path.exists() and _receipt(env, tid) is None
++    else:
++        assert _receipt(env, tid) is not None
++        if race == "reoccupied":
++            assert list(path.iterdir()) == []
++            intent_paths = list((kb.kanban_home() / "archive" / "scratch" / "default" / tid).glob("detach-*.json"))
++            assert len(intent_paths) == 1
++            intent = json.loads(intent_paths[0].read_text())
++            assert (Path(intent["detached"]) / "repo" / "tracked.txt").exists()
++        else:
++            assert (path / "repo" / "tracked.txt").exists()
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc_archive.py b/tests/hermes_cli/test_kanban_scratch_gc_archive.py
+index ec3204de5e4..9659be32ce0 100644
+--- a/tests/hermes_cli/test_kanban_scratch_gc_archive.py
++++ b/tests/hermes_cli/test_kanban_scratch_gc_archive.py
+@@ -254,3 +254,534 @@ def test_named_board_archives_under_its_slug(board, remote):
+         assert gc_task_scratch(conn, older_than_days=7) == 1
+     assert not path.exists()
+     assert (_archive(tid, "other") / "repo" / "meta.json").is_file()
++
++
++# --- complete filesystem payload (non-git trees, ignored/sibling files) ---------------
++
++PAYLOAD = ".hermes-complete-archive-v1"
++
++
++def _members(tid):
++    with tarfile.open(_archive(tid) / PAYLOAD / "tree.tar.gz") as tar:
++        return {m.name: (m, tar.extractfile(m).read() if m.isfile() else None) for m in tar.getmembers()}
++
++
++def _plain_task(build):
++    tid, path = _task()
++    (path / "link").symlink_to("notes.txt")  # symlink makes the tree non-removable -> archive path
++    build(path)
++    return tid, path
++
++
++def test_non_git_symlink_tree_is_archived_completely_then_removed(board):
++    outside = board / "outside"
++    outside.mkdir()
++    (outside / "secret.txt").write_text("must not be copied")
++
++    def build(p):
++        (p / "empty").mkdir()
++        (p / "deep" / "er").mkdir(parents=True)
++        (p / "deep" / "er" / "run.sh").write_text("#!/bin/sh\n")
++        (p / "deep" / "er" / "run.sh").chmod(0o750)
++        (p / "home").symlink_to(outside)
++        (p / "dangling").symlink_to("nowhere/at/all")
++
++    tid, path = _plain_task(build)
++    assert _gc() == 0
++    assert not path.exists()
++    m = _members(tid)
++    assert m["empty"][0].isdir() and m["deep/er/run.sh"][0].mode == 0o750
++    assert m["deep/er/run.sh"][1] == b"#!/bin/sh\n" and m["notes.txt"][1] == b"scratch"
++    assert m["home"][0].issym() and m["home"][0].linkname == str(outside)
++    assert m["dangling"][0].issym() and m["dangling"][0].linkname == "nowhere/at/all"
++    assert not any(n.startswith("home/") for n in m)
++    assert (outside / "secret.txt").read_text() == "must not be copied"
++    from hermes_cli import kanban_scratch_archive as sa
++    sa.verify_complete_archive(_archive(tid))
++
++
++def test_mixed_git_tree_keeps_ignored_and_sibling_files(board, remote):
++    tid, path = _task(remote=remote)
++    (path / "repo" / ".gitignore").write_text("cache/\n")
++    (path / "repo" / "cache").mkdir()
++    (path / "repo" / "cache" / "blob.bin").write_bytes(b"\x00\x01ignored")
++    (path / "sibling").mkdir()
++    (path / "sibling" / "evidence.txt").write_text("only here")
++    assert _gc() == 0
++    assert not path.exists()
++    m = _members(tid)
++    assert m["repo/cache/blob.bin"][1] == b"\x00\x01ignored"
++    assert m["sibling/evidence.txt"][1] == b"only here"
++    assert (_archive(tid) / "repo" / "meta.json").is_file()  # existing layout untouched
++
++
++def test_source_mutation_during_archive_keeps_workspace(board, monkeypatch):
++    tid, path = _plain_task(lambda p: (p / "deep").mkdir())
++    real = tarfile.TarFile.addfile
++    state = {"done": False}
++
++    def racing(self, tarinfo, fileobj=None):
++        out = real(self, tarinfo, fileobj)
++        if not state["done"] and tarinfo.isfile():
++            state["done"] = True
++            (path / "deep" / "late.txt").write_text("written mid-archive")
++        return out
++
++    monkeypatch.setattr(tarfile.TarFile, "addfile", racing)
++    assert _gc() == 0
++    assert (path / "deep" / "late.txt").read_text() == "written mid-archive"
++    assert (path / "notes.txt").exists()
++    parent = _archive(tid).parent
++    assert not parent.exists() or list(parent.iterdir()) == []
++
++
++def test_nested_rewrite_of_archived_file_keeps_workspace(board, monkeypatch):
++    tid, path = _plain_task(lambda p: ((p / "a").mkdir(), (p / "a" / "f.txt").write_text("v1")))
++    real = tarfile.TarFile.close
++
++    def racing(self):
++        real(self)
++        (path / "a" / "f.txt").write_text("v2-longer")
++
++    monkeypatch.setattr(tarfile.TarFile, "close", racing)
++    assert _gc() == 0
++    assert (path / "a" / "f.txt").read_text() == "v2-longer"
++    assert not _archive(tid).exists()
++
++
++def test_payload_write_failure_keeps_workspace(board, monkeypatch):
++    tid, path = _plain_task(lambda p: None)
++
++    def boom(self, *a, **k):
++        raise OSError("disk full")
++
++    monkeypatch.setattr(tarfile.TarFile, "addfile", boom)
++    assert _gc() == 0
++    assert (path / "notes.txt").read_text() == "scratch"
++    parent = _archive(tid).parent
++    assert not parent.exists() or list(parent.iterdir()) == []
++
++
++def test_special_file_keeps_workspace(board):
++    tid, path = _plain_task(lambda p: os.mkfifo(p / "pipe"))
++    assert _gc() == 0
++    assert (path / "notes.txt").exists()
++    assert not _archive(tid).exists()
++
++
++def test_reserved_metadata_name_collision_keeps_workspace(board):
++    tid, path = _plain_task(lambda p: (p / PAYLOAD).mkdir())
++    assert _gc() == 0
++    assert (path / PAYLOAD).is_dir() and (path / "notes.txt").exists()
++    assert not _archive(tid).exists()
++
++
++def test_verify_rejects_tampered_payload(board):
++    from hermes_cli import kanban_scratch_archive as sa
++    tid, _path = _plain_task(lambda p: None)
++    assert _gc() == 0
++    sa.verify_complete_archive(_archive(tid))
++    tar_path = _archive(tid) / PAYLOAD / "tree.tar.gz"
++    tar_path.write_bytes(tar_path.read_bytes()[:-20])
++    with pytest.raises(sa.ArchiveRefused):
++        sa.verify_complete_archive(_archive(tid))
++
++
++# --- snapshot enforcement at detach, ctime, descriptor traversal -------------------------
++
++def _hook_check_snapshot(monkeypatch, when, action):
++    """Run *action(path)* just before the *when*-th (0-based) check_snapshot call."""
++    from hermes_cli import kanban_scratch_archive as sa
++    real, calls = sa.check_snapshot, []
++
++    def wrapper(path, snapshot, **kw):
++        if len(calls) == when:
++            action(Path(path))
++        calls.append(path)
++        return real(path, snapshot, **kw)
++
++    monkeypatch.setattr(sa, "check_snapshot", wrapper)
++    return calls
++
++
++@pytest.mark.parametrize("when", [0, 1], ids=["pre_detach", "detached_before_rmtree"])
++def test_nested_change_after_archive_keeps_or_restores_workspace(board, monkeypatch, when):
++    _tid, path = _plain_task(lambda p: ((p / "a" / "b").mkdir(parents=True), (p / "a" / "b" / "f").write_text("v1")))
++    calls = _hook_check_snapshot(monkeypatch, when, lambda root: (root / "a" / "b" / "late.txt").write_text("late"))
++    assert _gc() == 0
++    assert len(calls) == when + 1
++    assert (path / "a" / "b" / "late.txt").read_text() == "late"
++    assert (path / "notes.txt").exists()
++    assert not [p for p in path.parent.iterdir() if ".gc-" in p.name]
++
++
++def test_equal_size_rewrite_with_restored_mtime_is_detected(board, monkeypatch):
++    tid, path = _plain_task(lambda p: (p / "a.txt").write_text("v1"))
++    ext = board / "hardlink-ext"
++    os.link(path / "a.txt", ext)  # rewrite arrives through a second hardlink
++    st = (path / "a.txt").stat()
++    real = tarfile.TarFile.close
++
++    def racing(self):
++        real(self)
++        ext.write_text("v2")  # same size
++        os.utime(ext, ns=(st.st_atime_ns, st.st_mtime_ns))  # mtime restored; ctime cannot be
++
++    monkeypatch.setattr(tarfile.TarFile, "close", racing)
++    assert _gc() == 0
++    assert (path / "a.txt").read_text() == "v2"
++    assert not _archive(tid).exists()
++
++
++def test_equal_size_rewrite_after_return_is_detected_at_detach(board, monkeypatch):
++    _tid, path = _plain_task(lambda p: (p / "a.txt").write_text("v1"))
++    st = (path / "a.txt").stat()
++
++    def rewrite(root):
++        (root / "a.txt").write_text("v2")
++        os.utime(root / "a.txt", ns=(st.st_atime_ns, st.st_mtime_ns))
++
++    _hook_check_snapshot(monkeypatch, 0, rewrite)
++    assert _gc() == 0
++    assert (path / "a.txt").read_text() == "v2"
++
++
++def test_ancestor_directory_swapped_for_external_symlink_is_not_followed(board, monkeypatch):
++    outside = board / "outside"
++    outside.mkdir()
++    (outside / "secret.txt").write_text("must not be read")
++    tid, path = _plain_task(lambda p: ((p / "deep").mkdir(), (p / "deep" / "f.txt").write_text("x")))
++    real = tarfile.TarFile.addfile
++    state = {"done": False}
++
++    def racing(self, tarinfo, fileobj=None):
++        out = real(self, tarinfo, fileobj)
++        if not state["done"] and tarinfo.name == "deep":
++            state["done"] = True
++            import shutil
++            shutil.rmtree(path / "deep")
++            (path / "deep").symlink_to(outside)
++        return out
++
++    monkeypatch.setattr(tarfile.TarFile, "addfile", racing)
++    assert _gc() == 0
++    assert state["done"] and (path / "deep").is_symlink()
++    assert (outside / "secret.txt").read_text() == "must not be read"
++    assert not _archive(tid).exists()
++
++
++def test_scan_refuses_symlink_root_and_swapped_ancestor(board):
++    from hermes_cli import kanban_scratch_archive as sa
++    real = board / "real"
++    (real / "d").mkdir(parents=True)
++    (board / "link").symlink_to(real)
++    with pytest.raises(sa.ArchiveRefused):
++        sa._scan(board / "link")
++    with pytest.raises(sa.ArchiveRefused):
++        sa.find_repos(board / "link")
++    # O_NOFOLLOW on the final component alone does not reject this path.
++    with pytest.raises(sa.ArchiveRefused):
++        sa._scan(board / "link" / "d")
++    with pytest.raises(sa.ArchiveRefused):
++        sa.find_repos(board / "link" / "d")
++
++
++def test_regular_file_replaced_by_fifo_before_open_refuses_without_blocking(board, monkeypatch):
++    from hermes_cli import kanban_scratch_archive as sa
++    root = board / "fifo-race"
++    root.mkdir()
++    victim = root / "file"
++    victim.write_text("original")
++    real_open = os.open
++    raced = []
++
++    def racing(name, flags, *args, **kwargs):
++        if name == "file" and kwargs.get("dir_fd") is not None:
++            # Assert before opening: a regression must fail, not hang the suite.
++            assert flags & os.O_NONBLOCK
++            victim.unlink()
++            os.mkfifo(victim)
++            raced.append(True)
++        return real_open(name, flags, *args, **kwargs)
++
++    monkeypatch.setattr(os, "open", racing)
++    with tarfile.open(board / "fifo-race.tar", "w") as tar:
++        with pytest.raises(sa.ArchiveRefused, match="changed during archive"):
++            sa._scan(root, tar, {})
++    assert raced == [True]
++
++
++@pytest.mark.parametrize("race", ["none", "pickup", "reoccupied", "job", "mutation"])
++def test_archive_scans_outside_transactions_and_rechecks_after_postscan(board, monkeypatch, race):
++    from hermes_cli import kanban_scratch_archive as sa
++    from hermes_cli import kanban_worktree_gc as gc
++    tid, path = _plain_task(lambda p: (p / "nested").mkdir())
++    with kbc.connect_closing() as conn:
++        scan, check = sa._scan, sa.check_snapshot
++        calls = []
++        job = []
++
++        def scan_unlocked(*args, **kwargs):
++            assert not conn.in_transaction, "recursive archive scan holds the Board writer lock"
++            return scan(*args, **kwargs)
++
++        def postscan(tree, snapshot, **kwargs):
++            assert not conn.in_transaction
++            check(tree, snapshot, **kwargs)
++            calls.append(tree)
++            if kwargs.get("renamed"):
++                def pickup():
++                    # Use a second connection: proves a pickup can commit while scanning.
++                    with kbc.connect_closing() as other, kb.write_txn(other):
++                        other.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
++
++                def mutate():
++                    (tree / "nested" / "late.txt").write_text("late")
++                    check(tree, snapshot, **kwargs)
++
++                actions = {"none": lambda: None, "pickup": pickup,
++                           "reoccupied": path.mkdir, "job": lambda: job.append(True),
++                           "mutation": mutate}
++                actions[race]()
++
++        monkeypatch.setattr(sa, "_scan", scan_unlocked)
++        monkeypatch.setattr(sa, "check_snapshot", postscan)
++        monkeypatch.setattr(gc, "defer_owned_job_cleanup", lambda *_: bool(job))
++        assert gc._archive_and_remove_scratch(conn, tid, path, OLD) == (race == "none")
++        assert len(calls) == 2
++        events = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='workspace_archived'",
++                              (tid,)).fetchall()
++        assert bool(events) == (race == "none")
++        if race == "pickup":
++            assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
++        intents = list(_archive(tid).glob("detach-*.json"))
++        if race == "none":
++            assert not path.exists() and not intents
++        elif race == "reoccupied":
++            assert path.is_dir() and list(path.iterdir()) == []
++            record = json.loads(intents[0].read_text())
++            assert record["original"] == str(path)
++            assert (Path(record["detached"]) / "notes.txt").read_text() == "scratch"
++        else:
++            assert (path / "notes.txt").read_text() == "scratch"
++            if race == "mutation":
++                assert (path / "nested" / "late.txt").read_text() == "late"
++
++
++@pytest.mark.platforms("linux")
++def test_process_crash_after_detach_leaves_recoverable_intent(board):
++    import sys
++    from tools.environments.local import build_subprocess_env
++    from hermes_cli import kanban_scratch_archive as sa
++    from hermes_cli import kanban_worktree_gc as gc
++    tid, path = _plain_task(lambda p: None)
++    script = """
++import os
++import sys
++from pathlib import Path
++from hermes_cli import kanban_scratch_archive as sa
++from hermes_cli import kanban_db_connect as kbc
++path, dest = map(Path, sys.argv[1:3])
++saved = sa.archive_workspace(path, dest, task_id=path.name, completed_at=None)
++real = sa.check_snapshot
++def crash(tree, snapshot, **kwargs):
++    if kwargs.get('renamed'):
++        os._exit(79)  # no finally/restore: abrupt process death, not a Python exception
++    real(tree, snapshot, **kwargs)
++sa.check_snapshot = crash
++with kbc.connect_closing() as conn:
++    sa.remove_archived(conn, path, saved, lambda tree: True, lambda: None)
++"""
++    result = subprocess.run(
++        [sys.executable, "-c", script, str(path), str(_archive(tid))],
++        env=build_subprocess_env(extra={"HERMES_HOME": str(kb.kanban_home()), "HOME": str(board)}),
++        capture_output=True, text=True, encoding="utf-8", timeout=60, check=False,
++    )
++    assert result.returncode == 79, result.stderr
++    assert not path.exists()
++    intents = list(_archive(tid).glob("detach-*.json"))
++    assert len(intents) == 1
++    record = json.loads(intents[0].read_text())
++    detached = Path(record["detached"])
++    assert record["original"] == str(path) and record["archive"] == str(_archive(tid))
++    assert detached.stat().st_ino == record["root_identity"][4]
++    assert (detached / "notes.txt").read_text() == "scratch"
++    sa.verify_complete_archive(Path(record["archive"]))
++    # A subsequent pass must not guess that this unowned hidden tree is deletable.
++    with kbc.connect_closing() as conn:
++        assert gc.gc_task_scratch(conn, older_than_days=7) == 0
++    assert detached.is_dir() and intents[0].exists()
++    sa._rename_noreplace(detached, path)  # demonstrate receipt-guided manual recovery
++    assert (path / "notes.txt").read_text() == "scratch"
++
++
++@pytest.mark.parametrize("failure", ["intent_fsync", "commit", "remove", "restore"])
++def test_archive_detach_faults_preserve_recovery_evidence(board, monkeypatch, failure):
++    import contextlib
++    import sqlite3
++    from hermes_cli import kanban_scratch_archive as sa
++    tid, path = _plain_task(lambda p: None)
++    saved = sa.archive_workspace(path, _archive(tid), task_id=tid, completed_at=OLD)
++    real_txn = kb.write_txn
++    calls = []
++
++    @contextlib.contextmanager
++    def fail_final_commit(conn):
++        with real_txn(conn):
++            calls.append(True)
++            yield
++            if len(calls) == 2:
++                raise sqlite3.OperationalError("injected final commit failure")
++
++    def fail(*args, **kwargs):
++        raise OSError("injected filesystem failure")
++
++    if failure == "intent_fsync":
++        monkeypatch.setattr(sa.os, "fsync", fail)
++    elif failure == "commit":
++        monkeypatch.setattr(kb, "write_txn", fail_final_commit)
++    elif failure == "remove":
++        monkeypatch.setattr(sa.shutil, "rmtree", fail)
++    else:
++        real_check, real_rename = sa.check_snapshot, sa._rename_noreplace
++
++        def change(tree, snapshot, **kwargs):
++            if kwargs.get("renamed"):
++                (tree / "late.txt").write_text("unarchived")
++            real_check(tree, snapshot, **kwargs)
++
++        def cannot_restore(source, dest):
++            if dest == path:
++                fail()
++            real_rename(source, dest)
++
++        monkeypatch.setattr(sa, "check_snapshot", change)
++        monkeypatch.setattr(sa, "_rename_noreplace", cannot_restore)
++    with kbc.connect_closing() as conn:
++        def finalize():
++            conn.execute("UPDATE tasks SET title='finalized' WHERE id=?", (tid,))
++
++        with pytest.raises((OSError, sqlite3.Error, sa.ArchiveRefused)):
++            sa.remove_archived(conn, path, saved, lambda tree: True, finalize)
++        title = conn.execute("SELECT title FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++        assert (title == "finalized") == (failure == "remove")
++    intents = list(saved.glob("detach-*.json"))
++    assert len(intents) == 1
++    record = json.loads(intents[0].read_text())
++    if failure in ("intent_fsync", "commit"):
++        assert (path / "notes.txt").read_text() == "scratch"
++        assert not Path(record["detached"]).exists()
++    else:
++        assert not path.exists()
++        assert (Path(record["detached"]) / "notes.txt").read_text() == "scratch"
++        if failure == "restore":
++            assert (Path(record["detached"]) / "late.txt").read_text() == "unarchived"
++
++
++@pytest.mark.parametrize("when", [0, 1], ids=["pre_detach", "postscan"])
++def test_root_replaced_after_scan_is_never_removed(board, monkeypatch, when):
++    from hermes_cli import kanban_scratch_archive as sa
++    tid, path = _plain_task(lambda p: None)
++    saved = sa.archive_workspace(path, _archive(tid), task_id=tid, completed_at=OLD)
++    check, calls = sa.check_snapshot, []
++    preserved = path.with_name(path.name + "-preserved")
++
++    def swap_after_scan(tree, snapshot, **kwargs):
++        check(tree, snapshot, **kwargs)
++        if len(calls) == when:
++            tree.rename(preserved)
++            tree.mkdir()
++        calls.append(tree)
++
++    def forbidden(*args, **kwargs):
++        pytest.fail("must not remove a root whose identity changed after scan")
++
++    monkeypatch.setattr(sa, "check_snapshot", swap_after_scan)
++    monkeypatch.setattr(sa.shutil, "rmtree", forbidden)
++    with kbc.connect_closing() as conn:
++        if when:
++            with pytest.raises(sa.ArchiveRefused):
++                sa.remove_archived(conn, path, saved, lambda tree: True, forbidden)
++        else:
++            assert sa.remove_archived(conn, path, saved, lambda tree: True, forbidden) == 0
++    assert (preserved / "notes.txt").read_text() == "scratch"
++    assert path.is_dir() and list(path.iterdir()) == []
++
++
++# ---- review fixes: durability before publication, raw-row path equality -------------------------------
++
++
++def _fd_path(fd):
++    return os.readlink(f"/proc/self/fd/{fd}")
++
++
++def test_archive_fsyncs_all_artifacts_bottom_up_before_publication_and_detach(board, monkeypatch):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    tid, path = _plain_task(lambda p: ((p / "sub").mkdir(), (p / "sub" / "f.txt").write_text("x")))
++    events = []
++    real_fsync, real_detach, real_rename = os.fsync, sa._rename_noreplace, Path.rename
++
++    def spy_fsync(fd):
++        events.append(("fsync", _fd_path(fd)))
++        return real_fsync(fd)
++
++    def spy_detach(src, dst):
++        events.append(("detach", str(src)))
++        return real_detach(src, dst)
++
++    def spy_publish(self, target):
++        if ".partial-" in self.name:
++            events.append(("publish", str(self)))
++        return real_rename(self, target)
++
++    monkeypatch.setattr(os, "fsync", spy_fsync)
++    monkeypatch.setattr(sa, "_rename_noreplace", spy_detach)
++    monkeypatch.setattr(Path, "rename", spy_publish)
++    assert _gc() == 0 and not path.exists()
++    kinds = [k for k, _ in events]
++    pub, det = kinds.index("publish"), kinds.index("detach")
++    assert pub < det
++    partial = events[pub][1]
++    before = [p for k, p in events[:pub] if k == "fsync"]
++    tree = next(i for i, p in enumerate(before) if p.endswith("tree.tar.gz"))
++    manifest = next(i for i, p in enumerate(before) if p.endswith("manifest.json"))
++    payload_dir = before.index(str(Path(partial) / sa.PAYLOAD_DIR))
++    assert max(tree, manifest) < payload_dir < before.index(partial)  # files, then dir, then parent dir
++    assert str(_archive(tid).parent) in [p for k, p in events[pub:det] if k == "fsync"]
++
++
++@pytest.mark.parametrize("target", ["file", "directory", "publication_parent"])
++def test_fsync_failure_fails_closed_without_publication(board, monkeypatch, target):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    tid, path = _plain_task(lambda p: None)
++    real_fsync = os.fsync
++
++    def flaky(fd):
++        link = _fd_path(fd)
++        hit = {"file": link.endswith("manifest.json"), "directory": link.endswith(sa.PAYLOAD_DIR),
++               "publication_parent": link == str(_archive(tid).parent)}[target]
++        if hit:
++            raise OSError(5, "EIO")
++        return real_fsync(fd)
++
++    monkeypatch.setattr(os, "fsync", flaky)
++    assert _gc() == 0
++    assert (path / "notes.txt").read_text() == "scratch"
++    parent = _archive(tid).parent
++    assert not parent.exists() or list(parent.iterdir()) == []
++
++
++@pytest.mark.parametrize("raw", [None, "~/hermes/kanban/workspaces/{tid}"], ids=["null_path", "tilde_path"])
++def test_null_or_tilde_row_path_is_archived_and_repeat_gc_is_idempotent(board, monkeypatch, raw):
++    monkeypatch.setenv("HOME", str(board))
++    tid, path = _plain_task(lambda p: None)
++    with kbc.connect_closing() as conn, kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (raw.format(tid=tid) if raw else None, tid))
++    assert _gc() == 0
++    assert not path.exists()
++    assert (_archive(tid) / PAYLOAD / "manifest.json").exists()
++    assert [k for k, _ in _events(tid)].count("workspace_archived") == 1
++    assert _gc() == 0
++    assert [k for k, _ in _events(tid)].count("workspace_archived") == 1
+-- 
+2.55.0
+

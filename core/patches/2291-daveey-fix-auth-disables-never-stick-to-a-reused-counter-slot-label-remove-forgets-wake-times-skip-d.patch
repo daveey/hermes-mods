@@ -1,0 +1,182 @@
+From 2354ecdd51ed43ce6cfd7ad7e845de76434110f2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:06:35 +0000
+Subject: [PATCH] [daveey] fix(auth): disables never stick to a reused
+ counter/slot label; remove forgets; wake times skip disabled rows
+
+>From the review of 5dd6e6063d8 (items not covered by the later commits):
+- labels that name a slot or a counter (api-key-N, env-var/slot names like claude_code,
+  hermes_pkce, device_code, env:...) never match by label, so a new row reusing one is not
+  born disabled; matching then goes by id (+ JWT account);
+- hermes auth remove drops the disable records of the removed row unless another remaining row
+  of that account still matches them;
+- next_available_at ignores disabled rows (fallback-restore gate and 'available at' messages).
+
+Proof: 4 new tests RED with the fixes reverted, GREEN with them.
+---
+ agent/credential_pool.py                      |  4 +--
+ agent/credential_pool_disabled.py             | 33 +++++++++++++++++-
+ hermes_cli/auth_commands.py                   |  2 ++
+ .../test_credential_pool_disabled_paths.py    | 34 +++++++++++++++++++
+ tests/hermes_cli/test_auth_disable_command.py |  7 ++++
+ 5 files changed, 77 insertions(+), 3 deletions(-)
+
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index cca2172328f..36112c45f15 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -1008,14 +1008,14 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+                 until
+                 for until in (
+                     _exhausted_until(entry, sole_credential=sole_credential)
+-                    for entry in self._entries
++                    for entry in self._enabled_entries()
+                     if entry.last_status == STATUS_EXHAUSTED
+                 )
+                 if until is not None
+             ]
+             candidates.extend(
+                 until
+-                for entry in self._entries
++                for entry in self._enabled_entries()
+                 if entry.last_status != STATUS_DEAD
+                 for until in (model_cooldown_until(entry, model),)
+                 if until is not None
+diff --git a/agent/credential_pool_disabled.py b/agent/credential_pool_disabled.py
+index cc5c31d9e80..9c363ee4bb8 100644
+--- a/agent/credential_pool_disabled.py
++++ b/agent/credential_pool_disabled.py
+@@ -20,6 +20,7 @@ applies to every profile on the host. Reads are cached by each file's (mtime, si
+ from __future__ import annotations
+ 
+ import json
++import re
+ import logging
+ import os
+ import threading
+@@ -48,8 +49,13 @@ def _records(store: dict[str, Any], provider: str) -> list[dict[str, Any]]:
+     return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+ 
+ 
++_GENERIC_RE = re.compile(r"api-key-\d+|[a-z][a-z0-9]*(_[a-z0-9]+)+")  # numbered keys, env-var/slot names
++
++
+ def _generic(label: str) -> bool:
+-    return label in _GENERIC_LABELS or label.startswith(("env:", "env ")) or not label
++    """Labels naming a slot or a counter, not an account: reused by unrelated rows, so never matched."""
++    return not label or label in _GENERIC_LABELS or label.startswith(("env:", "env ")) or bool(
++        _GENERIC_RE.fullmatch(label))
+ 
+ 
+ def account_of(entry: Any) -> Optional[str]:
+@@ -189,6 +195,31 @@ def set_credential_disabled(provider: str, entry: Any, disabled: bool) -> bool:
+     return True
+ 
+ 
++def forget_removed(provider: str, removed: Any, remaining: Iterable[Any]) -> bool:
++    """After ``hermes auth remove``: drop the records that disabled *removed* and match no remaining row,
++    so a later row reusing its id or label is not born disabled. Active store only."""
++    from hermes_cli import auth as auth_mod
++    remaining = list(remaining)
++    with auth_mod._auth_store_lock():
++        store = auth_mod._load_auth_store()
++        records = _records(store, provider)
++        keep = [r for r in records if not matches(removed, _keys_from_records([r]))
++                or any(matches(e, _keys_from_records([r])) for e in remaining)]
++        if len(keep) == len(records):
++            return False
++        section = store.get(SECTION) if isinstance(store.get(SECTION), dict) else {}
++        if keep:
++            section[provider] = keep
++        else:
++            section.pop(provider, None)
++        if section:
++            store[SECTION] = section
++        else:
++            store.pop(SECTION, None)
++        auth_mod._save_auth_store(store)
++    return True
++
++
+ def disabled_by_root(provider: str, entry: Any) -> bool:
+     """True when the global root (not the active profile) holds a record disabling *entry*."""
+     from hermes_cli import auth as auth_mod
+diff --git a/hermes_cli/auth_commands.py b/hermes_cli/auth_commands.py
+index 0495fc2c42d..82eb44e7776 100644
+--- a/hermes_cli/auth_commands.py
++++ b/hermes_cli/auth_commands.py
+@@ -616,6 +616,8 @@ def auth_remove_command(args) -> None:
+     if removed is None:
+         raise SystemExit(f'No credential matching "{target}" for provider {provider}.')
+     print(f"Removed {provider} credential #{index} ({removed.label})")
++    from agent.credential_pool_disabled import forget_removed
++    forget_removed(provider, removed, pool.entries())
+ 
+     # Every credential source Hermes reads from (env vars, external OAuth files, auth.json blocks,
+     # custom config) has a RemovalStep in agent.credential_sources; it does the source-specific
+diff --git a/tests/agent/test_credential_pool_disabled_paths.py b/tests/agent/test_credential_pool_disabled_paths.py
+index 66b8534d6c4..9a84cc310c1 100644
+--- a/tests/agent/test_credential_pool_disabled_paths.py
++++ b/tests/agent/test_credential_pool_disabled_paths.py
+@@ -1,5 +1,6 @@
+ """Paths that hand out a token without pool selection also refuse a `hermes auth disable`d account."""
+ import os
++from dataclasses import replace
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -265,3 +266,36 @@ def test_a_disabled_row_is_not_a_fallback_and_never_binds_a_delegated_child(monk
+     child = SimpleNamespace(_credential_pool=pool, base_url="https://child.example", _swap_credential=bound.append)
+     _, lease = _lease_child_credential(child)
+     assert bound == [] and lease is None
++
++
++def test_counter_and_slot_labels_never_disable_an_unrelated_row():
++    for label in ("api-key-2", "device_code", "hermes_pkce", "claude_code", "anthropic_token", "env:ANTHROPIC_TOKEN"):
++        keys = cpd._keys_from_records([{"id": "gone", "label": label}])
++        assert not cpd.matches(SimpleNamespace(id="new", label=label, access_token=""), keys), label
++    keys = cpd._keys_from_records([{"id": "gone", "label": "A@Example.com"}])
++    assert cpd.matches(SimpleNamespace(id="new", label="a@example.com", access_token=""), keys)
++
++
++def test_auth_remove_forgets_the_disable_unless_another_row_of_that_account_remains():
++    rows = [PooledCredential(provider="anthropic", id=f"row{i}", label=label, source="manual", auth_type="api_key",
++                             access_token=f"fixture-anthropic-{i}", priority=i)
++            for i, label in enumerate(["a@example.com", "a@example.com", "b@example.com"])]
++    write_credential_pool("anthropic", [e.to_dict() for e in rows])
++    _disable("anthropic", rows[0])
++    _disable("anthropic", rows[2])
++    assert cpd.forget_removed("anthropic", rows[0], rows[1:]) is False  # row1 is the same account: keep
++    assert cpd.forget_removed("anthropic", rows[2], rows[:2]) is True
++    cpd._cache.clear()
++    assert cpd.is_credential_disabled("anthropic", rows[1])
++    assert not cpd.is_credential_disabled("anthropic", SimpleNamespace(id="row2", label="b@example.com", access_token=""))
++
++
++def test_next_available_at_ignores_disabled_rows():
++    import time
++    pool = _pool("openai-codex")
++    soon, later = time.time() + 60, time.time() + 3600
++    pool._entries = [replace(e, last_status="exhausted", last_error_reset_at=t)
++                     for e, t in zip(pool._entries, (soon, later))]
++    assert abs(pool.next_available_at() - soon) < 1
++    _disable("openai-codex", pool.entries()[0])
++    assert abs(pool.next_available_at() - later) < 1
+diff --git a/tests/hermes_cli/test_auth_disable_command.py b/tests/hermes_cli/test_auth_disable_command.py
+index 3ddce365208..72abbea45d3 100644
+--- a/tests/hermes_cli/test_auth_disable_command.py
++++ b/tests/hermes_cli/test_auth_disable_command.py
+@@ -78,3 +78,10 @@ def test_enable_warns_when_root_disables(home, monkeypatch, tmp_path, capsys):
+     _run("enable", "acct0", parse=False)
+     out = capsys.readouterr().out
+     assert "(already enabled)" in out and "global Hermes home also disables" in out
++
++
++def test_remove_forgets_the_disable_so_a_re_added_row_is_not_born_disabled(home):
++    from hermes_cli.auth_commands import auth_remove_command
++    _run("disable", "acct0")
++    auth_remove_command(SimpleNamespace(provider="anthropic", target="acct0"))
++    assert "disabled_credentials" not in json.loads((home / "auth.json").read_text())
+-- 
+2.55.0
+

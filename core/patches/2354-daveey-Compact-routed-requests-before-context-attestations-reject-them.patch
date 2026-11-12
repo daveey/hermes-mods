@@ -1,0 +1,659 @@
+From 1ade020096a4890775ec6113b3e0768bf9dc9380 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:38:02 +0000
+Subject: [PATCH] [daveey] Compact routed requests before context attestations
+ reject them
+
+Treat only otherwise eligible request-size refusals as bounded context overflow; retain billing, funding, mixed-capability and irreducible-budget refusals. Align proactive compression with the route validator estimator and output runway; use attested auxiliary class windows without probing selectors.
+
+Proof: parent turn-loop RED required=276008 attested=272000 (2 failures, 6 policy controls pass). Focused GREEN 24 tests; related compression/routing/autoraise suite 1081 passed before final control additions. Sixteen exact-anchor mutants killed. Ordinary Codex .50-to-.85 autoraise with a true 272k window was already safe; estimator divergence is independently covered. Worker deployment and post-deploy live threshold crossing remain to be verified by the owner card.
+---
+ agent/context_compressor.py                   |  13 +--
+ agent/context_compressor_threshold.py         |  16 +++
+ agent/context_engine.py                       |  13 ++-
+ agent/conversation_compression.py             |  18 +--
+ agent/conversation_compression_feasibility.py |  20 ++++
+ agent/error_classifier.py                     |   3 +
+ agent/model_routing.py                        |   4 +
+ agent/model_routing_request.py                |  78 ++++++++++++-
+ agent/turn_preflight_gate.py                  |   3 +-
+ agent/turn_request_assembly.py                |   5 +
+ tests/agent/test_route_context_budget.py      | 105 ++++++++++++++++++
+ .../agent/test_route_context_budget_edges.py  |  84 ++++++++++++++
+ tests/agent/test_route_context_recovery.py    |  98 ++++++++++++++++
+ 13 files changed, 434 insertions(+), 26 deletions(-)
+ create mode 100644 agent/context_compressor_threshold.py
+ create mode 100644 tests/agent/test_route_context_budget.py
+ create mode 100644 tests/agent/test_route_context_budget_edges.py
+ create mode 100644 tests/agent/test_route_context_recovery.py
+
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 372e98771b3..02f7293ac79 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -2205,12 +2205,8 @@ class ContextCompressor(
+ 
+     @property
+     def threshold_tokens(self) -> int:
+-        if self._threshold_tokens is None:
+-            # Resolve the window first: it may floor threshold_percent as a side effect.
+-            _ctx = self.context_length
+-            self._threshold_tokens = self._compute_threshold_tokens(_ctx, self.threshold_percent, self.max_tokens)
+-            self._apply_threshold_tokens_cap()
+-        return self._threshold_tokens
++        from agent.context_compressor_threshold import threshold_tokens
++        return threshold_tokens(self)
+ 
+     @threshold_tokens.setter
+     def threshold_tokens(self, value: int) -> None:
+@@ -2681,6 +2677,7 @@ class ContextCompressor(
+         if max_tokens is not None:
+             self.max_tokens = self._coerce_max_tokens(max_tokens)
+         if runtime_changed:
++            self._route_context_ceiling = None
+             # The aux ceiling was probed against the previous main runtime (an "auto" aux route follows the
+             # main model); the caller re-runs the feasibility probe. A same-runtime recompute (overflow-reported
+             # window, grown local window, tier cap) keeps it: the summariser did not change (#114707).
+@@ -2741,11 +2738,11 @@ class ContextCompressor(
+         """Clamp threshold_tokens to the configured cap (itself clamped to the context length) and to the
+         auxiliary summariser's window when the feasibility probe installed one."""
+         cap = self._effective_threshold_cap(self.context_length)
+-        if cap is not None and cap < self.threshold_tokens:
++        if cap is not None and cap < self._threshold_tokens:
+             self.threshold_tokens = cap
+         # Durable, so every recomputation honours it rather than a one-time assignment (#114707).
+         _aux_ceiling = getattr(self, "_aux_context_ceiling", None)
+-        if isinstance(_aux_ceiling, int) and 0 < _aux_ceiling < self.threshold_tokens:
++        if isinstance(_aux_ceiling, int) and 0 < _aux_ceiling < self._threshold_tokens:
+             self.threshold_tokens = _aux_ceiling
+ 
+     @staticmethod
+diff --git a/agent/context_compressor_threshold.py b/agent/context_compressor_threshold.py
+new file mode 100644
+index 00000000000..bbcfce4a875
+--- /dev/null
++++ b/agent/context_compressor_threshold.py
+@@ -0,0 +1,16 @@
++"""Lazy compression trigger evaluation, including the selected route's request budget."""
++
++
++def threshold_tokens(compressor):
++    if compressor._threshold_tokens is None:
++        # Resolve the window first: it may floor threshold_percent as a side effect.
++        context = compressor.context_length
++        compressor._threshold_tokens = compressor._compute_threshold_tokens(
++            context, compressor.threshold_percent, compressor.max_tokens)
++        compressor._apply_threshold_tokens_cap()
++    threshold = compressor._threshold_tokens
++    for name in ("_aux_context_ceiling", "_route_context_ceiling"):
++        cap = getattr(compressor, name, None)
++        if isinstance(cap, int):
++            threshold = min(threshold, cap)
++    return threshold
+diff --git a/agent/context_engine.py b/agent/context_engine.py
+index eec8ac0efcd..e47b1767ce4 100644
+--- a/agent/context_engine.py
++++ b/agent/context_engine.py
+@@ -57,7 +57,18 @@ class ContextEngine(ABC):
+     last_prompt_tokens: int = 0
+     last_completion_tokens: int = 0
+     last_total_tokens: int = 0
+-    threshold_tokens: int = 0
++    _engine_threshold_tokens: int = 0
++
++    @property
++    def threshold_tokens(self) -> int:
++        cap = getattr(self, "_route_context_ceiling", None)
++        return min(self._engine_threshold_tokens, cap) if isinstance(cap, int) else self._engine_threshold_tokens
++
++    @threshold_tokens.setter
++    def threshold_tokens(self, value: int) -> None:
++        self._engine_threshold_tokens = value
++        self._route_context_ceiling = None
++
+     context_length: int = 0
+     compression_count: int = 0
+     # Compaction parameters (read by run_agent.py for preflight). protect_first_n counts
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index e33b9eed3d7..04120de9753 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -2037,7 +2037,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
+             _resolve_task_provider_model, _try_configured_fallback_for_unavailable_client,
+             get_text_auxiliary_client,
+         )
+-        from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
++        from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
+         # Provider may be "auto"; fall back to the client's base_url hostname so the
+         # user can tell where the compression model is actually called.
+         try:
+@@ -2078,17 +2078,8 @@ def check_compression_model_feasibility(agent: Any) -> None:
+         _aux_provider = (
+             _aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(agent, "provider", "")
+         )
+-        _aux_cfg_ctx = _configured_compression_context_length(agent)
+-        if _aux_cfg_ctx is None and _aux_inherits_main_route(agent, aux_model, aux_base_url):
+-            # Same model on the same route: reuse the main model's already-resolved window (which honours
+-            # model.context_length / provider pins). Re-resolving from scratch lost the pin and auto-lowered
+-            # the session threshold to a catch-all catalog value (#89500, #45519).
+-            aux_context = int(agent.context_compressor.context_length)
+-        else:
+-            aux_context = get_model_context_length(
+-                aux_model, base_url=aux_base_url, api_key=aux_api_key, config_context_length=_aux_cfg_ctx,
+-                provider=_aux_provider, custom_providers=_configured_custom_providers(agent),
+-            )
++        from agent.conversation_compression_feasibility import compression_context_window
++        aux_context = compression_context_window(agent, aux_model, aux_base_url, aux_api_key, _aux_provider)
+         # Aux model must meet MINIMUM_CONTEXT_LENGTH like the main model, else it cannot summarise a full window.
+         if aux_context and aux_context < MINIMUM_CONTEXT_LENGTH:
+             raise ValueError(
+@@ -2111,6 +2102,9 @@ def check_compression_model_feasibility(agent: Any) -> None:
+             # replayed (``replay_compression_warning``) for a session that is no longer clamped (#114707).
+             agent._last_feasibility_notice = None
+             agent._compression_warning = None
++        if getattr(agent.context_compressor, "_route_context_ceiling", None) is not None:
++            # Keep a masked aux limit: removing the route cap must not lose it.
++            agent.context_compressor._aux_context_ceiling = aux_context
+     except ValueError:
+         # Hard rejections (aux below minimum context) must propagate so the session refuses to start.
+         raise
+diff --git a/agent/conversation_compression_feasibility.py b/agent/conversation_compression_feasibility.py
+index 3b0d2a7012a..63ed02539ec 100644
+--- a/agent/conversation_compression_feasibility.py
++++ b/agent/conversation_compression_feasibility.py
+@@ -10,6 +10,26 @@ from typing import Any
+ logger = logging.getLogger("agent.conversation_compression")
+ 
+ 
++def compression_context_window(agent, aux_model, aux_base_url, aux_api_key, aux_provider):
++    """Concrete metadata for allocated helpers; attested windows for deferred classes."""
++    from agent.conversation_compression import (
++        _aux_inherits_main_route, _configured_compression_context_length, _configured_custom_providers)
++    from agent.model_metadata import get_model_context_length
++    from agent.model_routing import is_class_selector
++
++    if is_class_selector(aux_model):
++        # Readiness must neither allocate nor send a selector into the model catalog.
++        from gateway.run_class_routing import class_context_length
++        return class_context_length(aux_model)
++    configured = _configured_compression_context_length(agent)
++    if configured is None and _aux_inherits_main_route(agent, aux_model, aux_base_url):
++        # Reuse the main route's resolved window, including its explicit context pin.
++        return int(agent.context_compressor.context_length)
++    return get_model_context_length(
++        aux_model, base_url=aux_base_url, api_key=aux_api_key, config_context_length=configured,
++        provider=aux_provider, custom_providers=_configured_custom_providers(agent))
++
++
+ def _probe(agent: Any) -> None:
+     from agent.conversation_compression import check_compression_model_feasibility
+     check_compression_model_feasibility(agent)
+diff --git a/agent/error_classifier.py b/agent/error_classifier.py
+index 7fb46e0b668..2e69b1a903d 100644
+--- a/agent/error_classifier.py
++++ b/agent/error_classifier.py
+@@ -1130,6 +1130,9 @@ def classify_api_error(
+     ``api_key`` identifies an anonymous request; a host or fairshare reason alone does not.
+     The credential is never included in the returned context."""
+     from hermes_cli.anon_auth import is_anonymous_request
++    from agent.model_routing import RouteContextOverflow
++    if isinstance(error, RouteContextOverflow):
++        return ClassifiedError(provider=provider, model=model, message=str(error), **_V_CONTEXT_OVERFLOW)
+     status_code = _extract_status_code(error)
+     # Some SDK RateLimitError / AuthenticationError classes set no .status_code; the class names it.
+     if status_code is None:
+diff --git a/agent/model_routing.py b/agent/model_routing.py
+index f5fdbd8edb5..0b52d2943f4 100644
+--- a/agent/model_routing.py
++++ b/agent/model_routing.py
+@@ -17,6 +17,10 @@ class ModelRoutingError(ValueError):
+     """Fail closed; deliberately not AuthError (legacy paid fallbacks catch it)."""
+ 
+ 
++class RouteContextOverflow(ModelRoutingError):
++    """An otherwise eligible route only needs a smaller request; never authorize failover."""
++
++
+ def is_class_selector(model):
+     return isinstance(model, str) and model.startswith("class:")
+ 
+diff --git a/agent/model_routing_request.py b/agent/model_routing_request.py
+index 514ae4e4f5e..98f6bf3ce11 100644
+--- a/agent/model_routing_request.py
++++ b/agent/model_routing_request.py
+@@ -47,6 +47,64 @@ def _failing_requirements(route, requirements):
+     return failing
+ 
+ 
++def output_reservation(agent, request):
++    """One output runway calculation for route admission and proactive compaction."""
++    reservation = next((request[key] for key in (
++        "max_tokens", "max_completion_tokens", "max_output_tokens") if request.get(key)), None)
++    if reservation is not None:
++        return reservation
++    reservation = getattr(agent, "_ephemeral_max_output_tokens", None)
++    if reservation is None:
++        reservation = getattr(agent, "max_tokens", None)
++    if getattr(agent, "api_mode", None) == "anthropic_messages":
++        from agent.anthropic_adapter import _resolve_anthropic_messages_max_tokens
++        reservation = _resolve_anthropic_messages_max_tokens(reservation, agent.model)
++        window = agent.context_compressor.context_length
++        return max(window - 1, 1) if window and reservation > window else reservation
++    return reservation or 4096
++
++
++def route_preflight_pressure(agent, request, pressure):
++    """Honor the selected transport's attestation even when usage/catalog estimates disagree.
++
++    This does not authorize a request: final validation still checks the current
++    policy, identity and every capability. Recompute the cap per request so a new
++    output reservation or route never retains the previous route's budget.
++    """
++    import logging
++    from hermes_cli.config_effective import load_user_config_effective
++
++    agent._route_context_pressure = False
++    metadata = getattr(agent, "model_routing", None)
++    compressor = getattr(agent, "context_compressor", None)
++    if compressor is None:
++        return pressure
++    compressor._route_context_ceiling = None
++    if not metadata:
++        return pressure
++    policy = load_user_config_effective().get("model_routing", {})
++    routes = policy.get("routes", {}).get(metadata["requested_class"], [])
++    windows = [r["capabilities"].get("context_tokens", 0) for r in routes
++               if (r["provider"], r["model"], r["billing"]) == (
++                   agent.provider, agent.model, metadata["billing_group"])]
++    if not windows or windows[0] <= 0:
++        return pressure
++    # No amount of history compression can create output runway in this case.
++    cap = windows[0] * 98 // 100 - output_reservation(agent, request)
++    if cap <= 0:
++        return pressure
++    previous = compressor.threshold_tokens
++    compressor._route_context_ceiling = cap
++    if cap < previous and not getattr(agent, "_route_context_cap_logged", False):
++        logging.getLogger(__name__).info(
++            "Route context cap: model=%s provider=%s attested=%s prompt_trigger=%s output_reservation=%s",
++            agent.model, agent.provider, windows[0], cap, output_reservation(agent, request))
++        agent._route_context_cap_logged = True
++    estimate = _estimate_context_tokens(request, request)
++    agent._route_context_pressure = estimate >= compressor.threshold_tokens
++    return max(pressure, estimate)
++
++
+ def _requirements(agent, request, streaming):
+     requirements = dict(agent._model_routing_requirements)
+     # The construction-time minimum (e.g. compression's context floor) is remembered once;
+@@ -61,9 +119,7 @@ def _requirements(agent, request, streaming):
+     # against token-denominated route caps). Includes tool schemas, system prompt and the
+     # output reservation, not just user text.
+     context = _estimate_context_tokens(request, payload)
+-    reservation = next((request[key] for key in (
+-        "max_tokens", "max_completion_tokens", "max_output_tokens") if request.get(key)), None)
+-    context += reservation or getattr(agent, "max_tokens", None) or 4096
++    context += output_reservation(agent, request)
+     requirements["min_context_tokens"] = max(floor, context)
+     requirements.update(tools=bool(request.get("tools")), vision=_has_image(payload),
+                         streaming=streaming, json=bool(request.get("response_format") or
+@@ -110,6 +166,20 @@ def validate_class_request(agent, request, *, streaming):
+         failing = _failing_requirements(same[0], requirements) if same else []
+         if failing:
+             detail = "; failing capability: " + ", ".join(failing)
+-        raise ModelRoutingError(
++        # Compress only a request-size failure. A withdrawn route, funding/billing
++        # fence, mixed capability failure or impossible construction floor is not
++        # made eligible by deleting history.
++        from agent.model_routing import RouteContextOverflow
++        context_free = {key: value for key, value in requirements.items() if key != "min_context_tokens"}
++        recoverable = policy.get("enabled") and any(
++            route.get("eligible") and route.get("funding_verified")
++            and route["billing"] == metadata["billing_group"]
++            and (route["billing"] == "subscription" or policy.get("allow_metered", False))
++            and _capable(route, context_free)
++            and agent._model_routing_context_floor <= route["capabilities"].get("context_tokens", 0)
++            and output_reservation(agent, request) < route["capabilities"].get("context_tokens", 0)
++            for route in same)
++        error_type = RouteContextOverflow if recoverable else ModelRoutingError
++        raise error_type(
+             "Selected class route is ineligible for this request; no bypass permitted" + detail)
+     agent._model_routing_requirements = requirements
+diff --git a/agent/turn_preflight_gate.py b/agent/turn_preflight_gate.py
+index 514038fb55f..57906d58177 100644
+--- a/agent/turn_preflight_gate.py
++++ b/agent/turn_preflight_gate.py
+@@ -93,7 +93,8 @@ def run_preflight_gate(
+         # An anchored figure is real usage + delta: never deferred. Only a whole-context rough
+         # estimate waits for the provider's count.
+         defer_preflight=(
+-            (lambda _t: False) if getattr(agent, "_request_pressure_anchored", False)
++            (lambda _t: False) if (getattr(agent, "_request_pressure_anchored", False)
++                                  or getattr(agent, "_route_context_pressure", False))
+             else getattr(_compressor, "should_defer_preflight_to_real_usage", lambda _t: False)
+         ),
+         moa_prepared_request=_moa_prepared_request, system_message=system_message,
+diff --git a/agent/turn_request_assembly.py b/agent/turn_request_assembly.py
+index 423f12a52d6..b0666737f81 100644
+--- a/agent/turn_request_assembly.py
++++ b/agent/turn_request_assembly.py
+@@ -289,6 +289,11 @@ def assemble_api_request(
+         request_pressure_tokens = _pressure_with_real_floor(
+             agent.context_compressor, request_pressure_tokens
+         )
++    from agent.model_routing_request import route_preflight_pressure
++
++    request_pressure_tokens = route_preflight_pressure(agent, {
++        "model": agent.model, "messages": api_messages, "tools": tools_for_api,
++    }, request_pressure_tokens)
+     # Measured: the request-only replay price must not reach a provider.
+     from agent.message_metadata import drop_request_reasoning_tokens
+ 
+diff --git a/tests/agent/test_route_context_budget.py b/tests/agent/test_route_context_budget.py
+new file mode 100644
+index 00000000000..7c85a5c1056
+--- /dev/null
++++ b/tests/agent/test_route_context_budget.py
+@@ -0,0 +1,105 @@
++"""Keep routed preflight in the validator's units and reserve output runway."""
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from agent.context_compressor import ContextCompressor
++from tests.agent import test_route_context_recovery as recovery
++from tests.agent import test_compression_feasibility as feasibility
++
++route = recovery.route
++
++
++def test_attested_budget_caps_larger_metadata_window(route, caplog):
++    from agent.model_routing_request import route_preflight_pressure
++    agent, _, _ = route
++    compressor = agent.context_compressor = ContextCompressor(
++        "gpt-6-astra", provider="openai-codex", config_context_length=1050000,
++        threshold_percent=.85, max_tokens=8000, quiet_mode=True)
++    request = {"messages": [{"role": "user", "content": "x" * 1072000}], "max_tokens": 8000}
++    with caplog.at_level("INFO"):
++        pressure = route_preflight_pressure(agent, request, 10000)
++        route_preflight_pressure(agent, request, 10000)
++    assert pressure >= 268000
++    assert compressor.threshold_tokens + 8000 <= 272000 * .98
++    assert agent._route_context_pressure
++    assert sum("Route context cap" in r.message for r in caplog.records) == 1
++    compressor.update_model("gpt-6-astra", context_length=1050000, provider="openai-codex")
++    assert compressor.threshold_tokens + 8000 <= 272000 * .98
++
++
++def test_budget_uses_request_reservation_and_updates_each_request(route):
++    from agent.model_routing_request import route_preflight_pressure
++    agent, _, _ = route
++    agent.context_compressor = ContextCompressor("test", config_context_length=1050000, quiet_mode=True)
++    route_preflight_pressure(agent, {"messages": [], "max_output_tokens": 16000}, 10)
++    assert agent.context_compressor.threshold_tokens == 250560
++    route_preflight_pressure(agent, {"messages": [], "max_completion_tokens": 8000}, 10)
++    assert agent.context_compressor.threshold_tokens == 258560
++    assert not agent._route_context_pressure
++
++
++def test_unrouted_pressure_unchanged():
++    from agent.model_routing_request import route_preflight_pressure
++    agent = SimpleNamespace()
++    assert route_preflight_pressure(agent, {}, 123) == 123
++
++
++def test_autoraise_correct_codex_window_is_already_safe():
++    # Falsifies the proposed autoraise-only cause: the observed bug needs either
++    # estimator divergence or a larger metadata window, not .85 against 272k.
++    from agent.agent_init import _resolve_compression_threshold
++    from agent.auxiliary_client import _compression_threshold_for_model
++    threshold, _ = _resolve_compression_threshold(
++        .50, _compression_threshold_for_model("gpt-6-astra", "openai-codex"),
++        model="gpt-6-astra", is_codex_autoraise=True)
++    compressor = ContextCompressor("gpt-6-astra", provider="openai-codex",
++                                   config_context_length=272000, threshold_percent=threshold,
++                                   max_tokens=8000, quiet_mode=True)
++    assert compressor.threshold_tokens + 8000 <= 272000 * .98
++
++
++def test_proactive_route_budget_compacts_before_first_send(route, monkeypatch):
++    from agent.model_routing_request import validate_class_request
++    from tests.agent import test_413_compression as loop
++    agent = loop._new_test_agent()
++    selected, _, _entry = route
++    agent.model, agent.provider = selected.model, selected.provider
++    agent.model_routing = selected.model_routing
++    agent._model_routing_requirements = {}
++    agent.max_tokens = 8000
++    agent.context_compressor = ContextCompressor(
++        agent.model, provider=agent.provider, config_context_length=1050000,
++        threshold_percent=.85, max_tokens=8000, quiet_mode=True)
++    monkeypatch.setattr(agent, "_check_compression_model_feasibility", lambda: None)
++    monkeypatch.setattr("agent.conversation_loop._midturn_request_pressure_tokens", lambda *a: 10000)
++    sent = []
++    def send(**kwargs):
++        validate_class_request(agent, kwargs, streaming=True)
++        sent.append(kwargs)
++        return loop._mock_response("Recovered")
++    agent.client.chat.completions.create.side_effect = send
++    history = [{"role": "user", "content": "x" * 1072000},
++               {"role": "assistant", "content": "working"}]
++    with patch.object(agent, "_compress_context", return_value=([
++        {"role": "system", "content": "You are helpful."},
++        {"role": "user", "content": "summary"}], "You are helpful.")) as compress, \
++         patch.object(agent, "_persist_session"), patch.object(agent, "_save_trajectory"), \
++         patch.object(agent, "_cleanup_task_resources"):
++        result = agent.run_conversation("continue", conversation_history=history)
++    assert not result.get("failed"), result
++    assert result["final_response"] == "Recovered"
++    assert compress.call_count == 1
++    assert compress.call_args.kwargs["trigger"] == "pre_api"
++    assert len(sent) == 1
++
++
++def test_aux_class_feasibility_does_not_probe_selector(route):
++    agent = feasibility._make_agent(main_context=1050000)
++    with patch("agent.auxiliary_client._resolve_task_provider_model",
++               return_value=("auto", "class:deep", None, None, None)), \
++         patch("agent.auxiliary_client.get_text_auxiliary_client",
++               return_value=(SimpleNamespace(base_url="", api_key=""), "class:deep")), \
++         patch("agent.model_metadata.get_model_context_length", return_value=256000) as metadata:
++        agent._check_compression_model_feasibility()
++    metadata.assert_not_called()
++    assert agent.context_compressor.threshold_tokens == 272000
+diff --git a/tests/agent/test_route_context_budget_edges.py b/tests/agent/test_route_context_budget_edges.py
+new file mode 100644
+index 00000000000..3009e9c9d49
+--- /dev/null
++++ b/tests/agent/test_route_context_budget_edges.py
+@@ -0,0 +1,84 @@
++"""Adversarial controls for route pressure: switches, plugin engines and output-only overflow."""
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from agent.context_compressor import ContextCompressor
++from agent.error_classifier import classify_api_error
++from agent.model_routing_request import output_reservation, route_preflight_pressure
++from tests.agent import test_route_context_recovery as recovery
++from tests.agent.test_context_engine import StubEngine
++
++route = recovery.route
++
++
++def test_runtime_switch_drops_old_route_ceiling(route):
++    agent, _, _ = route
++    engine = agent.context_compressor = ContextCompressor(
++        agent.model, provider=agent.provider, config_context_length=1050000, threshold_percent=.85,
++        max_tokens=8000, quiet_mode=True)
++    route_preflight_pressure(agent, {}, 10)
++    assert engine.threshold_tokens == 258560
++    engine.update_model("another-model", context_length=1000000, provider="another-provider")
++    assert engine.threshold_tokens == 843200
++
++
++def test_same_runtime_recalibration_retains_aux_and_config_caps(route):
++    agent, _, _ = route
++    engine = agent.context_compressor = ContextCompressor(
++        agent.model, provider=agent.provider, config_context_length=1050000, threshold_percent=.85,
++        max_tokens=8000, threshold_tokens_cap=500000, quiet_mode=True)
++    engine._aux_context_ceiling = 400000
++    route_preflight_pressure(agent, {}, 10)
++    engine.update_model(agent.model, context_length=1050000, provider=agent.provider)
++    assert engine.threshold_tokens == 258560
++    agent.model_routing = None
++    route_preflight_pressure(agent, {}, 10)
++    assert engine.threshold_tokens == 400000
++    engine._aux_context_ceiling = None
++    engine.update_model(agent.model, context_length=1050000, provider=agent.provider)
++    assert engine.threshold_tokens == 500000
++
++
++def test_plugin_engine_honors_cap_and_reset(route):
++    agent, _, _ = route
++    engine = agent.context_compressor = StubEngine(context_length=1050000)
++    route_preflight_pressure(agent, {}, 10)
++    assert engine.threshold_tokens == 258560
++    assert engine.should_compress(268000)
++    engine.update_model(context_length=2000000)
++    assert engine.threshold_tokens == 400000
++
++
++@pytest.mark.parametrize("reservation", [272000, 300000])
++def test_output_only_overflow_does_not_destroy_history(route, reservation):
++    agent, _, _ = route
++    agent.context_compressor = ContextCompressor("test", config_context_length=1050000, quiet_mode=True)
++    request = {"max_tokens": reservation}
++    before = agent.context_compressor.threshold_tokens
++    assert route_preflight_pressure(agent, request, 100) == 100
++    assert agent.context_compressor.threshold_tokens == before
++    assert not agent._route_context_pressure
++    assert not classify_api_error(recovery.refusal(agent, **request)).should_compress
++
++
++def test_reservation_respects_ephemeral_and_explicit_wire_values():
++    agent = SimpleNamespace(max_tokens=8000, _ephemeral_max_output_tokens=16000)
++    assert output_reservation(agent, {}) == 16000
++    assert agent._ephemeral_max_output_tokens == 16000  # preview must not consume it
++    assert output_reservation(agent, {"max_output_tokens": 12000}) == 12000
++    agent._ephemeral_max_output_tokens = None
++    assert output_reservation(agent, {}) == 8000
++    agent.max_tokens = None
++    assert output_reservation(agent, {}) == 4096
++
++
++def test_anthropic_default_matches_adapter():
++    from agent.anthropic_adapter import _resolve_anthropic_messages_max_tokens
++    agent = SimpleNamespace(api_mode="anthropic_messages", model="claude-sonnet-5-5", max_tokens=None,
++                            context_compressor=SimpleNamespace(context_length=1000000))
++    assert output_reservation(agent, {}) == _resolve_anthropic_messages_max_tokens(None, agent.model)
++    agent.context_compressor.context_length = 64000
++    with patch("agent.anthropic_adapter._resolve_anthropic_messages_max_tokens", return_value=128000):
++        assert output_reservation(agent, {}) == 63999
+diff --git a/tests/agent/test_route_context_recovery.py b/tests/agent/test_route_context_recovery.py
+new file mode 100644
+index 00000000000..da945660385
+--- /dev/null
++++ b/tests/agent/test_route_context_recovery.py
+@@ -0,0 +1,98 @@
++"""A route context attestation is a compressible limit, not an authorization failure."""
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from agent.error_classifier import FailoverReason, classify_api_error
++from agent.model_routing import ModelRoutingError
++from agent.model_routing_request import validate_class_request
++from tests.agent import test_413_compression as helpers
++
++
++@pytest.fixture
++def route(monkeypatch):
++    entry = {"provider": "openai-codex", "model": "gpt-6-astra", "billing": "subscription",
++             "eligible": True, "funding_verified": True, "weight": 1,
++             "capabilities": {"tools": True, "streaming": True, "context_tokens": 272000}}
++    policy = {"enabled": True, "policy_version": 1, "routes": {"deep": [entry]}}
++    monkeypatch.setattr("agent.model_routing_managed.verify_managed_agent", lambda *a, **k: None)
++    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective",
++                        lambda: {"model_routing": policy})
++    agent = SimpleNamespace(model="gpt-6-astra", provider="openai-codex", max_tokens=8000,
++                            _model_routing_requirements={},
++                            model_routing={"selected_model": "gpt-6-astra",
++                                           "selected_provider": "openai-codex",
++                                           "requested_class": "deep", "billing_group": "subscription"})
++    return agent, policy, entry
++
++
++def refusal(agent, **request):
++    with pytest.raises(ModelRoutingError) as raised:
++        validate_class_request(agent, {"model": agent.model, "messages": [
++            {"role": "user", "content": "x" * 1072000}], "max_tokens": 8000, **request}, streaming=True)
++    return raised.value
++
++
++def test_context_only_refusal_is_compressible(route):
++    agent, _, _ = route
++    error = refusal(agent)
++    verdict = classify_api_error(error, provider=agent.provider, model=agent.model)
++    assert verdict.reason == FailoverReason.context_overflow
++    assert verdict.should_compress
++    assert not verdict.should_rotate_credential
++    assert not verdict.should_fallback
++
++
++@pytest.mark.parametrize("target,key,value,extra", [
++    ("caps", "tools", False, {"tools": [{"type": "function", "function": {"name": "t"}}]}),
++    ("policy", "enabled", False, {}),
++    ("entry", "funding_verified", False, {}),
++    ("entry", "eligible", False, {}),
++    ("metadata", "billing_group", "metered", {}),
++    ("requirements", "min_context_tokens", 300000, {}),
++])
++def test_non_context_policy_refusals_remain_terminal(route, target, key, value, extra):
++    agent, policy, entry = route
++    objects = {"caps": entry["capabilities"], "policy": policy, "entry": entry,
++               "metadata": agent.model_routing, "requirements": agent._model_routing_requirements}
++    objects[target][key] = value
++    assert not classify_api_error(refusal(agent, **extra)).should_compress
++
++
++def test_metered_refusal_does_not_compress(route):
++    agent, _, entry = route
++    agent.model_routing["billing_group"] = entry["billing"] = "metered"
++    assert not classify_api_error(refusal(agent)).should_compress
++
++
++def test_error_text_alone_does_not_authorize_compression():
++    error = ModelRoutingError("failing capability: min_context_tokens(required=276008, attested=272000)")
++    assert not classify_api_error(error).should_compress
++
++
++@pytest.mark.parametrize("exhausted", [False, True])
++def test_route_refusal_compacts_once_then_succeeds(route, monkeypatch, exhausted):
++    error = refusal(route[0])
++    agent = helpers._new_test_agent()
++    agent.max_compression_attempts = 1
++    agent.context_compressor.threshold_tokens = 1000000
++    agent.client.chat.completions.create.side_effect = [
++        error, error if exhausted else helpers._mock_response("Recovered")]
++    history = [{"role": "user", "content": "x" * 1072000},
++               {"role": "assistant", "content": "working"}]
++    monkeypatch.setattr("agent.turn_overflow.time.sleep", lambda *_: None)
++    with patch.object(agent, "_compress_context", return_value=([
++        {"role": "system", "content": "You are helpful."},
++        {"role": "user", "content": "summary"}], "You are helpful.")) as compress, \
++         patch.object(agent, "_persist_session"), patch.object(agent, "_save_trajectory"), \
++         patch.object(agent, "_cleanup_task_resources"):
++        result = agent.run_conversation("continue", conversation_history=history)
++    if exhausted:
++        assert result.get("failed")
++        assert result.get("compression_exhausted")
++    else:
++        assert not result.get("failed"), result
++        assert result["final_response"] == "Recovered"
++    assert compress.call_count == 1
++    assert agent.client.chat.completions.create.call_count == 2
+-- 
+2.55.0
+

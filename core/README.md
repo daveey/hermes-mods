@@ -17,10 +17,10 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 The [2253 regex escape repair](hostname-escape-repair.md) is a **mandatory post-replay
-overlay** in the Applying recipe below. The immutable mails alone retain two invalid
+overlay** in the Applying recipe below, re-bound to snapshot 2409 by `repair_hostname_escapes_2409.py`. The immutable mails alone retain two invalid
 placement regexes; the original verifier proves historical fidelity, not regex validity.
 
-2253 patches, one entry per non-merge source commit through `9bc6ed6b6df403e0c80529753b9814d3ec119cba`.
+2409 patches, one entry per non-merge source commit through `10a929b4a93d10921b7a16a40bd699e5507ffd8e`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -28,12 +28,62 @@ later-dated mainline commits: ordinals 1203 onward include such entries, and 128
 follows 1281 although it sorts at position 1259 by date. Each patch is identified by its SHA header, never by its
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
-Upstream exclusion tip: `8471f614b4879144d36e8919fb4e1f3c430d2100`; current merge-base: `b3746e35ddd32079697728e2df57a9d78f1e9e32`.
-Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All forty-one published bridges remain unchanged; there are no merges in the 2157–2253 append. The bridge before 2087 excludes the six byte-identical path deltas carried by patch 2087. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Current snapshot: [mirror-replay-2253.json](mirror-replay-2253.json), [mirror-policy-2253.json](mirror-policy-2253.json), and [executed proof](mirror-2253-verification.md). Previous snapshot: [mirror-2156-verification.md](mirror-2156-verification.md). The following links retain historical verification:
+Upstream exclusion tip: `e3bf4be5df04cf72dab4914b073361c71af1dbe1`; current merge-base: `78abaafcccec20a546c94e8734a70e38c08a6a69`.
+Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All forty-one published bridges remain unchanged; three source-derived integration bridges precede entries 2254, 2255 and 2256 (44 total). The bridge before 2087 excludes the six byte-identical path deltas carried by patch 2087. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Current snapshot: [mirror-replay-2409.json](mirror-replay-2409.json), [mirror-policy-2409.json](mirror-policy-2409.json), and [executed proof](mirror-2409-verification.md). Previous snapshot: [mirror-2253-verification.md](mirror-2253-verification.md). The following links retain historical verification:
 Previous replay: [mirror-replay-2018.json](mirror-replay-2018.json) (twenty-four hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-2018.json](mirror-policy-2018.json). Executed checks: [mirror-2018-verification.md](mirror-2018-verification.md); previous snapshots: [mirror-2017-verification.md](mirror-2017-verification.md), [mirror-2016-verification.md](mirror-2016-verification.md), [mirror-2015-verification.md](mirror-2015-verification.md), [mirror-2010-verification.md](mirror-2010-verification.md), [mirror-2005-verification.md](mirror-2005-verification.md), [mirror-2004-verification.md](mirror-2004-verification.md), [mirror-1988-verification.md](mirror-1988-verification.md), [mirror-1979-verification.md](mirror-1979-verification.md), [mirror-1932-verification.md](mirror-1932-verification.md), [mirror-1923-verification.md](mirror-1923-verification.md), [mirror-1918-verification.md](mirror-1918-verification.md), [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 2254–2409
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Regression fixture isolation and deterministic cleanup](regression-fixture-isolation-2409a.md) | 2254 2262 2273 2284 2285 2326 2328 | Conformance test packages refuse bare unittest discovery, preserving the test runner's isolation contract without changing plugin registration. |
+| [Upstream sync landing PR lookup and runner evidence](upstream-sync-landing-evidence-2409a.md) | 2255 2270 2272 | Reuse an open main-target landing PR by head ref even when the origin slug's owner is stale after a repository transfer. |
+| [Gateway refusal detail and launchd test fence](gateway-refusal-and-launchd-test-fence-2409a.md) | 2256 2300 2301 | A restart-gap timeout preserves the original service_identity_unverified refusal and its diagnostic detail. |
+| [Kanban coordination portability and fresh capability evidence](kanban-coordination-attestation-2409a.md) | 2257 2258 2259 2260 2261 | Coordination reads can be worker-portable only when every configured destination has fresh operator capability attestations and is active, unheld and pickup-capable. |
+| [Update pause publication respects a late user Stop](update-pause-publication-2409a.md) | 2263 2264 | Decide whether an update pause still stands at terminal message publication, after payload construction can yield to a user Stop. |
+| [Native Darwin memory metrics without periodic subprocesses](darwin-memory-no-fork-2409a.md) | 2265 2266 2267 | Read fresh Darwin memory counters through libSystem rather than spawning periodic vm_stat/sysctl subprocesses from the gateway. |
+| [Kanban tool blocks retain agent caller attribution](kanban-tool-block-actor-2409a.md) | 2268 | Store and render tool-originated block notices as agent actions, even when no caller identity is available. |
+| [Kanban transitive, bounded and capacity-aware priority](kanban-bounded-priority-2409a.md) | 2269 2286 2329 2330 | Compute effective priority from the maximum active downstream waiter across the dependency chain without rewriting stored parent priorities; terminal intermediates stop inheritance. |
+| [Held-machine pins and lossless courier placement](kanban-held-pin-courier-2409a.md) | 2274 2275 | Refuse creation pins naming a remote pickup machine on Board hold, with created=false, machine_held and unheld alternatives. |
+| [Authoritative creation-time placement audit](kanban-creation-placement-audit-2409a.md) | 2276 2287 | Every created event snapshots the final insertion-time placement_policy, including an explicit null, after caller diagnostic fields are expanded. |
+| [Metadata-only flaky-test Actions artifacts](flaky-metadata-artifacts-2409a.md) | 2277 2298 | Export canonical pass-on-retry test identities and bounded run provenance, not raw failure output, parameter values or logs. |
+| [SQLite plain-file open guard and forensic copy fence](sqlite-plain-open-guard-2409a.md) | 2278 2279 2280 | Add scripts/check --only sqlite-sidecars and lint wiring to reject unmarked production plain-file calls on recognizable SQLite paths. |
+| [Bounded live Kanban notice custody](kanban-notice-custody-bound-2409a.md) | 2281 2282 2283 | Bound undelivered live-process notice custody independently of whether chat admission is open. |
+| [Disable and re-enable credential accounts](auth-disable-credentials-2409a.md) | 2288 2289 2290 2291 2292 2293 2294 2295 2296 2297 | hermes auth disable PROVIDER TARGET retains a credential but excludes it from use; enable reverses the active-store disable. Targets are an index, entry ID or exact label. |
+| [Remote notice routing projection reuse](remote-notice-routing-projection-2409a.md) | 2299 | Reuse per-row routing projections across unrelated replica changes and share them across chat polls. |
+| [SessionDB path normalization and quarantine locking](sessiondb-path-and-quarantine-2409a.md) | 2302 2303 | Accept string and os.PathLike filesystem inputs consistently by normalizing to Path before SessionDB initialization and isolation checks. |
+| [Scoped Desktop creation provenance for Kanban ownership](kanban-desktop-owner-provenance-2409a.md) | 2304 | Retain interactive Desktop/CLI/TUI/ACP/GUI owners whose local transport IDs resemble headless receipts. |
+| [Board wire compatibility, field custody and stall diagnostics](board-wire-compatibility-custody-2409a.md) | 2305 2306 2307 2308 2309 2310 2311 2312 2313 2314 2315 2316 2317 2318 | Guard exported Board wire columns and skip reconciliation chat links whose target card exists neither locally nor on the service. |
+| [Desktop alphabetical projects and row Archive placement](desktop-sidebar-project-policy-2409a.md) | 2319 2320 2321 | Put the hover Archive button at the row's right edge, after the session-actions kebab. |
+| [Pickup-stall evidence grace and grouped target refresh](kanban-pickup-evidence-grace-2409a.md) | 2322 2323 | Do not fabricate a pickup refusal when the detector runs before pickup has recorded its first skip after a drain. |
+| [Retain shell initialization policy on config read failures](shell-init-config-read-retention-2409a.md) | 2324 2325 | A transient config read failure retains the last successfully resolved shell-init files and auto_source_bashrc setting for that exact config path. |
+| [Fresh-card routing around known provider walls](kanban-first-spawn-provider-wall-2409a.md) | 2327 | Before a fresh unpinned card's first spawn, try an eligible alternate through the assignee's routing class when its base provider already has an active known wall. |
+| [Preserve an upstream contributor author alias](contributor-author-alias-2409a.md) | 2271 | Map the preserved upstream tile-pin author's commit email to the contributor handle used by the repository's contributor tooling. |
+| [Kanban priority bounds and guarded global normalization](kanban-priority-bounds-and-global-migration-2409b.md) | 2331, 2389–2396 | Reopen bounds, mixed-origin priority plan/stage/apply/restore/verify CLI, feed-validated capture. |
+| [Test deflakes and small refactors in the 2331–2409 range](test-stability-and-refactors-2409b.md) | 2332, 2355–2359, 2362–2363, 2376–2377, 2399–2400, 2402 | Test-only hardening plus one value-helper extraction and one Termux cleanup fix. |
+| [Desktop instant archive with soft-hide](desktop-instant-archive-2409b.md) | 2333–2334 | Archiving hides the sidebar row immediately and restores it on cancel/failure without cross-owner or pin regressions. |
+| [Qualified historical terminal carry recovery](kanban-terminal-carry-recovery-2409b.md) | 2335–2339 | Operator API that releases a retained shepherd obligation from hash-pinned owner-database completion evidence. |
+| [Desktop Kanban status meter and blocked-owner sidebar reason](desktop-kanban-status-signals-2409b.md) | 2340–2341, 2404 | Status-bar bar of open cards by state; sidebar red reason names blocked owners. |
+| [Guarded instant-update checkpoints](guarded-update-checkpoint-2409b.md) | 2342–2347, 2352–2353 | Update pause negotiates a bounded checkpoint with the gateway for known managed work, and recognizes fence-parked launchd launchers. |
+| [Advertised core-update drain holds expire while the writer lives](core-update-drain-hold-expiry-2409b.md) | 2348–2349 | A drain hold lease expires on time even if its writer process is alive. |
+| [Creator-chat backfill reuses one guarded replica reader](kanban-creator-backfill-replica-reader-2409b.md) | 2350 | Backfill opens the Board replica at most once per pass instead of once per card. |
+| [Hourly CI review comments and flaky-poll deadline](ci-review-batch-and-flaky-budget-2409b.md) | 2351, 2381–2385 | Review comments are batched hourly; the flaky Kanban poller checkpoints and stops at a deadline. |
+| [Compact routed requests before context attestations reject them](route-context-overflow-compaction-2409b.md) | 2354 | Request-size route refusals trigger compaction, using the route's attested budget. |
+| [Bounded async delegation orphan replay and legacy local completion routes](delegation-orphan-replay-and-legacy-local-routes-2409b.md) | 2360–2361 | Dead-owner completions keep their offer leases; raw legacy Desktop keys resolve through the owning authority. |
+| [Dashboard comment writer provenance for local agent processes](kanban-http-comment-provenance-2409b.md) | 2364–2365, 2386–2387 | Bare dashboard comments from a local agent process are recorded as agent, not operator. |
+| [Archive complete scratch trees before guarded garbage collection](kanban-scratch-archive-gc-2409b.md) | 2366–2368 | Scratch workspaces are archived with verified, fsynced payloads before removal. |
+| [Root-disk capacity fence for new worker card claims](kanban-disk-admission-2409b.md) | 2369 | Opt-in brake that refuses new Kanban claims when installation-root free space is low. |
+| [Attested remote-access placement for ssh and hub-read cards](kanban-declared-remote-access-placement-2409b.md) | 2370–2375, 2379 | Cards declaring remote access are placed only on workers that attest it. |
+| [Cross-gateway priority donation preserved after pickup](kanban-pickup-priority-donation-2409b.md) | 2378 | Dispatch ranks with priorities donated by remote waiters. |
+| [Dependency handoffs across unused grants and evicted history](kanban-dependency-handoff-history-2409b.md) | 2380, 2401 | Unused Board grants don't consume dependency handoffs; evicted parents need verified history. |
+| [Class vision scan ignores tool schemas; non-retryable local errors log a traceback](routing-vision-scan-tool-schema-2409b.md) | 2388 | Fixes a crash on every turn of class-routed chats whose tool schemas have a property named type. |
+| [Agent clients trust an exported SSL_CERT_FILE on macOS](ssl-cert-file-macos-trust-2409b.md) | 2397–2398 | The agent HTTP client honors a private-CA SSL_CERT_FILE on top of the platform store. |
+| [Explicit withdrawal receipts across gateway replicas](kanban-remote-withdrawal-receipts-2409b.md) | 2403 | Archived owner cards deliver explicit, content-free withdrawal receipts to remote origins. |
+| [Child model provenance recorded at reservation](delegation-child-model-provenance-2409b.md) | 2405–2407 | Delegated child sessions record where their model came from, degrading safely against older owners. |
+| [Split-phase registry CPU sampling and drop diagnostic](split-phase-cpu-sampling-2409b.md) | 2408–2409 | The sync reporter samples CPU without blocking and exposes dropped samples. |
 
 ## Mirror follow-ups 2157–2253
 
@@ -1317,16 +1367,16 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **2253-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply forty-one bridges and three ancestry-only markers from `mirror-replay-2253.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **2409-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply forty-four bridges and three ancestry-only markers from `mirror-replay-2409.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip 9bc6ed6b6df403e0c80529753b9814d3ec119cba \
-  --base 8471f614b4879144d36e8919fb4e1f3c430d2100 \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-2253.json" \
-  --replay-plan "$MODS/core/mirror-replay-2253.json"
+  --source-tip 10a929b4a93d10921b7a16a40bd699e5507ffd8e \
+  --base e3bf4be5df04cf72dab4914b073361c71af1dbe1 \
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-2409.json" \
+  --replay-plan "$MODS/core/mirror-replay-2409.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -1459,11 +1509,20 @@ git am -3 --empty=keep "${patches[@]:2082:4}"
 git apply --index --3way "$MODS/core/bridges/upstream-before-2087.diff"
 git commit -m 'Explicit upstream integration bridge before 2087'
 git am -3 --empty=keep "${patches[@]:2086:167}"
+git apply --index --3way "$MODS/core/bridges/upstream-before-2254.diff"
+git commit -m 'Explicit upstream integration bridge before 2254'
+git am -3 --empty=keep "${patches[@]:2253:1}"
+git apply --index --3way "$MODS/core/bridges/upstream-22084b164869-via-caa185a23c0.diff"
+git commit -m 'Explicit upstream integration bridge before 2255'
+git am -3 --empty=keep "${patches[@]:2254:1}"
+git apply --index --3way "$MODS/core/bridges/upstream-78abaafcccec-via-9f84f76fc8c.diff"
+git commit -m 'Explicit upstream integration bridge before 2256'
+git am -3 --empty=keep "${patches[@]:2255:154}"
 # Mandatory additive repair: historical mails intentionally remain immutable.
-python3 -B "$MODS/core/repair_hostname_escapes.py" "$PWD"
+python3 -B "$MODS/core/repair_hostname_escapes_2409.py" --tree "$PWD"
 git add hermes_cli/kanban_placement.py
 git commit -m 'Repair historical hostname regex word boundaries'
-python3 -B "$MODS/core/check_hostname_escape_repair.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
+python3 -B "$MODS/core/repair_hostname_escapes_2409.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

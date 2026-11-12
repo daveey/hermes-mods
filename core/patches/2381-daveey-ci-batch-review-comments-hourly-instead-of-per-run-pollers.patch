@@ -1,0 +1,500 @@
+From 430a05cd93d0012d6dd65d1924ea7d19a9d04c9d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 08:53:44 +0000
+Subject: [PATCH] [daveey] ci: batch review comments hourly instead of per-run
+ pollers
+
+---
+ .github/workflows/README.md             |   6 +-
+ .github/workflows/ci-review-comment.yml |  71 +++-------
+ scripts/ci/batch_review_comments.py     | 174 ++++++++++++++++++++++++
+ tests/ci/test_batch_review_comments.py  | 161 ++++++++++++++++++++++
+ 4 files changed, 355 insertions(+), 57 deletions(-)
+ create mode 100644 scripts/ci/batch_review_comments.py
+ create mode 100644 tests/ci/test_batch_review_comments.py
+
+diff --git a/.github/workflows/README.md b/.github/workflows/README.md
+index b337c162ba8..652c89a69c0 100644
+--- a/.github/workflows/README.md
++++ b/.github/workflows/README.md
+@@ -40,7 +40,7 @@ pull_request / push main
+  ├─ nix.yml      (own run; nix flake check)
+  └─ path-filtered: pm-bundle, termux-verify, plugin-catalog-ci, sandbox-image, windows-bundle-sdk
+ 
+-workflow_run CI started  → ci-review-comment.yml (live PR comment)
++hourly / manual dispatch → ci-review-comment.yml (batched PR snapshots)
+ PR labeled run-e2e       → label-rerun.yml (reruns CI, Docker, Nix)
+ 
+ schedule daily 06:41 UTC → canary-release.yml → (release.py dispatches) desktop-bundled-release.yml
+@@ -246,7 +246,7 @@ of every suite that reads it.
+ 
+ Steps inside one job keep what told the old jobs apart: the lane gate is the step's
+ `if:`, each guard runs whether or not an earlier one failed (`!cancelled()`), any red
+-step fails the job, and the `review-status-*` artifacts the live PR comment reads keep
++step fails the job, and the `review-status-*` artifacts the hourly PR snapshot reads keep
+ their names. The jobs were split only by history: each paid its own checkout and a
+ full billed minute for a few seconds of work.
+ 
+@@ -339,7 +339,7 @@ branch protection.
+ 
+ | Workflow | Trigger | What it does / skip conditions |
+ |---|---|---|
+-| `ci-review-comment.yml`, **CI review comment** | `workflow_run` of `CI`, `types: [in_progress]` | Polls the CI run and the sibling Docker run for up to ~50 min. Keeps one live review comment on the PR up to date. Always runs scripts from the default branch. **Skips** non-PR runs and PRs from forks. A first-time contributor's run starts it only after a maintainer approves it, because `in_progress` fires then. One poller per head repo+branch; a newer CI run cancels the old poller. |
++| `ci-review-comment.yml`, **CI review comment** | Hourly (`17 * * * *`) and manual dispatch | One batch snapshots every open same-repository PR using its newest exact-head CI pull-request run and sibling Docker results. Always runs trusted default-branch scripts; no polling or PR code execution. Forks, closed/moved heads, and heads with no CI run are skipped. Comments identify their SHA and hourly refresh cadence. One non-cancelling concurrency group, 15-minute job timeout; 168 scheduled runs/week. |
+ | `label-rerun.yml`, **Label rerun** | `pull_request: labeled` | Only for the `run-e2e` label. Cancels the head commit's `ci.yaml`, `docker.yml` and `nix.yml` runs if they are still going, then reruns them. Their `detect` reads the live labels, so Docker and Nix build. Exits if the PR head moved. The E2E suites stay off. |
+ 
+ ---
+diff --git a/.github/workflows/ci-review-comment.yml b/.github/workflows/ci-review-comment.yml
+index a4088ada6dc..d76164470cb 100644
+--- a/.github/workflows/ci-review-comment.yml
++++ b/.github/workflows/ci-review-comment.yml
+@@ -1,55 +1,34 @@
+ name: CI review comment
+ 
+-# Live-updating PR review comment.
++# Hourly batched PR review summaries.
+ #
+-# The poller runs for up to 40 minutes.
+-# This run lives in its own workflow.
+-# A run stays in progress until its last job ends, and GitHub refuses
+-# ``gh run rerun`` on a run that is in progress.
++# One scheduled run snapshots every open same-repo PR: the newest CI
++# ``pull_request`` run on the PR's exact head, one comment per PR. It replaces
++# the per-run live poller (one 40-minute per-run poller).
+ #
+-# ``workflow_run`` starts this when CI starts. It always reads the workflow
+-# and the scripts from the default branch, never from the PR head.
+-# It makes a write token safe here.
+-#
+-# The poller reads job results through the API. Thus it watches the CI run
+-# and the separate docker run, and it depends on neither.
++# It runs from the default branch only and never checks out or executes PR
++# code, which makes a write token safe here. Fork PRs are skipped.
+ 
+ on:
+-  workflow_run:
+-    workflows: [CI]
+-    # ``in_progress``, not ``requested``: a first-time contributor's run
+-    # sits in ``action_required`` until a maintainer approves it, and
+-    # ``requested`` fires at creation — the poller would wait out its
+-    # whole timeout on a run that never starts. ``in_progress`` fires
+-    # when the run actually starts, and it also fires on re-runs, which
+-    # ``requested`` does not.
+-    types: [in_progress]
++  schedule:
++    - cron: "17 * * * *"
++  workflow_dispatch:
+ 
+ permissions:
+   contents: read
+   actions: read
+   pull-requests: write
+ 
+-# One poller per CI run. A new push starts a new CI run, and its poller
+-# cancels the poller of the run that GitHub superseded. The group keys
+-# on the head repository too: fork PRs often share a branch name
+-# (``main``, ``patch-1``), and two PRs must not cancel each other.
++# One batch at a time; a running batch is never cancelled.
+ concurrency:
+-  group: ci-review-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+-  cancel-in-progress: true
++  group: ci-review-comment
++  cancel-in-progress: false
+ 
+ jobs:
+   comment:
+-    name: CI review comment (live)
+-    # Fork PRs get no comment: the poller needs a write token, and the
+-    # ``pull_requests`` payload is empty for a fork run.
+-    if: >-
+-      github.event.workflow_run.event == 'pull_request' &&
+-      github.event.workflow_run.head_repository.full_name == github.repository
+-    # [daveey] poll-only runners (label hermes-hub-poll ONLY, 0.5 CPU each): this
+-    # poller lives up to 40-60 min and used to hold a test runner slot.
++    name: CI review comment (hourly)
+     runs-on: blacksmith-2vcpu-ubuntu-2404
+-    timeout-minutes: 60
++    timeout-minutes: 15
+     steps:
+       - name: Checkout trusted default branch
+         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a  # v7.0.1 (fork: upstream uses useblacksmith/checkout)
+@@ -57,26 +36,10 @@ jobs:
+           ref: ${{ github.event.repository.default_branch }}
+           persist-credentials: false
+ 
+-      - name: Run live comment poller
++      - name: Post batched review summaries
+         env:
+           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-          # The CI run to report on — not this run. The name must not be
+-          # GITHUB_RUN_ID: the runner sets the GITHUB_* defaults itself and
+-          # ignores an env: override, so that name silently resolves to THIS
+-          # run. The poller then watches itself, which stays in_progress for
+-          # as long as the poller runs, and it waits out its whole timeout.
+-          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+-          # Sibling runs for the same commit that the comment also covers,
+-          # one workflow name per line (a name can contain a comma).
+-          # The poller resolves each name to its runs through the API.
++          # Sibling workflows whose jobs join each comment, one name per line.
+           WATCH_WORKFLOWS: |
+             Docker Build, Test, and Publish
+-          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+-          RUN_URL: ${{ github.event.workflow_run.html_url }}
+-          # Commit info for the review comment header.
+-          COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
+-          COMMIT_MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
+-        run: |
+-          python3 -u scripts/ci/live_comment.py \
+-            --interval 15 \
+-            --timeout 3000
++        run: python3 -u scripts/ci/batch_review_comments.py
+diff --git a/scripts/ci/batch_review_comments.py b/scripts/ci/batch_review_comments.py
+new file mode 100644
+index 00000000000..2f8a6811e52
+--- /dev/null
++++ b/scripts/ci/batch_review_comments.py
+@@ -0,0 +1,174 @@
++#!/usr/bin/env python3
++"""Hourly batched CI review summaries for open same-repo PRs.
++
++Replaces the per-run live poller. One scheduled invocation lists every open
++PR whose head lives in this repository (forks are excluded), picks the newest
++``CI`` ``pull_request`` run on each PR's exact head SHA, builds a snapshot
++with the :mod:`live_comment` helpers, and upserts the review comment.
++
++Safety / behaviour:
++
++  - Only API reads and comment writes. No PR code is checked out or run.
++  - No sleep/poll loop: one pass, then exit.
++  - Immediately before writing, the PR is re-read. If it was closed or its
++    head moved, the PR is skipped (the snapshot would be stale).
++  - Each PR is isolated: an error on one PR is recorded and the rest still
++    run. Any error (listing, collection, write) makes the exit code 1.
++  - The comment keeps the ``<!-- hermes-ci-review-bot -->`` marker, so it
++    replaces earlier comments from the live poller. The footer says the
++    snapshot is refreshed hourly, so it is not mistaken for a live view.
++"""
++
++from __future__ import annotations
++
++import argparse
++import importlib.util
++import json
++import os
++import sys
++from datetime import datetime, timezone
++from pathlib import Path
++
++CI_WORKFLOW_NAME = "CI"
++DEFAULT_WATCH_WORKFLOWS = ["Docker Build, Test, and Publish"]
++
++_HERE = Path(__file__).resolve().parent
++
++
++def _load_live_comment():
++    spec = importlib.util.spec_from_file_location("live_comment", _HERE / "live_comment.py")
++    if spec is None or spec.loader is None:
++        raise ImportError("Failed to load live_comment.py")
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules.setdefault("live_comment", mod)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++lc = _load_live_comment()
++
++
++def eligible_prs(prs: list[dict], repo: str) -> list[dict]:
++    """Open PRs whose head repository is ``repo`` (forks/deleted forks out)."""
++    out = []
++    for pr in prs:
++        if pr.get("state", "open") != "open":
++            continue
++        head = pr.get("head") or {}
++        head_repo = (head.get("repo") or {}).get("full_name", "")
++        if head_repo.lower() != repo.lower() or not head.get("sha"):
++            continue
++        out.append(pr)
++    return out
++
++
++def select_ci_run(runs: list[dict], head_sha: str) -> dict | None:
++    """Newest CI ``pull_request`` run whose head SHA is exactly ``head_sha``."""
++    best: dict | None = None
++    for r in runs:
++        if r.get("name") != CI_WORKFLOW_NAME or r.get("event") != "pull_request":
++            continue
++        if r.get("head_sha") != head_sha:
++            continue
++        key = (str(r.get("created_at", "")), int(r.get("id", 0) or 0))
++        if best is None or key > (str(best.get("created_at", "")), int(best.get("id", 0) or 0)):
++            best = r
++    return best
++
++
++def snapshot_commit_info(pr: dict, run: dict, repo: str, now: datetime) -> str:
++    sha = run["head_sha"]
++    url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/pull/{pr['number']}/commits/{sha}"
++    msg = ((run.get("head_commit") or {}).get("message") or "").split("\n")[0][:60]
++    tail = f" — {msg}" if msg else ""
++    stamp = now.strftime("%Y-%m-%d %H:%M UTC")
++    return (
++        f"<sub>snapshot of [{sha[:7]}]({url}){tail} · taken {stamp}; "
++        f"refreshed hourly, not live</sub>"
++    )
++
++
++def build_snapshot(token: str, repo: str, pr: dict, run: dict, now: datetime) -> str:
++    watch = lc.parse_watch_workflows(os.environ.get("WATCH_WORKFLOWS", "")) or DEFAULT_WATCH_WORKFLOWS
++    jobs, runs_completed = lc.collect_run_jobs(token, repo, str(run["id"]), watch)
++    completed, pending, job_urls = lc.classify_jobs(jobs)
++    by_check, check_urls = lc.split_failed_steps(jobs, completed, job_urls)
++    statuses = lc.fetch_all_review_statuses(token, repo, str(run["id"]))
++    return lc.build_comment_body(
++        lc._import_assembler(),
++        by_check,
++        pending,
++        run.get("html_url", ""),
++        check_urls,
++        json.dumps(statuses) if statuses else "",
++        snapshot_commit_info(pr, run, repo, now),
++        waiting=not runs_completed,
++    )
++
++
++def process_pr(token: str, repo: str, pr: dict, now: datetime) -> str:
++    """Returns 'posted' or 'skipped:<why>'. Raises on API/write failure."""
++    owner, name = repo.split("/")
++    number = pr["number"]
++    sha = pr["head"]["sha"]
++    runs = lc._api_get_paginated(
++        f"{lc.API_BASE}/repos/{owner}/{name}/actions/runs"
++        f"?event=pull_request&head_sha={sha}&per_page=100",
++        token, list_key="workflow_runs",
++    )
++    run = select_ci_run(runs, sha)
++    if run is None:
++        return "skipped:no CI run on head"
++    body = build_snapshot(token, repo, pr, run, now)
++
++    # Head race: re-read the PR right before writing.
++    fresh = lc._api_request(f"{lc.API_BASE}/repos/{owner}/{name}/pulls/{number}", token)
++    if fresh.get("state") != "open":
++        return "skipped:PR no longer open"
++    if (fresh.get("head") or {}).get("sha") != sha:
++        return "skipped:head changed"
++
++    if not lc.upsert_comment(token, repo, str(number), body):
++        raise RuntimeError("comment write failed")
++    return "posted"
++
++
++def run_batch(token: str, repo: str, now: datetime | None = None) -> int:
++    now = now or datetime.now(timezone.utc)
++    owner, name = repo.split("/")
++    try:
++        prs = lc._api_get_paginated(
++            f"{lc.API_BASE}/repos/{owner}/{name}/pulls?state=open&per_page=100", token,
++        )
++    except Exception as e:
++        print(f"ERROR listing open PRs: {e}", file=sys.stderr)
++        return 1
++
++    targets = eligible_prs(prs, repo)
++    print(f"{len(prs)} open PR(s), {len(targets)} same-repo")
++    failures = 0
++    for pr in targets:
++        try:
++            result = process_pr(token, repo, pr, now)
++            print(f"  PR #{pr['number']}: {result}")
++        except Exception as e:
++            failures += 1
++            print(f"  PR #{pr['number']}: ERROR {e}", file=sys.stderr)
++    if failures:
++        print(f"{failures} PR(s) failed", file=sys.stderr)
++        return 1
++    return 0
++
++
++def main() -> int:
++    argparse.ArgumentParser(description=__doc__).parse_args()
++    token = os.environ.get("GITHUB_TOKEN", "")
++    repo = os.environ.get("GITHUB_REPOSITORY", "")
++    if not token or not repo:
++        print("GITHUB_TOKEN and GITHUB_REPOSITORY are required", file=sys.stderr)
++        return 1
++    return run_batch(token, repo)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/ci/test_batch_review_comments.py b/tests/ci/test_batch_review_comments.py
+new file mode 100644
+index 00000000000..4cd50dd2091
+--- /dev/null
++++ b/tests/ci/test_batch_review_comments.py
+@@ -0,0 +1,161 @@
++"""Tests for scripts/ci/batch_review_comments.py (no network)."""
++
++from __future__ import annotations
++
++import importlib.util
++import sys
++from datetime import datetime, timezone
++from pathlib import Path
++
++import pytest
++
++_PATH = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "batch_review_comments.py"
++_spec = importlib.util.spec_from_file_location("batch_review_comments", _PATH)
++assert _spec and _spec.loader
++b = importlib.util.module_from_spec(_spec)
++sys.modules["batch_review_comments"] = b
++_spec.loader.exec_module(b)
++
++REPO = "o/r"
++NOW = datetime(2026, 11, 11, 12, 17, tzinfo=timezone.utc)
++
++
++def _pr(n, sha, head_repo: str | None = REPO, state="open"):
++    return {"number": n, "state": state, "head": {"sha": sha, "repo": {"full_name": head_repo} if head_repo else None}}
++
++
++def _run(rid, sha, created, name="CI", event="pull_request"):
++    return {"id": rid, "name": name, "event": event, "head_sha": sha, "created_at": created,
++            "html_url": f"https://x/runs/{rid}", "head_commit": {"message": f"msg {sha}\nbody"}}
++
++
++class Fake:
++    """Patches the live_comment API surface used by the batch script."""
++
++    def __init__(self, monkeypatch, prs, runs_by_sha, fresh=None, write_ok=None, fail_collect=()):
++        self.prs, self.runs_by_sha = prs, runs_by_sha
++        self.fresh = fresh or {}
++        self.write_ok = write_ok or {}
++        self.fail_collect = set(fail_collect)
++        self.posted: dict[str, str] = {}
++        self.collected: list[str] = []
++        lc = b.lc
++
++        def paginated(url, token, list_key=None):
++            if "/pulls?" in url:
++                if isinstance(self.prs, Exception):
++                    raise self.prs
++                return self.prs
++            if "/actions/runs?" in url:
++                sha = url.split("head_sha=")[1].split("&")[0]
++                assert "event=pull_request" in url
++                return self.runs_by_sha.get(sha, [])
++            raise AssertionError(url)
++
++        def request(url, token):
++            n = int(url.rsplit("/", 1)[1])
++            return self.fresh[n]
++
++        def collect(token, repo, run_id, watch=None):
++            self.collected.append(run_id)
++            if run_id in self.fail_collect:
++                raise RuntimeError("boom")
++            return [], True
++
++        def upsert(token, repo, pr, body, comment_id=None):
++            if not self.write_ok.get(pr, True):
++                return None
++            self.posted[pr] = body
++            return 1
++
++        monkeypatch.setattr(lc, "_api_get_paginated", paginated)
++        monkeypatch.setattr(lc, "_api_request", request)
++        monkeypatch.setattr(lc, "collect_run_jobs", collect)
++        monkeypatch.setattr(lc, "fetch_all_review_statuses", lambda *a, **k: [])
++        monkeypatch.setattr(lc, "upsert_comment", upsert)
++
++
++def _fresh(prs):
++    return {p["number"]: {"state": p["state"], "head": {"sha": p["head"]["sha"]}} for p in prs}
++
++
++def test_two_prs_one_invocation_exact_head_newest_run(monkeypatch):
++    prs = [_pr(1, "aaa"), _pr(2, "bbb")]
++    runs = {
++        "aaa": [_run(10, "aaa", "2026-11-11T01:00:00Z"), _run(11, "aaa", "2026-11-11T02:00:00Z"),
++                _run(12, "zzz", "2026-11-11T03:00:00Z"),  # other head
++                _run(13, "aaa", "2026-11-11T04:00:00Z", name="Docker"),
++                _run(14, "aaa", "2026-11-11T05:00:00Z", event="push")],
++        "bbb": [_run(20, "bbb", "2026-11-11T01:00:00Z")],
++    }
++    f = Fake(monkeypatch, prs, runs, fresh=_fresh(prs))
++    assert b.run_batch("t", REPO, NOW) == 0
++    assert f.collected == ["11", "20"]
++    assert set(f.posted) == {"1", "2"}
++    body = f.posted["1"]
++    assert "snapshot of" in body and "refreshed hourly, not live" in body
++    assert "running on" not in body
++    assert "<!-- hermes-ci-review-bot -->" in body
++
++
++def test_forks_and_closed_excluded(monkeypatch):
++    prs = [_pr(1, "a"), _pr(2, "b", head_repo="someone/fork"), _pr(3, "c", head_repo=None),
++           _pr(4, "d", state="closed")]
++    f = Fake(monkeypatch, prs, {"a": [_run(1, "a", "t")]}, fresh=_fresh(prs))
++    assert b.run_batch("t", REPO, NOW) == 0
++    assert list(f.posted) == ["1"]
++
++
++def test_empty_set_is_success(monkeypatch):
++    f = Fake(monkeypatch, [], {})
++    assert b.run_batch("t", REPO, NOW) == 0
++    assert f.posted == {} and f.collected == []
++
++
++def test_pr_without_ci_run_skipped_not_error(monkeypatch):
++    prs = [_pr(1, "a")]
++    f = Fake(monkeypatch, prs, {"a": [_run(1, "other", "t")]}, fresh=_fresh(prs))
++    assert b.run_batch("t", REPO, NOW) == 0
++    assert f.posted == {}
++
++
++def test_head_race_skips_and_closed_race_skips(monkeypatch):
++    prs = [_pr(1, "a"), _pr(2, "b"), _pr(3, "c")]
++    runs = {s: [_run(i, s, "t")] for i, s in enumerate("abc", 1)}
++    fresh = {1: {"state": "open", "head": {"sha": "NEW"}},
++             2: {"state": "closed", "head": {"sha": "b"}},
++             3: {"state": "open", "head": {"sha": "c"}}}
++    f = Fake(monkeypatch, prs, runs, fresh=fresh)
++    assert b.run_batch("t", REPO, NOW) == 0
++    assert list(f.posted) == ["3"]
++
++
++def test_list_failure_nonzero(monkeypatch):
++    Fake(monkeypatch, RuntimeError("api down"), {})
++    assert b.run_batch("t", REPO, NOW) == 1
++
++
++def test_per_pr_isolation_on_collect_and_write_errors(monkeypatch):
++    prs = [_pr(1, "a"), _pr(2, "b"), _pr(3, "c")]
++    runs = {"a": [_run(1, "a", "t")], "b": [_run(2, "b", "t")], "c": [_run(3, "c", "t")]}
++    f = Fake(monkeypatch, prs, runs, fresh=_fresh(prs), write_ok={"2": False}, fail_collect=["1"])
++    assert b.run_batch("t", REPO, NOW) == 1
++    assert list(f.posted) == ["3"]  # PR 3 still posted
++
++
++def test_main_requires_env(monkeypatch):
++    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
++    monkeypatch.setattr(sys, "argv", ["x"])
++    assert b.main() == 1
++
++
++def test_workflow_shape():
++    yaml = pytest.importorskip("hermes_yaml")
++    doc = yaml.safe_load((Path(__file__).resolve().parents[2] / ".github/workflows/ci-review-comment.yml").read_text())
++    on = doc.get("on", doc.get(True))
++    assert set(on) == {"schedule", "workflow_dispatch"}
++    assert on["schedule"] == [{"cron": "17 * * * *"}]
++    assert doc["concurrency"]["cancel-in-progress"] is False
++    job = doc["jobs"]["comment"]
++    assert job["timeout-minutes"] == 15 and job["runs-on"] == "blacksmith-2vcpu-ubuntu-2404"
++    assert any("batch_review_comments.py" in (s.get("run") or "") for s in job["steps"])
+-- 
+2.55.0
+

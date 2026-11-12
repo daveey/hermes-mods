@@ -1,0 +1,398 @@
+From c0e536b864e4851e3641699fc444192f7d4d9028 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:06:34 +0000
+Subject: [PATCH] [daveey] fix(auth): disabled accounts are refused on the
+ singleton, aux, env-token and bound-session paths
+
+Review of the disable feature found paths that hand out a token without pool selection:
+- runtime_provider._resolve_oauth_runtime (Codex/xAI auth.json singleton) now raises AuthError
+  when the singleton token is a disabled pool row's;
+- auxiliary_client._read_codex_singleton_token drops it;
+- anthropic _available_anthropic_token drops it for every caller, model or not;
+- a Codex/xAI session bound to a row that gets disabled moves to an enabled row before its next
+  request (rebind_off_disabled in _create_request_openai_client), AuthError if none is left;
+- an Anthropic session pinned to a row that is disabled with no enabled row left raises
+  AuthError instead of keeping the old token (reviewer repro);
+- try_refresh_current/try_refresh_matching never refresh a disabled row; acquire_lease(id) of a
+  disabled row leases another;
+- the cache stamp includes st_ino (same size+mtime atomic replace was missed).
+token_disabled costs nothing (no pool load) while nothing is disabled.
+
+Proof: tests/agent/test_credential_pool_disabled_paths.py, 7 RED with the hooks reverted, all
+GREEN; 163 pool/anthropic/routing/lifecycle/aux/auth/runtime_provider files: 1813 passed.
+---
+ agent/anthropic_credentials.py                |   7 +-
+ agent/auxiliary_client.py                     |   6 +-
+ agent/client_lifecycle.py                     |   9 +-
+ agent/credential_pool.py                      |   4 +-
+ agent/credential_pool_disabled.py             |  67 ++++++-
+ hermes_cli/runtime_provider.py                |   4 +
+ .../test_credential_pool_disabled_paths.py    | 168 ++++++++++++++++++
+ 7 files changed, 256 insertions(+), 9 deletions(-)
+ create mode 100644 tests/agent/test_credential_pool_disabled_paths.py
+
+diff --git a/agent/anthropic_credentials.py b/agent/anthropic_credentials.py
+index 1949ceefe52..033802622b8 100644
+--- a/agent/anthropic_credentials.py
++++ b/agent/anthropic_credentials.py
+@@ -692,8 +692,11 @@ def _available_anthropic_token(token: Optional[str], model: Optional[str]) -> Op
+     Only model-aware callers (the API-call paths) are gated: diagnostics that
+     resolve a token without a model (usage display, model discovery) keep it.
+     """
+-    if not token or not model:
+-        return token or None
++    from agent.credential_pool_disabled import token_disabled
++    if not token or token_disabled("anthropic", token):  # a disabled account, for every caller
++        return None
++    if not model:
++        return token
+     try:
+         from agent.credential_pool import load_pool
+         if load_pool("anthropic").token_is_blocked(token, model=model):
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 5683fdfaa5c..32d12234bac 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -2116,8 +2116,7 @@ def _read_codex_singleton_token() -> Optional[str]:
+         access_token = _read_codex_tokens().get("tokens", {}).get("access_token")
+         if not isinstance(access_token, str) or not access_token.strip():
+             return None
+-        # Expired JWTs would block the auto chain and prevent fallback to working providers.
+-        try:
++        try:  # expired JWTs would block the auto chain and prevent fallback to working providers
+             import base64
+             payload = access_token.split(".")[1]
+             payload += "=" * (-len(payload) % 4)
+@@ -2127,7 +2126,8 @@ def _read_codex_singleton_token() -> Optional[str]:
+                 return None
+         except Exception:
+             pass  # Non-JWT token or decode error — use as-is
+-        return access_token.strip()
++        from agent.credential_pool_disabled import token_disabled
++        return None if token_disabled("openai-codex", access_token) else access_token.strip()
+     except Exception as exc:
+         logger.debug("Could not read Codex auth for auxiliary client: %s", exc)
+         return None
+diff --git a/agent/client_lifecycle.py b/agent/client_lifecycle.py
+index 17a16746b73..7f5fd68cff5 100644
+--- a/agent/client_lifecycle.py
++++ b/agent/client_lifecycle.py
+@@ -441,6 +441,9 @@ class ClientLifecycleMixin:
+ 
+     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
+         from unittest.mock import Mock
++
++        from agent.credential_pool_disabled import rebind_off_disabled
++        rebind_off_disabled(self)  # `hermes auth disable` mid-session: never send the disabled account's token
+         primary_client = self._ensure_primary_openai_client(reason=reason)
+         if self.provider == "moa" or isinstance(primary_client, Mock):
+             return primary_client
+@@ -869,7 +872,11 @@ class ClientLifecycleMixin:
+             logger.debug("Anthropic credential refresh failed: %s", exc)
+             return False
+         new_token = new_token.strip() if isinstance(new_token, str) else ""
+-        if not new_token or new_token == self._anthropic_api_key:
++        if not new_token:
++            from agent.credential_pool_disabled import refuse_disabled_token
++            refuse_disabled_token("anthropic", current_key)  # nothing enabled to move to: never resend it
++            return False
++        if new_token == self._anthropic_api_key:
+             return False
+         if not self._adopt_anthropic_token(new_token):
+             return False
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index a6aef38bfdb..91dbbf5cf17 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -2377,7 +2377,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+         self, credential_id: Optional[str],
+     ) -> tuple[Optional[str], list[PooledCredential]]:
+         with self._lock:
+-            if credential_id:
++            if credential_id and any(e.id == credential_id for e in self._enabled_entries()):  # disabled: pick another
+                 self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
+                 self._current_id = credential_id
+                 return credential_id, []
+@@ -2435,7 +2435,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+ 
+     def _try_refresh_current_unlocked(self, failed_key: Optional[str] = None) -> Optional[PooledCredential]:
+         entry = self._current_unlocked()
+-        if entry is None:
++        if entry is None or all(e.id != entry.id for e in self._enabled_entries()):  # never refresh a disabled row
+             return None
+         refreshed = self._refresh_entry(entry, force=True, failed_key=failed_key)
+         if refreshed is not None:
+diff --git a/agent/credential_pool_disabled.py b/agent/credential_pool_disabled.py
+index afd988cf769..96f59780252 100644
+--- a/agent/credential_pool_disabled.py
++++ b/agent/credential_pool_disabled.py
+@@ -55,7 +55,7 @@ def _file_keys(path: Optional[Path], provider: str) -> tuple[frozenset[str], fro
+         st = os.stat(path)
+     except OSError:
+         return _EMPTY
+-    stamp = (st.st_mtime_ns, st.st_size)
++    stamp = (st.st_mtime_ns, st.st_size, st.st_ino)  # ino: the atomic-rename save always changes it
+     key = (str(path), provider)
+     with _cache_lock:
+         hit = _cache.get(key)
+@@ -155,3 +155,68 @@ def disabled_by_root(provider: str, entry: Any) -> bool:
+     if root is None or root == Path(auth_mod._auth_file_path()):
+         return False
+     return matches(entry, _file_keys(root, provider))
++
++
++def token_disabled(provider: str, token: Optional[str]) -> bool:
++    """Whether *token* belongs to a disabled pool row of *provider*.
++
++    For the resolvers that hand out a token without selecting it from the pool (the auth.json
++    singleton, env tokens, the Claude Code file): the pool row seeded from them carries the same token.
++    Costs nothing while nothing is disabled.
++    """
++    if not token:
++        return False
++    keys = disabled_keys(provider)
++    if not keys[0] and not keys[1]:
++        return False
++    from agent.credential_pool import load_pool
++    try:
++        entries = load_pool(provider).entries()
++    except Exception:
++        logger.warning("disabled-credential check: %s pool unreadable; token allowed", provider, exc_info=True)
++        return False
++    token = token.strip()
++    return any(
++        matches(e, keys) and token in (getattr(e, "runtime_api_key", None), getattr(e, "access_token", None))
++        for e in entries
++    )
++
++
++def rebind_off_disabled(agent: Any) -> None:
++    """Pre-request: move a Codex/xAI session whose bound pool row was disabled onto an enabled row.
++
++    Anthropic sessions get the same through the pinned-token check (``credential_pool_pin``).
++    Raises ``AuthError`` when every row of the pool is disabled, so no request goes out on the old token.
++    """
++    pool = getattr(agent, "_credential_pool", None)
++    provider = getattr(pool, "provider", None)
++    if pool is None or provider not in ("openai-codex", "xai-oauth") or getattr(agent, "provider", None) != provider:
++        return
++    keys = disabled_keys(provider)
++    if not keys[0] and not keys[1]:
++        return
++    entry_id, api_key = getattr(agent, "_credential_pool_entry_id", None), str(getattr(agent, "api_key", "") or "")
++    entries = pool.entries()
++    bound = next((e for e in entries if entry_id and e.id == entry_id), None) or next(
++        (e for e in entries if api_key and getattr(e, "runtime_api_key", None) == api_key), None)
++    if bound is None or not matches(bound, keys):
++        return
++    nxt = pool.select()
++    token = (getattr(nxt, "runtime_api_key", None) or "").strip() if nxt is not None else ""
++    if not token:
++        _raise_all_disabled(provider)
++    logger.warning("%s pool entry %s was disabled; moving the session to %s", provider, bound.id, nxt.id)
++    agent._adopt_openai_credentials(token, str(agent.base_url or ""), reason="credential_disabled")
++    agent._credential_pool_entry_id = nxt.id
++
++
++def _raise_all_disabled(provider: str) -> None:
++    from hermes_cli.auth import AuthError
++    raise AuthError(f"Every {provider} account is disabled; run `hermes auth enable {provider} <account>`",
++                    provider=provider, code="credentials_disabled")
++
++
++def refuse_disabled_token(provider: str, token: Optional[str]) -> None:
++    """Raise ``AuthError`` when a session would keep sending *token* of a disabled account."""
++    if token_disabled(provider, token):
++        _raise_all_disabled(provider)
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index c0943ec52b9..d004dd8708e 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -854,6 +854,10 @@ def _resolve_oauth_runtime(provider, requested_provider, model_cfg, target_model
+     stale/revoked/benched (``_ladder_rungs`` decides whether an "auto" request falls through)."""
+     spec = _OAUTH_RUNTIME_PROVIDERS[provider]
+     creds = spec.resolve()
++    from agent.credential_pool_disabled import token_disabled
++    if token_disabled(provider, creds.get("api_key")):  # the singleton is the disabled pool row's account
++        raise AuthError(f"The {provider} account is disabled (hermes auth enable)", provider=provider,
++                        code="credentials_disabled")
+     api_mode = spec.api_mode(_effective_model(model_cfg, target_model)) if callable(spec.api_mode) else spec.api_mode
+     return _runtime(provider, api_mode, (creds.get("base_url") or "").rstrip("/") or spec.default_base_url,
+                     creds.get("api_key", ""), source=creds.get("source", spec.default_source),
+diff --git a/tests/agent/test_credential_pool_disabled_paths.py b/tests/agent/test_credential_pool_disabled_paths.py
+new file mode 100644
+index 00000000000..f89210a6035
+--- /dev/null
++++ b/tests/agent/test_credential_pool_disabled_paths.py
+@@ -0,0 +1,168 @@
++"""Paths that hand out a token without pool selection also refuse a `hermes auth disable`d account."""
++import os
++from types import SimpleNamespace
++
++import pytest
++
++from agent import credential_pool_disabled as cpd
++from agent.credential_pool import CredentialPool, PooledCredential
++from hermes_cli.auth import AuthError, write_credential_pool
++
++
++@pytest.fixture(autouse=True)
++def _home(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
++    (tmp_path / "hermes").mkdir()
++    monkeypatch.setattr(cpd, "_root_path", lambda: None)
++    cpd._cache.clear()
++
++
++def _pool(provider, n=2):
++    rows = [PooledCredential(provider=provider, id=f"row{i}", label=f"account{i}@example.com", source="manual",
++                             auth_type="api_key", access_token=f"fixture-{provider}-{i}", priority=i)
++            for i in range(n)]
++    write_credential_pool(provider, [e.to_dict() for e in rows])
++    return CredentialPool(provider, rows)
++
++
++def _disable(provider, entry):
++    assert cpd.set_credential_disabled(provider, entry, True) is True
++    cpd._cache.clear()
++
++
++def test_token_disabled_matches_only_disabled_rows_and_is_free_when_nothing_disabled(monkeypatch):
++    pool = _pool("openai-codex")
++    import agent.credential_pool as cp
++    real, loads = cp.load_pool, []
++    monkeypatch.setattr(cp, "load_pool", lambda p: loads.append(p) or real(p))
++    assert cpd.token_disabled("openai-codex", "fixture-openai-codex-0") is False
++    assert loads == []  # nothing disabled: no pool load on the request path
++    _disable("openai-codex", pool.entries()[0])
++    assert cpd.token_disabled("openai-codex", "fixture-openai-codex-0") is True
++    assert cpd.token_disabled("openai-codex", "fixture-openai-codex-1") is False
++    assert cpd.token_disabled("openai-codex", "unknown") is False
++
++
++@pytest.mark.parametrize("provider", ["openai-codex", "xai-oauth"])
++def test_singleton_runtime_of_a_disabled_account_raises(monkeypatch, provider):
++    from hermes_cli import runtime_provider as rp
++    pool = _pool(provider)
++    _disable(provider, pool.entries()[0])
++    name = "resolve_codex_runtime_credentials" if provider == "openai-codex" else "resolve_xai_oauth_runtime_credentials"
++    monkeypatch.setattr(rp, name, lambda: {"api_key": f"fixture-{provider}-0", "base_url": "https://x.example"})
++    with pytest.raises(AuthError, match="disabled"):
++        rp._resolve_oauth_runtime(provider, provider, {}, None)
++    monkeypatch.setattr(rp, name, lambda: {"api_key": f"fixture-{provider}-1", "base_url": "https://x.example"})
++    assert rp._resolve_oauth_runtime(provider, provider, {}, None)["api_key"] == f"fixture-{provider}-1"
++
++
++def test_auxiliary_codex_singleton_token_of_a_disabled_account_is_dropped(monkeypatch):
++    from hermes_cli import auth
++    from agent import auxiliary_client as aux
++    pool = _pool("openai-codex")
++    monkeypatch.setattr(auth, "_read_codex_tokens", lambda: {"tokens": {"access_token": "fixture-openai-codex-0"}})
++    assert aux._read_codex_singleton_token() == "fixture-openai-codex-0"
++    _disable("openai-codex", pool.entries()[0])
++    assert aux._read_codex_singleton_token() is None
++
++
++def test_anthropic_token_of_a_disabled_account_is_dropped_even_without_a_model():
++    from agent.anthropic_credentials import _available_anthropic_token
++    pool = _pool("anthropic")
++    assert _available_anthropic_token("fixture-anthropic-0", None) == "fixture-anthropic-0"
++    _disable("anthropic", pool.entries()[0])
++    assert _available_anthropic_token("fixture-anthropic-0", None) is None
++    assert _available_anthropic_token("fixture-anthropic-0", "claude-x") is None
++    assert _available_anthropic_token("fixture-anthropic-1", None) == "fixture-anthropic-1"
++
++
++class _Agent(SimpleNamespace):
++    def _adopt_openai_credentials(self, api_key, base_url, *, reason):
++        self.adopted.append((api_key, base_url, reason))
++        self.api_key = api_key
++        return True
++
++
++def _agent(pool, entry_id="row0"):
++    return _Agent(provider=pool.provider, _credential_pool=pool, _credential_pool_entry_id=entry_id,
++                  api_key=f"fixture-{pool.provider}-0", base_url="https://chatgpt.example/backend", adopted=[])
++
++
++@pytest.mark.parametrize("provider", ["openai-codex", "xai-oauth"])
++def test_bound_session_moves_off_a_disabled_row_before_the_next_request(provider):
++    pool = _pool(provider)
++    agent = _agent(pool)
++    cpd.rebind_off_disabled(agent)
++    assert agent.adopted == []  # nothing disabled: untouched
++    _disable(provider, pool.entries()[0])
++    cpd.rebind_off_disabled(agent)
++    assert agent.adopted == [(f"fixture-{provider}-1", "https://chatgpt.example/backend", "credential_disabled")]
++    assert agent._credential_pool_entry_id == "row1"
++    _disable(provider, pool.entries()[1])
++    with pytest.raises(AuthError, match="Every .* account is disabled"):
++        cpd.rebind_off_disabled(agent)
++
++
++def test_unattributed_session_is_matched_by_its_token():
++    pool = _pool("openai-codex")
++    agent = _agent(pool, entry_id=None)
++    _disable("openai-codex", pool.entries()[0])
++    cpd.rebind_off_disabled(agent)
++    assert agent._credential_pool_entry_id == "row1"
++
++
++def test_request_client_checkout_runs_the_rebind(monkeypatch):
++    from agent.client_lifecycle import ClientLifecycleMixin
++
++    class Stop(Exception):
++        pass
++
++    def _rebind(agent):
++        raise Stop
++    monkeypatch.setattr(cpd, "rebind_off_disabled", _rebind)
++    with pytest.raises(Stop):
++        ClientLifecycleMixin._create_request_openai_client(SimpleNamespace(), reason="test")
++
++
++def test_refresh_and_lease_refuse_a_disabled_row(monkeypatch):
++    pool = _pool("openrouter")
++    pool._current_id = "row0"
++    _disable("openrouter", pool.entries()[0])
++    monkeypatch.setattr(pool, "_refresh_entry", lambda *a, **k: pytest.fail("refreshed a disabled row"))
++    assert pool.try_refresh_current() is None
++    assert pool.try_refresh_matching(credential_id="row0") is None
++    assert pool.acquire_lease("row0") == "row1"
++
++
++def test_cache_sees_a_same_size_same_mtime_replace(tmp_path):
++    pool = _pool("openrouter")
++    _disable("openrouter", pool.entries()[0])
++    path = tmp_path / "hermes" / "auth.json"
++    assert cpd.is_credential_disabled("openrouter", pool.entries()[0])
++    st = path.stat()
++    swapped = path.read_text().replace('"row0"', '"row1"').replace("account0@", "account1@")
++    tmp = path.with_suffix(".new")
++    tmp.write_text(swapped)
++    os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
++    os.replace(tmp, path)  # same size and mtime, new inode (the atomic save)
++    assert cpd.is_credential_disabled("openrouter", pool.entries()[1])
++    assert not cpd.is_credential_disabled("openrouter", pool.entries()[0])
++
++
++def test_anthropic_session_pinned_to_its_only_row_stops_when_that_row_is_disabled(monkeypatch):
++    """Reviewer repro: pin check reports the row gone, re-resolve finds nothing, the old token must not go out."""
++    from agent.client_lifecycle import ClientLifecycleMixin
++    for key in ("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):
++        monkeypatch.delenv(key, raising=False)
++    pool = _pool("anthropic", n=1)
++    agent = ClientLifecycleMixin.__new__(type("A", (ClientLifecycleMixin,), {}))
++    agent.api_mode, agent.provider, agent.model, agent.model_routing = "anthropic_messages", "anthropic", "claude-x", None
++    agent._anthropic_api_key = agent.api_key = "fixture-anthropic-0"
++    agent._anthropic_base_url, agent._is_anthropic_oauth = "", False
++    agent._credential_pool, agent._credential_pool_entry_id = pool, "row0"
++    import agent.anthropic_credentials as ac
++    monkeypatch.setattr(ac, "read_claude_code_credentials", lambda: None)
++    assert agent._try_refresh_anthropic_client_credentials() is False  # enabled: nothing to change
++    _disable("anthropic", pool.entries()[0])
++    with pytest.raises(AuthError, match="Every anthropic account is disabled"):
++        agent._try_refresh_anthropic_client_credentials()
+-- 
+2.55.0
+

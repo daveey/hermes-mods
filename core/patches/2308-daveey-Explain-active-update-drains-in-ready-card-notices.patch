@@ -1,0 +1,136 @@
+From c7eb57bb4e29dedd26ae502dd0fdc649bbd67d98 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:35:51 -0800
+Subject: [PATCH] [daveey] Explain active update drains in ready-card notices
+
+---
+ hermes_cli/kanban_chat_wait.py                | 10 +++-
+ hermes_cli/kanban_sync_diagnostics.py         | 16 ++++++
+ .../test_kanban_drain_wait_notice.py          | 52 +++++++++++++++++++
+ 3 files changed, 76 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_drain_wait_notice.py
+
+diff --git a/hermes_cli/kanban_chat_wait.py b/hermes_cli/kanban_chat_wait.py
+index 507ce8c42a4..44441438f88 100644
+--- a/hermes_cli/kanban_chat_wait.py
++++ b/hermes_cli/kanban_chat_wait.py
+@@ -88,6 +88,11 @@ def notice_text(payload: Any) -> str:
+     tid = str(payload.get("parent") or "<card>")[:64]
+     title = str(payload.get("parent_title") or "").strip()[:120]
+     named = f"{tid} ({title})" if title else tid
++    if payload.get("core_update_hold"):
++        return (f"{named}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min "
++                "with no worker: claims are held for a pending Hermes update "
++                f"(hold started {payload.get('core_update_started') or 'at an unknown time'}). "
++                "The hold lasts until the update applies or the drain's hard max.")
+     if payload.get("missing_shared_board"):
+         return (f"{named}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min "
+                 f"with no worker because it isn't on the shared Board (claim_deferred: not_found). "
+@@ -152,8 +157,9 @@ def _clock_hold_unchecked(conn, task_id: str, since: int, now: float) -> dict[st
+ 
+ def sweep(conn, *, now: Optional[float] = None) -> int:
+     """Append the once-per-ready-episode notice for every qualifying card; returns how many were appended."""
+-    from hermes_cli.kanban_sync_diagnostics import missing_board
++    from hermes_cli.kanban_sync_diagnostics import missing_board, update_hold
+     now = time.time() if now is None else now
++    drain = update_hold()
+     posted = 0
+     rows = conn.execute(_CANDIDATES, (int(now - MAX_EPISODE_SECONDS), int(now - THRESHOLD_SECONDS))).fetchall()
+     for row in rows:
+@@ -163,7 +169,7 @@ def sweep(conn, *, now: Optional[float] = None) -> int:
+             continue
+         if pu.post_notice(conn, row["id"], row["id"], wait_key=f"ready@{since}", waited_seconds=ready_for,
+                           ready_seconds=ready_for, parent_title=row["title"], kind=NOTICE_KIND,
+-                          extra={**_clock_hold(conn, row["id"], since, now),
++                          extra={**drain, **_clock_hold(conn, row["id"], since, now),
+                                  **missing_board(conn, row["id"], since)}):
+             posted += 1
+     return posted
+diff --git a/hermes_cli/kanban_sync_diagnostics.py b/hermes_cli/kanban_sync_diagnostics.py
+index 2fa69fe748d..e14b47b73bd 100644
+--- a/hermes_cli/kanban_sync_diagnostics.py
++++ b/hermes_cli/kanban_sync_diagnostics.py
+@@ -27,6 +27,22 @@ def record_claim(conn, task_id: str, reason: str) -> None:
+         kb._append_event(conn, task_id, "claim_deferred", {"reason": reason, "gateway": gateway})
+ 
+ 
++def update_hold() -> dict:
++    """Use admission's live marker reader, not an independent existence-only diagnosis."""
++    from datetime import datetime
++    from zoneinfo import ZoneInfo
++    from hermes_cli.kanban_gateway_drain import core_update_hold
++    hold = core_update_hold()
++    if hold is None:
++        return {}
++    try:
++        started = datetime.fromtimestamp(float(hold["started_at"]), ZoneInfo("America/Los_Angeles"))
++        stamp = started.strftime("%Y-%m-%d %H:%M:%S %Z")
++    except (KeyError, ValueError, TypeError, OverflowError, OSError):
++        stamp = "at an unknown time"
++    return {"core_update_hold": True, "core_update_started": stamp}
++
++
+ def missing_board(conn, task_id: str, since: int) -> dict:
+     """Only this gateway's latest claim in this ready episode can diagnose a missing Board row."""
+     state = sync.sync_state(conn)
+diff --git a/tests/hermes_cli/test_kanban_drain_wait_notice.py b/tests/hermes_cli/test_kanban_drain_wait_notice.py
+new file mode 100644
+index 00000000000..0d0bcee5898
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_drain_wait_notice.py
+@@ -0,0 +1,52 @@
++"""Ready notices use the same live update-hold evidence as admission."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from agent import core_update_drain as drain
++from hermes_cli import kanban_db_sync as sync
++from tests.hermes_cli import test_kanban_missing_board_notice as helpers
++
++kanban_home = helpers.kanban_home
++svc = helpers.svc
++live = helpers.live
++START = 1794403906  # 2026-11-11 05:31:46 PST
++
++
++@pytest.mark.parametrize("missing", [False, True])
++def test_active_drain_explains_hold_instead_of_capacity(live, tmp_path, monkeypatch, missing):
++    marker = tmp_path / "drain-hold"
++    marker.write_text(json.dumps({"pid": 12345, "started_at": START, "reason": "pending core update"}))
++    monkeypatch.setattr(drain, "hold_paths", lambda: [marker])
++    monkeypatch.setattr(drain, "_pid_alive", lambda pid: pid == 12345)
++    tid = helpers._card(live)
++    if missing:
++        monkeypatch.setattr(sync._client(), "acquire", lambda **kw: sync.Lease(
++            granted=False, run_uid=kw["run_uid"], reason="not_found"))
++        sync.claim_gate(live, tid, START + 900)
++    text = helpers._notice(live, tid)
++    assert "claims are held for a pending Hermes update" in text
++    assert "2026-11-11 05:31:46 PST" in text
++    assert "until the update applies or the drain's hard max" in text
++    assert "priority" not in text and "re-place" not in text
++
++
++@pytest.mark.parametrize("started", [None, "bad", float("inf")])
++def test_drain_without_valid_start_still_reports_hold(live, tmp_path, monkeypatch, started):
++    marker = tmp_path / "drain-hold"
++    marker.write_text(json.dumps({"pid": 12345, "started_at": started}))
++    monkeypatch.setattr(drain, "hold_paths", lambda: [marker])
++    monkeypatch.setattr(drain, "_pid_alive", lambda pid: True)
++    text = helpers._notice(live, helpers._card(live))
++    assert "hold started at an unknown time" in text
++    assert "pending Hermes update" in text and "priority" not in text
++
++
++def test_dead_drain_writer_does_not_hide_capacity_advice(live, tmp_path, monkeypatch):
++    marker = tmp_path / "drain-hold"
++    marker.write_text(json.dumps({"pid": 12345, "started_at": START}))
++    monkeypatch.setattr(drain, "hold_paths", lambda: [marker])
++    monkeypatch.setattr(drain, "_pid_alive", lambda pid: False)
++    assert "priority" in helpers._notice(live, helpers._card(live))
+-- 
+2.55.0
+

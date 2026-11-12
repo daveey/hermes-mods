@@ -1,0 +1,647 @@
+From 81562a1d99ebea34bbe224314913221a7f52faa4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:05:25 +0000
+Subject: [PATCH] [daveey] Deliver explicit withdrawal receipts across gateway
+ replicas
+
+---
+ hermes_cli/kanban_db_archive.py               |   4 +-
+ hermes_cli/kanban_origin_ledger.py            |   9 +-
+ hermes_cli/kanban_withdrawal_notice.py        |  38 +++++++
+ hermes_cli/kanban_withdrawal_recipients.py    |  44 ++++++++
+ .../test_remote_withdrawal_guards.py          | 101 +++++++++++++++++
+ .../test_remote_withdrawal_transport.py       | 104 ++++++++++++++++++
+ tui_gateway/kanban_remote_notice_state.py     |  11 ++
+ tui_gateway/kanban_remote_notices.py          |  64 ++++++++---
+ tui_gateway/kanban_remote_observations.py     |  16 ++-
+ tui_gateway/remote_index_projection.py        |   3 +-
+ 10 files changed, 371 insertions(+), 23 deletions(-)
+ create mode 100644 hermes_cli/kanban_withdrawal_notice.py
+ create mode 100644 hermes_cli/kanban_withdrawal_recipients.py
+ create mode 100644 tests/tui_gateway/test_remote_withdrawal_guards.py
+ create mode 100644 tests/tui_gateway/test_remote_withdrawal_transport.py
+ create mode 100644 tui_gateway/kanban_remote_notice_state.py
+
+diff --git a/hermes_cli/kanban_db_archive.py b/hermes_cli/kanban_db_archive.py
+index dcf493da4ce..744f46b41cf 100644
+--- a/hermes_cli/kanban_db_archive.py
++++ b/hermes_cli/kanban_db_archive.py
+@@ -55,7 +55,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via:
+         # Preserve a terminal receipt for the ask before archive removes its subscription.
+         # This is withdrawal, never a user's answer or successful task completion.
+         if row["status"] == "blocked" and row["human_request"]:
+-            kb._append_event(conn, task_id, "request_withdrawn", {}, run_id=run_id)
++            from hermes_cli.kanban_withdrawal_recipients import snapshot
++            kb._append_event(conn, task_id, "request_withdrawn",
++                             {"notice_version": 1, "recipients": snapshot(conn, task_id)}, run_id=run_id)
+         # [daveey] Same txn as the flip: a crash before forward_archive below still leaves the cancellation
+         # for the dispatcher sweep (kanban_placement_forward.sweep_unresolved_archives).
+         from hermes_cli.kanban_placement_forward import record_cancel_intent
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 97428aa67a4..aacb27d8140 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -220,7 +220,14 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+                 contract_ok = row[4] == 'local-only'
+             legacy = bool(legacy and contract_ok)
+             verified = legacy
+-    payload = {k: v for k, v in task.items() if k != 'origin_observation'}
++    payload = {k: v for k, v in task.items()
++               if k not in ('origin_observation', 'withdrawal_notice', 'withdrawal_recipients')}
++    from hermes_cli.kanban_withdrawal_notice import publish
++    withdrawal = publish(conn, task)
++    if withdrawal is not None:
++        from hermes_cli.kanban_withdrawal_recipients import published
++        payload['withdrawal_notice'] = withdrawal
++        payload['withdrawal_recipients'] = published(conn, withdrawal['event_id'])
+     if row[0] == 'blocked':
+         from hermes_cli.kanban_block_notice import blocked_actor_fields
+         payload.update(blocked_actor_fields(conn, task['id']))
+diff --git a/hermes_cli/kanban_withdrawal_notice.py b/hermes_cli/kanban_withdrawal_notice.py
+new file mode 100644
+index 00000000000..7471ab0127b
+--- /dev/null
++++ b/hermes_cli/kanban_withdrawal_notice.py
+@@ -0,0 +1,38 @@
++"""Explicit, content-free owner withdrawal receipts for remote transport."""
++from __future__ import annotations
++
++import json
++import math
++
++
++def publish(conn, task: dict) -> dict | None:
++    """Read inside the collector snapshot; never infer withdrawal from status."""
++    if task.get("status") != "archived":
++        return None
++    row = conn.execute(
++        "SELECT id,created_at,payload FROM task_events WHERE task_id=? "
++        "AND kind='request_withdrawn' ORDER BY id DESC LIMIT 1", (task["id"],)).fetchone()
++    if row is None:
++        return None
++    try:
++        payload = json.loads(row[2] or "{}")
++    except (TypeError, ValueError):
++        return None
++    if (not isinstance(payload, dict) or type(payload.get("notice_version")) is not int
++            or payload["notice_version"] != 1):
++        return None
++    return {"event_id": row[0], "kind": "request_withdrawn", "created_at": row[1]}
++
++
++def envelope(task: dict) -> dict | None:
++    """Fail closed for malformed/other-state envelopes at the replica boundary."""
++    notice = task.get("withdrawal_notice")
++    if task.get("status") != "archived" or not isinstance(notice, dict):
++        return None
++    if (set(notice) != {"event_id", "kind", "created_at"}
++            or notice.get("kind") != "request_withdrawn"
++            or type(notice.get("event_id")) is not int or notice["event_id"] <= 0
++            or type(notice.get("created_at")) not in (int, float)
++            or not math.isfinite(notice["created_at"]) or notice["created_at"] <= 0):
++        return None
++    return notice
+diff --git a/hermes_cli/kanban_withdrawal_recipients.py b/hermes_cli/kanban_withdrawal_recipients.py
+new file mode 100644
+index 00000000000..3a88d98ad49
+--- /dev/null
++++ b/hermes_cli/kanban_withdrawal_recipients.py
+@@ -0,0 +1,44 @@
++"""Archive-time remote receipt custody, independent of later link cleanup."""
++from __future__ import annotations
++
++import json
++
++
++def snapshot(conn, task_id: str) -> list[dict]:
++    """Capture identities only, inside the archive write transaction."""
++    destinations: set[tuple[str, str, str]] = set()
++    released: set[tuple[str, str, str]] = set()
++    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
++    if "task_chat_links" in tables:
++        for gw, profile, session, release in conn.execute(
++                "SELECT chat_gateway,chat_profile,chat_session,released FROM task_chat_links WHERE task_id=?",
++                (task_id,)):
++            key = (gw, profile or "default", session)
++            (released if release else destinations).add(key)
++    if "kanban_notify_subs" in tables:
++        for (chat,) in conn.execute(
++                "SELECT chat_id FROM kanban_notify_subs WHERE task_id=? AND platform='hub'", (task_id,)):
++            parts = str(chat).split("/", 2)
++            if len(parts) == 3 and all(parts):
++                destinations.add((parts[0], parts[1], parts[2]))
++    if "origin_creation_intents" in tables:
++        for (raw,) in conn.execute("SELECT binding_json FROM origin_creation_intents WHERE task_id=?", (task_id,)):
++            try:
++                binding = json.loads(raw)
++            except (TypeError, ValueError):
++                continue
++            origin = binding.get("origin") if isinstance(binding, dict) else None
++            if not isinstance(origin, dict):
++                continue
++            gw, profile, session = (origin.get(field) for field in ("gateway", "profile", "session"))
++            if all(isinstance(value, str) and value for value in (gw, profile, session)):
++                destinations.add((gw, profile, session))
++    return [dict(gw=gw, profile=profile, session=session, rel="shepherd")
++            for gw, profile, session in sorted(destinations - released)]
++
++
++def published(conn, event_id: int) -> list[dict] | None:
++    """No fallback to current bindings: their custody may have changed."""
++    row = conn.execute("SELECT payload FROM task_events WHERE id=?", (event_id,)).fetchone()
++    payload = json.loads(row[0])
++    return payload.get("recipients")
+diff --git a/tests/tui_gateway/test_remote_withdrawal_guards.py b/tests/tui_gateway/test_remote_withdrawal_guards.py
+new file mode 100644
+index 00000000000..da1096ad6bd
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_withdrawal_guards.py
+@@ -0,0 +1,101 @@
++"""Withdrawal receiver lifecycle and malformed wire controls."""
++import contextlib
++import json
++
++import pytest
++
++from hermes_cli.kanban_withdrawal_notice import envelope
++from hermes_state import SessionDB
++from tui_gateway import kanban_remote_notices as remote
++
++
++def task():
++    return dict(id="t_one", status="archived", board="default", title="Decision",
++                withdrawal_notice=dict(kind="request_withdrawn", event_id=42, created_at=100),
++                sessions=[dict(gw="origin", profile="work", session="chat", rel="shepherd")])
++
++
++@pytest.mark.parametrize("change", [dict(event_id=True), dict(event_id=0), dict(event_id="42"),
++                                    dict(created_at=True), dict(created_at=0), dict(created_at=float("nan")),
++                                    dict(created_at=float("inf")), dict(created_at="100"),
++                                    dict(kind="completed"), dict(payload={"action": "secret"})])
++def test_malformed_envelope_is_silent(change):
++    card = task()
++    card["withdrawal_notice"].update(change)
++    assert envelope(card) is None
++    assert list(remote._sweep_cards([("owner", "build/default/t_one", 1, json.dumps(card))], "origin")) == []
++
++
++@pytest.mark.parametrize("field,value", [("profile", 123), ("profile", []), ("profile", ""),
++                                        ("session", 123), ("session", ["chat"]),
++                                        ("session", ""), ("gw", ["origin"])])
++def test_withdrawal_recipient_identity_is_not_coerced(field, value):
++    card = task()
++    link = dict(gw="origin", profile="work", session="chat")
++    link[field] = value
++    card["withdrawal_recipients"] = [link]
++    assert remote._linked_chats(card, "origin") == []
++
++
++@pytest.mark.parametrize("status", ["todo", "blocked", "done"])
++def test_nonarchive_with_old_withdrawal_is_not_a_receipt(status):
++    card = task()
++    card["status"] = status
++    assert envelope(card) is None
++
++
++@pytest.mark.parametrize("notice", [None, [], "withdrawn"])
++def test_nonmapping_envelope_is_silent(notice):
++    card = task()
++    card["withdrawal_notice"] = notice
++    assert envelope(card) is None
++
++
++def test_released_shepherd_cannot_reenter_as_origin():
++    card = task()
++    card["sessions"][0]["released"] = True
++    card["origin_bindings"] = [dict(origin=dict(gateway="origin", profile="work", session="chat"))]
++    assert remote._linked_chats(card, "origin") == []
++    card["sessions"][0]["released"] = False
++    assert remote._linked_chats(card, "origin") == [("work", "chat")]
++
++
++@pytest.mark.parametrize("reason", ["archived", "moved_to_gateway:elsewhere"])
++def test_deferred_persist_rechecks_chat_exclusion(tmp_path, reason):
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session("chat", "desktop")
++        if reason == "archived":
++            db._write_rowcount("UPDATE sessions SET archived=1 WHERE id=?", ("chat",))
++        else:
++            db.end_session("chat", reason)
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            yield db, sid
++
++        ledger = tmp_path / "ledger.db"
++        claim = dict(session="chat", ref="owner/build/default/t_one", state="request_withdrawn@42")
++        key, metadata, text = remote._sweep_payload("owner", "build/default/t_one", task(), "origin", "work", "chat")
++        assert not remote._persist_claimed(opener, "work", "chat", text, metadata, claim,
++                                          ("replica", "work", "chat", key), ledger)
++        assert db.get_messages("chat") == []
++
++
++def test_stale_withdrawal_sweep_key_matches_event_identity():
++    row = dict(session="chat", notice_key="remote:owner:build/default/t_one:42",
++               state="request_withdrawn@42", ref="owner/build/default/t_one")
++    assert remote._stale_notice_id(row, task()) == ("work", "remote:owner:build/default/t_one:42:work:chat")
++
++
++def test_old_claim_ack_release_cannot_settle_new_event(tmp_path):
++    ledger = tmp_path / "ledger.db"
++    old = dict(session="chat", ref="owner/build/default/t_one", state="request_withdrawn@41")
++    new = dict(old, state="request_withdrawn@42")
++    with contextlib.closing(remote._ledger(ledger)) as conn:
++        for claim in (old, new):
++            assert remote._claim_notice(conn, **claim, now=100, fresh=True,
++                                        notice_key=claim["state"], task_id="t_one", transcript_has=None) == "offer"
++        assert remote.ack(old, ledger=ledger)
++        assert remote.release(old, ledger=ledger)
++        row = conn.execute("SELECT state,delivered FROM notices").fetchone()
++        assert tuple(row) == (new["state"], 0)
+diff --git a/tests/tui_gateway/test_remote_withdrawal_transport.py b/tests/tui_gateway/test_remote_withdrawal_transport.py
+new file mode 100644
+index 00000000000..696a2605389
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_withdrawal_transport.py
+@@ -0,0 +1,104 @@
++"""Withdrawal transport is an explicit owner event, not an archived status."""
++from contextlib import closing
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_origin_ledger import observe_owner_task
++from tui_gateway import kanban_remote_notices as remote
++
++
++@pytest.mark.parametrize("pending", [True, False])
++def test_owner_publishes_only_new_explicit_withdrawal(pending):
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="Decision", assignee="default")
++        if pending:
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='blocked',human_request=? WHERE id=?",
++                             ('{"action":"private request contents"}', tid))
++        assert kb.archive_task(conn, tid)
++        task = dict(id=tid, status="archived", gateway="owner", profile="build", board="default",
++                    origin_bindings=[], sessions=[])
++        conn.execute("BEGIN")
++        published = observe_owner_task(conn, task, now=0)
++        event = conn.execute("SELECT id,created_at FROM task_events WHERE task_id=? AND kind='request_withdrawn'",
++                             (tid,)).fetchone()
++        conn.rollback()
++        assert published["origin_observation"]["verified"] is False
++        if pending:
++            assert published.get("withdrawal_notice") == dict(
++                event_id=event[0], created_at=event[1], kind="request_withdrawn")
++            assert "private request contents" not in str(published)
++            # Pre-transport events deliberately do not opt in to historical replay.
++            with kb.write_txn(conn):
++                conn.execute("UPDATE task_events SET payload='{}' WHERE id=?", (event[0],))
++            conn.execute("BEGIN")
++            assert "withdrawal_notice" not in observe_owner_task(conn, task, now=0)
++            conn.rollback()
++        else:
++            assert "withdrawal_notice" not in published
++
++
++@pytest.mark.parametrize("payload", ['{bad', 'null', '[]', '{"notice_version":true}', '{"notice_version":1.0}', '{"notice_version":2}'])
++def test_owner_malformed_opt_in_is_silent(payload):
++    from hermes_cli.kanban_withdrawal_notice import publish
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="Malformed receipt", assignee="default")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (tid,))
++            conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?, 'request_withdrawn', ?, 1)",
++                         (tid, payload))
++        assert publish(conn, dict(id=tid, status="archived")) is None
++
++
++@pytest.mark.parametrize("raw", ['{bad', 'null', '[]', '{}', '{"origin":null}',
++                                 '{"origin":{"gateway":[],"profile":"default","session":"chat"}}'])
++def test_malformed_origin_does_not_prevent_archive(raw):
++    from hermes_cli.kanban_db_sync import SYNC_SCHEMA_SQL
++    with closing(kbc.connect()) as conn:
++        conn.executescript(SYNC_SCHEMA_SQL)
++        tid = kb.create_task(conn, title="Malformed origin", assignee="default", origin_intent=dict(
++            request_id="malformed-origin", owner=dict(gateway="owner", profile="build", board="default"),
++            origin=dict(gateway="origin", profile="default", session="chat")))
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='blocked',human_request=? WHERE id=?", ('{"action":"private"}', tid))
++            conn.execute("UPDATE origin_creation_intents SET binding_json=? WHERE task_id=?", (raw, tid))
++            conn.execute("DELETE FROM kanban_notify_subs WHERE task_id=?", (tid,))
++        assert kb.archive_task(conn, tid)
++        from hermes_cli.kanban_withdrawal_recipients import snapshot
++        assert snapshot(conn, tid) == []
++
++
++@pytest.mark.parametrize("status", ["todo", "blocked", "done"])
++def test_owner_does_not_publish_old_withdrawal_after_reopen(status):
++    from hermes_cli.kanban_withdrawal_notice import publish
++    with closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="Reopened receipt", assignee="default")
++        with kb.write_txn(conn):
++            conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?, 'request_withdrawn', ?, 1)",
++                         (tid, '{"notice_version":1}'))
++        assert publish(conn, dict(id=tid, status=status)) is None
++
++
++def test_withdrawal_projects_one_event_identity_for_both_consumers():
++    task = dict(id="t_one", status="archived", gateway="owner", profile="build", board="default",
++                title="Decision", withdrawal_notice=dict(event_id=42, created_at=100, kind="request_withdrawn"),
++                sessions=[dict(gw="origin", profile="work", session="chat", rel="shepherd")])
++    key = "build/default/t_one"
++    import json
++    cards = list(remote._sweep_cards([("owner", key, 1, json.dumps(task))], "origin"))
++    assert len(cards) == 1
++    event_key, metadata, text = remote._sweep_payload("owner", key, task, "origin", "work", "chat")
++    assert event_key == "remote:owner:build/default/t_one:42"
++    assert metadata["blocked_on_human"] is False
++    assert metadata["event_ids"] == [42]
++    assert "request withdrawn" in text and "not approval" in text and "not proof of completion" in text
++    assert remote._shared_key("owner", key, task, "work", "chat") == event_key
++    item = remote._notice_item(dict(gw="owner", key=key, task=task), "chat", "origin", "work")
++    assert item["event_key"] == event_key
++    assert item["state"] == "request_withdrawn@42"
++    assert item["blocked_on_human"] is False
++    # Ordinary archive is silent, even with the same retained chat link.
++    task.pop("withdrawal_notice")
++    assert list(remote._sweep_cards([("owner", key, 2, json.dumps(task))], "origin")) == []
+diff --git a/tui_gateway/kanban_remote_notice_state.py b/tui_gateway/kanban_remote_notice_state.py
+new file mode 100644
+index 00000000000..e1f646586dc
+--- /dev/null
++++ b/tui_gateway/kanban_remote_notice_state.py
+@@ -0,0 +1,11 @@
++"""Identity shared by remote notice arrival, claims and stale projections."""
++from hermes_cli.kanban_withdrawal_notice import envelope
++
++
++def state(task: dict) -> str:
++    notice = envelope(task)
++    if notice is not None:
++        return f"request_withdrawn@{notice['event_id']}"
++    from tui_gateway.kanban_remote_notices import _terminal_at
++    at = _terminal_at(task) if task.get("status") in ("done", "blocked") else None
++    return f"{task['status']}@{int(at) if at else 0}"
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 9fc4baa5f0c..dfd45201d9e 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -34,6 +34,8 @@ import time
+ from pathlib import Path
+ from types import SimpleNamespace
+ from typing import Any, Callable, Optional
++from hermes_cli.kanban_withdrawal_notice import envelope as _withdrawal
++from tui_gateway.kanban_remote_notice_state import state as _notice_state
+ 
+ FRESH_S = 6 * 3600.0
+ # ``notices.delivered``: 0 = in flight (or an old silent record), DELIVERED = the notice is in the chat transcript,
+@@ -83,6 +85,9 @@ def _terminal_at(task: dict) -> Optional[float]:
+ def _fresh_at(task: dict) -> Optional[float]:
+     """When the card reached its terminal state, for the freshness bound. Falls back to the owner's published
+     ``completion_notice.created_at`` (records without ``completed_at``). Not part of the ledger identity."""
++    withdrawal = _withdrawal(task)
++    if withdrawal is not None:
++        return float(withdrawal["created_at"])
+     at = _terminal_at(task)
+     if at is not None:
+         return at
+@@ -150,8 +155,21 @@ def _linked_chats(task: dict, me: str) -> list[tuple[str, str]]:
+     done notice at all, so it never summarised the finished work and its outcome stayed ``unresolved{no_summary}``
+     (hub card t_a989e5e0 -> MacBook chat 20261026_110445_20914b, 2026-10-31: the notice reached five unrelated
+     shepherd transcripts and not the chat that asked for the work)."""
++    if _withdrawal(task) is not None and "withdrawal_recipients" in task:
++        # Archive captures eligibility before cleanup releases links/removes subs.
++        # Never recover a destination from the mutable current binding projection.
++        recipients = task["withdrawal_recipients"]
++        return list(dict.fromkeys(
++            (link["profile"], link["session"])
++            for link in recipients if isinstance(link, dict) and link.get("gw") == me
++            and all(isinstance(link.get(key), str) and link[key] for key in ("profile", "session"))
++            and not _released(link)
++        )) if isinstance(recipients, list) else []
+     out: list[tuple[str, str]] = []
+     links = task.get("sessions")
++    released = {(str(link.get("profile") or "default"), str(link["session"]))
++                for link in links if isinstance(link, dict) and link.get("gw") == me
++                and link.get("session") and _released(link)} if isinstance(links, list) else set()
+     for link in links if isinstance(links, list) else ():
+         if (isinstance(link, dict) and link.get("gw") == me and link.get("rel") in LINK_RELS
+                 and link.get("session") and not _released(link)):
+@@ -161,7 +179,7 @@ def _linked_chats(task: dict, me: str) -> list[tuple[str, str]]:
+         origin = binding.get("origin") if isinstance(binding, dict) else None
+         if isinstance(origin, dict) and origin.get("gateway") == me and origin.get("session"):
+             out.append((str(origin.get("profile") or "default"), str(origin["session"])))
+-    return list(dict.fromkeys(out))  # one notice per chat even when a chat is both origin and shepherd
++    return [chat for chat in dict.fromkeys(out) if chat not in released]
+ 
+ 
+ def _released(link: dict) -> bool:
+@@ -200,6 +218,11 @@ def format_notice(gw: str, key: str, task: dict) -> str:
+     who = task.get("assignee") or ""
+     run = task.get("run") if isinstance(task.get("run"), dict) else {}
+     prefix = f"[{gw}:{board}] " + (f"@{who} " if who else "")
++    if _withdrawal(task) is not None:
++        from tui_gateway import server
++        return server._format_kanban_event_text(
++            {"task_id": tid}, SimpleNamespace(**task),
++            SimpleNamespace(kind="request_withdrawn", payload={}), board)
+     if task.get("status") == "done":
+         handoff = _first_line(run.get("summary") or task.get("result"), 200)
+         return f"✔ {prefix}Kanban {tid} done — {title}{handoff}\n(ran on {gw}; read it with cross_task @task:{board}@{gw}/{tid})"
+@@ -215,6 +238,9 @@ def _event_key(owner: str, key: str, notice: dict) -> str:
+ 
+ def _notice_id(owner: str, key: str, task: dict, profile: str, sid: str) -> str:
+     """The sweeper's per-chat ``notice_id`` (its ``swept`` and memo identity) for this card state."""
++    withdrawal = _withdrawal(task)
++    if withdrawal is not None:
++        return f"{_event_key(owner, key, withdrawal)}:{profile}:{sid}"
+     notice = task.get("completion_notice")
+     if task.get("status") == "done" and isinstance(notice, dict) and "event_id" in notice:
+         return f"remote:{owner}:{key}:{notice['event_id']}:{profile}:{sid}"
+@@ -224,6 +250,9 @@ def _notice_id(owner: str, key: str, task: dict, profile: str, sid: str) -> str:
+ def _shared_key(owner: str, key: str, task: dict, profile: str, sid: str) -> str:
+     """The ``kanban_event_keys`` value both paths record. Done uses :func:`_event_key`; blocked has no
+     completion event, so the terminal state plus the destination is the identity."""
++    withdrawal = _withdrawal(task)
++    if withdrawal is not None:
++        return _event_key(owner, key, withdrawal)
+     notice = task.get("completion_notice")
+     if task.get("status") == "done" and isinstance(notice, dict) and "event_id" in notice:
+         return _event_key(owner, key, notice)
+@@ -333,15 +362,14 @@ def remote_blocked_on_human(task: dict) -> bool:
+ 
+ def _notice_item(card: dict, session_key: str, me: str, profile: str) -> dict:
+     task = card["task"]
+-    at = _terminal_at(task)
+     sid = card.get("sid") or session_key
+     text = _completion_text(card["gw"], card["key"], task, me, profile, sid)
+     item = {"text": text or format_notice(card["gw"], card["key"], task), "session": session_key,
+-            "ref": f"{card['gw']}/{card['key']}", "state": f"{task['status']}@{int(at) if at else 0}",
++            "ref": f"{card['gw']}/{card['key']}", "state": _notice_state(task),
+             "blocked_on_human": remote_blocked_on_human(task)}
+     if text:
+         item["event_key"] = _event_key(card["gw"], card["key"], task["completion_notice"])
+-    elif task.get("status") == "blocked":
++    elif task.get("status") == "blocked" or _withdrawal(task) is not None:
+         item["event_key"] = _shared_key(card["gw"], card["key"], task, profile, sid)
+     return item
+ 
+@@ -359,8 +387,7 @@ def _reconcile_legacy(conn, session_key: str, cards: list, now: float, transcrip
+     by_state = {}
+     for card in cards:
+         task = card["task"]
+-        at = _terminal_at(task)
+-        by_state[(f"{card['gw']}/{card['key']}", f"{task['status']}@{int(at) if at else 0}")] = card
++        by_state[(f"{card['gw']}/{card['key']}", _notice_state(task))] = card
+     pid, start = _my_holder()
+     stale = 0
+     out = []
+@@ -515,8 +542,7 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+                     break
+                 task = card["task"]
+                 ref = f"{card['gw']}/{card['key']}"
+-                at = _terminal_at(task)
+-                state = f"{task['status']}@{int(at) if at else 0}"
++                state = _notice_state(task)
+                 if (ref, state) in offered:
+                     continue
+                 at_fresh = fresh_times.get((card["gw"], card["key"], state), _fresh_at(task))
+@@ -733,8 +759,7 @@ def _current_states(rows: list[tuple]) -> dict:
+             continue
+         if not isinstance(task, dict) or not task.get("status"):
+             continue
+-        at = _terminal_at(task) if task.get("status") in _TERMINAL else None
+-        out[f"{owner}/{key}"] = (f"{task['status']}@{int(at) if at else 0}", task)
++        out[f"{owner}/{key}"] = (_notice_state(task), task)
+     return out
+ 
+ 
+@@ -746,7 +771,7 @@ def _stale_notice_id(row, task: dict) -> tuple[str, str]:
+     if not profile and key.endswith(f":{sid}"):
+         profile = key[:-len(sid) - 1].rsplit(":", 1)[-1]
+     profile = profile or "default"
+-    if str(row["state"]).startswith("done@") and key and not key.endswith(f":{profile}:{sid}"):
++    if str(row["state"]).startswith(("done@", "request_withdrawn@")) and key and not key.endswith(f":{profile}:{sid}"):
+         return profile, f"{key}:{profile}:{sid}"
+     return profile, key or f"remote:{row['ref']}:{row['state']}:{profile}:{sid}"
+ 
+@@ -802,6 +827,15 @@ def _settle_stale_claims(states: dict, path, ledger) -> int:
+ 
+ def _sweep_payload(owner: str, key: str, task: dict, me: str, profile: str, sid: str) -> tuple:
+     """``(event_key, metadata, text)`` of one swept notice, keyed like ``collect``'s."""
++    withdrawal = _withdrawal(task)
++    if withdrawal is not None:
++        event_key = _event_key(owner, key, withdrawal)
++        metadata = {"notice_id": _notice_id(owner, key, task, profile, sid),
++                    "board": task.get("board", "default"), "task_id": task["id"],
++                    "gateway": owner, "event_ids": [withdrawal["event_id"]],
++                    "kanban_event_keys": [event_key], "blocked_on_human": False,
++                    "event_kind": "request_withdrawn"}
++        return event_key, metadata, format_notice(owner, key, task)
+     notice = task.get("completion_notice")
+     if task.get("status") == "done":
+         event_id = notice["event_id"]
+@@ -827,7 +861,7 @@ def _sweep_cards(rows: list[tuple], me: str):
+             continue
+         notice = task.get("completion_notice") if isinstance(task, dict) else None
+         done = task.get("status") == "done" and isinstance(notice, dict) and "event_id" in notice
+-        if not done and task.get("status") != "blocked":
++        if not done and task.get("status") != "blocked" and _withdrawal(task) is None:
+             continue
+         links = [{"profile": profile, "session": sid} for profile, sid in _linked_chats(task, me)]
+         if not links:
+@@ -887,7 +921,8 @@ def _persist_claimed(session_db, profile: str, sid: str, text: str, metadata: di
+     from hermes_state_errors import SessionTurnLeaseLostError
+     try:
+         with session_db(profile, sid) as (db, tip):
+-            if db is None:
++            from tui_gateway.notice_fanout import chat_skip_reason
++            if db is None or chat_skip_reason(db, sid) is not None:
+                 release(claim, ledger=ledger)
+                 return False
+             db.append_kanban_notice(tip, text, metadata)
+@@ -1007,8 +1042,7 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+ def _deliver_fresh(cards, fresh_times, me, now, path, live, session_db, ledger, settled, delivered, swept,
+                    counts, waker=None) -> None:
+     for owner, key, task, links in cards:
+-        at = _terminal_at(task)
+-        ref, state = f"{owner}/{key}", f"{task['status']}@{int(at) if at else 0}"
++        ref, state = f"{owner}/{key}", _notice_state(task)
+         observed_at = fresh_times.get((owner, key, state), _fresh_at(task))
+         if observed_at is None or now - observed_at > FRESH_S:
+             counts["stale"] = counts.get("stale", 0) + 1
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index a2e9b0dba0a..dfa5c6ce171 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -5,6 +5,8 @@ import contextlib
+ import json
+ import threading
+ from pathlib import Path
++from hermes_cli.kanban_withdrawal_notice import envelope as _withdrawal
++from tui_gateway.kanban_remote_notice_state import state as _notice_state
+ 
+ _lock = threading.Lock()
+ _memo: dict[tuple, tuple] = {}
+@@ -42,7 +44,7 @@ def _snapshot(replica: Path, previous=None) -> tuple[bool, list[tuple] | None, t
+             for owner, key, _seq, raw in _canonical(_task_rows(conn, meta.get("gateway"))):
+                 with contextlib.suppress(TypeError, ValueError):
+                     task = json.loads(raw)
+-                    if isinstance(task, dict) and task.get("status") in _TERMINAL:
++                    if isinstance(task, dict) and (task.get("status") in _TERMINAL or _withdrawal(task) is not None):
+                         cards.append((owner, key, task))
+             return ready, cards, signature
+         cards = _changed_rows_cards(conn, replica, meta.get("gateway"))
+@@ -58,7 +60,12 @@ _decoded_files: dict[str, tuple | None] = {}  # replica -> file identity its _de
+ 
+ 
+ def _summary(task) -> dict | None:
+-    if not isinstance(task, dict) or task.get("status") not in _terminal_states():
++    if not isinstance(task, dict):
++        return None
++    withdrawal = _withdrawal(task)
++    if withdrawal is not None:
++        return {"status": task["status"], "withdrawal_notice": withdrawal}
++    if task.get("status") not in _terminal_states():
+         return None
+     run = task.get("run")
+     run = run if isinstance(run, dict) else {}
+@@ -103,7 +110,7 @@ def _changed_rows_cards(conn, replica: Path, me) -> list[tuple]:
+ 
+ def _persist(source: str, cards: list[tuple], ledger, now: float) -> dict[tuple, float | None]:
+     """Seed retained history once; later current-key states receive one local window."""
+-    from tui_gateway.kanban_remote_notices import FRESH_S, _fresh_at, _ledger, _terminal_at
++    from tui_gateway.kanban_remote_notices import FRESH_S, _fresh_at, _ledger
+ 
+     with contextlib.closing(_ledger(ledger)) as conn:
+         conn.execute("CREATE TABLE IF NOT EXISTS observation_sources (source TEXT PRIMARY KEY)")
+@@ -118,8 +125,7 @@ def _persist(source: str, cards: list[tuple], ledger, now: float) -> dict[tuple,
+             fresh = {}
+             for owner, key, task in cards:
+                 at = _fresh_at(task)
+-                terminal = _terminal_at(task)
+-                state = f"{task['status']}@{int(terminal) if terminal else 0}"
++                state = _notice_state(task)
+                 ref = f"{owner}/{key}"
+                 # Unknown ages and frozen legacy keys cannot establish local freshness.
+                 seen = now if at is not None and key.count('/') >= 2 and (not initial or now - at <= FRESH_S) else None
+diff --git a/tui_gateway/remote_index_projection.py b/tui_gateway/remote_index_projection.py
+index 5a76e9dd3ee..bd035964db8 100644
+--- a/tui_gateway/remote_index_projection.py
++++ b/tui_gateway/remote_index_projection.py
+@@ -64,7 +64,8 @@ def snapshot(conn, identity, me):
+             except (TypeError, ValueError):
+                 task = None
+             chats = []
+-            if isinstance(task, dict) and task.get("status") in remote._TERMINAL and task.get("id"):
++            if (isinstance(task, dict) and task.get("id")
++                    and (task.get("status") in remote._TERMINAL or remote._withdrawal(task) is not None)):
+                 chats = remote._linked_chats(task, me)
+             hit = (seq, chats, {"gw": str(owner), "key": str(key), "task": task})
+         updated[(owner, key)] = hit
+-- 
+2.55.0
+

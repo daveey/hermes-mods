@@ -1,0 +1,257 @@
+From 856d8bbb9e8512b44f6782f6acb08baf05902090 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 18:57:55 +0000
+Subject: [PATCH] perf(tui): retain remote notice routing across replica churn
+ [daveey]
+
+---
+ .../test_remote_index_projection.py           | 96 +++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          | 28 ++----
+ tui_gateway/remote_index_projection.py        | 74 ++++++++++++++
+ 3 files changed, 177 insertions(+), 21 deletions(-)
+ create mode 100644 tests/tui_gateway/test_remote_index_projection.py
+ create mode 100644 tui_gateway/remote_index_projection.py
+
+diff --git a/tests/tui_gateway/test_remote_index_projection.py b/tests/tui_gateway/test_remote_index_projection.py
+new file mode 100644
+index 00000000000..accdbb464b8
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_index_projection.py
+@@ -0,0 +1,96 @@
++"""Index decoding must scale with changed remote rows, not replica churn."""
++import json
++import sqlite3
++
++import pytest
++
++from tests.tui_gateway.test_kanban_remote_idle_read import CHAT, NOW, _card, _index, _replica
++from tui_gateway import kanban_remote_notices as remote
++
++
++def test_only_changed_remote_rows_are_decoded(tmp_path, monkeypatch):
++    cards = [_card(f"t_{i}", CHAT, status="done", at=NOW) for i in range(30)]
++    path = _replica(tmp_path, cards, "wal")
++    remote._reset_for_tests()
++    assert len(_index(path)[1][("default", CHAT)]) == 30
++    seen, real = [], remote._linked_chats
++    monkeypatch.setattr(remote, "_linked_chats", lambda task, me: seen.append(task["id"]) or real(task, me))
++    with sqlite3.connect(path) as conn:
++        conn.execute("UPDATE replica SET seq=100 WHERE key=?", (cards[0]["key"],))
++    assert len(_index(path)[1][("default", CHAT)]) == 30
++    assert seen == ["t_0"]
++    seen.clear()
++    with sqlite3.connect(path) as conn:
++        me = conn.execute("SELECT v FROM meta WHERE k='gateway'").fetchone()[0]
++        conn.execute("INSERT INTO replica VALUES (?, 'tasks', 'default/default/local', '{}', 101)", (me,))
++    assert len(_index(path)[1][("default", CHAT)]) == 30
++    assert seen == []
++
++
++@pytest.mark.parametrize("missing", [False, True])
++def test_unknown_seq_does_not_hide_updates(tmp_path, missing):
++    card = _card("t_legacy", CHAT, status="done", at=NOW)
++    path = _replica(tmp_path, [card])
++    with sqlite3.connect(path) as conn:
++        if missing:
++            conn.execute("ALTER TABLE replica DROP COLUMN seq")
++        else:
++            conn.execute("UPDATE replica SET seq=NULL")
++    remote._reset_for_tests()
++    assert _index(path)[1]
++    card["task"]["status"] = "running"
++    with sqlite3.connect(path) as conn:
++        conn.execute("UPDATE replica SET data=?", (json.dumps(card["task"]),))
++    assert _index(path)[1] == {}
++
++
++def test_warm_read_fetches_only_changed_payload_and_keeps_snapshot(tmp_path, monkeypatch):
++    cards = [_card(f"t_{i}", CHAT, status="done", at=NOW) for i in range(2)]
++    path = _replica(tmp_path, cards, "wal")
++    remote._reset_for_tests()
++    assert len(_index(path)[1][("default", CHAT)]) == 2
++    with sqlite3.connect(path) as writer:
++        writer.execute("UPDATE replica SET seq=100 WHERE key=?", (cards[0]["key"],))
++    real_ro, traced = remote._ro, []
++    changed = False
++
++    def trace(sql):
++        nonlocal changed
++        traced.append(sql)
++        if sql.startswith("SELECT data") and not changed:
++            changed = True
++            with sqlite3.connect(path) as writer:
++                task = dict(cards[0]["task"], status="running")
++                writer.execute("UPDATE replica SET data=?, seq=101 WHERE key=?",
++                               (json.dumps(task), cards[0]["key"]))
++
++    def opened(path):
++        conn = real_ro(path)
++        conn.set_trace_callback(trace)
++        return conn
++
++    monkeypatch.setattr(remote, "_ro", opened)
++    assert len(_index(path)[1][("default", CHAT)]) == 2
++    assert changed
++    assert len([sql for sql in traced if sql.startswith("SELECT data")]) == 1
++    assert not any("seq, data" in sql for sql in traced)
++    assert len(_index(path)[1][("default", CHAT)]) == 1
++
++
++def test_canonical_deletion_and_legacy_done_without_notice(tmp_path):
++    card = _card("t_legacy", CHAT, status="done", at=NOW)
++    card["task"].pop("completion_notice", None)
++    card["key"] = "default/t_legacy"
++    path = _replica(tmp_path, [card])
++    remote._reset_for_tests()
++    assert _index(path)[1][("default", CHAT)][0]["key"] == card["key"]
++    with sqlite3.connect(path) as writer:
++        writer.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,100)",
++                       ("default/default/t_legacy", json.dumps(dict(card["task"], status="running"))))
++    assert _index(path)[1] == {}
++    with sqlite3.connect(path) as writer:
++        writer.execute("DELETE FROM replica WHERE key='default/default/t_legacy'")
++    assert _index(path)[1][("default", CHAT)][0]["key"] == card["key"]
++    with sqlite3.connect(path) as writer:
++        writer.execute("DELETE FROM replica")
++    assert _index(path)[1] == {}
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 75910b65e10..9fc4baa5f0c 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -117,8 +117,8 @@ def _canonical(rows: list[tuple]) -> list[tuple]:
+ 
+ def _index(path: Path) -> tuple[str, dict]:
+     """``(this gateway, {(profile, session): [card, ...]})`` for terminal cards owned by other gateways, cached on
+-    the replica observer's change key (an unchanged replica is not read) and, for the same db file, on its task-row
+-    signature (one decode per change, shared by every chat's poll)."""
++    the replica observer's change key (an unchanged replica is not read). Per-row routing projections
++    survive unrelated writes and are shared by every chat's poll."""
+     global _index_memo
+     from tui_gateway.kanban_replica_observer import file_identity, fingerprint
+ 
+@@ -131,29 +131,13 @@ def _index(path: Path) -> tuple[str, dict]:
+     try:
+         row = conn.execute("SELECT v FROM meta WHERE k = 'gateway'").fetchone()
+         me = str(row[0]) if row and row[0] else ""
+-        sig = conn.execute("SELECT COUNT(*), MAX(seq), TOTAL(seq) FROM replica WHERE coll = 'tasks'").fetchone()
+-        if (memo is not None and stamp is not None and memo[1] == file_identity(stamp) and memo[2:4] == (sig, me)
+-                and fingerprint(path) == stamp):
+-            _index_memo = (stamp, *memo[1:])  # same file, no task row moved (a meta write or checkpoint)
+-            return me, memo[4]
+-        rows = _canonical(_task_rows(conn))
++        from tui_gateway.remote_index_projection import snapshot
++        index = snapshot(conn, file_identity(stamp) if stamp is not None else None, me)
+         stable = stamp is not None and fingerprint(path) == stamp
+     finally:
+         conn.close()
+-    index: dict[tuple[str, str], list[dict]] = {}
+-    for gw, key, _seq, data in rows:
+-        if not me or gw == me:
+-            continue  # this gateway's own cards notify through local tui subscriptions
+-        try:
+-            task = json.loads(data)
+-        except (TypeError, ValueError):
+-            continue
+-        if not isinstance(task, dict) or task.get("status") not in _TERMINAL or not task.get("id"):
+-            continue
+-        for chat in _linked_chats(task, me):
+-            index.setdefault(chat, []).append({"gw": str(gw), "key": str(key), "task": task})
+     if stable:
+-        _index_memo = (stamp, file_identity(stamp), sig, me, index)
++        _index_memo = (stamp, file_identity(stamp), None, me, index)
+     return me, index
+ 
+ 
+@@ -690,7 +674,9 @@ def _reset_for_tests() -> None:
+     from tui_gateway.kanban_replica_observer import reset as reset_observers
+     from tui_gateway.remote_sweep_projection import reset as reset_projection
+ 
++    from tui_gateway.remote_index_projection import reset as reset_index_projection
+     reset_projection()
++    reset_index_projection()
+     global _index_memo, _sweep_memo
+     _sweep_memo = None
+     reset_observers()
+diff --git a/tui_gateway/remote_index_projection.py b/tui_gateway/remote_index_projection.py
+new file mode 100644
+index 00000000000..5a76e9dd3ee
+--- /dev/null
++++ b/tui_gateway/remote_index_projection.py
+@@ -0,0 +1,74 @@
++"""Share per-row notice routing projections across unrelated replica writes.
++
++Only routing is cached: freshness, delivery and claims stay with the caller.
++One file/gateway generation is retained and deleted/superseded rows are dropped.
++"""
++from __future__ import annotations
++
++import json
++
++_identity = None
++_rows: dict = {}
++
++
++def reset():
++    global _identity, _rows
++    _identity, _rows = None, {}
++
++
++def _read_rows(conn, me, previous):
++    """Warm reads fetch only changed payloads, with identities in the same snapshot."""
++    from tui_gateway import kanban_remote_notices as remote
++
++    if not previous:
++        return remote._canonical(remote._task_rows(conn, me))
++    conn.execute("BEGIN")
++    try:
++        rows = remote._canonical(conn.execute(
++            "SELECT gw, key, seq, NULL FROM replica WHERE coll='tasks' AND gw != ?", (me,)
++        ).fetchall())
++        result = []
++        for owner, key, seq, _ in rows:
++            hit = previous.get((owner, key))
++            if hit is not None and isinstance(seq, int) and seq > 0 and hit[0] == seq:
++                result.append((owner, key, seq, None))
++            else:
++                data = conn.execute("SELECT data FROM replica WHERE coll='tasks' AND gw=? AND key=?",
++                                    (owner, key)).fetchone()[0]
++                result.append((owner, key, seq, data))
++        return result
++    finally:
++        conn.rollback()
++
++
++def snapshot(conn, identity, me):
++    """Called under the notice reader lock; unknown sequences never grant reuse."""
++    from tui_gateway import kanban_remote_notices as remote
++
++    global _identity, _rows
++    scope = (identity, me)
++    previous = _rows if identity is not None and _identity == scope else {}
++    cols = {row[1] for row in conn.execute("PRAGMA table_info(replica)")}
++    if "seq" not in cols:
++        previous = {}
++    rows = _read_rows(conn, me, previous)
++    updated, index = {}, {}
++    for owner, key, seq, data in rows:
++        if not me or owner == me:
++            continue
++        hit = previous.get((owner, key))
++        reusable = "seq" in cols and isinstance(seq, int) and seq > 0
++        if hit is None or not reusable or hit[0] != seq:
++            try:
++                task = json.loads(data)
++            except (TypeError, ValueError):
++                task = None
++            chats = []
++            if isinstance(task, dict) and task.get("status") in remote._TERMINAL and task.get("id"):
++                chats = remote._linked_chats(task, me)
++            hit = (seq, chats, {"gw": str(owner), "key": str(key), "task": task})
++        updated[(owner, key)] = hit
++        for chat in hit[1]:
++            index.setdefault(chat, []).append(hit[2])
++    _identity, _rows = scope, updated if identity is not None else {}
++    return index
+-- 
+2.55.0
+

@@ -1,0 +1,271 @@
+From fe3c4ba4ac55925f5fce57ce5bb7b4ec7ae3661c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:48:52 +0000
+Subject: [PATCH] [daveey] Fence new worker card claims on root disk capacity
+
+---
+ hermes_cli/kanban_admission.py                |  19 +++
+ hermes_cli/kanban_disk_admission.py           |  54 +++++++
+ .../hermes_cli/test_kanban_disk_admission.py  | 138 ++++++++++++++++++
+ 3 files changed, 211 insertions(+)
+ create mode 100644 hermes_cli/kanban_disk_admission.py
+ create mode 100644 tests/hermes_cli/test_kanban_disk_admission.py
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 41accd4f54c..86be4940c81 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -222,6 +222,17 @@ def claim_and_open_run(conn, task_id, source_status, lock, expires, now, *, even
+     return run_id
+ 
+ 
++def disk_admission_refused(task_id=None):
++    """Independent card-only disk check; never writes the updater/operator hold."""
++    from hermes_cli.kanban_disk_admission import refusal_reason
++
++    reason = refusal_reason()
++    if reason:
++        _defer(task_id, reason)
++        logging.getLogger(__name__).info("Disk admission refused Kanban claim %s: %s", task_id, reason)
++    return reason is not None
++
++
+ def admission_hold_set(task_id=None):
+     """[daveey] Lock-free early read of the updater hold, for callers to check BEFORE side effects that
+     precede ``claim_transaction`` (the Board-service lease). Advisory only: ``claim_transaction`` still
+@@ -230,6 +241,8 @@ def admission_hold_set(task_id=None):
+     from hermes_constants import get_default_hermes_root
+     from hermes_cli.admission_fence import is_held, SUPPORTED
+ 
++    if disk_admission_refused(task_id):
++        return True
+     if not SUPPORTED:
+         return False
+     try:
+@@ -264,6 +277,9 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+         raise RuntimeError("Kanban claim cannot run inside an existing transaction")
+     if not SUPPORTED:
+         with write_txn(conn):
++            if disk_admission_refused(task_id):
++                yield False
++                return
+             _bind_echo(conn, task_id, gate)
+             yield True
+         return
+@@ -312,6 +328,9 @@ def claim_transaction(conn, *, task_id=None, gate=None):
+                 _defer(task_id, reason)
+                 yield False
+                 return
++            if disk_admission_refused(task_id):
++                yield False
++                return
+             _consumed.evidence = evidence
+             try:
+                 yield True
+diff --git a/hermes_cli/kanban_disk_admission.py b/hermes_cli/kanban_disk_admission.py
+new file mode 100644
+index 00000000000..4e53e52102a
+--- /dev/null
++++ b/hermes_cli/kanban_disk_admission.py
+@@ -0,0 +1,54 @@
++"""Opt-in installation-root disk brake for new Kanban claims only. [daveey]
++
++Workers set kanban.admission.disk_free_floor_bytes (10 GiB). Unset hosts retain
++existing behavior. Sample the actual root filesystem at every prelease/final
++claim boundary: no stale timer receipt, remote admin token, or shared hold to
++release. This stops new admissions, not writes from already-running producers.
++"""
++import os
++from pathlib import Path
++
++
++def refusal_reason():
++    """Return None when disabled/healthy, otherwise a typed defer reason.
++
++    Read the installation root rather than a task/profile config so every
++    dispatcher on a worker observes the same floor. Unknown configured state
++    fails closed. Recovery is automatic at the floor; no operator state changes.
++    """
++    from hermes_constants import get_default_hermes_root
++    from hermes_cli.config_backend import read_config_doc_readonly
++
++    try:
++        doc = read_config_doc_readonly(Path(get_default_hermes_root()) / 'config.yaml')
++    except FileNotFoundError:
++        return None
++    except Exception:  # health: allow BLE001 -- unreadable admission policy must refuse claims
++        return 'worker_disk_policy_unknown'
++    if doc is None:
++        return None
++    if not isinstance(doc, dict):
++        return 'worker_disk_policy_unknown'
++    kanban = doc.get('kanban', {})
++    if kanban is None:
++        return None
++    if not isinstance(kanban, dict):
++        return 'worker_disk_policy_unknown'
++    admission = kanban.get('admission', {})
++    if admission is None:
++        return None
++    if not isinstance(admission, dict):
++        return 'worker_disk_policy_unknown'
++    if 'disk_free_floor_bytes' not in admission:
++        return None
++    floor = admission['disk_free_floor_bytes']
++    if type(floor) is not int or floor <= 0:
++        return 'worker_disk_policy_unknown'
++    try:
++        stat = os.statvfs('/')
++        available = stat.f_bavail * stat.f_frsize
++    except OSError:
++        return 'worker_disk_unknown'
++    if available < 0:
++        return 'worker_disk_unknown'
++    return 'worker_disk_below_floor' if available < floor else None
+diff --git a/tests/hermes_cli/test_kanban_disk_admission.py b/tests/hermes_cli/test_kanban_disk_admission.py
+new file mode 100644
+index 00000000000..208f91c004d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_disk_admission.py
+@@ -0,0 +1,138 @@
++"""Disk brake exercises real ready/review claims, not monitor hold mocks."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import admission_fence as af
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_disk_admission as disk
++from tests.hermes_cli import test_kanban_admission_contention as helpers
++
++board = helpers.board
++
++
++@pytest.fixture
++def pressure(board, monkeypatch):
++    conn, home = board
++    config = home / 'config.yaml'
++    config.write_text('kanban:\n  admission:\n    disk_free_floor_bytes: 10\n')
++    space = [5]
++    monkeypatch.setattr(disk.os, 'statvfs', lambda path: SimpleNamespace(f_bavail=space[0], f_frsize=1))
++    return conn, home, space
++
++
++@pytest.mark.parametrize('review', [False, True])
++def test_low_space_refuses_before_board_lease_and_recovers(pressure, monkeypatch, review):
++    conn, home, space = pressure
++    task = helpers._task(conn, review)
++    claim = kb.claim_review_task if review else kb.claim_task
++    real_gate = kb._sync.claim_gate
++    calls = []
++    def gate(*args, **kwargs):
++        calls.append(True)
++        return real_gate(*args, **kwargs)
++    monkeypatch.setattr(kb._sync, 'claim_gate', gate)
++    assert claim(conn, task) is None
++    assert calls == []
++    assert conn.execute('SELECT count(*) FROM task_runs').fetchone()[0] == 0
++    # Normal turns are independent; no installation-wide hold was written.
++    reservation = af.reserve(home)
++    assert reservation is not None
++    reservation.close()
++    space[0] = 10
++    assert claim(conn, task).status == 'running'
++    assert calls == [True]
++    space[0] = 0
++    assert kb.get_task(conn, task).status == 'running'
++
++
++@pytest.mark.parametrize('review', [False, True])
++def test_space_falls_after_lease_final_gate_refuses(pressure, monkeypatch, review):
++    conn, _home, space = pressure
++    task = helpers._task(conn, review)
++    space[0] = 20
++    real_gate = kb._sync.claim_gate
++    def gate(*args, **kwargs):
++        result = real_gate(*args, **kwargs)
++        space[0] = 1
++        return result
++    monkeypatch.setattr(kb._sync, 'claim_gate', gate)
++    assert (kb.claim_review_task if review else kb.claim_task)(conn, task) is None
++    assert conn.execute('SELECT count(*) FROM task_runs').fetchone()[0] == 0
++
++
++def test_recovery_does_not_clear_operator_hold(pressure):
++    conn, home, space = pressure
++    task = helpers._task(conn, False)
++    af.set_hold(home)
++    space[0] = 100
++    assert kb.claim_task(conn, task) is None
++    assert af.is_held(home / 'core-update')
++
++
++def test_sample_failure_closed(pressure, monkeypatch):
++    conn, _home, _space = pressure
++    task = helpers._task(conn, False)
++    def fail(path):
++        raise OSError('unavailable')
++    monkeypatch.setattr(disk.os, 'statvfs', fail)
++    assert kb.claim_task(conn, task) is None
++
++
++@pytest.mark.parametrize('value', ['true', '-1', '0', 'garbage', '[]'])
++def test_invalid_enabled_floor_refuses(pressure, value):
++    conn, home, space = pressure
++    (home / 'config.yaml').write_text(f'kanban:\n  admission:\n    disk_free_floor_bytes: {value}\n')
++    space[0] = 100
++    assert kb.claim_task(conn, helpers._task(conn, False)) is None
++
++
++@pytest.mark.parametrize('config', ['{}\n', '', '# empty\n', 'kanban: null\n', 'kanban:\n  admission: null\n'])
++def test_unconfigured_host_unchanged(pressure, monkeypatch, config):
++    conn, home, _space = pressure
++    (home / 'config.yaml').write_text(config)
++    def unexpected(path):
++        pytest.fail('unconfigured host must not sample disk')
++    monkeypatch.setattr(disk.os, 'statvfs', unexpected)
++    assert kb.claim_task(conn, helpers._task(conn, False)).status == 'running'
++
++
++@pytest.mark.parametrize('config', ['kanban: []\n', 'kanban:\n  admission: []\n', 'kanban: [broken\n'])
++def test_malformed_policy(pressure, config):
++    _conn, home, _space = pressure
++    (home / 'config.yaml').write_text(config)
++    assert disk.refusal_reason() == 'worker_disk_policy_unknown'
++
++
++def test_installation_policy_wins_over_named_profile(pressure, monkeypatch):
++    _conn, home, space = pressure
++    profile = home / 'profiles' / 'reviewer'
++    profile.mkdir(parents=True)
++    (profile / 'config.yaml').write_text('{}\n')
++    monkeypatch.setenv('HERMES_HOME', str(profile))
++    assert disk.refusal_reason() == 'worker_disk_below_floor'
++    space[0] = 10
++    assert disk.refusal_reason() is None
++
++
++def test_unsupported_fence_still_checks_final_gate(pressure, monkeypatch):
++    from hermes_cli.kanban_admission import claim_transaction
++    conn, _home, space = pressure
++    monkeypatch.setattr(af, 'SUPPORTED', False)
++    with claim_transaction(conn) as admitted:
++        assert not admitted
++    space[0] = 10
++    with claim_transaction(conn) as admitted:
++        assert admitted
++
++
++def test_missing_config_is_disabled(pressure):
++    _conn, home, _space = pressure
++    (home / 'config.yaml').unlink()
++    assert disk.refusal_reason() is None
++
++
++def test_negative_sample_is_unknown(pressure):
++    _conn, _home, space = pressure
++    space[0] = -1
++    assert disk.refusal_reason() == 'worker_disk_unknown'
+-- 
+2.55.0
+

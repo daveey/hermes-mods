@@ -1,0 +1,317 @@
+From 508b3427af1204a67f186e45599e3c3e3304f617 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:19:48 +0000
+Subject: [PATCH] [daveey] Add canonical priority readback and expand guarded
+ operation tests
+
+---
+ docs/kanban-priority-rollout.md               | 15 ++++-
+ hermes_cli/kanban_parser.py                   |  2 +-
+ hermes_cli/kanban_priority_cli.py             | 24 ++++++++
+ hermes_cli/kanban_priority_prepare.py         | 22 ++++++-
+ tests/hermes_cli/test_kanban_priority_cli.py  | 49 ++++++++++++++++
+ .../test_kanban_priority_prepare.py           | 57 +++++++++++++++++++
+ .../hermes_cli/test_kanban_priority_verify.py | 51 +++++++++++++++++
+ 7 files changed, 215 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_priority_verify.py
+
+diff --git a/docs/kanban-priority-rollout.md b/docs/kanban-priority-rollout.md
+index 54509d82aab..ef932c81c95 100644
+--- a/docs/kanban-priority-rollout.md
++++ b/docs/kanban-priority-rollout.md
+@@ -93,9 +93,18 @@ commands in their own operator session. No automatic worker grant is introduced.
+    Retain all originals and receipts. Either guarded-restore applied origins or
+    deliberately capture and attach a new global plan from the new state.
+ 
+-4. Let normal Board sync publish the outbox, inspect rejection/pending counts,
+-   and read back canonical priorities against every manifest row. A local command
+-   receipt is not publication proof. Only after all origins match may the rollout
++4. Let normal Board sync publish the outbox and inspect rejection/pending counts.
++   Then run the read-only canonical verifier with the original bytes and digest:
++
++   ```sh
++   hermes kanban --board default supervisor-requests --priority-operation verify \
++     --writer ORIGIN --manifest /absolute/fresh-original.json --digest SHA256
++   ```
++
++   It requires exact global open membership, ownership and target values at one
++   stable head; no local import or write occurs. Use `verify-restore` to compare
++   original values after rollback. A local command receipt is not publication
++   proof. Only after all origins match may the rollout
+    owner install through the normal drain/update route. Verify no open stored
+    priority exceeds 1000; reserve 901..1000 for deliberate escalation. Verify a
+    genuinely eligible ready card's queue/claim under real capacity separately.
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index aaf094da364..709a663d46a 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -391,7 +391,7 @@ _SPECS = [
+     _cmd("link", [_arg("parent_id"), _arg("child_id")], help="Add a parent->child dependency"),
+     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
+     _cmd("supervisor-requests", [
+-        _arg("--priority-operation", choices=["prepare", "stage", "apply", "restore"],
++        _arg("--priority-operation", choices=["prepare", "stage", "apply", "restore", "verify", "verify-restore"],
+              help="Operator-only attached priority migration; never executable by workers"),
+         _arg("--writer", help="Explicit local primary gateway identity"),
+         _arg("--manifest", help="Original manifest input file for stage"),
+diff --git a/hermes_cli/kanban_priority_cli.py b/hermes_cli/kanban_priority_cli.py
+index 38182a89026..bfb5240f91d 100644
+--- a/hermes_cli/kanban_priority_cli.py
++++ b/hermes_cli/kanban_priority_cli.py
+@@ -44,6 +44,8 @@ def run(conn, args) -> int:
+                 manifest = prepare.capture(sync.Hub(identity), board_id=state['board_id'], exceptions=args.exception)
+             result = prepare.stage(conn, manifest, path=Path(args.backup), task_id=args.task,
+                                    writer=args.writer, original_bytes=data)
++        elif action in ('verify', 'verify-restore'):
++            result = _verify(conn, args, undo=action == 'verify-restore')
+         elif action in ('apply', 'restore'):
+             if not args.attachment_id or not args.digest:
+                 raise ValueError('--attachment-id and --digest required')
+@@ -58,3 +60,25 @@ def run(conn, args) -> int:
+         return _err(str(exc))
+     print(json.dumps(result, sort_keys=True))
+     return 0
++
++
++def _verify(conn, args, *, undo: bool) -> dict:
++    import hashlib
++    from hermes_cli import kanban_sync_client as sync
++    from hermes_cli.kanban_priority_manifest import validate
++
++    if not args.manifest or not args.digest:
++        raise ValueError('verify requires --manifest and --digest')
++    if args.backup or args.exception or args.attachment_id or args.allow_legacy_rollback or args.task:
++        raise ValueError('verify accepts only manifest, digest and writer')
++    data = Path(args.manifest).read_bytes()
++    if hashlib.sha256(data).hexdigest() != args.digest:
++        raise ValueError('manifest digest mismatch')
++    manifest = validate(json.loads(data))
++    identity = sync.load_identity()
++    state = sync_state(conn) or {}
++    if identity.gateway != args.writer or state.get('gateway_id') != args.writer:
++        raise ValueError('configured gateway differs from explicit writer')
++    if state.get('board_id') != manifest['board_id']:
++        raise ValueError('manifest belongs to a different board')
++    return prepare.verify(sync.Hub(identity), manifest, undo=undo)
+diff --git a/hermes_cli/kanban_priority_prepare.py b/hermes_cli/kanban_priority_prepare.py
+index 09facaf6ab3..56b7f5e91df 100644
+--- a/hermes_cli/kanban_priority_prepare.py
++++ b/hermes_cli/kanban_priority_prepare.py
+@@ -11,6 +11,26 @@ from hermes_cli.kanban_priority_migration import plan_global, save_manifest
+ 
+ 
+ def capture(hub, *, board_id: str, exceptions: list[str]) -> dict:
++    """Plan from raw canonical data without importing/clipping values."""
++    return validate(plan_global(_inventory(hub, board_id), board_id=board_id, exceptions=exceptions))
++
++
++def verify(hub, manifest: dict, *, undo: bool = False) -> dict:
++    """Read back all origins at a stable head; never write or import local state."""
++    validate(manifest)
++    rows = _inventory(hub, manifest["board_id"])
++    # Reuse capture's validation of IDs, ownership and integer priorities.
++    observed = validate(plan_global(rows, board_id=manifest["board_id"], exceptions=[]))
++    actual = {r["id"]: (r["origin"], r["old"]) for r in observed["rows"]}
++    target = "old" if undo else "new"
++    expected = {r["id"]: (r["origin"], r[target]) for r in manifest["rows"]}
++    if actual != expected:
++        raise ValueError("canonical ownership, membership or priorities differ from manifest")
++    return {"verified": len(expected), "board_id": manifest["board_id"],
++            "direction": "restore" if undo else "apply"}
++
++
++def _inventory(hub, board_id: str) -> list[dict]:
+     """Read raw Board pages at one feed head, without importing/clipping values."""
+     rows = []
+     after = ""
+@@ -45,7 +65,7 @@ def capture(hub, *, board_id: str, exceptions: list[str]) -> dict:
+     final = hub.snapshot_page(board_id, "tasks", limit=1)
+     if final.get("head") != head:
+         raise ValueError("canonical inventory changed; capture a new manifest")
+-    return validate(plan_global(rows, board_id=board_id, exceptions=exceptions))
++    return rows
+ 
+ 
+ def stage(conn, manifest: dict, *, path: Path, task_id: str, writer: str,
+diff --git a/tests/hermes_cli/test_kanban_priority_cli.py b/tests/hermes_cli/test_kanban_priority_cli.py
+index 4f84ba079ac..88804a4d3e4 100644
+--- a/tests/hermes_cli/test_kanban_priority_cli.py
++++ b/tests/hermes_cli/test_kanban_priority_cli.py
+@@ -82,3 +82,52 @@ def test_prepare_cli_reads_enrolled_canonical_board(conn, monkeypatch, tmp_path,
+     manifest = json.loads(path.read_bytes())
+     assert manifest['rows'][0]['old'] == 10000
+     assert manifest['exceptions'][0]['status'] == 'done'
++    verify_args = args('--priority-operation', 'verify-restore', '--writer', sync_helpers.ME,
++                       '--manifest', str(path), '--digest', receipt['manifest_sha256'])
++    assert cli.run(conn, verify_args) == 0
++    assert json.loads(capsys.readouterr().out)['verified'] == 1
++    verify_args.digest = 'wrong'
++    assert cli.run(conn, verify_args) != 0
++
++
++@pytest.mark.parametrize('words, message', [
++    (['--priority-operation', 'apply'], 'writer'),
++    (['--priority-operation', 'stage'], 'task'),
++    (['--priority-operation', 'stage', '--task', 'local', '--backup', 'unused'], 'manifest'),
++    (['--priority-operation', 'prepare', '--task', 'local', '--backup', 'unused', '--manifest', 'unused'], 'canonical'),
++    (['--priority-operation', 'apply', '--attachment-id', '1', '--digest', 'x', '--manifest', 'unused'], 'previously attached'),
++    (['--priority-operation', 'verify'], 'manifest'),
++    (['--priority-operation', 'verify', '--manifest', 'unused', '--digest', 'x', '--backup', 'unused'], 'only manifest'),
++])
++def test_cli_validation_precedes_io(conn, capsys, words, message):
++    from hermes_cli import kanban_priority_cli as cli
++    namespace = args(*words)
++    if message != 'writer':
++        namespace.writer = sync_helpers.ME
++    assert cli.run(conn, namespace) != 0
++    output = capsys.readouterr()
++    assert message in output.err + output.out
++
++
++@pytest.mark.parametrize('case', ['identity', 'local_writer', 'shadow', 'board'])
++def test_prepare_refuses_wrong_enrollment_before_fetch(conn, monkeypatch, tmp_path, capsys, case):
++    from hermes_cli import kanban_priority_cli as cli
++    from hermes_cli import kanban_sync_client as sync
++    ids, _, _ = helpers.setup_plan(conn)
++    gateway = 'foreign' if case == 'identity' else sync_helpers.ME
++    monkeypatch.setattr(sync, 'load_identity', lambda: sync.Identity('https://example.test', 'fixture', gateway))
++    def forbidden_hub(*args):
++        pytest.fail('invalid enrollment reached canonical fetch')
++    monkeypatch.setattr(sync, 'Hub', forbidden_hub)
++    sql = {'local_writer': "UPDATE kanban_sync_state SET gateway_id='foreign'",
++           'shadow': "UPDATE kanban_sync_state SET mode='shadow'",
++           'board': "UPDATE kanban_sync_state SET board_id=''"}
++    if case in sql:
++        conn.execute(sql[case])
++        conn.commit()
++    path = tmp_path / 'refused.json'
++    assert cli.run(conn, args('--priority-operation', 'prepare', '--writer', sync_helpers.ME,
++                             '--task', ids[0], '--backup', str(path))) != 0
++    assert not path.exists()
++    output = capsys.readouterr()
++    assert ('gateway' in output.out + output.err) or case in ('shadow', 'board')
+diff --git a/tests/hermes_cli/test_kanban_priority_prepare.py b/tests/hermes_cli/test_kanban_priority_prepare.py
+index d453eb33a7c..e2a6811c5ee 100644
+--- a/tests/hermes_cli/test_kanban_priority_prepare.py
++++ b/tests/hermes_cli/test_kanban_priority_prepare.py
+@@ -70,3 +70,60 @@ def test_stage_refuses_worker_before_writing_file(conn, monkeypatch, tmp_path):
+     with pytest.raises(PermissionError):
+         prepare.stage(conn, {}, path=path, task_id=ids[0], writer=sync_helpers.ME)
+     assert not path.exists()
++
++
++@pytest.mark.parametrize('patch', [
++    {'table': 'other'}, {'head': True}, {'rows': None}, {'more': 1},
++    {'rows': [None]}, {'rows': [{'id': 'a', 'status': 'unknown'}]},
++    {'rows': [{'id': 1, 'status': 'ready'}]},
++    {'rows': [{'id': '', 'status': 'ready'}]},
++    {'rows': [], 'more': True},
++])
++def test_capture_rejects_malformed_pages(patch):
++    from hermes_cli import kanban_priority_prepare as prepare
++    class Malformed:
++        def snapshot_page(self, *args, **kwargs):
++            return {'table': 'tasks', 'head': 1, 'rows': [], 'more': False, **patch}
++    with pytest.raises(ValueError):
++        prepare.capture(Malformed(), board_id='board', exceptions=[])
++
++
++def test_capture_rechecks_final_head():
++    from hermes_cli import kanban_priority_prepare as prepare
++    class Changed(Pages):
++        def snapshot_page(self, *args, **kwargs):
++            page = super().snapshot_page(*args, **kwargs)
++            if kwargs.get('limit') == 1:
++                page['head'] = 5
++            return page
++    with pytest.raises(ValueError, match='changed'):
++        prepare.capture(Changed(), board_id='board', exceptions=[])
++
++
++@pytest.mark.parametrize('case', ['shadow', 'writer', 'board', 'missing_owner', 'bytes', 'readback'])
++def test_stage_guard_failures_preserve_priorities(conn, tmp_path, monkeypatch, case):
++    from hermes_cli import kanban_priority_prepare as prepare
++    ids, _, _ = helpers.setup_plan(conn)
++    rows = [dict(r) for r in conn.execute('SELECT id,priority,created_on,status FROM tasks')]
++    plan = migration.plan_global(rows, board_id=sync_helpers.BOARD, exceptions=[])
++    writer, owner = sync_helpers.ME, ids[0]
++    data = None
++    if case == 'shadow':
++        conn.execute("UPDATE kanban_sync_state SET mode='shadow'")
++    if case == 'writer':
++        writer = 'foreign'
++    if case == 'board':
++        conn.execute("UPDATE kanban_sync_state SET board_id='foreign'")
++    if case == 'missing_owner':
++        owner = 'missing'
++    if case == 'bytes':
++        changed = dict(plan, board_id='different')
++        data = json.dumps(changed).encode()
++    if case == 'readback':
++        monkeypatch.setattr(kb, 'get_attachment', lambda *args: None)
++    conn.commit()
++    path = tmp_path / 'guarded.json'
++    with pytest.raises(ValueError):
++        prepare.stage(conn, plan, path=path, task_id=owner, writer=writer, original_bytes=data)
++    assert path.exists() == (case == 'readback')
++    assert helpers.helpers.priorities(conn, ids) == [10000, 10000, 50000]
+diff --git a/tests/hermes_cli/test_kanban_priority_verify.py b/tests/hermes_cli/test_kanban_priority_verify.py
+new file mode 100644
+index 00000000000..2901f5e862b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_verify.py
+@@ -0,0 +1,51 @@
++"""Canonical verification is read-only and checks the complete global inventory."""
++import copy
++
++import pytest
++
++from hermes_cli import kanban_priority_migration as migration
++from hermes_cli import kanban_priority_prepare as prepare
++
++
++class Canonical:
++    def __init__(self, rows):
++        self.rows = rows
++
++    def snapshot_page(self, board, table, **kwargs):
++        return {"table": "tasks", "head": 7, "rows": self.rows, "more": False}
++
++
++def inventory():
++    return [{"id": "a", "priority": 10000, "created_on": "one", "status": "ready"},
++            {"id": "b", "priority": 50000, "created_on": "two", "status": "running"},
++            {"id": "c", "priority": 90000, "created_on": "two", "status": "done"}]
++
++
++def test_verify_global_normalization_and_restore():
++    rows = inventory()
++    manifest = migration.plan_global(rows, board_id="board", exceptions=["b", "c"])
++    normalized = copy.deepcopy(rows)
++    for row, planned in zip(normalized, manifest["rows"]):
++        row["priority"] = planned["new"]
++    assert prepare.verify(Canonical(normalized), manifest) == {"verified": 2, "board_id": "board", "direction": "apply"}
++    assert prepare.verify(Canonical(rows), manifest, undo=True)["direction"] == "restore"
++    assert rows == inventory()
++
++
++@pytest.mark.parametrize("change", ["missing", "new", "owner", "value", "terminal", "exception-reopened"])
++def test_verify_refuses_stale_global_inventory(change):
++    rows = inventory()
++    manifest = migration.plan_global(rows, board_id="board", exceptions=["b", "c"])
++    for row, planned in zip(rows, manifest["rows"]):
++        row["priority"] = planned["new"]
++    actions = {
++        "missing": lambda: rows.pop(0),
++        "new": lambda: rows.append({"id": "d", "priority": 0, "created_on": "one", "status": "ready"}),
++        "owner": lambda: rows[0].update(created_on="two"),
++        "value": lambda: rows[0].update(priority=12),
++        "terminal": lambda: rows[0].update(status="done"),
++        "exception-reopened": lambda: rows[2].update(status="ready"),
++    }
++    actions[change]()
++    with pytest.raises(ValueError, match="canonical"):
++        prepare.verify(Canonical(rows), manifest)
+-- 
+2.55.0
+

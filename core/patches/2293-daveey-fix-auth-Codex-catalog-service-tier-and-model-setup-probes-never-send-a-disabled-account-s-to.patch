@@ -1,0 +1,135 @@
+From 6fe953df84d06db21976ba27db984ce092835421 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:06:35 +0000
+Subject: [PATCH] [daveey] fix(auth): Codex catalog, service-tier and
+ model-setup probes never send a disabled account's token
+
+codex_catalog_credentials skips disabled tokens (singleton and pool scan), the service-tier
+catalog token lookup returns unknown for a disabled account, and the model-setup flow drops a
+disabled token before the live catalog probe (status still reports the account).
+
+Proof: 3 tests RED with the fix reverted, GREEN with it (29 in test_credential_pool_disabled_paths);
+22 codex/model-setup/feature test files otherwise green.
+---
+ agent/codex_service_tiers.py                  |  3 ++
+ hermes_cli/codex_models.py                    |  4 ++
+ hermes_cli/model_setup_flows.py               |  4 ++
+ .../test_credential_pool_disabled_paths.py    | 48 +++++++++++++++++++
+ 4 files changed, 59 insertions(+)
+
+diff --git a/agent/codex_service_tiers.py b/agent/codex_service_tiers.py
+index a26a24b65dd..39c96771b3e 100644
+--- a/agent/codex_service_tiers.py
++++ b/agent/codex_service_tiers.py
+@@ -99,6 +99,9 @@ def _account_catalog_token(access_token: Any) -> str | None:
+             token = resolve_codex_runtime_credentials(read_only=True).get("api_key")
+         except AuthError:  # no Codex login on this profile: unknown, never a refusal
+             return None
++        from agent.credential_pool_disabled import token_disabled
++        if token_disabled("openai-codex", token):  # disabled account: its catalog is unknown, not read
++            return None
+     return token if isinstance(token, str) and token else None
+ 
+ 
+diff --git a/hermes_cli/codex_models.py b/hermes_cli/codex_models.py
+index b6e7eafacbe..9b3ed9e2351 100644
+--- a/hermes_cli/codex_models.py
++++ b/hermes_cli/codex_models.py
+@@ -117,6 +117,8 @@ def codex_catalog_credentials() -> list[tuple[str, Optional[str]]]:
+     from hermes_cli.auth import _codex_access_token_is_expiring, read_credential_pool, resolve_codex_runtime_credentials
+     from hermes_cli.auth_codex import _codex_pool_dicts, _codex_pool_route_base_url
+ 
++    from agent.credential_pool_disabled import token_disabled
++
+     found: list[tuple[str, Optional[str]]] = []
+     seen: set[str] = set()
+ 
+@@ -124,6 +126,8 @@ def codex_catalog_credentials() -> list[tuple[str, Optional[str]]]:
+         tok = str(token or "").strip()
+         if not tok or tok in seen or _codex_access_token_is_expiring(tok, 0):
+             return
++        if token_disabled("openai-codex", tok):  # `hermes auth disable`: never sent, not even for a catalog
++            return
+         seen.add(tok)
+         found.append((tok, (str(base_url).strip() if base_url else "") or _codex_pool_route_base_url("") or None))
+ 
+diff --git a/hermes_cli/model_setup_flows.py b/hermes_cli/model_setup_flows.py
+index 4bca163a685..d0065a2c670 100644
+--- a/hermes_cli/model_setup_flows.py
++++ b/hermes_cli/model_setup_flows.py
+@@ -383,12 +383,16 @@ def _model_flow_openai_codex(config, current_model=""):
+         _codex_status = get_codex_auth_status()
+         if _codex_status.get("logged_in"):
+             _codex_token, _codex_base = _codex_status.get("api_key"), _codex_status.get("base_url")
++
+     if not _codex_token:
+         with contextlib.suppress(Exception):
+             from hermes_cli.auth import resolve_codex_runtime_credentials
+             _creds = resolve_codex_runtime_credentials()
+             _codex_token, _codex_base = _creds.get("api_key"), _creds.get("base_url")
+ 
++    from agent.credential_pool_disabled import token_disabled
++    if token_disabled("openai-codex", _codex_token):  # status reports it; the catalog probe must not send it
++        _codex_token = _codex_base = None
+     codex_models = get_codex_model_ids(access_token=_codex_token, base_url=_codex_base)
+     selected = _prompt_model_selection(
+         codex_models, current_model=current_model, confirm_provider="openai-codex",
+diff --git a/tests/agent/test_credential_pool_disabled_paths.py b/tests/agent/test_credential_pool_disabled_paths.py
+index 2d8cbadde0c..e0011b0638f 100644
+--- a/tests/agent/test_credential_pool_disabled_paths.py
++++ b/tests/agent/test_credential_pool_disabled_paths.py
+@@ -363,3 +363,51 @@ def test_a_reseeded_borrowed_row_with_a_new_id_stays_disabled_by_fingerprint():
+     assert cpd.matches(reseeded, keys)
+     other = SimpleNamespace(id="new2", label="claude_code", access_token="", extra={"secret_fingerprint": "sha256:def"})
+     assert not cpd.matches(other, keys)
++
++
++def _codex_rows(*accounts):
++    rows = [{"id": f"r{i}", "label": f"{a}@example.com", "auth_type": "oauth", "priority": i,
++             "source": "manual:device_code", "access_token": _jwt(f"{a}@example.com", f"acct-{a}"),
++             "refresh_token": f"rt-{a}", "base_url": "https://chatgpt.com/backend-api/codex"} for i, a in enumerate(accounts)]
++    write_credential_pool("openai-codex", rows)
++    return rows
++
++
++def test_codex_catalog_credentials_never_include_a_disabled_account(_no_codex_env):
++    from hermes_cli.codex_models import codex_catalog_credentials
++    from agent.credential_pool import PooledCredential
++    a, b = _codex_rows("a", "b")
++    assert {t for t, _ in codex_catalog_credentials()} == {a["access_token"], b["access_token"]}
++    _disable("openai-codex", PooledCredential.from_dict("openai-codex", a))
++    assert [t for t, _ in codex_catalog_credentials()] == [b["access_token"]]
++    _disable("openai-codex", PooledCredential.from_dict("openai-codex", b))
++    assert codex_catalog_credentials() == []
++
++
++def test_codex_service_tier_lookup_does_not_read_with_a_disabled_account(monkeypatch, _no_codex_env):
++    import hermes_cli.auth_codex as ac
++    from agent import codex_service_tiers as cst
++    from agent.credential_pool import PooledCredential
++    (a,) = _codex_rows("a")
++    monkeypatch.setattr(ac, "resolve_codex_runtime_credentials", lambda **k: {"api_key": a["access_token"]})
++    assert cst._account_catalog_token(None) == a["access_token"]
++    _disable("openai-codex", PooledCredential.from_dict("openai-codex", a))
++    assert cst._account_catalog_token(None) is None
++
++
++def test_codex_model_setup_probe_does_not_send_a_disabled_account(monkeypatch, _no_codex_env):
++    import hermes_cli.model_setup_flows as flows
++    from agent.credential_pool import PooledCredential
++    (a,) = _codex_rows("a")
++    _disable("openai-codex", PooledCredential.from_dict("openai-codex", a))
++    from hermes_cli import auth
++    import hermes_cli.codex_models as cm
++    monkeypatch.setattr(auth, "get_codex_auth_status", lambda: {"logged_in": True, "api_key": a["access_token"],
++                                                                "base_url": a["base_url"]})
++    sent = []
++    monkeypatch.setattr(cm, "get_codex_model_ids", lambda access_token=None, base_url=None: sent.append(access_token) or ["m"])
++    monkeypatch.setattr(flows, "_oauth_gate", lambda *a, **k: True)
++    monkeypatch.setattr(auth, "_prompt_model_selection", lambda *a, **k: None)
++    monkeypatch.setattr(auth, "resolve_codex_runtime_credentials", lambda **k: {"api_key": a["access_token"]})
++    flows._model_flow_openai_codex({}, "")
++    assert sent and a["access_token"] not in sent
+-- 
+2.55.0
+

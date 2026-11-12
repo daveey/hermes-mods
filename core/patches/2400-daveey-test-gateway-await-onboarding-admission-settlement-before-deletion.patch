@@ -1,0 +1,95 @@
+From 911bb81434cd25b934f2559430d157e5615883c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:23:05 +0000
+Subject: [PATCH] [daveey] test(gateway): await onboarding admission settlement
+ before deletion
+
+The transcript lease can be gone while the admission is still started. Await the opening drain rather than treating lease release as idle. Preserve delete assertions and retry policy. Add an event-held real settlement regression, red against the old helper and green after the fix, including SIGSTOP/SIGCONT stress of canonical runner descendants.
+---
+ .../test_onboarding_on_the_authority.py       |  9 ++--
+ .../test_onboarding_settlement_wait.py        | 53 +++++++++++++++++++
+ 2 files changed, 57 insertions(+), 5 deletions(-)
+ create mode 100644 tests/gateway/test_onboarding_settlement_wait.py
+
+diff --git a/tests/gateway/test_onboarding_on_the_authority.py b/tests/gateway/test_onboarding_on_the_authority.py
+index a265f3ac2af..6febf463a96 100644
+--- a/tests/gateway/test_onboarding_on_the_authority.py
++++ b/tests/gateway/test_onboarding_on_the_authority.py
+@@ -193,11 +193,10 @@ def test_the_authority_turn_plays_the_opening_and_skips_the_note_while_a_card_wa
+ 
+ 
+ async def _settled(desktop, session_id):
+-    """The opening turn's lease released: a delete is not refused as a write in flight."""
+-    def idle():
+-        with desktop.db._read_ctx() as conn:
+-            return not desktop.db._guarded_ids(conn, [session_id])
+-    await async_wait_until(idle, timeout=10)
++    """Wait for the opening drain, including admission settlement after lease release."""
++    task = desktop.authority.sessions[session_id].task
++    assert task is not None, "onboarding.start did not schedule its opening turn"
++    await asyncio.wait_for(asyncio.shield(task), timeout=30)
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/gateway/test_onboarding_settlement_wait.py b/tests/gateway/test_onboarding_settlement_wait.py
+new file mode 100644
+index 00000000000..fc4f77f0d48
+--- /dev/null
++++ b/tests/gateway/test_onboarding_settlement_wait.py
+@@ -0,0 +1,53 @@
++"""The onboarding fixture waits for admission settlement, not just lease release."""
++import asyncio
++
++import pytest
++
++from tests.gateway.test_onboarding_on_the_authority import _desktop, _request, _settled
++
++
++@pytest.mark.asyncio
++async def test_settled_waits_for_the_opening_drain(tmp_path, monkeypatch):
++    from gateway import session_settlement_recovery
++
++    entered, release = asyncio.Event(), asyncio.Event()
++    settle = session_settlement_recovery.settle_and_deliver
++
++    async def held_settlement(*args, **kwargs):
++        entered.set()
++        await release.wait()
++        return await settle(*args, **kwargs)
++
++    monkeypatch.setattr(session_settlement_recovery, "settle_and_deliver", held_settlement)
++    desktop = await _desktop(tmp_path, monkeypatch, [])
++    waiter = None
++    try:
++        stored = (await _request(desktop, 1, "onboarding.start", {"rerun": True}))["result"]["stored_session_id"]
++        await asyncio.wait_for(entered.wait(), timeout=30)
++        with desktop.db._read_ctx() as conn:
++            assert not desktop.db._guarded_ids(conn, [stored])
++        drain = desktop.authority.sessions[stored].task
++        assert not drain.done()
++        waiter = asyncio.create_task(_settled(desktop, stored))
++        # Give the waiter its first turn while settlement is explicitly held.
++        await asyncio.sleep(0)
++        assert not waiter.done(), "lease release is not admission settlement"
++        release.set()
++        await asyncio.wait_for(waiter, timeout=30)
++        assert drain.done()
++        row = desktop.db.get_session(stored)
++        deleted = await _request(desktop, 2, "session.mutate", {
++            "session_id": stored, "request_id": "delete-settled-onboarding",
++            "expected_revision": row["runtime_revision"],
++            "expected_generation": row["runtime_generation"],
++            "operation": "delete", "payload": {},
++        })
++        assert "result" in deleted, deleted
++    finally:
++        release.set()
++        if waiter is not None:
++            await waiter
++        for live in list(desktop.authority.sessions.values()):
++            if live.task is not None:
++                await asyncio.wait_for(asyncio.shield(live.task), timeout=30)
++        await desktop.connection.close()
+-- 
+2.55.0
+

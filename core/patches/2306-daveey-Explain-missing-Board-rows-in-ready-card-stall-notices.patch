@@ -1,0 +1,276 @@
+From 065ad4dc21a9ef079f18a0d3f0cf4c3655c7f23c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 05:23:36 -0800
+Subject: [PATCH] [daveey] Explain missing Board rows in ready-card stall
+ notices
+
+---
+ hermes_cli/kanban_chat_wait.py                |   9 +-
+ hermes_cli/kanban_db_sync.py                  |   4 +
+ hermes_cli/kanban_sync_client.py              |   2 +-
+ hermes_cli/kanban_sync_diagnostics.py         |  42 ++++++
+ .../test_kanban_missing_board_notice.py       | 129 ++++++++++++++++++
+ 5 files changed, 184 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_diagnostics.py
+ create mode 100644 tests/hermes_cli/test_kanban_missing_board_notice.py
+
+diff --git a/hermes_cli/kanban_chat_wait.py b/hermes_cli/kanban_chat_wait.py
+index 5839e224117..507ce8c42a4 100644
+--- a/hermes_cli/kanban_chat_wait.py
++++ b/hermes_cli/kanban_chat_wait.py
+@@ -88,6 +88,11 @@ def notice_text(payload: Any) -> str:
+     tid = str(payload.get("parent") or "<card>")[:64]
+     title = str(payload.get("parent_title") or "").strip()[:120]
+     named = f"{tid} ({title})" if title else tid
++    if payload.get("missing_shared_board"):
++        return (f"{named}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min "
++                f"with no worker because it isn't on the shared Board (claim_deferred: not_found). "
++                f"Last sync rejection: {payload.get('sync_reject_reason') or 'no sync rejection recorded'}. "
++                "Repair the Board sync rejection before retrying dispatch.")
+     hold = ""
+     if payload.get("hold_reason") and payload.get("hold_until"):
+         stamp = time.strftime("%H:%M:%SZ", time.gmtime(int(payload["hold_until"])))
+@@ -147,6 +152,7 @@ def _clock_hold_unchecked(conn, task_id: str, since: int, now: float) -> dict[st
+ 
+ def sweep(conn, *, now: Optional[float] = None) -> int:
+     """Append the once-per-ready-episode notice for every qualifying card; returns how many were appended."""
++    from hermes_cli.kanban_sync_diagnostics import missing_board
+     now = time.time() if now is None else now
+     posted = 0
+     rows = conn.execute(_CANDIDATES, (int(now - MAX_EPISODE_SECONDS), int(now - THRESHOLD_SECONDS))).fetchall()
+@@ -157,7 +163,8 @@ def sweep(conn, *, now: Optional[float] = None) -> int:
+             continue
+         if pu.post_notice(conn, row["id"], row["id"], wait_key=f"ready@{since}", waited_seconds=ready_for,
+                           ready_seconds=ready_for, parent_title=row["title"], kind=NOTICE_KIND,
+-                          extra=_clock_hold(conn, row["id"], since, now)):
++                          extra={**_clock_hold(conn, row["id"], since, now),
++                                 **missing_board(conn, row["id"], since)}):
+             posted += 1
+     return posted
+ 
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index ed728981cae..5db7e6dfa24 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -776,6 +776,7 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str =
+     without a grant the card stays ``ready`` (no offline claims: every card is
+     at-most-once in v1). A grant bounds the local claim to the lease deadline."""
+     from hermes_cli.kanban_worker_placement import execution_refusal
++    from hermes_cli.kanban_sync_diagnostics import record_claim
+     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+     if row is not None and (reason := execution_refusal(conn, row)):
+         _CLAIM_DEFERRALS[task_id] = reason
+@@ -791,11 +792,14 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str =
+     except _CLIENT_ERRORS as exc:  # fail closed: an unreachable service defers the claim
+         _log.info("claim_deferred: offline task=%s (%s: %s)", task_id, type(exc).__name__, exc)
+         _CLAIM_DEFERRALS[task_id] = "offline"
++        record_claim(conn, task_id, "offline")
+         return ClaimGate(expires, deferred=True)
+     if not lease.granted:
+         _log.info("claim_deferred: %s task=%s holder=%s", lease.reason or "denied", task_id, lease.holder)
+         _CLAIM_DEFERRALS[task_id] = lease.reason or "denied"
++        record_claim(conn, task_id, lease.reason or "denied")
+         return ClaimGate(expires, deferred=True)
++    record_claim(conn, task_id, "granted")
+     deadline = lease.expires_ms // 1000 - LEASE_SAFETY_MARGIN_SECONDS
+     gate = ClaimGate(min(expires, deadline), lease=lease, ids=ids)
+     # Review ruling 2: the worker load formula guards a WORKER's claim of someone else's card. The origin claiming
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 6d3be5562d6..f33a4c8b212 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -731,7 +731,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+                                  "WHERE op_id = ?", (reason[:500], op_id))
+                     out.rejected += 1
+                     _log.warning("kanban sync: %s %s %s rejected (%s)", board, row["table_name"], row["row_uid"], reason)
+-                    if row["table_name"] == "tasks" and res.get("reason") == "live_claim":
++                    if row["table_name"] == "tasks" and res.get("reason") in ("live_claim", "forbidden_field"):
+                         _record_live_claim_rejection(conn, row, reason)
+                     if primary and res.get("row"):
+                         authoritative.append(_row_change(row["table_name"], res["row"]))
+diff --git a/hermes_cli/kanban_sync_diagnostics.py b/hermes_cli/kanban_sync_diagnostics.py
+new file mode 100644
+index 00000000000..2fa69fe748d
+--- /dev/null
++++ b/hermes_cli/kanban_sync_diagnostics.py
+@@ -0,0 +1,42 @@
++"""Durable, gateway-scoped evidence for Board claim stalls."""
++from __future__ import annotations
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++
++
++def _last_claim(conn, task_id, gateway):
++    return conn.execute(
++        "SELECT payload, created_at FROM task_events WHERE task_id=? AND kind='claim_deferred' "
++        "AND json_extract(payload, '$.gateway')=? ORDER BY created_at DESC, id DESC LIMIT 1",
++        (task_id, gateway)).fetchone()
++
++
++def record_claim(conn, task_id: str, reason: str) -> None:
++    """Keep changed outcomes after a missing-row denial, not an event on every dispatcher tick."""
++    state = sync.sync_state(conn)
++    gateway = state["gateway_id"]
++    with kb.write_txn(conn):
++        last = _last_claim(conn, task_id, gateway)
++        if last is None and reason != "not_found":
++            return
++        from hermes_cli.kanban_parent_unclaimed import ready_since
++        if (last is not None and last["created_at"] >= ready_since(conn, task_id)
++                and kb._json_dict(last["payload"]).get("reason") == reason):
++            return
++        kb._append_event(conn, task_id, "claim_deferred", {"reason": reason, "gateway": gateway})
++
++
++def missing_board(conn, task_id: str, since: int) -> dict:
++    """Only this gateway's latest claim in this ready episode can diagnose a missing Board row."""
++    state = sync.sync_state(conn)
++    if not state or state.get("mode") != "primary":
++        return {}
++    last = _last_claim(conn, task_id, state["gateway_id"])
++    if last is None or last["created_at"] < since or kb._json_dict(last["payload"]).get("reason") != "not_found":
++        return {}
++    rejected = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='sync_rejected' "
++        "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
++    reason = kb._json_dict(rejected[0]).get("reason") if rejected else None
++    return {"missing_shared_board": True, "sync_reject_reason": reason or "no sync rejection recorded"}
+diff --git a/tests/hermes_cli/test_kanban_missing_board_notice.py b/tests/hermes_cli/test_kanban_missing_board_notice.py
+new file mode 100644
+index 00000000000..cd49a16ca85
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_missing_board_notice.py
+@@ -0,0 +1,129 @@
++"""Missing Board rows must not be described as capacity waits."""
++from __future__ import annotations
++
++import json
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_chat_wait as cw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from tests.hermes_cli import test_kanban_sync_run_rows as helpers
++
++kanban_home = helpers.kanban_home
++svc = helpers.svc
++live = helpers.live
++REJECT = "forbidden_field: not writable on tasks: model_pin_mandatory"
++
++
++def _card(conn):
++    tid = kb.create_task(conn, title="new card", assignee="worker")
++    old = int(time.time()) - 31 * 60
++    conn.execute("UPDATE tasks SET session_id='origin', created_at=? WHERE id=?", (old, tid))
++    conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (old, tid))
++    kb._append_event(conn, tid, "sync_rejected", {"reason": REJECT})
++    conn.commit()
++    return tid
++
++
++def _notice(conn, tid):
++    assert cw.sweep(conn) == 1
++    payload = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, cw.NOTICE_KIND)).fetchone()[0]
++    return cw.notice_text(json.loads(payload))
++
++
++@pytest.fixture(autouse=True)
++def missing_claim(live, monkeypatch):
++    monkeypatch.setattr(sync._client(), "acquire", lambda **kw: sync.Lease(
++        granted=False, run_uid=kw["run_uid"], reason="not_found"))
++
++
++def test_missing_board_claim_produces_durable_reason_not_priority_advice(live):
++    tid = _card(live)
++    assert sync.claim_gate(live, tid, int(time.time()) + 900).deferred
++    # Dispatcher consumes the process-local hint; notice must survive that and another tick.
++    assert sync.pop_claim_deferral(tid) == "not_found"
++    assert sync.claim_gate(live, tid, int(time.time()) + 900).deferred
++    text = _notice(live, tid)
++    assert "isn't on the shared Board" in text
++    assert REJECT in text
++    assert "priority" not in text and "re-place" not in text
++    assert live.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='claim_deferred'", (tid,)).fetchone()[0] == 1
++
++
++@pytest.mark.parametrize("reason", ["capacity", "offline"])
++def test_changed_claim_reason_does_not_reuse_missing_board_diagnosis(live, monkeypatch, reason):
++    tid = _card(live)
++    assert sync.claim_gate(live, tid, int(time.time()) + 900).deferred
++    def acquire(**kwargs):
++        if reason == "offline":
++            raise OSError("offline")
++        return SimpleNamespace(granted=False, reason=reason, holder=None)
++    monkeypatch.setattr(sync._client(), "acquire", acquire)
++    assert sync.claim_gate(live, tid, int(time.time()) + 900).deferred
++    text = _notice(live, tid)
++    assert "isn't on the shared Board" not in text
++    assert "priority" in text
++
++
++def test_real_capacity_wait_retains_priority_advice(live):
++    tid = _card(live)
++    assert "priority" in _notice(live, tid)
++
++
++@pytest.mark.parametrize("change", ["old_episode", "foreign_gateway", "sync_off", "granted"])
++def test_stale_or_foreign_missing_row_evidence_is_not_a_current_diagnosis(live, monkeypatch, change):
++    tid = _card(live)
++    assert sync.claim_gate(live, tid, int(time.time()) + 900).deferred
++    if change == "old_episode":
++        live.execute("UPDATE task_events SET created_at=0 WHERE task_id=? AND kind='claim_deferred'", (tid,))
++    elif change == "foreign_gateway":
++        live.execute("UPDATE task_events SET payload=json_set(payload, '$.gateway', 'other') "
++                     "WHERE task_id=? AND kind='claim_deferred'", (tid,))
++    elif change == "sync_off":
++        sync.set_mode(live, "off")
++    else:
++        monkeypatch.setattr(sync._client(), "acquire", lambda **kw: sync.Lease(
++            granted=True, run_uid=kw["run_uid"], expires_ms=int(time.time() * 1000) + 900000))
++        with sync.claim_gate(live, tid, int(time.time()) + 900) as gate:
++            assert not gate.deferred
++    live.commit()
++    text = _notice(live, tid)
++    assert "isn't on the shared Board" not in text
++    assert "priority" in text
++
++
++def test_push_rejection_reaches_missing_board_notice(live):
++    from hermes_cli import kanban_sync_client as client
++    tid = _card(live)
++    live.execute("DELETE FROM task_events WHERE task_id=? AND kind='sync_rejected'", (tid,))
++    def ops(board, batch):
++        return {"results": [
++            {"client_op_id": op["client_op_id"], "status": "rejected", "reason": "forbidden_field",
++             "detail": "not writable on tasks: model_pin_mandatory"}
++            if op["table"] == "tasks" else {"client_op_id": op["client_op_id"], "status": "applied"}
++            for op in batch]}
++    client.push(live, SimpleNamespace(ops=ops), "default", "macbook", primary=True)
++    assert sync.claim_gate(live, tid, int(time.time()) + 900).deferred
++    assert REJECT in _notice(live, tid)
++
++
++def test_new_episode_records_a_repeated_missing_row_denial(live):
++    tid = _card(live)
++    sync.claim_gate(live, tid, int(time.time()) + 900)
++    live.execute("UPDATE task_events SET created_at=0 WHERE task_id=? AND kind='claim_deferred'", (tid,))
++    sync.claim_gate(live, tid, int(time.time()) + 900)
++    assert "isn't on the shared Board" in _notice(live, tid)
++
++
++def test_unknown_rejection_is_explicit_and_newest_rejection_wins(live):
++    tid = _card(live)
++    live.execute("DELETE FROM task_events WHERE task_id=? AND kind='sync_rejected'", (tid,))
++    sync.claim_gate(live, tid, int(time.time()) + 900)
++    from hermes_cli.kanban_sync_diagnostics import missing_board
++    assert missing_board(live, tid, 0)["sync_reject_reason"] == "no sync rejection recorded"
++    kb._append_event(live, tid, "sync_rejected", {"reason": "first"})
++    kb._append_event(live, tid, "sync_rejected", {"reason": REJECT})
++    assert missing_board(live, tid, 0)["sync_reject_reason"] == REJECT
+-- 
+2.55.0
+

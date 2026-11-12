@@ -1,0 +1,187 @@
+From 64e37999ec0d33e6e09a5b575f0497c73c24fc2b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:55:36 +0000
+Subject: [PATCH] fix(routing): class vision scan crashed on tool schemas with
+ a "type" property [daveey]
+
+Problem: every turn in hub chat 20261110_184601_52504d (class-routed, requested_class=deep) failed
+before any provider send with `TypeError: cannot use 'dict' as a set element (unhashable type:
+'dict')`, logged as "Non-retryable client error" with no traceback (21+ failures, 2026-11-11
+20:50Z..23:38Z; automation replays of Kanban notices failed the same way).
+
+Why 1: build_request_payload -> validate_class_request -> _requirements -> _has_image raised
+  (offline repro of the deferred desktop resume: agent/turn_api_request.py:127,
+  agent/model_routing_request.py:68, :15).
+Why 2: _has_image walked the WHOLE payload incl. `tools` and did `value.get("type") in {...}`;
+  a JSON-schema property NAMED "type" makes that value a dict (unhashable).
+Why 3: this chat's tools_for_api carried deferred schemas with such properties: user-steps
+  `action_request` (receipt.evidence.items.properties.type, tools[37]) and `inbox_post`
+  (tools[44]); validate_class_request only runs for class-routed agents, so unrouted chats
+  never reach the scan.
+Root (happened): the vision capability scan treated tool JSON schemas as message content and
+  assumed every "type" value is a string.
+Root (not caught): tests for validate_class_request only used string message content, never a
+  real tool schema; and the non-retryable path logged str(error) only (and skips the request
+  dump when api_kwargs was never built), so the raising frame was invisible.
+
+Fix:
+- _has_image scans only content keys (messages/input/system/instructions), never tools, and
+  only matches string "type" values.
+- "Non-retryable client error" logs the traceback when there is no HTTP status (a local
+  error while building/sending the request).
+
+Tests (RED before, GREEN after):
+- tests/agent/test_model_routing_request_context.py::test_tool_schema_with_property_named_type_does_not_crash_or_need_vision
+  (real action_request schema shape)
+- tests/agent/test_model_routing_request_context.py::test_tools_never_count_as_vision_but_image_block_in_messages_does
+- tests/agent/test_nonretryable_local_error_traceback.py::test_local_type_error_logs_traceback
+- tests/agent/test_nonretryable_local_error_traceback.py::test_http_client_error_stays_one_line
+---
+ agent/model_routing_request.py                | 13 +++++-
+ agent/turn_recovery.py                        |  5 +-
+ .../test_model_routing_request_context.py     | 29 ++++++++++++
+ ...test_nonretryable_local_error_traceback.py | 46 +++++++++++++++++++
+ 4 files changed, 90 insertions(+), 3 deletions(-)
+ create mode 100644 tests/agent/test_nonretryable_local_error_traceback.py
+
+diff --git a/agent/model_routing_request.py b/agent/model_routing_request.py
+index 98f6bf3ce11..0c84650baae 100644
+--- a/agent/model_routing_request.py
++++ b/agent/model_routing_request.py
+@@ -10,9 +10,17 @@ _IDENTITY_FIELDS = frozenset({
+ })
+ 
+ 
++_IMAGE_PART_TYPES = frozenset({"image", "image_url", "input_image"})
++# Payload keys that can carry user/tool image parts. ``tools`` holds JSON schemas, never images:
++# a schema property NAMED "type" makes ``dict.get("type")`` a dict (unhashable) and an
++# ``{"type": "image"}`` default/example would falsely demand vision.
++_CONTENT_KEYS = ("messages", "input", "system", "instructions")
++
++
+ def _has_image(value):
+     if isinstance(value, dict):
+-        return value.get("type") in {"image", "image_url", "input_image"} or any(
++        kind = value.get("type")
++        return (isinstance(kind, str) and kind in _IMAGE_PART_TYPES) or any(
+             _has_image(item) for item in value.values())
+     return isinstance(value, list) and any(_has_image(item) for item in value)
+ 
+@@ -121,7 +129,8 @@ def _requirements(agent, request, streaming):
+     context = _estimate_context_tokens(request, payload)
+     context += output_reservation(agent, request)
+     requirements["min_context_tokens"] = max(floor, context)
+-    requirements.update(tools=bool(request.get("tools")), vision=_has_image(payload),
++    requirements.update(tools=bool(request.get("tools")),
++                        vision=_has_image([payload[key] for key in _CONTENT_KEYS if key in payload]),
+                         streaming=streaming, json=bool(request.get("response_format") or
+                         (request.get("text") or {}).get("format")))
+     return requirements
+diff --git a/agent/turn_recovery.py b/agent/turn_recovery.py
+index ad889760f48..1097f654371 100644
+--- a/agent/turn_recovery.py
++++ b/agent/turn_recovery.py
+@@ -1075,7 +1075,10 @@ def nonretryable_client_error_result(
+             "      • Self-signed local endpoint (llama.cpp, LM Studio, vLLM)? Use http://",
+             "        for localhost, or add the server's cert to your trust store.",
+         )
+-    logger.error("%sNon-retryable client error: %s", agent.log_prefix, api_error)
++    # No HTTP status = the request never reached the provider (a local bug while building or
++    # sending it): log the traceback, or the raising frame is lost (chat 20261110_184601_52504d).
++    logger.error("%sNon-retryable client error: %s", agent.log_prefix, api_error,
++                 exc_info=api_error if status_code is None else None)
+     if classified.reason == FailoverReason.content_policy_blocked:
+         # Safety refusal that arrived as an exception (400 / APIError) rather than an HTTP-200
+         # finish_reason. Treat it exactly like the HTTP-200 refusal handler: do NOT persist the
+diff --git a/tests/agent/test_model_routing_request_context.py b/tests/agent/test_model_routing_request_context.py
+index 5735c0921aa..d425c50cc19 100644
+--- a/tests/agent/test_model_routing_request_context.py
++++ b/tests/agent/test_model_routing_request_context.py
+@@ -88,3 +88,32 @@ def test_capability_mismatch_still_fails_closed_and_is_named(setup, extra, key):
+         return
+     with pytest.raises(ModelRoutingError, match=f"failing capability: .*{key}"):
+         validate_class_request(agent, req, streaming=True)
++
++
++# Real shape from chat 20261110_184601_52504d: the deferred ``action_request`` tool's JSON schema has a
++# PROPERTY named "type" (receipt.evidence.items.properties.type), so ``dict.get("type")`` is a dict.
++# The vision scan's set-membership test raised "cannot use 'dict' as a set element" on every turn.
++_ACTION_REQUEST_TOOL = {"type": "function", "function": {"name": "action_request", "parameters": {
++    "type": "object", "properties": {"receipt": {"type": "object", "properties": {"evidence": {
++        "type": "array", "items": {"type": "object", "properties": {
++            "type": {"type": "string", "enum": ["message", "tool_call", "commit", "pr", "kanban", "file",
++                                                "url", "operation"]},
++            "id": {"type": "string"}, "board": {"type": "string"}, "note": {"type": "string"}}}}}}}}}}
++
++
++def test_tool_schema_with_property_named_type_does_not_crash_or_need_vision(setup):
++    agent, request = setup
++    validate_class_request(agent, request(10, tools=[_ACTION_REQUEST_TOOL]), streaming=True)
++    assert agent._model_routing_requirements.get("vision") is not True
++
++
++def test_tools_never_count_as_vision_but_image_block_in_messages_does(setup):
++    agent, request = setup
++    enum_tool = {"type": "function", "function": {"name": "t", "parameters": {
++        "type": "object", "properties": {"part": {"type": "object", "default": {"type": "image"}}}}}}
++    validate_class_request(agent, request(10, tools=[enum_tool]), streaming=True)
++    req = request(10)
++    req["messages"].append({"role": "user", "content": [
++        {"type": "image", "source": {"type": "base64", "data": "x"}}]})
++    with pytest.raises(ModelRoutingError, match="vision"):
++        validate_class_request(agent, req, streaming=True)
+diff --git a/tests/agent/test_nonretryable_local_error_traceback.py b/tests/agent/test_nonretryable_local_error_traceback.py
+new file mode 100644
+index 00000000000..46f58b9d6ba
+--- /dev/null
++++ b/tests/agent/test_nonretryable_local_error_traceback.py
+@@ -0,0 +1,46 @@
++"""A non-retryable LOCAL exception (no HTTP status) logs its traceback; an HTTP 4xx stays one line.
++
++Chat 20261110_184601_52504d failed every turn for hours on a TypeError raised while assembling the
++request, and agent.log/errors.log held only the message, so the raising frame had to be rebuilt
++offline. The traceback rides on the terminal "Non-retryable client error" record.
++"""
++import logging
++
++import pytest
++
++from agent.error_classifier import classify_api_error
++from agent.turn_recovery import nonretryable_client_error_result
++from tests.agent.test_failed_turn_chat_copy import _Agent, _Http
++
++
++def _run(error, status):
++    classified = classify_api_error(error, provider="anthropic", model="claude-opus-5-5")
++    return nonretryable_client_error_result(
++        _Agent(), error, classified, status_code=status, api_kwargs=None, api_messages=[], messages=[],
++        conversation_history=None, api_call_count=1, approx_tokens=10, provider="anthropic",
++        base_url="https://api.anthropic.com", model="claude-opus-5-5",
++    )
++
++
++def _records(caplog):
++    return [r for r in caplog.records if "Non-retryable client error" in r.getMessage()]
++
++
++def test_local_type_error_logs_traceback(caplog):
++    def _scan(value):
++        return value.get("type") in {"image"}  # the real failing expression's shape
++    with pytest.raises(TypeError) as raised:
++        _scan({"type": {"type": "string"}})
++    error = raised.value
++    with caplog.at_level(logging.ERROR, logger="agent.conversation_loop"):
++        _run(error, None)
++    (record,) = _records(caplog)
++    assert record.exc_info and record.exc_info[1] is error
++    assert "_scan" in caplog.text and "Traceback" in caplog.text
++
++
++def test_http_client_error_stays_one_line(caplog):
++    with caplog.at_level(logging.ERROR, logger="agent.conversation_loop"):
++        _run(_Http(404, "HTTP 404: model not found"), 404)
++    (record,) = _records(caplog)
++    assert not record.exc_info
+-- 
+2.55.0
+

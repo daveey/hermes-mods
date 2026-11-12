@@ -1,0 +1,301 @@
+From 35e93461b1b288dfed38939b572f316491097585 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:39:30 +0000
+Subject: [PATCH] [daveey] Recognize fence-parked launchd launchers before
+ update pause
+
+---
+ hermes_cli/update_cmd_posix_pause.py          |  13 +-
+ hermes_cli/update_gateway_fence.py            |  58 +++++++
+ .../test_update_fenced_launcher_pause.py      | 162 ++++++++++++++++++
+ 3 files changed, 230 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_update_fenced_launcher_pause.py
+
+diff --git a/hermes_cli/update_cmd_posix_pause.py b/hermes_cli/update_cmd_posix_pause.py
+index 18cafd9d19d..35d52e01ccc 100644
+--- a/hermes_cli/update_cmd_posix_pause.py
++++ b/hermes_cli/update_cmd_posix_pause.py
+@@ -524,7 +524,7 @@ def _drain_budget() -> float:
+     return _gateway_drain_budget()
+ 
+ 
+-def _stop_gateways(token: dict, entries: list[dict]) -> None:
++def _stop_gateways(token: dict, entries: list[dict], *, fence_checked: bool = False) -> None:
+     """Request idle-only stops, then wait within one bounded pre-swap budget.
+     A supervised gateway that exited through the drain is stopped through
+     its supervisor at once: its exit 75 asks for a restart, which systemd honours after
+@@ -532,9 +532,12 @@ def _stop_gateways(token: dict, entries: list[dict]) -> None:
+     defers without forcing active work to stop; the checkout must not move."""
+     from hermes_cli import update_pause_record as pause_record
+     from hermes_cli.update_cmd_drain_report import drain_progress_reporter
++    from hermes_cli.update_gateway_fence import parked_launchd_launcher
+     budget, waiting = min(_drain_budget(), _PRE_SWAP_DRAIN_WAIT_S), []
+     refusals, refused = [], []
+     for entry in entries:
++        if not fence_checked and parked_launchd_launcher(entry):
++            continue  # the ancestor fence owns starting and verifying this job
+         pause_record.mark_stop_sent(token, entry["pid"])  # before the request: see _ask_to_drain
+         acknowledged = _ask_to_drain(entry)
+         if acknowledged:
+@@ -675,7 +678,9 @@ def _pause(token: dict) -> str | None:
+         return f"could not list running gateways ({exc}); the checkout was not changed"
+     for line in notices + more:
+         print(line)
+-    supervised = units + jobs
++    from hermes_cli.update_gateway_fence import parked_launchd_launcher
++    # Do not acquire restart custody for a job already stopped by the caller's fence.
++    supervised = [entry for entry in units + jobs if not parked_launchd_launcher(entry)]
+     if not supervised and not bare:
+         _deferral_streak()
+         return None
+@@ -709,7 +714,9 @@ def _pause(token: dict) -> str | None:
+     # in ``_cmd_update_impl`` for this token), else the next launch's recovery, restarts it.
+     token["posix_stopped"] = True
+     try:
+-        _stop_gateways(token, supervised + bare)
++        # Exemption and restart custody were decided together before recording. Re-evaluating
++        # here could skip a newly parked launcher while retaining its durable restart debt.
++        _stop_gateways(token, supervised + bare, fence_checked=True)
+     except BaseException as exc:  # health: allow BLE001 -- interruption must settle before cmd_update releases its fence
+         from hermes_cli.update_cmd_windows import _resume_windows_gateways_after_update
+         print(f"  ↷ Update deferred: {exc or type(exc).__name__}; the checkout was not changed")
+diff --git a/hermes_cli/update_gateway_fence.py b/hermes_cli/update_gateway_fence.py
+index e1d1ff42edc..caba6f6f064 100644
+--- a/hermes_cli/update_gateway_fence.py
++++ b/hermes_cli/update_gateway_fence.py
+@@ -81,6 +81,64 @@ def _gateway_homes() -> list[Path]:
+     return unique
+ 
+ 
++def parked_launchd_launcher(entry: dict) -> bool:
++    """Prove a launchd PID is only a launcher parked at this updater's ancestor fence.
++
++    A socket answer or any launcher child means the gateway may still be running.
++    Never exempt an unresponsive gateway merely because an intent exists.
++    """
++    if entry.get("kind") != "launchd" or not entry.get("home"):
++        return False
++    home = Path(entry["home"])
++    owner = ancestor_fence_owner([home])
++    if owner is None:
++        return False
++    try:
++        import psutil
++    except ImportError:
++        return False
++    try:
++        from gateway.control_socket import query_gateway_control
++        from gateway.status import get_process_start_time
++        from hermes_cli.gateway_launchd import _SIGNED_WRAPPER_SOURCE, gateway_launcher_path
++
++        if query_gateway_control(home, "identify", timeout=0.5) is not None:
++            return False
++        root = psutil.Process(entry["pid"])
++        if not root.is_running():
++            return False
++        if entry.get("ct") is not None and get_process_start_time(entry["pid"]) != entry["ct"]:
++            return False
++
++        def launcher(proc):
++            argv = proc.cmdline()
++            # Direct executable or interpreter + script, never a substring in a shim's -c source.
++            offset = next((i for i in range(min(2, len(argv)))
++                           if Path(argv[i]).name == "hermes-gateway-launcher"), None)
++            return (offset is not None and len(argv) > offset + 4
++                    and Path(argv[offset]).resolve() == gateway_launcher_path(str(home)).resolve()
++                    and argv[offset + 1] == "--home"
++                    and Path(argv[offset + 2]).resolve() == home.resolve()
++                    and argv[offset + 3] == "--")
++
++        candidate = root
++        if not launcher(root):
++            argv = root.cmdline()
++            app_bin = Path.home() / "Applications/Hermes Python.app/Contents/MacOS"
++            if (len(argv) != 5 or argv[1:4] != ["-I", "-c", _SIGNED_WRAPPER_SOURCE]
++                    or Path(argv[0]).parent != app_bin or not Path(argv[0]).name.startswith("python3")
++                    or not argv[4].startswith("exec ")):
++                return False
++            children = root.children()
++            if len(children) != 1:
++                return False
++            candidate = children[0]  # signed Python's forwarding shim directly owns the launcher
++        return bool(launcher(candidate) and candidate.is_running() and not candidate.children()
++                    and ancestor_fence_owner([home]) == owner)
++    except (ImportError, OSError, ValueError, KeyError, TypeError, psutil.Error):
++        return False
++
++
+ def ancestor_fence_owner(homes: Optional[Iterable[Path]] = None) -> Optional[int]:
+     """Pid of a live ancestor of this process holding a core-update intent on a gateway home, else None.
+ 
+diff --git a/tests/hermes_cli/test_update_fenced_launcher_pause.py b/tests/hermes_cli/test_update_fenced_launcher_pause.py
+new file mode 100644
+index 00000000000..ac74dedd545
+--- /dev/null
++++ b/tests/hermes_cli/test_update_fenced_launcher_pause.py
+@@ -0,0 +1,162 @@
++"""A launchd launcher parked at the updater's ancestor fence is not a live gateway."""
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import psutil
++import pytest
++
++from gateway import control_socket
++from hermes_cli import update_cmd_posix_pause as pause
++from hermes_cli import update_gateway_fence as fence
++from hermes_cli import update_pause_record as record
++
++
++@pytest.fixture
++def parked(tmp_path, monkeypatch):
++    now = [0.0]
++    monkeypatch.setattr(pause, 'time', SimpleNamespace(
++        monotonic=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds)))
++    monkeypatch.setattr(pause, '_drain_budget', lambda: 30.0)
++    monkeypatch.setattr(pause, '_alive', lambda *a: True)
++    ask = Mock(return_value=None)
++    sent = Mock()
++    disarm = Mock()
++    monkeypatch.setattr(pause, '_ask_to_drain', ask)
++    monkeypatch.setattr(record, 'mark_stop_sent', sent)
++    monkeypatch.setattr(pause, '_disarm', disarm)
++    owner = Mock(return_value=77)
++    monkeypatch.setattr(fence, 'ancestor_fence_owner', owner)
++    query = Mock(return_value=None)
++    monkeypatch.setattr(control_socket, 'query_gateway_control', query)
++    launcher = Mock()
++    launcher.cmdline.return_value = ['/usr/bin/python3', str(tmp_path / 'bin/hermes-gateway-launcher'), '--home', str(tmp_path), '--', '/fixture/hermes', 'gateway', 'run']
++    launcher.children.return_value = []
++    launcher.is_running.return_value = True
++    monkeypatch.setattr(psutil, 'Process', Mock(return_value=launcher))
++    entry = dict(pid=4242, kind='launchd', label='ai.hermes.gateway', home=str(tmp_path))
++    return SimpleNamespace(entry=entry, now=now, ask=ask, sent=sent, disarm=disarm,
++                           owner=owner, query=query, launcher=launcher)
++
++
++def test_parked_launcher_returns_without_pause_wait_or_disarm(parked):
++    pause._stop_gateways({}, [parked.entry])
++    assert parked.now == [0.0]
++    parked.ask.assert_not_called()
++    parked.sent.assert_not_called()
++    parked.disarm.assert_not_called()
++    parked.owner.assert_called_with([Path(parked.entry['home'])])
++
++
++def test_live_answering_gateway_still_waits(parked):
++    parked.query.return_value = {'pid': 5000}
++    parked.ask.return_value = True
++    with pytest.raises(pause.PauseRefused, match='still draining after 30s'):
++        pause._stop_gateways({}, [parked.entry])
++    assert parked.now[0] >= 30
++    parked.ask.assert_called_once()
++    parked.sent.assert_called_once()
++    parked.disarm.assert_not_called()
++
++
++@pytest.mark.parametrize('case', ['foreign-fence', 'wrong-home', 'has-child', 'unknown-argv', 'dead', 'systemd'])
++def test_only_positively_parked_launcher_is_exempt(parked, case):
++    if case == 'foreign-fence':
++        parked.owner.return_value = None
++    elif case == 'wrong-home':
++        parked.launcher.cmdline.return_value[3] = '/another/home'
++    elif case == 'has-child':
++        parked.launcher.children.return_value = [Mock()]
++    elif case == 'unknown-argv':
++        parked.launcher.cmdline.side_effect = psutil.AccessDenied(4242)
++    elif case == 'dead':
++        parked.launcher.is_running.return_value = False
++    else:
++        parked.entry['kind'] = 'systemd'
++    with pytest.raises(pause.PauseRefused):
++        pause._stop_gateways({}, [parked.entry])
++    parked.ask.assert_called_once()
++
++
++def test_signed_wrapper_with_one_parked_launcher(parked, monkeypatch):
++    wrapper = Mock()
++    from hermes_cli.gateway_launchd import _SIGNED_WRAPPER_SOURCE
++    wrapper.cmdline.return_value = [str(Path.home() / 'Applications/Hermes Python.app/Contents/MacOS/python3'),
++                                    '-I', '-c', _SIGNED_WRAPPER_SOURCE, 'exec launcher']
++    wrapper.children.return_value = [parked.launcher]
++    wrapper.is_running.return_value = True
++    monkeypatch.setattr(psutil, 'Process', Mock(return_value=wrapper))
++    pause._stop_gateways({}, [parked.entry])
++    parked.ask.assert_not_called()
++
++
++@pytest.mark.parametrize('case', ['unknown-wrapper', 'wrapped-child', 'wrapped-socket', 'multiple',
++                                      'birth', 'owner-changed', 'children-error', 'wrong-launcher'])
++def test_ambiguous_wrapper_and_identity_fail_closed(parked, monkeypatch, case):
++    from gateway import status
++    from hermes_cli.gateway_launchd import _SIGNED_WRAPPER_SOURCE
++    wrapper = Mock()
++    wrapper.cmdline.return_value = [str(Path.home() / 'Applications/Hermes Python.app/Contents/MacOS/python3'),
++                                    '-I', '-c', _SIGNED_WRAPPER_SOURCE, 'exec launcher']
++    wrapper.children.return_value = [parked.launcher]
++    wrapper.is_running.return_value = True
++    monkeypatch.setattr(psutil, 'Process', Mock(return_value=wrapper))
++    if case == 'unknown-wrapper':
++        wrapper.cmdline.return_value[3] = 'unrelated source'
++    elif case == 'wrapped-child':
++        parked.launcher.children.return_value = [Mock()]
++    elif case == 'wrapped-socket':
++        parked.query.return_value = {}
++    elif case == 'multiple':
++        wrapper.children.return_value.append(Mock())
++    elif case == 'birth':
++        parked.entry['ct'] = 123
++        monkeypatch.setattr(status, 'get_process_start_time', lambda pid: 456)
++    elif case == 'owner-changed':
++        parked.owner.side_effect = [77, 78]
++    elif case == 'children-error':
++        parked.launcher.children.side_effect = psutil.AccessDenied(4242)
++    elif case == 'wrong-launcher':
++        parked.launcher.cmdline.return_value[1] = '/untrusted/hermes-gateway-launcher'
++    with pytest.raises(pause.PauseRefused):
++        pause._stop_gateways({}, [parked.entry])
++    parked.ask.assert_called_once()
++
++
++def test_recorded_nonexempt_entry_is_not_reclassified_after_custody(parked, monkeypatch):
++    check = Mock(return_value=True)
++    monkeypatch.setattr(fence, 'parked_launchd_launcher', check)
++    with pytest.raises(pause.PauseRefused):
++        pause._stop_gateways({}, [parked.entry], fence_checked=True)
++    check.assert_not_called()
++    parked.ask.assert_called_once()
++    parked.sent.assert_called_once()
++
++
++@pytest.mark.parametrize('mixed', [False, True])
++def test_pause_discovery_leaves_restart_custody_with_fence(parked, monkeypatch, mixed):
++    from gateway import status
++    ordinary = dict(pid=4343, kind='systemd', unit='fixture.service', home=parked.entry['home'])
++    monkeypatch.setattr(pause, '_discover_systemd', lambda: [ordinary] if mixed else [])
++    monkeypatch.setattr(status, 'get_process_start_time', lambda pid: 1)
++    monkeypatch.setattr(record, 'identity', lambda pid: {'ct': 'ct:1'})
++    monkeypatch.setattr(record, 'mark_stop_requested', Mock())
++    monkeypatch.setattr(record, 'sync', Mock())
++    stop = Mock()
++    monkeypatch.setattr(pause, '_stop_gateways', stop)
++    monkeypatch.setattr(pause, '_discover_launchd', lambda: [parked.entry])
++    monkeypatch.setattr(pause, '_left_running', lambda u, j: (u, j, []))
++    monkeypatch.setattr(pause, '_discover_bare', lambda p: ([], []))
++    monkeypatch.setattr(pause, '_deferral_streak', lambda: None)
++    write = Mock()
++    monkeypatch.setattr(record, 'record_pause', write)
++    token = pause._empty_token()
++    assert pause._pause(token) is None
++    assert token['resume_needed'] is mixed
++    assert token['posix_units'] == ([ordinary] if mixed else [])
++    if mixed:
++        write.assert_called_once()
++        stop.assert_called_once_with(token, [ordinary], fence_checked=True)
++    else:
++        write.assert_not_called()
++        stop.assert_not_called()
+-- 
+2.55.0
+

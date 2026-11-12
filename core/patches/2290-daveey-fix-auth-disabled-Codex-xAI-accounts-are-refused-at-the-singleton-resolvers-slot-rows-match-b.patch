@@ -1,0 +1,484 @@
+From 4edb9e2a87750f564bb7c8ebad2add68797411a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:06:34 +0000
+Subject: [PATCH] [daveey] fix(auth): disabled Codex/xAI accounts are refused
+ at the singleton resolvers; slot rows match by account
+
+Second review (exact head e9f591f9f25) found:
+- resolve_codex_runtime_credentials / resolve_xai_oauth_runtime_credentials handed a disabled
+  account's token to their other callers (plugin provider requests, usage fetch, aux forced
+  refresh, xAI aux) and spent its refresh grant first. Both now refuse before any refresh
+  (status/read-only lookups still report).
+- the Codex singleton row's id is its slot and its label is the generic 'device_code', so
+  disabling it disabled whoever signed in next. Records now carry the JWT account (email or
+  ChatGPT account id); a slot row whose token names another account never matches, generic
+  labels never match by label, and the account stays disabled wherever it reappears.
+- API-key providers fall back to env vars / any pool row when select() is empty, so
+  'hermes auth disable' is now limited to anthropic, openai-codex, xai-oauth (the panel's scope).
+- the delegated-child endpoint fallback could bind a disabled row; _is_sole_credential counted
+  disabled rows.
+- token_disabled reads persisted rows (no load_pool seeding re-entry) and checks refresh tokens;
+  disabled_keys fails soft when no store path resolves.
+
+Proof: 6 new tests in test_credential_pool_disabled_paths.py RED with the fixes reverted, GREEN
+with them; reviewer repros (codex singleton fresh/expiring, slot reuse) now refuse / pass.
+---
+ agent/credential_pool.py                      |   2 +-
+ agent/credential_pool_disabled.py             | 117 ++++++++++++------
+ hermes_cli/auth_codex.py                      |   3 +
+ hermes_cli/auth_commands.py                   |   5 +-
+ hermes_cli/auth_xai.py                        |   3 +
+ .../test_credential_pool_disabled_paths.py    |  99 +++++++++++++++
+ tests/hermes_cli/test_auth_disable_command.py |  20 +--
+ tools/delegate_tool_child_run.py              |   4 +-
+ 8 files changed, 205 insertions(+), 48 deletions(-)
+
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index 91dbbf5cf17..cca2172328f 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -1028,7 +1028,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+ 
+     def _is_sole_credential(self) -> bool:
+         """DEAD entries never re-enter rotation, so <=1 non-DEAD entry means nothing to rotate to."""
+-        return sum(1 for e in self._entries if e.last_status != STATUS_DEAD) <= 1
++        return sum(1 for e in self._enabled_entries() if e.last_status != STATUS_DEAD) <= 1  # disabled: not a fallback
+ 
+     def _find(self, predicate: Callable[[PooledCredential], bool]) -> Optional[PooledCredential]:
+         return next((e for e in self._entries if predicate(e)), None)
+diff --git a/agent/credential_pool_disabled.py b/agent/credential_pool_disabled.py
+index 96f59780252..cc5c31d9e80 100644
+--- a/agent/credential_pool_disabled.py
++++ b/agent/credential_pool_disabled.py
+@@ -6,9 +6,12 @@ pulls) rewrites rows from its in-memory copy, so a flag stored on a row would be
+ flush from any process that loaded the pool before the user disabled it. Only
+ :func:`set_credential_disabled` writes this section, under the auth-store lock.
+ 
+-A record matches a row by id OR by case-insensitive label. Label matching keeps an account disabled
+-when its row is recreated with a new id (a re-login, a hub pull, a singleton re-seed), which all keep
+-the account's label (its email).
++A record ``{"id", "label", "account"}`` matches a row by id OR by case-insensitive label, so an account
++stays disabled when its row is recreated with a new id (a re-login, a hub pull). Generic labels that
++name a slot, not an account (``device_code``, ``claude_code``, ``env:...``), never match by label.
++``account`` is the identity in the row's JWT (email or ChatGPT account id) when it has one: a row
++whose token names a DIFFERENT account never matches, so disabling the Codex/xAI singleton slot does
++not also disable whoever signs into that slot next.
+ 
+ Readers union the active store's section with the global root's, so a disable in the root home
+ applies to every profile on the host. Reads are cached by each file's (mtime, size), so a
+@@ -29,7 +32,10 @@ SECTION = "disabled_credentials"
+ 
+ _cache_lock = threading.Lock()
+ _cache: dict[tuple[str, str], tuple[tuple[int, int], tuple[frozenset[str], frozenset[str]]]] = {}
+-_EMPTY: tuple[frozenset[str], frozenset[str]] = (frozenset(), frozenset())
++_EMPTY: tuple = (frozenset(), frozenset(), frozenset())
++_GENERIC_LABELS = frozenset({"device_code", "claude_code", "hermes_pkce", "manual", "oauth", "api_key", "env"})
++# Only the providers whose every token path checks this list (pool, singleton, env/borrowed tokens).
++SUPPORTED_PROVIDERS = frozenset({"anthropic", "openai-codex", "xai-oauth"})
+ 
+ 
+ def _norm_label(label: Any) -> str:
+@@ -42,13 +48,36 @@ def _records(store: dict[str, Any], provider: str) -> list[dict[str, Any]]:
+     return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+ 
+ 
+-def _keys_from_records(records: Iterable[dict[str, Any]]) -> tuple[frozenset[str], frozenset[str]]:
++def _generic(label: str) -> bool:
++    return label in _GENERIC_LABELS or label.startswith(("env:", "env ")) or not label
++
++
++def account_of(entry: Any) -> Optional[str]:
++    """Lowercase account identity from the row's JWT access token (email, else ChatGPT account id)."""
++    from hermes_cli.auth_constants import _decode_jwt_claims
++    claims = _decode_jwt_claims(getattr(entry, "access_token", None) or "")
++    if not isinstance(claims, dict) or not claims:
++        return None
++    profile = claims.get("https://api.openai.com/profile") or {}
++    auth = claims.get("https://api.openai.com/auth") or {}
++    for value in (claims.get("email"), profile.get("email") if isinstance(profile, dict) else None,
++                  auth.get("chatgpt_account_id") if isinstance(auth, dict) else None):
++        if isinstance(value, str) and value.strip():
++            return value.strip().lower()
++    return None
++
++
++def _keys_from_records(records: Iterable[dict[str, Any]]) -> tuple:
++    """``(ids, labels, guards)``; guards = ``(id, account)`` pairs a matching row's token must not contradict."""
++    records = list(records)
+     ids = frozenset(str(r["id"]) for r in records if r.get("id"))
+-    labels = frozenset(_norm_label(r.get("label")) for r in records if _norm_label(r.get("label")))
+-    return ids, labels
++    labels = frozenset(lab for r in records for lab in (_norm_label(r.get("label")), _norm_label(r.get("account")))
++                       if not _generic(lab))
++    guards = frozenset((str(r["id"]), _norm_label(r["account"])) for r in records if r.get("id") and r.get("account"))
++    return ids, labels, guards
+ 
+ 
+-def _file_keys(path: Optional[Path], provider: str) -> tuple[frozenset[str], frozenset[str]]:
++def _file_keys(path: Optional[Path], provider: str) -> tuple:
+     if path is None:
+         return _EMPTY
+     try:
+@@ -80,25 +109,34 @@ def _root_path() -> Optional[Path]:
+     return Path(root) if root is not None else None
+ 
+ 
+-def disabled_keys(provider: str) -> tuple[frozenset[str], frozenset[str]]:
+-    """``(ids, lowercase labels)`` the user disabled for *provider* (active store + global root)."""
++def disabled_keys(provider: str) -> tuple:
++    """``(ids, lowercase labels, guards)`` the user disabled for *provider* (active store + global root)."""
+     from hermes_cli import auth as auth_mod
+-    active = auth_mod._auth_file_path()
+-    root = _root_path()
+-    ids, labels = _file_keys(active, provider)
++    try:
++        active, root = auth_mod._auth_file_path(), _root_path()
++    except Exception:  # no resolvable store (or a guarded one) holds no disable records
++        logger.debug("disabled-credential check: auth store path unavailable", exc_info=True)
++        return _EMPTY
++    keys = _file_keys(active, provider)
+     if root is not None and root != Path(active):
+-        root_ids, root_labels = _file_keys(root, provider)
+-        ids, labels = ids | root_ids, labels | root_labels
+-    return ids, labels
++        keys = tuple(a | b for a, b in zip(keys, _file_keys(root, provider)))
++    return keys
+ 
+ 
+-def matches(entry: Any, keys: tuple[frozenset[str], frozenset[str]]) -> bool:
+-    ids, labels = keys
++def matches(entry: Any, keys: tuple) -> bool:
++    ids, labels = keys[0], keys[1]
+     if not ids and not labels:
+         return False
+-    return getattr(entry, "id", None) in ids or (
+-        bool(labels) and _norm_label(getattr(entry, "label", "")) in labels
+-    )
++    acct = account_of(entry)
++    if acct is not None and acct in labels:
++        return True
++    entry_id = getattr(entry, "id", None)
++    if entry_id in ids:
++        wanted = {a for i, a in (keys[2] if len(keys) > 2 else ()) if i == entry_id}
++        if not wanted or acct is None or acct in wanted:
++            return True
++    label = _norm_label(getattr(entry, "label", ""))
++    return not _generic(label) and label in labels
+ 
+ 
+ def enabled_entries(provider: str, entries: Iterable[Any]) -> list[Any]:
+@@ -131,7 +169,10 @@ def set_credential_disabled(provider: str, entry: Any, disabled: bool) -> bool:
+         if disabled:
+             if hit:
+                 return False
+-            records.append({"id": entry_id, "label": label})
++            record = {"id": entry_id, "label": label}
++            if (acct := account_of(entry)) is not None:
++                record["account"] = acct
++            records.append(record)
+         else:
+             if not hit:
+                 return False
+@@ -157,28 +198,34 @@ def disabled_by_root(provider: str, entry: Any) -> bool:
+     return matches(entry, _file_keys(root, provider))
+ 
+ 
+-def token_disabled(provider: str, token: Optional[str]) -> bool:
+-    """Whether *token* belongs to a disabled pool row of *provider*.
++def token_disabled(provider: str, *tokens: Optional[str]) -> bool:
++    """Whether any of *tokens* (access or refresh) belongs to a disabled account of *provider*.
+ 
+     For the resolvers that hand out a token without selecting it from the pool (the auth.json
+-    singleton, env tokens, the Claude Code file): the pool row seeded from them carries the same token.
+-    Costs nothing while nothing is disabled.
++    singleton, env tokens, the Claude Code file). A JWT naming a disabled account is disabled outright;
++    otherwise the token must be a disabled pool row's access/refresh token. Reads the persisted rows,
++    never ``load_pool`` (seeding may call the very resolver asking). Free while nothing is disabled.
+     """
+-    if not token:
++    wanted = {t.strip() for t in tokens if isinstance(t, str) and t.strip()}
++    if not wanted:
+         return False
+     keys = disabled_keys(provider)
+     if not keys[0] and not keys[1]:
+         return False
+-    from agent.credential_pool import load_pool
++    from types import SimpleNamespace
++    if any(account_of(SimpleNamespace(access_token=t)) in keys[1] for t in wanted):
++        return True
++    from hermes_cli import auth as auth_mod
+     try:
+-        entries = load_pool(provider).entries()
++        rows = auth_mod.read_credential_pool(provider)
+     except Exception:
+         logger.warning("disabled-credential check: %s pool unreadable; token allowed", provider, exc_info=True)
+         return False
+-    token = token.strip()
++    rows = [SimpleNamespace(**{k: r.get(k) for k in ("id", "label", "access_token", "refresh_token", "agent_key")})
++            for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict)]
+     return any(
+-        matches(e, keys) and token in (getattr(e, "runtime_api_key", None), getattr(e, "access_token", None))
+-        for e in entries
++        matches(r, keys) and wanted & {r.access_token, r.refresh_token, r.agent_key}
++        for r in rows
+     )
+ 
+ 
+@@ -216,7 +263,7 @@ def _raise_all_disabled(provider: str) -> None:
+                     provider=provider, code="credentials_disabled")
+ 
+ 
+-def refuse_disabled_token(provider: str, token: Optional[str]) -> None:
+-    """Raise ``AuthError`` when a session would keep sending *token* of a disabled account."""
+-    if token_disabled(provider, token):
++def refuse_disabled_token(provider: str, *tokens: Optional[str]) -> None:
++    """Raise ``AuthError`` when *tokens* (access/refresh) are a disabled account's: never send or spend them."""
++    if token_disabled(provider, *tokens):
+         _raise_all_disabled(provider)
+diff --git a/hermes_cli/auth_codex.py b/hermes_cli/auth_codex.py
+index d3373da53f7..d62ca4db514 100644
+--- a/hermes_cli/auth_codex.py
++++ b/hermes_cli/auth_codex.py
+@@ -672,6 +672,9 @@ def resolve_codex_runtime_credentials(
+                          "codex_auth_missing", relogin=True)
+     tokens = dict(data["tokens"])
+     access_token = _stripped(tokens.get("access_token"))
++    if not read_only:  # a disabled account: never send its token, never spend its refresh grant
++        from agent.credential_pool_disabled import refuse_disabled_token
++        refuse_disabled_token("openai-codex", access_token, tokens.get("refresh_token"))
+     refresh_timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
+ 
+     def _should_refresh(token: str) -> bool:
+diff --git a/hermes_cli/auth_commands.py b/hermes_cli/auth_commands.py
+index 785693b06c9..0495fc2c42d 100644
+--- a/hermes_cli/auth_commands.py
++++ b/hermes_cli/auth_commands.py
+@@ -511,8 +511,11 @@ def auth_priority_command(args) -> None:
+ 
+ def _auth_set_disabled(args, disabled: bool) -> None:
+     """`hermes auth disable|enable <provider> <target>`: switch one pooled credential off or back on."""
+-    from agent.credential_pool_disabled import disabled_by_root, set_credential_disabled
++    from agent.credential_pool_disabled import SUPPORTED_PROVIDERS, disabled_by_root, set_credential_disabled
+     provider = _normalize_provider(getattr(args, "provider", ""))
++    if disabled and provider not in SUPPORTED_PROVIDERS:
++        raise SystemExit(f"Disabling is supported for {', '.join(sorted(SUPPORTED_PROVIDERS))}, not {provider}; "
++                         f"use `hermes auth remove {provider} <target>` instead.")
+     target = getattr(args, "target", None)
+     pool = load_pool(provider)
+     index, matched, error = pool.resolve_target(target)
+diff --git a/hermes_cli/auth_xai.py b/hermes_cli/auth_xai.py
+index 2b92438a4da..bb47f3213f0 100644
+--- a/hermes_cli/auth_xai.py
++++ b/hermes_cli/auth_xai.py
+@@ -432,6 +432,9 @@ def resolve_xai_oauth_runtime_credentials(
+ 
+     data = _read_xai_oauth_tokens()
+     tokens = dict(data["tokens"])
++    if refresh_if_expiring or force_refresh:  # status (refresh_if_expiring=False) only reports
++        from agent.credential_pool_disabled import refuse_disabled_token  # never send/spend a disabled account's
++        refuse_disabled_token("xai-oauth", tokens.get("access_token"), tokens.get("refresh_token"))
+     refresh_timeout_seconds = env_float("HERMES_XAI_REFRESH_TIMEOUT_SECONDS", 20)
+     if _should_refresh(data):
+         with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+diff --git a/tests/agent/test_credential_pool_disabled_paths.py b/tests/agent/test_credential_pool_disabled_paths.py
+index f89210a6035..66b8534d6c4 100644
+--- a/tests/agent/test_credential_pool_disabled_paths.py
++++ b/tests/agent/test_credential_pool_disabled_paths.py
+@@ -166,3 +166,102 @@ def test_anthropic_session_pinned_to_its_only_row_stops_when_that_row_is_disable
+     _disable("anthropic", pool.entries()[0])
+     with pytest.raises(AuthError, match="Every anthropic account is disabled"):
+         agent._try_refresh_anthropic_client_credentials()
++
++
++def _jwt(email, acct, exp_in=6 * 3600):
++    import base64
++    import json
++    import time
++    def enc(d):
++        return base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
++    claims = {"exp": int(time.time()) + exp_in, "https://api.openai.com/profile": {"email": email},
++              "https://api.openai.com/auth": {"chatgpt_account_id": acct}}
++    return f"{enc({'alg': 'none'})}.{enc(claims)}.sig"
++
++
++def _codex_singleton(token, refresh="rt-fixture"):
++    import json
++    import time
++    from hermes_cli.auth import _auth_file_path
++    path = _auth_file_path()
++    store = json.loads(path.read_text()) if path.exists() else {"version": 1, "providers": {}}
++    store["providers"]["openai-codex"] = {"tokens": {"access_token": token, "refresh_token": refresh},
++                                         "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++                                         "auth_mode": "chatgpt"}
++    path.write_text(json.dumps(store))
++    cpd._cache.clear()
++
++
++@pytest.fixture
++def _no_codex_env(monkeypatch):
++    for key in [k for k in os.environ if k.startswith(("OPENAI", "CODEX", "HERMES_CODEX"))]:
++        monkeypatch.delenv(key)
++
++
++@pytest.mark.parametrize("exp_in", [6 * 3600, 30])
++def test_codex_singleton_resolver_refuses_a_disabled_account_before_any_refresh(monkeypatch, _no_codex_env, exp_in):
++    """Covers every resolve_codex_runtime_credentials caller (plugin requests, usage, aux); no grant is spent."""
++    import hermes_cli.auth_codex as ac
++    from agent.credential_pool import load_pool
++    _codex_singleton(_jwt("a@example.com", "acct-a", exp_in))
++    spent = []
++    monkeypatch.setattr(ac, "_refresh_codex_auth_tokens", lambda tokens, timeout: spent.append(1) or tokens)
++    for entry in load_pool("openai-codex").entries():
++        _disable("openai-codex", entry)
++    with pytest.raises(AuthError, match="disabled"):
++        ac.resolve_codex_runtime_credentials()
++    assert spent == []
++    assert ac.resolve_codex_runtime_credentials(read_only=True)["api_key"]  # status still reports it
++
++
++def test_disabling_the_codex_singleton_slot_does_not_disable_the_next_account_signed_in(_no_codex_env):
++    from agent.credential_pool import load_pool
++    _codex_singleton(_jwt("a@example.com", "acct-a"))
++    (row,) = load_pool("openai-codex").entries()
++    _disable("openai-codex", row)
++    assert load_pool("openai-codex").select() is None
++    _codex_singleton(_jwt("b@example.com", "acct-b"), refresh="rt-b")  # sign in as someone else
++    pool = load_pool("openai-codex")
++    assert pool.entries()[0].id == row.id  # same slot id ...
++    assert pool.select() is not None  # ... different account: usable
++    # A stays disabled wherever its row reappears (a hub pull labelled with the email) and by token.
++    assert cpd.is_credential_disabled("openai-codex", SimpleNamespace(id="other", label="a@example.com", access_token=""))
++    assert cpd.token_disabled("openai-codex", _jwt("a@example.com", "acct-a")) is True
++
++
++def test_xai_singleton_resolver_refuses_a_disabled_account(monkeypatch):
++    from hermes_cli import auth_xai
++    rows = [{"id": "row0", "label": "a@example.com", "auth_type": "oauth", "priority": 0, "source": "manual:device_code",
++             "access_token": "xai-fixture-access", "refresh_token": "xai-fixture-rt", "base_url": "https://api.x.ai/v1"}]
++    write_credential_pool("xai-oauth", rows)
++    _disable("xai-oauth", SimpleNamespace(**rows[0]))
++    monkeypatch.setattr(auth_xai, "_read_xai_oauth_tokens", lambda: {"tokens": {
++        "access_token": "xai-fixture-access", "refresh_token": "xai-fixture-rt"}})
++    with pytest.raises(AuthError, match="disabled"):
++        auth_xai.resolve_xai_oauth_runtime_credentials()
++
++
++def test_cli_refuses_disabling_providers_whose_env_and_fallback_paths_ignore_it():
++    from hermes_cli.auth_commands import auth_disable_command
++    _pool("deepseek", n=1)
++    with pytest.raises(SystemExit, match="hermes auth remove deepseek"):
++        auth_disable_command(SimpleNamespace(provider="deepseek", target="1"))
++
++
++def test_a_disabled_row_is_not_a_fallback_and_never_binds_a_delegated_child(monkeypatch):
++    import contextlib
++    import agent.credential_pool as cp
++    import tools.delegate_tool_routes as routes
++    from tools.delegate_tool_child_run import _lease_child_credential
++    pool = _pool("openai-codex", n=3)
++    assert pool._is_sole_credential() is False
++    _disable("openai-codex", pool.entries()[1])
++    _disable("openai-codex", pool.entries()[2])
++    assert pool._is_sole_credential() is True
++    # The leased row 0 serves another endpoint; only the disabled rows serve the child's.
++    monkeypatch.setattr(cp, "credential_pool_entry_serves_endpoint", lambda e, url: e is not None and e.id != "row0")
++    monkeypatch.setattr(routes, "child_profile_scope", lambda c: contextlib.nullcontext())
++    bound = []
++    child = SimpleNamespace(_credential_pool=pool, base_url="https://child.example", _swap_credential=bound.append)
++    _, lease = _lease_child_credential(child)
++    assert bound == [] and lease is None
+diff --git a/tests/hermes_cli/test_auth_disable_command.py b/tests/hermes_cli/test_auth_disable_command.py
+index 41d8f772fb2..3ddce365208 100644
+--- a/tests/hermes_cli/test_auth_disable_command.py
++++ b/tests/hermes_cli/test_auth_disable_command.py
+@@ -11,12 +11,12 @@ def home(tmp_path, monkeypatch):
+     hermes_home = tmp_path / "hermes"
+     hermes_home.mkdir()
+     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+-    for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
++    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+         monkeypatch.delenv(key, raising=False)
+     rows = [{"id": f"row{i}", "label": f"acct{i}", "auth_type": "api_key", "priority": i,
+              "source": "manual", "access_token": f"sk-or-fixture-{i}"} for i in range(2)]
+     (hermes_home / "auth.json").write_text(json.dumps(
+-        {"version": 1, "providers": {}, "credential_pool": {"openrouter": rows}}))
++        {"version": 1, "providers": {}, "credential_pool": {"anthropic": rows}}))
+     from agent import credential_pool_disabled as cpd
+     monkeypatch.setattr(cpd, "_root_path", lambda: None)
+     cpd._cache.clear()
+@@ -25,12 +25,12 @@ def home(tmp_path, monkeypatch):
+ 
+ def _run(verb, target, *, parse=True):
+     from hermes_cli import auth_commands
+-    args = SimpleNamespace(auth_action=verb, provider="openrouter", target=target)
++    args = SimpleNamespace(auth_action=verb, provider="anthropic", target=target)
+     if parse:  # through the real `hermes auth` subcommand parser
+         from hermes_cli.subcommands.auth import build_auth_parser
+         parser = argparse.ArgumentParser()
+         build_auth_parser(parser.add_subparsers(dest="command"), cmd_auth=lambda a: None)
+-        args = parser.parse_args(["auth", verb, "openrouter", target])
++        args = parser.parse_args(["auth", verb, "anthropic", target])
+         assert args.auth_action == verb and args.target == target
+     auth_commands.auth_command(args)
+ 
+@@ -38,7 +38,7 @@ def _run(verb, target, *, parse=True):
+ def _list(capsys):
+     from hermes_cli.auth_commands import auth_list_command
+     capsys.readouterr()
+-    auth_list_command(SimpleNamespace(provider="openrouter"))
++    auth_list_command(SimpleNamespace(provider="anthropic"))
+     return {line.split()[1]: line for line in capsys.readouterr().out.splitlines() if line.strip().startswith("#")}
+ 
+ 
+@@ -47,19 +47,19 @@ def test_disable_enable_round_trip(home, capsys):
+     from agent.credential_pool import load_pool
+ 
+     _run("disable", "acct0")
+-    assert "Disabled openrouter credential #1 (acct0)" in capsys.readouterr().out
++    assert "Disabled anthropic credential #1 (acct0)" in capsys.readouterr().out
+     cpd._cache.clear()
+     rows = _list(capsys)
+     assert "[disabled]" in rows["acct0"] and "[disabled]" not in rows["acct1"]
+-    assert load_pool("openrouter").select().id == "row1"
++    assert load_pool("anthropic").select().id == "row1"
+     stored = json.loads((home / "auth.json").read_text())
+-    assert stored["disabled_credentials"] == {"openrouter": [{"id": "row0", "label": "acct0"}]}
++    assert stored["disabled_credentials"] == {"anthropic": [{"id": "row0", "label": "acct0"}]}
+ 
+     _run("disable", "row0")
+     assert "(already disabled)" in capsys.readouterr().out
+ 
+     _run("enable", "1")
+-    assert "Enabled openrouter credential #1 (acct0)" in capsys.readouterr().out
++    assert "Enabled anthropic credential #1 (acct0)" in capsys.readouterr().out
+     cpd._cache.clear()
+     assert "[disabled]" not in _list(capsys)["acct0"]
+     assert "disabled_credentials" not in json.loads((home / "auth.json").read_text())
+@@ -73,7 +73,7 @@ def test_unknown_target_exits(home):
+ def test_enable_warns_when_root_disables(home, monkeypatch, tmp_path, capsys):
+     from agent import credential_pool_disabled as cpd
+     root = tmp_path / "root.json"
+-    root.write_text(json.dumps({"providers": {}, "disabled_credentials": {"openrouter": [{"id": "row0"}]}}))
++    root.write_text(json.dumps({"providers": {}, "disabled_credentials": {"anthropic": [{"id": "row0"}]}}))
+     monkeypatch.setattr(cpd, "_root_path", lambda: root)
+     _run("enable", "acct0", parse=False)
+     out = capsys.readouterr().out
+diff --git a/tools/delegate_tool_child_run.py b/tools/delegate_tool_child_run.py
+index acf9f61b129..0570090130e 100644
+--- a/tools/delegate_tool_child_run.py
++++ b/tools/delegate_tool_child_run.py
+@@ -518,8 +518,10 @@ def _lease_child_credential(child: Any) -> tuple[Any, Optional[str]]:
+                 leased_entry = next((e for e in child_pool.entries() if e.id == leased_cred_id), None)
+                 if not _entry_serves_endpoint(leased_entry, base_url):
+                     child_pool.release_lease(leased_cred_id)
++                    from agent.credential_pool_disabled import enabled_entries
+                     leased_entry = next(
+-                        (e for e in child_pool.entries() if e.last_status != "dead" and _entry_serves_endpoint(e, base_url)),
++                        (e for e in enabled_entries(child_pool.provider, child_pool.entries())
++                         if e.last_status != "dead" and _entry_serves_endpoint(e, base_url)),
+                         None,
+                     )
+                     leased_cred_id = child_pool.acquire_lease(leased_entry.id) if leased_entry is not None else None
+-- 
+2.55.0
+

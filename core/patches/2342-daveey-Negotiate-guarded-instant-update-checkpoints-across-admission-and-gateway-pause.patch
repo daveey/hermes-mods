@@ -1,0 +1,781 @@
+From 543e0051993382c17c17fc824df66afb8fa58b1b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:11:45 +0000
+Subject: [PATCH] [daveey] Negotiate guarded instant-update checkpoints across
+ admission and gateway pause
+
+---
+ gateway/run_bootstrap.py                      |   3 +
+ gateway/update_checkpoint.py                  | 124 ++++++++
+ hermes_cli/admission_fence.py                 |  20 +-
+ hermes_cli/update_cmd_posix_pause.py          |  60 +++-
+ tests/gateway/test_update_checkpoint.py       | 174 ++++++++++++
+ .../test_update_checkpoint_pause.py           | 267 ++++++++++++++++++
+ 6 files changed, 638 insertions(+), 10 deletions(-)
+ create mode 100644 gateway/update_checkpoint.py
+ create mode 100644 tests/gateway/test_update_checkpoint.py
+ create mode 100644 tests/hermes_cli/test_update_checkpoint_pause.py
+
+diff --git a/gateway/run_bootstrap.py b/gateway/run_bootstrap.py
+index 489e64a1580..beeb40fcf17 100644
+--- a/gateway/run_bootstrap.py
++++ b/gateway/run_bootstrap.py
+@@ -374,6 +374,7 @@ async def _start_gateway_start_control_socket(runner):
+         _main_loop = asyncio.get_running_loop()
+ 
+         from gateway.cron_pause import pause_for_update
++        from gateway.update_checkpoint import checkpoint_for_update, checkpoint_inventory
+ 
+         def _rescan_profiles_handler() -> dict:
+             """``hermes profile create/delete`` asks the multiplexer to reconcile ``profiles/`` now
+@@ -393,6 +394,8 @@ async def _start_gateway_start_control_socket(runner):
+         _control_server = GatewayControlServer(
+             verb_handlers={"pause-for-update": lambda: pause_for_update(runner, _main_loop),
+                            "pause-if-idle-for-update": lambda: pause_for_update(runner, _main_loop, idle_only=True),
++                           "checkpoint-for-update": lambda params: checkpoint_for_update(runner, _main_loop, params),
++                           "checkpoint-inventory": checkpoint_inventory,
+                            "identify": _identify_runtime,
+                            "rescan-profiles": _rescan_profiles_handler,
+                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
+diff --git a/gateway/update_checkpoint.py b/gateway/update_checkpoint.py
+new file mode 100644
+index 00000000000..b9bc3133bbe
+--- /dev/null
++++ b/gateway/update_checkpoint.py
+@@ -0,0 +1,124 @@
++"""Negotiated instant-update checkpoint for managed cards and explicitly cut cron runs.
++
++Ordinary idle pauses remain unchanged. Unknown reservations/work fail closed;
++this is not a forced-stop interface. The request binds to one live sync episode.
++"""
++from __future__ import annotations
++
++import json
++import os
++import threading
++import time
++from pathlib import Path
++
++from hermes_constants import get_default_hermes_root, get_hermes_home
++from hermes_cli import admission_fence
++from gateway.cron_pause import preserve_cron_slots
++from gateway.session_runtime_workers import kanban_managed_count
++from gateway.run_shutdown_restart_wait import CORE_UPDATE_KANBAN_WAIT_S, CORE_UPDATE_KANBAN_STOP_LEASH_S
++
++CHECKPOINT_PAUSE = True
++_REQUEST_WAIT_S = 5.0
++CHECKPOINT_DRAIN_S = CORE_UPDATE_KANBAN_WAIT_S + CORE_UPDATE_KANBAN_STOP_LEASH_S + 15.0
++
++
++def checkpoint_intent(home):
++    """Return the bounded, live unfenced episode, or None (never infer authority from an env flag)."""
++    try:
++        data = json.loads((Path(home) / "core-update/intent").read_text(encoding="utf-8"))
++        now = time.time()
++        if (not isinstance(data, dict) or data.get("kind") != "unfenced"
++                or data.get("checkpoint") is not True or type(data.get("pid")) is not int
++                or data["pid"] <= 0 or not isinstance(data.get("nonce"), str) or not data["nonce"]
++                or not 0 <= now - float(data["created_at"]) < 180
++                or not now < float(data["expires_at"]) <= float(data["created_at"]) + 180):
++            return None
++        os.kill(data["pid"], 0)
++        root = get_default_hermes_root(home=home)
++        if not admission_fence.is_held(Path(root) / "core-update"):
++            return None
++        return data
++    except (OSError, ValueError, TypeError, KeyError, OverflowError):
++        return None
++
++
++def known_cron_reservations():
++    """Exact published run reservations, never all files owned by the gateway PID.
++
++    A tick or another admission in this same process can still be unpublished.
++    Read outside the event-loop callback; cron registers under this lock.
++    """
++    from cron.scheduler import _running_lock, _running_job_ids, _running_reservations
++    if not _running_lock.acquire(timeout=0.1):
++        raise TimeoutError("cron reservation inventory busy")
++    try:
++        return {reservation.path.name for key, reservation in _running_reservations.items()
++                if key in _running_job_ids and reservation.fd is not None}
++    finally:
++        _running_lock.release()
++
++
++def checkpoint_inventory():
++    home = get_hermes_home().resolve()
++    root = get_default_hermes_root(home=home).resolve()
++    return {"version": 1, "pid": os.getpid(), "home": str(home), "root": str(root),
++            "reservation_ids": sorted(known_cron_reservations())}
++
++
++def checkpoint_for_update(runner, loop, params):
++    home = get_hermes_home()
++    root = get_default_hermes_root(home=home)
++    refused = {"pausing": False, "already_stopping": False, "busy": True, "pid": os.getpid()}
++    intent = checkpoint_intent(home)
++    if intent is None or params.get("nonce") != intent["nonce"]:
++        return refused
++    # No admission lock is held while reading cron's lock (cron uses the reverse order).
++    try:
++        known = known_cron_reservations() if intent.get("cron_cut") is True else set()
++    except (OSError, TimeoutError):
++        return refused
++    done = threading.Event()
++    result = []
++    deadline = time.monotonic() + _REQUEST_WAIT_S
++    gate = threading.Lock()
++    cancelled = False
++    claimed = False
++    pending = {"pausing": False, "already_stopping": True, "checkpoint": True,
++               "nonce": intent["nonce"], "pid": os.getpid(), "drain_timeout": CHECKPOINT_DRAIN_S}
++
++    def request():
++        nonlocal claimed
++        try:
++            if time.monotonic() >= deadline or checkpoint_intent(home) != intent:
++                return
++            # No waiting on the event loop. A lock race or an unpublished reservation retries.
++            state = admission_fence.state(root, details=True, timeout=0)
++            if not state["held"] or not set(state["reservation_ids"]).issubset(known):
++                return
++            from gateway.run_active_work_verb import _delegation_units
++            cron = runner._active_cron_job_count() if intent.get("cron_cut") is True else 0
++            if (_delegation_units(time.time())
++                    or runner._active_work_count() != kanban_managed_count(runner) + cron):
++                return
++            preserve_cron_slots(runner.config)
++            # Atomically claim permission versus the handler's timeout. Never hold
++            # this lock across runner code: even a claimed request must return bounded.
++            with gate:
++                if cancelled or time.monotonic() >= deadline:
++                    return
++                claimed = True
++            accepted = runner.request_restart(detached=False, via_service=True)
++            result.append({"pausing": bool(accepted), "already_stopping": not accepted,
++                           "checkpoint": True, "nonce": intent["nonce"], "pid": os.getpid(), "drain_timeout": CHECKPOINT_DRAIN_S})
++        except (OSError, TimeoutError, ValueError, TypeError, KeyError):
++            return
++        finally:
++            done.set()
++
++    loop.call_soon_threadsafe(request)
++    done.wait(timeout=_REQUEST_WAIT_S)
++    with gate:
++        cancelled = True
++        # Claimed-but-incomplete is unknown, not refusal: the updater must settle
++        # the recorded identity, never assume an ACK authorizes tree mutation.
++        return result[0] if result else (pending if claimed else refused)
+diff --git a/hermes_cli/admission_fence.py b/hermes_cli/admission_fence.py
+index 68c16b1a5c8..b1e386fefa0 100644
+--- a/hermes_cli/admission_fence.py
++++ b/hermes_cli/admission_fence.py
+@@ -195,10 +195,11 @@ def extend(home, *, timeout=0.05):
+             raise
+ 
+ 
+-def _state_locked(root):
++def _state_locked(root, *, details=False):
+     import fcntl
+ 
+     count = 0
++    reservation_ids = []
+     directory = root / "reservations"
+     try:
+         paths = list(directory.iterdir())
+@@ -216,16 +217,20 @@ def _state_locked(root):
+                 if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                     raise
+                 count += 1
++                reservation_ids.append(path.name)
+             else:
+                 path.unlink(missing_ok=True)  # crashed owner; no age/PID heuristic
+         finally:
+             os.close(fd)
+-    return {"version": 1, "held": is_held(root), "reservations": count}
++    result = {"version": 1, "held": is_held(root), "reservations": count}
++    if details:
++        result["reservation_ids"] = sorted(reservation_ids)
++    return result
+ 
+ 
+-def state(home):
+-    with admission_lock(home) as root:
+-        return _state_locked(root)
++def state(home, *, details=False, timeout=10.0):
++    with admission_lock(home, timeout=timeout) as root:
++        return _state_locked(root, details=details)
+ 
+ 
+ def set_hold(home):
+@@ -295,7 +300,7 @@ def main():
+     import argparse
+ 
+     parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("action", choices=("capability", "state", "hold", "release"))
++    parser.add_argument("action", choices=("capability", "state", "state-details", "hold", "release"))
+     parser.add_argument("--home", type=Path)
+     args = parser.parse_args()
+     if args.action == "capability":
+@@ -303,7 +308,8 @@ def main():
+     else:
+         if args.home is None:
+             parser.error("--home must name the explicit installation root")
+-        result = {"state": state, "hold": set_hold, "release": clear_hold}[args.action](args.home)
++        result = (state(args.home, details=True) if args.action == "state-details" else
++                  {"state": state, "hold": set_hold, "release": clear_hold}[args.action](args.home))
+     print(json.dumps(result))
+ 
+ 
+diff --git a/hermes_cli/update_cmd_posix_pause.py b/hermes_cli/update_cmd_posix_pause.py
+index 4dd4d641891..18cafd9d19d 100644
+--- a/hermes_cli/update_cmd_posix_pause.py
++++ b/hermes_cli/update_cmd_posix_pause.py
+@@ -60,6 +60,10 @@ _READY_TIMEOUT_S = 30.0
+ # approval the draining turn needs. A pre-swap wait must yield, not spend the
+ # post-restart after-turn budget behind that fence.
+ _PRE_SWAP_DRAIN_WAIT_S = 30.0
++# Guarded checkpoint requests may already be claimed when their reply is lost.
++# Both acknowledged drains and unknown-outcome settlement are bounded at 70s;
++# settlement alone never authorizes mutation.
++_CHECKPOINT_DRAIN_WAIT_S = 70.0
+ 
+ 
+ class PauseRefused(RuntimeError):
+@@ -432,6 +436,29 @@ def _wait_gone(pids, timeout: float, born: dict | None = None) -> set[int]:
+     return live
+ 
+ 
++def _checkpoint_nonce(entry: dict) -> str | None:
++    """The nonce of a valid, live explicit instant-update intent for this gateway's home, else
++    ``None`` (never inferred from an environment flag; any doubt keeps the idle-only contract)."""
++    if not entry.get("home"):
++        return None
++    try:
++        from gateway.update_checkpoint import checkpoint_intent
++        intent = checkpoint_intent(Path(entry["home"]))
++    except Exception:  # health: allow BLE001 -- no provable intent means idle-only
++        return None
++    nonce = intent.get("nonce") if isinstance(intent, dict) else None
++    return nonce if isinstance(nonce, str) and nonce else None
++
++
++def _valid_checkpoint_ack(ack: dict, entry: dict, nonce: str) -> bool:
++    """A checkpoint ACK is believed only when it is from the gateway we asked (pid), for this
++    episode (required nonce echo), names the checkpoint, and states a sane bounded drain."""
++    drain = ack.get("drain_timeout")
++    return (ack.get("checkpoint") is True and type(ack.get("pid")) is int and ack["pid"] == entry.get("pid")
++            and ack.get("nonce") == nonce
++            and isinstance(drain, (int, float)) and not isinstance(drain, bool) and 0 < drain)
++
++
+ def _ask_to_drain(entry: dict) -> bool | None:
+     """Ask the gateway to exit only if idle; True on its ACK. Busy/old gateways refuse rather
+     than starting an uncancellable pre-swap drain. SIGTERM,
+@@ -439,12 +466,36 @@ def _ask_to_drain(entry: dict) -> bool | None:
+     planned-stop marker on this path: the gateway's marker watcher takes that same immediate
+     signal-stop path, and could fire before the request lands. The caller records the request
+     (``mark_stop_sent``) BEFORE sending it, so a request that reaches the gateway after this update
+-    died still leaves the evidence that keeps the drained gateway's restart debt."""
+-    from gateway.control_socket import pause_gateway_for_update
++    died still leaves the evidence that keeps the drained gateway's restart debt.
++
++    With an explicit live instant-update intent (``checkpoint_intent``) the request is the guarded
++    ``checkpoint-for-update`` carrying its nonce: the gateway itself refuses unknown reservations
++    or work. Only a validated checkpoint ACK sets ``entry['checkpoint_drain_timeout']``, which
++    ``_stop_gateways`` turns into the longer wait. There is no forced-stop fallback."""
++    from gateway.control_socket import pause_gateway_for_update, query_gateway_control
+     if not entry.get("home"):
+         return False  # no request was sent
++    entry.pop("checkpoint_drain_timeout", None)
++    entry.pop("checkpoint_settle_timeout", None)
++    nonce = _checkpoint_nonce(entry)
+     try:
+-        ack = pause_gateway_for_update(Path(entry["home"]), idle_only=True)
++        if nonce is not None:
++            # A lost reply does not revoke a request already claimed by the loop.
++            # This extends settlement only, never authorizes a checkout move.
++            entry["checkpoint_settle_timeout"] = _CHECKPOINT_DRAIN_WAIT_S
++            ack = query_gateway_control(Path(entry["home"]), "checkpoint-for-update",
++                                        params={"nonce": nonce}, timeout=8.0, report_unsupported=True)
++            if ack and ack.get("unsupported"):  # old gateway: the stricter idle-only request still applies
++                entry.pop("checkpoint_settle_timeout", None)
++                ack = pause_gateway_for_update(Path(entry["home"]), idle_only=True)
++            elif ack and (ack.get("pausing") or ack.get("already_stopping")):
++                if not _valid_checkpoint_ack(ack, entry, nonce):
++                    return None  # unbelievable ACK: may be exiting; settle it, never extend the wait
++                if ack.get("pausing"):
++                    entry["checkpoint_drain_timeout"] = float(ack["drain_timeout"])
++                return True
++        else:
++            ack = pause_gateway_for_update(Path(entry["home"]), idle_only=True)
+     except Exception:  # health: allow BLE001 -- unknown/busy gateways must not authorize a tree mutation
+         return None
+     if ack and (ack.get("pausing") or ack.get("already_stopping")):
+@@ -502,6 +553,9 @@ def _stop_gateways(token: dict, entries: list[dict]) -> None:
+         if refusals:
+             raise PauseRefused("; ".join(refusals), refused)
+         return
++    if acked := [e.get("checkpoint_drain_timeout") or e.get("checkpoint_settle_timeout")
++                 for e in waiting if e.get("checkpoint_drain_timeout") or e.get("checkpoint_settle_timeout")]:
++        budget = max(budget, min(max(acked), _CHECKPOINT_DRAIN_WAIT_S))
+     print(f"  ⏳ Waiting up to {budget:.0f}s for paused gateways {_names(waiting)} to exit before the update...")
+     ticks = [drain_progress_reporter(Path(e["home"]) if e.get("home") else None, budget_s=budget) for e in waiting]
+     deadline = time.monotonic() + budget
+diff --git a/tests/gateway/test_update_checkpoint.py b/tests/gateway/test_update_checkpoint.py
+new file mode 100644
+index 00000000000..698e10a902c
+--- /dev/null
++++ b/tests/gateway/test_update_checkpoint.py
+@@ -0,0 +1,174 @@
++"""Instant updates negotiate a bounded checkpoint, never waive unknown admission."""
++import json
++import os
++import time
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import admission_fence
++
++
++@pytest.fixture
++def checkpoint(tmp_path, monkeypatch):
++    from gateway import update_checkpoint as checkpoint
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(checkpoint, "get_hermes_home", lambda: home)
++    monkeypatch.setattr(checkpoint, "get_default_hermes_root", lambda **kw: home)
++    monkeypatch.setattr(checkpoint, "known_cron_reservations", lambda: set())
++    monkeypatch.setattr(checkpoint, "kanban_managed_count", lambda runner: 1)
++    monkeypatch.setattr(checkpoint, "preserve_cron_slots", Mock())
++    runner = SimpleNamespace(
++        config=object(), request_restart=Mock(return_value=True),
++        _active_work_count=lambda: 1,
++        _active_cron_job_count=lambda: 0,
++    )
++    admission_fence.set_hold(home)
++    intent = {"pid": os.getpid(), "kind": "unfenced", "checkpoint": True,
++              "cron_cut": True, "created_at": time.time(), "expires_at": time.time() + 120,
++              "nonce": "episode-one"}
++    (home / "core-update/intent").write_text(json.dumps(intent))
++    return checkpoint, home, runner, intent
++
++
++def invoke(checkpoint, runner, nonce="episode-one", before=None):
++    def schedule(callback):
++        if before:
++            before()
++        callback()
++    return checkpoint.checkpoint_for_update(
++        runner, SimpleNamespace(call_soon_threadsafe=schedule), {"nonce": nonce})
++
++
++def test_known_managed_work_uses_existing_restart_checkpoint(checkpoint):
++    module, _home, runner, _intent = checkpoint
++    result = invoke(module, runner)
++    assert result["pausing"] and result["checkpoint"]
++    assert result["drain_timeout"] >= 60
++    runner.request_restart.assert_called_once_with(detached=False, via_service=True)
++
++
++@pytest.mark.parametrize("change", ["no-hold", "expired", "dead-owner", "wrong-kind", "no-checkpoint", "nonce"])
++def test_invalid_episode_never_starts_restart(checkpoint, change):
++    module, home, runner, intent = checkpoint
++    if change == "no-hold":
++        admission_fence.clear_hold(home)
++    elif change == "expired":
++        intent["expires_at"] = time.time() - 1
++    elif change == "dead-owner":
++        intent["pid"] = -1
++    elif change == "wrong-kind":
++        intent["kind"] = "fenced"
++    elif change == "no-checkpoint":
++        intent["checkpoint"] = False
++    (home / "core-update/intent").write_text(json.dumps(intent))
++    result = invoke(module, runner, nonce="wrong" if change == "nonce" else "episode-one")
++    assert not result["pausing"]
++    runner.request_restart.assert_not_called()
++
++
++def test_unpublished_reservation_is_not_covered_by_known_cron(checkpoint, monkeypatch):
++    module, home, runner, _intent = checkpoint
++    known = admission_fence.extend(home)
++    unknown = admission_fence.extend(home)
++    monkeypatch.setattr(module, "known_cron_reservations", lambda: {known.path.name})
++    try:
++        result = invoke(module, runner)
++        assert not result["pausing"]
++        runner.request_restart.assert_not_called()
++    finally:
++        known.close()
++        unknown.close()
++
++
++def test_known_cron_reservation_can_cross_only_cut_authorized_episode(checkpoint, monkeypatch):
++    module, home, runner, intent = checkpoint
++    known = admission_fence.extend(home)
++    monkeypatch.setattr(module, "known_cron_reservations", lambda: {known.path.name})
++    runner._active_work_count = lambda: 2
++    runner._active_cron_job_count = lambda: 1
++    try:
++        assert invoke(module, runner)["pausing"]
++        runner.request_restart.reset_mock()
++        intent["cron_cut"] = False
++        (home / "core-update/intent").write_text(json.dumps(intent))
++        assert not invoke(module, runner)["pausing"]
++        runner.request_restart.assert_not_called()
++    finally:
++        known.close()
++
++
++def test_unknown_work_in_callback_is_not_tolerated(checkpoint):
++    module, _home, runner, _intent = checkpoint
++    def racing_work():
++        runner._active_work_count = lambda: 2
++    assert not invoke(module, runner, before=racing_work)["pausing"]
++    runner.request_restart.assert_not_called()
++
++
++def test_reservation_added_before_callback_is_rechecked(checkpoint):
++    module, home, runner, _intent = checkpoint
++    reservations = []
++    try:
++        result = invoke(module, runner, before=lambda: reservations.append(admission_fence.extend(home)))
++        assert not result["pausing"]
++        runner.request_restart.assert_not_called()
++    finally:
++        for reservation in reservations:
++            reservation.close()
++
++
++@pytest.mark.parametrize("stage", ["preserve", "restart"])
++def test_timeout_cancels_unclaimed_but_settles_claimed_callback(checkpoint, monkeypatch, stage):
++    import threading
++    module, _home, runner, intent = checkpoint
++    entered, release = threading.Event(), threading.Event()
++    threads = []
++    def blocked(*args, **kwargs):
++        entered.set()
++        assert release.wait(3)
++        return True
++    monkeypatch.setattr(module, "_REQUEST_WAIT_S", 0.1)
++    if stage == "preserve":
++        monkeypatch.setattr(module, "preserve_cron_slots", blocked)
++    else:
++        runner.request_restart.side_effect = blocked
++    def schedule(callback):
++        thread = threading.Thread(target=callback)
++        threads.append(thread)
++        thread.start()
++        assert entered.wait(3)
++    try:
++        result = module.checkpoint_for_update(runner, SimpleNamespace(call_soon_threadsafe=schedule),
++                                              {"nonce": intent["nonce"]})
++        assert threads[0].is_alive()  # handler did not wait for a claimed callback
++        if stage == "preserve":
++            assert result["busy"] and not result["already_stopping"]
++        else:
++            assert result["already_stopping"] and result["drain_timeout"] == 70
++    finally:
++        release.set()
++        for thread in threads:
++            thread.join(3)
++            assert not thread.is_alive()
++    if stage == "preserve":
++        runner.request_restart.assert_not_called()
++
++
++def test_cron_inventory_lock_acquisition_is_bounded(monkeypatch):
++    import threading
++    from cron import scheduler
++    from gateway.update_checkpoint import known_cron_reservations
++    lock = threading.Lock()
++    monkeypatch.setattr(scheduler, "_running_lock", lock)
++    lock.acquire()
++    try:
++        with pytest.raises(TimeoutError):
++            known_cron_reservations()
++    finally:
++        lock.release()
++    assert known_cron_reservations() == set()
++
+diff --git a/tests/hermes_cli/test_update_checkpoint_pause.py b/tests/hermes_cli/test_update_checkpoint_pause.py
+new file mode 100644
+index 00000000000..53659a40f49
+--- /dev/null
++++ b/tests/hermes_cli/test_update_checkpoint_pause.py
+@@ -0,0 +1,267 @@
++"""The updater negotiates the guarded instant-update checkpoint only for an explicit live intent.
++
++The gateway side is real: a ``GatewayControlServer`` on a real Unix socket serving the actual
++``gateway.update_checkpoint`` handlers, real admission flocks and the real cron reservation
++registry. Only the runner (the gateway's session bookkeeping) is a stub.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import time
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from gateway import update_checkpoint as checkpoint
++from gateway.control_socket import GatewayControlServer
++from hermes_cli import admission_fence
++from hermes_cli import update_cmd_posix_pause as pause
++from hermes_cli import update_pause_record as record
++
++pytestmark = pytest.mark.platforms("posix")
++
++NONCE = "episode-one"
++
++
++@pytest.fixture
++def episode(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(checkpoint, "preserve_cron_slots", Mock())
++    monkeypatch.setattr(checkpoint, "kanban_managed_count", lambda runner: runner.managed)
++    runner = SimpleNamespace(
++        config=object(), managed=1, active=1, cron=0,
++        request_restart=Mock(return_value=True),
++        _active_work_count=lambda: runner.active,
++        _active_cron_job_count=lambda: runner.cron,
++    )
++    monkeypatch.setattr("gateway.run_active_work_verb._delegation_units", lambda now: [])
++    return SimpleNamespace(home=home, runner=runner, held=[])
++
++
++def write_intent(home, **over):
++    now = time.time()
++    intent = {"pid": os.getpid(), "kind": "unfenced", "checkpoint": True, "cron_cut": True,
++              "created_at": now, "expires_at": now + 120, "nonce": NONCE, **over}
++    (home / "core-update").mkdir(exist_ok=True)
++    (home / "core-update/intent").write_text(json.dumps(intent))
++    return intent
++
++
++def hold(episode):
++    admission_fence.set_hold(episode.home)
++
++
++def reservation(episode, *, cron):
++    """A real, flock-held reservation; ``cron`` registers it as a published cron run."""
++    reservation = admission_fence.extend(episode.home)
++    episode.held.append(reservation)
++    if cron:
++        from cron.scheduler import _running_job_ids, _running_lock, _running_reservations
++        key = (str(episode.home), f"job-{len(episode.held)}")
++        with _running_lock:
++            _running_reservations[key] = reservation
++            _running_job_ids.add(key)
++    return reservation
++
++
++@pytest.fixture(autouse=True)
++def release(episode):
++    yield
++    from cron.scheduler import _running_job_ids, _running_lock, _running_reservations
++    with _running_lock:
++        for key in [k for k in _running_reservations if k[0] == str(episode.home)]:
++            _running_reservations.pop(key)
++            _running_job_ids.discard(key)
++    for item in episode.held:
++        item.close()
++
++
++def ask(episode, *, checkpoint_verb=True, pid=None, entry_extra=None):
++    """Run the real updater call against a real gateway control socket; return (result, entry, idle_calls)."""
++    idle = []
++    entry = {"pid": pid or os.getpid(), "home": str(episode.home), "kind": "systemd",
++             "unit": "hermes-gateway-test.service", **(entry_extra or {})}
++
++    async def scenario():
++        loop = asyncio.get_running_loop()
++        handlers = {"pause-if-idle-for-update": lambda: idle.append(1) or {"busy": True}}
++        if checkpoint_verb:
++            handlers["checkpoint-for-update"] = lambda params: checkpoint.checkpoint_for_update(
++                episode.runner, loop, params)
++        server = GatewayControlServer(episode.home, verb_handlers=handlers)
++        assert await server.start()
++        try:
++            return await loop.run_in_executor(None, pause._ask_to_drain, entry)
++        finally:
++            await server.stop()
++
++    return asyncio.run(scenario()), entry, idle
++
++
++def test_explicit_intent_negotiates_the_checkpoint_for_known_managed_work(episode):
++    write_intent(episode.home)
++    hold(episode)
++    result, entry, idle = ask(episode)
++    assert result is True and idle == []
++    assert entry["checkpoint_drain_timeout"] == checkpoint.CHECKPOINT_DRAIN_S == 70.0
++    episode.runner.request_restart.assert_called_once_with(detached=False, via_service=True)
++
++
++def test_exactly_known_cron_reservation_is_accepted(episode):
++    write_intent(episode.home)
++    reservation(episode, cron=True)
++    hold(episode)
++    episode.runner.active, episode.runner.cron = 2, 1
++    result, entry, _ = ask(episode)
++    assert result is True and entry["checkpoint_drain_timeout"] == 70.0
++
++
++def test_unknown_reservation_or_work_is_refused_without_a_stop(episode):
++    write_intent(episode.home)
++    reservation(episode, cron=False)  # a held flock the gateway never published
++    hold(episode)
++    result, entry, idle = ask(episode)
++    assert result is False and "checkpoint_drain_timeout" not in entry and idle == []
++    episode.runner.request_restart.assert_not_called()
++
++
++def test_unknown_active_work_is_refused(episode):
++    write_intent(episode.home)
++    hold(episode)
++    episode.runner.active = 2  # one managed card + one unaccounted turn
++    result, entry, _ = ask(episode)
++    assert result is False and "checkpoint_drain_timeout" not in entry
++    episode.runner.request_restart.assert_not_called()
++
++
++@pytest.mark.parametrize("change", ["no-hold", "expired", "not-checkpoint", "wrong-kind", "dead-owner", "no-intent"])
++def test_without_a_valid_explicit_intent_only_the_idle_verb_is_used(episode, change):
++    if change != "no-intent":
++        over = {"expired": {"expires_at": time.time() - 1}, "not-checkpoint": {"checkpoint": False},
++                "wrong-kind": {"kind": "fenced"}, "dead-owner": {"pid": 2 ** 22 + 12345}}.get(change, {})
++        write_intent(episode.home, **over)
++    if change != "no-hold":
++        hold(episode)
++    result, entry, idle = ask(episode)
++    assert result is False and idle == [1]  # the idle-only refusal answered; checkpoint never asked
++    assert "checkpoint_drain_timeout" not in entry
++    episode.runner.request_restart.assert_not_called()
++
++
++def test_stale_nonce_is_refused_by_the_gateway_not_downgraded(episode, monkeypatch):
++    write_intent(episode.home)
++    hold(episode)
++    monkeypatch.setattr(pause, "_checkpoint_nonce", lambda entry: "other-episode")
++    result, entry, idle = ask(episode)
++    assert result is False and idle == [] and "checkpoint_drain_timeout" not in entry
++    episode.runner.request_restart.assert_not_called()
++
++
++def test_gateway_without_the_checkpoint_verb_gets_only_the_stricter_idle_request(episode):
++    write_intent(episode.home)
++    hold(episode)
++    result, entry, idle = ask(episode, checkpoint_verb=False)
++    assert result is False and idle == [1]
++    assert "checkpoint_drain_timeout" not in entry
++
++
++@pytest.mark.parametrize("ack", [
++    {"pausing": True, "checkpoint": True, "pid": 1, "drain_timeout": 70.0},          # another process
++    {"pausing": True, "checkpoint": True, "pid": os.getpid(), "drain_timeout": 70.0, "nonce": "x"},
++    {"pausing": True, "pid": os.getpid(), "drain_timeout": 70.0},                      # not a checkpoint
++    {"pausing": True, "checkpoint": True, "pid": os.getpid()},                         # no bound
++    {"pausing": True, "checkpoint": True, "pid": os.getpid(), "drain_timeout": True},
++    {"pausing": True, "checkpoint": True, "pid": os.getpid(), "drain_timeout": -5},
++])
++def test_unbelievable_ack_never_extends_the_wait(episode, monkeypatch, ack):
++    write_intent(episode.home)
++    hold(episode)
++    from gateway import control_socket
++    monkeypatch.setattr(control_socket, "query_gateway_control", lambda *a, **k: dict(ack))
++    entry = {"pid": os.getpid(), "home": str(episode.home)}
++    assert pause._ask_to_drain(entry) is None  # may be exiting: settled, never trusted
++    assert "checkpoint_drain_timeout" not in entry
++
++
++def test_echoed_nonce_is_accepted(episode, monkeypatch):
++    write_intent(episode.home)
++    hold(episode)
++    from gateway import control_socket
++    ack = {"pausing": True, "checkpoint": True, "pid": os.getpid(), "drain_timeout": 70.0, "nonce": NONCE}
++    monkeypatch.setattr(control_socket, "query_gateway_control", lambda *a, **k: dict(ack))
++    entry = {"pid": os.getpid(), "home": str(episode.home)}
++    assert pause._ask_to_drain(entry) is True and entry["checkpoint_drain_timeout"] == 70.0
++
++
++# ---- the wait budget -------------------------------------------------------------------
++
++def run_stop(monkeypatch, entry, drain):
++    now = [0.0]
++    monkeypatch.setattr(pause, "time", SimpleNamespace(
++        monotonic=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s)))
++    monkeypatch.setattr(pause, "_drain_budget", lambda: 1885.0)
++    monkeypatch.setattr(pause, "_alive", lambda *a: True)
++    monkeypatch.setattr(record, "mark_stop_sent", lambda *a: None)
++    monkeypatch.setattr(pause, "_ask_to_drain", lambda e: e.update(drain) or True)
++    stop = Mock()
++    monkeypatch.setattr(pause, "_stop_at_once", stop)
++    with pytest.raises(pause.PauseRefused, match="still draining"):
++        pause._stop_gateways({}, [entry])
++    stop.assert_not_called()  # never forced
++    return now[0]
++
++
++def entry():
++    return {"pid": 4242, "kind": "systemd", "unit": "hermes-gateway-test.service"}
++
++
++def test_default_budget_stays_thirty_seconds(monkeypatch):
++    assert 30.0 <= run_stop(monkeypatch, entry(), {}) <= 31.0
++
++
++def test_acknowledged_checkpoint_waits_seventy_seconds(monkeypatch):
++    elapsed = run_stop(monkeypatch, entry(), {"checkpoint_drain_timeout": 70.0})
++    assert 70.0 <= elapsed <= 71.0
++
++
++def test_checkpoint_budget_is_capped_at_seventy(monkeypatch):
++    assert run_stop(monkeypatch, entry(), {"checkpoint_drain_timeout": 5000.0}) <= 71.0
++
++
++def test_short_checkpoint_budget_never_goes_below_default(monkeypatch):
++    assert 30.0 <= run_stop(monkeypatch, entry(), {"checkpoint_drain_timeout": 10.0}) <= 31.0
++
++
++@pytest.mark.parametrize("gone", [False, True])
++def test_lost_checkpoint_ack_settles_seventy_seconds_without_authorizing_mutation(episode, monkeypatch, gone):
++    write_intent(episode.home)
++    hold(episode)
++    from gateway import control_socket
++    monkeypatch.setattr(control_socket, "query_gateway_control", Mock(side_effect=TimeoutError))
++    item = {"pid": os.getpid(), "home": str(episode.home)}
++    now = [0.0]
++    monkeypatch.setattr(pause, "time", SimpleNamespace(
++        monotonic=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s)))
++    monkeypatch.setattr(pause, "_alive", lambda *a: not (gone and now[0] >= 40))
++    monkeypatch.setattr(pause, "_drain_budget", lambda: 1885)
++    monkeypatch.setattr(record, "mark_stop_sent", Mock())
++    disarm = Mock()
++    monkeypatch.setattr(pause, "_disarm", disarm)
++    monkeypatch.setattr(pause, "_stop_at_once", Mock(side_effect=AssertionError("forced stop")))
++    with pytest.raises(pause.PauseRefused):
++        pause._stop_gateways({}, [item])
++    assert item["checkpoint_settle_timeout"] == 70
++    assert "checkpoint_drain_timeout" not in item
++    if gone:
++        assert 40 <= now[0] < 41
++        disarm.assert_called_once_with(item)
++    else:
++        assert 70 <= now[0] < 71
++        disarm.assert_not_called()
++
+-- 
+2.55.0
+

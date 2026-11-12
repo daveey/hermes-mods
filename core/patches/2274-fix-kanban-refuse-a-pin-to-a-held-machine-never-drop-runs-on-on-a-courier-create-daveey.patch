@@ -1,0 +1,414 @@
+From 35132c911aaa1982eafbb22b7416faeae9d339ea Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 05:44:31 +0000
+Subject: [PATCH] fix(kanban): refuse a pin to a held machine; never drop
+ runs_on on a courier create [daveey]
+
+Two ways a machine pin was accepted and then not honoured (card t_01a1c8e051c4b598, 2026-11-11).
+
+1. Held machine. worker-1 was on Board hold from 02:17 to 05:19 UTC for an AZ migration. At 03:42 a MacBook
+   kanban_create(placement="worker-1") returned ok with runs_on=[machine:worker-1]. A held machine's pickup
+   imports nothing (eligible() -> "held") and the Board refuses its leases, so the card sat ready 48 min while the
+   origin read "waiting for worker-1 ... queued, not stuck". placement_runs_on() and check_machine_pins() checked
+   state and pickup, never hold.
+   - check_machine_pins refuses a held machine (placement_unavailable, rejection machine_held, naming the unheld
+     machines that pick up). The placement= path now runs the same check (kanban_sync_runstate.placement_runs_on),
+     so tool placement=, tool runs_on= and `hermes kanban create --runs-on` all refuse (kanban move already
+     refused a held target as no_machine).
+   - A card already waiting when the hold lands: the queue place carries `held`, and the card read says ON HOLD
+     and how to re-place it instead of "queued, not stuck".
+
+2. runs_on on a courier create. kanban_create(placement="hub", runs_on=["machine:worker-1"]) created the card on
+   the hub with runs_on NULL: hermes-hub create-task has no runs_on option, and runs_on was in neither
+   CARRIED_OPTIONS nor UNCARRIED_OPTIONS. It is now uncarried: with a pin to another gateway the create is
+   refused; without one the card stays on its board, where the Board lease reads the labels. An explicit []
+   counts too.
+
+Tests fail on main before this change (10) and pass after: test_kanban_held_machine_pin.py,
+test_kanban_placement_runs_on.py, two new cases in test_kanban_placement.py.
+
+test_every_create_parameter_is_classified_for_the_courier guards the cause of 2: a kanban_create parameter in
+neither option list (nor the reviewed handled-elsewhere set) fails the test instead of being dropped.
+---
+ hermes_cli/kanban_placement.py                |   8 +-
+ hermes_cli/kanban_queue_position.py           |  13 +-
+ hermes_cli/kanban_sync_runstate.py            |  11 +-
+ hermes_cli/kanban_worker_node.py              |  36 +++++-
+ .../test_kanban_held_machine_pin.py           | 121 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_placement.py     |   3 +
+ .../test_kanban_placement_runs_on.py          |  65 ++++++++++
+ 7 files changed, 250 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_held_machine_pin.py
+ create mode 100644 tests/hermes_cli/test_kanban_placement_runs_on.py
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index f7c7db6597f..55be6278360 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -153,7 +153,11 @@ TARGET_HOST_MARKERS = (r"\bhermes-hub\b", r"\bon the hub\b", r"\bthe hub's\b")
+ UNKNOWN_GATEWAY = "no gateway is named"
+ # kanban_create options hermes-hub create-task cannot carry: a card using them stays local.
+ UNCARRIED_OPTIONS = ("initial_status", "human_request", "workspace_path", "project", "project_id", "tenant",
+-                     "max_retries")  # hermes-hub create-task has no retry breaker option [daveey]
++                     "max_retries",  # hermes-hub create-task has no retry breaker option [daveey]
++                     # nor machine labels: before this a courier create dropped them and the card ran on the
++                     # target's own queue (11-11: placement="hub", runs_on=[machine:worker-1]). The labels work
++                     # from the creating board (Board lease), so such a card stays here; with a pin it is refused.
++                     "runs_on")
+ # kanban_create options a hermes-hub client with `create-task --option KEY=JSON` carries to the card.
+ # (hermes-hub also allows reasoning_effort, but kanban_create has no such parameter.)
+ CARRIED_OPTIONS = ("skills", "max_runtime_seconds", "priority", "model", "provider", "goal_mode",
+@@ -620,6 +624,8 @@ def _uncarried(args: dict, c: _Cfg, carries: Optional[bool]) -> list[str]:
+     """The options of ``args`` hermes-hub cannot carry. ``carries`` None probes the client, only
+     when an option an older client lacks is actually used."""
+     used = [k for k in UNCARRIED_OPTIONS if args.get(k) not in (None, "", False, [])]
++    if args.get("runs_on") is not None and "runs_on" not in used:
++        used.append("runs_on")  # an explicit [] ("any machine") is a placement too: never dropped
+     legacy = [k for k in LEGACY_UNCARRIED if args.get(k) not in (None, "", False, [])]
+     if (args.get("completion_contract") or "local-only") != "local-only":
+         legacy.append("completion_contract")
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index a5fab4585e8..d46c3fc4565 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -87,7 +87,11 @@ def placement(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]
+         return None
+     fits = sorted(name for name, have in carried.items() if wanted <= have)
+     if fits:
+-        return {"lane": "machine", "runs_on": labels, "machines": fits}
++        place: dict[str, Any] = {"lane": "machine", "runs_on": labels, "machines": fits}
++        held = [name for name in fits if (machines.get(name) or {}).get("hold")]
++        if held:  # a held machine imports and leases nothing: the wait has no end until an operator releases it
++            place["held"] = held
++        return place
+     every = set().union(*carried.values())
+     return {"lane": "unplaceable", "runs_on": labels, "missing": [lb for lb in labels if lb not in every],
+             "machines": sorted(machines)}
+@@ -139,6 +143,13 @@ def describe(place: Optional[dict[str, Any]]) -> Optional[str]:
+                 else "no machine carries all of " + ", ".join(place.get("runs_on") or []))
+         return (f"unplaceable: no machine can run it ({what}; known: {', '.join(place.get('machines') or [])}). "
+                 "Re-place it (`hermes kanban move <id> --runs-on <label> --reason ...`); waiting will not start it")
++    if lane == "machine" and place.get("held") and set(place["held"]) >= set(place.get("machines") or []):
++        held = ", ".join(place["held"])
++        return (f"waiting for {held} (runs_on {', '.join(place.get('runs_on') or [])}), which is ON HOLD in the "
++                "Board registry: it claims no cards until an operator releases the hold (`hermes-mail admin "
++                f"machine-audit {place['held'][0]}` shows who set it and when). Not started by waiting: re-place it "
++                "(`hermes kanban move <id> --runs-on <label> --reason ...`) or wait for the release; do not clear "
++                "a hold to start a card")
+     if lane == "machine":
+         return (f"waiting for {', '.join(place.get('machines') or [])} (runs_on "
+                 f"{', '.join(place.get('runs_on') or [])}); this machine cannot lease it. " + _NOT_STUCK)
+diff --git a/hermes_cli/kanban_sync_runstate.py b/hermes_cli/kanban_sync_runstate.py
+index 75d14e65843..e3b3acb74eb 100644
+--- a/hermes_cli/kanban_sync_runstate.py
++++ b/hermes_cli/kanban_sync_runstate.py
+@@ -103,11 +103,18 @@ def describe(record: Optional[dict[str, Any]] = None) -> str:
+ 
+ def placement_runs_on(conn: Any, placement: Any) -> Optional[list[str]]:
+     """``kanban_worker_node.placement_runs_on``, except None while sync is down: a machine pin then takes the
+-    gateway route (the placement relay) instead of a local ``runs_on`` row nothing can push. [daveey]"""
++    gateway route (the placement relay) instead of a local ``runs_on`` row nothing can push. [daveey]
++
++    Raises ``MachinePinRefused`` (``placement_unavailable``) when the machine is on Board ``hold``: it imports
++    nothing while held (11-11: a ``placement="worker-1"`` create returned ok during a migration hold and the card
++    sat unclaimed 48 min). Not checked while sync is down: the gateway route is unchanged there."""
+     if down():
+         return None
+     from hermes_cli import kanban_worker_node as wn
+-    return wn.placement_runs_on(conn, placement)
++    labels = wn.placement_runs_on(conn, placement)
++    if labels is not None:
++        wn.check_machine_pins(conn, labels)
++    return labels
+ 
+ 
+ def explicit_runs_on(conn: Any, value: Any, *, courier: bool = False) -> Optional[list[str]]:
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index a649e64c6c3..6a18aac7b2f 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -90,12 +90,28 @@ class MachinePinRefused(Exception):  # not ValueError: label-syntax handlers mus
+ 
+     Such a card sits ``ready`` forever: only that machine may lease it, and it never looks (10-28: three hub cards
+     with ``runs_on=[machine:macbook]`` were never claimed). Nothing was written; the working route is a
+-    cross-gateway create on the machine's own gateway (``placement="<name>"``)."""
++    cross-gateway create on the machine's own gateway (``placement="<name>"``).
++
++    ``held`` is the other way a pin strands: the machine copies cards, but an operator set ``hold`` on it in the
++    Board registry, so its pickup imports nothing and the Board refuses its leases (11-11: worker-1 was held for
++    an AZ migration, a MacBook ``placement="worker-1"`` create returned ok and the card sat unclaimed for 48 min).
++    Its own gateway is held too, so the remedy is another machine (``others``), not a cross-gateway create."""
+ 
+     code = "placement_unavailable"
+ 
+-    def __init__(self, machine: str, why: str):
++    def __init__(self, machine: str, why: str, *, held: bool = False, others: Iterable[str] = ()):
+         self.machine = machine
++        self.held = held
++        self.others = sorted(others)
++        if held:
++            alt = (f"Pin a machine that is not held instead ({', '.join(self.others)})" if self.others
++                   else "No other machine that picks up cards is unheld right now")
++            super().__init__(
++                f"The pin names machine:{machine}, but {why}, so no worker would claim the card until an operator "
++                f"releases the hold. Nothing was written. {alt}, or leave placement and runs_on out so the card "
++                f"takes the default route. `hermes-mail admin machine-audit {machine}` shows who set the hold and "
++                "when; a hold is deliberate (a drain or a migration), so do not clear it to place a card.")
++            return
+         super().__init__(
+             f"runs_on names machine:{machine}, but {why}, so no worker would ever claim the card on this board. "
+             f"Nothing was written. Create it on that machine's own gateway instead (a cross-gateway create): "
+@@ -104,16 +120,28 @@ class MachinePinRefused(Exception):  # not ValueError: label-syntax handlers mus
+ 
+     @property
+     def tool_error_fields(self) -> dict:
++        if self.held:
++            return {"machine": self.machine, "created": False, "rejection": "machine_held", "unheld": self.others}
+         return {"machine": self.machine, "placement": self.machine, "created": False}
+ 
+ 
++HELD_WHY = "that machine is on hold in the Board registry (hold=true: it copies and leases no new cards)"
++
++
++def unheld_pickup_machines(pool: Mapping[str, Mapping[str, Any]], *, skip: str = "") -> list[str]:
++    """Active registry machines that pick up other gateways' cards and are not on hold (``skip`` left out)."""
++    return sorted(n for n, e in pool.items() if n != skip and e and e.get("state", "active") == "active"
++                  and not e.get("hold") and advertises_pickup(e))
++
++
+ def check_machine_pins(conn: sqlite3.Connection, runs_on: Any, *,
+                        machines: Optional[Mapping[str, Mapping[str, Any]]] = None,
+                        me: Optional[str] = None) -> None:
+     """Refuse (:class:`MachinePinRefused`) a ``runs_on`` naming ``machine:<x>`` (x not this machine) unless x is an
+     active registry machine that advertises pickup (:func:`advertises_pickup`; null or missing = no pickup).
+     Labels other than ``machine:*`` are not checked. A no-op off a Board primary (``set_runs_on`` refuses there).
+-    The registry unreachable fails closed: pickup cannot be confirmed."""
++    The registry unreachable fails closed: pickup cannot be confirmed. A machine on ``hold`` is refused too
++    (``held``): placement-derived pins (``placement=<machine>``) are passed through here for that check."""
+     if runs_on is None:
+         return
+     labels = normalize_runs_on(runs_on if isinstance(runs_on, str) else list(runs_on))
+@@ -139,6 +167,8 @@ def check_machine_pins(conn: sqlite3.Connection, runs_on: Any, *,
+         if not advertises_pickup(entry):
+             raise MachinePinRefused(name, "that machine does not pick up other gateways' cards (its /v2/machines "
+                                           f"entry has pickup={entry.get('pickup')!r})")
++        if entry.get("hold"):  # its pickup imports nothing and the Board refuses its leases while held
++            raise MachinePinRefused(name, HELD_WHY, held=True, others=unheld_pickup_machines(pool, skip=name))
+ 
+ 
+ def explicit_runs_on(conn: sqlite3.Connection, value: Any) -> Optional[list[str]]:
+diff --git a/tests/hermes_cli/test_kanban_held_machine_pin.py b/tests/hermes_cli/test_kanban_held_machine_pin.py
+new file mode 100644
+index 00000000000..a106c9771bd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_held_machine_pin.py
+@@ -0,0 +1,121 @@
++"""A pin to a machine on Board ``hold`` is refused at the write, and a card already waiting on one says so. [daveey]
++
++2026-11-11: worker-1 was put on ``hold`` at 02:17 UTC for an AZ migration (machine-audit seq 52). At 03:42 a MacBook
++chat ran ``kanban_create(placement="worker-1")``; it returned ok with ``runs_on=[machine:worker-1]``. A held machine's
++pickup imports nothing (``eligible`` -> ``held``) and the Board refuses its leases, so the card sat ready 48 min with
++the origin reading "waiting for worker-1 ... queued, not stuck". ``placement_runs_on`` and ``check_machine_pins``
++checked ``state`` and ``pickup`` but never ``hold``.
++
++Pinned here, one test per write path: the agent tool with ``placement=<machine>``, the agent tool with ``runs_on``,
++``hermes kanban create --runs-on``; and the read side (``kanban_show`` queue + note) for a card pinned before the hold.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_queue_position as kqp
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, WORKER, Gateway
++
++WORKER_2 = {**MACHINES[WORKER], "name": "worker-2"}
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True, machines=MACHINES)
++
++
++@pytest.fixture
++def hub(tmp_path, monkeypatch, svc):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
++    sync.consume_dispatcher_wake()
++    gw = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    gw.enter()
++    yield gw
++    gw.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _registry(*, hold):
++    """worker-1 as on 11-11 (active, pickup on, ``hold`` as given) beside an unheld worker-2."""
++    held = {**MACHINES[WORKER], "hold": hold}
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": [MACHINES[HUB], held, WORKER_2, MACHINES["macbook"]]})
++
++
++def _count(conn):
++    return conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
++
++
++def _create(args):
++    from tools import kanban_tools
++    return json.loads(kanban_tools._handle_create({"title": "verify five fixes", "assignee": "default", **args}))
++
++
++def _refused(out):
++    assert out.get("code") == "placement_unavailable" and out.get("rejection") == "machine_held", out
++    assert "on hold" in out["error"] and "worker-2" in out["error"] and out["unheld"] == ["worker-2"], out
++    assert out["created"] is False and 'placement="worker-1"' not in out["error"], out  # its gateway is held too
++
++
++@pytest.mark.parametrize("args", [{"placement": WORKER}, {"runs_on": ["machine:worker-1"]}],
++                         ids=["placement_pin", "explicit_runs_on"])
++def test_tool_create_pinned_to_a_held_machine_is_refused_and_writes_nothing(hub, args):
++    _registry(hold=True)
++    before = _count(hub.conn)
++    _refused(_create(args))
++    assert _count(hub.conn) == before
++
++
++@pytest.mark.parametrize("args", [{"placement": WORKER}, {"runs_on": ["machine:worker-1"]}],
++                         ids=["placement_pin", "explicit_runs_on"])
++def test_tool_create_pinned_to_an_unheld_machine_still_lands_with_its_label(hub, args):
++    _registry(hold=False)
++    out = _create(args)
++    assert "error" not in out and out["runs_on"] == ["machine:worker-1"], out
++
++
++def test_cli_create_pinned_to_a_held_machine_is_refused(hub):
++    from hermes_cli import kanban as kcli
++    _registry(hold=True)
++    before = _count(hub.conn)
++    out = kcli.run_slash('create "verify" --assignee default --runs-on machine:worker-1 --json')
++    assert "placement_unavailable" in out and "on hold" in out, out
++    assert _count(hub.conn) == before
++
++
++def test_a_card_already_waiting_on_a_held_machine_reads_on_hold_not_queued(hub):
++    """The hold can land after the create: the origin's card read must stop saying "queued, not stuck"."""
++    _registry(hold=False)
++    tid = kb.create_task(hub.conn, title="pinned before the hold", assignee="default",
++                         runs_on=["machine:worker-1"])
++    place = kqp.placement(hub.conn, tid)
++    assert place == {"lane": "machine", "runs_on": ["machine:worker-1"], "machines": ["worker-1"]}, place
++    assert "queued, not stuck" in (kqp.describe(place) or "")
++    wn.set_registry_fetch(None)
++    _registry(hold=True)
++    place = kqp.placement(hub.conn, tid)
++    assert place == {"lane": "machine", "runs_on": ["machine:worker-1"], "machines": ["worker-1"],
++                     "held": ["worker-1"]}, place
++    note = kqp.describe(place) or ""
++    assert "ON HOLD" in note and "machine-audit worker-1" in note and "queued, not stuck" not in note, note
++
++
++def test_a_label_one_unheld_machine_still_carries_keeps_the_plain_wait(hub):
++    """``gpu`` is on held worker-1 and unheld worker-2: the card still has a taker, so no hold wording."""
++    w1 = {**MACHINES[WORKER], "labels": ["linux", "gpu"], "hold": True}
++    w2 = {**WORKER_2, "labels": ["linux", "gpu"]}
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": [MACHINES[HUB], w1, w2, MACHINES["macbook"]]})
++    tid = kb.create_task(hub.conn, title="needs a gpu", assignee="default", runs_on=["gpu"])
++    place = kqp.placement(hub.conn, tid)
++    assert place == {"lane": "machine", "runs_on": ["gpu"], "machines": ["worker-1", "worker-2"],
++                     "held": ["worker-1"]}, place
++    note = kqp.describe(place) or ""
++    assert "ON HOLD" not in note and "queued, not stuck" in note, note
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index 6afa9026b45..b15d20e0150 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -85,6 +85,9 @@ def test_options_a_new_client_carries_go_to_the_target(extra):
+     ({"tenant": "acme"}, "tenant"),
+     ({"goal_mode": True, "tenant": "acme"}, "tenant"),
+     ({"max_retries": 5}, "max_retries"),  # hermes-hub create-task has no retry breaker option [daveey]
++    # 11-11: placement="hub" + runs_on=[machine:worker-1] ran on the hub's own queue, labels dropped. [daveey]
++    ({"runs_on": ["machine:worker-1"]}, "runs_on"),
++    ({"runs_on": []}, "runs_on"),  # an explicit "any machine" is a placement too
+ ])
+ def test_options_no_client_carries_stay_local(extra, why):
+     d = decide({"title": "Fix the flaky test", **extra}, carries=True)
+diff --git a/tests/hermes_cli/test_kanban_placement_runs_on.py b/tests/hermes_cli/test_kanban_placement_runs_on.py
+new file mode 100644
+index 00000000000..4b9af1f264a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placement_runs_on.py
+@@ -0,0 +1,65 @@
++"""``runs_on`` never rides the hermes-hub courier: a card that names machine labels stays on its board. [daveey]
++
++2026-11-11 04:31 UTC: a MacBook chat ran ``kanban_create(placement="hub", runs_on=["machine:worker-1"])``. The courier
++(hermes-hub ``create-task``, whose ``CREATE_OPTIONS`` has no ``runs_on``) created t_01a1c8de2f9e874c on the hub with
++``runs_on`` NULL, so it ran in the hub's own queue instead of on worker-1. ``runs_on`` was in neither
++``CARRIED_OPTIONS`` nor ``UNCARRIED_OPTIONS``, so nothing refused it. The labels work from the creating board (the
++Board lease reads them), so the card stays local; with an explicit pin to another gateway the create is refused.
++The decide-level cases sit in ``test_kanban_placement.py`` (``test_options_no_client_carries_stay_local``).
++"""
++import json
++
++from hermes_cli import kanban_placement as kp
++from tests.hermes_cli import test_kanban_placement as helpers
++
++mac = helpers.mac
++
++
++def test_runs_on_card_pinned_to_the_hub_is_refused_not_sent_without_its_labels(mac):
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "placement": "hub",
++                                        "runs_on": ["machine:worker-1"]}))
++    assert not out.get("ok") and out["code"] == "placement_unavailable" and "runs_on" in out["error"], out
++    assert mac["calls"] == [] and helpers._local_count() == 0
++
++
++def test_runs_on_card_with_a_new_client_is_still_refused(mac):
++    """A client that carries ``--option`` still has no runs_on option: same refusal, no courier call."""
++    from tools import kanban_tools as kt
++    mac["result"]["help"] = helpers.NEW_HELP
++    out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "placement": "hub",
++                                        "runs_on": ["machine:worker-1"]}))
++    assert out.get("code") == "placement_unavailable" and "runs_on" in out["error"], out
++    assert mac["calls"] == [] and helpers._local_count() == 0
++
++
++def test_runs_on_is_never_among_the_options_sent_to_the_target():
++    assert "runs_on" in kp.UNCARRIED_OPTIONS and "runs_on" not in kp.CARRIED_OPTIONS
++    assert "runs_on" not in kp.carried_options({"title": "t", "runs_on": ["machine:worker-1"]})
++
++
++def test_runs_on_card_is_not_pool_portable():
++    """A worker pool never re-places a card whose creator named its machines."""
++    assert kp.portable_reason({"title": "Fix the flaky test", "runs_on": ["machine:worker-1"]},
++                              {"assignees": ["default"]}) == "uncarried option"
++
++
++# kanban_create parameters the courier handles outside the two option lists, each reviewed:
++HANDLED_ELSEWHERE = {
++    "title", "body", "assignee",  # create-task's own arguments
++    "origin_session",             # sent as the request's origin binding
++    "placement",                  # the routing input itself
++    "board", "parents", "workspace_kind",  # decide() keeps the card local on these
++    "human_action_now",           # only meaningful with initial_status, which is uncarried
++}
++
++
++def test_every_create_parameter_is_classified_for_the_courier():
++    """runs_on was in neither list, so it was dropped. A new kanban_create parameter must be put in one."""
++    from tools.kanban_tools_schemas import KANBAN_CREATE_SCHEMA
++    params = set(KANBAN_CREATE_SCHEMA["parameters"]["properties"])
++    carried, uncarried = set(kp.CARRIED_OPTIONS), set(kp.UNCARRIED_OPTIONS)
++    assert not carried & uncarried
++    unclassified = params - carried - uncarried - HANDLED_ELSEWHERE
++    assert not unclassified, (f"kanban_create parameters {sorted(unclassified)} are in neither CARRIED_OPTIONS nor "
++                              "UNCARRIED_OPTIONS: a courier create would drop them silently")
+-- 
+2.55.0
+

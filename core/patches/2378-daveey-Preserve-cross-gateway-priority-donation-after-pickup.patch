@@ -1,0 +1,309 @@
+From dc0d195fc5b7749801e5552391533ff636b83680 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:20:05 +0000
+Subject: [PATCH] [daveey] Preserve cross-gateway priority donation after
+ pickup
+
+Pickup ranks the full replica but dispatch previously ranked only its imported subset, dropping priorities donated by remote waiters. Overlay the read-only graph with local rows and child-edge authority; preserve admission, review reservation and stored priorities. Replica faults fall back to local dispatch.
+
+Proof: raw foreign900/local100 control passes on baseline; inherited900 foreign0/local100 fails before and passes after. Canonical focused suites: 143 tests; 10 behavioral mutants killed. Read-only hub graph replay: 4582 tasks, 1953 edges, 65 ready candidates in 17ms; no writes.
+---
+ hermes_cli/kanban_db_dispatch_queries.py      |   4 +-
+ hermes_cli/kanban_dispatch_priority.py        |  67 ++++++
+ .../hermes_cli/test_kanban_pickup_priority.py | 191 ++++++++++++++++++
+ 3 files changed, 261 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/kanban_dispatch_priority.py
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_priority.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_queries.py b/hermes_cli/kanban_db_dispatch_queries.py
+index 62f1c0d7c57..97b802b9a53 100644
+--- a/hermes_cli/kanban_db_dispatch_queries.py
++++ b/hermes_cli/kanban_db_dispatch_queries.py
+@@ -32,11 +32,13 @@ DISPATCH_ORDER = (
+ 
+ def lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
+     """Unclaimed rows of one lane in dispatch order (:data:`DISPATCH_ORDER`)."""
+-    return conn.execute(
++    rows = conn.execute(
+         "SELECT id, assignee FROM tasks "
+         f"WHERE status = '{status}' AND claim_lock IS NULL "
+         f"ORDER BY {DISPATCH_ORDER}"
+     ).fetchall()
++    from hermes_cli.kanban_dispatch_priority import order_with_remote_waiters
++    return order_with_remote_waiters(conn, rows)
+ 
+ 
+ def still_current_worker(conn: sqlite3.Connection, row, pid: int) -> bool:
+diff --git a/hermes_cli/kanban_dispatch_priority.py b/hermes_cli/kanban_dispatch_priority.py
+new file mode 100644
+index 00000000000..8173e61b495
+--- /dev/null
++++ b/hermes_cli/kanban_dispatch_priority.py
+@@ -0,0 +1,67 @@
++"""Read-only priority donation across a partial executor board and its replica."""
++import logging
++import sqlite3
++from collections import defaultdict
++
++from hermes_cli.kanban_priority import PRIORITY_CAP
++
++_LOG = logging.getLogger(__name__)
++
++
++def order_with_remote_waiters(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
++    """Keep remote descendants in dispatch ranking without importing or editing them.
++
++    Local rows override replica rows, and a child's local edge set overrides its
++    replicated edges (including an unlinked empty set). This preserves changes
++    not yet pushed to the Board. The Board still authorizes every actual claim.
++    """
++    try:
++        return _order_with_remote_waiters(conn, rows)
++    except Exception:  # health: allow BLE001 -- advisory replica reads must never stop local dispatch
++        _LOG.warning("could not read replica priority graph; using local ordering", exc_info=True)
++        return rows
++
++
++def _order_with_remote_waiters(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++
++    if not rows or sync.board_mode(conn) != "primary":
++        return rows
++    replica = wn.open_replica(conn)
++    if replica is None:
++        return rows
++    try:
++        remote = replica.execute(
++            "SELECT id, priority, status, created_at FROM tasks WHERE status NOT IN ('done', 'archived')"
++        ).fetchall()
++        edges = replica.execute("SELECT parent_id, child_id FROM task_links").fetchall()
++    finally:
++        replica.close()
++    local = conn.execute("SELECT id, priority, status, created_at FROM tasks").fetchall()
++    local_ids = {r["id"] for r in local}
++    tasks = {r["id"]: r for r in remote}
++    tasks.update((r["id"], r) for r in local)
++    edges = [(p, c) for p, c in edges if c not in local_ids]
++    edges.extend(conn.execute("SELECT parent_id, child_id FROM task_links").fetchall())
++    children = defaultdict(set)
++    for parent, child in edges:
++        if child in tasks and tasks[child]["status"] not in ("done", "archived"):
++            children[parent].add(child)
++
++    def rank(row):
++        tid = row["id"]
++        task = tasks[tid]
++        priority = task["priority"] or 0
++        pending = list(children[tid])
++        seen = {tid}
++        while pending:
++            child = pending.pop()
++            if child in seen:
++                continue
++            seen.add(child)
++            priority = max(priority, tasks[child]["priority"] or 0)
++            pending.extend(children[child] - seen)
++        return -min(PRIORITY_CAP, priority), -bool(children[tid]), task["created_at"]
++
++    return sorted(rows, key=rank)
+diff --git a/tests/hermes_cli/test_kanban_pickup_priority.py b/tests/hermes_cli/test_kanban_pickup_priority.py
+new file mode 100644
+index 00000000000..962a4061501
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_priority.py
+@@ -0,0 +1,191 @@
++"""Cross-gateway priority must survive pickup into a partial local board."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_dispatch_priority as priority
++
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_worker_node as support
++
++svc = support.svc
++gws = support.gws
++
++
++@pytest.mark.parametrize("inherited", [False, True])
++def test_foreign_higher_priority_gets_next_slot(gws, inherited):
++    home, executor = gws
++    home.enter()
++    foreign = kb.create_task(home.conn, title="foreign prerequisite", assignee="default",
++                             priority=0 if inherited else 900, runs_on=[f"machine:{support.WORKER}"])
++    if inherited:
++        kb.create_task(home.conn, title="urgent foreign waiter", assignee="default", priority=900,
++                       parents=[foreign], runs_on=[f"machine:{support.HUB}"])
++    home.round()
++    executor.enter()
++    local = kb.create_task(executor.conn, title="local background work", assignee="default", priority=100)
++    executor.round()
++    executor.tick(max_spawn=1)
++    assert kb.get_task(executor.conn, foreign).status == "running"
++    assert kb.get_task(executor.conn, local).status == "ready"
++    assert kb.get_task(executor.conn, foreign).priority == (0 if inherited else 900)
++
++
++@pytest.fixture
++def graph(tmp_path, monkeypatch):
++    from hermes_cli import kanban_worker_node as wn
++    from hermes_cli import kanban_db_sync as sync
++
++    local = sqlite3.connect(":memory:")
++    replica = tmp_path / "replica.db"
++    remote = sqlite3.connect(replica)
++    schema = """
++        CREATE TABLE tasks (id TEXT PRIMARY KEY, priority INTEGER, status TEXT, created_at INTEGER);
++        CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
++    """
++    for conn in (local, remote):
++        conn.row_factory = sqlite3.Row
++        conn.executescript(schema)
++    local.executemany("INSERT INTO tasks VALUES (?, ?, 'ready', ?)", [("local", 100, 1), ("foreign", 0, 2)])
++    remote.executemany("INSERT INTO tasks VALUES (?, ?, ?, ?)", [
++        ("foreign", 0, "ready", 2), ("waiter", 900, "todo", 3)])
++    remote.execute("INSERT INTO task_links VALUES ('foreign', 'waiter')")
++    remote.commit()
++    monkeypatch.setattr(sync, "board_mode", lambda conn: "primary")
++
++    def open_replica(conn):
++        copy = sqlite3.connect(replica)
++        copy.row_factory = sqlite3.Row
++        return copy
++
++    monkeypatch.setattr(wn, "open_replica", open_replica)
++    yield local, remote
++    local.close()
++    remote.close()
++
++
++def _order(conn):
++    rows = conn.execute("SELECT id FROM tasks WHERE status='ready' ORDER BY priority DESC").fetchall()
++    return [r["id"] for r in priority.order_with_remote_waiters(conn, rows)]
++
++
++def test_remote_donation_is_derived_and_has_no_writes(graph):
++    local, remote = graph
++    before = local.total_changes
++    assert _order(local) == ["foreign", "local"]
++    assert local.total_changes == before
++    assert local.execute("SELECT priority FROM tasks WHERE id='foreign'").fetchone()[0] == 0
++    assert local.execute("SELECT count(*) FROM tasks").fetchone()[0] == 2
++    remote.execute("UPDATE tasks SET priority=50 WHERE id='waiter'")
++    remote.commit()
++    assert _order(local) == ["local", "foreign"]
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++def test_local_terminal_waiter_overrides_stale_remote_donation(graph, status):
++    local, _ = graph
++    local.execute("INSERT INTO tasks VALUES ('waiter', 900, ?, 3)", (status,))
++    local.execute("INSERT INTO task_links VALUES ('foreign', 'waiter')")
++    assert _order(local) == ["local", "foreign"]
++
++
++def test_local_unlink_overrides_replica_edge_and_local_link_is_used(graph):
++    local, _ = graph
++    local.execute("INSERT INTO tasks VALUES ('waiter', 950, 'todo', 3)")
++    assert _order(local) == ["local", "foreign"]  # no local edge = already unlinked
++    local.execute("INSERT INTO task_links VALUES ('foreign', 'waiter')")
++    assert _order(local) == ["foreign", "local"]
++
++
++def test_transitive_donation_cycle_missing_and_terminal_cutoff(graph):
++    local, remote = graph
++    remote.execute("UPDATE tasks SET priority=0 WHERE id='waiter'")
++    remote.execute("INSERT INTO tasks VALUES ('grandchild', 950, 'blocked', 4)")
++    remote.executemany("INSERT INTO task_links VALUES (?, ?)", [
++        ("waiter", "grandchild"), ("grandchild", "waiter"), ("foreign", "missing")])
++    remote.commit()
++    assert _order(local) == ["foreign", "local"]
++    remote.execute("UPDATE tasks SET status='done' WHERE id='waiter'")
++    remote.commit()
++    assert _order(local) == ["local", "foreign"]
++
++
++def test_priority_cap_waiter_tie_and_creation_order(graph):
++    local, remote = graph
++    local.execute("UPDATE tasks SET priority=1000 WHERE id='local'")
++    remote.execute("UPDATE tasks SET priority=9000 WHERE id='waiter'")
++    remote.commit()
++    assert _order(local) == ["foreign", "local"]  # equal capped priority, open waiter wins
++    local.execute("INSERT INTO tasks VALUES ('local-waiter', 1500, 'todo', 4)")
++    local.execute("INSERT INTO task_links VALUES ('local', 'local-waiter')")
++    assert _order(local) == ["local", "foreign"]  # both capped and waited-on: older first
++
++
++def test_local_priority_edit_wins_over_replica(graph):
++    local, remote = graph
++    remote.execute("UPDATE tasks SET priority=0 WHERE id='waiter'")
++    remote.execute("UPDATE tasks SET priority=900 WHERE id='foreign'")
++    remote.commit()
++    assert _order(local) == ["local", "foreign"]
++
++
++@pytest.mark.parametrize("mode", [None, "mirror"])
++def test_non_primary_does_not_open_replica(graph, monkeypatch, mode):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++
++    local, _ = graph
++    monkeypatch.setattr(sync, "board_mode", lambda conn: mode)
++    monkeypatch.setattr(wn, "open_replica", lambda conn: pytest.fail("must not read replica"))
++    assert _order(local) == ["local", "foreign"]
++
++
++def test_no_replica_empty_lane_and_unreadable_replica_fall_back(graph, monkeypatch):
++    from hermes_cli import kanban_worker_node as wn
++
++    local, _ = graph
++    monkeypatch.setattr(wn, "open_replica", lambda conn: None)
++    assert _order(local) == ["local", "foreign"]
++    monkeypatch.setattr(wn, "open_replica", lambda conn: pytest.fail("empty lane must not open"))
++    assert priority.order_with_remote_waiters(local, []) == []
++    empty = sqlite3.connect(":memory:")
++    monkeypatch.setattr(wn, "open_replica", lambda conn: empty)
++    assert _order(local) == ["local", "foreign"]
++    with pytest.raises(sqlite3.ProgrammingError):
++        empty.execute("SELECT 1")  # failure still closes replica
++
++
++@pytest.mark.parametrize("error", [sqlite3.OperationalError("lifecycle busy"), OSError("rotated"),
++                                    RuntimeError("unavailable")])
++def test_replica_open_failure_preserves_local_order(graph, monkeypatch, error):
++    from hermes_cli import kanban_worker_node as wn
++
++    local, _ = graph
++
++    def failed(conn):
++        raise error
++
++    monkeypatch.setattr(wn, "open_replica", failed)
++    assert _order(local) == ["local", "foreign"]
++
++
++def test_dispatch_still_claims_local_when_replica_open_fails(gws, monkeypatch):
++    from hermes_cli import kanban_worker_node as wn
++
++    _, executor = gws
++    executor.enter()
++    local = kb.create_task(executor.conn, title="local work", assignee="default")
++
++    def failed(conn):
++        raise sqlite3.OperationalError("shadow lifecycle busy")
++
++    monkeypatch.setattr(wn, "open_replica", failed)
++    executor.tick(max_spawn=1)
++    assert kb.get_task(executor.conn, local).status == "running"
++
++
++def test_malformed_replica_priority_preserves_local_order(graph):
++    local, remote = graph
++    remote.execute("UPDATE tasks SET priority='invalid' WHERE id='waiter'")
++    remote.commit()
++    assert _order(local) == ["local", "foreign"]
+-- 
+2.55.0
+

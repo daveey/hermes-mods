@@ -1,0 +1,312 @@
+From 612ad22790c5cc5b9b48c2ff7465a3a63b89bd53 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 10:07:24 +0000
+Subject: [PATCH] perf(metrics): read Darwin memory without periodic
+ subprocesses [daveey]
+
+---
+ hermes_cli/machine_memory_darwin.py           |  85 +++++++++++
+ hermes_cli/machine_metrics.py                 |  10 +-
+ .../hermes_cli/test_machine_memory_darwin.py  | 133 ++++++++++++++++++
+ .../hermes_cli/test_machine_memory_nofork.py  |  29 ++++
+ 4 files changed, 250 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/machine_memory_darwin.py
+ create mode 100644 tests/hermes_cli/test_machine_memory_darwin.py
+ create mode 100644 tests/hermes_cli/test_machine_memory_nofork.py
+
+diff --git a/hermes_cli/machine_memory_darwin.py b/hermes_cli/machine_memory_darwin.py
+new file mode 100644
+index 00000000000..172d2d23a7f
+--- /dev/null
++++ b/hermes_cli/machine_memory_darwin.py
+@@ -0,0 +1,85 @@
++"""Read Darwin memory counters without forking the multithreaded gateway.
++
++ABI: XNU mach/vm_statistics.h (vm_statistics64, revision 2) and host_info.h.
++vm_stat displays free_count - speculative_count, so the existing reader's
++free + inactive + speculative + purgeable equals free_count + inactive_count
+++ purgeable_count here. Keep that policy, not psutil's different definition.
++"""
++from __future__ import annotations
++
++import ctypes
++from functools import lru_cache
++
++
++class _VMStatistics64(ctypes.Structure):
++    _fields_ = (
++        [(n, ctypes.c_uint32) for n in ("free", "active", "inactive", "wired")]
++        + [(n, ctypes.c_uint64) for n in (
++            "zero_fill", "reactivations", "pageins", "pageouts", "faults", "cow_faults", "lookups", "hits", "purges")]
++        + [(n, ctypes.c_uint32) for n in ("purgeable", "speculative")]
++        + [(n, ctypes.c_uint64) for n in ("decompressions", "compressions", "swapins", "swapouts")]
++        + [(n, ctypes.c_uint32) for n in ("compressor", "throttled", "external", "internal")]
++        + [(n, ctypes.c_uint64) for n in ("total_uncompressed", "swapped")]
++    )
++
++
++@lru_cache(maxsize=1)
++def _library():
++    # Cache bindings only. Every read gets fresh counters; no timer-based value cache.
++    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
++    lib.sysctlbyname.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
++                                ctypes.c_void_p, ctypes.c_size_t]
++    lib.sysctlbyname.restype = ctypes.c_int
++    lib.mach_host_self.argtypes = []
++    lib.mach_host_self.restype = ctypes.c_uint32
++    lib.host_page_size.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_size_t)]
++    lib.host_page_size.restype = ctypes.c_int
++    lib.host_statistics64.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_void_p,
++                                      ctypes.POINTER(ctypes.c_uint32)]
++    lib.host_statistics64.restype = ctypes.c_int
++    lib.mach_port_deallocate.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
++    lib.mach_port_deallocate.restype = ctypes.c_int
++    return lib, ctypes.c_uint32.in_dll(lib, "mach_task_self_").value
++
++
++def _sysctl_uint(lib, name: bytes, kind):
++    value = kind()
++    size = ctypes.c_size_t(ctypes.sizeof(value))
++    if lib.sysctlbyname(name, ctypes.byref(value), ctypes.byref(size), None, 0) != 0:
++        raise OSError(ctypes.get_errno(), "memory sysctl failed")
++    if size.value != ctypes.sizeof(value) or value.value <= 0:
++        raise ValueError("invalid memory sysctl size/value")
++    return value.value
++
++
++def read_used_pct() -> float:
++    try:
++        return _read_used_pct()
++    except (AttributeError, ctypes.ArgumentError) as exc:
++        raise OSError("incompatible Darwin memory API") from exc
++
++
++def _read_used_pct() -> float:
++    lib, task = _library()
++    total = _sysctl_uint(lib, b"hw.memsize", ctypes.c_uint64)
++    host = lib.mach_host_self()
++    if not host:
++        raise OSError("null host port")
++    try:
++        # Host counters use kernel pages, not a translated process's map page size.
++        page = ctypes.c_size_t()
++        if lib.host_page_size(host, ctypes.byref(page)) != 0 or not page.value:
++            raise OSError("host_page_size failed")
++        page_size = page.value
++        stats = _VMStatistics64()
++        count = ctypes.c_uint32(ctypes.sizeof(stats) // ctypes.sizeof(ctypes.c_uint32))
++        if lib.host_statistics64(host, 4, ctypes.byref(stats), ctypes.byref(count)) != 0:
++            raise OSError("host_statistics64 failed")
++        # Revision 0 contains all policy inputs (24 natural_t words); accept newer/older kernels.
++        if not 24 <= count.value <= ctypes.sizeof(stats) // 4:
++            raise ValueError("short/oversized host statistics")
++        available = (stats.free + stats.inactive + stats.purgeable) * page_size
++        return round(max(0.0, min(100.0, 100.0 * (total - available) / total)), 1)
++    finally:
++        if lib.mach_port_deallocate(task, host) != 0:
++            raise OSError("host port deallocation failed")
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 159b66b8623..dbf37c4855c 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -19,7 +19,6 @@ import os
+ import re
+ import shutil
+ import sqlite3
+-import subprocess
+ import sys
+ import time
+ from pathlib import Path
+@@ -56,12 +55,9 @@ def _mem_used_pct() -> Optional[float]:
+         if sys.platform.startswith("linux"):
+             return _linux_mem_used_pct(Path("/proc/meminfo").read_text(encoding="utf-8"))
+         if sys.platform == "darwin":
+-            def out(argv: list[str]) -> str:
+-                return subprocess.run(argv, capture_output=True, timeout=5, check=True).stdout.decode("utf-8", "replace")
+-            memsize = int(out(["/usr/sbin/sysctl", "-n", "hw.memsize"]).strip())
+-            vm = out(["/usr/bin/vm_stat"])
+-            return _macos_mem_used_pct(memsize, vm)
+-    except (OSError, ValueError, subprocess.SubprocessError):
++            from hermes_cli.machine_memory_darwin import read_used_pct
++            return read_used_pct()
++    except (OSError, ValueError):
+         return None
+     return None
+ 
+diff --git a/tests/hermes_cli/test_machine_memory_darwin.py b/tests/hermes_cli/test_machine_memory_darwin.py
+new file mode 100644
+index 00000000000..c638f39ba29
+--- /dev/null
++++ b/tests/hermes_cli/test_machine_memory_darwin.py
+@@ -0,0 +1,133 @@
++"""ABI fixture and policy equivalence for the direct Darwin memory reader."""
++import ctypes
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import machine_memory_darwin as native
++from hermes_cli.machine_metrics import _macos_mem_used_pct
++
++
++class Kernel:
++    def __init__(self):
++        self.total = 16 * 1024 ** 3
++        self.page = 16384
++        self.free, self.inactive, self.purgeable, self.speculative = 131072, 131072, 1024, 65536
++        self.calls = []
++        self.failure = None
++
++    def sysctlbyname(self, name, value, size, new, newlen):
++        assert new is None and newlen == 0
++        self.calls.append(name)
++        value._obj.value = self.total if name == b"hw.memsize" else self.page
++        if self.failure == (name, "size"):
++            size._obj.value -= 1
++        if self.failure == (name, "zero"):
++            value._obj.value = 0
++        return -1 if self.failure == name else 0
++
++    def mach_host_self(self):
++        self.calls.append("host")
++        return 0 if self.failure == "null" else 123
++
++    def host_page_size(self, host, page):
++        assert host == 123
++        self.calls.append("page")
++        page._obj.value = 0 if self.failure == "zero_page" else self.page
++        return 1 if self.failure == "page" else 0
++
++    def host_statistics64(self, host, flavor, stats, count):
++        assert host == 123 and flavor == 4 and count._obj.value == 40
++        self.calls.append("stats")
++        stats._obj.free, stats._obj.inactive = self.free, self.inactive
++        stats._obj.purgeable, stats._obj.speculative = self.purgeable, self.speculative
++        if isinstance(self.failure, int):
++            count._obj.value = self.failure
++        return 1 if self.failure == "stats" else 0
++
++    def mach_port_deallocate(self, task, host):
++        assert (task, host) == (7, 123)
++        self.calls.append("release")
++        return 1 if self.failure == "release" else 0
++
++    def text(self):
++        return (f"Mach Virtual Memory Statistics: (page size of {self.page} bytes)\n"
++                f"Pages free: {self.free-self.speculative}.\nPages inactive: {self.inactive}.\n"
++                f"Pages purgeable: {self.purgeable}.\nPages speculative: {self.speculative}.\n")
++
++
++@pytest.fixture
++def kernel(monkeypatch):
++    k = Kernel()
++    monkeypatch.setattr(native, "_library", lambda: (k, 7))
++    return k
++
++
++def test_native_abi():
++    assert ctypes.sizeof(native._VMStatistics64) == 160
++    assert native._VMStatistics64.purgeable.offset == 88
++    assert native._VMStatistics64.speculative.offset == 92
++    assert native._VMStatistics64.swapped.offset == 152
++
++
++def test_same_input_policy_freshness_and_cleanup(kernel):
++    for free, inactive, purgeable, speculative in [(131072, 131072, 1024, 65536), (65536, 0, 0, 0), (0, 0, 0, 0), (2**30, 0, 0, 0)]:
++        kernel.free, kernel.inactive, kernel.purgeable, kernel.speculative = free, inactive, purgeable, speculative
++        assert native.read_used_pct() == _macos_mem_used_pct(kernel.total, kernel.text())
++    assert kernel.calls == [b"hw.memsize", "host", "page", "stats", "release"] * 4
++
++
++@pytest.mark.parametrize("failure", [b"hw.memsize", (b"hw.memsize", "size"), (b"hw.memsize", "zero"), "null", "page", "zero_page", "stats", 23, 41, "release"])
++def test_fail_closed_and_no_port_leak(kernel, failure):
++    kernel.failure = failure
++    with pytest.raises((OSError, ValueError)):
++        native.read_used_pct()
++    assert kernel.calls.count("release") == int("page" in kernel.calls)
++
++
++def test_old_kernel_prefix_is_sufficient(kernel):
++    kernel.failure = 24
++    assert native.read_used_pct() == _macos_mem_used_pct(kernel.total, kernel.text())
++
++
++def test_missing_library_omits_without_spawning(monkeypatch):
++    from hermes_cli import machine_metrics as mm
++
++    def unavailable():
++        raise OSError("libSystem unavailable")
++
++    monkeypatch.setattr(native, "_library", unavailable)
++    monkeypatch.setattr(mm, "sys", SimpleNamespace(platform="darwin"))
++    assert mm._mem_used_pct() is None
++
++
++@pytest.mark.parametrize("error", [AttributeError("missing symbol"), ctypes.ArgumentError("bad ABI")])
++def test_binding_incompatibility_is_unavailable(monkeypatch, error):
++    def unavailable():
++        raise error
++
++    monkeypatch.setattr(native, "_library", unavailable)
++    with pytest.raises(OSError, match="incompatible Darwin memory API"):
++        native.read_used_pct()
++
++
++def test_captured_vm_stat_policy_and_no_spawn(kernel, monkeypatch):
++    import subprocess
++
++    def forbidden(*args, **kwargs):
++        raise AssertionError("native reader spawned")
++
++    monkeypatch.setattr(subprocess, "Popen", forbidden)
++    # Numeric memory-only excerpt captured from a real arm64 vm_stat snapshot.
++    text = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
++Pages free: 450707.
++Pages inactive: 3251273.
++Pages speculative: 303400.
++Pages purgeable: 106035.
++"""
++    kernel.total = 137438953472
++    kernel.free, kernel.inactive, kernel.speculative, kernel.purgeable = 754107, 3251273, 303400, 106035
++    assert native.read_used_pct() == _macos_mem_used_pct(kernel.total, text) == 51.0
++    # A different process map page size must not affect host counters.
++    monkeypatch.setattr("os.sysconf", lambda name: 4096)
++    assert native.read_used_pct() == 51.0
+diff --git a/tests/hermes_cli/test_machine_memory_nofork.py b/tests/hermes_cli/test_machine_memory_nofork.py
+new file mode 100644
+index 00000000000..c1eca77f024
+--- /dev/null
++++ b/tests/hermes_cli/test_machine_memory_nofork.py
+@@ -0,0 +1,29 @@
++"""Darwin metrics must not fork an otherwise idle gateway."""
++import subprocess
++import sys
++from types import SimpleNamespace
++
++from hermes_cli import machine_metrics as mm
++
++
++def test_darwin_reader_is_fresh_without_subprocess(monkeypatch):
++    values = iter([75.0, 75.0, 62.5])
++    monkeypatch.setattr(sys, "platform", "darwin")
++    monkeypatch.setitem(sys.modules, "hermes_cli.machine_memory_darwin", SimpleNamespace(read_used_pct=lambda: next(values)))
++
++    def forbidden(*a, **kw):
++        raise AssertionError("idle memory metric spawned a subprocess")
++
++    monkeypatch.setattr(subprocess, "run", forbidden)
++    assert [mm._mem_used_pct() for _ in range(3)] == [75.0, 75.0, 62.5]
++
++
++def test_darwin_reader_failure_omits_metric_without_spawn(monkeypatch):
++    monkeypatch.setattr(sys, "platform", "darwin")
++
++    def unavailable():
++        raise OSError("host statistics unavailable")
++
++    monkeypatch.setitem(sys.modules, "hermes_cli.machine_memory_darwin", SimpleNamespace(read_used_pct=unavailable))
++    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("spawn")))
++    assert mm._mem_used_pct() is None
+-- 
+2.55.0
+

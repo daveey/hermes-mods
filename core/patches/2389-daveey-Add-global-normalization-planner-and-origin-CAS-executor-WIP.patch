@@ -1,0 +1,296 @@
+From 2ce39e3cd5432cd98a944da8b5f52ba1e8450fb9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 23:46:48 +0000
+Subject: [PATCH] [daveey] Add global normalization planner and origin CAS
+ executor (WIP)
+
+---
+ hermes_cli/kanban_priority_executor.py        |  56 ++++++++++
+ hermes_cli/kanban_priority_migration.py       |  38 +++++++
+ .../test_kanban_priority_executor.py          | 103 ++++++++++++++++++
+ .../hermes_cli/test_kanban_priority_global.py |  51 +++++++++
+ 4 files changed, 248 insertions(+)
+ create mode 100644 hermes_cli/kanban_priority_executor.py
+ create mode 100644 tests/hermes_cli/test_kanban_priority_executor.py
+ create mode 100644 tests/hermes_cli/test_kanban_priority_global.py
+
+diff --git a/hermes_cli/kanban_priority_executor.py b/hermes_cli/kanban_priority_executor.py
+new file mode 100644
+index 00000000000..b072013afd8
+--- /dev/null
++++ b/hermes_cli/kanban_priority_executor.py
+@@ -0,0 +1,56 @@
++"""Origin-scoped priority operation for the existing non-worker supervisor executor."""
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++
++from hermes_cli import kanban_db as kb
++
++
++def apply_attached(conn, attachment_id: int, digest: str, *, writer: str) -> dict:
++    """Apply only this origin's rows from an already attached global manifest."""
++    from hermes_cli.kanban_db_sync import sync_state
++    from hermes_cli.kanban_supervisor_requests import _non_worker_refusal
++
++    refusal = _non_worker_refusal()
++    if refusal:
++        raise PermissionError(refusal)
++    changes = []
++    with kb.write_txn(conn):
++        identity = sync_state(conn) or {}
++        if identity.get("mode") != "primary":
++            raise ValueError("normalization requires a primary writer")
++        if identity.get("gateway_id") != writer:
++            raise ValueError("different writer; explicitly name this origin")
++        attachment = kb.get_attachment(conn, attachment_id)
++        if attachment is None:
++            raise ValueError("attached manifest required")
++        data = Path(attachment.stored_path).read_bytes()
++        if hashlib.sha256(data).hexdigest() != digest:
++            raise ValueError("manifest digest mismatch")
++        manifest = json.loads(data)
++        if manifest["board_id"] != identity.get("board_id"):
++            raise ValueError("manifest belongs to a different board")
++        rows = [r for r in manifest["rows"] if r["origin"] == writer]
++        live = {r["id"]: r["priority"] for r in conn.execute(
++            "SELECT id,priority FROM tasks WHERE created_on=? AND status NOT IN ('done','archived')", (writer,))}
++        if set(live) != {r["id"] for r in rows}:
++            raise ValueError("ownership or membership changed; capture a new manifest")
++        if all(live[r["id"]] == r["new"] for r in rows):
++            return {"changed": 0, "writer": writer, "manifest_sha256": digest}
++        if any(live[r["id"]] != r["old"] for r in rows):
++            raise ValueError("priorities changed; capture a new manifest")
++        for row in rows:
++            current = live[row["id"]]
++            if current == row["new"]:
++                continue
++            conn.execute("UPDATE tasks SET priority=? WHERE id=?", (row["new"], row["id"]))
++            kb._append_event(conn, row["id"], "reprioritized", {
++                "priority": row["new"], "previous_priority": current,
++                "reason": "priority normalization v2", "manifest_sha256": digest,
++            })
++            changes.append(row["id"])
++    for task_id in changes:
++        kb.notify_task_updated(conn, task_id, ["priority"])
++    return {"changed": len(changes), "writer": writer, "manifest_sha256": digest}
+diff --git a/hermes_cli/kanban_priority_migration.py b/hermes_cli/kanban_priority_migration.py
+index d423b0d8a25..75190423f32 100644
+--- a/hermes_cli/kanban_priority_migration.py
++++ b/hermes_cli/kanban_priority_migration.py
+@@ -41,6 +41,44 @@ def plan(conn) -> dict:
+     ]}
+ 
+ 
++def plan_global(rows: list[dict], *, board_id: str, exceptions: list[str]) -> dict:
++    """Rank one complete authoritative inventory, never separately on each origin.
++
++    Exceptions are ordered low to high and retain terminal resolution evidence.
++    Missing requested cards are unknown, not implicitly terminal.
++    """
++    if not board_id:
++        raise ValueError("missing board identity")
++    if len(set(exceptions)) != len(exceptions):
++        raise ValueError("duplicate exception")
++    indexed = {r["id"]: r for r in rows}
++    if len(indexed) != len(rows):
++        raise ValueError("duplicate task in inventory")
++    if set(exceptions) - indexed.keys():
++        raise ValueError("unresolved exception; canonical evidence required")
++    if any(not r.get("created_on") for r in rows):
++        raise ValueError("missing origin in inventory")
++    if any(type(r["priority"]) is not int for r in rows):
++        raise ValueError("priority must be an integer")
++    resolved = [{"id": key, "status": indexed[key]["status"],
++                 "origin": indexed[key]["created_on"], "old": indexed[key]["priority"]}
++                for key in exceptions]
++    active = [r for r in rows if r["status"] not in ("done", "archived")]
++    reserved = [key for key in exceptions if indexed[key]["status"] not in ("done", "archived")]
++    ceiling = PRIORITY_CAP - HEADROOM
++    band = ceiling - len(reserved)
++    values = sorted({r["priority"] for r in active if r["priority"] > 0 and r["id"] not in reserved})
++    if band < 0 or len(values) > band:
++        raise ValueError("too many distinct priorities for lossless normalization")
++    ranks = {value: (i + 1) * band // len(values) for i, value in enumerate(values)}
++    special = {key: band + i + 1 for i, key in enumerate(reserved)}
++    return {"version": 2, "cap": PRIORITY_CAP, "board_id": board_id, "ceiling": ceiling,
++            "exceptions": resolved, "rows": [
++                {"id": r["id"], "origin": r["created_on"], "old": r["priority"],
++                 "new": special.get(r["id"], ranks.get(r["priority"], r["priority"]))}
++                for r in sorted(active, key=lambda r: r["id"])]}
++
++
+ def save_manifest(path: Path, manifest: dict) -> None:
+     """Durably record original values, refusing to overwrite an earlier backup."""
+     with path.open("x", encoding="utf-8") as stream:
+diff --git a/tests/hermes_cli/test_kanban_priority_executor.py b/tests/hermes_cli/test_kanban_priority_executor.py
+new file mode 100644
+index 00000000000..a0f13c76042
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_executor.py
+@@ -0,0 +1,103 @@
++"""Only a non-worker supervisor may apply an attached global plan on its origin."""
++import hashlib
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_priority_migration as migration
++from tests.hermes_cli import test_kanban_priority_migration as helpers
++from tests.hermes_cli import test_kanban_sync_client as sync_helpers
++
++kanban_home = sync_helpers.kanban_home
++conn = sync_helpers.live
++
++
++def setup_plan(conn):
++    conn.execute("UPDATE kanban_sync_state SET mode='primary'")
++    conn.commit()
++    ids = helpers.legacy(conn, [10000, 10000, 50000])
++    for task, origin in zip(ids, [sync_helpers.ME, "two", sync_helpers.ME]):
++        conn.execute("UPDATE tasks SET created_on=? WHERE id=?", (origin, task))
++    conn.commit()
++    rows = [dict(r) for r in conn.execute("SELECT id,priority,created_on,status FROM tasks")]
++    manifest = migration.plan_global(rows, board_id=sync_helpers.BOARD, exceptions=[])
++    data = json.dumps(manifest).encode()
++    attachment = kb.store_attachment_bytes(conn, ids[0], "global.json", data, content_type="application/json")
++    conn.execute("DELETE FROM kanban_sync_outbox")
++    conn.commit()
++    return ids, attachment, hashlib.sha256(data).hexdigest()
++
++
++def test_executor_writes_only_origin_rows_and_captures_normal_outbox(conn):
++    ids, attachment, digest = setup_plan(conn)
++    from hermes_cli import kanban_priority_executor as executor
++    result = executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)
++    assert result["changed"] == 2
++    assert helpers.priorities(conn, ids) == [450, 10000, 900]
++    assert executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)["changed"] == 0
++    outbox = [dict(r) for r in conn.execute("SELECT * FROM kanban_sync_outbox")]
++    assert outbox
++    assert ids[1] not in json.dumps(outbox)
++
++
++@pytest.mark.parametrize("case, reason", [
++    ("missing", "attached manifest required"), ("digest", "digest mismatch"),
++    ("writer", "different writer"), ("shadow", "primary writer"),
++    ("board", "different board"), ("priority", "priorities changed"),
++    ("ownership", "ownership or membership changed"),
++    ("terminal", "ownership or membership changed"),
++    ("new", "ownership or membership changed"),
++])
++def test_executor_refuses_whole_origin_atomically(conn, case, reason):
++    from hermes_cli import kanban_priority_executor as executor
++    ids, attachment, digest = setup_plan(conn)
++    writer = sync_helpers.ME
++    if case == "missing":
++        attachment = -1
++    elif case == "digest":
++        digest = "0" * 64
++    elif case == "writer":
++        writer = "two"
++    elif case == "shadow":
++        conn.execute("UPDATE kanban_sync_state SET mode='shadow'")
++    elif case == "board":
++        conn.execute("UPDATE kanban_sync_state SET board_id='another'")
++    elif case == "priority":
++        conn.execute("UPDATE tasks SET priority=777 WHERE id=?", (ids[2],))
++    elif case == "ownership":
++        conn.execute("UPDATE tasks SET created_on='two' WHERE id=?", (ids[2],))
++    elif case == "terminal":
++        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (ids[2],))
++    elif case == "new":
++        extra = helpers.legacy(conn, [10000])[0]
++        conn.execute("UPDATE tasks SET created_on=? WHERE id=?", (writer, extra))
++    conn.commit()
++    before = helpers.priorities(conn, ids)
++    outbox_before = [tuple(r) for r in conn.execute("SELECT * FROM kanban_sync_outbox")]
++    with pytest.raises(ValueError, match=reason):
++        executor.apply_attached(conn, attachment, digest, writer=writer)
++    assert helpers.priorities(conn, ids) == before
++    assert [tuple(r) for r in conn.execute("SELECT * FROM kanban_sync_outbox")] == outbox_before
++
++
++@pytest.mark.parametrize("context", ["worker", "descendant"])
++def test_worker_boundary_is_not_an_executor(conn, monkeypatch, tmp_path, context):
++    from pathlib import Path
++    from hermes_cli import kanban_priority_executor as executor
++    from agent import delegation_context
++    ids, attachment, digest = setup_plan(conn)
++    old_path = tmp_path / "legacy.json"
++    migration.save_manifest(old_path, migration.plan(conn))
++    before = helpers.priorities(conn, ids)
++    if context == "worker":
++        monkeypatch.setenv("HERMES_KANBAN_TASK", ids[0])
++    else:
++        monkeypatch.setenv(delegation_context.DELEGATED_CHILD_ENV_MARKER, "1")
++        monkeypatch.setenv(delegation_context.DELEGATED_CHILD_OWNER_ENV, delegation_context._owner_token())
++        # The original low-level API remains fenced too. No mocked write fence.
++        with pytest.raises(PermissionError, match="cannot mutate"):
++            migration.apply(conn, Path(old_path))
++    with pytest.raises(PermissionError, match="cannot execute"):
++        executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)
++    assert helpers.priorities(conn, ids) == before
+diff --git a/tests/hermes_cli/test_kanban_priority_global.py b/tests/hermes_cli/test_kanban_priority_global.py
+new file mode 100644
+index 00000000000..42d34a89722
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_global.py
+@@ -0,0 +1,51 @@
++"""Global rank plans preserve cross-origin ties and explicit operator exceptions."""
++import pytest
++
++from hermes_cli import kanban_priority_migration as migration
++
++
++@pytest.mark.parametrize("case, reason", [
++    ("missing", "unresolved exception"), ("duplicates", "duplicate"),
++    ("origin", "origin"), ("priority", "integer"), ("ranks", "distinct"),
++    ("exception_duplicates", "duplicate exception"), ("board", "board identity"),
++])
++def test_global_plan_rejects_ambiguous_inventory(case, reason):
++    rows = [{"id": "a", "priority": 10000, "created_on": "one", "status": "ready"}]
++    exceptions = []
++    board = "board"
++    if case == "missing":
++        exceptions = ["missing"]
++    elif case == "duplicates":
++        rows *= 2
++    elif case == "origin":
++        rows[0]["created_on"] = None
++    elif case == "priority":
++        rows[0]["priority"] = True
++    elif case == "ranks":
++        rows = [{"id": str(i), "priority": i + 1, "created_on": "one", "status": "ready"}
++                for i in range(901)]
++    elif case == "exception_duplicates":
++        exceptions = ["a", "a"]
++    elif case == "board":
++        board = ""
++    with pytest.raises(ValueError, match=reason):
++        migration.plan_global(rows, board_id=board, exceptions=exceptions)
++
++
++def test_global_plan_reserves_exception_bands_and_records_terminal_resolution():
++    rows = [
++        {"id": "a", "priority": 50000, "created_on": "one", "status": "ready"},
++        {"id": "b", "priority": 50000, "created_on": "two", "status": "ready"},
++        {"id": "c", "priority": 70000, "created_on": "two", "status": "ready"},
++        {"id": "operator", "priority": 20002, "created_on": "one", "status": "ready"},
++        {"id": "earlier", "priority": 10300, "created_on": "two", "status": "done"},
++    ]
++    plan = migration.plan_global(rows, board_id="board", exceptions=["earlier", "operator"])
++    by_id = {r["id"]: r for r in plan["rows"]}
++    assert by_id["a"]["new"] == by_id["b"]["new"] < by_id["c"]["new"] < 900
++    assert by_id["operator"] == {"id": "operator", "origin": "one", "old": 20002, "new": 900}
++    assert plan["exceptions"] == [
++        {"id": "earlier", "status": "done", "origin": "two", "old": 10300},
++        {"id": "operator", "status": "ready", "origin": "one", "old": 20002},
++    ]
++    assert "earlier" not in by_id
+-- 
+2.55.0
+

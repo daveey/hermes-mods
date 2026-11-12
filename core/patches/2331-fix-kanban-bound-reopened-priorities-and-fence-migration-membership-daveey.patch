@@ -1,0 +1,160 @@
+From 28984b95b01cf35bf8cecc08fddf8f7eaa2d216b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:54:14 +0000
+Subject: [PATCH] fix(kanban): bound reopened priorities and fence migration
+ membership [daveey]
+
+---
+ docs/kanban-priority-rollout.md               | 11 +++++
+ hermes_cli/kanban_db.py                       |  4 ++
+ hermes_cli/kanban_priority.py                 | 14 ++++++
+ hermes_cli/kanban_priority_migration.py       |  7 ++-
+ .../hermes_cli/test_kanban_priority_reopen.py | 43 +++++++++++++++++++
+ 5 files changed, 77 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_priority_reopen.py
+
+diff --git a/docs/kanban-priority-rollout.md b/docs/kanban-priority-rollout.md
+index c2575070796..5135398f2a7 100644
+--- a/docs/kanban-priority-rollout.md
++++ b/docs/kanban-priority-rollout.md
+@@ -62,6 +62,17 @@ or restart a busy gateway by hand. Use the normal reviewed core-update route.
+    additionally requires `allow_legacy_rollback=True`: this is an explicit rollback
+    of the priority policy and must be coordinated with deployment, not normal
+    editing. No lifecycle state, lease, parent edge or run is reverted.
++   Both apply and undo refuse atomically if any recorded card has become terminal
++   or disappeared. Undo allows newly created cards, leaving them untouched; apply
++   requires exact open membership. Movement among open statuses is safe.
++
++Legacy terminal priorities remain historical until reopened. The shared descendant
++invalidation path bounds the reopened root and every invalidated descendant in the
++same transaction, recording each original value in a `reprioritized` event.
++Review found both omissions because initial tests exercised input edits and value
++CAS, not lifecycle re-entry or membership loss. Five added regressions failed on
++the reviewed head and passed after correction (ancestor/descendant audit plus
++done/archived departures on apply/undo).
+ 
+ Normalization is intentionally not an implicit connection-time migration: clipping
+ before saving originals would destroy the very order the operator asked to retain.
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index cc2c62bc552..3cfcd8f4a04 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3598,11 +3598,14 @@ def invalidate_descendants_for_parent_reopen(
+     Returns ``{"invalidated": [{id, prior_status, new_status, resume_status}],
+     "terminations": [(worker_pid, claim_lock, worker_started_at)]}``.
+     """
++    from hermes_cli.kanban_priority import bound_reopened
++
+     caller_owns_txn = bool(conn.in_transaction)
+     now = int(time.time())
+     invalidated: list[dict[str, Any]] = []
+     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+     with write_txn(conn, allow_nested=True):
++        bound_reopened(conn, task_id)
+         rows = conn.execute(
+             """
+             WITH RECURSIVE descendants(id) AS (
+@@ -3641,6 +3644,7 @@ def invalidate_descendants_for_parent_reopen(
+                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                 "current_run_id = NULL, consecutive_failures = 0, human_request = NULL WHERE id = ?", (row["id"],),
+             )
++            bound_reopened(conn, row["id"])
+             entry = {
+                 "id": row["id"], "prior_status": previous_status,
+                 "new_status": "todo", "resume_status": resume_status,
+diff --git a/hermes_cli/kanban_priority.py b/hermes_cli/kanban_priority.py
+index 79210211799..5afdf58f5da 100644
+--- a/hermes_cli/kanban_priority.py
++++ b/hermes_cli/kanban_priority.py
+@@ -11,6 +11,20 @@ def bounded(value: int) -> int:
+     return min(PRIORITY_CAP, int(value))
+ 
+ 
++def bound_reopened(conn, task_id: str) -> None:
++    """Bound an opened legacy row in the caller's transaction, retaining its audit."""
++    from hermes_cli import kanban_db as kb
++
++    row = conn.execute("SELECT priority FROM tasks WHERE id=? AND status NOT IN ('done','archived')",
++                       (task_id,)).fetchone()
++    if row is None or row[0] <= PRIORITY_CAP:
++        return
++    conn.execute("UPDATE tasks SET priority=? WHERE id=?", (PRIORITY_CAP, task_id))
++    kb._append_event(conn, task_id, "reprioritized", {
++        "previous_priority": row[0], "priority": PRIORITY_CAP, "reason": "legacy priority bounded on reopen",
++    })
++
++
+ def lane_evidence(conn, task_id: str) -> dict:
+     """Compare effective priorities in the same ready/assignee/placement lane.
+ 
+diff --git a/hermes_cli/kanban_priority_migration.py b/hermes_cli/kanban_priority_migration.py
+index 3130efc8752..d423b0d8a25 100644
+--- a/hermes_cli/kanban_priority_migration.py
++++ b/hermes_cli/kanban_priority_migration.py
+@@ -83,9 +83,12 @@ def apply(conn, path: Path, *, undo: bool = False, allow_legacy_rollback: bool =
+                                    (identity["gateway_id"],)).fetchone()
+             if foreign is not None:
+                 raise ValueError("foreign-owned rows require normalization on their origin writer")
++        live_ids = {r[0] for r in conn.execute("SELECT id FROM tasks WHERE status NOT IN ('done','archived')")}
++        recorded_ids = {r["id"] for r in rows}
++        if recorded_ids - live_ids:
++            raise ValueError("open membership changed since snapshot; terminal rows cannot be normalized or undone")
+         if not undo:
+-            live_ids = {r[0] for r in conn.execute("SELECT id FROM tasks WHERE status NOT IN ('done','archived')")}
+-            if live_ids - {r["id"] for r in rows}:
++            if live_ids - recorded_ids:
+                 raise ValueError("new open cards since snapshot; capture a new manifest")
+         current = {r["id"]: conn.execute("SELECT priority FROM tasks WHERE id=?", (r["id"],)).fetchone()
+                    for r in rows}
+diff --git a/tests/hermes_cli/test_kanban_priority_reopen.py b/tests/hermes_cli/test_kanban_priority_reopen.py
+new file mode 100644
+index 00000000000..486cd729647
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_reopen.py
+@@ -0,0 +1,43 @@
++"""Legacy terminal priorities are historical until reopened; migration fences membership."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_operator import reopen_done_task
++from hermes_cli import kanban_priority_migration as migration
++from tests.hermes_cli import test_kanban_parent_first_dispatch as helpers
++
++conn = helpers.conn
++
++
++def test_reopen_bounds_ancestor_and_done_descendant_with_audit(conn):
++    parent = helpers._ready(conn, "parent")
++    child = helpers._ready(conn, "child")
++    kb.link_tasks(conn, parent, child)
++    for task in (parent, child):
++        conn.execute("UPDATE tasks SET status='done', priority=10300 WHERE id=?", (task,))
++    conn.commit()
++    assert kb.get_task(conn, child).priority == 10300
++    assert reopen_done_task(conn, parent, reason="retry", actor="operator") == "ready"
++    for task in (parent, child):
++        assert kb.get_task(conn, task).priority == 1000
++        events = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='reprioritized'", (task,)).fetchall()
++        assert any('10300' in row[0] and '1000' in row[0] for row in events)
++    assert kb.get_task(conn, child).status == "todo"
++
++
++@pytest.mark.parametrize("undo", [False, True])
++@pytest.mark.parametrize("terminal", ["done", "archived"])
++def test_migration_refuses_departed_open_rows_atomically(conn, tmp_path, undo, terminal):
++    ids = [helpers._ready(conn, name) for name in ("one", "two")]
++    for task in ids:
++        kb.edit_task(conn, task, priority=500)
++    path = tmp_path / "manifest.json"
++    migration.save_manifest(path, migration.plan(conn))
++    if undo:
++        migration.apply(conn, path)
++    before = [kb.get_task(conn, task).priority for task in ids]
++    conn.execute("UPDATE tasks SET status=? WHERE id=?", (terminal, ids[1]))
++    conn.commit()
++    with pytest.raises(ValueError, match="open membership"):
++        migration.apply(conn, path, undo=undo)
++    assert [kb.get_task(conn, task).priority for task in ids] == before
+-- 
+2.55.0
+

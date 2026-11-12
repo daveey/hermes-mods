@@ -1,0 +1,699 @@
+From 7026994c9b80916b094add04c640da3131173e3c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:51:20 +0000
+Subject: [PATCH] [daveey] fix(kanban): classify local Desktop owners by scoped
+ creation provenance
+
+---
+ hermes_cli/kanban_chat_links.py               |  27 ++--
+ hermes_cli/kanban_creator_chats.py            |   5 +-
+ hermes_cli/kanban_db_notify.py                |  96 +----------
+ hermes_cli/kanban_session_provenance.py       | 133 ++++++++++++++++
+ .../test_kanban_desktop_local_owners.py       | 149 ++++++++++++++++++
+ .../test_kanban_desktop_local_replica.py      |  38 +++++
+ .../test_kanban_session_provenance.py         |  69 ++++++++
+ tui_gateway/notice_fanout.py                  |  13 +-
+ 8 files changed, 423 insertions(+), 107 deletions(-)
+ create mode 100644 hermes_cli/kanban_session_provenance.py
+ create mode 100644 tests/hermes_cli/test_kanban_desktop_local_owners.py
+ create mode 100644 tests/hermes_cli/test_kanban_desktop_local_replica.py
+ create mode 100644 tests/hermes_cli/test_kanban_session_provenance.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index e6c3564e48d..16593588c48 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -36,10 +36,10 @@ def link_uid(task_id: str, gateway: str, profile: Optional[str], session: str, k
+     return f"{task_id}:{gateway}:{profile or '-'}:{session}:{kind}"
+ 
+ 
+-def _worker_shepherd(session: Any, kind: str) -> bool:
++def _worker_shepherd(session: Any, kind: str, gateway=None, profile=None) -> bool:
+     """A headless execution receipt is provenance, never a chat destination. [daveey]"""
+     from hermes_cli.kanban_db_notify import is_headless_session
+-    return is_headless_session(session)
++    return is_headless_session(session, gateway=gateway, profile=profile)
+ 
+ 
+ def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str, Any]]:
+@@ -47,7 +47,7 @@ def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str,
+ 
+     A machine session of this gateway (``is_machine_session``: a worker/cron/one-shot/subagent transcript) is no
+     chat, so it is never wanted: :func:`reconcile` releases a link to it and never writes one back. [daveey]"""
+-    from hermes_cli.kanban_db_notify import machine_sessions
++    from hermes_cli.kanban_db_notify import is_machine_session, machine_sessions
+     from hermes_cli.kanban_session_activity import _counted_sub_clause
+     now = int(time.time())
+     out: dict[str, dict[str, Any]] = {}
+@@ -68,7 +68,7 @@ def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str,
+             f"WHERE s.platform = 'tui' AND s.chat_id != '' AND {_counted_sub_clause(conn)}")]
+     except sqlite3.Error:  # board predates notify subscriptions
+         shepherds = []
+-    machine = machine_sessions(gateway, [r["chat_session"] for r in created] + [r[1] for r in sessions]
++    machine = machine_sessions(gateway, [r[1] for r in sessions]
+                                + [r[1] for r in shepherds], local_gateway=gateway)
+ 
+     def add(task_id: str, session: str, kind: str, created_at: Any) -> None:
+@@ -80,7 +80,7 @@ def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str,
+                     "chat_session": session, "kind": kind, "released": 0, "created_at": int(created_at or now)}
+ 
+     for row in created:
+-        if not _worker_shepherd(row["chat_session"], row["kind"]) and row["chat_session"] not in machine:
++        if not is_machine_session(gateway, row["chat_session"], profile=row["chat_profile"], local_gateway=gateway):
+             # [daveey] Wanted unreleased, like a ``tasks.session_id`` creator link: creator-chat ownership has no
+             # release on this gateway but the machine/placeholder rules above. Keeping the stored flag let one
+             # foreign reconcile (a named-profile gateway on an older core holding the host sync lock) release it
+@@ -105,10 +105,10 @@ def _ledger_links(board: str, gateway: str) -> dict[str, dict[str, Any]]:
+             continue
+         from hermes_cli.kanban_placement import is_placeholder_session
+         kind = "created" if card.get("via") == "origin" else "shepherd"
+-        if is_placeholder_session(card["session"]) or _worker_shepherd(card["session"], kind):
++        if is_placeholder_session(card["session"]):
+             continue
+         from hermes_cli.kanban_db_notify import is_machine_session
+-        if is_machine_session(gateway, card["session"], local_gateway=gateway):
++        if is_machine_session(gateway, card["session"], local_gateway=gateway, profile=card.get("origin_profile")):
+             continue
+         profile = card.get("origin_profile")
+         uid = link_uid(card["id"], gateway, profile, card["session"], kind)
+@@ -135,7 +135,7 @@ def _owner_written_releases(board: str, gateway: str, want: dict[str, dict[str,
+     no human reads that session, so it owns nothing even on an open card (hub t_01a19864fc42f5b2 was owned by
+     MacBook worker transcript 20261029_180356_84db5f, 2026-11-01)."""
+     from hermes_cli import kanban_sync_client as ksc
+-    from hermes_cli.kanban_db_notify import machine_sessions
++    from hermes_cli.kanban_db_notify import is_machine_session
+     from hermes_cli.kanban_lockguard import connect
+     from hermes_cli.kanban_placement import is_placeholder_session
+     path = ksc.shadow_path(board)
+@@ -156,12 +156,13 @@ def _owner_written_releases(board: str, gateway: str, want: dict[str, dict[str,
+     except sqlite3.Error as exc:  # an unreadable replica releases nothing this round; the next one retries
+         _log.info("kanban chat links: replica %s unreadable for owner-link releases (%s)", path, exc)
+         return {}
+-    machine = machine_sessions(gateway, [r["chat_session"] for r in rows], local_gateway=gateway)
+     out: dict[str, dict[str, Any]] = {}
+     for r in rows:
+-        if r["uid"] in want or is_placeholder_session(r["chat_session"]) or _worker_shepherd(r["chat_session"], "created"):
++        if r["uid"] in want or is_placeholder_session(r["chat_session"]) or _worker_shepherd(
++                r["chat_session"], "created", gateway, r["chat_profile"]):
+             continue
+-        if r.pop("status") not in TERMINAL_STATUSES and r["chat_session"] not in machine:
++        if r.pop("status") not in TERMINAL_STATUSES and not is_machine_session(
++                gateway, r["chat_session"], local_gateway=gateway, profile=r["chat_profile"]):
+             continue
+         out[r["uid"]] = {**r, "released": 1, "created_at": int(r["created_at"] or time.time())}
+     return out
+@@ -179,7 +180,7 @@ def _plan(conn: sqlite3.Connection, board: str, gateway: str, ledger: bool) -> t
+     if ledger:
+         want.update(_ledger_links(board, gateway))
+     want.update(_owner_written_releases(board, gateway, want))
+-    rows = conn.execute("SELECT uid, released, chat_session, kind, task_id FROM task_chat_links "
++    rows = conn.execute("SELECT uid, released, chat_session, kind, task_id, chat_profile FROM task_chat_links "
+                         "WHERE chat_gateway = ?", (gateway,)).fetchall()
+     return want, rows
+ 
+@@ -234,7 +235,7 @@ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: boo
+     # A placement attribution id is not a chat: its link is deleted (captured, so the Board drops it too), never
+     # merely released; a released one still counted in every diff and replica read. A worker transcript's
+     # shepherd link is no chat either (its wakes are refused). [daveey]
+-    placeholders = {r[0] for r in rows if is_placeholder_session(r[2]) or _worker_shepherd(r[2], r[3])}
++    placeholders = {r[0] for r in rows if is_placeholder_session(r[2]) or _worker_shepherd(r[2], r[3], gateway, r[5])}
+     added = changed = released = retired = 0
+     with write_txn(conn):
+         for uid in placeholders - set(want):
+diff --git a/hermes_cli/kanban_creator_chats.py b/hermes_cli/kanban_creator_chats.py
+index 11876c72f7c..d92b62bc004 100644
+--- a/hermes_cli/kanban_creator_chats.py
++++ b/hermes_cli/kanban_creator_chats.py
+@@ -21,7 +21,7 @@ def initialize_ownership(conn, task_id, creator_task_id, parents, created_at, ch
+     from hermes_cli.kanban_chat_links import link_uid
+ 
+     origin = parse_origin(chat_origin) if chat_origin else None
+-    if origin is None or is_headless_session(origin.session):
++    if origin is None or is_headless_session(origin.chat_id):
+         inherit_creator_origin(conn, task_id, creator_task_id, created_at=created_at)
+         _inherit_notify_subs(conn, task_id, parents, created_at=created_at)
+         if origin is not None and not conn.execute(
+@@ -93,7 +93,8 @@ def resolve_chats(conn: sqlite3.Connection, creator_task_id: str) -> list[dict]:
+                 continue
+             seen.add(task_id)
+             for row in _chat_links(conn, task_id):
+-                if (not is_machine_session(row["chat_gateway"], row["chat_session"], local_gateway=me)
++                if (not is_machine_session(row["chat_gateway"], row["chat_session"], local_gateway=me,
++                                           profile=row["chat_profile"])
+                         and not is_placeholder_session(row["chat_session"])):
+                     key = (row["chat_gateway"], row["chat_profile"], row["chat_session"])
+                     owners.setdefault(key, dict(row))
+diff --git a/hermes_cli/kanban_db_notify.py b/hermes_cli/kanban_db_notify.py
+index 564074a23f3..b5e367b40f8 100644
+--- a/hermes_cli/kanban_db_notify.py
++++ b/hermes_cli/kanban_db_notify.py
+@@ -46,91 +46,10 @@ _SCALAR_TYPES = (str, int, float, bool)
+ _SUB_KEY_WHERE = "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?"
+ 
+ 
+-# A ``local-<sha256>`` session id is a headless LOCAL creation receipt (``hermes_state_keys.local_identity``): a
+-# Kanban worker run, cron job or one-shot, never an interactive chat. Its notices are never read and a wake is
+-# refused (``session.resume`` 4132 for workers), so it is never a notify destination. [daveey]
+-_HEADLESS_SESSION = re.compile(r"local-[0-9a-f]{64}")
+-_HEADLESS_GLOB = "local-" + "[0-9a-f]" * 64
+-
+-
+-def is_headless_session(chat_id: Any) -> bool:
+-    """True for a headless receipt session id, bare (``tui``) or ``<gw>/<profile>/<session>`` (``hub``)."""
+-    return bool(_HEADLESS_SESSION.fullmatch(str(chat_id or "").rsplit("/", 1)[-1]))
+-
+-
+-# ``sessions.source`` values of sessions no human reads: Kanban worker runs, cron runs, one-shots, subagents.
+-# Older ones carry ordinary timestamp ids (``20261029_180356_84db5f``), so the id rule above misses them. [daveey]
+-MACHINE_SESSION_SOURCES = frozenset({"kanban", "cron", "oneshot", "subagent"})
+-_MISSING_TTL_S = 300.0
+-# ``(state.db, session) -> (source, cached_at)``. A session's source never changes, so found rows stay cached;
+-# a missing row is re-read after ``_MISSING_TTL_S`` (its session may be created later).
+-_source_cache: dict[tuple[str, str], tuple[Optional[str], float]] = {}
+-
+-
+-def _local_session_sources(sessions: Iterable[str]) -> dict[str, Optional[str]]:
+-    """``sessions.source`` for each id in this gateway's state.db (None when missing or unreadable). Read-only."""
+-    from contextlib import closing
+-    from hermes_constants import get_hermes_home
+-    path = str(get_hermes_home() / "state.db")
+-    now = time.monotonic()
+-    out: dict[str, Optional[str]] = {}
+-    todo = []
+-    for sid in dict.fromkeys(sessions):
+-        hit = _source_cache.get((path, sid))
+-        if hit is not None and (hit[0] is not None or now - hit[1] < _MISSING_TTL_S):
+-            out[sid] = hit[0]
+-        else:
+-            todo.append(sid)
+-    if not todo:
+-        return out
+-    found: dict[str, Optional[str]] = {}
+-    readable = False
+-    if Path(path).exists():
+-        try:
+-            uri = Path(path).as_uri() + "?mode=ro"
+-            with closing(sqlite3.connect(uri, uri=True, timeout=5)) as db:  # noqa: kanban-lockguard (state.db, not a board)
+-                for i in range(0, len(todo), 500):
+-                    chunk = todo[i:i + 500]
+-                    found.update(db.execute(
+-                        f"SELECT id, source FROM sessions WHERE id IN ({','.join('?' * len(chunk))})", chunk))
+-            readable = True
+-        except sqlite3.Error:
+-            pass
+-    for sid in todo:
+-        source = found.get(sid)
+-        out[sid] = str(source) if source is not None else None
+-        if readable:
+-            _source_cache[(path, sid)] = (out[sid], now)
+-    return out
+-
+-
+-def machine_sessions(gateway: Any, sessions: Iterable[Any], *, local_gateway: Optional[str] = None) -> set[str]:
+-    """The ids among ``sessions`` (chats of ``gateway``; bare or ``<gw>/<profile>/<session>``) that are machine
+-    sessions per :func:`is_machine_session`, with one state.db read for the batch."""
+-    ids = {str(s or "") for s in sessions}
+-    out = {s for s in ids if is_headless_session(s) or s.rsplit("/", 1)[-1].startswith("cron_")}
+-    rest = {s: s.rsplit("/", 1)[-1] for s in ids - out if s}
+-    if not rest or not gateway:
+-        return out
+-    if local_gateway is None:
+-        from hermes_cli.kanban_origin import gateway_names
+-        local_gateway = gateway_names()[0]
+-    if not local_gateway or str(gateway) != local_gateway:
+-        return out
+-    sources = _local_session_sources(rest.values())
+-    return out | {s for s, sid in rest.items() if sources.get(sid) in MACHINE_SESSION_SOURCES}
+-
+-
+-def is_machine_session(gateway: Any, session: Any, *, local_gateway: Optional[str] = None) -> bool:
+-    """True when ``session`` (a chat of ``gateway``) is a session no human reads, so never a chat owner:
+-
+-    - a headless receipt id (:func:`is_headless_session`);
+-    - a cron run id (``cron_<job>_<ts>``);
+-    - a session of THIS gateway whose state.db ``sessions.source`` is in :data:`MACHINE_SESSION_SOURCES`.
+-
+-    A missing or unknown session, or one on another gateway (its state.db is not readable here), stays human.
+-    ``local_gateway`` defaults to ``kanban_origin.gateway_names()[0]``; batch callers pass it once. [daveey]"""
+-    return bool(machine_sessions(gateway, (session,), local_gateway=local_gateway))
++# Compatibility exports: provenance is shared by link reconciliation and notice delivery.
++from hermes_cli.kanban_session_provenance import (
++    is_headless_session, is_machine_session, machine_sessions, _source_cache,
++)
+ 
+ 
+ def _sub_key(task_id: str, platform: str, chat_id: str, thread_id: Optional[str]) -> tuple:
+@@ -1107,11 +1026,8 @@ def _owning_sub_clause() -> str:
+     observers = ", ".join(f"'{r}'" for r in OBSERVER_SUB_REASONS)
+     reason = ("CASE WHEN json_valid(s.delivery_metadata) "
+               "THEN json_extract(s.delivery_metadata, '$.reason') END")
+-    # A headless receipt session (worker/cron transcript) is never a destination, whatever its reason: a row
+-    # written before ``add_notify_sub`` refused them must not spread to children (``is_headless_session``).
+-    headless = (f"(s.platform IN ('hub', 'tui') AND (s.chat_id GLOB '{_HEADLESS_GLOB}' "
+-                f"OR s.chat_id GLOB '*/{_HEADLESS_GLOB}'))")
+-    return (f"COALESCE({reason} IN ({observers}), 0) = 0 AND NOT {headless} AND ({reason} IS NOT NULL "
++    # Machine destinations are filtered by _machine_sub_chats: an ID-only SQL veto rejects Desktop too.
++    return (f"COALESCE({reason} IN ({observers}), 0) = 0 AND ({reason} IS NOT NULL "
+             f"OR s.platform != 'hub' OR s.created_at <= COALESCE(p.created_at, 0) + {LEGACY_ORIGIN_BIND_WINDOW_S})")
+ 
+ 
+diff --git a/hermes_cli/kanban_session_provenance.py b/hermes_cli/kanban_session_provenance.py
+new file mode 100644
+index 00000000000..609731774d3
+--- /dev/null
++++ b/hermes_cli/kanban_session_provenance.py
+@@ -0,0 +1,133 @@
++"""Classify chat destinations from gateway/profile-scoped creation provenance.
++
++Local transport hashes identify both interactive chats and headless runs. Unknown
++hashes remain suppressed; a foreign ref never borrows a local session's proof.
++"""
++from __future__ import annotations
++
++from contextlib import closing
++import re
++import sqlite3
++import time
++from pathlib import Path
++from typing import Any, Iterable, Optional
++
++_HEADLESS_SESSION = re.compile(r"local-[0-9a-f]{64}")
++_INTERACTIVE_SOURCES = frozenset({"desktop", "cli", "tui", "acp", "gui"})
++MACHINE_SESSION_SOURCES = frozenset({"kanban", "cron", "oneshot", "subagent"})
++_MISSING_TTL_S = 300.0
++_source_cache: dict[tuple[str, str], tuple[Optional[str], float]] = {}
++
++
++def session_creation_source(row) -> Optional[str]:
++    """Machine provenance wins; local transport alone is not interactive proof."""
++    source, created = row.get("source"), row.get("created_source")
++    if source in MACHINE_SESSION_SOURCES or created in MACHINE_SESSION_SOURCES:
++        return source if source in MACHINE_SESSION_SOURCES else created
++    return created if source == "local" else source
++
++
++def _local_session_sources(sessions: Iterable[str], *, home: Optional[Path] = None) -> dict[str, Optional[str]]:
++    """Read effective creation sources, without creating a store or migrating it."""
++    from hermes_constants import get_hermes_home
++    path = str((home if home is not None else get_hermes_home()) / "state.db")
++    now = time.monotonic()
++    out: dict[str, Optional[str]] = {}
++    todo = []
++    for sid in dict.fromkeys(sessions):
++        hit = _source_cache.get((path, sid))
++        if hit is not None and now - hit[1] < _MISSING_TTL_S:
++            out[sid] = hit[0]
++        else:
++            todo.append(sid)
++    if not todo:
++        return out
++    found: dict[str, Optional[str]] = {}
++    readable = False
++    if Path(path).exists():
++        try:
++            uri = Path(path).as_uri() + "?mode=ro"
++            with closing(sqlite3.connect(uri, uri=True, timeout=5)) as db:  # noqa: kanban-lockguard (state.db)
++                columns = {r[1] for r in db.execute("PRAGMA table_info(sessions)")}
++                created = "created_source" if "created_source" in columns else "NULL"
++                for i in range(0, len(todo), 500):
++                    chunk = todo[i:i + 500]
++                    for sid, source, provenance in db.execute(
++                            f"SELECT id, source, {created} FROM sessions WHERE id IN ({','.join('?' * len(chunk))})", chunk):
++                        found[sid] = session_creation_source({"source": source, "created_source": provenance})
++            readable = True
++        except sqlite3.Error:
++            pass
++    for sid in todo:
++        source = found.get(sid)
++        out[sid] = str(source) if source is not None else None
++        if readable:
++            _source_cache[(path, sid)] = (out[sid], now)
++    return out
++
++
++def _local_homes(profile: Optional[str]) -> list[Path]:
++    """Explicit profiles read only that store; legacy bare board IDs search local profiles.
++
++    Boards and legacy tui subscriptions are host-wide and often omit a profile.
++    Do not bind those rows to whichever profile happens to run reconciliation.
++    """
++    from hermes_constants import get_hermes_home
++    from hermes_cli.profiles import get_active_profile_name, get_profile_dir, list_profile_names
++    active = get_active_profile_name()
++    if profile is not None:
++        try:
++            return [get_hermes_home() if profile == active else get_profile_dir(profile)]
++        except ValueError:
++            return []
++    return list(dict.fromkeys([get_hermes_home(), *(get_profile_dir(p) for p in list_profile_names())]))
++
++
++def scoped_sources(gateway: Any, sessions: Iterable[Any], *, local_gateway=None, profile=None) -> dict[str, Optional[str]]:
++    """No network lookup: foreign/ambiguous provenance is unknown, never human proof."""
++    from hermes_cli.kanban_origin import gateway_names
++    me = local_gateway if local_gateway is not None else gateway_names()[0]
++    grouped: dict[Optional[str], dict[str, str]] = {}
++    out: dict[str, Optional[str]] = {str(s or ""): None for s in sessions}
++    for ref in out:
++        parts = ref.split("/")
++        gw, prof = gateway, profile
++        if len(parts) == 3:
++            gw, prof, sid = parts
++            if (gateway is not None and gateway != gw) or (profile is not None and profile != prof):
++                continue
++        elif len(parts) == 1:
++            sid = ref
++        else:
++            continue
++        if not sid or (gw is not None and (not me or gw != me)):
++            continue
++        grouped.setdefault(prof, {})[ref] = sid
++    for prof, refs in grouped.items():
++        observations = [_local_session_sources(refs.values(), home=home) for home in _local_homes(prof)]
++        for ref, sid in refs.items():
++            sources = {value for row in observations if (value := row.get(sid)) is not None}
++            machine = sources & MACHINE_SESSION_SOURCES
++            # Conflicting profile rows are not affirmative proof (legacy IDs can collide).
++            out[ref] = sorted(machine)[0] if machine else next(iter(sources)) if len(sources) == 1 else None
++    return out
++
++
++def is_headless_session(chat_id: Any, *, gateway=None, profile=None, local_gateway=None) -> bool:
++    """A receipt-shaped destination lacking authoritative interactive provenance."""
++    ref = str(chat_id or "")
++    if not _HEADLESS_SESSION.fullmatch(ref.rsplit("/", 1)[-1]):
++        return False
++    return scoped_sources(gateway, (ref,), local_gateway=local_gateway, profile=profile)[ref] not in _INTERACTIVE_SOURCES
++
++
++def machine_sessions(gateway: Any, sessions: Iterable[Any], *, local_gateway=None, profile=None) -> set[str]:
++    """Known machines plus unknown receipt hashes; preserve legacy ordinary-ID behavior."""
++    sources = scoped_sources(gateway, sessions, local_gateway=local_gateway, profile=profile)
++    return {ref for ref, source in sources.items() if ref.rsplit("/", 1)[-1].startswith("cron_")
++            or source in MACHINE_SESSION_SOURCES
++            or (_HEADLESS_SESSION.fullmatch(ref.rsplit("/", 1)[-1]) and source not in _INTERACTIVE_SOURCES)}
++
++
++def is_machine_session(gateway: Any, session: Any, *, local_gateway=None, profile=None) -> bool:
++    return bool(machine_sessions(gateway, (session,), local_gateway=local_gateway, profile=profile))
+diff --git a/tests/hermes_cli/test_kanban_desktop_local_owners.py b/tests/hermes_cli/test_kanban_desktop_local_owners.py
+new file mode 100644
+index 00000000000..1471ca5afa5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_desktop_local_owners.py
+@@ -0,0 +1,149 @@
++"""Local transport receipt IDs do not establish machine creation provenance."""
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as notify
++from hermes_state import SessionDB
++from tests.tools.test_kanban_worker_created_chats import make_home, WORKER
++
++CHAT = "local-" + "cd" * 32
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = make_home(tmp_path, monkeypatch)
++    monkeypatch.setattr("hermes_cli.kanban_origin.gateway_names", lambda: ("here", {"here", "away"}))
++    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
++    db = SessionDB(db_path=home / "state.db")
++    db.create_session(CHAT, source="desktop")
++    db._conn.execute("UPDATE sessions SET source='local', created_source='desktop' WHERE id=?", (CHAT,))
++    db._conn.commit()
++    db.close()
++    notify._source_cache.clear()
++    return home
++
++
++def test_desktop_hash_is_not_headless(home):
++    assert not notify.is_headless_session(CHAT)
++    assert not notify.is_headless_session(f"here/default/{CHAT}")
++    assert not notify.is_machine_session("here", CHAT)
++    assert notify.is_headless_session(WORKER)
++    assert notify.is_headless_session("local-" + "ef" * 32)
++
++
++@pytest.mark.parametrize("ref", [f"away/default/{CHAT}", f"here/research/{CHAT}"])
++def test_local_row_cannot_prove_foreign_provenance(home, ref):
++    assert notify.is_headless_session(ref)
++    assert notify.is_machine_session(ref.split('/')[0], ref)
++
++
++@pytest.mark.parametrize("via", ["origin", "shepherd"])
++def test_ledger_keeps_desktop_origin_and_shepherd(home, monkeypatch, via):
++    monkeypatch.setattr("hermes_cli.kanban_session_activity._remote_links", lambda: [
++        {"id": "remote-card", "board": "default", "origin_gateway": "here", "origin_profile": "default",
++         "session": CHAT, "via": via, "status": "ready"}])
++    rows = list(links._ledger_links("default", "here").values())
++    assert len(rows) == 1
++    assert rows[0]["chat_session"] == CHAT and rows[0]["released"] == 0
++
++
++def test_ledger_profile_is_not_ambient_profile(home, monkeypatch):
++    monkeypatch.setattr("hermes_cli.kanban_session_activity._remote_links", lambda: [
++        {"id": "remote-card", "board": "default", "origin_gateway": "here", "origin_profile": "research",
++         "session": CHAT, "via": "origin", "status": "ready"}])
++    assert links._ledger_links("default", "here") == {}
++
++
++def test_desktop_subscription_inherits_and_reconciles(home):
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="Desktop parent", session_id=CHAT)
++        notify.add_notify_sub(conn, task_id=parent, platform="tui", chat_id=CHAT,
++                              delivery_metadata={"reason": "create"})
++        assert [s["chat_id"] for s in notify.list_notify_subs(conn, parent)] == [CHAT]
++        child = kb.create_task(conn, title="child", parents=[parent])
++        assert [s["chat_id"] for s in notify.list_notify_subs(conn, child)] == [CHAT]
++        links.reconcile(conn, "default", "here", ledger=False)
++        assert conn.execute("SELECT 1 FROM task_chat_links WHERE task_id=? AND chat_session=? AND released=0",
++                            (parent, CHAT)).fetchone()
++
++
++def test_notice_uses_supplied_store_provenance(home):
++    from tui_gateway.notice_fanout import worker_transcript_reason, WORKER_TRANSCRIPT
++    db = SessionDB(db_path=home / "state.db", read_only=True)
++    try:
++        assert worker_transcript_reason(db, CHAT) is None
++        assert worker_transcript_reason(db, WORKER) == WORKER_TRANSCRIPT
++    finally:
++        db.close()
++
++
++def test_other_profile_reconcile_and_inheritance_retain_desktop(home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="Desktop owner", session_id=CHAT)
++        notify.add_notify_sub(conn, task_id=parent, platform="tui", chat_id=CHAT,
++                              delivery_metadata={"reason": "create"}, notifier_profile="default")
++        links.reconcile(conn, "default", "here", ledger=False)
++        other = home / "profiles" / "research"
++        other.mkdir(parents=True)
++        monkeypatch.setenv("HERMES_HOME", str(other))
++        monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "research")
++        # The same board is reconciled and a child is filed by another local profile.
++        assert not notify.is_headless_session(f"here/default/{CHAT}")
++        result = links.reconcile(conn, "default", "here", ledger=False)
++        assert result["retired"] == 0
++        assert conn.execute("SELECT 1 FROM task_chat_links WHERE task_id=? AND released=0", (parent,)).fetchone()
++        child = kb.create_task(conn, title="other-profile child", parents=[parent])
++        assert [s["chat_id"] for s in notify.list_notify_subs(conn, child)] == [CHAT]
++
++
++@pytest.mark.parametrize("created", ["kanban", "cron", "oneshot", "subagent", "unknown", "local", None])
++def test_local_transport_requires_interactive_provenance(home, created):
++    db = SessionDB(db_path=home / "state.db")
++    try:
++        db._conn.execute("UPDATE sessions SET created_source=? WHERE id=?", (created, CHAT))
++        db._conn.commit()
++    finally:
++        db.close()
++    notify._source_cache.clear()
++    assert notify.is_headless_session(CHAT)
++    assert notify.is_machine_session("here", CHAT)
++
++
++def test_explicit_profile_reads_only_that_profile(home):
++    other = home / "profiles" / "research"
++    other.mkdir(parents=True)
++    db = SessionDB(db_path=other / "state.db")
++    db.create_session(CHAT, source="kanban")
++    db.close()
++    assert notify.is_headless_session(f"here/research/{CHAT}")
++    assert not notify.is_headless_session(f"here/default/{CHAT}")
++    # Unqualified colliding data cannot establish human proof.
++    assert notify.is_headless_session(CHAT)
++
++
++def test_qualified_local_desktop_subscription_and_origin(home):
++    from hermes_cli import kanban_creator_chats
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="qualified parent")
++        notify.add_notify_sub(conn, task_id=parent, platform="hub", chat_id=f"here/default/{CHAT}",
++                              delivery_metadata={"reason": "origin"})
++        child = kb.create_task(conn, title="qualified child", parents=[parent])
++        assert [s["chat_id"] for s in notify.list_notify_subs(conn, child)] == [f"here/default/{CHAT}"]
++        kanban_creator_chats.initialize_ownership(conn, child, None, [], 1, f"@session:default@here/{CHAT}")
++        assert conn.execute("SELECT 1 FROM task_chat_links WHERE task_id=? AND chat_session=? AND released=0",
++                            (child, CHAT)).fetchone()
++
++
++def test_notice_does_not_use_ambient_profile(home):
++    from tui_gateway.notice_fanout import worker_transcript_reason, WORKER_TRANSCRIPT
++    other = home / "profiles" / "research"
++    other.mkdir(parents=True)
++    db = SessionDB(db_path=other / "state.db")
++    db.create_session(CHAT, source="kanban")
++    try:
++        assert not notify.is_headless_session(f"here/default/{CHAT}")
++        assert worker_transcript_reason(db, CHAT) == WORKER_TRANSCRIPT
++    finally:
++        db.close()
+diff --git a/tests/hermes_cli/test_kanban_desktop_local_replica.py b/tests/hermes_cli/test_kanban_desktop_local_replica.py
+new file mode 100644
+index 00000000000..c920523617c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_desktop_local_replica.py
+@@ -0,0 +1,38 @@
++"""Local Desktop provenance survives ledger reconciliation into replica API/count views."""
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as notify
++from hermes_state import SessionDB
++from tests.hermes_cli import test_kanban_chat_links_parity as parity
++
++CHAT = "local-" + "cd" * 32
++env = parity.env
++
++
++@pytest.mark.parametrize("via", ["origin", "shepherd"])
++def test_desktop_ledger_link_reaches_task_list_and_active_count(env, monkeypatch, via):
++    monkeypatch.setattr("hermes_cli.kanban_origin.gateway_names", lambda: (parity.ME, {parity.ME, parity.HUB}))
++    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
++    db = SessionDB(db_path=env["home"] / "state.db")
++    db.create_session(CHAT, source="desktop")
++    assert db._conn is not None
++    db._conn.execute("UPDATE sessions SET source='local', created_source='desktop' WHERE id=?", (CHAT,))
++    db._conn.commit()
++    db.close()
++    notify._source_cache.clear()
++    env["ledger"].append({"id": "t_remote", "board": "default", "gateway": parity.HUB, "profile": "default",
++                          "origin_gateway": parity.ME, "origin_profile": "default", "session": CHAT,
++                          "via": via, "status": "ready", "unfinished": True})
++    with kbc.connect_closing(env["home"] / "kanban.db") as conn:
++        links.reconcile(conn, "default", parity.ME)
++        rows = [tuple(r) for r in conn.execute(
++            "SELECT task_id, chat_session, kind, released FROM task_chat_links WHERE task_id='t_remote'")]
++        assert rows == [("t_remote", CHAT, "created" if via == "origin" else "shepherd", 0)]
++        assert conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='task_chat_links'").fetchone()
++    # Read back the actual reconciled link shape through the shared replica consumer.
++    parity.replica(env, [("t_remote", "ready", parity.HUB)], rows)
++    annotated, tasks = parity.assert_parity(CHAT, expect=1)
++    assert annotated["kanban_active"] == 1
++    assert [(t["id"], t["status"], t["source"]) for t in tasks] == [("t_remote", "ready", "replica")]
+diff --git a/tests/hermes_cli/test_kanban_session_provenance.py b/tests/hermes_cli/test_kanban_session_provenance.py
+new file mode 100644
+index 00000000000..a27710ef07f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_session_provenance.py
+@@ -0,0 +1,69 @@
++"""Fail-closed provenance boundaries independent of board state."""
++import sqlite3
++from contextlib import closing
++
++import pytest
++
++from hermes_cli import kanban_session_provenance as provenance
++
++
++@pytest.mark.parametrize("surface", ["desktop", "cli", "tui", "gui", "acp"])
++def test_interactive_local_surfaces(surface):
++    assert provenance.session_creation_source({"source": "local", "created_source": surface}) == surface
++    assert surface in provenance._INTERACTIVE_SOURCES
++
++
++@pytest.mark.parametrize("source,created,expected", [
++    ("kanban", "desktop", "kanban"), ("desktop", "cron", "cron"), ("local", "oneshot", "oneshot"),
++    ("local", "subagent", "subagent"), ("desktop", None, "desktop"), ("local", None, None),
++])
++def test_machine_creation_wins(source, created, expected):
++    assert provenance.session_creation_source({"source": source, "created_source": created}) == expected
++
++
++@pytest.mark.parametrize("ref,gateway,profile", [
++    ("here/default/sid", "away", None), ("here/default/sid", "here", "research"),
++    ("away/default/sid", None, None), ("here/default/sid/extra", None, None),
++    ("here/sid", None, None), ("sid", "", None), ("", None, None),
++])
++def test_foreign_malformed_and_conflicting_refs_never_read_local_store(monkeypatch, ref, gateway, profile):
++    def forbidden(*args, **kwargs):
++        pytest.fail("foreign ref attempted local provenance lookup")
++    monkeypatch.setattr(provenance, "_local_homes", forbidden)
++    assert provenance.scoped_sources(gateway, [ref], profile=profile, local_gateway="here") == {ref: None}
++
++
++def test_legacy_store_and_cache_expiry(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    path = home / "state.db"
++    with closing(sqlite3.connect(path)) as db:
++        db.execute("CREATE TABLE sessions(id TEXT, source TEXT)")
++        db.execute("INSERT INTO sessions VALUES ('sid','desktop')")
++        db.commit()
++    now = [1.0]
++    monkeypatch.setattr(provenance.time, "monotonic", lambda: now[0])
++    provenance._source_cache.clear()
++    assert provenance._local_session_sources(["sid", "missing"], home=home) == {"sid": "desktop", "missing": None}
++    with closing(sqlite3.connect(path)) as db:
++        db.execute("UPDATE sessions SET source='kanban'")
++        db.commit()
++    assert provenance._local_session_sources(["sid"], home=home) == {"sid": "desktop"}
++    now[0] += provenance._MISSING_TTL_S + 1
++    assert provenance._local_session_sources(["sid"], home=home) == {"sid": "kanban"}
++
++
++def test_missing_and_unreadable_store_are_unknown_without_creation(tmp_path):
++    provenance._source_cache.clear()
++    assert provenance._local_session_sources(["sid"], home=tmp_path) == {"sid": None}
++    assert not (tmp_path / "state.db").exists()
++    (tmp_path / "state.db").write_text("not sqlite")
++    assert provenance._local_session_sources(["sid"], home=tmp_path) == {"sid": None}
++    assert not provenance._source_cache
++
++
++def test_empty_batch_does_not_open_store(tmp_path, monkeypatch):
++    def forbidden(*args, **kwargs):
++        pytest.fail("empty batch opened a connection")
++    monkeypatch.setattr(provenance.sqlite3, "connect", forbidden)
++    assert provenance._local_session_sources([], home=tmp_path) == {}
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index fee3c822615..3c70a372e7c 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -69,8 +69,17 @@ def worker_transcript_reason(db: Any, chat_id: str) -> Optional[str]:
+ 
+     Hub card t_a989e5e0 (2026-10-31): five MacBook worker transcripts of another card held shepherd subs on it, so
+     its done notice was written into all five and each wake was refused. Never raises (unknown = a chat)."""
+-    from hermes_cli.kanban_db_notify import is_headless_session
+-    if is_headless_session(chat_id):
++    from hermes_cli.kanban_session_provenance import _HEADLESS_SESSION, _INTERACTIVE_SOURCES, session_creation_source
++    from hermes_cli.kanban_session_provenance import MACHINE_SESSION_SOURCES
++    # The supplied store is the destination authority, not the process's ambient profile.
++    read = getattr(db, "get_session", None)
++    try:
++        row = read(chat_id) if read is not None else None
++    except sqlite3.Error:
++        row = None
++    source = session_creation_source(dict(row)) if isinstance(row, (dict, sqlite3.Row)) else None
++    if source in MACHINE_SESSION_SOURCES or (
++            _HEADLESS_SESSION.fullmatch(chat_id) and source not in _INTERACTIVE_SOURCES):
+         return WORKER_TRANSCRIPT
+     probe = getattr(db, "is_kanban_owned_session", None)
+     try:
+-- 
+2.55.0
+

@@ -1,0 +1,201 @@
+From 20ceba88d4bed7620698081808e513b07754ec58 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:08:17 +0000
+Subject: [PATCH] [daveey] Preserve resolved shell init on config read failures
+
+Cache every successful shell-init policy read and warn once per exception type/message when falling back. Keep first-read defaults explicit rather than silently substituting startup semantics.
+
+Proof: parent b12b7ea426e7: 2 passed / 8 failed; fixed: 35 passed across shell-init, login PATH and isolated HTTP readback suites. Real localhost 503 reproduction covers snapshot and login fallback. Four condition mutants killed.
+---
+ .../test_local_shell_init_config_failure.py   | 134 ++++++++++++++++++
+ tools/environments/local.py                   |  26 +++-
+ 2 files changed, 155 insertions(+), 5 deletions(-)
+ create mode 100644 tests/tools/test_local_shell_init_config_failure.py
+
+diff --git a/tests/tools/test_local_shell_init_config_failure.py b/tests/tools/test_local_shell_init_config_failure.py
+new file mode 100644
+index 00000000000..9c194348a84
+--- /dev/null
++++ b/tests/tools/test_local_shell_init_config_failure.py
+@@ -0,0 +1,134 @@
++"""Last-known shell startup policy and observable config-read failures (#1107)."""
++
++import logging
++import threading
++from http.server import BaseHTTPRequestHandler, HTTPServer
++from unittest.mock import patch
++
++import pytest
++
++from tools.environments import local
++
++
++@pytest.fixture(autouse=True)
++def isolated_shell_init_cache(monkeypatch):
++    monkeypatch.setattr(local, "_shell_init_config_cache", None, raising=False)
++    monkeypatch.setattr(local, "_shell_init_config_warned", set(), raising=False)
++
++
++def test_read_error_keeps_previous_shell_init(caplog):
++    with patch("hermes_cli.config.load_config", return_value={
++        "terminal": {"shell_init_files": ["/custom/init.sh"], "auto_source_bashrc": False},
++    }):
++        assert local._read_terminal_shell_init_config() == (["/custom/init.sh"], False)
++    with patch("hermes_cli.config.load_config", side_effect=OSError("injected config read failure")):
++        assert local._read_terminal_shell_init_config() == (["/custom/init.sh"], False)
++    assert "OSError: injected config read failure" in caplog.text
++    assert "previously resolved shell init is kept" in caplog.text
++    assert caplog.records[-1].levelno == logging.WARNING
++
++
++def test_first_read_error_warns_about_default_home_profiles(caplog):
++    with patch("hermes_cli.config.load_config", side_effect=OSError("injected config read failure")):
++        assert local._read_terminal_shell_init_config() == ([], True)
++    assert "OSError: injected config read failure" in caplog.text
++    assert "configured shell init was not applied" in caplog.text
++    assert "default home profiles are sourced instead" in caplog.text
++    assert caplog.records[-1].levelno == logging.WARNING
++
++
++def test_warning_once_per_exception_type_and_message(caplog):
++    for error in [OSError("one"), OSError("one"), OSError("two"), ValueError("one")]:
++        with patch("hermes_cli.config.load_config", side_effect=error):
++            local._read_terminal_shell_init_config()
++    warnings = [r for r in caplog.records if r.name == local.__name__]
++    assert len(warnings) == 3
++    assert all(r.levelno == logging.WARNING for r in warnings)
++
++
++@pytest.mark.parametrize("files,auto", [(["new.sh", None, 17], False), ([], False), ("bad", True)])
++def test_success_refreshes_cache_without_changing_normalization(files, auto, caplog):
++    with patch("hermes_cli.config.load_config", return_value={"terminal": {"shell_init_files": ["old.sh"]}}):
++        local._read_terminal_shell_init_config()
++    expected = ([str(f) for f in files if f] if isinstance(files, list) else [], auto)
++    with patch("hermes_cli.config.load_config", return_value={
++        "terminal": {"shell_init_files": files, "auto_source_bashrc": auto},
++    }):
++        result = local._read_terminal_shell_init_config()
++        assert result == expected
++        result[0].append("caller-mutation.sh")
++    with patch("hermes_cli.config.load_config", side_effect=OSError("failed")):
++        assert local._read_terminal_shell_init_config() == expected
++    assert "previously resolved shell init is kept" in caplog.text
++
++
++@pytest.fixture
++def unavailable_app():
++    requests = []
++
++    class Handler(BaseHTTPRequestHandler):
++        def do_GET(self):
++            requests.append(self.path)
++            self.send_response(503)
++            self.end_headers()
++
++        def log_message(self, format, *args):
++            pass
++
++    server = HTTPServer(("127.0.0.1", 0), Handler)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    try:
++        yield f"http://127.0.0.1:{server.server_port}/requested", requests
++    finally:
++        server.shutdown()
++        thread.join(timeout=5)
++        server.server_close()
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("read_fails", [False, True])
++@pytest.mark.parametrize("snapshot_fallback", [False, True])
++def test_real_startup_keeps_configured_shell_function(
++    tmp_path, monkeypatch, caplog, read_fails, snapshot_fallback, unavailable_app,
++):
++    """The injected #1107 OSError must not silently replace configured commands."""
++    init = tmp_path / "custom.sh"
++    init.write_text('/usr/bin/curl() { printf 200; }\nexport -f /usr/bin/curl\n')
++    monkeypatch.setenv("HOME", str(tmp_path))
++    monkeypatch.delenv("BASH_ENV", raising=False)
++    config = {"terminal": {"shell_init_files": [str(init)], "auto_source_bashrc": False}}
++    with patch("hermes_cli.config.load_config", return_value=config):
++        assert local._resolve_shell_init_files() == [str(init)]
++    # Restrict injection to the shell-init read, leaving unrelated config consumers intact.
++    read = local._read_terminal_shell_init_config
++    def controlled_read():
++        with patch("hermes_cli.config.load_config", return_value=config,
++                   side_effect=OSError("injected config read failure") if read_fails else None):
++            return read()
++    monkeypatch.setattr(local, "_read_terminal_shell_init_config", controlled_read)
++    if snapshot_fallback:
++        # Force bootstrap failure before spawning; then exercise real login fallback.
++        monkeypatch.setattr(local.LocalEnvironment, "_snapshot_script_kwargs",
++                            lambda self, cwd: dict(quoted_cwd="/", quoted_snap="/dev/null/not-a-file",
++                                                   snap_tmp_template="/dev/null/not-a-file", cwd_marker=self._cwd_marker))
++        monkeypatch.setattr(local.LocalEnvironment, "_probe_nonlogin_fallback", lambda self, detail: (False, detail))
++    url, requests = unavailable_app
++    command = f'/usr/bin/curl -q --noproxy "*" --max-time 5 -s -o /dev/null -w "%{{http_code}}" {url}'
++    env = local.LocalEnvironment(cwd=str(tmp_path), timeout=15)
++    try:
++        assert env._snapshot_ready is not snapshot_fallback
++        result = env.execute(command)
++        assert result["returncode"] == 0
++        assert result["output"].strip() == "200"
++        assert requests == []
++        # Bypassing the function reaches the real application: it really is 503.
++        ordinary = env.execute("command " + command)
++        assert ordinary["returncode"] == 0
++        assert ordinary["output"].strip() == "503"
++        assert requests == ["/requested"]
++    finally:
++        env.cleanup()
++    if read_fails:
++        assert "OSError: injected config read failure" in caplog.text
++        assert "previously resolved shell init is kept" in caplog.text
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index 72a491d9b67..379e50e54ad 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -836,18 +836,34 @@ _hermes_site_packages: list[Path] | None = None  # lazily cached by local_python
+ 
+ 
+ # --- Login-shell init files ---
++_shell_init_config_cache: tuple[tuple[str, ...], bool] | None = None
++_shell_init_config_warned: set[tuple[type[Exception], str]] = set()
++
++
+ def _read_terminal_shell_init_config() -> tuple[list[str], bool]:
+-    """(shell_init_files, auto_source_bashrc) from config.yaml; defaults on any
+-    failure so terminal execution never breaks."""
++    """Read startup policy, retaining the last successful process-local resolution on failure."""
++    global _shell_init_config_cache
+     try:
+         from hermes_cli.config import load_config
+         terminal_cfg = (load_config() or {}).get("terminal") or {}
+         files = terminal_cfg.get("shell_init_files") or []
+         if not isinstance(files, list):
+             files = []
+-        return [str(f) for f in files if f], bool(terminal_cfg.get("auto_source_bashrc", True))
+-    except Exception:
+-        return [], True
++        resolved = (tuple(str(f) for f in files if f), bool(terminal_cfg.get("auto_source_bashrc", True)))
++    except Exception as exc:
++        resolved = _shell_init_config_cache
++        key = (type(exc), str(exc))
++        if key not in _shell_init_config_warned:
++            _shell_init_config_warned.add(key)
++            detail = ("previously resolved shell init is kept" if resolved is not None else
++                      "configured shell init was not applied; default home profiles are sourced instead")
++            logger.warning("Shell init config read failed (%s: %s); %s", type(exc).__name__, str(exc), detail,
++                           exc_info=True)
++        if resolved is None:
++            return [], True
++    else:
++        _shell_init_config_cache = resolved
++    return list(resolved[0]), resolved[1]
+ 
+ 
+ def _resolve_shell_init_files() -> list[str]:
+-- 
+2.55.0
+

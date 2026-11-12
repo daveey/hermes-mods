@@ -1,0 +1,157 @@
+From c2db2cc27f7677c5f8d93d8fffd8a96f3ff66cb6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:26:53 +0000
+Subject: [PATCH] [daveey] ci: preserve final-comment contract and fail closed
+ on incomplete snapshots
+
+---
+ scripts/ci/batch_review_comments.py    | 11 +++++----
+ scripts/ci/live_comment.py             | 17 +++++++++++---
+ tests/ci/test_batch_review_comments.py | 32 ++++++++++++++++++++++++++
+ 3 files changed, 53 insertions(+), 7 deletions(-)
+
+diff --git a/scripts/ci/batch_review_comments.py b/scripts/ci/batch_review_comments.py
+index 7cce3bfbe0a..6d905ad4c07 100644
+--- a/scripts/ci/batch_review_comments.py
++++ b/scripts/ci/batch_review_comments.py
+@@ -76,14 +76,15 @@ def select_ci_run(runs: list[dict], head_sha: str) -> dict | None:
+     return best
+ 
+ 
+-def snapshot_commit_info(pr: dict, run: dict, repo: str, now: datetime) -> str:
++def snapshot_commit_info(pr: dict, run: dict, repo: str, now: datetime, *, completed: bool = False) -> str:
+     sha = run["head_sha"]
+     url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/pull/{pr['number']}/commits/{sha}"
+     msg = ((run.get("head_commit") or {}).get("message") or "").split("\n")[0][:60]
+     tail = f" — {msg}" if msg else ""
+     stamp = now.strftime("%Y-%m-%d %H:%M UTC")
++    phase = "ran on" if completed else "running on"
+     return (
+-        f"<sub>snapshot of [{sha[:7]}]({url}){tail} · taken {stamp}; "
++        f"<sub>snapshot of CI; {phase} [{sha[:7]}]({url}){tail} · taken {stamp}; "
+         f"refreshed hourly, not live</sub>"
+     )
+ 
+@@ -93,7 +94,7 @@ def build_snapshot(token: str, repo: str, pr: dict, run: dict, now: datetime) ->
+     jobs, runs_completed = lc.collect_run_jobs(token, repo, str(run["id"]), watch)
+     completed, pending, job_urls = lc.classify_jobs(jobs)
+     by_check, check_urls = lc.split_failed_steps(jobs, completed, job_urls)
+-    statuses = lc.fetch_all_review_statuses(token, repo, str(run["id"]))
++    statuses = lc.fetch_all_review_statuses(token, repo, str(run["id"]), strict=True)
+     return lc.build_comment_body(
+         lc._import_assembler(),
+         by_check,
+@@ -101,7 +102,7 @@ def build_snapshot(token: str, repo: str, pr: dict, run: dict, now: datetime) ->
+         run.get("html_url", ""),
+         check_urls,
+         json.dumps(statuses) if statuses else "",
+-        snapshot_commit_info(pr, run, repo, now),
++        snapshot_commit_info(pr, run, repo, now, completed=runs_completed),
+         waiting=not runs_completed,
+     )
+ 
+@@ -119,6 +120,8 @@ def process_pr(token: str, repo: str, pr: dict, now: datetime) -> str:
+     run = select_ci_run(runs, sha)
+     if run is None:
+         return "skipped:no CI run on head"
++    if run.get("status") == "completed" and run.get("conclusion") not in {"success", "failure"}:
++        return "skipped:CI cancelled or incomplete"
+     body = build_snapshot(token, repo, pr, run, now)
+ 
+     # Head race: re-read the PR right before writing.
+diff --git a/scripts/ci/live_comment.py b/scripts/ci/live_comment.py
+index e8a622f7aa9..6b719fd25ff 100644
+--- a/scripts/ci/live_comment.py
++++ b/scripts/ci/live_comment.py
+@@ -464,7 +464,7 @@ def _parse_status_file(status_file: Path) -> list[dict]:
+ 
+ 
+ def fetch_all_review_statuses(
+-    token: str, repo: str, run_id: str,
++    token: str, repo: str, run_id: str, *, strict: bool = False,
+ ) -> list[dict]:
+     """Fetch and merge all review-status artifacts from the run.
+ 
+@@ -475,7 +475,8 @@ def fetch_all_review_statuses(
+     status-producing job.
+ 
+     Returns the merged list of ``{source, results: [...]}`` objects.
+-    Artifacts that don't exist yet or fail to parse are silently skipped.
++    In strict snapshot mode, collection errors refuse publication instead of
++    erasing prior review sections. Artifacts not uploaded yet remain absent.
+     """
+     all_statuses: list[dict] = []
+     temp_base = Path(tempfile.gettempdir()) / "review-status-artifacts"
+@@ -483,6 +484,8 @@ def fetch_all_review_statuses(
+     try:
+         artifacts = _list_artifacts(token, repo, run_id)
+     except Exception:
++        if strict:
++            raise
+         return all_statuses
+ 
+     rs_artifacts = [
+@@ -501,8 +504,16 @@ def fetch_all_review_statuses(
+     for artifact in rs_artifacts:
+         status_file = _download_artifact(token, repo, artifact, run_dl_dir)
+         if status_file is None:
++            if strict:
++                raise RuntimeError("review-status artifact download failed")
+             continue
+-        statuses = _parse_status_file(status_file)
++        if strict:
++            content = status_file.read_text().strip().removeprefix("review_status=")
++            statuses = json.loads(content)
++            if not isinstance(statuses, list) or not all(isinstance(s, dict) for s in statuses):
++                raise ValueError("invalid review-status artifact")
++        else:
++            statuses = _parse_status_file(status_file)
+         all_statuses.extend(statuses)
+ 
+     # A re-run can leave several non-expired artifacts with the same name,
+diff --git a/tests/ci/test_batch_review_comments.py b/tests/ci/test_batch_review_comments.py
+index da57d7d18b6..56aa62c8a5e 100644
+--- a/tests/ci/test_batch_review_comments.py
++++ b/tests/ci/test_batch_review_comments.py
+@@ -149,6 +149,38 @@ def test_main_requires_env(monkeypatch):
+     assert b.main() == 1
+ 
+ 
++@pytest.mark.parametrize("conclusion", ["cancelled", "timed_out", "action_required", "neutral", "skipped"])
++def test_incomplete_run_never_overwrites_comment(monkeypatch, conclusion):
++    prs = [_pr(1, "a")]
++    run = _run(1, "a", "t") | {"status": "completed", "conclusion": conclusion}
++    f = Fake(monkeypatch, prs, {"a": [run]}, fresh=_fresh(prs))
++    assert b.run_batch("t", REPO, NOW) == 0
++    assert f.posted == {}
++
++
++def test_final_snapshot_preserves_ship_footer_contract(monkeypatch):
++    prs = [_pr(1, "a")]
++    run = _run(1, "a", "t") | {"status": "completed", "conclusion": "success"}
++    f = Fake(monkeypatch, prs, {"a": [run]}, fresh=_fresh(prs))
++    assert b.run_batch("t", REPO, NOW) == 0
++    assert "ran on [a]" in f.posted["1"]
++
++
++def test_artifact_listing_error_is_not_clean_snapshot(monkeypatch):
++    def fail(*args):
++        raise OSError("artifact API unavailable")
++    monkeypatch.setattr(b.lc, "_list_artifacts", fail)
++    with pytest.raises(OSError):
++        b.lc.fetch_all_review_statuses("t", REPO, "1", strict=True)
++
++
++def test_artifact_download_error_is_not_clean_snapshot(monkeypatch):
++    monkeypatch.setattr(b.lc, "_list_artifacts", lambda *args: [{"name": "review-status-test"}])
++    monkeypatch.setattr(b.lc, "_download_artifact", lambda *args: None)
++    with pytest.raises(RuntimeError):
++        b.lc.fetch_all_review_statuses("t", REPO, "1", strict=True)
++
++
+ def test_workflow_shape():
+     yaml = pytest.importorskip("hermes_yaml")
+     doc = yaml.safe_load((Path(__file__).resolve().parents[2] / ".github/workflows/ci-review-comment.yml").read_text())
+-- 
+2.55.0
+

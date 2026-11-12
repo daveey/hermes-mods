@@ -1,0 +1,352 @@
+From 9e5140d95c208a28ac2bd8c9a7be829e73d128ac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:04:40 +0000
+Subject: [PATCH] fix(kanban): reuse guarded replica reader within creator
+ backfill [daveey]
+
+---
+ hermes_cli/kanban_creator_chats.py            |  85 +++++---
+ .../test_kanban_backfill_replica_budget.py    | 202 ++++++++++++++++++
+ 2 files changed, 258 insertions(+), 29 deletions(-)
+ create mode 100644 tests/tools/test_kanban_backfill_replica_budget.py
+
+diff --git a/hermes_cli/kanban_creator_chats.py b/hermes_cli/kanban_creator_chats.py
+index d92b62bc004..ed0f7b48058 100644
+--- a/hermes_cli/kanban_creator_chats.py
++++ b/hermes_cli/kanban_creator_chats.py
+@@ -128,36 +128,61 @@ def _copy_delivery(conn: sqlite3.Connection, task_id: str, owner: dict) -> None:
+         (task_id, task_id, owner["task_id"], hub_chat, owner["chat_session"]))
+ 
+ 
+-def _replica_chats(conn: sqlite3.Connection, creator_task_id: str) -> list[dict]:
+-    """``resolve_chats`` on this board's replica (``sync-shadow/<board>.db``, the whole board).
++class _ReplicaReader:
++    """One lazy guarded handle per repair pass, never cached ownership or misses.
+ 
+-    A worker node runs another gateway's card from a copy in its live file: the copy carries no chat links, and its
+-    creator chain lives only in the replica, so a card that worker files would resolve nothing here. Read-only;
+-    [] when the board has no replica or it cannot be read.
++    Backfill must retry even terminal cards: a creator's human link can arrive late.
++    Reusing setup, rather than skipping candidates, bounds opens without hiding those arrivals.
++    The next pass always opens anew (including after a missing or replaced replica).
+     """
+-    from pathlib import Path
+-    from hermes_cli import kanban_db_sync as sync
+-    from hermes_cli.kanban_sync_client import shadow_path
+-    key = sync._db_key(conn)
+-    if not key or Path(key).parent.name in (sync.SHADOW_DIR, sync.LINKS_DIR):
+-        return []
+-    path = shadow_path(sync.board_slug_for_path(key))
+-    try:
+-        if not path.exists() or path.resolve() == Path(key).resolve():
+-            return []
++
++    def __init__(self, conn: sqlite3.Connection):
++        self.conn = conn
++        self.replica = None
++        self.attempted = False
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        if self.replica is not None:
++            self.replica.close()
++
++    def _open(self):
++        from pathlib import Path
++        from hermes_cli import kanban_db_sync as sync
++        from hermes_cli.kanban_sync_client import shadow_path
+         from hermes_cli import kanban_lockguard
++
++        key = sync._db_key(self.conn)
++        if not key or Path(key).parent.name in (sync.SHADOW_DIR, sync.LINKS_DIR):
++            return
++        path = shadow_path(sync.board_slug_for_path(key))
++        if not path.exists() or path.resolve() == Path(key).resolve():
++            return
+         replica = kanban_lockguard.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+-    except (OSError, sqlite3.Error):
+-        return []
+-    try:
+-        replica.row_factory = sqlite3.Row
+-        if not replica.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++        try:
++            replica.row_factory = sqlite3.Row
++            if replica.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++                self.replica = replica
++        finally:
++            if self.replica is None:
++                replica.close()
++
++    def resolve(self, creator_task_id: str) -> list[dict]:
++        try:
++            if not self.attempted:
++                self.attempted = True
++                self._open()
++            return resolve_chats(self.replica, creator_task_id) if self.replica is not None else []
++        except (OSError, sqlite3.Error):
+             return []
+-        return resolve_chats(replica, creator_task_id)
+-    except sqlite3.Error:
+-        return []
+-    finally:
+-        replica.close()
++
++
++def _replica_chats(conn: sqlite3.Connection, creator_task_id: str) -> list[dict]:
++    """Standalone creation uses the same reader, scoped to this single lookup."""
++    with _ReplicaReader(conn) as reader:
++        return reader.resolve(creator_task_id)
+ 
+ 
+ def _owner_delivery(conn: sqlite3.Connection, task_id: str, owner: dict) -> None:
+@@ -175,7 +200,8 @@ def _owner_delivery(conn: sqlite3.Connection, task_id: str, owner: dict) -> None
+         (task_id, platform, chat_id, json.dumps({"reason": "create"}), task_id))
+ 
+ 
+-def inherit_chats(conn: sqlite3.Connection, task_id: str, creator_task_id: str) -> None:
++def inherit_chats(conn: sqlite3.Connection, task_id: str, creator_task_id: str,
++                  *, replica_reader: _ReplicaReader | None = None) -> None:
+     """Copy a creator's real chat links inside the card creation transaction."""
+     from hermes_cli.kanban_chat_links import link_uid
+     from hermes_cli.kanban_db import _append_event
+@@ -183,7 +209,8 @@ def inherit_chats(conn: sqlite3.Connection, task_id: str, creator_task_id: str)
+         return
+     owners, source = resolve_chats(conn, creator_task_id), None
+     if not owners:
+-        owners = _replica_chats(conn, creator_task_id)
++        owners = (replica_reader.resolve(creator_task_id) if replica_reader is not None
++                  else _replica_chats(conn, creator_task_id))
+         source = "replica" if owners else None
+     if not owners:
+         if not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='creator_chats_unresolved'",
+@@ -214,7 +241,7 @@ def backfill(conn: sqlite3.Connection) -> dict:
+         "AND e.kind='created' WHERE NOT EXISTS (SELECT 1 FROM task_events done WHERE done.task_id=t.id "
+         "AND done.kind='creator_chats_resolved')").fetchall()
+     attempted, unresolved = [], []
+-    with write_txn(conn):
++    with _ReplicaReader(conn) as replica_reader, write_txn(conn):
+         for row in rows:
+             if row["session_id"] and not (is_headless_session(row["session_id"])
+                                           or is_placeholder_session(row["session_id"])):
+@@ -222,7 +249,7 @@ def backfill(conn: sqlite3.Connection) -> dict:
+             creator = json.loads(row["payload"] or "{}").get("creator_task_id")
+             if not creator:
+                 continue
+-            inherit_chats(conn, row["id"], creator)
++            inherit_chats(conn, row["id"], creator, replica_reader=replica_reader)
+             attempted.append(row["id"])
+             if not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='creator_chats_resolved'",
+                                 (row["id"],)).fetchone():
+diff --git a/tests/tools/test_kanban_backfill_replica_budget.py b/tests/tools/test_kanban_backfill_replica_budget.py
+new file mode 100644
+index 00000000000..be7b5bb1646
+--- /dev/null
++++ b/tests/tools/test_kanban_backfill_replica_budget.py
+@@ -0,0 +1,202 @@
++"""Bound replica setup per repair pass without abandoning late ownership. [daveey]"""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_creator_chats as creator
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_lockguard
++from tests.tools.test_kanban_cross_board_creator_chats import _replica
++from tests.tools.test_kanban_worker_created_chats import WORKER, make_home
++
++
++@pytest.mark.parametrize('count', [3, 40, 923])
++def test_backfill_opens_replica_once_for_unresolved_backlog(tmp_path, monkeypatch, count):
++    home = make_home(tmp_path, monkeypatch)
++    _replica(home)
++    with kbc.connect_closing() as conn:
++        children = [kb.create_task(conn, title=f'orphan {i}', assignee='default',
++                                   creator_task_id=f'missing-{i}', session_id=WORKER)
++                    for i in range(count)]
++        for i, child in enumerate(children):
++            conn.execute('UPDATE tasks SET status=? WHERE id=?',
++                         (('done', 'archived', 'todo')[i % 3], child))
++        conn.commit()
++        real = kanban_lockguard.connect
++        opened = []
++        def counted(*args, **kwargs):
++            result = real(*args, **kwargs)
++            if 'sync-shadow' in str(args[0]):
++                opened.append(result)
++            return result
++        monkeypatch.setattr(kanban_lockguard, 'connect', counted)
++        result = creator.backfill(conn)
++        assert set(result['attempted']) == set(children)
++        assert set(result['unresolved']) == set(children)
++        assert len(opened) == 1
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            opened[0].execute('SELECT 1')
++
++
++def test_all_local_backfill_never_opens_replica(tmp_path, monkeypatch):
++    from tests.tools.test_kanban_cross_board_creator_chats import _link
++    make_home(tmp_path, monkeypatch)
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title='parent', assignee='default')
++        child = kb.create_task(conn, title='child', assignee='default',
++                               creator_task_id=parent, session_id=WORKER)
++        _link(conn, parent, 'away', 'research', 'human')
++        def forbidden(*args, **kwargs):
++            pytest.fail('all-local repair opened a replica')
++        monkeypatch.setattr(creator._ReplicaReader, '_open', forbidden)
++        assert creator.backfill(conn) == {'attempted': [child], 'unresolved': []}
++
++
++def test_missing_replica_retried_next_pass_and_terminal_child_repaired(tmp_path, monkeypatch):
++    home = make_home(tmp_path, monkeypatch)
++    remote = _replica(home, 'pending.db')
++    with kbc.connect_closing() as conn:
++        child = kb.create_task(conn, title='late', assignee='default',
++                               creator_task_id=remote, session_id=WORKER)
++        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (child,))
++        conn.commit()
++        assert creator.backfill(conn)['unresolved'] == [child]
++        shadow = home / 'kanban' / 'sync-shadow'
++        for suffix in ('', '-wal', '-shm'):
++            source = shadow / f'pending.db{suffix}'
++            if source.exists():
++                source.rename(shadow / f'default.db{suffix}')
++        assert creator.backfill(conn) == {'attempted': [child], 'unresolved': []}
++        assert conn.execute('SELECT status FROM tasks WHERE id=?', (child,)).fetchone()[0] == 'done'
++
++
++def test_reader_sees_new_and_released_links_without_result_cache(tmp_path, monkeypatch):
++    from tests.tools.test_kanban_cross_board_creator_chats import _link
++    from hermes_cli import kanban_db_notify as notify
++    home = make_home(tmp_path, monkeypatch)
++    _replica(home)
++    path = home / 'kanban' / 'sync-shadow' / 'default.db'
++    with kbc.connect_closing() as conn, kbc.connect_closing(path) as remote:
++        parent = kb.create_task(remote, title='new parent', assignee='default')
++        with creator._ReplicaReader(conn) as reader:
++            assert reader.resolve(parent) == []
++            _link(remote, parent, 'away', 'research', 'human')
++            notify.add_notify_sub(remote, task_id=parent, platform='hub',
++                                  chat_id='away/research/human', delivery_metadata={'reason': 'origin'})
++            remote.commit()
++            owners = reader.resolve(parent)
++            assert [(r['chat_profile'], r['chat_session']) for r in owners] == [('research', 'human')]
++            remote.execute('UPDATE task_chat_links SET released=1 WHERE task_id=?', (parent,))
++            remote.commit()
++            assert reader.resolve(parent) == []  # legacy sub cannot resurrect a released link
++
++
++def test_backfill_reads_local_writes_before_descendant(tmp_path, monkeypatch):
++    from tests.tools.test_kanban_cross_board_creator_chats import _link
++    make_home(tmp_path, monkeypatch)
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title='parent', assignee='default')
++        child = kb.create_task(conn, title='child', assignee='default',
++                               creator_task_id=parent, session_id=WORKER)
++        grandchild = kb.create_task(conn, title='grandchild', assignee='default',
++                                    creator_task_id=child, session_id=WORKER)
++        _link(conn, parent, 'away', 'research', 'human')
++        result = creator.backfill(conn)
++        assert set(result['attempted']) == {child, grandchild}
++        assert result['unresolved'] == []
++        assert conn.execute('SELECT COUNT(*) FROM task_chat_links WHERE task_id IN (?,?)',
++                            (child, grandchild)).fetchone()[0] == 2
++
++
++def test_replica_closes_on_resolution_error(tmp_path, monkeypatch):
++    home = make_home(tmp_path, monkeypatch)
++    remote = _replica(home)
++    with kbc.connect_closing() as conn:
++        reader = creator._ReplicaReader(conn)
++        def broken(*args):
++            raise sqlite3.OperationalError('injected read failure')
++        monkeypatch.setattr(creator, 'resolve_chats', broken)
++        with reader:
++            assert reader.resolve(remote) == []
++            handle = reader.replica
++            assert handle is not None
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            handle.execute('SELECT 1')
++
++
++def test_open_failure_is_bounded_and_retried_on_next_pass(tmp_path, monkeypatch):
++    home = make_home(tmp_path, monkeypatch)
++    remote = _replica(home, 'pending.db')
++    with kbc.connect_closing() as conn:
++        children = [kb.create_task(conn, title=f'child{i}', assignee='default',
++                                   creator_task_id=remote, session_id=WORKER) for i in range(3)]
++        shadow = home / 'kanban' / 'sync-shadow'
++        for suffix in ('', '-wal', '-shm'):
++            source = shadow / f'pending.db{suffix}'
++            if source.exists():
++                source.rename(shadow / f'default.db{suffix}')
++        real = kanban_lockguard.connect
++        attempts = []
++        def fail_once(*args, **kwargs):
++            attempts.append(args[0])
++            if len(attempts) == 1:
++                raise sqlite3.OperationalError('temporary schema contention')
++            return real(*args, **kwargs)
++        monkeypatch.setattr(kanban_lockguard, 'connect', fail_once)
++        assert set(creator.backfill(conn)['unresolved']) == set(children)
++        assert len(attempts) == 1
++        assert creator.backfill(conn)['unresolved'] == []
++        assert len(attempts) == 2
++
++
++def test_new_link_during_backfill_resolves_later_candidate(tmp_path, monkeypatch):
++    from tests.tools.test_kanban_cross_board_creator_chats import _link
++    home = make_home(tmp_path, monkeypatch)
++    _replica(home)
++    path = home / 'kanban' / 'sync-shadow' / 'default.db'
++    with kbc.connect_closing(path) as remote:
++        parent = kb.create_task(remote, title='unowned', assignee='default')
++    with kbc.connect_closing() as conn:
++        children = [kb.create_task(conn, title=f'child{i}', assignee='default',
++                                   creator_task_id=parent, session_id=WORKER) for i in range(3)]
++        real = creator.inherit_chats
++        visited = []
++        def arriving(local, task_id, creator_id, **kwargs):
++            real(local, task_id, creator_id, **kwargs)
++            visited.append(task_id)
++            if len(visited) == 1:
++                with kbc.connect_closing(path) as remote:
++                    _link(remote, parent, 'away', 'research', 'human')
++        monkeypatch.setattr(creator, 'inherit_chats', arriving)
++        result = creator.backfill(conn)
++        assert set(result['attempted']) == set(children)
++        assert result['unresolved'] == visited[:1]
++        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='creator_chats_resolved'").fetchone()[0] == 2
++
++
++def test_reader_closes_missing_schema_and_exception_scope(tmp_path, monkeypatch):
++    home = make_home(tmp_path, monkeypatch)
++    _replica(home)
++    opened = []
++    real = kanban_lockguard.connect
++    def counted(*args, **kwargs):
++        result = real(*args, **kwargs)
++        opened.append(result)
++        return result
++    with kbc.connect_closing() as conn:
++        monkeypatch.setattr(kanban_lockguard, 'connect', counted)
++        with pytest.raises(RuntimeError, match='abort'):
++            with creator._ReplicaReader(conn) as reader:
++                reader.resolve('missing')
++                raise RuntimeError('abort')
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            opened[-1].execute('SELECT 1')
++    path = home / 'kanban' / 'sync-shadow' / 'default.db'
++    with kbc.connect_closing(path) as remote:
++        remote.execute('DROP TABLE task_chat_links')
++        remote.commit()
++    with kbc.connect_closing() as conn, creator._ReplicaReader(conn) as reader:
++        assert reader.resolve('missing') == []
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            opened[-1].execute('SELECT 1')
+-- 
+2.55.0
+

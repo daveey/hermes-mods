@@ -1,0 +1,351 @@
+From 6e0d3134b3514efee9c3fb7ed1c294dd0748cb92 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:41:54 +0000
+Subject: [PATCH] fix(kanban): preserve dependency handoffs across unused
+ grants [daveey]
+
+---
+ hermes_cli/kanban_chat_wait.py                |  4 +
+ hermes_cli/kanban_db_dispatch_pr_state.py     | 15 ++--
+ hermes_cli/kanban_parent_unclaimed.py         | 16 +++-
+ hermes_cli/kanban_queue_position.py           | 28 +++++++
+ hermes_cli/kanban_unused_grant.py             | 40 ++++++++++
+ .../test_kanban_dependency_unused_grant.py    | 80 +++++++++++++++++++
+ .../test_kanban_guard_queue_notice.py         | 40 ++++++++++
+ 7 files changed, 213 insertions(+), 10 deletions(-)
+ create mode 100644 hermes_cli/kanban_unused_grant.py
+ create mode 100644 tests/hermes_cli/test_kanban_dependency_unused_grant.py
+ create mode 100644 tests/hermes_cli/test_kanban_guard_queue_notice.py
+
+diff --git a/hermes_cli/kanban_chat_wait.py b/hermes_cli/kanban_chat_wait.py
+index 09c7ccc12e2..8d5dab11969 100644
+--- a/hermes_cli/kanban_chat_wait.py
++++ b/hermes_cli/kanban_chat_wait.py
+@@ -98,6 +98,10 @@ def notice_text(payload: Any) -> str:
+                 f"with no worker because it isn't on the shared Board (claim_deferred: not_found). "
+                 f"Last sync rejection: {payload.get('sync_reject_reason') or 'no sync rejection recorded'}. "
+                 "Repair the Board sync rejection before retrying dispatch.")
++    if payload.get("respawn_guard"):
++        return (f"{named}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min "
++                f"with no worker: last recorded respawn guard is {payload['respawn_guard']}. "
++                "Check the current dispatcher verdict and resolve that guard; priority changes do not clear it.")
+     hold = ""
+     if payload.get("hold_reason") and payload.get("hold_until"):
+         stamp = time.strftime("%H:%M:%SZ", time.gmtime(int(payload["hold_until"])))
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 2fbc9afa7a7..1e4741cca6b 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -329,12 +329,12 @@ def _dependency_handoff_after(conn: sqlite3.Connection, task_id: str, since: int
+     """
+     from hermes_cli import kanban_db as kb
+ 
+-    run = conn.execute(
+-        "SELECT r.* FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+-        "WHERE r.task_id = ? AND r.profile = t.assignee "
+-        "AND r.id = (SELECT MAX(id) FROM task_runs WHERE task_id = t.id)",
+-        (task_id,),
+-    ).fetchone()
++    from hermes_cli.kanban_unused_grant import latest_started_run
++
++    run = latest_started_run(conn, task_id)
++    task = kb.get_task(conn, task_id)
++    if run is not None and (task is None or run["profile"] != task.assignee):
++        return False
+     if run is None or run["outcome"] != "blocked" or run["ended_at"] is None:
+         return False
+     ended = kb._to_epoch(run["ended_at"])
+@@ -429,7 +429,8 @@ def active_pr_reason(conn: sqlite3.Connection, task_id: str, now: int) -> Option
+     one continuation after parent completion/promotion: it must belong to the latest
+     claimed run of this card and assignee, ended orderly as blocked, with no subsequent
+     crash/reclaim/timeout. Operator-only links or synthetic unclaimed runs do not count;
+-    the next claim consumes the handoff. A same-second dependency park counts only when
++    the next execution claim consumes the handoff (a proven unused grant does not).
++    A same-second dependency park counts only when
+     its server-stamped comment watermark covers the newest PR comment; otherwise it stays guarded.
+     This does not change the separate review-checkpoint exception below. So does
+     a completed exact-head review of the checkpointed PRs (repair metadata, including
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 47409da436a..9439de36e0e 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -69,9 +69,11 @@ def notice_text(payload: Any) -> str:
+     parent = str(payload.get("parent") or "<parent>")[:64]
+     title = str(payload.get("parent_title") or "").strip()[:120]
+     named = f"{parent} ({title})" if title else parent
++    advice = ("Check the current dispatcher verdict and resolve the recorded guard; priority changes do not clear it"
++              if payload.get("respawn_guard") else _options(parent, payload.get("priority_evidence")))
+     return (f"Waiting {payload.get('wait_minutes', '?')} min on parent {named}, which has been ready "
+             f"{payload.get('ready_minutes', '?')} min with no worker ({payload.get('queue') or 'queue place unknown'}). "
+-            + _options(parent, payload.get("priority_evidence")) + ".")
++            + advice + ".")
+ 
+ 
+ def ready_hint(conn, task, *, now: Optional[float] = None) -> Optional[str]:
+@@ -83,7 +85,11 @@ def ready_hint(conn, task, *, now: Optional[float] = None) -> Optional[str]:
+     if waited < THRESHOLD_SECONDS:
+         return None
+     from hermes_cli.kanban_priority import lane_evidence
+-    return (f"Ready {_minutes(waited)} min, unclaimed; {_queue_words(_place(conn, task.id))}. "
++    from hermes_cli import kanban_queue_position as kqp
++    place = _place(conn, task.id)
++    if place.get("lane") == "respawn_guard":
++        return f"Ready {_minutes(waited)} min, unclaimed; {kqp.describe(place)}."
++    return (f"Ready {_minutes(waited)} min, unclaimed; {_queue_words(place)}. "
+             + _options(task.id, lane_evidence(conn, task.id)) + ".")
+ 
+ 
+@@ -141,6 +147,9 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+     wait (``kanban_chat_wait``), where ``waiting_on`` is ``task_id`` itself; ``extra`` adds payload fields (its
+     clock hold). Returns True when it posted."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_queue_position as kqp
++    place = _place(conn, waiting_on)
++    guard = place.get("reason") if place.get("lane") == "respawn_guard" else None
+     with kb.write_txn(conn):
+         if any(kb._json_dict(p).get("wait_event_id") == wait_key and kb._json_dict(p).get("parent") == waiting_on
+                for (p,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+@@ -153,7 +162,8 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+         kb._append_event(conn, task_id, kind, {
+             "parent": waiting_on, "parent_title": parent_title, "wait_event_id": wait_key,
+             "wait_minutes": _minutes(waited_seconds), "ready_minutes": _minutes(ready_seconds),
+-            "queue": _queue_words(_place(conn, waiting_on)), **(extra or {}),
++            "queue": kqp.describe(place) if guard else _queue_words(place), **(extra or {}),
++            "respawn_guard": guard,
+             "priority_evidence": lane_evidence(conn, waiting_on),
+         })
+     return True
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 61519929777..fd8b74d9071 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -97,6 +97,28 @@ def placement(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]
+             "machines": sorted(machines)}
+ 
+ 
++def recorded_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    """Last dispatch hold in this ready episode; advisory, never a fresh verdict.
++
++    Do not run the guard here: PR lookups can do network I/O, and notice callers
++    hold a write transaction. A later lifecycle handoff invalidates the observation.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_diagnostics import _READY_WAIT_FLOOR_KINDS
++
++    kinds = {*_READY_WAIT_FLOOR_KINDS, "respawn_guarded", "continued", "scheduled", "reassigned", "reopened",
++             "hold_released"}
++    slots = ",".join("?" for _ in kinds)
++    row = conn.execute(
++        f"SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ({slots}) "
++        "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id, *sorted(kinds)),
++    ).fetchone()
++    if row is not None and row["kind"] == "respawn_guarded":
++        reason = kb._json_dict(row["payload"]).get("reason")
++        return reason if isinstance(reason, str) and reason else None
++    return None
++
++
+ def position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Optional[dict[str, Any]]:
+     """The queue a ``ready`` ``task`` in this gateway's live file waits in; None for any other status."""
+     if task is None or task.status != "ready":
+@@ -106,6 +128,9 @@ def position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Opt
+     lock = conn.execute("SELECT claim_lock, worker_pid FROM tasks WHERE id = ?", (task.id,)).fetchone()
+     if lock is not None and lock[0]:
+         return {"lane": "leftover_claim", "claim_lock": lock[0], "worker_pid": lock[1]}
++    guard = recorded_guard(conn, task.id)
++    if guard:
++        return {"lane": "respawn_guard", "reason": guard}
+     from hermes_cli.kanban_worker_placement import POLICY
+     if getattr(task, "placement_policy", None) == POLICY:
+         from hermes_cli import kanban_queue_reason as kqr
+@@ -133,6 +158,9 @@ def describe(place: Optional[dict[str, Any]]) -> Optional[str]:
+     if not place:
+         return None
+     lane = place.get("lane")
++    if lane == "respawn_guard":
++        return (f"last recorded dispatch hold: respawn guard ({place.get('reason')}). "
++                "Check the current dispatcher verdict and resolve that guard; priority changes do not clear it")
+     if lane == "leftover_claim":
+         return (f"held by leftover claim {place.get('claim_lock')} (worker gone, pid {place.get('worker_pid')}): "
+                 "the dispatcher skips a ready card with a claim_lock. Its leftover-claim sweep clears a dead local "
+diff --git a/hermes_cli/kanban_unused_grant.py b/hermes_cli/kanban_unused_grant.py
+new file mode 100644
+index 00000000000..86f28fdbc0a
+--- /dev/null
++++ b/hermes_cli/kanban_unused_grant.py
+@@ -0,0 +1,40 @@
++"""Distinguish a returned Board reservation from an owner execution. [daveey]"""
++from __future__ import annotations
++
++import sqlite3
++
++
++def is_unused_grant(conn: sqlite3.Connection, run) -> bool:
++    """Require a bare Board grant/release, with no contradictory execution trace."""
++    from hermes_cli import kanban_db as kb
++
++    metadata = kb._json_dict(run["metadata"])
++    if (run["status"] != "released" or run["outcome"] != "released" or run["ended_at"] is None
++            or set(metadata) != {"unused_grant"} or metadata.get("unused_grant") is not True):
++        return False
++    if any(run[key] is not None for key in ("worker_pid", "worker_started_at", "last_heartbeat_at", "claim_lock")):
++        return False
++    if run["summary"] or run["error"]:
++        return False
++    released = False
++    for event in conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND run_id = ?",
++                              (run["task_id"], run["id"])):
++        payload = kb._json_dict(event["payload"])
++        if event["kind"] == "claimed" and "lock" not in payload:
++            continue
++        if event["kind"] != "released" or payload.get("unused_grant") is not True:
++            return False
++        released = True
++    return released
++
++
++def latest_started_run(conn: sqlite3.Connection, task_id: str):
++    """Latest run, ignoring only positively attested, unstarted unused grants.
++
++    A missing receipt or any execution/failure evidence consumes the handoff.
++    Keep run/event identity local: sync remaps their run ids together.
++    """
++    for run in conn.execute("SELECT * FROM task_runs WHERE task_id = ? ORDER BY id DESC", (task_id,)):
++        if not is_unused_grant(conn, run):
++            return run
++    return None
+diff --git a/tests/hermes_cli/test_kanban_dependency_unused_grant.py b/tests/hermes_cli/test_kanban_dependency_unused_grant.py
+new file mode 100644
+index 00000000000..d433300716b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dependency_unused_grant.py
+@@ -0,0 +1,80 @@
++"""Unused Board grants must not spend an owner's dependency continuation."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from tests.hermes_cli import test_kanban_dependency_pr_handoff as helpers
++
++board = helpers.board
++
++
++def release_unused(conn, task, clock, *, evidence=None, unused=True):
++    clock[0] += 1
++    kb.claim_task(conn, task)
++    run = kb.get_task(conn, task).current_run_id
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_runs SET status = 'released', outcome = 'released', ended_at = ?, "
++                     "claim_lock = NULL, metadata = ? WHERE id = ?",
++                     (clock[0], '{"unused_grant":true}', run))
++        conn.execute("UPDATE task_events SET payload = ? WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
++                     ('{"holder":"hub"}', task, run))
++        conn.execute("UPDATE tasks SET status = 'ready', claim_lock = NULL, current_run_id = NULL WHERE id = ?", (task,))
++        kb._append_event(conn, task, "released", {"unused_grant": unused, "retry_status": "ready"}, run_id=run)
++        if evidence:
++            kb._append_event(conn, task, evidence, {}, run_id=run)
++    return run
++
++
++def test_unused_grants_preserve_dependency_dispatch(board, monkeypatch, all_assignees_spawnable):
++    task, _, clock = helpers.park(board, monkeypatch)
++    release_unused(board, task, clock)
++    release_unused(board, task, clock)
++    assert prs.active_pr_reason(board, task, int(time.time())) is None
++    launched = []
++    result = dispatch.dispatch_once(board, spawn_fn=lambda task, workspace, **kwargs: launched.append(task.id) or 123456789)
++    assert task in launched, result
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++
++
++@pytest.mark.parametrize("evidence", ["worker_bound", "worker_result", "spawned", "crashed", "reclaimed", "timed_out",
++                                      "owner_admitted", "heartbeat", "unknown_future_execution"])
++def test_used_or_failed_grants_remain_guarded(board, monkeypatch, evidence):
++    task, _, clock = helpers.park(board, monkeypatch)
++    release_unused(board, task, clock, evidence=evidence)
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++
++
++@pytest.mark.parametrize("field,value", [
++    ("status", "running"), ("outcome", "crashed"), ("ended_at", None),
++    ("worker_pid", 123), ("worker_started_at", "birth"), ("last_heartbeat_at", 123),
++    ("claim_lock", "hub:123"), ("summary", "worked"), ("error", "failed"),
++    ("metadata", '{}'), ("metadata", '{"unused_grant":1}'),
++    ("metadata", '{"unused_grant":true,"worker_result":{}}'),
++])
++def test_contradictory_run_fields_consume_handoff(board, monkeypatch, field, value):
++    task, _, clock = helpers.park(board, monkeypatch)
++    run = release_unused(board, task, clock)
++    with kb.write_txn(board):
++        board.execute(f"UPDATE task_runs SET {field} = ? WHERE id = ?", (value, run))
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++
++
++def test_local_claim_or_missing_release_consumes_handoff(board, monkeypatch):
++    task, _, clock = helpers.park(board, monkeypatch)
++    run = release_unused(board, task, clock)
++    with kb.write_txn(board):
++        board.execute("UPDATE task_events SET payload = ? WHERE run_id = ? AND kind = 'claimed'",
++                      ('{"lock":"local"}', run))
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++    with kb.write_txn(board):
++        board.execute("DELETE FROM task_events WHERE run_id = ?", (run,))
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
++
++
++def test_release_without_unused_receipt_remains_guarded(board, monkeypatch):
++    task, _, clock = helpers.park(board, monkeypatch)
++    release_unused(board, task, clock, unused=False)
++    assert prs.active_pr_reason(board, task, int(time.time())) == "active_pr"
+diff --git a/tests/hermes_cli/test_kanban_guard_queue_notice.py b/tests/hermes_cli/test_kanban_guard_queue_notice.py
+new file mode 100644
+index 00000000000..2415289c589
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_guard_queue_notice.py
+@@ -0,0 +1,40 @@
++"""Queue and chat notices describe guard observations, not nonexistent slot waits."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_chat_wait as cw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_parent_unclaimed as pu
++from hermes_cli import kanban_queue_position as qp
++from tests.hermes_cli import test_kanban_dependency_pr_handoff as helpers
++
++board = helpers.board
++
++
++@pytest.mark.parametrize("cleared_by", ["unblocked", "hold_released", "continued", "promoted"])
++@pytest.mark.parametrize("reason", ["active_pr", "blocker_auth", "recent_success"])
++def test_guarded_queue_and_notice(board, monkeypatch, reason, cleared_by):
++    clock = [int(time.time())]
++    monkeypatch.setattr(time, "time", lambda: clock[0])
++    task = kb.create_task(board, title="waiting owner", assignee="dev", session_id="chat")
++    clock[0] += 1801
++    with kb.write_txn(board):
++        kb._append_event(board, task, "respawn_guarded", {"reason": reason})
++    place = qp.position(board, kb.get_task(board, task))
++    assert place == {"lane": "respawn_guard", "reason": reason}
++    assert cw.sweep(board, now=clock[0]) == 1
++    payload = kb._json_dict(board.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?", (task, cw.NOTICE_KIND),
++    ).fetchone()[0])
++    assert payload["respawn_guard"] == reason
++    for text in (qp.describe(place), cw.notice_text(payload), pu.notice_text(payload),
++                 pu.ready_hint(board, kb.get_task(board, task))):
++        assert reason in text
++        assert "local slot" not in text
++        assert "bump" not in text
++        assert "last recorded" in text
++    assert qp.position(board, kb.get_task(board, task)) == place  # notice doesn't erase hold
++    with kb.write_txn(board):
++        kb._append_event(board, task, cleared_by, {})
++    assert qp.position(board, kb.get_task(board, task))["lane"] != "respawn_guard"
+-- 
+2.55.0
+

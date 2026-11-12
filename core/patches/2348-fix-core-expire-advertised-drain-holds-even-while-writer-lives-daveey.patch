@@ -1,0 +1,115 @@
+From ee3d831301e751f59ed9880fa34678b1b3281836 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:40:04 +0000
+Subject: [PATCH] fix(core): expire advertised drain holds even while writer
+ lives [daveey]
+
+---
+ agent/core_update_drain.py            | 14 ++++++++-
+ tests/agent/test_core_update_drain.py | 41 +++++++++++++++++++++++++--
+ 2 files changed, 52 insertions(+), 3 deletions(-)
+
+diff --git a/agent/core_update_drain.py b/agent/core_update_drain.py
+index 969bcef9234..be084f447e4 100644
+--- a/agent/core_update_drain.py
++++ b/agent/core_update_drain.py
+@@ -6,7 +6,9 @@ finish and no Desktop turn is live, applies ``hermes update --yes`` and removes
+ hold is active the kanban dispatcher spawns nothing (running workers are never touched), so a
+ saturated board drains instead of refilling between update checks.
+ 
+-A hold only counts while its writer pid is alive: a crashed updater must not freeze dispatch.
++A hold only counts while its writer pid is alive and its advertised ``started_at + max_s``
++lease has not expired: a live but stalled updater must not freeze dispatch. Legacy records
++without ``max_s`` retain PID-only lifetime; invalid leases are inactive.
+ A file that cannot be parsed counts for ``_UNPARSEABLE_GRACE_S`` (a writer mid-write), then not.
+ """
+ 
+@@ -14,6 +16,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import math
+ import threading
+ import time
+ from pathlib import Path
+@@ -65,6 +68,15 @@ def read_hold(path: Path, now: Optional[float] = None, *, strict_errors: bool =
+         return {"pid": None, "reason": "unparseable drain hold"} if 0 <= age < _UNPARSEABLE_GRACE_S else None
+     if pid <= 0 or not _pid_alive(pid):
+         return None
++    if "max_s" in data:
++        try:
++            started_at, max_s = float(data["started_at"]), float(data["max_s"])
++        except (KeyError, TypeError, ValueError, OverflowError):
++            return None
++        if not math.isfinite(started_at) or not math.isfinite(max_s) or max_s <= 0:
++            return None
++        if (time.time() if now is None else now) - started_at >= max_s:
++            return None
+     return data if isinstance(data, dict) else None
+ 
+ 
+diff --git a/tests/agent/test_core_update_drain.py b/tests/agent/test_core_update_drain.py
+index f5525847410..b0b6a4d9163 100644
+--- a/tests/agent/test_core_update_drain.py
++++ b/tests/agent/test_core_update_drain.py
+@@ -43,6 +43,40 @@ def test_live_hold_blocks_dispatch(home):
+     assert _kanban_dispatch_allowed() is False
+ 
+ 
++@pytest.mark.parametrize("age,active", [(119, True), (120, False), (1800, False)])
++def test_live_writer_lease_expires(home, monkeypatch, age, active):
++    from gateway.kanban_watchers_common import _kanban_dispatch_allowed
++
++    record = {"pid": os.getpid(), "started_at": 1000, "max_s": 120}
++    path = _write(home, record)
++    monkeypatch.setattr(drain.time, "time", lambda: 1000 + age)
++    assert drain.active_hold() == ({**record, "path": str(path)} if active else None)
++    assert _kanban_dispatch_allowed() is not active
++    assert path.exists()  # a reader never deletes another publisher's marker
++
++
++@pytest.mark.parametrize("fields", [
++    {"max_s": None}, {"max_s": "bad"}, {"max_s": float("inf")},
++    {"max_s": float("nan")}, {"max_s": -1}, {"max_s": 0},
++    {"max_s": 120, "started_at": "bad"},
++    {"max_s": 120, "started_at": float("inf")},
++    {"max_s": 120, "started_at": float("nan")},
++])
++def test_invalid_lease_cannot_hold_dispatch_forever(home, fields):
++    path = _write(home, {"pid": os.getpid(), "started_at": 1000, **fields})
++    assert drain.read_hold(path, now=0) is None
++
++
++def test_expired_profile_hold_does_not_hide_active_root(tmp_path, monkeypatch):
++    profile = tmp_path / "profiles" / "worker"
++    monkeypatch.setattr(drain, "_hermes_home", lambda: profile)
++    monkeypatch.setattr(drain, "_canonical_root", lambda: tmp_path)
++    monkeypatch.setattr(drain.time, "time", lambda: 2000)
++    _write(profile, {"pid": os.getpid(), "started_at": 1000, "max_s": 120})
++    root = _write(tmp_path, {"pid": os.getpid(), "started_at": 1999, "max_s": 120})
++    assert drain.active_hold()["path"] == str(root)
++
++
+ def test_dead_writer_hold_is_ignored(home):
+     from gateway.kanban_watchers_common import _kanban_dispatch_allowed
+     _write(home, {"pid": _dead_pid(), "started_at": time.time()})
+@@ -167,11 +201,14 @@ def test_live_hold_runs_wake_probes_and_promotion_but_claims_nothing(tmp_path, m
+     assert st["ready"] == "ready" and spawned == []  # but nothing was claimed
+ 
+ 
+-def test_without_hold_the_same_tick_claims(tmp_path, monkeypatch):
+-    """Control: the board above is spawnable, so the held tick's zero claims are the hold's doing."""
++@pytest.mark.parametrize("expired_hold", [False, True])
++def test_without_active_hold_the_same_tick_claims(tmp_path, monkeypatch, expired_hold):
++    """A spawnable board resumes claims even while the expired hold's writer lives."""
+     monkeypatch.setattr(drain, "_hermes_home", lambda: tmp_path)
+     monkeypatch.setattr(drain, "_canonical_root", lambda: tmp_path)
+     ids, spawned = _dispatcher_board(tmp_path, monkeypatch)
++    if expired_hold:
++        _write(tmp_path, {"pid": os.getpid(), "started_at": time.time() - 1800, "max_s": 120})
+     _run_one_tick(tmp_path, monkeypatch)
+     assert ids["ready"] in spawned
+     assert _statuses(ids)["ready"] == "running"
+-- 
+2.55.0
+

@@ -1,0 +1,128 @@
+From ecde38b87adcd8b843e975e6520806f290d7a939 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:52:23 +0000
+Subject: [PATCH] [daveey] Preserve admitting checkpoint intent across restart
+ withdrawal
+
+---
+ gateway/run_shutdown.py                       |  5 +--
+ gateway/update_checkpoint.py                  |  4 ++-
+ tests/gateway/test_update_checkpoint.py       | 36 +++++++++++++++++--
+ .../test_update_checkpoint_pause.py           |  2 +-
+ 4 files changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/gateway/run_shutdown.py b/gateway/run_shutdown.py
+index 4b287e50d79..39c30ee3512 100644
+--- a/gateway/run_shutdown.py
++++ b/gateway/run_shutdown.py
+@@ -1630,10 +1630,11 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+         logger.info("Restart deferred wait complete — active work drained; proceeding to stop()")
+         return True
+ 
+-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
++    def request_restart(self, *, detached: bool = False, via_service: bool = False, update_intent=None) -> bool:
+         if self._restart_task_started:
+             return False
+-        self._restart_update_intent = self._core_update_intent_path()
++        # An explicit path stays armed even if already gone, so the wait cancels instead of stopping.
++        self._restart_update_intent = self._core_update_intent_path() if update_intent is None else update_intent
+         self._restart_requested = True
+         self._restart_detached = detached
+         self._restart_via_service = via_service
+diff --git a/gateway/update_checkpoint.py b/gateway/update_checkpoint.py
+index b9bc3133bbe..678f8b322e4 100644
+--- a/gateway/update_checkpoint.py
++++ b/gateway/update_checkpoint.py
+@@ -70,6 +70,7 @@ def checkpoint_for_update(runner, loop, params):
+     root = get_default_hermes_root(home=home)
+     refused = {"pausing": False, "already_stopping": False, "busy": True, "pid": os.getpid()}
+     intent = checkpoint_intent(home)
++    intent_path = Path(home) / "core-update/intent"
+     if intent is None or params.get("nonce") != intent["nonce"]:
+         return refused
+     # No admission lock is held while reading cron's lock (cron uses the reverse order).
+@@ -107,7 +108,8 @@ def checkpoint_for_update(runner, loop, params):
+                 if cancelled or time.monotonic() >= deadline:
+                     return
+                 claimed = True
+-            accepted = runner.request_restart(detached=False, via_service=True)
++            # The admitted path, not a fresh lookup: a withdrawal during preserve must still cancel.
++            accepted = runner.request_restart(detached=False, via_service=True, update_intent=intent_path)
+             result.append({"pausing": bool(accepted), "already_stopping": not accepted,
+                            "checkpoint": True, "nonce": intent["nonce"], "pid": os.getpid(), "drain_timeout": CHECKPOINT_DRAIN_S})
+         except (OSError, TimeoutError, ValueError, TypeError, KeyError):
+diff --git a/tests/gateway/test_update_checkpoint.py b/tests/gateway/test_update_checkpoint.py
+index b8a375d883a..abd00d62faf 100644
+--- a/tests/gateway/test_update_checkpoint.py
++++ b/tests/gateway/test_update_checkpoint.py
+@@ -1,4 +1,5 @@
+ """Instant updates negotiate a bounded checkpoint, never waive unknown admission."""
++import asyncio
+ import json
+ import os
+ import time
+@@ -44,11 +45,11 @@ def invoke(checkpoint, runner, nonce="episode-one", before=None):
+ 
+ 
+ def test_known_managed_work_uses_existing_restart_checkpoint(checkpoint):
+-    module, _home, runner, _intent = checkpoint
++    module, home, runner, _intent = checkpoint
+     result = invoke(module, runner)
+     assert result["pausing"] and result["checkpoint"]
+     assert result["drain_timeout"] >= 60
+-    runner.request_restart.assert_called_once_with(detached=False, via_service=True)
++    runner.request_restart.assert_called_once_with(detached=False, via_service=True, update_intent=home / "core-update/intent")
+ 
+ 
+ @pytest.mark.parametrize("change", ["no-hold", "expired", "dead-owner", "wrong-kind", "no-checkpoint", "nonce"])
+@@ -167,3 +168,34 @@ def test_cron_inventory_lock_acquisition_is_bounded(monkeypatch):
+         lock.release()
+     assert known_cron_reservations() == set()
+ 
++
++
++@pytest.mark.parametrize("stage", ["during-preserve", "after-snapshot"])
++def test_withdrawal_after_admission_cancels_real_restart_without_stop(checkpoint, monkeypatch, stage):
++    """Real runner: an intent removed after admission must not be rediscovered as 'no update'."""
++    from unittest.mock import AsyncMock
++    from tests.gateway.restart_test_helpers import make_restart_runner
++    module, home, _fake, _intent = checkpoint
++    path = home / "core-update/intent"
++    runner, _adapter = make_restart_runner()
++    runner.stop = AsyncMock()
++    runner.config = object()
++    monkeypatch.setattr(module, "kanban_managed_count", lambda r: 0)
++    if stage == "during-preserve":
++        monkeypatch.setattr(module, "preserve_cron_slots", lambda config: path.unlink())
++    else:
++        real = runner.request_restart
++        def withdrawn(**kw):
++            accepted = real(**kw)
++            path.unlink()
++            return accepted
++        monkeypatch.setattr(runner, "request_restart", withdrawn)
++    async def scenario():
++        result = module.checkpoint_for_update(
++            runner, SimpleNamespace(call_soon_threadsafe=lambda cb: cb()), {"nonce": "episode-one"})
++        assert result["pausing"] is True
++        assert runner._restart_update_intent == path
++        await asyncio.wait_for(runner._restart_task, 5)
++    asyncio.run(scenario())
++    runner.stop.assert_not_awaited()
++    assert runner._restart_requested is False and runner._draining is False
+diff --git a/tests/hermes_cli/test_update_checkpoint_pause.py b/tests/hermes_cli/test_update_checkpoint_pause.py
+index 53659a40f49..c6cb928e529 100644
+--- a/tests/hermes_cli/test_update_checkpoint_pause.py
++++ b/tests/hermes_cli/test_update_checkpoint_pause.py
+@@ -110,7 +110,7 @@ def test_explicit_intent_negotiates_the_checkpoint_for_known_managed_work(episod
+     result, entry, idle = ask(episode)
+     assert result is True and idle == []
+     assert entry["checkpoint_drain_timeout"] == checkpoint.CHECKPOINT_DRAIN_S == 70.0
+-    episode.runner.request_restart.assert_called_once_with(detached=False, via_service=True)
++    episode.runner.request_restart.assert_called_once_with(detached=False, via_service=True, update_intent=episode.home / "core-update/intent")
+ 
+ 
+ def test_exactly_known_cron_reservation_is_accepted(episode):
+-- 
+2.55.0
+

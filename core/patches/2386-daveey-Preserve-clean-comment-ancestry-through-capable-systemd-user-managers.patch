@@ -1,0 +1,225 @@
+From 8145c78324e0a04265fa52ea129a412e0808150a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:37:32 +0000
+Subject: [PATCH] [daveey] Preserve clean comment ancestry through capable
+ systemd user managers
+
+---
+ hermes_cli/kanban_comment_writer.py           |  44 ++++++-
+ .../test_kanban_comment_user_manager.py       | 124 ++++++++++++++++++
+ 2 files changed, 164 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_comment_user_manager.py
+
+diff --git a/hermes_cli/kanban_comment_writer.py b/hermes_cli/kanban_comment_writer.py
+index 9ac47e174ba..1555affaa05 100644
+--- a/hermes_cli/kanban_comment_writer.py
++++ b/hermes_cli/kanban_comment_writer.py
+@@ -21,10 +21,14 @@ process ANCESTRY's start-time environments, not from this process's mutable ``os
+ 
+ No input asserts ``human``: no flag, no variable. Human is only a COMPLETE walk to init that found
+ no marker; an inconclusive walk (psutil unusable, an ancestor vanishing mid-walk, a same-user
+-process whose environment can't be read, the depth cap) records ``agent``. Only ROOT's unreadable
++process whose environment can't be read, the depth cap) records ``agent``. ROOT's unreadable
+ process is skipped (``login``/``sshd``, launchd, a setuid ``login`` whose effective uid is root, a
+-non-dumpable ``sshd-session`` whose environ is root's): an agent's own processes are this user's
+-and readable. The ``/kanban`` slash command typed into a chat composer passes ``human`` explicitly
++non-dumpable ``sshd-session`` whose environ is root's). Linux also skips a same-uid
++``systemd --user`` with permitted capabilities beyond ours when environment access is denied:
++CAP_WAKE_ALARM can deny ptrace even though its environ is user-owned. Third-uid managers and
++ordinary unreadable processes remain inconclusive; readable markers always win. Agent user
++units carry their markers below the manager.
++The ``/kanban`` slash command typed into a chat composer passes ``human`` explicitly
+ (``run_slash(human_typed=True)`` at its ingress points). Fail-safe direction: a leaked marker (a
+ terminal app started from an agent, the TUI's ``!`` shell) labels a person's note ``agent``, which
+ only withholds operator authority; so does Windows, where an unreadable or exited ancestor (the
+@@ -39,6 +43,7 @@ HTTP peers retain the legacy human default, not a claim of authenticated human i
+ from __future__ import annotations
+ 
+ import os
++from pathlib import Path
+ from typing import Callable, Mapping, Optional
+ 
+ # Any one, non-empty, in a process's start-time environment marks it (and its descendants) as an
+@@ -65,7 +70,7 @@ class Inconclusive(Exception):
+     """The ancestry could not be read far enough to rule an agent out."""
+ 
+ 
+-# (ppid, start-time environ, or None for root's unreadable process) for a pid. Raises
++# (ppid, start-time environ, or None for a skipped OS supervisor) for a pid. Raises
+ # :class:`Inconclusive` when the pid is gone or any other process can't be read.
+ ProcReader = Callable[[int], tuple[int, Optional[Mapping[str, str]]]]
+ 
+@@ -95,9 +100,40 @@ def _read_proc(pid: int) -> tuple[int, Optional[Mapping[str, str]]]:
+     except (psutil.Error, OSError) as exc:
+         if _foreign(proc, pid):  # root's login/sshd, launchd, a non-dumpable sshd-session
+             return ppid, None
++        if isinstance(exc, (psutil.AccessDenied, PermissionError)) and _capable_user_manager(proc, pid):
++            return ppid, None
+         raise Inconclusive(f"pid {pid}: environment unreadable") from exc
+ 
+ 
++def _capable_user_manager(proc, pid: int) -> bool:
++    """Recognize Linux's same-uid user manager at a capability/ptrace boundary.
++
++    commoncap's PTRACE_MODE_READ_FSCREDS check compares the reader's effective
++    capabilities with the target's *permitted* set. Use our permitted set as a
++    stricter bound: only skip a manager with privilege we cannot even enable.
++    Do not skip arbitrary capable services (which can themselves be agents).
++    This is a provenance heuristic, not authentication against forged argv.
++    """
++    import psutil
++
++    try:
++        uid = getattr(os, "getuid", lambda: 0)()
++        if uid == 0 or tuple(proc.uids()) != (uid, uid, uid):
++            return False
++        status = dict(line.split(":", 1) for line in
++                      Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace").splitlines() if ":" in line)
++        own = dict(line.split(":", 1) for line in
++                   Path("/proc/self/status").read_text(encoding="utf-8", errors="replace").splitlines() if ":" in line)
++        if status.get("Name", "").strip() != "systemd":
++            return False
++        if not (int(status["CapPrm"], 16) & ~int(own["CapPrm"], 16)):
++            return False
++        argv = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")
++        return len(argv) == 2 and argv[0].rsplit(b"/", 1)[-1] == b"systemd" and argv[1] == b"--user"
++    except (psutil.Error, OSError, ValueError, KeyError, AttributeError):
++        return False
++
++
+ def _foreign(proc, pid: int) -> bool:
+     """True when ``proc`` is root's rather than this user's: any of its real/effective/saved uids
+     is root (``sshd``, launchd, macOS setuid ``login``, which keeps the user's real uid), or
+diff --git a/tests/hermes_cli/test_kanban_comment_user_manager.py b/tests/hermes_cli/test_kanban_comment_user_manager.py
+new file mode 100644
+index 00000000000..8e05a41fc2b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_comment_user_manager.py
+@@ -0,0 +1,124 @@
++"""Capability-bearing Linux user managers must not taint clean comment ancestry."""
++from pathlib import Path
++from types import SimpleNamespace
++import os
++import shutil
++import subprocess
++import sys
++
++import psutil
++import pytest
++
++from hermes_cli import kanban_comment_writer as writer
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("case,clean", [
++    ("manager", True), ("permission_error", True), ("third_uid", False), ("ordinary", False),
++    ("no_extra_caps", False), ("not_user_manager", False),
++    ("missing_status", False), ("malformed_caps", False),
++    ("marked", False), ("vanished", False), ("argv_name", False),
++    ("argv_extra", False), ("missing_caps", False), ("uid_error", False),
++])
++def test_unreadable_manager_exception_is_narrow(monkeypatch, case, clean):
++    uid = os.getuid()
++    if uid == 0:
++        pytest.skip("requires an unprivileged reader")
++    def environ():
++        if case == "marked":
++            return {"HERMES_AGENT": "1"}
++        if case == "vanished":
++            raise psutil.NoSuchProcess(4242)
++        if case == "permission_error":
++            raise PermissionError("ptrace denied")
++        raise psutil.AccessDenied(4242)
++    def uids():
++        if case == "uid_error":
++            raise psutil.AccessDenied(4242)
++        return (uid + (case == "third_uid"),) * 3
++    proc = SimpleNamespace(ppid=lambda: 1, environ=environ, uids=uids)
++    monkeypatch.setattr(psutil, "Process", lambda pid: proc)
++    real_stat = os.stat
++    monkeypatch.setattr(writer.os, "stat", lambda path, *a, **kw: (
++        SimpleNamespace(st_uid=uid) if str(path) == "/proc/4242/environ"
++        else real_stat(path, *a, **kw)))
++    real_text = Path.read_text
++    def text(path, **kwargs):
++        if str(path) not in {"/proc/self/status", "/proc/4242/status"}:
++            return real_text(path, **kwargs)
++        if case == "missing_status":
++            raise PermissionError("status unreadable")
++        if str(path) == "/proc/self/status":
++            return "CapPrm:\t0000000000000001\n"
++        caps = "invalid" if case == "malformed_caps" else "1" if case == "no_extra_caps" else "800000000"
++        name = "python" if case == "ordinary" else "systemd"
++        if case == "missing_caps":
++            return f"Name:\t{name}\n"
++        return f"Name:\t{name}\nCapPrm:\t{caps}\n"
++    monkeypatch.setattr(Path, "read_text", text)
++    argv = {
++        "not_user_manager": b"/usr/lib/systemd/systemd\0--system\0",
++        "argv_name": b"/usr/bin/python\0--user\0",
++        "argv_extra": b"/usr/lib/systemd/systemd\0--user\0extra\0",
++    }.get(case, b"/usr/lib/systemd/systemd\0--user\0")
++    real_bytes = Path.read_bytes
++    monkeypatch.setattr(Path, "read_bytes", lambda path: (
++        argv if str(path) == "/proc/4242/cmdline" else real_bytes(path)))
++    def read(pid):
++        return (0, {}) if pid == 1 else writer._read_proc(pid)
++    if clean:
++        assert writer.agent_ancestor(4242, read=read) is None
++    elif case == "marked":
++        assert writer.agent_ancestor(4242, read=read) == "4242:HERMES_AGENT"
++    else:
++        with pytest.raises(writer.Inconclusive):
++            writer.agent_ancestor(4242, read=read)
++
++
++@pytest.mark.platforms("linux")
++def test_real_user_manager_ancestry():
++    """Read real /proc, including the manager's kernel-denied environment, through init."""
++    managers = []
++    for proc in psutil.process_iter():
++        try:
++            if proc.uids().real == os.getuid() and proc.name() == "systemd" and "--user" in proc.cmdline():
++                managers.append(proc)
++        except psutil.Error:
++            continue
++    if not managers:
++        pytest.skip("no systemd --user")
++    for proc in managers:
++        assert writer.agent_ancestor(proc.pid) is None
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("marked", [False, True])
++def test_real_clean_or_marked_user_unit(marked):
++    """A real user unit is detached from pytest's marked ancestry, not a bounded fake walk."""
++    from tools.environments.local import build_subprocess_env
++
++    if not all(shutil.which(cmd) for cmd in ("systemctl", "systemd-run")):
++        pytest.skip("systemd tools unavailable")
++    env = build_subprocess_env(scrub_secrets=True)
++    env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
++    env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={env['XDG_RUNTIME_DIR']}/bus"
++    probe = subprocess.run(["systemctl", "--user", "show-environment"],
++                           env=env, capture_output=True, timeout=10, check=False)
++    if probe.returncode:
++        pytest.skip("user manager bus unavailable")
++    code = (
++        "import sys; sys.path.insert(0, sys.argv[1]); "
++        "from hermes_cli.kanban_comment_writer import agent_ancestor; "
++        "print(repr(agent_ancestor()), flush=True)"
++    )
++    args = ["systemd-run", "--user", "--pipe", "--wait", "--collect", "--quiet",
++            "/usr/bin/env", "-i"]
++    if marked:
++        args.append("HERMES_SUPERVISED_CHILD=1")
++    result = subprocess.run(args + [sys.executable, "-c", code, str(Path(__file__).resolve().parents[2])],
++                            env=env, capture_output=True, text=True, encoding="utf-8", timeout=30, check=False)
++    assert result.returncode == 0, result.stderr
++    if marked:
++        assert ":HERMES_SUPERVISED_CHILD" in result.stdout
++    else:
++        assert result.stdout.strip() == "None"
+-- 
+2.55.0
+

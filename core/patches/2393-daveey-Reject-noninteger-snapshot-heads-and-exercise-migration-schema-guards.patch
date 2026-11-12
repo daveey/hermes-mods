@@ -1,0 +1,154 @@
+From a108549e68e7f36bc35949af5b269370549ef3d9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:40:27 +0000
+Subject: [PATCH] [daveey] Reject noninteger snapshot heads and exercise
+ migration schema guards
+
+---
+ hermes_cli/kanban_priority_prepare.py         |  2 +-
+ .../test_kanban_priority_boundary_cases.py    | 56 +++++++++++++++++++
+ .../test_kanban_priority_manifest.py          | 56 +++++++++++++++++++
+ 3 files changed, 113 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_priority_boundary_cases.py
+ create mode 100644 tests/hermes_cli/test_kanban_priority_manifest.py
+
+diff --git a/hermes_cli/kanban_priority_prepare.py b/hermes_cli/kanban_priority_prepare.py
+index 56b7f5e91df..4c3f5d495e8 100644
+--- a/hermes_cli/kanban_priority_prepare.py
++++ b/hermes_cli/kanban_priority_prepare.py
+@@ -63,7 +63,7 @@ def _inventory(hub, board_id: str) -> list[dict]:
+     # A final read closes the final-page/return gap at an observed head. Apply
+     # still has local CAS; this is not a distributed transaction or a lease.
+     final = hub.snapshot_page(board_id, "tasks", limit=1)
+-    if final.get("head") != head:
++    if type(final.get("head")) is not int or final.get("head") != head:
+         raise ValueError("canonical inventory changed; capture a new manifest")
+     return rows
+ 
+diff --git a/tests/hermes_cli/test_kanban_priority_boundary_cases.py b/tests/hermes_cli/test_kanban_priority_boundary_cases.py
+new file mode 100644
+index 00000000000..7d0fdb81674
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_boundary_cases.py
+@@ -0,0 +1,56 @@
++"""Adversarial boundary cases independent of valid-plan happy paths."""
++import hashlib
++import json
++
++import pytest
++
++from hermes_cli import kanban_priority_migration as migration
++from tests.hermes_cli import test_kanban_priority_cli as cli_helpers
++from tests.hermes_cli import test_kanban_priority_executor as helpers
++from tests.hermes_cli import test_kanban_priority_prepare as prepare_helpers
++from tests.hermes_cli import test_kanban_sync_client as sync_helpers
++
++kanban_home = sync_helpers.kanban_home
++conn = sync_helpers.live
++
++
++@pytest.mark.parametrize('head', [True, 1.0])
++def test_final_snapshot_requires_integer_head(head):
++    from hermes_cli import kanban_priority_prepare as prepare
++
++    class Malformed(prepare_helpers.Pages):
++        def snapshot_page(self, *args, **kwargs):
++            page = super().snapshot_page(*args, **kwargs)
++            if kwargs.get('limit') == 1:
++                page['head'] = head
++            return page
++
++    with pytest.raises(ValueError):
++        prepare.capture(Malformed(), board_id='board', exceptions=[])
++
++
++@pytest.mark.parametrize('case', ['identity', 'local_writer', 'board'])
++def test_verify_enrollment_refuses_before_network(conn, tmp_path, monkeypatch, case):
++    from hermes_cli import kanban_priority_cli as cli
++    from hermes_cli import kanban_sync_client as sync
++    helpers.setup_plan(conn)
++    rows = [dict(r) for r in conn.execute('SELECT id,priority,created_on,status FROM tasks')]
++    manifest = migration.plan_global(rows, board_id=sync_helpers.BOARD, exceptions=[])
++    path = tmp_path / 'original.json'
++    data = json.dumps(manifest).encode()
++    path.write_bytes(data)
++    gateway = 'foreign' if case == 'identity' else sync_helpers.ME
++    monkeypatch.setattr(sync, 'load_identity', lambda: sync.Identity('https://example.test', 'fixture', gateway))
++
++    def forbidden_hub(*args):
++        pytest.fail('invalid identity reached canonical network')
++
++    monkeypatch.setattr(sync, 'Hub', forbidden_hub)
++    sql = {'local_writer': "UPDATE kanban_sync_state SET gateway_id='foreign'",
++           'board': "UPDATE kanban_sync_state SET board_id='foreign'"}
++    if case in sql:
++        conn.execute(sql[case])
++        conn.commit()
++    namespace = cli_helpers.args('--priority-operation', 'verify', '--manifest', str(path),
++                                 '--digest', hashlib.sha256(data).hexdigest(), '--writer', sync_helpers.ME)
++    assert cli.run(conn, namespace) != 0
+diff --git a/tests/hermes_cli/test_kanban_priority_manifest.py b/tests/hermes_cli/test_kanban_priority_manifest.py
+new file mode 100644
+index 00000000000..73dece9b29b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_manifest.py
+@@ -0,0 +1,56 @@
++"""Manifest schema guards, including Python's bool/int equality ambiguity."""
++import pytest
++
++from hermes_cli.kanban_priority_manifest import validate
++from hermes_cli.kanban_priority_migration import plan_global
++
++
++def plan():
++    return plan_global([
++        {'id': 'a', 'created_on': 'one', 'priority': 10000, 'status': 'ready'},
++        {'id': 'b', 'created_on': 'two', 'priority': 50000, 'status': 'done'},
++    ], board_id='board', exceptions=['a', 'b'])
++
++
++@pytest.mark.parametrize('case, message', [
++    ('board', 'missing board identity'), ('version_type', 'noninteger policy version'),
++    ('rows_type', 'rows and exceptions must be lists'), ('row_shape', 'invalid row'),
++    ('row_identity', 'missing row identity'), ('row_value', 'noninteger priority'),
++    ('exception_shape', 'invalid exception'), ('exception_identity', 'missing exception identity'),
++    ('exception_value', 'invalid exception value or status'),
++    ('terminal_open', 'terminal exception is in open inventory'),
++    ('active_drift', 'exception differs from open inventory'), ('extra', 'unknown fields'),
++])
++def test_schema_rejects_malformed_values(case, message):
++    manifest = plan()
++    if case == 'board':
++        manifest['board_id'] = 1
++    if case == 'version_type':
++        manifest['version'] = 2.0
++    if case == 'rows_type':
++        manifest['rows'] = tuple(manifest['rows'])
++    if case == 'row_shape':
++        manifest['rows'][0]['extra'] = 1
++    if case == 'row_identity':
++        manifest['rows'][0]['id'] = 1
++    if case == 'row_value':
++        manifest['rows'][0]['new'] = 900.0
++    if case == 'exception_shape':
++        manifest['exceptions'][0]['extra'] = 1
++    if case == 'exception_identity':
++        manifest['exceptions'][1]['origin'] = 1
++    if case == 'exception_value':
++        manifest['exceptions'][1]['status'] = 'unknown'
++    if case == 'terminal_open':
++        manifest['exceptions'][0]['status'] = 'done'
++    if case == 'active_drift':
++        manifest['exceptions'][0]['old'] = 20
++    if case == 'extra':
++        manifest['extra'] = 1
++    with pytest.raises(ValueError, match=message):
++        validate(manifest)
++
++
++def test_valid_plan_roundtrip():
++    manifest = plan()
++    assert validate(manifest) == manifest
+-- 
+2.55.0
+

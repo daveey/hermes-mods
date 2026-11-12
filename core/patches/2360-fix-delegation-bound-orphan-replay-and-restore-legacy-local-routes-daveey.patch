@@ -1,0 +1,849 @@
+From 760c52a43e8f4c28049236999a474d39ed6b58bd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:05:08 +0000
+Subject: [PATCH] fix(delegation): bound orphan replay and restore legacy local
+ routes [daveey]
+
+---
+ gateway/completion_local_route.py             |  57 ++++
+ gateway/run_notifications.py                  |   7 +
+ tests/gateway/test_completion_delivery.py     |   4 +
+ tests/gateway/test_legacy_local_completion.py | 296 ++++++++++++++++++
+ .../test_async_delegation_orphan_sweep.py     |   6 +-
+ tests/tools/test_async_orphan_handback.py     | 202 ++++++++++++
+ tools/async_delegation.py                     |  95 ++++--
+ 7 files changed, 637 insertions(+), 30 deletions(-)
+ create mode 100644 gateway/completion_local_route.py
+ create mode 100644 tests/gateway/test_legacy_local_completion.py
+ create mode 100644 tests/tools/test_async_orphan_handback.py
+
+diff --git a/gateway/completion_local_route.py b/gateway/completion_local_route.py
+new file mode 100644
+index 00000000000..6d5d53ae15f
+--- /dev/null
++++ b/gateway/completion_local_route.py
+@@ -0,0 +1,57 @@
++"""Raw legacy Desktop completion keys, resolved only through the one authority that owns the local receipt."""
++from __future__ import annotations
++import logging
++
++logger = logging.getLogger(__name__)
++
++# Any of these makes the event an explicit route (messaging or API), never a bare Desktop session id.
++_ROUTE_FIELDS = ("platform", "chat_id", "chat_type", "thread_id", "origin_session_id")
++
++
++def _owner_route(authority, runner, key: str, delegation_id: str):
++    """The canonical local route of *key* when *authority* provably owns it, else None."""
++    from gateway.run import _parse_session_key
++    from gateway.session_local_recovery import owned_receipt
++    try:
++        _receipt, _source, route, _entry = owned_receipt(authority, key)
++        # The durable claim runs in the ambient ledger: only the owner's own ledger may hold this row, or
++        # claim_completion_delivery's missing-row ``True`` would claim (and settle) it in the wrong store.
++        with authority.db._read_ctx() as conn:
++            row = conn.execute("SELECT 1 FROM async_delegations WHERE delegation_id=?", (delegation_id,)).fetchone()
++    except Exception:  # no receipt, foreign store, no ledger table, refused or unavailable
++        logger.debug("Legacy completion route could not be verified", exc_info=True)
++        return None
++    registry = getattr(runner, "session_authorities", None)
++    namespace = registry.profile_name(authority) if registry is not None else None  # profile_id is a HOME path
++    parsed = _parse_session_key(route) or {}
++    if (row is None or parsed.get("platform") != "local" or parsed.get("chat_id") != key
++            or parsed.get("profile") != namespace):
++        return None
++    return route
++
++
++def resolve_legacy_local_event(runner, evt: dict) -> dict:
++    """*evt* with its canonical local ``session_key`` when it is a legacy raw Desktop event, else *evt*.
++
++    Legacy rows persisted the raw Desktop session id as ``session_key`` (equal to ``parent_session_id``)
++    with no platform, chat or origin fields. Runs before scope selection, so it asks EVERY serving
++    authority, not the ambient one: exactly one must hold a verified local receipt for that id, own its
++    route namespace and hold the delegation row in its ledger. Zero or several matches (API events, other
++    profiles, unknown ids, ambiguity) return *evt* unchanged.
++    """
++    if evt.get("type") != "async_delegation":
++        return evt
++    key = str(evt.get("session_key") or "")
++    delegation_id = str(evt.get("delegation_id") or "")
++    if (not key or not delegation_id or key.startswith("agent:")
++            or key != str(evt.get("parent_session_id") or "")
++            or any(evt.get(field) for field in _ROUTE_FIELDS)):
++        return evt
++    from gateway.session_authorities import serving_authorities
++    routes = [route for authority in serving_authorities(runner)
++              if (route := _owner_route(authority, runner, key, delegation_id)) is not None]
++    if len(routes) != 1:
++        if routes:
++            logger.warning("Legacy completion %s is claimed by several local receipts; not routing it", delegation_id)
++        return evt
++    return dict(evt, session_key=routes[0])
+diff --git a/gateway/run_notifications.py b/gateway/run_notifications.py
+index 9dda98f08a9..c757365e120 100644
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -1274,8 +1274,11 @@ class GatewayNotificationsMixin(
+         The supervised ``_async_delegation_watcher`` and startup-recovered process watchers run under
+         the ROOT scope, so a secondary profile's completion was looked up in the DEFAULT profile's
+         state.db — classified ``terminal`` and dropped, its ledger row stranded ``pending`` forever."""
++        from gateway.completion_local_route import resolve_legacy_local_event
+         from gateway.run import _async_profile_runtime_scope
+         from hermes_constants import get_hermes_home_override
++        # A raw legacy Desktop key names no profile: its owner's receipt decides the scope, before selection.
++        evt = resolve_legacy_local_event(self, evt)
+         source = self._build_process_event_source(evt)
+         if source is None or not getattr(source, "profile", None):
+             raw_sid = _raw_process_event_session_id(evt)
+@@ -1326,6 +1329,8 @@ class GatewayNotificationsMixin(
+         from tools.process_registry_notifications import should_surface_notification
+         if not should_surface_notification(evt):
+             return None  # Suppressed noise is terminal, not a consumed process result.
++        from gateway.completion_local_route import resolve_legacy_local_event
++        evt = resolve_legacy_local_event(self, evt)
+         restore_completion_route(self, str(evt.get("session_key") or ""))
+         from gateway.session_detached import follow_detached_pin
+         evt = await follow_detached_pin(self, evt)
+@@ -1566,6 +1571,8 @@ class GatewayNotificationsMixin(
+         from gateway.run import _format_gateway_process_notification
+         from gateway.session_local_recovery import restore_completion_route
+         from tools.process_registry import process_registry as _pr
++        from gateway.completion_local_route import resolve_legacy_local_event
++        group = [resolve_legacy_local_event(self, evt) for evt in group]
+         restore_completion_route(self, str(group[0].get("session_key") or ""))
+         # API delivery does not start a model turn, so there is nothing to coalesce.
+         # Keep each unit's stable identity with its row across partial delivery/retry.
+diff --git a/tests/gateway/test_completion_delivery.py b/tests/gateway/test_completion_delivery.py
+index e3539b632ac..0c58cff07e4 100644
+--- a/tests/gateway/test_completion_delivery.py
++++ b/tests/gateway/test_completion_delivery.py
+@@ -204,6 +204,10 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
+ def _persist_pending_completion(event):
+     from tools import async_delegation
+ 
++    # These are live-delivery fixtures, not expired historical replays.
++    event = dict(event, dispatched_at=async_delegation.time.time() - 12,
++                 completed_at=async_delegation.time.time())
++
+     async_delegation._persist_dispatch({
+         "delegation_id": event["delegation_id"],
+         "session_key": event["session_key"],
+diff --git a/tests/gateway/test_legacy_local_completion.py b/tests/gateway/test_legacy_local_completion.py
+new file mode 100644
+index 00000000000..9c54294ba6c
+--- /dev/null
++++ b/tests/gateway/test_legacy_local_completion.py
+@@ -0,0 +1,296 @@
++"""A legacy async delegation names its Desktop parent by the raw session id.
++
++Exactly one serving authority's verified local receipt (and ledger row) turns that raw key into the canonical
++local route, BEFORE the routing scope is chosen; API-server events, other profiles, retiring or unserved
++authorities, a row in another ledger and ambiguous owners stay as they were.
++
++Fixtures are realistic: ``authority.profile_id`` is the profile HOME path (``gateway/run_runtime.py``), the
++launch and a served secondary each own a ``state.db``, ledger and route namespace.
++"""
++from types import SimpleNamespace
++
++import pytest
++
++from tools import async_delegation as delegation
++
++
++def _actor(home):
++    from gateway.session_contract import SessionActor
++    return SessionActor("test-owner", str(home), frozenset({"session:create", "session:submit", "session:read"}),
++                        "fixture")
++
++
++async def _rig(tmp_path, monkeypatch, *, secondary=True):
++    """A multiplexing runner: launch home plus (optionally) one served secondary, each with a local session."""
++    import gateway.run as gw
++    import hermes_state
++    from gateway.config import GatewayConfig
++    from gateway.run import GatewayRunner, _profile_runtime_scope
++    from gateway.session_authorities import SessionAuthorities
++    from gateway.session_authority import SessionAuthority, initialize_session_authority
++    from gateway.session_local import create_local_session
++    from hermes_state import SessionDB
++
++    root = tmp_path / "root"
++    sec_home = root / "profiles" / "secondary"
++    sec_home.mkdir(parents=True)
++    (sec_home / "config.yaml").write_text("{}\n")
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    monkeypatch.setenv("HERMES_BASE_HOME", str(root))
++    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
++    monkeypatch.setattr(gw, "_hermes_home", root)
++    monkeypatch.setattr(SessionAuthority, "_schedule", lambda self, ref: None)  # admitted rows stay queued
++    runner = GatewayRunner(GatewayConfig(multiplex_profiles=True, sessions_dir=tmp_path / "sessions"))
++    db = SessionDB(root / "state.db")  # the runner's own handles resolve per scope, as in production
++    registry = SessionAuthorities(root, multiplexed=True)
++    runner.session_authorities = registry
++    launch = await initialize_session_authority(runner, profile_id=str(root), instance_id="launch", db=db)
++    registry.add(root, launch)
++    assert launch.profile_id == str(root)  # production: a HOME path, never the profile name
++    rig = SimpleNamespace(runner=runner, registry=registry, launch=launch, root=root, sec_home=sec_home,
++                          served=None, scope=_profile_runtime_scope)
++    rig.launch_ref = create_local_session(launch, _actor(root), dict(
++        request_id="launch", source="cli", model="fixture", toolsets=[]))
++    if secondary:
++        registry.add(sec_home, None, name="secondary")
++        sdb = SessionDB(sec_home / "state.db")
++        rig.served = await initialize_session_authority(
++            runner, profile_id=str(sec_home), instance_id="served", register=False, db=sdb)
++        registry.replace(sec_home, rig.served)
++        rig.served_ref = create_local_session(rig.served, _actor(sec_home), dict(
++            request_id="served", source="cli", model="fixture", toolsets=[]))
++    monkeypatch.setattr(runner, "_handle_message", _refuse_turn)
++    return rig
++
++
++async def _refuse_turn(event):
++    raise AssertionError("no viewer: the completion must be a note, not a turn")
++
++
++def _legacy(home, sid, name, scope=None, **extra):
++    """A legacy row exactly as the producer persisted it: raw Desktop id, no route fields, in *home*'s ledger."""
++    from gateway.run import _profile_runtime_scope
++    from tests.gateway.test_completion_admission import pending
++    with _profile_runtime_scope(home):
++        return dict(pending(sid, name), parent_session_id=sid, **extra)
++
++
++def _row(home, evt):
++    from gateway.run import _profile_runtime_scope
++    with _profile_runtime_scope(home):
++        return delegation.get_durable_delegation(evt["delegation_id"])
++
++
++def _notes(authority, evt, target=None):
++    from gateway.session_local_recovery import owned_receipt
++    target = target or owned_receipt(authority, evt["parent_session_id"])[0]["entry"]["session_id"]
++    return [m for m in authority.db.get_messages(target) if evt["delegation_id"] in str(m.get("content"))]
++
++
++async def _drain(authority, ref):
++    """The admitted turn's drain, run in its owner's scope as production's ``_schedule`` task does."""
++    from gateway.session_authorities import owner_scope
++    with owner_scope(authority):
++        await authority._drain(ref)
++
++
++def _admitted(authority, sid):
++    from hermes_state_runtime import list_session_admissions
++    return [r for r in list_session_admissions(authority.db, session_id=sid, pending_only=False)
++            if r["principal_id"].startswith("automation:")]
++
++
++async def _delivered_once(rig, authority, home, ref, evt):
++    """Group delivery from the UNSCOPED root (the supervised watcher's scope), then a replay of the same row."""
++    assert await rig.runner._deliver_async_delegation_group([evt]) is True
++    await _drain(authority, ref)
++    assert [_row(home, evt)[k] for k in ("delivery_state", "delivery_attempts")] == ["delivered", 1]
++    assert len(_notes(authority, evt)) == 1 and len(_admitted(authority, ref.session_id)) == 1
++    await rig.runner._deliver_async_delegation_group([evt])
++    await _drain(authority, ref)
++    assert len(_notes(authority, evt)) == 1 and len(_admitted(authority, ref.session_id)) == 1
++    assert _row(home, evt)["delivery_attempts"] == 1
++
++
++def _close(rig):
++    for authority in (rig.launch, rig.served):
++        if authority is not None:
++            authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_launch_raw_desktop_key_resolves_with_home_path_profile_id(tmp_path, monkeypatch):
++    rig = await _rig(tmp_path, monkeypatch, secondary=False)
++    try:
++        evt = _legacy(rig.root, rig.launch_ref.session_id, "deleg_legacy_launch")
++        await _delivered_once(rig, rig.launch, rig.root, rig.launch_ref, evt)
++    finally:
++        _close(rig)
++
++
++@pytest.mark.asyncio
++async def test_single_completion_notification_path_resolves_too(tmp_path, monkeypatch):
++    rig = await _rig(tmp_path, monkeypatch, secondary=False)
++    try:
++        evt = _legacy(rig.root, rig.launch_ref.session_id, "deleg_legacy_single")
++        assert await rig.runner._deliver_completion_notification("[finished] deleg_legacy_single", evt) is True
++        await _drain(rig.launch, rig.launch_ref)
++        assert len(_notes(rig.launch, evt)) == 1
++    finally:
++        _close(rig)
++
++
++@pytest.mark.asyncio
++async def test_served_secondary_event_is_scoped_and_claimed_in_its_own_ledger(tmp_path, monkeypatch):
++    from hermes_constants import get_hermes_home
++    rig = await _rig(tmp_path, monkeypatch)
++    try:
++        evt = _legacy(rig.sec_home, rig.served_ref.session_id, "deleg_legacy_secondary")
++        async with rig.runner._completion_event_scope(evt):  # selected from the resolved owner, not the raw key
++            assert get_hermes_home() == rig.sec_home
++        await _delivered_once(rig, rig.served, rig.sec_home, rig.served_ref, evt)
++        assert _row(rig.root, evt) is None  # the launch ledger never saw it, so nothing could claim there
++    finally:
++        _close(rig)
++
++
++@pytest.mark.asyncio
++async def test_served_secondary_single_path_and_retired_session(tmp_path, monkeypatch):
++    rig = await _rig(tmp_path, monkeypatch)
++    try:
++        sid = rig.served_ref.session_id
++        live = rig.served.sessions[sid]
++        target = rig.runner.session_store.lookup_by_session_key(live.route).session_id
++        rig.served.db.end_session(target, "user_exit")
++        rig.served.sessions.pop(sid)  # boot left the ended session unrestored
++        evt = _legacy(rig.sec_home, sid, "deleg_legacy_secondary_retired")
++        assert await rig.runner._deliver_completion_notification("[finished] deleg_legacy_secondary_retired", evt) is True
++        await _drain(rig.served, rig.served_ref)
++        assert sid in rig.served.sessions
++        assert _row(rig.sec_home, evt)["delivery_state"] == "delivered"
++        assert len(_notes(rig.served, evt, target)) == 1 and len(_admitted(rig.served, sid)) == 1
++    finally:
++        _close(rig)
++
++
++@pytest.mark.asyncio
++async def test_served_secondary_compressed_session_delivers_to_the_tip(tmp_path, monkeypatch):
++    from hermes_state_local_lineage import advance_local_target
++    from gateway.session_local_recovery import owned_receipt
++    rig = await _rig(tmp_path, monkeypatch)
++    try:
++        sid = rig.served_ref.session_id
++        receipt = owned_receipt(rig.served, sid)[0]
++        tip, tip_child = receipt["entry"]["session_id"], "compressed-tip"
++        db = rig.served.db
++        db.end_session(tip, "compression")
++        db.create_session(tip_child, "local", session_key=receipt["route"], chat_id=sid,
++                          user_id=receipt["principal_id"], parent_session_id=tip)
++        db._execute_write(lambda conn: advance_local_target(conn, tip, tip_child))
++        assert owned_receipt(rig.served, sid)[0]["entry"]["session_id"] == tip_child
++        evt = _legacy(rig.sec_home, sid, "deleg_legacy_secondary_compressed")
++        assert await rig.runner._deliver_async_delegation_group([evt]) is True
++        await _drain(rig.served, rig.served_ref)
++        assert _row(rig.sec_home, evt)["delivery_state"] == "delivered"
++        assert len(_notes(rig.served, evt)) == 1
++        assert not [m for m in db.get_messages(tip) if evt["delegation_id"] in str(m.get("content"))]
++    finally:
++        _close(rig)
++
++
++@pytest.mark.asyncio
++async def test_ambiguous_owners_fail_closed(tmp_path, monkeypatch):
++    from gateway.completion_local_route import resolve_legacy_local_event
++    rig = await _rig(tmp_path, monkeypatch)
++    try:
++        dup = rig.root / "profiles" / "dup"
++        dup.mkdir()
++        # A second home serving the SAME store under the same namespace: both verify the one receipt.
++        rig.registry.add(dup, SimpleNamespace(profile_id=str(dup), db=rig.served.db, runner=rig.runner), name="secondary")
++        evt = _legacy(rig.sec_home, rig.served_ref.session_id, "deleg_legacy_ambiguous")
++        assert resolve_legacy_local_event(rig.runner, evt) is evt
++        rig.registry.remove(dup)
++        assert resolve_legacy_local_event(rig.runner, evt)["session_key"].startswith("agent:secondary:local:")
++    finally:
++        _close(rig)
++
++
++@pytest.mark.asyncio
++async def test_row_in_another_ledger_is_never_claimed_through_the_receipt_owner(tmp_path, monkeypatch):
++    """claim_completion_delivery answers True for a row missing from the ambient ledger: the resolver must not
++    send a launch-ledger row into the secondary's scope, where that missing-row True would claim it falsely."""
++    from gateway.completion_local_route import resolve_legacy_local_event
++    rig = await _rig(tmp_path, monkeypatch)
++    try:
++        evt = _legacy(rig.root, rig.served_ref.session_id, "deleg_legacy_elsewhere")
++        assert resolve_legacy_local_event(rig.runner, evt) is evt
++        await rig.runner._deliver_async_delegation_group([evt])
++        assert _row(rig.sec_home, evt) is None and not _admitted(rig.served, rig.served_ref.session_id)
++        assert _row(rig.root, evt)["delivery_state"] == "pending"  # still the launch ledger's, unclaimed
++        assert _row(rig.root, evt)["delivery_attempts"] == 0
++    finally:
++        _close(rig)
++
++
++@pytest.mark.asyncio
++async def test_retiring_or_unserved_owner_is_not_resolved(tmp_path, monkeypatch):
++    from gateway.completion_local_route import resolve_legacy_local_event
++    rig = await _rig(tmp_path, monkeypatch)
++    try:
++        evt = _legacy(rig.sec_home, rig.served_ref.session_id, "deleg_legacy_parked")
++        assert resolve_legacy_local_event(rig.runner, evt)["session_key"].startswith("agent:secondary:local:")
++        rig.served.retiring = True
++        assert resolve_legacy_local_event(rig.runner, evt) is evt
++        rig.served.retiring = False
++        rig.registry.remove(rig.sec_home)  # no longer served at all
++        assert resolve_legacy_local_event(rig.runner, evt) is evt
++    finally:
++        _close(rig)
++
++
++@pytest.mark.asyncio
++async def test_resolver_negatives_leave_the_event_alone(tmp_path, monkeypatch):
++    from gateway.completion_local_route import resolve_legacy_local_event
++    rig = await _rig(tmp_path, monkeypatch)
++    try:
++        sid = rig.served_ref.session_id
++        base = _legacy(rig.sec_home, sid, "deleg_legacy_negatives")
++        resolved = resolve_legacy_local_event(rig.runner, base)
++        assert resolved["session_key"].startswith("agent:secondary:local:") and resolved["session_key"] != sid
++        assert base["session_key"] == sid  # never mutates the producer's row
++        negatives = {
++            "other event": {**base, "type": "process"},
++            "no delegation id": {k: v for k, v in base.items() if k != "delegation_id"},
++            "no ledger row": {**base, "delegation_id": "deleg_never_persisted"},
++            "thread id": {**base, "thread_id": "thread"},
++            "whitespace id": {**base, "session_key": " " + sid, "parent_session_id": " " + sid},
++            "no receipt": {**base, "session_key": "opaque-client", "parent_session_id": "opaque-client"},
++            "launch's own receipt id": {**base, "session_key": rig.launch_ref.session_id,
++                                        "parent_session_id": rig.launch_ref.session_id},  # row is not in launch
++            "parent differs": {**base, "parent_session_id": "other"},
++            "no parent": {k: v for k, v in base.items() if k != "parent_session_id"},
++            "explicit api platform": {**base, "platform": "api_server", "chat_id": sid},
++            "api platform only": {**base, "platform": "api_server"},
++            "chat id": {**base, "chat_id": "1"},
++            "chat type": {**base, "chat_type": "dm"},
++            "origin session": {**base, "origin_session_id": sid},
++            "structured key": {**base, "session_key": resolved["session_key"]},
++        }
++        for label, evt in negatives.items():
++            assert resolve_legacy_local_event(rig.runner, evt) is evt, label
++    finally:
++        _close(rig)
++
++
++@pytest.mark.asyncio
++async def test_explicit_api_event_keeps_its_route_through_delivery(tmp_path, monkeypatch):
++    rig = await _rig(tmp_path, monkeypatch)
++    try:
++        sid = rig.served_ref.session_id
++        evt = _legacy(rig.sec_home, sid, "deleg_legacy_api", platform="api_server", chat_id=sid)
++        await rig.runner._deliver_async_delegation_group([evt])
++        assert not _admitted(rig.served, sid) and not _admitted(rig.launch, sid)
++        unknown = _legacy(rig.root, "opaque-client-session", "deleg_legacy_unknown")
++        assert await rig.runner._deliver_async_delegation_group([unknown]) is None  # unchanged: terminal drop
++    finally:
++        _close(rig)
+diff --git a/tests/tools/test_async_delegation_orphan_sweep.py b/tests/tools/test_async_delegation_orphan_sweep.py
+index 345db46b2df..07ff3bb7e23 100644
+--- a/tests/tools/test_async_delegation_orphan_sweep.py
++++ b/tests/tools/test_async_delegation_orphan_sweep.py
+@@ -340,7 +340,8 @@ def test_offer_dropped_by_a_session_that_cannot_own_it_is_re_offered_to_the_owne
+         assert _row(home, delegation_id)["delivery_state"] == "pending"
+ 
+         monkeypatch.setitem(server._sessions, "sid-owner", owner)  # the owner resumes
+-        assert ad.sweep_orphaned_completions(q, now=later + ad.ORPHAN_SWEEP_INTERVAL_S) == 1
++        assert ad.sweep_orphaned_completions(q, now=later + ad.ORPHAN_SWEEP_INTERVAL_S) == 0
++        assert ad.sweep_orphaned_completions(q, now=later + ad._CLAIM_LEASE_S + 1) == 1
+         drain("sid-owner", owner)
+     assert started == ["sid-owner"]
+     assert _row(home, delegation_id)["delivery_state"] == "delivered"
+@@ -368,7 +369,8 @@ def test_offer_released_after_a_failed_tui_turn_is_re_offered(tmp_path, monkeypa
+         server._notif_dispatch_event("sid-owner", owner, evt, "text")
+         row = _row(home, delegation_id)
+         assert (row["delivery_state"], row["delivery_claim"], row["delivery_attempts"]) == ("pending", None, 1)
+-        assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + ad._ORPHAN_STALE_S + 1) == 1
++        assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + ad._ORPHAN_STALE_S + 1) == 0
++        assert ad.sweep_orphaned_completions(q, now=max(later, row["updated_at"]) + ad._CLAIM_LEASE_S + 1) == 1
+     assert [e["delegation_id"] for e in _drain(q)] == [delegation_id]
+ 
+ 
+diff --git a/tests/tools/test_async_orphan_handback.py b/tests/tools/test_async_orphan_handback.py
+new file mode 100644
+index 00000000000..922045b7fd1
+--- /dev/null
++++ b/tests/tools/test_async_orphan_handback.py
+@@ -0,0 +1,202 @@
++"""Offer custody survives handback; terminal replay expiry ignores in-memory custody."""
++
++import logging
++import os
++import queue
++
++import pytest
++
++from tests.tools import test_async_delegation_orphan_sweep as helpers
++from tools import async_delegation as ad
++from tools.process_registry import process_registry
++
++
++@pytest.fixture(autouse=True)
++def isolated_state(monkeypatch):
++    ad._reset_for_tests()
++    monkeypatch.setattr(process_registry, "completion_queue", queue.Queue())
++    yield
++    ad._reset_for_tests()
++
++
++@pytest.fixture
++def orphan(tmp_path):
++    home = tmp_path / "home"
++    delegation_id = helpers._orphan(home)
++    return home, delegation_id, helpers._row(home, delegation_id)
++
++
++@pytest.mark.parametrize("startup", [False, True])
++def test_dead_owner_handbacks_retain_every_offer_lease(orphan, monkeypatch, startup):
++    home, delegation_id, row = orphan
++    q = queue.Queue()
++    now = row["updated_at"] + ad._ORPHAN_STALE_S + 1
++    monkeypatch.setattr(ad.time, "time", lambda: now)
++    with helpers._Home(home):
++        if startup:
++            assert ad.restore_undelivered_completions(q) == 1
++        else:
++            assert ad.sweep_orphaned_completions(q, now=now) == 1
++        for _ in range(3):
++            (evt,) = helpers._drain(q)
++            ad.return_completion_offer(evt)
++            if startup:
++                assert ad.restore_undelivered_completions(q) == 0
++            assert ad.sweep_orphaned_completions(q, now=now + 30) == 0
++            assert ad.sweep_orphaned_completions(q, now=now + ad._CLAIM_LEASE_S) == 0
++            assert helpers._row(home, delegation_id)["delivery_attempts"] == 0
++            now += ad._CLAIM_LEASE_S + 1
++            assert ad.sweep_orphaned_completions(q, now=now) == 1
++        # Copies from competing delivery loops still arbitrate through the durable claim.
++        (evt,) = helpers._drain(q)
++        claim = ad.claim_event_delivery(evt, "winner")
++        assert claim and ad.claim_event_delivery(evt, "competitor") is None
++        assert ad.complete_completion_delivery(delegation_id, claim)
++        assert ad.sweep_orphaned_completions(q, now=now + 1000) == 0
++    assert helpers._row(home, delegation_id)["delivery_state"] == "delivered"
++
++
++@pytest.mark.parametrize("custody", ["queued", "held"])
++@pytest.mark.parametrize("owner", ["dead", "current", "foreign"])
++def test_live_copies_survive_leases_but_not_terminal_replay_age(orphan, monkeypatch, caplog, custody, owner):
++    home, delegation_id, row = orphan
++    q = queue.Queue()
++    now = row["updated_at"] + ad._ORPHAN_STALE_S + 1
++    with helpers._Home(home):
++        assert ad.sweep_orphaned_completions(q, now=now) == 1
++        if owner != "dead":
++            pid = os.getpid() if owner == "current" else os.getppid()
++            helpers._set(home, delegation_id, owner_pid=pid, owner_started_at=None)
++            monkeypatch.setattr(ad, "_owner_liveness", lambda: lambda pid, started: True)
++        if custody == "held":
++            ad.mark_copy_held(delegation_id)
++            helpers._drain(q)
++        try:
++            assert ad.sweep_orphaned_completions(q, now=now + ad._CLAIM_LEASE_S + 1) == 0
++            assert helpers._row(home, delegation_id)["delivery_state"] == "pending"
++            caplog.set_level(logging.WARNING, logger="tools.async_delegation")
++            expiry = row["completed_at"] + ad._MAX_COMPLETION_REPLAY_AGE_S + 1
++            assert ad.sweep_orphaned_completions(q, now=expiry) == 0
++            dropped = helpers._row(home, delegation_id)
++            assert dropped["delivery_state"] == "dropped"
++            assert dropped["delivery_attempts"] > 0
++            assert dropped["event_json"] == row["event_json"]
++            assert any("replay age expired" in r.message and "attempt" in r.message for r in caplog.records)
++            assert not ad.claim_completion_delivery(delegation_id, "late-copy")
++        finally:
++            if custody == "held":
++                ad.unmark_copy_held(delegation_id)
++
++
++@pytest.mark.parametrize("entry", ["startup", "sweep"])
++@pytest.mark.parametrize("budget", ["age", "attempts"])
++def test_active_claim_is_not_expired_or_replayed(orphan, monkeypatch, entry, budget):
++    home, delegation_id, row = orphan
++    now = row["completed_at"] + ad._MAX_COMPLETION_REPLAY_AGE_S + 1
++    attempts = ad._MAX_DELIVERY_ATTEMPTS if budget == "attempts" else 2
++    if budget == "attempts":
++        now = row["updated_at"] + ad._CLAIM_LEASE_S + 1
++    helpers._set(home, delegation_id, delivery_claim="active", delivery_claimed_at=now - 1,
++                 delivery_attempts=attempts)
++    before = helpers._row(home, delegation_id)
++    monkeypatch.setattr(ad.time, "time", lambda: now)
++    q = queue.Queue()
++    with helpers._Home(home):
++        count = ad.restore_undelivered_completions(q) if entry == "startup" else ad.sweep_orphaned_completions(q, now=now)
++        assert count == 0 and q.empty()
++        assert helpers._row(home, delegation_id) == before
++        now += ad._CLAIM_LEASE_S + 1
++        count = ad.restore_undelivered_completions(q) if entry == "startup" else ad.sweep_orphaned_completions(q, now=now)
++        assert count == 0 and q.empty()
++    dropped = helpers._row(home, delegation_id)
++    assert dropped["delivery_state"] == "dropped"
++    assert dropped["delivery_claim"] is None and dropped["delivery_claimed_at"] is None
++    assert dropped["delivery_attempts"] == attempts
++
++
++@pytest.mark.parametrize("entry", ["startup", "sweep"])
++def test_attempt_cap_resolves_even_a_queued_copy(orphan, monkeypatch, caplog, entry):
++    home, delegation_id, row = orphan
++    q = queue.Queue()
++    now = row["updated_at"] + ad._ORPHAN_STALE_S + 1
++    monkeypatch.setattr(ad.time, "time", lambda: now)
++    with helpers._Home(home):
++        assert ad.restore_undelivered_completions(q) == 1
++        helpers._set(home, delegation_id, delivery_attempts=ad._MAX_DELIVERY_ATTEMPTS)
++        count = ad.restore_undelivered_completions(q) if entry == "startup" else ad.sweep_orphaned_completions(q, now=now)
++        assert count == 0
++    dropped = helpers._row(home, delegation_id)
++    assert dropped["delivery_state"] == "dropped"
++    assert dropped["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS
++    assert any("delivery attempts exhausted" in r.message for r in caplog.records)
++
++
++@pytest.mark.parametrize("owner", ["current", "foreign"])
++def test_missing_copy_recovery_only_for_the_current_live_owner(orphan, monkeypatch, owner):
++    home, delegation_id, row = orphan
++    helpers._set(home, delegation_id, owner_pid=os.getpid() if owner == "current" else os.getppid(),
++                 owner_started_at=None)
++    monkeypatch.setattr(ad, "_owner_liveness", lambda: lambda pid, started: True)
++    q = queue.Queue()
++    with helpers._Home(home):
++        assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + ad._CLAIM_LEASE_S + 1) == (owner == "current")
++    assert helpers._row(home, delegation_id)["delivery_attempts"] == 0
++
++
++def test_unready_admission_defers_without_spending_an_attempt(orphan):
++    home, delegation_id, row = orphan
++    q = queue.Queue()
++    with helpers._Home(home):
++        assert ad.sweep_orphaned_completions(q, now=row["updated_at"] + ad._ORPHAN_STALE_S + 1) == 1
++        (evt,) = helpers._drain(q)
++        claim = ad.claim_event_delivery(evt, "unready")
++        assert claim and ad.defer_completion_delivery(delegation_id, claim)
++        ad.return_completion_offer(evt)
++    deferred = helpers._row(home, delegation_id)
++    assert deferred["delivery_state"] == "pending"
++    assert deferred["delivery_claim"] is None and deferred["delivery_attempts"] == 0
++
++
++@pytest.mark.parametrize("age_basis", ["dispatch", "absent"])
++def test_startup_expiry_uses_dispatch_fallback_but_not_an_absent_age(orphan, monkeypatch, age_basis):
++    home, delegation_id, row = orphan
++    helpers._set(home, delegation_id, completed_at=0,
++                 dispatched_at=row["dispatched_at"] if age_basis == "dispatch" else 0)
++    monkeypatch.setattr(ad.time, "time", lambda: row["dispatched_at"] + ad._MAX_COMPLETION_REPLAY_AGE_S + 1)
++    q = queue.Queue()
++    with helpers._Home(home):
++        assert ad.restore_undelivered_completions(q) == (age_basis == "absent")
++    assert helpers._row(home, delegation_id)["delivery_state"] == ("dropped" if age_basis == "dispatch" else "pending")
++
++
++@pytest.mark.parametrize("terminal", ["delivered", "dropped", "deleted"])
++def test_offer_history_prunes_only_settled_home_rows(orphan, monkeypatch, terminal):
++    home, delegation_id, row = orphan
++    now = row["updated_at"] + ad._ORPHAN_STALE_S + 1
++    monkeypatch.setattr(ad.time, "time", lambda: now)
++    q = queue.Queue()
++    with helpers._Home(home):
++        assert ad.restore_undelivered_completions(q) == 1
++        key = (ad.hermes_home_key(home), delegation_id)
++        other = ("/other/home", delegation_id)
++        ad._offered.add(other)
++        ad._offered_at[other] = now
++        ad._reoffered_at[key] = now
++        # A queued pending copy retains its history beyond a claim lease.
++        assert ad.sweep_orphaned_completions(q, now=now + ad._CLAIM_LEASE_S + 1) == 0
++        assert key in ad._offered_at and key in ad._offered
++        if terminal == "deleted":
++            with ad._transaction() as conn:
++                conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
++        else:
++            helpers._set(home, delegation_id, delivery_state=terminal)
++        assert ad.sweep_orphaned_completions(q, now=now + ad._CLAIM_LEASE_S + 2) == 0
++        assert key not in ad._offered_at and key not in ad._offered and key not in ad._reoffered_at
++        assert other in ad._offered_at and other in ad._offered
++        assert delegation_id in ad._startup_replayed  # still needed by the other home's copy
++        ad._offered.remove(other)
++        del ad._offered_at[other]
++        # A new local stale history entry is removed along with its startup marker.
++        ad._offered_at[key] = now
++        assert ad.sweep_orphaned_completions(q, now=now + ad._CLAIM_LEASE_S + 3) == 0
++        assert delegation_id not in ad._startup_replayed
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index c3a56a40329..8c3846ad811 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -71,13 +71,14 @@ _orphan_lock = threading.Lock()
+ # that copy is alive. A consumer that discards its copy with the row still pending hands it back
+ # (``return_completion_offer``); the delivery claim stays the only thing that settles the row.
+ _offered: set = set()
++# Every offer retains its lease even when the consumer hands its copy back.
++_offered_at: dict[tuple[str, str], float] = {}
+ # Delegation ids this process first offered from its startup replay. Their copies carry
+ # ``startup_replay`` on the sweep's later re-offers too, so a refused one stays gated.
+ _startup_replayed: set = set()
+ _last_orphan_sweep: dict[str, float] = {}
+-# (home key, delegation_id) -> when the sweep last re-offered a lost copy. A consumer that keeps
+-# handing the copy back would otherwise be re-offered every tick: re-offering touches no ledger
+-# column, so each re-offer gets its own ``_CLAIM_LEASE_S`` here, and only the first one warns.
++# (home key, delegation_id) -> last lost-copy warning; only the first re-offer warns.
++# The independent _offered_at map enforces the lease even after a consumer hands the copy back.
+ _reoffered_at: dict[tuple[str, str], float] = {}
+ # delegation_id -> number of copies a consumer holds off-queue (``mark_copy_held``). The sweep counts
+ # them as live alongside the queued ones, so it never adds a duplicate beside a held copy.
+@@ -368,34 +369,78 @@ def restore_undelivered_completions(target_queue) -> int:
+     recover_abandoned_delegations()
+     now = time.time()
+     with _DB_LOCK, _transaction() as conn:
++        _expire_pending_completions(conn, now)
+         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
+                FROM async_delegations
+-               WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
+-               ORDER BY completed_at, delegation_id""").fetchall()
++               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending' AND event_json IS NOT NULL
++                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
++               ORDER BY completed_at, delegation_id""", (now - _CLAIM_LEASE_S,)).fetchall()
+         return _replay_pending(conn, rows, target_queue, now, startup=True)
+ 
+ 
++def _expire_pending_completions(conn, now: float) -> None:
++    """Resolve expired terminal rows even if their copies are queued or held; never steal a live claim."""
++    rows = conn.execute("""SELECT delegation_id, delivery_attempts,
++                  COALESCE(NULLIF(completed_at, 0), dispatched_at)
++           FROM async_delegations
++           WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
++             AND event_json IS NOT NULL
++             AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
++             AND (delivery_attempts >= ? OR
++                  (COALESCE(NULLIF(completed_at, 0), dispatched_at) > 0 AND
++                   COALESCE(NULLIF(completed_at, 0), dispatched_at) < ?))""",
++        (now - _CLAIM_LEASE_S, _MAX_DELIVERY_ATTEMPTS, now - _MAX_COMPLETION_REPLAY_AGE_S)).fetchall()
++    for delegation_id, attempts, age_basis in rows:
++        expired = age_basis and now - age_basis > _MAX_COMPLETION_REPLAY_AGE_S
++        reason = "replay age expired" if expired else "delivery attempts exhausted"
++        attempts = max(1, attempts or 0)
++        changed = conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
++                      delivery_claim=NULL, delivery_claimed_at=NULL, delivery_attempts=MAX(1, delivery_attempts), updated_at=?
++               WHERE delegation_id=? AND delivery_state='pending'
++                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
++            (now, delegation_id, now - _CLAIM_LEASE_S)).rowcount
++        if changed:
++            logger.warning("Async delegation %s: %s; terminally dropped after %d delivery attempt(s) "
++                           "(result remains queryable).", delegation_id, reason, attempts)
++    _prune_offer_history(conn)
++
++
++def _prune_offer_history(conn) -> None:
++    """Keep custody history only for this home's pending rows (including live claims).
++
++    Time alone is unsafe: a copy can remain queued beyond a lease. Terminal/deleted rows cannot
++    be replayed, while another home's history must survive this home's sweep.
++    """
++    home = hermes_home_key(get_hermes_home())
++    pending = {row[0] for row in conn.execute(
++        "SELECT delegation_id FROM async_delegations WHERE delivery_state='pending'")}
++    with _orphan_lock:
++        keys = _offered | _offered_at.keys() | _reoffered_at.keys()
++        stale = {key for key in keys if key[0] == home and key[1] not in pending}
++        _offered.difference_update(stale)
++        for key in stale:
++            _offered_at.pop(key, None)
++            _reoffered_at.pop(key, None)
++        remaining_ids = {key[1] for key in keys - stale}
++        _startup_replayed.difference_update({key[1] for key in stale} - remaining_ids)
++
++
+ def _replay_pending(conn, rows, target_queue, now: float, *, startup: bool = False) -> int:
+     """Put each pending ``(delegation_id, event_json, completed_at, dispatched_at)`` row on ``target_queue``
+     stamped ``restored``, or terminally drop it past ``_MAX_COMPLETION_REPLAY_AGE_S``. Records the offer so
+-    the orphan sweep skips the row until the copy is handed back (``return_completion_offer``)."""
++    the orphan sweep retains the offer lease even after ``return_completion_offer``."""
+     home, restored = hermes_home_key(get_hermes_home()), 0
+     for delegation_id, payload, completed_at, dispatched_at in rows:
+         age_basis = completed_at or dispatched_at
+         if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
+-            conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+-                          delivery_claim=NULL, delivery_claimed_at=NULL,
+-                          updated_at=?
+-                   WHERE delegation_id=? AND delivery_state='pending'""", (now, delegation_id))
+-            logger.warning("Async delegation %s: pending completion is %.1fh old "
+-                           "(cap %.1fh); terminally dropping the replay (result remains queryable).",
+-                           delegation_id, (now - age_basis) / 3600.0, _MAX_COMPLETION_REPLAY_AGE_S / 3600.0)
+-            continue
++            continue  # the caller expires all rows once, before selecting replay candidates
+         with _orphan_lock:
+             if (home, delegation_id) in _offered:
+                 # The owner's explicit startup replay and the first-consume replay
+                 # (process_registry.restore_completions) may both run: offer once.
+                 continue
++            if startup and _offered_at.get((home, delegation_id), float("-inf")) >= now - _CLAIM_LEASE_S:
++                continue
+         evt = json.loads(payload)
+         if isinstance(evt, dict):
+             evt = redact_completion_event(evt)
+@@ -409,6 +454,7 @@ def _replay_pending(conn, rows, target_queue, now: float, *, startup: bool = Fal
+         target_queue.put(evt)
+         with _orphan_lock:
+             _offered.add((home, delegation_id))
++            _offered_at[(home, delegation_id)] = now
+         restored += 1
+     return restored
+ 
+@@ -470,7 +516,7 @@ def _copy_may_be_live(delegation_id: str, pid, updated_at: float, live_ids: set,
+     if delegation_id in live_ids or updated_at >= now - _CLAIM_LEASE_S:
+         return True
+     with _orphan_lock:
+-        return _reoffered_at.get((home, delegation_id), float("-inf")) >= now - _CLAIM_LEASE_S
++        return _offered_at.get((home, delegation_id), float("-inf")) >= now - _CLAIM_LEASE_S
+ 
+ 
+ def _note_reoffers(home: str, lost: list, now: float) -> None:
+@@ -519,30 +565,22 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) ->
+     from tools.process_registry import process_registry
+     live = _queued_completion_ids(target_queue, process_registry.completion_queue)
+     with _orphan_lock:
+-        offered = {delegation_id for key, delegation_id in _offered if key == home}
++        offered = {delegation_id for key, delegation_id in _offered | _offered_at.keys() if key == home}
+     with _DB_LOCK, _transaction() as conn:
++        _expire_pending_completions(conn, now)
+         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at,
+-                      owner_pid, owner_started_at, delivery_attempts, updated_at
++                      owner_pid, owner_started_at, updated_at
+                FROM async_delegations
+                WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                  AND event_json IS NOT NULL AND updated_at < ?
+                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
+                ORDER BY completed_at, delegation_id""", (now - _ORPHAN_STALE_S, now - _CLAIM_LEASE_S)).fetchall()
+         orphans, lost = [], []
+-        for delegation_id, payload, completed_at, dispatched_at, pid, started, attempts, updated_at in rows:
++        for delegation_id, payload, completed_at, dispatched_at, pid, started, updated_at in rows:
+             copy_lost = alive(pid, started) or delegation_id in offered
+             if copy_lost and (live is None or _copy_may_be_live(delegation_id, pid, updated_at, live, home,
+                                                                   offered, now)):
+                 continue
+-            if (attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
+-                # Its last claimant died holding the final attempt; converge like release_completion_delivery.
+-                conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+-                              delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+-                       WHERE delegation_id=? AND delivery_state='pending'""", (now, delegation_id))
+-                logger.warning("Async delegation %s exhausted its %d delivery attempts; "
+-                               "marking terminally dropped (result remains queryable).",
+-                               delegation_id, _MAX_DELIVERY_ATTEMPTS)
+-                continue
+             orphans.append((delegation_id, payload, completed_at, dispatched_at))
+             if copy_lost:
+                 lost.append(delegation_id)
+@@ -727,7 +765,7 @@ def release_event_delivery(evt: dict[str, Any], claim_id: str) -> None:
+ def return_completion_offer(evt: dict[str, Any]) -> None:
+     """Hand an offered completion back to the orphan sweep after its in-memory copy was discarded while
+     the durable row stays pending, e.g. a TUI session that cannot prove it owns the event drops it (every
+-    session poller drains one process-wide queue). The next sweep may offer the row again. Delegation ids
++    session poller drains one process-wide queue). After its offer lease the sweep may offer it again. Delegation ids
+     are unique across profiles, so this clears the offer in every home."""
+     delegation_id = str(evt.get("delegation_id") or "") if evt.get("type") == "async_delegation" else ""
+     if not delegation_id or is_interim_delegation_event(evt):
+@@ -1479,6 +1517,7 @@ def _reset_for_tests() -> None:
+         _refused_by.clear()
+     with _orphan_lock:
+         _offered.clear()
++        _offered_at.clear()
+         _startup_replayed.clear()
+         _last_orphan_sweep.clear()
+         _reoffered_at.clear()
+-- 
+2.55.0
+

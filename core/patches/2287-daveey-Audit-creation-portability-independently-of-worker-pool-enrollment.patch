@@ -1,0 +1,143 @@
+From 88e7bdfbfcead592f453ca953c81a8096f48aa68 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 17:55:23 +0000
+Subject: [PATCH] [daveey] Audit creation portability independently of worker
+ pool enrollment
+
+Why: profile-local worker_pools absence suppressed structural diagnostics on the shared board. Keep scheduling guards unchanged; audit with the actual caller config and expose classifier failures conservatively.
+
+Proof: no-pool DB/CLI/tool regressions failed on missing portable_reason before patch; focused audit and placement suites pass after. Shared-board fixtures assert enrollment stays unset and profile config unchanged.
+---
+ hermes_cli/kanban_worker_placement.py         | 12 ++--
+ tests/hermes_cli/test_kanban_no_pool_audit.py | 65 +++++++++++++++++++
+ .../test_kanban_portable_reason_audit.py      |  5 +-
+ 3 files changed, 74 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_no_pool_audit.py
+
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index c1838b97dd9..9deb0375bb0 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -62,19 +62,19 @@ def creation_decision(args, cfg, gateway, pin, origin_intent):
+ 
+ 
+ def creation_audit(args, cfg=None):
+-    """``{"portable_reason": <why it cannot leave its origin> | None}`` for the card's ``created`` event, or None when
+-    no worker pool is configured (nothing to audit). Records the structural check every create runs, so the share of
+-    cards a pool never sees, and why, is a query instead of a replay (kanban-12ee0e4b65). Never raises. [daveey]"""
++    """Record structural portability for every create, independent of pool enrollment.
++
++    None means structurally portable, not admitted. Use the caller's placement config even without worker_pools;
++    its assignee allowlist and host markers still apply. A failed audit is explicit, never portable. [daveey]
++    """
+     from hermes_cli import kanban_placement as placement
+ 
+     try:
+         cfg = placement.config() if cfg is None else cfg
+-        if not isinstance(cfg, dict) or not cfg.get("worker_pools"):
+-            return None
+         return {"portable_reason": placement.portable_reason(args, cfg)}
+     except Exception:  # health: allow BLE001 -- an audit field never blocks a create
+         logger.warning("portable_reason audit failed", exc_info=True)
+-        return None
++        return {"portable_reason": "audit failed"}
+ 
+ 
+ def resolved_db_placement(fields):
+diff --git a/tests/hermes_cli/test_kanban_no_pool_audit.py b/tests/hermes_cli/test_kanban_no_pool_audit.py
+new file mode 100644
+index 00000000000..07d80f9f01e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_no_pool_audit.py
+@@ -0,0 +1,65 @@
++"""A profile's scheduling opt-out must not hide shared-board creation diagnostics."""
++import json
++import re
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_placement as placement
++from hermes_cli import kanban_worker_placement as worker
++
++
++@pytest.mark.parametrize("frontdoor", ["db", "cli", "tool"])
++@pytest.mark.parametrize("assignee,body,reason", [
++    ("specialist", "", "assignee not allowlisted"),
++    ("default", "Inspect special-device", "home gateway marker"),
++    ("default", "", None),
++])
++def test_no_pool_profile_audits_shared_default_board(tmp_path, monkeypatch, frontdoor, assignee, body, reason):
++    root = tmp_path / ".hermes"
++    profile = root / "profiles" / "specialist"
++    profile.mkdir(parents=True)
++    (root / "config.yaml").write_text("kanban:\n  placement:\n    worker_pools:\n      hub: [worker-1]\n")
++    config = "kanban:\n  placement:\n    extra_home_markers: [special-device]\n"
++    (profile / "config.yaml").write_text(config)
++    board = root / "kanban" / "boards" / "default.db"
++    board.parent.mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(profile))
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(board))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
++    cfg = placement.config()
++    assert "worker_pools" not in cfg
++    assert cfg["extra_home_markers"] == ["special-device"]
++    kb.init_db()
++    args = {"title": "Analyze public data", "assignee": assignee, "body": body, "requires": []}
++    if frontdoor == "db":
++        with kbc.connect() as conn:
++            tid = kb.create_task(conn, **args)
++    elif frontdoor == "cli":
++        from hermes_cli import kanban as kc
++        out = kc.run_slash(f"create 'Analyze public data' --assignee {assignee} --body '{body}'")
++        tid = re.search(r"(t_[0-9a-f]+)", out).group(1)
++    else:
++        from tools import kanban_tools as kt
++        result = json.loads(kt._handle_create(args))
++        assert result.get("ok"), result
++        tid = result["task_id"]
++    with kbc.connect() as conn:
++        assert conn.execute("PRAGMA database_list").fetchone()[2] == str(board)
++        task = kb.get_task(conn, tid)
++        event = next(e for e in kb.list_events(conn, tid) if e.kind == "created")
++        assert event.payload["portable_reason"] == reason
++        assert event.payload["placement_policy"] is None
++        assert task.placement_policy is None
++    assert worker.creation_decision(args, cfg, "hub", "auto", None) is None
++    assert (profile / "config.yaml").read_text() == config
++
++
++def test_audit_failure_is_visible_not_portable(monkeypatch):
++    def broken(*args):
++        raise ValueError("invalid classifier input")
++    monkeypatch.setattr(placement, "portable_reason", broken)
++    assert worker.creation_audit({}, {}) == {"portable_reason": "audit failed"}
+diff --git a/tests/hermes_cli/test_kanban_portable_reason_audit.py b/tests/hermes_cli/test_kanban_portable_reason_audit.py
+index b6bc7f53ae6..ac81df6e0ef 100644
+--- a/tests/hermes_cli/test_kanban_portable_reason_audit.py
++++ b/tests/hermes_cli/test_kanban_portable_reason_audit.py
+@@ -112,7 +112,7 @@ def test_tool_created_event_records_portable_reason(kanban_home, monkeypatch, re
+     assert payload["portable_reason"] == reason
+ 
+ 
+-def test_created_event_omits_audit_when_no_pool_is_configured(tmp_path, monkeypatch):
++def test_created_event_records_audit_when_no_pool_is_configured(tmp_path, monkeypatch):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
+ 
+@@ -122,7 +122,8 @@ def test_created_event_omits_audit_when_no_pool_is_configured(tmp_path, monkeypa
+     kb.init_db()
+     with kbc.connect() as conn:
+         tid = kb.create_task(conn, title="plain")
+-    assert "portable_reason" not in created_payload(tid)
++    assert created_payload(tid)["portable_reason"] is None
++    assert created_payload(tid)["placement_policy"] is None
+ 
+ 
+ def test_create_task_records_a_passed_reason(kanban_home):
+-- 
+2.55.0
+

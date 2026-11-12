@@ -1,0 +1,604 @@
+From 7ea5d5c103c01b5a4f26ea48ec297dff2830c356 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 05:22:10 +0000
+Subject: [PATCH] [daveey] lint: forbid plain file calls on SQLite -shm/-wal
+ sidecars (check --only sqlite-sidecars)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+hermes-hub state.db was corrupted on 2026-11-11 because session_list_flight.data_stamp() read the
+WAL-index header with open("<db>-shm") + close on every GET /api/sessions. POSIX cancels all of a
+process's locks on a file when it closes any descriptor for it, and SQLite's WAL writer lock lives
+on -shm, so a list call inside a write transaction let a second process write the same WAL
+(fixed in a332e272cc7). The rule was documented in sqlite_safe_read but nothing enforced it:
+92e3135eddb added that line with tests for the cache behaviour only.
+
+scripts/check_sqlite_sidecar_opens.py is an AST guard, wired like check_detached_spawns
+(scripts/check _GUARDS, so the hooks `scripts/check --install-hook` writes run it, and a lint.yml
+step): open/FileIO, <x>.open/read_bytes/read_text/write_bytes/write_text and
+copy/copy2/copyfile/copyfileobj/move (bare or on any receiver) are flagged when an argument (or
+the receiver, unless it is os/io/shutil) carries a "-shm"/"-wal" literal, or a name assigned from one: variables per
+function (assignment, loop/with target, parameter default), attributes and class constants by
+name for the whole file, no flow. sqlite_safe_read.py (the lock-safe readers) is not scanned;
+`sqlite-sidecar-open: ok — <why>` marks a call made with no connection open. On the tree before
+a332e272cc7 it reports hermes_cli/session_list_flight.py:42, the incident line. The two other
+hits are marked with their reason: kanban recover's corrupt-file fallback copy (its connection
+is closed first) and session recovery's snapshot copy (inside offline_file_access, which refuses while a tracked
+connection is open).
+
+Not caught: a sidecar path built in another file or passed as a parameter, a subscript store, an
+aliased open, and a plain open of the main database file.
+
+Card: t_01a1c8d56207ac96
+---
+ .github/workflows/lint.yml                    |   7 +
+ hermes_cli/kanban_db_recover.py               |   1 +
+ hermes_cli/session_recovery.py                |   1 +
+ scripts/check                                 |   1 +
+ scripts/check_sqlite_sidecar_opens.py         | 317 ++++++++++++++++++
+ .../test_check_sqlite_sidecar_opens.py        | 161 +++++++++
+ tests/scripts/test_code_health_cli.py         |   1 +
+ 7 files changed, 489 insertions(+)
+ create mode 100644 scripts/check_sqlite_sidecar_opens.py
+ create mode 100644 tests/scripts/test_check_sqlite_sidecar_opens.py
+
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index 3605b914956..4c0cb7ef1ff 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -105,6 +105,13 @@ jobs:
+         if: ${{ !cancelled() && steps.setup.outcome == 'success' && inputs.python }}
+         run: just check --only detached-spawns
+ 
++      # close() on any descriptor for a SQLite -shm/-wal cancels this process's locks on it (the
++      # WAL writer lock included): hermes-hub state.db corruption 2026-11-11. Raw reads go through
++      # hermes_cli.sqlite_safe_read; `sqlite-sidecar-open: ok — <why>` marks an offline call.
++      - name: Forbid plain file calls on SQLite -shm/-wal sidecars
++        if: ${{ !cancelled() && steps.setup.outcome == 'success' && inputs.python }}
++        run: just check --only sqlite-sidecars
++
+       # The install root has one owner, hermes_cli._startup_fast.project_root_str(); sys.path
+       # belongs to entry points. New __file__ climbs or import-time sys.path edits fail here.
+       - name: Forbid new install-root math and import-time sys.path edits
+diff --git a/hermes_cli/kanban_db_recover.py b/hermes_cli/kanban_db_recover.py
+index 5ab6062b7b0..912968cb5db 100644
+--- a/hermes_cli/kanban_db_recover.py
++++ b/hermes_cli/kanban_db_recover.py
+@@ -587,6 +587,7 @@ def _snapshot(watch: sqlite3.Connection, live: Path, dest: Path) -> tuple[sqlite
+     shutil.copyfile(live, dest)
+     wal = live.with_name(live.name + "-wal")
+     if wal.exists():
++        # sqlite-sidecar-open: ok — corrupt-file fallback; `watch`, this process's connection, is closed above
+         shutil.copyfile(wal, dest.with_name(dest.name + "-wal"))
+     watch = sqlite3.connect(str(live), timeout=30)
+     try:
+diff --git a/hermes_cli/session_recovery.py b/hermes_cli/session_recovery.py
+index c817bab06c4..f812c4153cd 100644
+--- a/hermes_cli/session_recovery.py
++++ b/hermes_cli/session_recovery.py
+@@ -207,6 +207,7 @@ def _copy_source_bundle(source: Path, snapshot_dir: Path) -> tuple[Path, list[st
+                 source_part = _sidecar_path(source, suffix)
+                 if source_part.exists():
+                     destination_part = _sidecar_path(snapshot_source, suffix)
++                    # sqlite-sidecar-open: ok — inside offline_file_access: refused while a tracked connection is open
+                     shutil.copy2(source_part, destination_part)
+                     copied.append(destination_part.name)
+     except LiveConnectionError as exc:
+diff --git a/scripts/check b/scripts/check
+index 852229d6ef7..757caacac16 100755
+--- a/scripts/check
++++ b/scripts/check
+@@ -156,6 +156,7 @@ _GUARDS = {
+     "shebangs": ["scripts/check_bash_shebangs.py"],
+     "no-tmp": ["scripts/check_no_tmp_literals.py"],
+     "detached-spawns": ["scripts/check_detached_spawns.py"],
++    "sqlite-sidecars": ["scripts/check_sqlite_sidecar_opens.py"],
+     "install-root": ["scripts/install_root_lint.py"],
+     "config-writers": ["scripts/check_config_yaml_writers.py"],
+     "config-readers": ["scripts/check_config_yaml_readers.py"],
+diff --git a/scripts/check_sqlite_sidecar_opens.py b/scripts/check_sqlite_sidecar_opens.py
+new file mode 100644
+index 00000000000..be326b36eb8
+--- /dev/null
++++ b/scripts/check_sqlite_sidecar_opens.py
+@@ -0,0 +1,317 @@
++#!/usr/bin/env python3
++"""Fail when production code opens a SQLite ``-shm``/``-wal`` sidecar with a plain file call.
++
++POSIX cancels every advisory lock a process holds on a file when that process closes ANY
++descriptor for it. SQLite keeps its WAL locks (the writer lock included) as POSIX locks on
++``<db>-shm``, so ``open(f"{db}-shm").read()`` inside a process that also has the database open
++releases a write transaction's lock mid-flight, and a second process can then write the same WAL.
++That corrupted hermes-hub's state.db on 2026-11-11 (duplicate rows, index/table mismatches,
++freelist damage): the session-list cache read the WAL-index header that way on every
++``GET /api/sessions``. Raw reads of a live database file or its sidecars go through
++``hermes_cli.sqlite_safe_read`` (``pread_lock_safe``, ``read_header_lock_safe``,
++``sha256_lock_safe``: a cached descriptor that is never closed; ``copy_file_out_of_process`` for
++copies).
++
++Flags, in Python files of the production trees (tests, evals and scripts excluded), a call that
++opens, reads, writes or copies a file
++
++  open(...), FileIO(...), copy/copy2/copyfile/copyfileobj/move(...) called bare, and
++  <x>.open(...), <x>.FileIO(...), <x>.read_bytes(), <x>.read_text(), <x>.write_bytes(...),
++  <x>.write_text(...), <x>.copy/copy2/copyfile/copyfileobj/move(...) on ANY receiver
++  (``os``, ``io``, ``shutil`` under any alias, a ``Path``; the method name alone decides)
++
++when it names a sidecar: ANY argument (or the receiver, unless that is ``os``/``io``/``shutil``) contains a
++``str``/``bytes`` literal ending in ``-shm`` or ``-wal`` (each f-string fragment counts, so do
++``name + "-wal"`` and ``"%s-wal" % db``), or a name assigned from such an expression. A literal
++that is only tested (``name.endswith("-wal")``, ``x == "-shm"``) does not count.
++
++Names are tracked without flow, and err toward flagging (rename the variable or mark the line):
++
++  variables      per function: assignment, ``for``/comprehension target, ``with ... as``,
++                 a parameter default. Module- and class-level names and those of an enclosing
++                 function are visible inside; a parameter does not hide them. A name that holds
++                 a sidecar path anywhere in a function is one throughout it, and so is a value
++                 derived from it.
++  attributes     for the whole file, by attribute name: ``self.shm = db + "-shm"`` in one
++                 method, or ``SUFFIX = "-wal"`` in a class body, marks every ``<x>.shm`` /
++                 ``<x>.SUFFIX``.
++
++Not caught: a sidecar path built in another file, by a helper defined elsewhere, or passed in
++as a parameter; one stored under a subscript (``d["wal"] = ...; open(d["wal"])``); an aliased
++import (``from os import open as os_open``); a plain open of the main database file (no
++literal names it); ``open`` under another name (``op = open``); a global one function writes
++and another opens; a copy made by a child process; and descriptors opened from C extensions. The runtime side of this rule is ``hermes_state``'s WAL
++lock guard; a review still has to catch those.
++
++``hermes_cli/sqlite_safe_read.py`` is not scanned: the lock-safe readers are the one place that
++holds a raw descriptor on a sidecar. Calls into it from other files need no exemption, since
++``pread_lock_safe(...)`` and friends are not file calls.
++
++Opt out of one line with ``sqlite-sidecar-open: ok — <why>`` on that line or the line directly
++above it; a marker without a reason after the dash does not count. Legitimate reasons: this
++process provably holds no connection to that database at that point (an offline recovery tool
++after it closed its handles), or the file is a detached copy no connection ever opens.
++
++``_BASELINE`` maps a file to a tolerated count of unmarked hits. It is empty; keep it that way.
++
++Run: python scripts/check_sqlite_sidecar_opens.py [--all] [--print-baseline] [--strict-baseline] [paths...]
++Exit 1 on any violation, 0 when clean.
++"""
++from __future__ import annotations
++
++import argparse
++import ast
++import re
++import subprocess
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++MARKER = "sqlite-sidecar-open: ok"
++# The lock-safe readers themselves: the one place a raw descriptor on a sidecar is the point.
++HELPER_FILES = {"hermes_cli/sqlite_safe_read.py"}
++SCAN_TREES = ("agent", "cron", "gateway", "hermes_cli", "plugins", "tools", "tui_gateway", "acp_adapter", "pm")
++SCAN_ROOT_FILES = ("cli.py", "run_agent.py", "hermes_state.py", "utils.py", "hermes_constants.py")
++SKIP_PARTS = {"tests", "__pycache__", "evals", "node_modules"}
++_SUFFIXES = ("-shm", "-wal")
++_BYTE_SUFFIXES = (b"-shm", b"-wal")
++# Cheap text prefilter: only files mentioning a sidecar suffix are parsed.
++_NEEDLES = _SUFFIXES
++_TEST_METHODS = {"endswith", "startswith", "removesuffix", "removeprefix", "count", "find", "index"}
++_SHUTIL_FUNCS = {"copy", "copy2", "copyfile", "copyfileobj", "move"}
++_OPEN_NAMES = {"open", "FileIO", *_SHUTIL_FUNCS}  # bare names: builtins, ``from shutil import copyfile``
++_FILE_METHODS = {"open", "FileIO", "read_bytes", "read_text", "write_bytes", "write_text"}
++
++
++def _names_sidecar(node: ast.AST, tainted: set[str] | frozenset[str]) -> bool:
++    """Whether the expression ``node`` mentions a ``-shm``/``-wal`` literal or a tainted variable."""
++    stack: list[ast.AST] = [node]
++    while stack:
++        sub = stack.pop()
++        # A suffix that is only tested (``name.endswith("-wal")``, ``x == "-shm"``) builds no path.
++        if isinstance(sub, ast.Compare) or (isinstance(sub, ast.Call) and getattr(sub.func, "attr", None) in _TEST_METHODS):
++            continue
++        stack.extend(ast.iter_child_nodes(sub))
++        if isinstance(sub, ast.Constant) and (
++                (isinstance(sub.value, str) and sub.value.endswith(_SUFFIXES))
++                or (isinstance(sub.value, bytes) and sub.value.endswith(_BYTE_SUFFIXES))):
++            return True
++        if isinstance(sub, ast.Name) and sub.id in tainted:
++            return True
++        if isinstance(sub, ast.Attribute) and "." + sub.attr in tainted:
++            return True
++    return False
++
++
++def _target_names(target: ast.AST) -> list[str]:
++    if isinstance(target, ast.Name):
++        return [target.id]
++    if isinstance(target, ast.Attribute):  # self.shm = ...: tracked by attribute name, as ".shm"
++        return ["." + target.attr]
++    if isinstance(target, ast.Starred):
++        return _target_names(target.value)
++    if isinstance(target, (ast.Tuple, ast.List)):
++        return [name for elt in target.elts for name in _target_names(elt)]
++    return []
++
++
++_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
++
++
++def _scope_nodes(scope: ast.AST) -> list[ast.AST]:
++    """Nodes of ``scope`` itself, not those of functions nested in it."""
++    out: list[ast.AST] = []
++    stack = list(ast.iter_child_nodes(scope))
++    while stack:
++        node = stack.pop()
++        out.append(node)
++        if not isinstance(node, _SCOPES):
++            stack.extend(ast.iter_child_nodes(node))
++    return out
++
++
++def _tainted_names(nodes: list[ast.AST], inherited: frozenset[str]) -> frozenset[str]:
++    """``inherited`` plus the names ``nodes`` assign from an expression naming a sidecar (to a
++    fixed point, so ``wal = db + "-wal"; src = wal`` marks both). ``self.x`` is kept as ``.x``."""
++    assigns: list[tuple[list[str], ast.AST]] = []
++    for node in nodes:
++        if isinstance(node, ast.Assign):
++            names = [name for target in node.targets for name in _target_names(target)]
++            assigns.append((names, node.value))
++        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr, ast.AugAssign)) and node.value is not None:
++            assigns.append((_target_names(node.target), node.value))
++        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):  # for p in (db + "-wal", ...)
++            assigns.append((_target_names(node.target), node.iter))
++        elif isinstance(node, ast.withitem) and node.optional_vars is not None:  # with x(db + "-shm") as p
++            assigns.append((_target_names(node.optional_vars), node.context_expr))
++        elif isinstance(node, ast.arguments):  # def f(p=db + "-wal")
++            positional = [*node.posonlyargs, *node.args]
++            pairs = [*zip(positional[len(positional) - len(node.defaults):], node.defaults),
++                     *zip(node.kwonlyargs, node.kw_defaults)]
++            assigns.extend(([arg.arg], default) for arg, default in pairs if default is not None)
++        elif isinstance(node, ast.ClassDef):  # class C: SUFFIX = "-wal" -> self.SUFFIX / C.SUFFIX
++            for stmt in node.body:
++                if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None:
++                    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
++                    names = ["." + name for target in targets for name in _target_names(target)
++                             if not name.startswith(".")]
++                    assigns.append((names, stmt.value))
++    tainted = set(inherited)
++    changed = True
++    while changed:
++        changed = False
++        for names, value in assigns:
++            if names and not set(names) <= tainted and _names_sidecar(value, tainted):
++                tainted.update(names)
++                changed = True
++    return frozenset(tainted)
++
++
++def _file_call_paths(node: ast.Call) -> list[ast.AST]:
++    """The path-bearing expressions of ``node`` when it is a file open/read/write/copy call."""
++    func = node.func
++    args: list[ast.AST] = [*node.args, *(kw.value for kw in node.keywords)]
++    if isinstance(func, ast.Name):
++        return args if func.id in _OPEN_NAMES else []
++    if not isinstance(func, ast.Attribute):
++        return []
++    owner = func.value.id if isinstance(func.value, ast.Name) else None
++    if func.attr in _FILE_METHODS or func.attr in _SHUTIL_FUNCS:
++        # os.open(path, ...), shutil.copyfile(src, dst): only the arguments are paths. For
++        # Path(path).open(), path.read_bytes(), path.copy(dst) the receiver is one too.
++        return args if owner in {"os", "io", "shutil"} else [func.value, *args]
++    return []
++
++
++def sidecar_open_lines(text: str) -> list[int]:
++    """Line numbers of plain file calls on a ``-shm``/``-wal`` path in ``text`` (a Python module)."""
++    if not any(needle in text for needle in _NEEDLES):
++        return []
++    try:
++        tree = ast.parse(text)
++    except (SyntaxError, ValueError):
++        return []
++    # Attribute names (``self.shm = db + "-shm"``) are shared by the whole file: the method that
++    # sets one is rarely the method that opens it.
++    attrs = frozenset(n for n in _tainted_names(list(ast.walk(tree)), frozenset()) if n.startswith("."))
++    lines: set[int] = set()
++    scopes: list[tuple[ast.AST, frozenset[str]]] = [(tree, attrs)]
++    while scopes:
++        scope, inherited = scopes.pop()
++        nodes = _scope_nodes(scope)
++        tainted = _tainted_names(nodes, inherited)
++        for node in nodes:
++            if isinstance(node, _SCOPES):
++                scopes.append((node, tainted))  # a nested function sees the names of the one around it
++            elif isinstance(node, ast.Call) and any(_names_sidecar(path, tainted) for path in _file_call_paths(node)):
++                lines.add(node.lineno)
++    return sorted(lines)
++
++
++# The marker counts only with a reason: ``sqlite-sidecar-open: ok — <why>`` (an em dash or hyphens).
++_MARKED = re.compile(re.escape(MARKER) + r"\s*(?:—|-+)\s*\S")
++
++
++def _marked(src_lines: list[str], lineno: int) -> bool:
++    here = src_lines[lineno - 1] if lineno - 1 < len(src_lines) else ""
++    above = src_lines[lineno - 2] if lineno >= 2 else ""
++    return bool(_MARKED.search(here) or _MARKED.search(above))
++
++
++def _tracked_files(root: Path) -> list[Path]:
++    try:
++        out = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", *SCAN_TREES, *SCAN_ROOT_FILES],
++                             capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL, timeout=60).stdout
++    except (OSError, subprocess.SubprocessError) as exc:
++        # Fail closed: scanning nothing would report "no sidecar opens".
++        raise RuntimeError(f"cannot list the tracked files under {root}: {exc}") from exc
++    return [root / rel for rel in out.split("\0") if rel.endswith(".py")]
++
++
++def _in_scope(rel: str) -> bool:
++    parts = Path(rel).parts
++    return not (SKIP_PARTS & set(parts)) and not Path(rel).name.startswith("test_") and rel not in HELPER_FILES
++
++
++def scan(paths=None, root: Path | None = None) -> dict[str, list[tuple[int, str]]]:
++    """Repo-relative path -> [(lineno, line)] of unmarked sidecar opens."""
++    root = (root or ROOT).resolve()
++    hits: dict[str, list[tuple[int, str]]] = {}
++    for path in (list(paths) if paths else _tracked_files(root)):
++        path = Path(path).resolve()
++        try:
++            rel = path.relative_to(root).as_posix()
++        except ValueError:
++            rel = str(path)
++        if path.suffix != ".py" or not _in_scope(rel):
++            continue
++        try:
++            text = path.read_text(encoding="utf-8-sig", errors="ignore")
++        except OSError:
++            continue
++        src = text.splitlines()
++        found = [(n, src[n - 1]) for n in sidecar_open_lines(text) if not _marked(src, n)]
++        if found:
++            hits[rel] = found
++    return hits
++
++
++# Burn-down list of files with unmarked hits. Empty: route the read through sqlite_safe_read or
++# mark the line with its reason instead of adding an entry.
++_BASELINE: dict[str, int] = {
++}
++
++
++def _format_baseline(hits: dict[str, list]) -> str:
++    body = "".join(f'    "{rel}": {len(found)},\n' for rel, found in sorted(hits.items()))
++    return "_BASELINE: dict[str, int] = {\n" + body + "}"
++
++
++def main(argv: list[str] | None = None) -> int:
++    ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
++    ap.add_argument("paths", nargs="*", help="files to check (default: the production trees)")
++    ap.add_argument("--all", action="store_true", help="ignore _BASELINE; report every hit")
++    ap.add_argument("--print-baseline", action="store_true", help="print a _BASELINE for the current tree")
++    ap.add_argument("--strict-baseline", action="store_true", help="also fail when _BASELINE overstates a file")
++    args = ap.parse_args(argv)
++
++    try:
++        hits = scan(args.paths or None)
++    except RuntimeError as exc:
++        print(f"check_sqlite_sidecar_opens: {exc}", file=sys.stderr)
++        return 2
++    if args.print_baseline:
++        print(_format_baseline(hits))
++        return 0
++    baseline = {} if (args.all or args.paths) else _BASELINE
++    problems: list[str] = []
++    advisories: list[str] = []
++    for rel in sorted(hits):
++        allowed = baseline.get(rel)
++        if allowed is not None and len(hits[rel]) <= allowed:
++            if len(hits[rel]) < allowed:
++                advisories.append(f"{rel}: {len(hits[rel])} sidecar file call(s) left, _BASELINE says {allowed}")
++            continue
++        problems.extend(f"{rel}:{n}: {line.strip()[:160]}" for n, line in hits[rel])
++    advisories.extend(f"{rel}: listed in _BASELINE but clean (or gone)" for rel in sorted(baseline) if rel not in hits)
++    if advisories:
++        print("advisory — _BASELINE in scripts/check_sqlite_sidecar_opens.py is stale; regenerate it with "
++              "--print-baseline (fewer hits than listed is progress, not a failure):")
++        print("\n".join("  " + a for a in advisories))
++    if args.strict_baseline:
++        problems.extend(advisories)
++    if not problems:
++        print("no plain file calls on SQLite -shm/-wal sidecars outside sqlite_safe_read")
++        return 0
++    print("\n".join(problems))
++    print(f"\n{len(problems)} plain file call(s) on a SQLite -shm/-wal sidecar. Closing any descriptor on a "
++          "sidecar cancels this process's SQLite locks on it (a write transaction's writer lock included), "
++          "so another process can write the same WAL. Read it with hermes_cli.sqlite_safe_read "
++          "(pread_lock_safe / read_header_lock_safe / sha256_lock_safe, copy_file_out_of_process), or mark a "
++          f"call made while this process holds no connection to that database with `{MARKER} — <why>` "
++          "(same line or the line above).")
++    return 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/scripts/test_check_sqlite_sidecar_opens.py b/tests/scripts/test_check_sqlite_sidecar_opens.py
+new file mode 100644
+index 00000000000..d6951ad78e2
+--- /dev/null
++++ b/tests/scripts/test_check_sqlite_sidecar_opens.py
+@@ -0,0 +1,161 @@
++"""scripts/check_sqlite_sidecar_opens.py: plain file calls on a SQLite -shm/-wal path are flagged unless marked."""
++
++import importlib.util
++import textwrap
++from pathlib import Path
++
++import pytest
++
++SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "check_sqlite_sidecar_opens.py"
++
++
++def _load():
++    spec = importlib.util.spec_from_file_location("check_sqlite_sidecar_opens", SCRIPT)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++@pytest.mark.parametrize(
++    "src",
++    [
++        # hermes-hub 2026-11-11: this exact line released the WAL writer lock on every session-list call.
++        'with open(f"{db}-shm", "rb") as f: head = f.read(96)',
++        'open(str(db) + "-wal", "rb")',
++        'fd = os.open(f"{db}-shm", os.O_RDONLY)',
++        'io.open(db_path + "-wal")',
++        'Path(f"{db}-shm").read_bytes()',
++        'db.with_name(db.name + "-wal").open("rb")',
++        'Path(str(db) + "-shm").write_bytes(b"")',
++        'shutil.copyfile(live.with_name(live.name + "-wal"), dest)',
++        'shutil.copy2(src=f"{db}-shm", dst=out)',
++        'sh.copyfile(db + "-wal", dest)',  # import shutil as sh
++        'copyfile(db + "-wal", dest)',  # from shutil import copyfile
++        'io.FileIO(f"{db}-shm")',
++        'Path(db + "-wal").copy(dest)',  # pathlib, Python 3.14: the receiver is the path
++        'Path(db + "-wal").move(dest)',
++        'open("%s-wal" % db, "rb")',
++        'os.fdopen(os.open(db + "-shm", os.O_RDONLY))',
++    ],
++)
++def test_sidecar_file_calls_are_flagged(src):
++    assert _load().sidecar_open_lines(src) == [1]
++
++
++def test_a_variable_assigned_from_a_sidecar_path_is_followed():
++    src = textwrap.dedent("""\
++        wal = live.with_name(live.name + "-wal")
++        source = wal
++        if wal.exists():
++            shutil.copyfile(source, dest)
++        for shm in [p]:
++            pass
++        (a, b) = (f"{db}-shm", 1)
++        open(a)
++    """)
++    assert _load().sidecar_open_lines(src) == [4, 8]
++
++
++@pytest.mark.parametrize(
++    "src",
++    [
++        'self.shm = db + "-shm"\nopen(self.shm)',
++        'p = db\np += "-wal"\nopen(p)',
++        'for p in (db + "-wal", db + "-shm"):\n    open(p)',
++        'heads = [open(p).read() for p in (db + "-wal", db + "-shm")]',
++        'SUFFIX = "-wal"\nopen(db + SUFFIX)',
++        'with tracked(db + "-shm") as p:\n    open(p)',
++        'def f(p=db + "-wal"):\n    open(p)',
++        'def f(*, p=db + "-wal"):\n    open(p)',
++        'class C:\n    SUFFIX = "-wal"\n    def m(self, db):\n        open(db + self.SUFFIX)',
++        'class C:\n    SUFFIX: str = "-wal"\ndef f(db):\n    open(db + C.SUFFIX)',
++        'open(db + b"-wal")',
++    ],
++)
++def test_attributes_loop_variables_and_augmented_assignments_are_followed(src):
++    assert _load().sidecar_open_lines(src) == [src.count("\n") + 1]
++
++
++def test_names_are_tracked_per_function_without_flow_and_any_argument_counts():
++    """Pinned on purpose: within a function the guard has no flow, so it over-flags rather than
++    misses. Tightening it (flow-aware names, path arguments only) must be a deliberate change."""
++    mod = _load()
++    # Rebinding does not clear a name, and a value derived from a sidecar path keeps the mark.
++    assert mod.sidecar_open_lines('p = db + "-wal"\np = other\nopen(p)') == [3]
++    assert mod.sidecar_open_lines('wal = db + "-wal"\nlog = wal.parent / "x.log"\nopen(log)') == [3]
++    # A tuple assignment marks every target.
++    assert mod.sidecar_open_lines('a, b = (f"{db}-shm", 1)\nopen(b)') == [2]
++    # Any argument, not only the path, and any receiver: the method name alone decides.
++    assert mod.sidecar_open_lines('open(path, encoding="-wal")') == [1]
++    assert mod.sidecar_open_lines('game.move(db + "-wal")') == [1]
++    # A parameter does not hide a module-level name; a comprehension variable stays marked after it.
++    assert mod.sidecar_open_lines('p = db + "-wal"\nf = lambda p: open(p)') == [2]
++    assert mod.sidecar_open_lines('names = [p for p in (db + "-wal",)]\nopen(p)') == [2]
++    # Module-level names and an enclosing function's names are visible in a function ...
++    assert mod.sidecar_open_lines('SUFFIXES = ("", "-wal")\ndef f(db):\n    for s in SUFFIXES:\n        open(db + s)') == [4]
++    assert mod.sidecar_open_lines('def f(db):\n    wal = db + "-wal"\n    def g():\n        return open(wal)') == [4]
++    # ... but one function's local name says nothing about the same name in another.
++    assert mod.sidecar_open_lines('def a(db):\n    path = db + "-wal"\ndef b(path):\n    open(path)') == []
++    assert mod.sidecar_open_lines('def a(db):\n    path = db + "-wal"\npath = "x.log"\nopen(path)') == []
++    # An attribute set in one method is a sidecar path in every method of the file.
++    assert mod.sidecar_open_lines(
++        'class C:\n    def a(self, db):\n        self.shm = db + "-shm"\n    def b(self):\n        open(self.shm)') == [5]
++
++
++@pytest.mark.parametrize(
++    "src",
++    [
++        'pread_lock_safe(f"{db}-shm", 0, 96)',
++        'copy_file_out_of_process(f"{db}-wal", dest)',
++        'os.stat(f"{db}-wal")',
++        'Path(f"{db}-shm").exists()',
++        'os.unlink(str(db) + "-wal")',
++        'open(db_path, "rb")',
++        'open(log_path)  # rotates like a -wal',
++        'doc = "open(db-shm) in a string"',
++        'webbrowser.open(url)',
++        'name = "-wal"',
++        'open(f"{db}-wal-backup")',
++        'os.rename(db + "-wal", dest)',
++        'if path.endswith("-wal"): open(other)',
++        # Documented under "Not caught": a subscript store and an aliased open.
++        'd["wal"] = db + "-wal"\nopen(d["wal"])',
++        'from os import open as os_open\nos_open(db + "-wal", 0)',
++    ],
++)
++def test_other_shapes_are_not_flagged(src):
++    assert _load().sidecar_open_lines(src) == []
++
++
++def test_marker_on_the_line_or_the_line_above_opts_out(tmp_path):
++    mod = _load()
++    pkg = tmp_path / "hermes_cli"
++    pkg.mkdir()
++    f = pkg / "x.py"
++    f.write_text(textwrap.dedent("""\
++        import shutil
++        shutil.copyfile(f"{a}-wal", out)  # sqlite-sidecar-open: ok — offline tool, connections closed
++        # sqlite-sidecar-open: ok — detached copy nothing connects to
++        shutil.copyfile(f"{b}-wal", out)
++        # sqlite-sidecar-open: ok
++        shutil.copyfile(f"{c}-wal", out)
++        # an unrelated comment
++        shutil.copyfile(f"{d}-wal", out)
++    """), encoding="utf-8")
++    hits = mod.scan([f], root=tmp_path)
++    assert [n for n, _ in hits["hermes_cli/x.py"]] == [6, 8]
++
++
++def test_tests_and_the_helper_are_out_of_scope(tmp_path):
++    mod = _load()
++    for rel in ("tests/hermes_cli/test_x.py", "hermes_cli/test_y.py", "hermes_cli/sqlite_safe_read.py"):
++        path = tmp_path / rel
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text('open(f"{db}-shm", "rb")\n', encoding="utf-8")
++    assert mod.scan(list(tmp_path.rglob("*.py")), root=tmp_path) == {}
++
++
++def test_the_tree_is_clean_and_the_baseline_is_empty():
++    mod = _load()
++    assert mod._BASELINE == {}
++    assert mod.scan() == {}
+diff --git a/tests/scripts/test_code_health_cli.py b/tests/scripts/test_code_health_cli.py
+index 12324f95385..f3e50e149f3 100644
+--- a/tests/scripts/test_code_health_cli.py
++++ b/tests/scripts/test_code_health_cli.py
+@@ -26,6 +26,7 @@ REPO = Path(__file__).resolve().parents[2]
+ _GUARD_SCRIPTS = (
+     "scripts/check-windows-footguns.py", "scripts/check_bash_shebangs.py",
+     "scripts/check_no_tmp_literals.py", "scripts/check_detached_spawns.py", "scripts/install_root_lint.py",
++    "scripts/check_sqlite_sidecar_opens.py",
+     "scripts/check_config_yaml_writers.py", "scripts/check_config_yaml_readers.py",
+     "scripts/ci/check_os_marker_fakes.py", "scripts/check-case-collisions.py",
+     "scripts/ci/check_lazy_deps_imports.py", "scripts/ci/check_profile_archive_boundary.py",
+-- 
+2.55.0
+

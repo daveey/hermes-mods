@@ -1,0 +1,297 @@
+From e2fa4de5c6159f8e8b96fb925a3728d1e26ab57d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:23:39 +0000
+Subject: [PATCH] [daveey] Isolate baseline suite fixtures from host metadata
+ and readiness
+
+---
+ tests/gateway/test_readiness.py               | 18 ++++++++++---
+ tests/hermes_cli/test_banner.py               |  2 ++
+ tests/hermes_cli/test_banner_skills_width.py  |  1 +
+ .../hermes_cli/test_doctor_pm_store_probe.py  |  6 +++--
+ tests/hermes_cli/test_pty_bridge.py           |  8 +++---
+ .../test_web_host_terminal_persistence.py     | 17 +++++++-----
+ tests/tools/test_browser_launcher.py          |  6 ++++-
+ tests/tools/test_fal_sdk.py                   | 26 +++++++++++--------
+ 8 files changed, 58 insertions(+), 26 deletions(-)
+
+diff --git a/tests/gateway/test_readiness.py b/tests/gateway/test_readiness.py
+index b9bb48333c9..2c39ebae352 100644
+--- a/tests/gateway/test_readiness.py
++++ b/tests/gateway/test_readiness.py
+@@ -4,11 +4,15 @@ import json
+ import os
+ import sqlite3
+ from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
+ 
+ from gateway.readiness import collect_runtime_readiness
+ 
+ 
+-def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monkeypatch):
++@pytest.mark.parametrize("used,expected", [(50, "ok"), (94, "degraded")])
++def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monkeypatch, used, expected):
+     home = tmp_path / ".hermes"
+     home.mkdir()
+     (home / "config.yaml").write_text(
+@@ -19,6 +23,12 @@ def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monke
+         conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+     monkeypatch.setenv("HERMES_HOME", str(home))
+ 
++    def disk_usage(path):
++        assert path == home
++        return SimpleNamespace(total=100, used=used, free=100 - used)
++
++    monkeypatch.setattr("gateway.readiness.shutil.disk_usage", disk_usage)
++
+     result = collect_runtime_readiness(
+         configured_model="test/model",
+         runtime_status={
+@@ -29,14 +39,16 @@ def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monke
+         active_api_runs=2,
+     )
+ 
+-    assert result["status"] == "ok"
++    assert result["status"] == expected
+     assert result["checks"]["state_db"]["status"] == "ok"
+     assert result["checks"]["session_store"]["status"] == "ok"
+     assert result["checks"]["config"]["status"] == "ok"
+     assert result["checks"]["model"]["status"] == "ok"
+     assert result["checks"]["gateway"]["status"] == "ok"
+     assert result["checks"]["background_queues"]["active_api_runs"] == 2
+-    assert result["checks"]["disk"]["status"] in {"ok", "degraded"}
++    assert result["checks"]["disk"] == {
++        "status": expected, "used_percent": used, "free_bytes": 100 - used,
++    }
+ 
+ 
+ def test_collect_runtime_readiness_degrades_on_invalid_config_and_stopped_gateway(
+diff --git a/tests/hermes_cli/test_banner.py b/tests/hermes_cli/test_banner.py
+index 2c9013876ba..79f7aee69f9 100644
+--- a/tests/hermes_cli/test_banner.py
++++ b/tests/hermes_cli/test_banner.py
+@@ -44,6 +44,7 @@ def test_empty_model_shows_no_model_configured(tmp_path, monkeypatch):
+         patch.object(banner, "get_available_skills", return_value={}),
+         patch.object(banner, "get_update_result", return_value=None),
+         patch.object(tools.mcp_tool_discovery, "get_mcp_status", return_value=[]),
++        patch.object(banner, "format_banner_version_label", return_value="test version"),
+     ):
+         console = Console(record=True, force_terminal=False, color_system=None, width=160)
+         banner.build_welcome_banner(console=console, model="", cwd="/tmp/project", tools=[],
+@@ -65,6 +66,7 @@ def test_build_welcome_banner_does_not_center_pad_hero_art():
+         patch.object(banner, "get_available_skills", return_value={}),
+         patch.object(banner, "get_update_result", return_value=None),
+         patch.object(banner, "get_latest_release_tag", return_value=None),
++        patch.object(banner, "format_banner_version_label", return_value="test version"),
+         patch.object(tools.mcp_tool_discovery, "get_mcp_status", return_value=[]),
+         patch.object(banner, "_active_skin", return_value=skin),
+     ):
+diff --git a/tests/hermes_cli/test_banner_skills_width.py b/tests/hermes_cli/test_banner_skills_width.py
+index b44b14254ff..f870cbe4d21 100644
+--- a/tests/hermes_cli/test_banner_skills_width.py
++++ b/tests/hermes_cli/test_banner_skills_width.py
+@@ -19,6 +19,7 @@ def _build_banner_with_skills(skills_by_category, term_width=160):
+         ),
+         patch.object(banner, "get_available_skills", return_value=skills_by_category),
+         patch.object(banner, "get_update_result", return_value=None),
++        patch.object(banner, "format_banner_version_label", return_value="test version"),
+         patch.object(tools.mcp_tool_discovery, "get_mcp_status", return_value=[]),
+         patch("shutil.get_terminal_size", return_value=os.terminal_size((term_width, 50))),
+     ):
+diff --git a/tests/hermes_cli/test_doctor_pm_store_probe.py b/tests/hermes_cli/test_doctor_pm_store_probe.py
+index ecc2c1b5757..0522936f925 100644
+--- a/tests/hermes_cli/test_doctor_pm_store_probe.py
++++ b/tests/hermes_cli/test_doctor_pm_store_probe.py
+@@ -20,8 +20,10 @@ from pm.store import current_target, tree_digest
+ 
+ @pytest.fixture
+ def tool_store(tmp_path, monkeypatch):
+-    rg = shutil.which("rg")
+-    assert rg is not None, "this executable parity test requires ripgrep"
++    # Exercise real executable selection without reading the host's PM tool store.
++    rg = tmp_path / "fixture-rg"
++    rg.write_text("#!/bin/sh\nprintf 'ripgrep 15.2.0\\n'\n", encoding="utf-8")
++    rg.chmod(0o755)
+     version_output = subprocess.run(
+         [rg, "--version"], capture_output=True, text=True, check=True, timeout=10,
+     ).stdout
+diff --git a/tests/hermes_cli/test_pty_bridge.py b/tests/hermes_cli/test_pty_bridge.py
+index bebd72c4ccc..36858a6f183 100644
+--- a/tests/hermes_cli/test_pty_bridge.py
++++ b/tests/hermes_cli/test_pty_bridge.py
+@@ -433,9 +433,11 @@ class TestPtyBridgeClose:
+             "while :; do sleep 0.05; done\n"
+         )
+         bridge = PtyBridge.spawn(["/bin/sh", "-c", f"/bin/sh {script} & exec sleep 60"])
+-        _read_until(bridge, b"armed", timeout=10.0)  # the helper's trap is installed
+-
+-        bridge.close()
++        try:
++            output = _read_until(bridge, b"armed", timeout=10.0)
++            assert b"armed" in output, output  # the helper's trap is installed
++        finally:
++            bridge.close()
+ 
+         assert marker.read_text().strip() == "ok"
+ 
+diff --git a/tests/hermes_cli/test_web_host_terminal_persistence.py b/tests/hermes_cli/test_web_host_terminal_persistence.py
+index e59e1c7d6f8..ad52bb52f8f 100644
+--- a/tests/hermes_cli/test_web_host_terminal_persistence.py
++++ b/tests/hermes_cli/test_web_host_terminal_persistence.py
+@@ -165,12 +165,17 @@ def test_real_shell_survives_disconnect_and_explicit_close(host_app, tmp_path):
+             assert closed.value.code == 1000
+             assert not bridge.is_alive()
+             import psutil
+-            try:
+-                child_process = psutil.Process(foreground_pid)
+-            except psutil.NoSuchProcess:
+-                pass
+-            else:
+-                assert child_process.status() == psutil.STATUS_ZOMBIE
++            from tests.waiting import wait_until
++
++            def foreground_has_exited():
++                try:
++                    return psutil.Process(foreground_pid).status() == psutil.STATUS_ZOMBIE
++                except psutil.NoSuchProcess:
++                    return True
++
++            # The terminal hangup initiates exit in the foreground job's separate
++            # group; a same-instant process-status sample can precede kernel exit.
++            wait_until(foreground_has_exited, timeout=3.0, what="foreground job exit after close")
+         with client.websocket_connect(url("&attach=" + token)) as ws:
+             with pytest.raises(WebSocketDisconnect) as expired:
+                 ws.receive_bytes()
+diff --git a/tests/tools/test_browser_launcher.py b/tests/tools/test_browser_launcher.py
+index 4c6b26d42ce..b6d2aa544bb 100644
+--- a/tests/tools/test_browser_launcher.py
++++ b/tests/tools/test_browser_launcher.py
+@@ -394,7 +394,7 @@ def test_a_crashed_launchers_shared_browser_is_reaped_only_after_its_last_holder
+ 
+ 
+ @pytest.mark.platforms("posix")
+-def test_a_throwaway_profile_left_by_a_process_that_died_mid_launch_is_reclaimed():
++def test_a_throwaway_profile_left_by_a_process_that_died_mid_launch_is_reclaimed(monkeypatch):
+     """A process that dies between creating its throwaway profile and writing the launch record (a first
+     launch can wait 120 s) leaves no record behind. The next reap reclaims the dir by its owner's pid and
+     start time; the dir of a live process is never touched."""
+@@ -414,6 +414,10 @@ def test_a_throwaway_profile_left_by_a_process_that_died_mid_launch_is_reclaimed
+         held = Path(alive.stdout.readline().strip())
+         assert died.is_dir() and held.is_dir() and died.parent == held.parent
+ 
++        # Only the fixture owner is alive; unrelated host Chromium argv can name
++        # protected real-home profiles. Keep real owner identity/liveness checks.
++        import psutil
++        monkeypatch.setattr(psutil, "process_iter", lambda *a, **kw: iter([psutil.Process(alive.pid)]))
+         launcher.reap_orphaned_browsers()
+         assert not died.exists()
+         assert held.is_dir()
+diff --git a/tests/tools/test_fal_sdk.py b/tests/tools/test_fal_sdk.py
+index 8ed361d4297..0fa152a4c95 100644
+--- a/tests/tools/test_fal_sdk.py
++++ b/tests/tools/test_fal_sdk.py
+@@ -2,7 +2,6 @@
+ import json
+ from types import SimpleNamespace
+ 
+-import fal_client
+ import httpx
+ import pytest
+ 
+@@ -13,7 +12,12 @@ from tools.fal_common import (
+ 
+ 
+ @pytest.fixture
+-def transport(monkeypatch):
++def fal_client():
++    return pytest.importorskip("fal_client")
++
++
++@pytest.fixture
++def transport(monkeypatch, fal_client):
+     requests, responses, clients = [], [], []
+     original = httpx.Client.__init__
+ 
+@@ -47,7 +51,7 @@ def accepted():
+ 
+ 
+ @pytest.mark.parametrize("path", ["sub/path", "/sub/path"])
+-def test_sdk_submit_preserves_wire_contract(transport, path):
++def test_sdk_submit_preserves_wire_contract(transport, path, fal_client):
+     requests, replies = transport
+     replies.append(accepted())
+     client = _ManagedFalSyncClient(fal_client, key="test-token", queue_run_origin="  https://queue.test///  ")
+@@ -77,7 +81,7 @@ def test_sdk_submit_preserves_wire_contract(transport, path):
+ 
+ @pytest.mark.parametrize("status", [402, 409, 429, 503, "transport"])
+ @pytest.mark.parametrize("keyed", [True, False])
+-def test_keyed_errors_survive_without_duplicate_submission(transport, status, keyed):
++def test_keyed_errors_survive_without_duplicate_submission(transport, status, keyed, fal_client):
+     requests, replies = transport
+     body = {"error": {"code": "BILLING_ERROR", "message": "meter disabled",
+                        "details": {"upstreamPayload": {"code": "meter_missing", "error": "not configured"}}}}
+@@ -122,7 +126,7 @@ def test_exception_status_shapes(response_status, status, expected):
+     ("_client", "SyncClient._client"), ("_maybe_retry_request", "request helpers"),
+     ("_raise_for_status", "request helpers"), ("SyncRequestHandle", "SyncRequestHandle"),
+ ])
+-def test_missing_sdk_surface_is_actionable(transport, monkeypatch, missing, message):
++def test_missing_sdk_surface_is_actionable(transport, monkeypatch, missing, message, fal_client):
+     owner = fal_client if missing in {"SyncClient", "client"} else fal_client.client
+     if missing == "_client":
+         owner = fal_client.SyncClient
+@@ -135,7 +139,7 @@ def test_missing_sdk_surface_is_actionable(transport, monkeypatch, missing, mess
+     ("add_priority_header", {"priority": "low"}, "add_priority_header"),
+     ("add_timeout_header", {"start_timeout": 60}, "add_timeout_header"),
+ ])
+-def test_optional_sdk_surface_refused_before_http(transport, monkeypatch, helper, options, message):
++def test_optional_sdk_surface_refused_before_http(transport, monkeypatch, helper, options, message, fal_client):
+     monkeypatch.setattr(fal_client.client, helper, None)
+     client = _ManagedFalSyncClient(fal_client, key="token", queue_run_origin="https://queue.test")
+     with pytest.raises(RuntimeError, match=message):
+@@ -144,7 +148,7 @@ def test_optional_sdk_surface_refused_before_http(transport, monkeypatch, helper
+ 
+ 
+ @pytest.mark.parametrize("failure", [None, ImportError("external SDK"), RuntimeError("PM acquisition failed")])
+-def test_import_adapter_keeps_pm_failure_policy(monkeypatch, failure):
++def test_import_adapter_keeps_pm_failure_policy(monkeypatch, failure, fal_client):
+     import pm
+     calls = []
+ 
+@@ -162,20 +166,20 @@ def test_import_adapter_keeps_pm_failure_policy(monkeypatch, failure):
+     assert calls == ["fal"]
+ 
+ 
+-def test_import_adapter_runs_real_pm_availability_without_install(monkeypatch):
++def test_import_adapter_runs_real_pm_availability_without_install(monkeypatch, fal_client):
+     import pm.client
+     monkeypatch.setattr(pm.client, "sync_venv", lambda *a, **kw: pytest.fail("available SDK must not install"))
+     assert import_fal_client() is fal_client
+ 
+ 
+-def test_external_sdk_remains_importable_without_pm(monkeypatch):
++def test_external_sdk_remains_importable_without_pm(monkeypatch, fal_client):
+     import sys
+     monkeypatch.setitem(sys.modules, "pm", None)
+     assert import_fal_client() is fal_client
+ 
+ 
+ @pytest.mark.parametrize("timeout,expected", [(None, 120.0), (300.0, 300.0)])
+-def test_older_sdk_timeout_default_and_optional_hint(transport, monkeypatch, timeout, expected):
++def test_older_sdk_timeout_default_and_optional_hint(transport, monkeypatch, timeout, expected, fal_client):
+     monkeypatch.setattr(fal_client.client, "add_hint_header", None)
+     client = _ManagedFalSyncClient(fal_client, key="token", queue_run_origin="https://queue.test")
+     # Keep its real HTTP client and request helpers, vary only older SDK metadata.
+@@ -186,7 +190,7 @@ def test_older_sdk_timeout_default_and_optional_hint(transport, monkeypatch, tim
+     assert "x-fal-runner-hint" not in transport[0][0].headers
+ 
+ 
+-def test_image_wait_polls_queue_status_at_gateway_cadence(transport, monkeypatch):
++def test_image_wait_polls_queue_status_at_gateway_cadence(transport, monkeypatch, fal_client):
+     """The SDK's ``handle.get()`` polls every 0.1 s: one job alone burns the gateway's 200 req/min."""
+     import tools.image_generation_tool as image_tool
+     from tools.fal_common import FAL_QUEUE_POLL_SECONDS
+-- 
+2.55.0
+

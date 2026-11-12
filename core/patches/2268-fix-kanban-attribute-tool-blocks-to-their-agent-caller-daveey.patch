@@ -1,0 +1,175 @@
+From 46d7fe856fd2c14d5268f40aba162df2ccb560c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 03:30:23 -0800
+Subject: [PATCH] fix(kanban): attribute tool blocks to their agent caller
+ [daveey]
+
+---
+ hermes_cli/kanban_cli_actor.py         | 30 ++++++++--
+ tests/tools/test_kanban_block_actor.py | 82 ++++++++++++++++++++++++++
+ tools/kanban_tools.py                  |  8 +--
+ 3 files changed, 110 insertions(+), 10 deletions(-)
+ create mode 100644 tests/tools/test_kanban_block_actor.py
+
+diff --git a/hermes_cli/kanban_cli_actor.py b/hermes_cli/kanban_cli_actor.py
+index 43bf8ed867b..ee79bbdfe20 100644
+--- a/hermes_cli/kanban_cli_actor.py
++++ b/hermes_cli/kanban_cli_actor.py
+@@ -1,15 +1,33 @@
+-"""Audit-only identity for CLI lifecycle calls; never an authorization signal."""
++"""Audit-only identity for lifecycle calls; never an authorization signal."""
+ import os
+ 
+ 
++def _agent_actor(*, session="", worker="") -> str:
++    if session:
++        return f"agent (chat {session})"
++    return f"agent (task {worker})" if worker else "agent"
++
++
+ def cli_actor() -> str:
+     """Distinguish a tool subprocess from a human shell without guessing from profile."""
+     from hermes_cli import kanban
+ 
+     session = (os.environ.get("HERMES_SESSION_KEY") or os.environ.get("HERMES_SESSION_ID") or "").strip()
+-    if session:
+-        return f"agent (chat {session})"
+     worker = os.environ.get("HERMES_KANBAN_WORKER_TASK") or os.environ.get("HERMES_KANBAN_TASK")
+-    if worker:
+-        return f"agent (task {worker})"
+-    return "agent" if kanban._agent_invoked() else "user"
++    if session or worker or kanban._agent_invoked():
++        return _agent_actor(session=session, worker=worker)
++    return "user"
++
++
++def tool_actor(*, worker_task=None) -> str:
++    """Tools are always agents; an already-guarded owning task takes precedence.
++
++    Chat identity is request-scoped: another chat may have set process env.
++    The caller supplies worker_task only after its lifecycle ownership guard.
++    """
++    from gateway.session_context import get_session_env
++
++    if worker_task:
++        return _agent_actor(worker=worker_task)
++    session = (get_session_env("HERMES_SESSION_ID") or get_session_env("HERMES_SESSION_KEY") or "").strip()
++    return _agent_actor(session=session)
+diff --git a/tests/tools/test_kanban_block_actor.py b/tests/tools/test_kanban_block_actor.py
+new file mode 100644
+index 00000000000..e721efea2a2
+--- /dev/null
++++ b/tests/tools/test_kanban_block_actor.py
+@@ -0,0 +1,82 @@
++"""Tool provenance survives local, gateway and remote blocked notices."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban, kanban_db as db
++from hermes_cli.kanban_db_connect import connect_closing
++from tests.tools import test_kanban_tools as helpers
++
++worker_env = helpers.worker_env
++REQUEST = dict(action="Choose A. Unblock = proceed; archive = abandon.",
++               why_human="Owner decision", interaction="reply", scope="Fixture", evidence="Fixture decision")
++
++
++def notices(conn, tid, event):
++    from gateway.kanban_watchers_notifier import _fmt_blocked
++    from hermes_cli.kanban_origin_ledger import observe_owner_task
++    from tui_gateway.kanban_remote_notices import format_notice
++    from tui_gateway.session_notifications import _format_kanban_event_text
++    task = db.get_task(conn, tid)
++    local = _format_kanban_event_text({"task_id": tid}, task, event, "default")
++    gateway, wake, _ = _fmt_blocked(event, SimpleNamespace(task=task, task_id=tid, board_slug="default", head=tid))
++    with db.write_txn(conn):
++        projected = observe_owner_task(conn, {"id": tid, "status": "blocked", "human_request": REQUEST}, now=0)
++    return local, gateway, wake, format_notice("other-host", "default/" + tid, projected)
++
++
++@pytest.mark.parametrize("worker", [True, False])
++def test_tool_actor_stored_and_rendered(worker_env, monkeypatch, worker):
++    from tools import kanban_tools  # register the real handler
++    from tools.registry import registry
++    tid = worker_env
++    monkeypatch.setenv("HERMES_SESSION_ID", "fixture-chat")
++    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
++    if not worker:
++        monkeypatch.delenv("HERMES_KANBAN_TASK")
++    result = json.loads(registry.dispatch("kanban_block", {
++        "task_id": tid, "reason": "Fixture decision", "kind": "needs_input", "human_request": REQUEST,
++    }))
++    assert "error" not in result, result
++    expected = f"agent (task {tid})" if worker else "agent (chat fixture-chat)"
++    with connect_closing() as conn:
++        event = db.list_events(conn, tid)[-1]
++        assert event.payload.get("actor") == expected
++        for text in notices(conn, tid, event):
++            assert f"actor: {expected}" in text
++            assert "actor: user" not in text
++
++
++def test_tool_without_identity_is_still_agent(monkeypatch):
++    from hermes_cli.kanban_cli_actor import tool_actor
++    for key in (*kanban._AGENT_ENV_MARKERS, "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_TASK"):
++        monkeypatch.delenv(key, raising=False)
++    assert tool_actor() == "agent"
++
++
++@pytest.mark.parametrize("session,key,expected", [
++    ("scoped-chat", "scoped-key", "agent (chat scoped-chat)"),
++    ("", "scoped-key", "agent (chat scoped-key)"),
++    ("", "", "agent"),
++])
++def test_tool_actor_uses_request_scope(monkeypatch, session, key, expected):
++    from gateway.session_context import scoped_current_session_id, scoped_session_key
++    from hermes_cli.kanban_cli_actor import tool_actor
++    monkeypatch.setenv("HERMES_SESSION_ID", "foreign-chat")
++    monkeypatch.setenv("HERMES_SESSION_KEY", "foreign-key")
++    with scoped_current_session_id(session), scoped_session_key(key):
++        assert tool_actor() == expected
++        assert tool_actor(worker_task="owned-task") == "agent (task owned-task)"
++
++
++def test_no_request_notice_unchanged():
++    from tui_gateway.session_notifications import _format_kanban_event_text
++    with connect_closing() as conn:
++        tid = db.create_task(conn, title="No request fixture", assignee="owner")
++        db._append_event(conn, tid, "blocked", {"reason": "legacy reason", "kind": "transient"})
++        event = db.list_events(conn, tid)[-1]
++        task = db.get_task(conn, tid)
++        before = _format_kanban_event_text({"task_id": tid}, task, event, "default")
++        event.payload["actor"] = "agent (chat fixture-chat)"
++        assert _format_kanban_event_text({"task_id": tid}, task, event, "default") == before
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 488778c814d..578eeb8203d 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1087,10 +1087,8 @@ def _handle_block(args: dict, **kw) -> str:
+     with _board(args.get("board")) as (kb, conn):
+         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
+                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
+-        # The goal loop treats ANY blocked status as terminal, so kanban_block
+-        # would be an escape hatch around the completion judge: goal_mode tasks
+-        # may only block on genuine external blockers.
+-        # Goal-mode block gate (Issue #38696, sibling of the kanban_complete judge gate in #38367).
++        # Goal-mode blocks terminate the loop, so only genuine external blockers are allowed.
++        # Other stops must pass the completion judge (Issue #38696 / #38367).
+         # kanban_block is a second exit path out of the goal loop — run_kanban_goal_loop() treats ANY
+         # `blocked` status as terminal, identically to `done`, regardless of kind. Without this, a worker
+         # that learns kanban_complete is gated can just call kanban_block(reason="anything") to escape the
+@@ -1115,7 +1113,9 @@ def _handle_block(args: dict, **kw) -> str:
+         _park_guard(conn, tid, "block", wake, reason=reason, kind=kind, blocker_id=blocker_id,
+                     human_request=args.get("human_request"))
+         _check(*ask_checks(args.get("human_request"), context=filing_context(conn, tid)))  # lint + probe [daveey]
++        from hermes_cli.kanban_cli_actor import tool_actor
+         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
++                           actor=tool_actor(worker_task=_own_task_env(tid, "HERMES_KANBAN_TASK")),
+                            blocker_id=blocker_id, wake_check=wake[0], check_every=wake[1], awaiting=awaiting,
+                            clock_only=wake[2], human_request=kb.redact_review_value(args.get("human_request")),
+                            clear_blocker=clear_blocker, **_blocker_scope_args(args))
+-- 
+2.55.0
+

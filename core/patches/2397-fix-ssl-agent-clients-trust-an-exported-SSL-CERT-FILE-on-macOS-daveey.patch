@@ -1,0 +1,160 @@
+From 6ceb608859c5f57401a8cc845f6eea16a64a26ac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:56:37 -0800
+Subject: [PATCH] fix(ssl): agent clients trust an exported SSL_CERT_FILE on
+ macOS [daveey]
+
+Problem: on macOS every native-Gemini e2e file (test_native_gemini_schema,
+_tools, _errors, _compaction) failed with "generativelanguage.googleapis.com
+certificate is not trusted"; the same files pass on the Linux hub.
+
+Why 1: the agent's keep-alive client got verify=resolve_httpx_verify(), which
+returned the platform-only context _shared_context(None) whenever SSL_CERT_FILE
+was set, so the fake's CA (passed via SSL_CERT_FILE) was never loaded.
+Why 2: truststore on macOS evaluates with Security.framework, which never reads
+SSL_CERT_FILE; on Linux truststore falls back to OpenSSL's default paths, which
+do read it, so the bug was invisible there.
+Why 3: 0c889a774f fixed exactly this for platform_ssl_context() (Telegram) but
+the sibling resolver kept its own copy of the policy.
+Root (happened): one SSL_CERT_FILE policy implemented twice.
+Root (not caught): test_ssl_verify pinned the divergence (`bundle_ctx is not
+platform`), and CI is Linux-only, where OpenSSL masks it.
+
+Production impact: macOS users exporting SSL_CERT_FILE for a private/corporate CA
+not in the Keychain lost trust on every provider client built by the agent.
+
+Fix: resolve_httpx_verify() returns platform_ssl_context() (bundle on top of the
+platform store, stale path -> platform store), so both paths share one policy and
+one cached context. Tests: identity contract (fails on any OS before the fix),
+stale-path fallback, and a real loopback handshake with a private CA via
+SSL_CERT_FILE (fails on macOS before the fix). SSL_CERT_DIR stays platform-only.
+---
+ agent/ssl_verify.py                         | 13 +++++--
+ tests/agent/test_ssl_transport_contracts.py | 42 +++++++++++++++++++++
+ tests/agent/test_ssl_verify.py              | 19 +++++++---
+ 3 files changed, 64 insertions(+), 10 deletions(-)
+
+diff --git a/agent/ssl_verify.py b/agent/ssl_verify.py
+index ed91f241f83..983797e7552 100644
+--- a/agent/ssl_verify.py
++++ b/agent/ssl_verify.py
+@@ -309,7 +309,9 @@ def resolve_httpx_verify(
+     2. explicit ``ca_bundle`` (the provider's ``ssl_ca_cert``) — that
+        bundle INSTEAD of the platform store, for an endpoint whose chain
+        the machine has no reason to trust
+-    3. ``True`` — the platform store, via the process-wide install, or the
++    3. ``SSL_CERT_FILE``/``SSL_CERT_DIR`` exported — ``platform_ssl_context()``:
++       an existing ``SSL_CERT_FILE`` bundle ON TOP of the platform store
++    4. ``True`` — the platform store, via the process-wide install, or the
+        platform context when the certifi bundle this process resolved at
+        import no longer exists (a replaced install environment)
+ 
+@@ -336,8 +338,11 @@ def resolve_httpx_verify(
+             effective_ca,
+         )
+     # HTTPX reads CA env vars before the injected verifier gets control. Pass
+-    # the platform context directly so stale paths cannot break construction;
+-    # proxy environment handling remains enabled.
++    # the shared context directly so stale paths cannot break construction;
++    # proxy environment handling remains enabled. An existing SSL_CERT_FILE
++    # bundle is trusted on top of the platform store (platform_ssl_context):
++    # macOS's Security.framework never reads SSL_CERT_FILE itself, so the
++    # platform-only context rejected a private CA exported that way.
+     if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+-        return _shared_context(None)
++        return platform_ssl_context()
+     return _default_verify()
+diff --git a/tests/agent/test_ssl_transport_contracts.py b/tests/agent/test_ssl_transport_contracts.py
+index 3dd28a28b10..f079b1115e8 100644
+--- a/tests/agent/test_ssl_transport_contracts.py
++++ b/tests/agent/test_ssl_transport_contracts.py
+@@ -132,3 +132,45 @@ def test_pinned_clients_share_transport_not_close_state(local_tls, insecure):
+     finally:
+         a.close()
+         b.close()
++
++
++def test_ssl_cert_file_private_ca_reaches_the_agent_client(tmp_path, monkeypatch):
++    """A private CA exported only through SSL_CERT_FILE verifies a real handshake on the agent's
++    keep-alive client. macOS's verifier never reads SSL_CERT_FILE, so a platform-only context
++    rejected it there ("certificate is not trusted") while Linux OpenSSL read the env var itself."""
++    from run_agent import AIAgent
++    from tests.fakes.providers.gemini_native import _write_tls_material
++
++    ca, cert, key = _write_tls_material(tmp_path / "tls")
++
++    class Handler(BaseHTTPRequestHandler):
++        protocol_version = "HTTP/1.1"
++
++        def do_GET(self):
++            self.send_response(204)
++            self.send_header("Content-Length", "0")
++            self.end_headers()
++
++        def log_message(self, *args):
++            pass
++
++    context = _original_SSLContext(ssl.PROTOCOL_TLS_SERVER)
++    context.load_cert_chain(cert, key)
++    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++    server.daemon_threads = True
++    server.socket = context.wrap_socket(server.socket, server_side=True)
++    thread = Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
++    monkeypatch.setenv("SSL_CERT_FILE", str(ca))
++    monkeypatch.setattr(ssl_verify, "_CA_CONTEXTS", {})
++    url = f"https://127.0.0.1:{server.server_port}"
++    try:
++        client = AIAgent._build_keepalive_http_client(url, verify=ssl_verify.resolve_httpx_verify(base_url=url))
++        assert client is not None
++        with client:
++            assert client.get(url + "/v1/models").status_code == 204
++    finally:
++        server.shutdown()
++        server.server_close()
++        thread.join(timeout=5)
+diff --git a/tests/agent/test_ssl_verify.py b/tests/agent/test_ssl_verify.py
+index ae71c789e11..0893727f1d5 100644
+--- a/tests/agent/test_ssl_verify.py
++++ b/tests/agent/test_ssl_verify.py
+@@ -32,11 +32,10 @@ def test_missing_explicit_bundle_falls_back_to_the_platform_store(tmp_path, capl
+ 
+ 
+ def test_missing_bundle_under_a_cert_env_var_shares_the_platform_context(tmp_path, monkeypatch):
+-    """With SSL_CERT_FILE exported the platform store is handed over as one
+-    shared context (httpx would otherwise read the env var itself); a missing
+-    bundle must land on that same object, not a second pool. The long-lived
+-    clients' platform_ssl_context() honours the bundle ON TOP of the platform
+-    store (as httpx verify=True did), cached once."""
++    """With SSL_CERT_FILE exported, resolve_httpx_verify() hands over the ONE
++    shared context that trusts that bundle ON TOP of the platform store (as httpx
++    verify=True did) — the same object the long-lived clients' platform_ssl_context()
++    returns, cached once; a missing provider bundle lands on it too, not a second pool."""
+     import ssl
+ 
+     import certifi
+@@ -51,11 +50,19 @@ def test_missing_bundle_under_a_cert_env_var_shares_the_platform_context(tmp_pat
+ 
+     bundle_ctx = ssl_verify.platform_ssl_context()
+     assert bundle_ctx is ssl_verify.platform_ssl_context()
+-    assert bundle_ctx is not platform
++    assert bundle_ctx is platform
+     assert type(bundle_ctx) is ssl.SSLContext  # truststore-injected: bundle + OS store
+     assert bundle_ctx is ssl_verify._CA_CONTEXTS[(str(Path(certifi.where()).resolve()), True)]
+ 
+ 
++def test_stale_ssl_cert_file_falls_back_to_the_platform_store(tmp_path, monkeypatch):
++    from agent import ssl_verify
++
++    monkeypatch.setattr(ssl_verify, "_CA_CONTEXTS", {})
++    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "gone.pem"))
++    assert resolve_httpx_verify() is ssl_verify._shared_context(None)
++
++
+ @pytest.mark.parametrize("value", [False, "false", "0", "no", "off", "FALSE"])
+ def test_insecure_disables_verification(value):
+     assert resolve_httpx_verify(ssl_verify=value) is False
+-- 
+2.55.0
+

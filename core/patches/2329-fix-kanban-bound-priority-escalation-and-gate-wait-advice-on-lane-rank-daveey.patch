@@ -1,0 +1,823 @@
+From 767370f64e7549cb2a5bf676656061d4f776cd63 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:14:14 +0000
+Subject: [PATCH] fix(kanban): bound priority escalation and gate wait advice
+ on lane rank [daveey]
+
+---
+ docs/kanban-priority-rollout.md               |  76 +++++++++++++
+ hermes_cli/kanban.py                          |  21 ++--
+ hermes_cli/kanban_chat_wait.py                |   5 +-
+ hermes_cli/kanban_contract_cli.py             |   2 +-
+ hermes_cli/kanban_db.py                       |   4 +-
+ hermes_cli/kanban_db_dispatch_queries.py      |   5 +-
+ hermes_cli/kanban_db_edit.py                  |  14 +++
+ hermes_cli/kanban_db_sync.py                  |   3 +
+ hermes_cli/kanban_parent_unclaimed.py         |  14 ++-
+ hermes_cli/kanban_parser.py                   |   3 +-
+ hermes_cli/kanban_priority.py                 |  49 ++++++++
+ hermes_cli/kanban_priority_migration.py       | 106 ++++++++++++++++++
+ hermes_cli/kanban_queue_position.py           |   6 +-
+ .../test_kanban_parent_first_dispatch.py      |   6 +-
+ .../test_kanban_priority_boundaries.py        |  62 ++++++++++
+ tests/hermes_cli/test_kanban_priority_cap.py  |  88 +++++++++++++++
+ .../test_kanban_priority_migration.py         |  60 ++++++++++
+ 17 files changed, 499 insertions(+), 25 deletions(-)
+ create mode 100644 docs/kanban-priority-rollout.md
+ create mode 100644 hermes_cli/kanban_priority.py
+ create mode 100644 hermes_cli/kanban_priority_migration.py
+ create mode 100644 tests/hermes_cli/test_kanban_priority_boundaries.py
+ create mode 100644 tests/hermes_cli/test_kanban_priority_cap.py
+ create mode 100644 tests/hermes_cli/test_kanban_priority_migration.py
+
+diff --git a/docs/kanban-priority-rollout.md b/docs/kanban-priority-rollout.md
+new file mode 100644
+index 00000000000..c2575070796
+--- /dev/null
++++ b/docs/kanban-priority-rollout.md
+@@ -0,0 +1,76 @@
++# Bounded Kanban priority rollout
++
++## Failure chain
++
++Problem: stored hub priorities escalated past 10000 while ready work waited on a
++finite worker pool. An absolute bump merely moved the escalation threshold.
++
++- Creation and editing accepted unbounded integers (`kanban_db.create_task`,
++  `kanban_db_edit.edit_task`). Therefore repeated raises persisted indefinitely.
++- Parent/direct-chat notices recommended raising every waiter without checking
++  capacity or lane rank (`kanban_parent_unclaimed._options`, `kanban_chat_wait`).
++- Transitive inheritance donated the maximum waiter priority at read time
++  (`kanban_db_dispatch_queries.EFFECTIVE_PRIORITY`). It did **not** rewrite parent
++  priorities; it made escalation affect the prerequisite queue as intended.
++
++Root (happened): unbounded priority input plus capacity-blind escalation advice.
++Root (not caught): ordering and notice tests explicitly expected unconditional
++bump advice, but had no cap/median contracts.
++Recurrence: queue-wait advice introduced for the earlier unclaimed-parent and
++human-go incidents remained in place after transitive inheritance was added.
++
++## Policy
++
++- Cap newly created, explicitly edited, remotely imported and effective inherited
++  priorities at **1000**. Negative deprioritization remains supported.
++- `hermes kanban edit ID --priority-bump 10` computes a **relative**, bounded raise
++  inside the write transaction. It records previous/requested/applied values.
++  This chooses the relative-bump alternative: it is not a TTL or an expiring boost.
++- Ready-wait notices recommend placement/capacity first. A relative bump is offered
++  only when captured effective priority is below the median of the same ready,
++  assignee and placement lane. Missing evidence means no bump recommendation.
++- Inheritance, parent-first tie-breaking and age ordering remain intact. Two cards
++  at 1000 can still have work ahead; priority never creates capacity.
++
++## One-shot migration and rollback
++
++Run on the origin writer, **not a worker replica**. Do not move its live checkout
++or restart a busy gateway by hand. Use the normal reviewed core-update route.
++
++1. Before installing cap-aware import code, coordinate the snapshot/application
++   window with the origin operator. Capture all open priorities through
++   `kanban_priority_migration.plan(conn)` from the reviewed worktree. Save with
++   `save_manifest(Path(absolute_path), manifest)`; it uses exclusive creation and
++   fsync. Attach this JSON to the owner task **before** applying it.
++2. `apply(conn, Path(absolute_path))` normalizes distinct positive ranks to 1..900,
++   preserving ordering and ties and leaving nonpositive values unchanged. The
++   highest two requested cards therefore remain in the highest two distinct bands.
++   Reserve 901..1000 for deliberate subsequent escalation. Terminal rows are not
++   rewritten. The operation refuses a different board/gateway, shadow mode,
++   foreign-owned open rows, new open cards or any changed recorded priority.
++   On refusal capture and attach a **new** manifest; never overwrite the original.
++3. Publish the origin deltas through normal Board sync and read back exact target
++   values. Install on the hub using normal drain/update coordination. Ensure old
++   clients which can write priorities are upgraded; imported legacy values are
++   bounded locally, but this does not remotely rewrite a legacy sender's database.
++4. Verify no open stored priority exceeds 1000. With a genuinely free slot and
++   other eligible effective priorities below 1000, bump one authorized ready card
++   to 1000 and verify `queue.ahead == 0`, then observe its claim. Do not manufacture
++   capacity, disturb running work or claim this fixture is live proof.
++5. Rollback: `apply(conn, manifest_path, undo=True)` restores prior values only
++   when all recorded current values still match. Restoring above-cap legacy values
++   additionally requires `allow_legacy_rollback=True`: this is an explicit rollback
++   of the priority policy and must be coordinated with deployment, not normal
++   editing. No lifecycle state, lease, parent edge or run is reverted.
++
++Normalization is intentionally not an implicit connection-time migration: clipping
++before saving originals would destroy the very order the operator asked to retain.
++Keep the manifest attachment and installed-revision proof with the task.
++
++## Proof
++
++Focused regressions: `test_kanban_priority_cap.py`,
++`test_kanban_priority_boundaries.py`, `test_kanban_priority_migration.py`;
++existing transitive inheritance, parent-first dispatch, priority-lowering,
++ready-wait episode and held-machine tests. The sync test replays an above-cap peer
++update twice and verifies the bounded value with no echo outbox growth.
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index c6016f91237..5bdee859863 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1312,7 +1312,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+     if getattr(args, "completion_contract", None) is not None:
+         return _contract_cli.cmd_edit_contract(args)
+     reason = getattr(args, "reason", None)
+-    if reason is not None and getattr(args, "priority", None) is None:
++    if reason is not None and getattr(args, "priority", None) is None and getattr(args, "priority_bump", None) is None:
+         return _err("kanban edit: --reason only applies to --completion-contract or --priority", 2)
+     result = getattr(args, "result", None)
+     raw_metadata = getattr(args, "metadata", None)
+@@ -1320,13 +1320,19 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+     title = getattr(args, "title", None)
+     body = getattr(args, "body", None)
+     priority = getattr(args, "priority", None)
++    priority_bump = getattr(args, "priority_bump", None)
++    if priority_bump is not None and (priority is not None or priority_bump <= 0):
++        return _err("--priority-bump must be positive and cannot be combined with --priority", 2)
++    from hermes_cli.kanban_priority import bounded
++    if priority is not None:
++        priority = bounded(priority)
+     operator = {name: getattr(args, name, None) for name in _OPERATOR_EDIT_FLAGS}
+     if operator["goal_mode"] is not None:
+         operator["goal_mode"] = operator["goal_mode"] == "on"
+     has_operator = any(value is not None for value in operator.values())
+     if result is None and (summary is not None or raw_metadata is not None):
+         return _err("kanban edit: --summary and --metadata require --result", 2)
+-    if all(value is None for value in (title, body, priority, result)) and not has_operator:
++    if all(value is None for value in (title, body, priority, priority_bump, result)) and not has_operator:
+         return _err(
+             "kanban edit: provide --title, --body, --priority, --result, --max-retries, --goal-mode, "
+             "--goal-max-turns, --max-runtime-seconds, --session-id, or --completion-contract", 2,
+@@ -1338,12 +1344,13 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+         return rc
+     with kbc.connect_closing() as conn:
+         changed: dict = {}
+-        if priority is not None and has_operator and not (reason or "").strip():
++        if (priority is not None or priority_bump is not None) and has_operator and not (reason or "").strip():
+             # Refuse before the operator columns commit, so a refused lowering applies nothing;
+             # edit_task re-checks inside its own write transaction. [daveey]
+             row = conn.execute("SELECT priority FROM tasks WHERE id = ?", (args.task_id,)).fetchone()
+-            if row is not None and priority < int(row[0] or 0):
+-                return _err(f"kanban edit: {kb.PriorityLowerRefused(args.task_id, int(row[0] or 0), priority)}")
++            requested = priority if priority is not None else bounded(int(row[0] or 0) + priority_bump) if row else None
++            if row is not None and requested < int(row[0] or 0):
++                return _err(f"kanban edit: {kb.PriorityLowerRefused(args.task_id, int(row[0] or 0), requested)}")
+         if has_operator:
+             # Operator columns first: a refusal (e.g. a session_id overwrite) must leave the
+             # whole edit unapplied rather than half of it. [daveey]
+@@ -1355,12 +1362,12 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+                 return _err(f"kanban edit: {exc}")
+             if changed is None:
+                 return _err(f"cannot edit {args.task_id} (unknown id)")
+-        if any(value is not None for value in (title, body, priority, result)):
++        if any(value is not None for value in (title, body, priority, priority_bump, result)):
+             try:
+                 ok = kb.edit_task(
+                     conn, args.task_id, title=title, body=body, priority=priority,
+                     result=result, summary=summary, metadata=metadata,
+-                    priority_reason=reason, require_lower_reason=True,
++                    priority_reason=reason, require_lower_reason=True, priority_bump=priority_bump,
+                 )
+             except (kb.PriorityLowerRefused, ReceiptEditRefused) as exc:
+                 return _err(f"kanban edit: {exc}")
+diff --git a/hermes_cli/kanban_chat_wait.py b/hermes_cli/kanban_chat_wait.py
+index 44441438f88..09c7ccc12e2 100644
+--- a/hermes_cli/kanban_chat_wait.py
++++ b/hermes_cli/kanban_chat_wait.py
+@@ -31,7 +31,7 @@ THRESHOLD_SECONDS = pu.THRESHOLD_SECONDS
+ # A ready episode older than this when first seen is backlog, not a wait the chat just promised; kanban_show's
+ # queue_hint covers it. This also bounds the burst on the first tick after deploy.
+ MAX_EPISODE_SECONDS = 6 * 3600
+-NO_PROMISE = "bump priority, re-place, or do it in this chat; don't promise a pickup"
++NO_PROMISE = "check placement and available capacity first; re-place if suitable; don't promise a pickup"
+ 
+ 
+ # --- priority on a chat's human-approval unblock ---------------------------------------------------------------
+@@ -103,7 +103,8 @@ def notice_text(payload: Any) -> str:
+         stamp = time.strftime("%H:%M:%SZ", time.gmtime(int(payload["hold_until"])))
+         hold = f"; dispatcher hold {payload['hold_reason']} until {stamp}"
+     return (f"{named}, which this chat waits on, has been ready {payload.get('ready_minutes', '?')} min with no "
+-            f"worker ({payload.get('queue') or 'queue place unknown'}{hold}). " + pu._options(tid) + ".")
++            f"worker ({payload.get('queue') or 'queue place unknown'}{hold}). "
++            + pu._options(tid, payload.get("priority_evidence")) + ".")
+ 
+ 
+ def _floor_kinds() -> str:
+diff --git a/hermes_cli/kanban_contract_cli.py b/hermes_cli/kanban_contract_cli.py
+index bd859f52735..b0d693c27a1 100644
+--- a/hermes_cli/kanban_contract_cli.py
++++ b/hermes_cli/kanban_contract_cli.py
+@@ -82,7 +82,7 @@ def cmd_edit_contract(args: argparse.Namespace) -> int:
+             "card's gate. Block without a human_request so the owning chat re-points it", 2,
+         )
+     others = [f"--{name.replace('_', '-')}" for name in (
+-        "title", "body", "priority", "result", "summary", "metadata", *_OPERATOR_EDIT_FLAGS,
++        "title", "body", "priority", "priority_bump", "result", "summary", "metadata", *_OPERATOR_EDIT_FLAGS,
+     ) if getattr(args, name, None) is not None]
+     if others or getattr(args, "force", False):
+         return _err(
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 7287613e61c..cc2c62bc552 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -31,7 +31,7 @@ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Optional
+ 
+-from hermes_cli import kanban_db_sync as _sync
++from hermes_cli import kanban_db_sync as _sync, kanban_priority
+ from hermes_cli.kanban_worker_placement import resolved_db_placement, validate_creation
+ from hermes_cli import kanban_placement_forward as _placement_fwd  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+@@ -1371,7 +1371,7 @@ def create_task(
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     """,
+                     (
+-                        task_id, title.strip(), body, assignee, task_status, priority,
++                        task_id, title.strip(), body, assignee, task_status, kanban_priority.bounded(priority),
+                         created_by, now, workspace_kind, workspace_path,
+                         branch_name, project_id, tenant, idempotency_key, _opt_int(max_runtime_seconds),
+                         json.dumps(skills_list) if skills_list is not None else None,
+diff --git a/hermes_cli/kanban_db_dispatch_queries.py b/hermes_cli/kanban_db_dispatch_queries.py
+index 719d00fc73b..62f1c0d7c57 100644
+--- a/hermes_cli/kanban_db_dispatch_queries.py
++++ b/hermes_cli/kanban_db_dispatch_queries.py
+@@ -1,6 +1,7 @@
+ """Read-only native dispatcher lane queries, plus the reaper's live-owner check."""
+ import os
+ import sqlite3
++from hermes_cli.kanban_priority import PRIORITY_CAP
+ 
+ 
+ # Compute rather than store inheritance: edits, imported edges and unlinking take
+@@ -19,8 +20,8 @@ EFFECTIVE_PRIORITY = (
+     f"SELECT w.id {_WAITERS} UNION "
+     "SELECT w.id FROM waiting a JOIN task_links wl ON wl.parent_id = a.id "
+     f"JOIN tasks w ON w.id = wl.child_id WHERE {_OPEN_WAITER}"
+-    ") SELECT MAX(COALESCE(tasks.priority, 0), "
+-    "COALESCE(MAX(w.priority), COALESCE(tasks.priority, 0))) "
++    f") SELECT MIN({PRIORITY_CAP}, MAX(COALESCE(tasks.priority, 0), "
++    "COALESCE(MAX(w.priority), COALESCE(tasks.priority, 0)))) "
+     "FROM waiting a JOIN tasks w ON w.id = a.id)"
+ )
+ DISPATCH_ORDER = (
+diff --git a/hermes_cli/kanban_db_edit.py b/hermes_cli/kanban_db_edit.py
+index 5cbc6927cae..e2ccf9c87fc 100644
+--- a/hermes_cli/kanban_db_edit.py
++++ b/hermes_cli/kanban_db_edit.py
+@@ -26,6 +26,7 @@ def edit_task(
+     result: Optional[str] = None, summary: Optional[str] = None,
+     metadata: Optional[dict] = None, board: Optional[str] = None,
+     priority_reason: Optional[str] = None, require_lower_reason: bool = False,
++    priority_bump: Optional[int] = None,
+ ) -> bool:
+     """Edit task fields, optionally backfilling a completed task's result.
+ 
+@@ -35,6 +36,11 @@ def edit_task(
+     stale read can't slip past it. ``priority_reason`` lands in the ``reprioritized``
+     event payload. [daveey]
+     """
++    from hermes_cli.kanban_priority import bounded
++    if priority_bump is not None and (priority is not None or priority_bump <= 0):
++        raise ValueError("priority_bump must be positive and cannot be combined with priority")
++    if priority is not None:
++        priority = bounded(priority)
+     changed_fields = [
+         field for field, value in (("title", title), ("body", body), ("priority", priority))
+         if value is not None
+@@ -43,6 +49,10 @@ def edit_task(
+         status = _kb._task_status(conn, task_id)
+         if status is None or (result is not None and status != "done"):
+             return False
++        previous_priority = conn.execute("SELECT priority FROM tasks WHERE id=?", (task_id,)).fetchone()[0] or 0
++        if priority_bump is not None:
++            priority = bounded(previous_priority + priority_bump)
++            changed_fields.append("priority")
+         if priority is not None and require_lower_reason and not (priority_reason or "").strip():
+             row = conn.execute("SELECT priority FROM tasks WHERE id = ?", (task_id,)).fetchone()
+             current = int(row[0] or 0) if row else 0
+@@ -66,6 +76,10 @@ def edit_task(
+         )
+         if priority is not None:
+             payload: dict = {"priority": priority}
++            if priority_bump is not None:
++                payload["previous_priority"] = previous_priority
++                payload["relative_bump"] = priority_bump
++                payload["applied_delta"] = priority - previous_priority
+             if priority_reason and priority_reason.strip():
+                 payload["reason"] = priority_reason.strip()
+             _kb._append_event(conn, task_id, "reprioritized", payload)
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index d614e6e1b9a..8e7270cd6c5 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1221,6 +1221,9 @@ def _local_fields(conn: sqlite3.Connection, table: str, fields: Mapping[str, Any
+         value = _from_wire(fields[wire])
+         if column in SECONDS_COLUMNS.get(table, ()):
+             value = to_seconds(value)
++        if table == "tasks" and column == "priority" and value is not None:
++            from hermes_cli.kanban_priority import bounded
++            value = bounded(value)
+         out[column] = _local_run_id(conn, value, task_id) if (table, column) in REF_COLUMNS else value
+     return out
+ 
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 15401d7ea63..47409da436a 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -58,9 +58,9 @@ def _queue_words(place: dict[str, Any]) -> str:
+     return words
+ 
+ 
+-def _options(parent_id: str) -> str:
+-    return (f"{NO_FIX}: bump its priority (`hermes kanban edit {parent_id} --priority 10`), re-place it on a "
+-            f"gateway with capacity, or do the work here")
++def _options(parent_id: str, evidence: Optional[dict[str, Any]] = None) -> str:
++    from hermes_cli.kanban_priority import advice
++    return f"{NO_FIX}: " + advice(parent_id, evidence)
+ 
+ 
+ def notice_text(payload: Any) -> str:
+@@ -71,7 +71,7 @@ def notice_text(payload: Any) -> str:
+     named = f"{parent} ({title})" if title else parent
+     return (f"Waiting {payload.get('wait_minutes', '?')} min on parent {named}, which has been ready "
+             f"{payload.get('ready_minutes', '?')} min with no worker ({payload.get('queue') or 'queue place unknown'}). "
+-            + _options(parent) + ".")
++            + _options(parent, payload.get("priority_evidence")) + ".")
+ 
+ 
+ def ready_hint(conn, task, *, now: Optional[float] = None) -> Optional[str]:
+@@ -82,7 +82,9 @@ def ready_hint(conn, task, *, now: Optional[float] = None) -> Optional[str]:
+     waited = now - ready_since(conn, task.id, task.created_at)
+     if waited < THRESHOLD_SECONDS:
+         return None
+-    return f"Ready {_minutes(waited)} min, unclaimed; {_queue_words(_place(conn, task.id))}. " + _options(task.id) + "."
++    from hermes_cli.kanban_priority import lane_evidence
++    return (f"Ready {_minutes(waited)} min, unclaimed; {_queue_words(_place(conn, task.id))}. "
++            + _options(task.id, lane_evidence(conn, task.id)) + ".")
+ 
+ 
+ _CANDIDATES = (
+@@ -147,9 +149,11 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+         still = conn.execute("SELECT status, claim_lock FROM tasks WHERE id = ?", (waiting_on,)).fetchone()
+         if still is None or still["status"] != "ready" or still["claim_lock"]:
+             return False
++        from hermes_cli.kanban_priority import lane_evidence
+         kb._append_event(conn, task_id, kind, {
+             "parent": waiting_on, "parent_title": parent_title, "wait_event_id": wait_key,
+             "wait_minutes": _minutes(waited_seconds), "ready_minutes": _minutes(ready_seconds),
+             "queue": _queue_words(_place(conn, waiting_on)), **(extra or {}),
++            "priority_evidence": lane_evidence(conn, waiting_on),
+         })
+     return True
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 4abd5ec3c8c..9cf11bbedb6 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -445,7 +445,8 @@ _SPECS = [
+         _TASK_ID,
+         _arg("--title", help="Replace the task title"),
+         _arg("--body", help="Replace the task body"),
+-        _arg("--priority", type=int, help="Replace the task priority (lowering it requires --reason)"),
++        _arg("--priority", type=int, help="Replace priority (cap 1000; lowering requires --reason)"),
++        _arg("--priority-bump", type=int, help="Atomically raise priority by this positive amount (cap 1000)"),
+         _arg("--result", help="Backfilled task result text for a done task"),
+         *_STEP_HANDOFF,
+         _arg("--max-retries", type=int, metavar="N", dest="max_retries",
+diff --git a/hermes_cli/kanban_priority.py b/hermes_cli/kanban_priority.py
+new file mode 100644
+index 00000000000..79210211799
+--- /dev/null
++++ b/hermes_cli/kanban_priority.py
+@@ -0,0 +1,49 @@
++"""Bound priority inputs and make queue advice conditional on measured lane evidence."""
++from __future__ import annotations
++
++from statistics import median
++
++PRIORITY_CAP = 1000
++
++
++def bounded(value: int) -> int:
++    """Keep negative deprioritization, but never permit an escalation arms race."""
++    return min(PRIORITY_CAP, int(value))
++
++
++def lane_evidence(conn, task_id: str) -> dict:
++    """Compare effective priorities in the same ready/assignee/placement lane.
++
++    Missing evidence never recommends escalation. Placement policy and runs_on
++    distinguish host-bound work from portable work; no global median is used.
++    """
++    from hermes_cli.kanban_db_dispatch_queries import EFFECTIVE_PRIORITY
++
++    columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
++    labels = "runs_on" if "runs_on" in columns else "NULL"
++    row = conn.execute(
++        f"SELECT assignee, status, placement_policy, {labels} AS labels FROM tasks WHERE id=?", (task_id,),
++    ).fetchone()
++    if row is None or row["status"] != "ready":
++        return {}
++    rows = conn.execute(
++        f"SELECT id, {EFFECTIVE_PRIORITY} AS effective FROM tasks "
++        "WHERE status='ready' AND claim_lock IS NULL AND assignee IS ? "
++        f"AND placement_policy IS ? AND {labels} IS ?",
++        (row["assignee"], row["placement_policy"], row["labels"]),
++    ).fetchall()
++    own = next((r["effective"] for r in rows if r["id"] == task_id), None)
++    if own is None:
++        return {}
++    middle = median(r["effective"] for r in rows)
++    return {"effective_priority": own, "lane_median": middle, "below_lane_median": own < middle}
++
++
++def advice(task_id: str, evidence: dict | None = None) -> str:
++    """Capacity first; a bounded relative bump only with below-median evidence."""
++    text = ("check placement and available capacity first; re-place on a capable gateway with free slots. "
++            "Do not run a second worker outside the dispatcher or promise a pickup")
++    if (evidence or {}).get("below_lane_median") is True:
++        text += (f"; this card is below its lane median: consider a bounded relative bump "
++                 f"(`hermes kanban edit {task_id} --priority-bump 10`, cap {PRIORITY_CAP})")
++    return text
+diff --git a/hermes_cli/kanban_priority_migration.py b/hermes_cli/kanban_priority_migration.py
+new file mode 100644
+index 00000000000..e5e3e9e928a
+--- /dev/null
++++ b/hermes_cli/kanban_priority_migration.py
+@@ -0,0 +1,106 @@
++"""Explicit, reversible priority normalization; never run implicitly on connection.
++
++Snapshot BEFORE installing cap-aware imports (legacy wire values would be clipped).
++Persist the returned manifest to an exclusive JSON file and attach it before apply.
++Apply/undo fence every recorded value, refusing concurrent edits atomically. Undo
++above the cap is a deliberate policy rollback, not an ordinary priority edit.
++"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++
++from hermes_cli.kanban_priority import PRIORITY_CAP
++
++
++HEADROOM = 100
++
++
++def _identity(conn) -> dict:
++    from hermes_cli.kanban_db_sync import sync_state
++    state = sync_state(conn) or {}
++    return {key: state.get(key) for key in ("board_id", "gateway_id", "mode")}
++
++
++def plan(conn) -> dict:
++    """Map distinct positive open priorities monotonically into 1..900; keep ties.
++
++    Nonpositive priorities retain their meaning. Refuse rather than collapse more
++    distinct ranks than the target band can represent. Terminal rows are untouched.
++    """
++    rows = conn.execute("SELECT id, priority FROM tasks WHERE status NOT IN ('done','archived') ORDER BY id").fetchall()
++    values = sorted({int(r["priority"] or 0) for r in rows if (r["priority"] or 0) > 0})
++    ceiling = PRIORITY_CAP - HEADROOM
++    if len(values) > ceiling:
++        raise ValueError("too many distinct priorities for lossless normalization")
++    ranks = {value: (index + 1) * ceiling // len(values) for index, value in enumerate(values)}
++    return {"version": 1, "cap": PRIORITY_CAP, "identity": _identity(conn), "ceiling": ceiling, "rows": [
++        {"id": r["id"], "old": int(r["priority"] or 0), "new": ranks.get(r["priority"], int(r["priority"] or 0))}
++        for r in rows
++    ]}
++
++
++def save_manifest(path: Path, manifest: dict) -> None:
++    """Durably record original values, refusing to overwrite an earlier backup."""
++    with path.open("x", encoding="utf-8") as stream:
++        json.dump(manifest, stream, indent=2)
++        stream.write("\n")
++        stream.flush()
++        os.fsync(stream.fileno())
++
++
++def apply(conn, path: Path, *, undo: bool = False, allow_legacy_rollback: bool = False) -> int:
++    """Apply an already-saved manifest once, or explicitly roll back its values.
++
++    Run on the board's authorized writer, not a worker replica. The normal edit
++    transaction emits sync deltas; no sync flags or leases are bypassed. A second
++    application is a no-op. Mixed old/new states or intervening changes refuse.
++    """
++    from hermes_cli import kanban_db as kb
++
++    manifest = json.loads(path.read_text(encoding="utf-8"))
++    if manifest.get("version") != 1 or manifest.get("cap") != PRIORITY_CAP:
++        raise ValueError("unknown priority migration manifest")
++    rows = manifest["rows"]
++    if len({r["id"] for r in rows}) != len(rows):
++        raise ValueError("duplicate task in manifest")
++    if any(not isinstance(r[k], int) for r in rows for k in ("old", "new")):
++        raise ValueError("noninteger priority in manifest")
++    if any(r["new"] > PRIORITY_CAP - HEADROOM for r in rows):
++        raise ValueError("normalization must reserve headroom")
++    if undo and any(r["old"] > PRIORITY_CAP for r in rows) and not allow_legacy_rollback:
++        raise ValueError("restoring above-cap values requires explicit legacy policy rollback")
++    source, target = ("new", "old") if undo else ("old", "new")
++    changes = [r for r in rows if r[source] != r[target]]
++    with kb.write_txn(conn):
++        identity = _identity(conn)
++        if identity != manifest.get("identity") or identity.get("mode") == "shadow":
++            raise ValueError("manifest belongs to a different writer or a read-only shadow")
++        if identity.get("mode") == "primary":
++            foreign = conn.execute("SELECT id FROM tasks WHERE status NOT IN ('done','archived') "
++                                   "AND created_on IS NOT NULL AND created_on != ? LIMIT 1",
++                                   (identity["gateway_id"],)).fetchone()
++            if foreign is not None:
++                raise ValueError("foreign-owned rows require normalization on their origin writer")
++        if not undo:
++            live_ids = {r[0] for r in conn.execute("SELECT id FROM tasks WHERE status NOT IN ('done','archived')")}
++            if live_ids - {r["id"] for r in rows}:
++                raise ValueError("new open cards since snapshot; capture a new manifest")
++        current = {r["id"]: conn.execute("SELECT priority FROM tasks WHERE id=?", (r["id"],)).fetchone()
++                   for r in rows}
++        if all(current[r["id"]] is not None and current[r["id"]][0] == r[target] for r in rows):
++            return 0
++        if any(current[r["id"]] is None or current[r["id"]][0] != r[source] for r in rows):
++            raise ValueError("priorities changed since snapshot; capture a new manifest, do not overwrite")
++        for row in changes:
++            # This explicit rollback is the only path permitted to restore a legacy
++            # value above the policy cap; regular edits always enforce the cap.
++            conn.execute("UPDATE tasks SET priority=? WHERE id=?", (row[target], row["id"]))
++            kb._append_event(conn, row["id"], "reprioritized", {
++                "priority": row[target], "previous_priority": row[source],
++                "reason": "priority normalization rollback" if undo else "priority normalization v1",
++            })
++    for row in changes:
++        kb.notify_task_updated(conn, row["id"], ["priority"])
++    return len(changes)
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index d46c3fc4565..61519929777 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -121,9 +121,9 @@ def position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Opt
+     return {"lane": "local", "ahead": _ahead(conn, task), "running": running, "limit": limit, "approximate": True}
+ 
+ 
+-_NOT_STUCK = ("queued, not stuck: the dispatcher starts it; do not run its work outside the dispatcher "
+-              "(two workers on one card). To start it sooner, raise its priority (`hermes kanban edit <id> "
+-              "--priority 10`)")
++_NOT_STUCK = ("queued, not stuck: check placement and available capacity first; re-place if suitable. "
++              "Do not run its work outside the dispatcher (two workers on one card). "
++              "Only consider a bounded relative priority bump when below the lane median")
+ 
+ 
+ def describe(place: Optional[dict[str, Any]]) -> Optional[str]:
+diff --git a/tests/hermes_cli/test_kanban_parent_first_dispatch.py b/tests/hermes_cli/test_kanban_parent_first_dispatch.py
+index 0f475dd4a9b..02d04672e0a 100644
+--- a/tests/hermes_cli/test_kanban_parent_first_dispatch.py
++++ b/tests/hermes_cli/test_kanban_parent_first_dispatch.py
+@@ -148,7 +148,8 @@ def test_chat_owned_wait_on_unclaimed_parent_notifies_once(conn, waiting):
+     assert len(notices) == 1
+     assert notices[0]["parent"] == parent
+     text = pu.notice_text(notices[0])
+-    assert parent in text and "bump" in text and "re-place" in text and "here" in text
++    assert parent in text and "capacity first" in text and "re-place" in text
++    assert "--priority" not in text  # Already heads its lane; another raise cannot add capacity.
+     assert pu.sweep(conn) == 0
+     assert len(_notices(conn, child)) == 1
+ 
+@@ -206,7 +207,8 @@ def test_kanban_show_hints_a_long_ready_card(conn, waiting, monkeypatch):
+     out = json.loads(kanban_show.show({"task_id": parent}))
+     hint = out.get("queue_hint") or ""
+     assert "a card that can't start is no fix" in hint
+-    assert "bump" in hint and "re-place" in hint
++    assert "capacity first" in hint and "re-place" in hint
++    assert "--priority" not in hint
+ 
+ 
+ def test_kanban_show_has_no_hint_for_a_fresh_ready_card(conn, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_priority_boundaries.py b/tests/hermes_cli/test_kanban_priority_boundaries.py
+new file mode 100644
+index 00000000000..4d3c0169a75
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_boundaries.py
+@@ -0,0 +1,62 @@
++"""Public CLI and sync boundaries for bounded priorities."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_priority_migration as migration
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli import test_kanban_edit_priority_lower as cli
++
++kanban_home = cli.kanban_home
++
++
++@pytest.fixture
++def synced(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    yield from support.synced_conn(home)
++
++
++def test_cli_relative_bump_and_audit(kanban_home):
++    task = cli._card(990)
++    assert cli._main(["edit", task, "--priority-bump", "15", "--reason", "below lane median"]) == 0
++    assert cli._priority(task) == 1000
++    assert cli._reprioritized(task)[-1] == {
++        "priority": 1000, "previous_priority": 990, "relative_bump": 15,
++        "applied_delta": 10, "reason": "below lane median",
++    }
++    assert cli._main(["edit", task, "--priority-bump", "0", "--title", "invalid"]) == 2
++    assert cli._main(["edit", task, "--priority-bump", "10", "--priority", "900"]) == 2
++
++
++def test_sync_import_clamps_without_echo_loop(synced):
++    sync.set_identity(synced, "board", "local")
++    change = sync.RemoteChange(seq=1, table="tasks", uid="t_remote", op="upsert", fields={
++        "title": "legacy", "status": "ready", "assignee": "default", "priority": 10300,
++        "created_at": 10, "created_on": "remote",
++    }, version=1, hlc="1", origin_gateway="remote")
++    before = synced.execute("SELECT count(*) FROM kanban_sync_outbox").fetchone()[0]
++    for _ in range(2):
++        sync.apply_remote_changes(synced, [change], new_cursor=1, observers=False)
++        assert kb.get_task(synced, "t_remote").priority == 1000
++        assert synced.execute("SELECT count(*) FROM kanban_sync_outbox").fetchone()[0] == before
++
++
++def test_migration_refuses_other_writer_shadow_and_foreign(synced, tmp_path):
++    sync.set_identity(synced, "board", "local")
++    task = kb.create_task(synced, title="local", priority=500)
++    synced.execute("UPDATE tasks SET created_on='local' WHERE id=?", (task,))
++    synced.commit()
++    path = tmp_path / "manifest.json"
++    migration.save_manifest(path, migration.plan(synced))
++    sync.set_identity(synced, "board", "different")
++    with pytest.raises(ValueError, match="different writer"):
++        migration.apply(synced, path)
++    sync.set_identity(synced, "board", "local")
++    sync.set_mode(synced, "primary")
++    path2 = tmp_path / "primary.json"
++    migration.save_manifest(path2, migration.plan(synced))
++    synced.execute("UPDATE tasks SET created_on='foreign' WHERE id=?", (task,))
++    synced.commit()
++    with pytest.raises(ValueError, match="foreign-owned"):
++        migration.apply(synced, path2)
++    assert kb.get_task(synced, task).priority == 500
+diff --git a/tests/hermes_cli/test_kanban_priority_cap.py b/tests/hermes_cli/test_kanban_priority_cap.py
+new file mode 100644
+index 00000000000..0675be6ddf7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_cap.py
+@@ -0,0 +1,88 @@
++"""Bound escalation at input and inherited ordering; capacity advice is evidence-led."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_parent_unclaimed as notices
++from hermes_cli.kanban_db_dispatch_queries import EFFECTIVE_PRIORITY
++from hermes_cli.kanban_priority import PRIORITY_CAP, advice, lane_evidence
++from tests.hermes_cli import test_kanban_parent_first_dispatch as helpers
++
++conn = helpers.conn
++
++
++def test_create_edit_and_relative_bump_cap(conn):
++    task = helpers._ready(conn, "urgent", priority=10300)
++    assert kb.get_task(conn, task).priority == PRIORITY_CAP
++    kb.edit_task(conn, task, priority=990)
++    kb.edit_task(conn, task, priority_bump=9)
++    assert kb.get_task(conn, task).priority == 999
++    kb.edit_task(conn, task, priority_bump=9000)
++    assert kb.get_task(conn, task).priority == PRIORITY_CAP
++    kb.edit_task(conn, task, priority=99999)
++    assert kb.get_task(conn, task).priority == PRIORITY_CAP
++    kb.edit_task(conn, task, priority=-10)
++    assert kb.get_task(conn, task).priority == -10
++
++
++@pytest.mark.parametrize("kwargs", [{"priority_bump": 0}, {"priority_bump": -1},
++                                   {"priority_bump": 1, "priority": 2}])
++def test_invalid_bump_is_atomic(conn, kwargs):
++    task = helpers._ready(conn, "unchanged")
++    with pytest.raises(ValueError):
++        kb.edit_task(conn, task, title="changed", **kwargs)
++    assert kb.get_task(conn, task).title == "unchanged"
++
++
++def test_legacy_transitive_value_cannot_escape_cap(conn):
++    root = helpers._ready(conn, "root", priority=-10)
++    middle = kb.create_task(conn, title="middle", assignee="default", parents=[root])
++    child = kb.create_task(conn, title="child", assignee="default", parents=[middle])
++    conn.execute("UPDATE tasks SET priority=10300 WHERE id=?", (child,))
++    conn.commit()
++    assert conn.execute(f"SELECT {EFFECTIVE_PRIORITY} FROM tasks WHERE id=?", (root,)).fetchone()[0] == 1000
++    assert kb.get_task(conn, root).priority == -10
++
++
++def test_sync_fields_cap(conn):
++    from hermes_cli.kanban_db_sync import _local_fields
++    assert _local_fields(conn, "tasks", {"priority": 10300}, "id")["priority"] == 1000
++    assert _local_fields(conn, "tasks", {"priority": -5}, "id")["priority"] == -5
++
++
++def test_lane_median_and_notice_rendering(conn):
++    low = helpers._ready(conn, "low", priority=1)
++    high = helpers._ready(conn, "high", priority=900)
++    kb.create_task(conn, title="different assignee", assignee="other", initial_status="running", priority=-100)
++    assert lane_evidence(conn, low)["lane_median"] == 450.5
++    for task, wants_bump in [(low, True), (high, False)]:
++        assert notices.post_notice(conn, task, task, wait_key=1, waited_seconds=3600, ready_seconds=3600)
++        raw = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
++                           (task, notices.NOTICE_KIND)).fetchone()[0]
++        payload = json.loads(raw)
++        from hermes_cli.kanban_chat_wait import notice_text
++        for render in [notices.notice_text, notice_text]:
++            text = render(payload)
++            assert "capacity first" in text
++            assert ("--priority-bump" in text) == wants_bump
++    assert "--priority" not in advice(high)
++    assert "--priority" not in notices.notice_text({"parent": high})
++
++
++def test_inherited_priority_not_below_lane_median(conn):
++    root = helpers._ready(conn, "root")
++    helpers._ready(conn, "ordinary", priority=100)
++    kb.create_task(conn, title="child", assignee="default", parents=[root], priority=900)
++    assert lane_evidence(conn, root)["below_lane_median"] is False
++
++
++def test_cap_bump_heads_queue_with_free_slots(conn, monkeypatch):
++    from hermes_cli import kanban_queue_position as queue
++    helpers._ready(conn, "older", priority=900, created_at=1)
++    task = helpers._ready(conn, "bumped", priority=800)
++    kb.edit_task(conn, task, priority_bump=200)
++    monkeypatch.setattr(queue, "_running_and_limit", lambda *_: (0, 7))
++    result = queue.position(conn, kb.get_task(conn, task))
++    assert result["ahead"] == 0
++    assert result["running"] < result["limit"]
+diff --git a/tests/hermes_cli/test_kanban_priority_migration.py b/tests/hermes_cli/test_kanban_priority_migration.py
+new file mode 100644
+index 00000000000..b709bdaa70e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_migration.py
+@@ -0,0 +1,60 @@
++"""One-shot normalization preserves rank/ties, records undo, and refuses stale writes."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_priority_migration as migration
++from tests.hermes_cli import test_kanban_parent_first_dispatch as helpers
++
++conn = helpers.conn
++
++
++def legacy(conn, values):
++    ids = [helpers._ready(conn, f"card {i}") for i in range(len(values))]
++    for task, value in zip(ids, values):
++        conn.execute("UPDATE tasks SET priority=? WHERE id=?", (value, task))
++    conn.commit()
++    return ids
++
++
++def priorities(conn, ids):
++    return [kb.get_task(conn, task).priority for task in ids]
++
++
++def test_roundtrip_ranks_ties_headroom_and_idempotence(conn, tmp_path):
++    values = [-10, 0, 10, 900, 900, 10000, 10250, 10300]
++    ids = legacy(conn, values)
++    terminal = helpers._ready(conn, "terminal")
++    conn.execute("UPDATE tasks SET status='done', priority=99999 WHERE id=?", (terminal,))
++    conn.commit()
++    manifest = migration.plan(conn)
++    path = tmp_path / "priorities.json"
++    migration.save_manifest(path, manifest)
++    with pytest.raises(FileExistsError):
++        migration.save_manifest(path, manifest)
++    assert migration.apply(conn, path) == 6
++    assert priorities(conn, ids) == [-10, 0, 180, 360, 360, 540, 720, 900]
++    assert kb.get_task(conn, terminal).priority == 99999
++    assert migration.apply(conn, path) == 0
++    with pytest.raises(ValueError, match="explicit legacy"):
++        migration.apply(conn, path, undo=True)
++    assert migration.apply(conn, path, undo=True, allow_legacy_rollback=True) == 6
++    assert priorities(conn, ids) == values
++    assert migration.apply(conn, path, undo=True, allow_legacy_rollback=True) == 0
++
++
++def test_concurrent_priority_edit_refuses_whole_plan(conn, tmp_path):
++    ids = legacy(conn, [10000, 10250])
++    path = tmp_path / "priorities.json"
++    migration.save_manifest(path, migration.plan(conn))
++    kb.edit_task(conn, ids[1], priority=700)
++    with pytest.raises(ValueError, match="changed since snapshot"):
++        migration.apply(conn, path)
++    assert priorities(conn, ids) == [10000, 700]
++
++
++def test_empty_and_all_nonpositive(conn, tmp_path):
++    path = tmp_path / "empty.json"
++    migration.save_manifest(path, migration.plan(conn))
++    assert migration.apply(conn, path) == 0
++    ids = legacy(conn, [-10, 0])
++    assert [r["new"] for r in migration.plan(conn)["rows"]] == priorities(conn, sorted(ids))
+-- 
+2.55.0
+

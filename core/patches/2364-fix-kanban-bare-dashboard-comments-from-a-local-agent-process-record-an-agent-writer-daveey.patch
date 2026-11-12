@@ -1,0 +1,1194 @@
+From 520732c4104142b24c14745a5b22eb972409d38c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 05:27:38 +0000
+Subject: [PATCH] fix(kanban): bare dashboard comments from a local agent
+ process record an agent writer [daveey]
+
+POST /api/plugins/kanban/tasks/<id>/comments recorded writer_kind='human' whenever the
+client omitted writer_kind, so any dashboard-token holder (an agent's curl, a plugin) was
+recorded as the operator. For a raw loopback TCP peer the endpoint now resolves the socket
+owner (exact reversed tuple; per-process fallback for macOS) and walks its start-time
+ancestry with the CLI's kanban_comment_writer: an agent marker or inconclusive walk -> agent.
+Clean local ancestry and remote/unresolvable peers keep the legacy human default
+(heuristic, not authentication). The raw peer is observed outside Uvicorn's unchanged
+ProxyHeadersMiddleware so X-Forwarded-For cannot launder it. Linux/Darwin only; the
+per-process socket scan runs only on Darwin (global inventory denied there).
+
+The browser auto-opens of `hermes dashboard` (start_server, running-backend attach) and
+`hermes webapp` now open the URL from a child interpreter with clean_launch_env(), and
+`hermes desktop` launching an installed /Applications/Hermes.app passes clean_launch_env():
+main() advertises HERMES_AGENT in os.environ for every command, so a browser or app started
+with it would carry the agent markers and a person's drawer notes typed there would record
+as an agent's. Windows opener children get CREATE_NO_WINDOW.
+
+Verified: real token-holding marked curl -> agent (Linux test, unmocked); fresh isolated
+Desktop drawer on a Mac -> human; Desktop SSH-target tunnels (Darwin and Linux sshd) ->
+human; real BROWSER-script proof the opened browser has no agent markers; 24/24 mutations
+killed.
+---
+ hermes_cli/kanban_comment_writer.py           |   6 +-
+ hermes_cli/kanban_http_comment_writer.py      |  91 +++++++++
+ hermes_cli/main_dashboard.py                  |   4 +-
+ hermes_cli/main_desktop.py                    |  11 +-
+ hermes_cli/top_level_env.py                   |  40 ++++
+ hermes_cli/web_server.py                      |  13 +-
+ hermes_cli/web_server_lifecycle.py            |  19 +-
+ hermes_cli/web_server_transport.py            |  22 +++
+ hermes_cli/webapp_launcher.py                 |   5 +-
+ plugins/kanban/dashboard/plugin_api.py        |   4 +-
+ .../dashboard/plugin_api_comment_actor.py     |  13 +-
+ tests/conftest.py                             |   5 +
+ tests/hermes_cli/test_dashboard_auth_gate.py  |  32 +++-
+ tests/hermes_cli/test_gui_command.py          |   9 +-
+ tests/hermes_cli/test_ipv6_url_authorities.py |   8 +-
+ .../test_kanban_http_comment_writer.py        | 177 ++++++++++++++++++
+ tests/hermes_cli/test_open_url_for_person.py  | 117 ++++++++++++
+ .../test_web_server_raw_transport.py          |  33 ++++
+ .../test_kanban_http_comment_provenance.py    | 135 +++++++++++++
+ .../test_kanban_http_comment_real_client.py   | 101 ++++++++++
+ 20 files changed, 804 insertions(+), 41 deletions(-)
+ create mode 100644 hermes_cli/kanban_http_comment_writer.py
+ create mode 100644 hermes_cli/web_server_transport.py
+ create mode 100644 tests/hermes_cli/test_kanban_http_comment_writer.py
+ create mode 100644 tests/hermes_cli/test_open_url_for_person.py
+ create mode 100644 tests/hermes_cli/test_web_server_raw_transport.py
+ create mode 100644 tests/tools/test_kanban_http_comment_provenance.py
+ create mode 100644 tests/tools/test_kanban_http_comment_real_client.py
+
+diff --git a/hermes_cli/kanban_comment_writer.py b/hermes_cli/kanban_comment_writer.py
+index d73db487903..9ac47e174ba 100644
+--- a/hermes_cli/kanban_comment_writer.py
++++ b/hermes_cli/kanban_comment_writer.py
+@@ -32,9 +32,9 @@ parent of ``explorer.exe``) leaves every walk inconclusive. Out of reach: a same
+ deliberately destroys its marked ancestry (``exec env -i`` replacing the tool shell, double-fork
+ daemonizing) or hands its command to a process outside its ancestry (``tmux send-keys``, ``at``,
+ ``ssh <host> hermes kanban comment``, whose remote sshd session starts clean) — evasion or a
+-handoff, not provenance, which needs real authentication. Not covered here: the dashboard API
+-(``POST /api/plugins/kanban/tasks/<id>/comments``) still records ``human`` for any token holder
+-that omits ``writer_kind`` (``plugin_api_comment_actor``); that server-side gap is a follow-up.
++handoff, not provenance, which needs real authentication. The dashboard API uses this ancestry
++reader for resolved raw loopback TCP peers (``kanban_http_comment_writer``); remote/unresolvable
++HTTP peers retain the legacy human default, not a claim of authenticated human identity.
+ """
+ from __future__ import annotations
+ 
+diff --git a/hermes_cli/kanban_http_comment_writer.py b/hermes_cli/kanban_http_comment_writer.py
+new file mode 100644
+index 00000000000..c512f497eb8
+--- /dev/null
++++ b/hermes_cli/kanban_http_comment_writer.py
+@@ -0,0 +1,91 @@
++"""Best-effort local HTTP comment provenance, not human authentication.
++
++Only a resolved raw loopback TCP peer is inspected. Remote/unresolvable callers retain the
++legacy human default; explicit agent courier labels are handled before this heuristic.
++
++Known limits (each records the legacy ``human``, never a false ``agent`` for a person):
++- a caller dialing this host's LAN/tailnet address instead of loopback is not inspected;
++- a peer owned by another user, a non-dumpable process (Linux ``sshd-session`` carrying a
++  Desktop SSH-target ``ssh -L`` tunnel) or a socket already closed is unresolvable;
++- macOS returns an empty environment for Apple-protected binaries (``/usr/bin/curl``), so
++  a marker set only on such a process is invisible; a readable marked ancestor still counts;
++- an agent-started local proxy/relay presents its own (possibly clean) ancestry.
++A GUI launched from an agent terminal inherits its markers and records ``agent``. Hermes's
++own dashboard/webapp auto-open drops them (``top_level_env.open_url_for_person``); other
++in-process ``webbrowser.open`` callers (OAuth/device-flow sign-ins) can still cold-start a
++marked browser. macOS denies the global socket inventory, so each bare comment scans
++same-user processes there.
++"""
++from __future__ import annotations
++
++import ipaddress
++import sys
++
++from hermes_cli import kanban_comment_writer as ancestry
++
++
++def _endpoint(value):
++    if not value or len(value) != 2:
++        return None
++    try:
++        address = ipaddress.ip_address(value[0])
++        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
++            address = address.ipv4_mapped
++        return address, int(value[1])
++    except (ValueError, TypeError):
++        return None
++
++
++def _socket_owners(psutil, peer, server) -> set[int]:
++    def matches(connection):
++        return _endpoint(connection.laddr) == peer and _endpoint(connection.raddr) == server
++
++    try:
++        connections = psutil.net_connections(kind="tcp")
++    except (psutil.Error, OSError):
++        connections = []
++    matching = [c for c in connections if matches(c)]
++    owners = {c.pid for c in matching if c.pid}
++    if (owners and all(c.pid for c in matching)) or sys.platform != "darwin":
++        # Linux attributes every socket it can read in the global inventory; a per-process
++        # pass can't read more (other users', non-dumpable sshd-session) and costs a scan.
++        return owners
++    # macOS may deny the global inventory but expose same-user process sockets. An
++    # inaccessible unrelated process is not evidence about this connection's ancestry.
++    try:
++        for proc in psutil.process_iter():
++            try:
++                if any(matches(c) for c in proc.net_connections(kind="tcp")):
++                    owners.add(proc.pid)
++            except (psutil.Error, OSError):
++                continue
++    except (psutil.Error, OSError):
++        pass  # No resolved owner keeps the explicitly required legacy default.
++    return owners
++
++
++def http_comment_writer(scope: dict) -> tuple[str, None]:
++    """Lower bare comments from a resolved agent (or unreadable ancestry) to agent."""
++    # Windows cannot complete the existing ancestry walk for Explorer-launched GUI
++    # processes (Explorer's parent commonly exits). Keep the pre-existing default
++    # there rather than relabel every person's drawer note; explicit agents still
++    # bypass this helper. The socket heuristic is supported on Linux and Darwin.
++    if sys.platform not in ("linux", "darwin"):
++        return "human", None
++    raw = scope.get("hermes.raw_transport")
++    if raw is None:
++        return "human", None
++    peer, server = map(_endpoint, raw)
++    if peer is None or server is None or not peer[0].is_loopback:
++        return "human", None
++    try:
++        import psutil
++    except ImportError:
++        return "human", None
++    for pid in _socket_owners(psutil, peer, server):
++        try:
++            if ancestry.agent_ancestor(pid) is not None:
++                return "agent", None
++        except ancestry.Inconclusive:
++            return "agent", None
++    return "human", None
+diff --git a/hermes_cli/main_dashboard.py b/hermes_cli/main_dashboard.py
+index 181993f2f4c..90ab174ec3d 100644
+--- a/hermes_cli/main_dashboard.py
++++ b/hermes_cli/main_dashboard.py
+@@ -1026,8 +1026,8 @@ def _attach_to_host_backend(args, headless_backend: bool) -> None:
+     print(f"  Managing profile '{wanted}': {url}")
+     if not headless_backend and not args.no_open:
+         with contextlib.suppress(Exception):
+-            import webbrowser
+-            webbrowser.open(url)
++            from hermes_cli.top_level_env import open_url_for_person
++            open_url_for_person(url)  # [daveey] no agent markers in a person's browser
+     sys.exit(0)
+ 
+ 
+diff --git a/hermes_cli/main_desktop.py b/hermes_cli/main_desktop.py
+index 085b7dbceb2..25d189d40c1 100644
+--- a/hermes_cli/main_desktop.py
++++ b/hermes_cli/main_desktop.py
+@@ -1802,19 +1802,18 @@ def _site_packages_install_kind(project_root: Path) -> Optional[str]:
+ 
+ 
+ def _launch_installed_macos_desktop_app() -> bool:
+-    """Launch a separately installed ``/Applications/Hermes.app``, if present.
+-
+-    Returns True only when the app bundle exists and a detached launch was
+-    started — the caller then exits without touching the build ladder.
+-    """
++    """Return True after launching installed ``/Applications/Hermes.app``; skip the build ladder."""
+     if sys.platform != "darwin":
+         return False
+     executable = Path("/Applications/Hermes.app/Contents/MacOS/Hermes")
+     if not executable.is_file():
+         return False
+     from hermes_cli.bundled_app import launch_detached
++    from hermes_cli.top_level_env import clean_launch_env
+ 
+-    pid = launch_detached([str(executable)], cwd=executable.parent)
++    # [daveey] Electron is not an agent: main()'s HERMES_AGENT/AI_AGENT would otherwise mark
++    # the app, and the Kanban drawer's comments would record as an agent's.
++    pid = launch_detached([str(executable)], env=clean_launch_env(), cwd=executable.parent)
+     print(f"→ Launched the installed Hermes Desktop app: {executable} (pid {pid})")
+     return True
+ 
+diff --git a/hermes_cli/top_level_env.py b/hermes_cli/top_level_env.py
+index ced294ad91e..ac15832db36 100644
+--- a/hermes_cli/top_level_env.py
++++ b/hermes_cli/top_level_env.py
+@@ -57,6 +57,46 @@ def clean_launch_env(base: Optional[MutableMapping[str, str]] = None) -> dict[st
+     return drop_agent_attribution(env)
+ 
+ 
++def url_opener_command(url: str) -> list[str]:
++    """argv that opens ``url`` with the stdlib browser registry in a fresh interpreter (exit 0 = opened)."""
++    import sys
++    return [sys.executable, "-I", "-c",
++            "import sys, webbrowser; sys.exit(0 if webbrowser.open(sys.argv[1]) else 1)", url]
++
++
++def open_url_for_person(url: str) -> None:
++    """Open ``url`` in the person's browser without handing it the agent markers. [daveey]
++
++    main() advertises ``HERMES_AGENT``/``AI_AGENT`` in ``os.environ`` for every command, so an
++    in-process ``webbrowser.open`` gives a newly launched browser (``xdg-open`` -> Firefox) those
++    markers at start time. The dashboard comment endpoint reads a loopback peer's start-time
++    ancestry (``kanban_http_comment_writer``): notes a person typed in that browser would be
++    recorded as an agent's. The opener runs in a child with :func:`clean_launch_env` instead of
++    mutating this (multi-threaded) process's environment."""
++    _spawn_clean_url_opener(url)
++
++
++def open_url_for_person_checked(url: str, timeout: float = 15.0) -> bool:
++    """:func:`open_url_for_person` for callers that report whether a browser opened.
++
++    True when the child's ``webbrowser.open`` succeeded, or is still running at ``timeout``
++    (a browser being launched); False on its failure or a spawn error."""
++    try:
++        proc = _spawn_clean_url_opener(url)
++    except OSError:
++        return False
++    try:
++        return proc.wait(timeout) == 0
++    except subprocess.TimeoutExpired:
++        return True
++
++
++def _spawn_clean_url_opener(url: str) -> subprocess.Popen:
++    return subprocess.Popen(url_opener_command(url), env=clean_launch_env(), stdin=subprocess.DEVNULL,
++                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
++                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # no console flash
++
++
+ def _first_positional(argv: Sequence[str]) -> str:
+     return next((arg for arg in argv if arg and not arg.startswith("-")), "")
+ 
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index a730c17468f..6e268fe7a98 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -1262,15 +1262,18 @@ def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
+         ping_interval, ping_timeout = TUNNEL_WS_PING_INTERVAL_S, TUNNEL_WS_PING_TIMEOUT_S
+ 
+     _uvicorn_console_logging()  # log_config=None: uvicorn's dictConfig would close every live handler
++    from hermes_cli.web_server_transport import transport_observed_app
++
++    forwarded_allow_ips = _dashboard_forwarded_allow_ips(_dash_cfg)
++    served_app = transport_observed_app(
++        served_app, proxy_headers=bool(app.state.auth_required), forwarded_allow_ips=forwarded_allow_ips)
+     config = uvicorn.Config(
+         served_app, host=host, port=port, log_level="warning", log_config=None,
+-        # Off by default so _ws_client_is_allowed sees the real peer, not
+-        # X-Forwarded-For. Gated mode runs behind a TLS terminator and needs
+-        # X-Forwarded-Proto for cookie Secure flags.
+-        proxy_headers=bool(app.state.auth_required),
++        # Composed inside raw transport observation above, with the same trust policy.
++        proxy_headers=False,
+         # Loopback-only unless the operator trusts a bounded upstream proxy, so
+         # spoofed X-Forwarded-* from arbitrary callers is never honoured.
+-        forwarded_allow_ips=_dashboard_forwarded_allow_ips(_dash_cfg),
++        forwarded_allow_ips=forwarded_allow_ips,
+         ws_ping_interval=ping_interval,
+         ws_ping_timeout=ping_timeout,
+         # Per-frame zlib on the loop buys nothing for a local client (build_listener_server); a peer
+diff --git a/hermes_cli/web_server_lifecycle.py b/hermes_cli/web_server_lifecycle.py
+index c92e1e15bf4..2bf96d51914 100644
+--- a/hermes_cli/web_server_lifecycle.py
++++ b/hermes_cli/web_server_lifecycle.py
+@@ -232,8 +232,6 @@ def _maybe_open_browser(host: str, actual_port: int, open_browser: bool, initial
+     if not open_browser:
+         return
+ 
+-    import webbrowser
+-
+     _has_display = sys.platform != "linux" or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+     if not _has_display:
+         _log.debug(
+@@ -253,7 +251,9 @@ def _maybe_open_browser(host: str, actual_port: int, open_browser: bool, initial
+     def _open():
+         try:
+             time.sleep(1.0)
+-            webbrowser.open(_open_url)
++            from hermes_cli.top_level_env import open_url_for_person
++
++            open_url_for_person(_open_url)  # [daveey] no agent markers in a person's browser
+         except Exception:
+             pass
+ 
+@@ -623,15 +623,18 @@ def build_listener_server(served_app, host: str, port: int, *, auth_required: bo
+         ws_ping = (None, None) if host in _LOOPBACK_HOST_VALUES else (
+             _ws_ping_setting("ws_ping_interval"), _ws_ping_setting("ws_ping_timeout"))
+     _uvicorn_console_logging()
++    from hermes_cli.web_server_transport import transport_observed_app
++
++    forwarded_allow_ips = _dashboard_forwarded_allow_ips(dash_cfg)
++    served_app = transport_observed_app(
++        served_app, proxy_headers=auth_required, forwarded_allow_ips=forwarded_allow_ips)
+     config = uvicorn.Config(
+         served_app, host=host, port=port, log_level="warning", log_config=None,
+-        # Off by default so _ws_client_is_allowed sees the real peer, not
+-        # X-Forwarded-For. Gated mode runs behind a TLS terminator and needs
+-        # X-Forwarded-Proto for cookie Secure flags.
+-        proxy_headers=auth_required,
++        # Composed inside raw transport observation above, with the same trust policy.
++        proxy_headers=False,
+         # Loopback-only unless the operator trusts a bounded upstream proxy, so
+         # spoofed X-Forwarded-* from arbitrary callers is never honoured.
+-        forwarded_allow_ips=_dashboard_forwarded_allow_ips(dash_cfg),
++        forwarded_allow_ips=forwarded_allow_ips,
+         ws_ping_interval=ws_ping[0],
+         ws_ping_timeout=ws_ping[1],
+         ws_per_message_deflate=per_message_deflate,
+diff --git a/hermes_cli/web_server_transport.py b/hermes_cli/web_server_transport.py
+new file mode 100644
+index 00000000000..356134b0279
+--- /dev/null
++++ b/hermes_cli/web_server_transport.py
+@@ -0,0 +1,22 @@
++"""Observe transport endpoints before the existing trusted-proxy interpretation."""
++from __future__ import annotations
++
++from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
++
++
++def transport_observed_app(app, *, proxy_headers: bool, forwarded_allow_ips):
++    """Compose raw observation outside Uvicorn's unchanged proxy middleware.
++
++    Pass ``proxy_headers=False`` to Config: its automatic wrapper would otherwise run
++    outside this observer and discard the original peer. Authentication still sees the
++    same interpreted client/scheme as before; only provenance reads the raw observation.
++    """
++    inner = ProxyHeadersMiddleware(app, trusted_hosts=forwarded_allow_ips) if proxy_headers else app
++
++    async def observed(scope, receive, send):
++        if scope["type"] in ("http", "websocket"):
++            scope = dict(scope)
++            scope["hermes.raw_transport"] = (scope.get("client"), scope.get("server"))
++        await inner(scope, receive, send)
++
++    return observed
+diff --git a/hermes_cli/webapp_launcher.py b/hermes_cli/webapp_launcher.py
+index 4b987405e52..ec45c3b1a2d 100644
+--- a/hermes_cli/webapp_launcher.py
++++ b/hermes_cli/webapp_launcher.py
+@@ -94,10 +94,13 @@ def _control(home, verb: str, params: dict | None = None) -> dict:
+ def _open(url: str) -> bool:
+     import webbrowser
+     from hermes_cli.auth_device_flow import _can_open_graphical_browser
++    from hermes_cli.top_level_env import open_url_for_person_checked
+     if not _can_open_graphical_browser():
+         return False
+     try:
+-        return bool(webbrowser.open(url))
++        # [daveey] a clean child: a browser this command starts must not carry main()'s agent
++        # markers, or a person's Kanban drawer notes typed there would record as an agent's.
++        return open_url_for_person_checked(url)
+     except (webbrowser.Error, OSError):
+         return False
+ 
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 72baadd3025..93b1004bb8c 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -923,10 +923,10 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str)
+ # --- Comments / links -------------------------------------------------------
+ 
+ @router.post("/tasks/{task_id}/comments")
+-def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query(None)):
++def add_comment(task_id: str, payload: CommentBody, request: Request, board: Optional[str] = Query(None)):
+     if not payload.body.strip():
+         raise HTTPException(status_code=400, detail="body is required")
+-    writer_kind, writer_session = comment_writer(payload)  # [daveey] agent courier vs GUI human
++    writer_kind, writer_session = comment_writer(payload, request.scope)
+     with _board_conn(board) as (board, conn):
+         _foreign_card_409(conn, task_id)
+         _require_task(conn, task_id)
+diff --git a/plugins/kanban/dashboard/plugin_api_comment_actor.py b/plugins/kanban/dashboard/plugin_api_comment_actor.py
+index 7ef20748c5f..719b12f48d2 100644
+--- a/plugins/kanban/dashboard/plugin_api_comment_actor.py
++++ b/plugins/kanban/dashboard/plugin_api_comment_actor.py
+@@ -6,9 +6,10 @@ agent's cross-gateway comment reached the worker as "from the operator" (comment
+ agent-261aa31f49 fix covered only the in-process ``kanban_comment`` tool).
+ 
+ A caller may only LOWER provenance. ``writer_kind='agent'`` (with the sending agent's session) is
+-accepted; human is this endpoint's own default for a person typing in the GUI and is never taken
+-from the payload, so an explicit ``human`` claim, an unknown kind, or a session with no agent kind
+-is refused before anything is stored.
++accepted. Bare comments from a resolved raw loopback agent process (or inconclusive ancestry)
++are also lowered to agent. Clean local ancestry and remote/unresolvable peers keep the legacy
++human default. This is a provenance heuristic, not human authentication. An explicit ``human``
++claim, an unknown kind, or a session with no agent kind is refused before anything is stored.
+ """
+ from __future__ import annotations
+ 
+@@ -26,13 +27,15 @@ class CommentBody(BaseModel):
+     writer_session: Optional[str] = None
+ 
+ 
+-def comment_writer(payload: CommentBody) -> tuple[str, Optional[str]]:
++def comment_writer(payload: CommentBody, scope: Optional[dict] = None) -> tuple[str, Optional[str]]:
+     """``(writer_kind, writer_session)`` to record for ``payload``; HTTP 400 for a forged/malformed actor."""
+     kind, session = payload.writer_kind, payload.writer_session
+     if kind is None:
+         if session is not None:
+             raise HTTPException(status_code=400, detail="writer_session requires writer_kind='agent'")
+-        return "human", None
++        from hermes_cli.kanban_http_comment_writer import http_comment_writer
++
++        return http_comment_writer(scope or {})
+     if kind != "agent":
+         raise HTTPException(status_code=400, detail=(
+             "writer_kind may only be 'agent'; omit it for a comment a person typed "
+diff --git a/tests/conftest.py b/tests/conftest.py
+index b1ab94042c3..a13438bbb08 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -809,6 +809,11 @@ def _neutralize_webbrowser(monkeypatch):
+     for name in ("open", "open_new", "open_new_tab"):
+         monkeypatch.setattr(_webbrowser, name, _record, raising=False)
+     monkeypatch.setattr(_webbrowser, "get", lambda *_args, **_kwargs: browser)
++    # The dashboard opens its URL from a clean child interpreter (agent markers dropped),
++    # which the in-process stubs above can't reach.
++    from hermes_cli import top_level_env as _top_level_env
++    monkeypatch.setattr(_top_level_env, "open_url_for_person", _record)
++    monkeypatch.setattr(_top_level_env, "open_url_for_person_checked", _record)
+ 
+     return opened
+ 
+diff --git a/tests/hermes_cli/test_dashboard_auth_gate.py b/tests/hermes_cli/test_dashboard_auth_gate.py
+index d339b86342e..18e2200ee12 100644
+--- a/tests/hermes_cli/test_dashboard_auth_gate.py
++++ b/tests/hermes_cli/test_dashboard_auth_gate.py
+@@ -51,6 +51,25 @@ def test_should_require_auth_truth_table(host, allow_public, expected):
+ # ---------------------------------------------------------------------------
+ 
+ 
++def _record_proxy_wrapping(monkeypatch):
++    """Record the proxy policy start_server composes inside raw-transport observation.
++
++    Uvicorn's automatic ``proxy_headers`` stays off: the same ProxyHeadersMiddleware runs
++    inside ``transport_observed_app`` so provenance can still read the raw TCP peer.
++    """
++    from hermes_cli import web_server_transport
++
++    seen: dict = {}
++    original = web_server_transport.transport_observed_app
++
++    def recording(app, *, proxy_headers, forwarded_allow_ips):
++        seen.update(proxy_headers=proxy_headers, forwarded_allow_ips=forwarded_allow_ips)
++        return original(app, proxy_headers=proxy_headers, forwarded_allow_ips=forwarded_allow_ips)
++
++    monkeypatch.setattr(web_server_transport, "transport_observed_app", recording)
++    return seen
++
++
+ def _stub_uvicorn_run(monkeypatch):
+     """Replace uvicorn.Config/Server with no-op fakes so start_server
+     returns immediately (rather than blocking on the event loop). Returns the dict
+@@ -180,8 +199,9 @@ def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(monkeyp
+ 
+     The SystemExit-refusing-to-bind guard is REPLACED in gated mode by
+     "the gate engages", so as long as a provider is registered the bind
+-    succeeds.  uvicorn is called with proxy_headers=True so X-Forwarded-Proto
+-    from Fly's TLS terminator is honoured for cookie Secure-flag decisions.
++    succeeds.  Proxy headers are honoured (via ProxyHeadersMiddleware composed inside
++    raw-transport observation) so X-Forwarded-Proto from Fly's TLS terminator is
++    honoured for cookie Secure-flag decisions.
+     """
+     from hermes_cli.dashboard_auth import clear_providers, register_provider
+     from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+@@ -189,6 +209,7 @@ def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(monkeyp
+     clear_providers()
+     register_provider(StubAuthProvider())
+     captured = _stub_uvicorn_run(monkeypatch)
++    proxy = _record_proxy_wrapping(monkeypatch)
+     try:
+         web_server.app.state.auth_required = None
+         web_server.start_server(
+@@ -197,7 +218,8 @@ def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(monkeyp
+         )
+         assert web_server.app.state.auth_required is True
+         assert captured["kwargs"].get("host") == "0.0.0.0"
+-        assert captured["kwargs"].get("proxy_headers") is True
++        assert captured["kwargs"].get("proxy_headers") is False
++        assert proxy == {"proxy_headers": True, "forwarded_allow_ips": ["127.0.0.1", "::1"]}
+         assert captured["kwargs"].get("forwarded_allow_ips") == [
+             "127.0.0.1",
+             "::1",
+@@ -328,6 +350,7 @@ def test_start_server_loopback_public_url_enables_gate(monkeypatch):
+     clear_providers()
+     register_provider(StubAuthProvider())
+     captured = _stub_uvicorn_run(monkeypatch)
++    proxy = _record_proxy_wrapping(monkeypatch)
+     _restore_app_state_after_test(
+         monkeypatch,
+         "auth_required",
+@@ -345,7 +368,8 @@ def test_start_server_loopback_public_url_enables_gate(monkeypatch):
+             {"dashboard.example.test"}
+         )
+         assert captured["kwargs"].get("host") == "127.0.0.1"
+-        assert captured["kwargs"].get("proxy_headers") is True
++        assert captured["kwargs"].get("proxy_headers") is False
++        assert proxy["proxy_headers"] is True
+     finally:
+         clear_providers()
+ 
+diff --git a/tests/hermes_cli/test_gui_command.py b/tests/hermes_cli/test_gui_command.py
+index 3eee05e8e88..94002b37356 100644
+--- a/tests/hermes_cli/test_gui_command.py
++++ b/tests/hermes_cli/test_gui_command.py
+@@ -345,13 +345,20 @@ def test_launch_installed_macos_desktop_app_gates_on_bundle_and_platform(tmp_pat
+     exe = Path("/Applications/Hermes.app/Contents/MacOS/Hermes")
+     monkeypatch.setattr(main_desktop.Path, "is_file", lambda self: exists if self == exe else Path.is_file(self))
+     calls = []
++    envs = []
++    monkeypatch.setenv("HERMES_AGENT", "true")
++    monkeypatch.setenv("AI_AGENT", "hermes-agent")
+     if exists and platform == "darwin":
+         from hermes_cli import bundled_app
+-        monkeypatch.setattr(bundled_app, "launch_detached", lambda argv, **kw: calls.append(argv) or 4321)
++        monkeypatch.setattr(bundled_app, "launch_detached",
++                            lambda argv, **kw: calls.append(argv) or envs.append(kw.get("env")) or 4321)
+ 
+     assert main_desktop._launch_installed_macos_desktop_app() is (exists and platform == "darwin")
+     if exists and platform == "darwin":
+         assert calls == [[str(exe)]]
++        # The app starts without main()'s agent markers (Kanban drawer comment provenance).
++        assert envs[0] is not None and not {"HERMES_AGENT", "AI_AGENT"} & envs[0].keys()
++        assert envs[0].get("PATH") == os.environ.get("PATH")
+ 
+ 
+ # ── Content-hash stamp tests ──────────────────────────────────────────
+diff --git a/tests/hermes_cli/test_ipv6_url_authorities.py b/tests/hermes_cli/test_ipv6_url_authorities.py
+index 17f21dc6c9e..e9323d5d7b2 100644
+--- a/tests/hermes_cli/test_ipv6_url_authorities.py
++++ b/tests/hermes_cli/test_ipv6_url_authorities.py
+@@ -101,7 +101,7 @@ class TestBrowserOpenUrl:
+ 
+     def test_maybe_open_browser_brackets_ipv6_loopback(self, monkeypatch):
+         """The browser auto-open URL needs brackets around an IPv6 authority."""
+-        import webbrowser
++        from hermes_cli import top_level_env
+ 
+         opened = []
+ 
+@@ -114,7 +114,7 @@ class TestBrowserOpenUrl:
+ 
+         monkeypatch.setattr(web_server_lifecycle.threading, "Thread", _ImmediateThread)
+         monkeypatch.setattr(web_server_lifecycle.time, "sleep", lambda _s: None)
+-        monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url))
++        monkeypatch.setattr(top_level_env, "open_url_for_person", lambda url: opened.append(url))
+         monkeypatch.setenv("DISPLAY", ":0")
+ 
+         web_server_lifecycle._maybe_open_browser("::1", 9119, True, "worker_x")
+@@ -134,11 +134,11 @@ class TestAttachUrl:
+ 
+     def test_attach_brackets_ipv6_host_in_browser_url(self, monkeypatch):
+         """Named-profile attach to a running IPv6 dashboard must open a valid URL."""
+-        import webbrowser
+         from gateway import host_rendezvous as hr
++        from hermes_cli import top_level_env
+ 
+         opened = []
+-        monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url))
++        monkeypatch.setattr(top_level_env, "open_url_for_person", lambda url: opened.append(url))
+         record = types.SimpleNamespace(host="::1", port=9119, pid=4242, role="dashboard")
+         monkeypatch.setattr(main_dashboard, "_host_backend_attachment", lambda: record)
+         monkeypatch.setattr(main_dashboard, "_is_desktop_owned_backend", lambda: False)
+diff --git a/tests/hermes_cli/test_kanban_http_comment_writer.py b/tests/hermes_cli/test_kanban_http_comment_writer.py
+new file mode 100644
+index 00000000000..33c0bee204c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_http_comment_writer.py
+@@ -0,0 +1,177 @@
++"""Socket attribution uses both endpoints, with Darwin-compatible process fallback."""
++from types import SimpleNamespace
++
++import psutil
++import pytest
++
++from hermes_cli import kanban_comment_writer as ancestry
++from hermes_cli.kanban_http_comment_writer import http_comment_writer
++
++PEER = ("127.0.0.1", 40123)
++SERVER = ("127.0.0.1", 8765)
++SCOPE = {"hermes.raw_transport": (PEER, SERVER)}
++
++
++@pytest.fixture(autouse=True)
++def supported_platform(monkeypatch):
++    monkeypatch.setattr("hermes_cli.kanban_http_comment_writer.sys", SimpleNamespace(platform="linux"))
++
++
++@pytest.mark.parametrize("platform", ["win32", "freebsd13"])
++def test_unsupported_platform_preserves_gui_default(monkeypatch, platform):
++    monkeypatch.setattr("hermes_cli.kanban_http_comment_writer.sys", SimpleNamespace(platform=platform))
++    monkeypatch.setattr(psutil, "net_connections", lambda **kw: pytest.fail("unsupported ancestry"))
++    assert http_comment_writer(SCOPE) == ("human", None)
++
++
++def connection(pid=42, local=PEER, remote=SERVER):
++    return SimpleNamespace(pid=pid, laddr=local, raddr=remote)
++
++
++def darwin(monkeypatch):
++    monkeypatch.setattr("hermes_cli.kanban_http_comment_writer.sys", SimpleNamespace(platform="darwin"))
++
++
++@pytest.mark.parametrize("global_result", [psutil.AccessDenied(), [], [connection(None)]])
++def test_linux_never_scans_processes_for_an_unattributed_socket(monkeypatch, global_result):
++    """Linux's global inventory already reads every socket it can; a scan finds nothing more."""
++    def global_connections(**kwargs):
++        if isinstance(global_result, Exception):
++            raise global_result
++        return global_result
++
++    monkeypatch.setattr(psutil, "net_connections", global_connections)
++    monkeypatch.setattr(psutil, "process_iter", lambda: pytest.fail("per-process scan on Linux"))
++    assert http_comment_writer(SCOPE) == ("human", None)
++
++
++@pytest.mark.parametrize("global_result", [psutil.AccessDenied(), [], [connection(None)]])
++def test_process_fallback_resolves_despite_unrelated_denied_process(monkeypatch, global_result):
++    darwin(monkeypatch)
++    def global_connections(**kwargs):
++        if isinstance(global_result, Exception):
++            raise global_result
++        return global_result
++
++    def denied(**kwargs):
++        raise psutil.AccessDenied(3)
++
++    processes = [SimpleNamespace(pid=3, net_connections=denied),
++                 SimpleNamespace(pid=42, net_connections=lambda **kw: [connection(None)])]
++    monkeypatch.setattr(psutil, "net_connections", global_connections)
++    monkeypatch.setattr(psutil, "process_iter", lambda: iter(processes))
++    monkeypatch.setattr(ancestry, "agent_ancestor", lambda pid: f"{pid}:HERMES_AGENT")
++    assert http_comment_writer(SCOPE) == ("agent", None)
++
++
++@pytest.mark.parametrize("peers", [[connection(41), connection(42)], [connection(42), connection(41)]])
++@pytest.mark.parametrize("inconclusive", [False, True])
++def test_any_matching_owner_can_lower_provenance(monkeypatch, peers, inconclusive):
++    monkeypatch.setattr(psutil, "net_connections", lambda **kw: peers)
++
++    def classify(pid):
++        if pid == 41:
++            return None
++        if inconclusive:
++            raise ancestry.Inconclusive("exited")
++        return "42:HERMES_AGENT"
++
++    monkeypatch.setattr(ancestry, "agent_ancestor", classify)
++    assert http_comment_writer(SCOPE) == ("agent", None)
++
++
++@pytest.mark.parametrize("connections", [
++    [], [connection(local=("127.0.0.2", PEER[1]))],
++    [connection(remote=(SERVER[0], SERVER[1] + 1))],
++    [connection(local=SERVER, remote=PEER)],
++])
++def test_unresolved_complete_reverse_tuple_keeps_legacy_human(monkeypatch, connections):
++    monkeypatch.setattr(psutil, "net_connections", lambda **kw: connections)
++    monkeypatch.setattr(psutil, "process_iter", lambda: iter([]))
++    monkeypatch.setattr(ancestry, "agent_ancestor", lambda pid: pytest.fail("not this socket"))
++    assert http_comment_writer(SCOPE) == ("human", None)
++
++
++@pytest.mark.parametrize("scope", [{}, {"client": PEER, "server": SERVER},
++    {"hermes.raw_transport": (("192.0.2.1", PEER[1]), SERVER)},
++    {"hermes.raw_transport": (None, SERVER)},
++    {"hermes.raw_transport": (PEER, None)},
++    {"hermes.raw_transport": (("testclient", 1), SERVER)},
++])
++def test_only_raw_loopback_peer_is_eligible(monkeypatch, scope):
++    monkeypatch.setattr(psutil, "net_connections", lambda **kw: pytest.fail("not local TCP"))
++    assert http_comment_writer(scope) == ("human", None)
++
++
++def test_resolved_clean_ancestry_is_human(monkeypatch):
++    monkeypatch.setattr(psutil, "net_connections", lambda **kw: [connection()])
++    monkeypatch.setattr(ancestry, "agent_ancestor", lambda pid: None)
++    assert http_comment_writer(SCOPE) == ("human", None)
++
++
++def test_ipv4_mapped_ipv6_matches_ipv4_socket(monkeypatch):
++    monkeypatch.setattr(psutil, "net_connections", lambda **kw: [connection()])
++    monkeypatch.setattr(ancestry, "agent_ancestor", lambda pid: "42:HERMES_AGENT")
++    scope = {"hermes.raw_transport": (("::ffff:127.0.0.1", PEER[1]), ("::ffff:127.0.0.1", SERVER[1]))}
++    assert http_comment_writer(scope) == ("agent", None)
++
++
++@pytest.mark.parametrize("fallback", [False, True])
++def test_real_loopback_socket_resolves_its_client_pid(monkeypatch, fallback):
++    import os
++    import socket
++
++    seen = []
++
++    def classify(pid):
++        seen.append(pid)
++        return f"{pid}:HERMES_AGENT"
++
++    monkeypatch.setattr(ancestry, "agent_ancestor", classify)
++    proc = psutil.Process(os.getpid())
++    # Both inventory paths inspect real sockets, but only those this test owns.
++    monkeypatch.setattr(psutil, "net_connections", lambda **kw: [
++        connection(proc.pid, c.laddr, c.raddr) for c in proc.net_connections(**kw)])
++    monkeypatch.setattr(psutil, "process_iter", lambda: iter([proc]))
++    if fallback:
++        darwin(monkeypatch)
++        def denied(**kwargs):
++            raise psutil.AccessDenied()
++        monkeypatch.setattr(psutil, "net_connections", denied)
++        # Retain real per-process socket inspection, without touching unrelated host processes.
++        monkeypatch.setattr(psutil, "process_iter", lambda: iter([psutil.Process(os.getpid())]))
++    with socket.socket() as listener, socket.socket() as client:
++        listener.bind(("127.0.0.1", 0))
++        listener.listen()
++        client.connect(listener.getsockname())
++        accepted, peer = listener.accept()
++        with accepted:
++            assert http_comment_writer({"hermes.raw_transport": (peer, accepted.getsockname())}) == ("agent", None)
++    assert seen == [os.getpid()]
++
++
++@pytest.mark.parametrize("platform", ["linux", "darwin"])
++@pytest.mark.parametrize("error", [psutil.AccessDenied(), psutil.NoSuchProcess(3), OSError("unavailable")])
++def test_unavailable_socket_inventories_keep_legacy_default(monkeypatch, error, platform):
++    monkeypatch.setattr("hermes_cli.kanban_http_comment_writer.sys", SimpleNamespace(platform=platform))
++    def unavailable(**kwargs):
++        raise error
++    monkeypatch.setattr(psutil, "net_connections", unavailable)
++    monkeypatch.setattr(psutil, "process_iter", unavailable)
++    assert http_comment_writer(SCOPE) == ("human", None)
++
++
++def test_missing_psutil_keeps_legacy_default(monkeypatch):
++    import sys
++
++    monkeypatch.setitem(sys.modules, "psutil", None)
++    assert http_comment_writer(SCOPE) == ("human", None)
++
++
++def test_partial_global_inventory_checks_all_fallback_owners(monkeypatch):
++    darwin(monkeypatch)
++    monkeypatch.setattr(psutil, "net_connections", lambda **kw: [connection(41), connection(None)])
++    processes = [SimpleNamespace(pid=pid, net_connections=lambda **kw: [connection(None)]) for pid in (41, 42)]
++    monkeypatch.setattr(psutil, "process_iter", lambda: iter(processes))
++    monkeypatch.setattr(ancestry, "agent_ancestor", lambda pid: None if pid == 41 else "42:HERMES_AGENT")
++    assert http_comment_writer(SCOPE) == ("agent", None)
+diff --git a/tests/hermes_cli/test_open_url_for_person.py b/tests/hermes_cli/test_open_url_for_person.py
+new file mode 100644
+index 00000000000..5c7e618e384
+--- /dev/null
++++ b/tests/hermes_cli/test_open_url_for_person.py
+@@ -0,0 +1,117 @@
++"""The dashboard's browser auto-open must not hand a person's browser the agent markers. [daveey]
++
++main() advertises HERMES_AGENT/AI_AGENT in os.environ for every command; a browser that
++``hermes dashboard`` launched in-process would inherit them at start time, and the dashboard
++comment endpoint (kanban_http_comment_writer) would then record a person's drawer notes typed
++there as an agent's.
++"""
++from __future__ import annotations
++
++import os
++import stat
++import sys
++import time
++
++import pytest
++
++from hermes_cli import top_level_env
++
++# Captured at import, before the autouse browser guard (tests/conftest.py) replaces them.
++REAL_OPEN = top_level_env.open_url_for_person
++REAL_CHECKED = top_level_env.open_url_for_person_checked
++
++
++def test_unchecked_opener_spawns_the_clean_child(monkeypatch):
++    spawned = []
++    monkeypatch.setattr(top_level_env, "_spawn_clean_url_opener", spawned.append)
++    REAL_OPEN("http://127.0.0.1:9119")
++    assert spawned == ["http://127.0.0.1:9119"]
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="POSIX BROWSER script")
++def test_opened_browser_starts_without_agent_markers(tmp_path, monkeypatch):
++    dump = tmp_path / "browser-env.txt"
++    script = tmp_path / "fake-browser"
++    script.write_text(f"#!/bin/sh\nenv > '{dump}.tmp'\necho \"URL=$1\" >> '{dump}.tmp'\nmv '{dump}.tmp' '{dump}'\n")
++    script.chmod(script.stat().st_mode | stat.S_IXUSR)
++    monkeypatch.setenv("BROWSER", f"{script} %s")
++    monkeypatch.setenv("HERMES_AGENT", "true")
++    monkeypatch.setenv("AI_AGENT", "hermes-agent")
++    monkeypatch.setenv("HERMES_SESSION_ID", "agent-session")
++
++    proc = top_level_env._spawn_clean_url_opener("http://127.0.0.1:9119/?profile=default")
++    assert proc.wait(30) == 0
++    deadline = time.monotonic() + 30
++    while not dump.exists() and time.monotonic() < deadline:
++        time.sleep(0.05)
++    lines = dump.read_text().splitlines()
++    env = dict(line.split("=", 1) for line in lines if "=" in line and not line.startswith("URL="))
++    assert "URL=http://127.0.0.1:9119/?profile=default" in lines
++    assert not {"HERMES_AGENT", "AI_AGENT", "HERMES_SESSION_ID"} & env.keys()
++    assert env.get("PATH") == os.environ["PATH"]  # an ordinary environment otherwise
++
++
++@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="BROWSER as the only registered browser")
++@pytest.mark.parametrize("status, expected", [(0, True), (3, False)])
++def test_checked_opener_reports_a_real_browser_outcome(tmp_path, monkeypatch, status, expected):
++    script = tmp_path / "fake-browser"
++    script.write_text(f"#!/bin/sh\nexit {status}\n")
++    script.chmod(script.stat().st_mode | stat.S_IXUSR)
++    for name in ("DISPLAY", "WAYLAND_DISPLAY"):
++        monkeypatch.delenv(name, raising=False)  # no xdg-open/graphical fallbacks registered
++    monkeypatch.setenv("BROWSER", f"{script} %s")
++    monkeypatch.setenv("PATH", str(tmp_path))  # no console browsers (w3m, lynx) to fall back to
++    assert REAL_CHECKED("http://127.0.0.1:9119/") is expected
++
++
++class _Proc:
++    def __init__(self, result):
++        self._result = result
++
++    def wait(self, timeout):
++        if isinstance(self._result, BaseException):
++            raise self._result
++        return self._result
++
++
++@pytest.mark.parametrize("spawn, expected", [
++    (lambda url: _Proc(0), True),
++    (lambda url: _Proc(1), False),
++    (lambda url: _Proc(__import__("subprocess").TimeoutExpired("opener", 15)), True),
++    (lambda url: (_ for _ in ()).throw(OSError("no interpreter")), False),
++])
++def test_checked_opener_reports_the_childs_outcome(monkeypatch, spawn, expected):
++    monkeypatch.setattr(top_level_env, "_spawn_clean_url_opener", spawn)
++    assert REAL_CHECKED("http://127.0.0.1:9119") is expected
++
++
++def test_webapp_open_uses_clean_opener(monkeypatch, _neutralize_webbrowser):
++    from hermes_cli import auth_device_flow, webapp_launcher
++    import webbrowser
++
++    monkeypatch.setattr(auth_device_flow, "_can_open_graphical_browser", lambda: True)
++    monkeypatch.setattr(webbrowser, "open", lambda url: pytest.fail("in-process browser open"))
++    assert webapp_launcher._open("http://127.0.0.1:9120/") is True
++    assert _neutralize_webbrowser == ["http://127.0.0.1:9120/"]
++
++
++def test_dashboard_auto_open_uses_clean_opener(monkeypatch, _neutralize_webbrowser):
++    """The autouse guard records ``open_url_for_person``; the in-process opener must not run."""
++    from hermes_cli import web_server_lifecycle
++
++    class _ImmediateThread:
++        def __init__(self, *, target, daemon):
++            self._target = target
++
++        def start(self):
++            self._target()
++
++    monkeypatch.setattr(web_server_lifecycle.threading, "Thread", _ImmediateThread)
++    monkeypatch.setattr(web_server_lifecycle.time, "sleep", lambda _s: None)
++    monkeypatch.setenv("DISPLAY", ":0")
++    import webbrowser
++    monkeypatch.setattr(webbrowser, "open", lambda url: pytest.fail("in-process browser open"))
++
++    web_server_lifecycle._maybe_open_browser("127.0.0.1", 9119, True, "")
++
++    assert _neutralize_webbrowser == ["http://127.0.0.1:9119"]
+diff --git a/tests/hermes_cli/test_web_server_raw_transport.py b/tests/hermes_cli/test_web_server_raw_transport.py
+new file mode 100644
+index 00000000000..f29d7e3ed0f
+--- /dev/null
++++ b/tests/hermes_cli/test_web_server_raw_transport.py
+@@ -0,0 +1,33 @@
++"""Transport observation must precede Uvicorn's trusted proxy rewrite, not replace it."""
++import pytest
++from fastapi import FastAPI, Request
++from fastapi.testclient import TestClient
++
++
++@pytest.mark.parametrize("builder", ["listener", "dashboard"])
++@pytest.mark.parametrize("proxy_enabled", [False, True])
++def test_builders_preserve_raw_peer_without_changing_proxy_semantics(monkeypatch, builder, proxy_enabled):
++    from hermes_cli.web_server_lifecycle import build_listener_server
++
++    app = FastAPI()
++    app.state.auth_required = proxy_enabled
++
++    @app.get("/observe")
++    def observe(request: Request):
++        return {"raw": request.scope.get("hermes.raw_transport"),
++                "client": request.scope["client"], "scheme": request.scope["scheme"]}
++
++    if builder == "listener":
++        config, _ = build_listener_server(app, "127.0.0.1", 0, auth_required=proxy_enabled)
++    else:
++        from hermes_cli import web_server
++        monkeypatch.setattr(web_server, "app", app)
++        config, _ = web_server._build_uvicorn_server("127.0.0.1", 0)
++    config.load()
++    response = TestClient(config.loaded_app, client=("127.0.0.1", 40123)).get(
++        "http://127.0.0.1:8765/observe", headers={"X-Forwarded-For": "192.0.2.99", "X-Forwarded-Proto": "https"})
++    assert response.status_code == 200, response.text
++    value = response.json()
++    assert value["raw"] == [["127.0.0.1", 40123], ["127.0.0.1", 8765]]
++    assert value["client"] == (["192.0.2.99", 0] if proxy_enabled else ["127.0.0.1", 40123])
++    assert value["scheme"] == ("https" if proxy_enabled else "http")
+diff --git a/tests/tools/test_kanban_http_comment_provenance.py b/tests/tools/test_kanban_http_comment_provenance.py
+new file mode 100644
+index 00000000000..6205c96c30e
+--- /dev/null
++++ b/tests/tools/test_kanban_http_comment_provenance.py
+@@ -0,0 +1,135 @@
++"""Raw loopback comment callers must not acquire operator provenance by omission."""
++from types import SimpleNamespace
++
++import psutil
++import pytest
++
++from hermes_cli import kanban_comment_writer as ancestry
++from tests.tools import test_kanban_dashboard_comment_actor as actor
++
++worker_home = actor.worker_home
++client = actor.client
++
++
++@pytest.fixture(autouse=True)
++def supported_platform(monkeypatch):
++    monkeypatch.setattr("hermes_cli.kanban_http_comment_writer.sys", SimpleNamespace(platform="linux"))
++
++
++def _connection(pid=41001, local=("127.0.0.1", 40123), remote=("127.0.0.1", 8765)):
++    return SimpleNamespace(pid=pid, laddr=local, raddr=remote)
++
++
++def _raw_client(client, peer=("127.0.0.1", 40123), server=("127.0.0.1", 8765)):
++    @client.app.middleware("http")
++    async def transport(request, call_next):
++        request.scope["hermes.raw_transport"] = (peer, server)
++        return await call_next(request)
++    return client
++
++
++def test_bare_agent_socket_comment_records_agent(client, monkeypatch):
++    monkeypatch.setattr(psutil, "net_connections", lambda **kw: [_connection()])
++    monkeypatch.setattr(ancestry, "agent_ancestor", lambda pid: f"{pid}:HERMES_AGENT")
++    tid = actor._ready_task()
++    response = _raw_client(client).post(f"/tasks/{tid}/comments", json={"body": "agent note", "author": "desktop"})
++    assert response.status_code == 200, response.text
++    assert actor._last_payload(tid)["writer_kind"] == "agent"
++
++
++@pytest.mark.parametrize("result", [None, "41001:HERMES_AGENT", ancestry.Inconclusive("exited")])
++def test_bare_comment_under_proxy_uses_raw_peer(client, monkeypatch, result):
++    from fastapi.testclient import TestClient
++    from hermes_cli.web_server_lifecycle import build_listener_server
++
++    monkeypatch.setattr(psutil, "net_connections", lambda **kw: [_connection()])
++
++    def classify(pid):
++        assert pid == 41001
++        if isinstance(result, Exception):
++            raise result
++        return result
++
++    monkeypatch.setattr(ancestry, "agent_ancestor", classify)
++    config, _ = build_listener_server(client.app, "127.0.0.1", 8765, auth_required=True)
++    config.load()
++    proxied = TestClient(config.loaded_app, client=("127.0.0.1", 40123))
++    tid = actor._ready_task()
++    response = proxied.post(f"http://127.0.0.1:8765/tasks/{tid}/comments", json={"body": "note"},
++                            headers={"X-Forwarded-For": "192.0.2.99", "X-Forwarded-Proto": "https"})
++    assert response.status_code == 200, response.text
++    assert actor._last_payload(tid)["writer_kind"] == ("human" if result is None else "agent")
++
++
++@pytest.mark.parametrize("extra, status", [
++    ({"writer_kind": "agent", "writer_session": "explicit-session"}, 200),
++    ({"writer_kind": "human"}, 400),
++    ({"writer_session": "forged"}, 400),
++])
++def test_explicit_actor_never_needs_socket_lookup(client, monkeypatch, extra, status):
++    monkeypatch.setattr(psutil, "net_connections", lambda **kw: pytest.fail("explicit actor lookup"))
++    tid = actor._ready_task()
++    response = _raw_client(client).post(f"/tasks/{tid}/comments", json={"body": "note", **extra})
++    assert response.status_code == status, response.text
++    if status == 200:
++        payload = actor._last_payload(tid)
++        assert payload["writer_kind"] == "agent"
++        assert payload["writer_session"] == "explicit-session"
++    else:
++        assert actor._comments(tid) == []
++
++
++def test_real_http_comment_resolves_client_socket_before_proxy_rewrite(client, monkeypatch):
++    import http.client
++    import json
++    import os
++    import socket
++    import threading
++
++    import uvicorn
++    from hermes_cli.web_server_lifecycle import build_listener_server
++
++    seen = []
++
++    def classify(pid):
++        seen.append(pid)
++        return f"{pid}:HERMES_AGENT"
++
++    monkeypatch.setattr(ancestry, "agent_ancestor", classify)
++    ready = threading.Event()
++    proc = psutil.Process(os.getpid())
++    monkeypatch.setattr(psutil, "net_connections", lambda **kw: [
++        _connection(proc.pid, c.laddr, c.raddr) for c in proc.net_connections(**kw)])
++    monkeypatch.setattr(psutil, "process_iter", lambda: iter([proc]))
++
++    class ReadyServer(uvicorn.Server):
++        async def startup(self, sockets=None):
++            await super().startup(sockets=sockets)
++            ready.set()
++
++    tid = actor._ready_task()
++    with socket.socket() as listener:
++        listener.bind(("127.0.0.1", 0))
++        listener.listen()
++        port = listener.getsockname()[1]
++        config, _ = build_listener_server(client.app, "127.0.0.1", port, auth_required=True, lifespan="off")
++        server = ReadyServer(config)
++        thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
++        thread.start()
++        try:
++            assert ready.wait(10), "listener did not start"
++            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
++            try:
++                connection.request("POST", f"/tasks/{tid}/comments", json.dumps({"body": "bare socket note"}),
++                                   headers={"Content-Type": "application/json", "X-Forwarded-For": "192.0.2.99"})
++                response = connection.getresponse()
++                assert response.status == 200, response.read()
++                response.read()
++            finally:
++                connection.close()
++        finally:
++            server.should_exit = True
++            thread.join(10)
++            assert not thread.is_alive(), "test listener failed to stop"
++    assert seen == [os.getpid()]
++    assert actor._last_payload(tid)["writer_kind"] == "agent"
+diff --git a/tests/tools/test_kanban_http_comment_real_client.py b/tests/tools/test_kanban_http_comment_real_client.py
+new file mode 100644
+index 00000000000..9efd8e6e89f
+--- /dev/null
++++ b/tests/tools/test_kanban_http_comment_real_client.py
+@@ -0,0 +1,101 @@
++"""A real token-holding agent process (curl) posting a bare dashboard comment records agent.
++
++Uses a real uvicorn listener built by ``build_listener_server`` (raw-transport observer
+++ proxy middleware), real dashboard token middleware, real psutil socket tuples and the
++real ``/proc`` ancestry reader. Socket inventory is limited to this test's children to
++avoid inspecting unrelated host processes and their deleted file descriptors.
++The child curl carries ``HERMES_AGENT`` in its own start-time environment, as an agent's
++terminal tool does. Linux only: Darwin hides protected Apple binaries' environments.
++"""
++from __future__ import annotations
++
++import os
++import shutil
++import socket
++import subprocess
++import sys
++import threading
++
++import pytest
++
++from tests.tools import test_kanban_dashboard_comment_actor as actor
++
++worker_home = actor.worker_home
++PREFIX = "/api/plugins/kanban"
++TOKEN = "test-real-client-token"
++
++pytestmark = [
++    pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc ancestry"),
++    pytest.mark.skipif(shutil.which("curl") is None, reason="needs curl"),
++]
++
++
++@pytest.fixture
++def served(worker_home, monkeypatch):
++    from types import SimpleNamespace
++
++    import psutil
++    import uvicorn
++    from fastapi import FastAPI
++
++    def owned_connections(*, kind):
++        return [SimpleNamespace(laddr=c.laddr, raddr=c.raddr, pid=p.pid)
++                for p in psutil.Process().children()
++                for c in p.net_connections(kind=kind)]
++
++    monkeypatch.setattr(psutil, "net_connections", owned_connections)
++
++    from hermes_cli import web_server
++    from hermes_cli.web_server_lifecycle import build_listener_server
++    from plugins.kanban.dashboard import plugin_api as api
++
++    monkeypatch.setattr(web_server, "_SESSION_TOKEN", TOKEN)
++    app = FastAPI()
++    app.state.auth_required = False
++    app.include_router(api.router, prefix=PREFIX)
++    app.middleware("http")(web_server.auth_middleware)
++    ready = threading.Event()
++
++    class ReadyServer(uvicorn.Server):
++        async def startup(self, sockets=None):
++            await super().startup(sockets=sockets)
++            ready.set()
++
++    with socket.socket() as listener:
++        listener.bind(("127.0.0.1", 0))
++        listener.listen()
++        port = listener.getsockname()[1]
++        config, _ = build_listener_server(app, "127.0.0.1", port, auth_required=False, lifespan="off")
++        server = ReadyServer(config)
++        thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
++        thread.start()
++        try:
++            assert ready.wait(10), "listener did not start"
++            yield port
++        finally:
++            server.should_exit = True
++            thread.join(10)
++            assert not thread.is_alive(), "test listener failed to stop"
++
++
++def _curl(port, tid, *, token, env):
++    args = ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
++            "-H", "Content-Type: application/json", "--data", '{"body": "bare curl note"}',
++            f"http://127.0.0.1:{port}{PREFIX}/tasks/{tid}/comments"]
++    if token:
++        args[1:1] = ["-H", f"Authorization: Bearer {token}"]
++    return subprocess.run(args, env=env, capture_output=True, text=True, timeout=30, check=False).stdout
++
++
++def test_agent_curl_with_token_records_agent(served):
++    tid = actor._ready_task()
++    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HERMES_AGENT": "1"}
++    assert _curl(served, tid, token=TOKEN, env=env) == "200"
++    assert actor._last_payload(tid)["writer_kind"] == "agent"
++
++
++def test_curl_without_token_is_refused_and_stores_nothing(served):
++    tid = actor._ready_task()
++    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HERMES_AGENT": "1"}
++    assert _curl(served, tid, token=None, env=env) == "401"
++    assert actor._comments(tid) == []
+-- 
+2.55.0
+
