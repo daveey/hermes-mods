@@ -1,0 +1,319 @@
+From 5dd5bd59dfee872210b6738692ecbde34c3c37d8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:18:45 +0000
+Subject: [PATCH] fix(logging): configurable errors/gateway/gui log rotation;
+ INFO trace for dropped process completions [daveey]
+
+errors.log (2 MB x 2) and gateway.log (5 MB x 3) rotation was hard-coded, so the busy
+hub kept about an hour of history and incidents older than that could not be
+root-caused. logging.<stem>_max_size_mb / logging.<stem>_backup_count (stem errors,
+gateway, gui) now size them; unset keeps the old sizes. agent.log already follows
+logging.max_size_mb / backup_count.
+
+A process completion dropped by the notification park (retention expiry, displaced
+by a result), by the unowned-event path (park refused, shutdown drain), or by the
+registry's parked-event box overflow was logged at DEBUG or not at all, so a chat
+that never woke for a re-adopted exit left no trace. Each now writes one INFO line
+"Dropped completion notification for process <proc id> (session=<key>): <why>";
+progress notices (watch_*, heartbeat) stay DEBUG.
+
+Tests: tests/tui_gateway/test_notification_park_drop_log.py (4) and two rotation
+tests in tests/test_hermes_logging.py; all 5 new behavioural tests fail without the
+source change.
+---
+ hermes_logging.py                             | 46 +++++++++---
+ tests/test_hermes_logging.py                  | 25 +++++++
+ .../test_notification_park_drop_log.py        | 71 +++++++++++++++++++
+ tools/process_registry_readopt.py             |  5 ++
+ tui_gateway/notification_park.py              | 20 ++++--
+ tui_gateway/session_notifications.py          | 12 ++--
+ 6 files changed, 158 insertions(+), 21 deletions(-)
+ create mode 100644 tests/tui_gateway/test_notification_park_drop_log.py
+
+diff --git a/hermes_logging.py b/hermes_logging.py
+index 15687c6dbe..4d033b5e64 100644
+--- a/hermes_logging.py
++++ b/hermes_logging.py
+@@ -405,7 +405,8 @@ def setup_logging(
+     """Configure the Hermes logging subsystem; returns the ``logs/`` directory.
+ 
+     Safe to call multiple times; the second call is a no-op unless *force*. Level and
+-    rotation defaults come from config.yaml ``logging.*``. ``mode="gateway"`` adds
++    rotation defaults come from config.yaml ``logging.*``; ``logging.<stem>_max_size_mb`` /
++    ``logging.<stem>_backup_count`` (stem errors, gateway, gui) size the fixed-size files. ``mode="gateway"`` adds
+     ``gateway.log`` and ``mode="gui"`` adds ``gui.log``.
+     """
+     global _logging_initialized
+@@ -426,7 +427,8 @@ def setup_logging(
+     # an existing router.
+     if _adopt_secondary_home(home):
+         return log_dir
+-    cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
++    log_cfg = _read_logging_section()
++    cfg_level, cfg_max_size, cfg_backup = log_cfg.get("level"), log_cfg.get("max_size_mb"), log_cfg.get("backup_count")
+     level_name = (log_level or cfg_level or "INFO").upper()
+     level = getattr(logging, level_name, logging.INFO)
+     max_bytes = (max_size_mb or cfg_max_size or 5) * 1024 * 1024
+@@ -440,9 +442,9 @@ def setup_logging(
+     # the file on ``mode`` and restricts it to that component's logger prefixes.
+     handler_specs = (
+         ("agent.log", level, max_bytes, backups, None),
+-        ("errors.log", logging.WARNING, 2 * 1024 * 1024, 2, None),
+-        ("gateway.log", logging.INFO, 5 * 1024 * 1024, 3, "gateway"),
+-        ("gui.log", logging.INFO, 10 * 1024 * 1024, 5, "gui"),
++        ("errors.log", logging.WARNING, *_file_rotation(log_cfg, "errors", 2 * 1024 * 1024, 2), None),
++        ("gateway.log", logging.INFO, *_file_rotation(log_cfg, "gateway", 5 * 1024 * 1024, 3), "gateway"),
++        ("gui.log", logging.INFO, *_file_rotation(log_cfg, "gui", 10 * 1024 * 1024, 5), "gui"),
+     )
+     for filename, lvl, size, count, component in handler_specs:
+         if component is not None and mode != component:
+@@ -1071,7 +1073,29 @@ def _add_rotating_handler(
+ 
+ 
+ def _read_logging_config():
+-    """Best-effort read of ``logging.*`` from config.yaml."""
++    """Best-effort read of ``logging.*`` from config.yaml: (level, max_size_mb, backup_count)."""
++    log_cfg = _read_logging_section()
++    return (log_cfg.get("level"), log_cfg.get("max_size_mb"), log_cfg.get("backup_count"))
++
++
++def _positive_int(value) -> Optional[int]:
++    try:
++        n = int(value)
++    except (TypeError, ValueError):
++        return None
++    return n if n > 0 else None
++
++
++def _file_rotation(log_cfg: dict, stem: str, size: int, count: int) -> tuple[int, int]:
++    """[daveey] ``logging.<stem>_max_size_mb`` / ``logging.<stem>_backup_count`` override a fixed-size file's
++    rotation (errors.log, gateway.log, gui.log), so a busy host can keep days of history; unset keeps the default."""
++    mb = _positive_int(log_cfg.get(f"{stem}_max_size_mb"))
++    backups = _positive_int(log_cfg.get(f"{stem}_backup_count"))
++    return (mb * 1024 * 1024 if mb else size), (backups or count)
++
++
++def _read_logging_section() -> dict:
++    """Best-effort read of the ``logging`` mapping from config.yaml ({} when absent or unreadable)."""
+     try:
+         # Prefer the shared effective-config cache (managed overlay included, so an administrator
+         # can pin logging.*) so this reuses hermes_cli.main's early parse (one config.yaml parse
+@@ -1079,15 +1103,15 @@ def _read_logging_config():
+         try:
+             from hermes_cli.config_effective import load_user_config_effective
+             cfg = load_user_config_effective(get_config_path())
+-        except Exception:
++        except Exception:  # health: allow BLE001 -- any cache failure falls back to the direct parse below
+             from hermes_cli.config_backend import config_exists, read_config_doc
+             config_path = get_config_path()
+             cfg = (read_config_doc(config_path) or {}) if config_exists(config_path) else {}
+         if not cfg:
+-            return (None, None, None)
++            return {}
+         log_cfg = cfg.get("logging", {})
+         if isinstance(log_cfg, dict):
+-            return (log_cfg.get("level"), log_cfg.get("max_size_mb"), log_cfg.get("backup_count"))
+-    except Exception:
++            return log_cfg
++    except Exception:  # health: allow BLE001,S110 -- runs before logging exists; a bad config must not stop it
+         pass
+-    return (None, None, None)
++    return {}
+diff --git a/tests/test_hermes_logging.py b/tests/test_hermes_logging.py
+index 37157f0665..db3c7cb3cc 100644
+--- a/tests/test_hermes_logging.py
++++ b/tests/test_hermes_logging.py
+@@ -738,6 +738,31 @@ class TestReadLoggingConfig:
+         assert max_size == 10
+         assert backup == 5
+ 
++    def test_per_file_rotation_overrides_reach_the_handlers(self, hermes_home, monkeypatch):
++        """[daveey] errors.log/gateway.log/gui.log rotation was hard-coded (2 MB x 2, 5 MB x 3), so a busy hub kept
++        about an hour of history; ``logging.<stem>_max_size_mb`` / ``_backup_count`` now size them."""
++        import hermes_yaml as yaml
++        config = {"logging": {"max_size_mb": 50, "backup_count": 12, "errors_max_size_mb": 20,
++                              "errors_backup_count": 5, "gateway_max_size_mb": 40, "gateway_backup_count": 6,
++                              "gui_backup_count": "bogus"}}
++        (hermes_home / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
++        seen = {}
++        monkeypatch.setattr(hermes_logging, "_add_rotating_handler",
++                            lambda path, **kw: seen.__setitem__(Path(path).name, (kw["max_bytes"], kw["backup_count"])))
++        for mode in ("gateway", "gui"):
++            hermes_logging.setup_logging(hermes_home=hermes_home, mode=mode, force=True)
++        mb = 1024 * 1024
++        assert seen == {"agent.log": (50 * mb, 12), "errors.log": (20 * mb, 5), "gateway.log": (40 * mb, 6),
++                        "gui.log": (10 * mb, 5)}
++
++    def test_per_file_rotation_defaults_unchanged(self, hermes_home, monkeypatch):
++        seen = {}
++        monkeypatch.setattr(hermes_logging, "_add_rotating_handler",
++                            lambda path, **kw: seen.__setitem__(Path(path).name, (kw["max_bytes"], kw["backup_count"])))
++        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway", force=True)
++        mb = 1024 * 1024
++        assert seen == {"agent.log": (5 * mb, 3), "errors.log": (2 * mb, 2), "gateway.log": (5 * mb, 3)}
++
+ 
+ 
+ class TestExternalRotationRecovery:
+diff --git a/tests/tui_gateway/test_notification_park_drop_log.py b/tests/tui_gateway/test_notification_park_drop_log.py
+new file mode 100644
+index 0000000000..7e74c1b52d
+--- /dev/null
++++ b/tests/tui_gateway/test_notification_park_drop_log.py
+@@ -0,0 +1,71 @@
++"""A dropped process completion leaves one INFO line naming the process and its session. [daveey]
++
++A chat that never woke for a re-adopted job's exit could not be root-caused: the park, the unowned-event path
++and the registry's parked-event box all dropped completions at DEBUG (or silently), so agent.log held no trace.
++Progress notices (``watch_*``, ``heartbeat``) stay DEBUG so a chatty watcher cannot flood the log.
++"""
++
++from __future__ import annotations
++
++import logging
++
++import pytest
++
++from tools import process_registry_readopt
++from tools.process_registry import ProcessRegistry
++from tui_gateway import notification_park
++from tui_gateway import session_notifications
++
++KEY = "20261103_024624_52dad5"
++COMPLETION = {"type": "completion", "session_id": "proc_697954de64e9", "session_key": KEY, "exit_code": 0,
++              "park_if_unowned": True}
++
++
++@pytest.fixture(autouse=True)
++def _empty_park():
++    notification_park.clear()
++    yield
++    notification_park.clear()
++
++
++def _drop_lines(caplog, level=logging.INFO):
++    return [r.getMessage() for r in caplog.records if r.levelno == level and r.getMessage().startswith("Dropped ")]
++
++
++def test_completion_expiring_from_the_park_logs_info_with_process_and_session(caplog):
++    caplog.set_level(logging.DEBUG)
++    assert notification_park.park(dict(COMPLETION))
++    with notification_park._lock:
++        expired = notification_park._expire_locked(float("inf"))
++    notification_park._release(expired)
++    lines = _drop_lines(caplog)
++    assert len(lines) == 1, lines
++    assert "proc_697954de64e9" in lines[0] and KEY in lines[0] and "retention window" in lines[0]
++
++
++def test_progress_notice_drop_stays_debug(caplog):
++    caplog.set_level(logging.DEBUG)
++    notification_park.log_drop({"type": "watch_match", "session_id": "proc_x", "session_key": KEY}, "test")
++    assert _drop_lines(caplog) == []
++    assert len(_drop_lines(caplog, logging.DEBUG)) == 1
++
++
++def test_unowned_completion_the_park_refuses_logs_info(caplog, monkeypatch):
++    caplog.set_level(logging.DEBUG)
++    monkeypatch.setattr(notification_park, "park", lambda evt: False)
++    session_notifications._notif_unowned_event("poller-sid", dict(COMPLETION), None)
++    session_notifications._notif_unowned_event("poller-sid", dict(COMPLETION), [])  # shutdown drain
++    lines = _drop_lines(caplog)
++    assert len(lines) == 2, lines
++    assert all("proc_697954de64e9" in line and KEY in line for line in lines)
++
++
++def test_registry_parked_box_overflow_logs_the_evicted_exit(caplog, monkeypatch):
++    caplog.set_level(logging.DEBUG)
++    monkeypatch.setattr(process_registry_readopt, "_MAX_PARKED_EVENTS", 1)
++    registry = ProcessRegistry()
++    registry.park_unowned_event(dict(COMPLETION))
++    registry.park_unowned_event({**COMPLETION, "session_id": "proc_newer"})
++    lines = _drop_lines(caplog)
++    assert len(lines) == 1, lines
++    assert "proc_697954de64e9" in lines[0] and KEY in lines[0]
+diff --git a/tools/process_registry_readopt.py b/tools/process_registry_readopt.py
+index a3d36a245c..6a2a802359 100644
+--- a/tools/process_registry_readopt.py
++++ b/tools/process_registry_readopt.py
+@@ -206,7 +206,12 @@ class ProcessReadoptMixin:
+             if self._parked_events is None:
+                 self._parked_events = []
+             self._parked_events.append(event)
++            evicted = self._parked_events[:-_MAX_PARKED_EVENTS]
+             del self._parked_events[:-_MAX_PARKED_EVENTS]
++        for old in evicted:  # [daveey] never silent: a lost exit must leave a trace in agent.log
++            logger.info("Dropped %s notification for process %s (session=%s): parked-event box full (%d)",
++                        old.get("type", "completion"), old.get("session_id") or "?",
++                        old.get("session_key") or "?", _MAX_PARKED_EVENTS)
+         from tui_gateway.notification_wait import wake
+         wake(self.completion_queue)
+ 
+diff --git a/tui_gateway/notification_park.py b/tui_gateway/notification_park.py
+index a0aaf6e746..40c88ae9b6 100644
+--- a/tui_gateway/notification_park.py
++++ b/tui_gateway/notification_park.py
+@@ -69,9 +69,20 @@ def _release(events) -> None:
+         if is_delegation:
+             return_completion_offer(evt)
+         unhold([evt])
+-        (logger.warning if is_delegation else logger.debug)(
+-            "Dropping parked %s notification past its retention window (key=%r)",
+-            evt.get("type", "completion"), str(evt.get("session_key") or ""))
++        if is_delegation:
++            logger.warning("Dropping parked %s notification past its retention window (key=%r)",
++                           evt.get("type", "completion"), str(evt.get("session_key") or ""))
++        else:
++            log_drop(evt, "parked past its retention window")
++
++
++def log_drop(evt: dict, why: str) -> None:
++    """[daveey] One line for a process notification nobody will deliver. A completion (re-adopted or parked) is
++    INFO, naming the process and its owner session, so a chat that never woke for an exit leaves a trace in
++    agent.log; progress notices (``watch_*``, ``heartbeat``) stay DEBUG."""
++    (logger.debug if _is_progress(evt) else logger.info)(
++        "Dropped %s notification for process %s (session=%s): %s", evt.get("type", "completion"),
++        evt.get("session_id") or "?", str(evt.get("session_key") or "") or "?", why)
+ 
+ 
+ def _key(evt: dict) -> str:
+@@ -108,8 +119,7 @@ def park(evt: dict) -> bool:
+             _parked.append((now + RETENTION_SECONDS, evt))
+     _release(expired)
+     for held in displaced:
+-        logger.debug("Dropping parked %s notification to make room for a %s (key=%r)",
+-                     held.get("type"), evt.get("type", "completion"), _key(held))
++        log_drop(held, f"displaced from the park by a {evt.get('type', 'completion')}")
+     if admitted:
+         from tools.process_registry import process_registry
+         from tui_gateway.notification_wait import wake
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 941f512d87..6db01f5da2 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -336,15 +336,17 @@ def _notif_unowned_event(sid: str, evt: dict, deferred) -> None:
+         if is_delegation:
+             deferred.append(evt)
+         else:
+-            logger.debug("Dropping unowned %s notification during shutdown drain (origin=%r key=%r)",
+-                         evt_type, origin, key)
++            notification_park.log_drop(evt, f"unowned during shutdown drain (origin={origin!r})")
+     else:
+         # A durable replay stays pending: hand it back so the orphan sweep re-offers it once its owner
+         # is live (#97202), and keep that retry out of WARNING.
+         restored = is_delegation and bool(evt.get("restored"))
+-        (logger.warning if is_delegation and not restored else logger.debug)(
+-            "Dropping unowned %s notification (origin=%r key=%r) instead of delivering to session %s",
+-            evt_type, origin, key, sid)
++        if is_delegation:
++            (logger.debug if restored else logger.warning)(
++                "Dropping unowned %s notification (origin=%r key=%r) instead of delivering to session %s",
++                evt_type, origin, key, sid)
++        else:
++            notification_park.log_drop(evt, f"unowned and not parkable (origin={origin!r}, poller={sid})")
+         if is_delegation:
+             from tools.async_delegation import return_completion_offer
+             return_completion_offer(evt)
+-- 
+2.43.0
+

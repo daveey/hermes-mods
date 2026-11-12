@@ -1,0 +1,350 @@
+From 2623c1b368b432f46959e3bfc9b0a6c73f63f416 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:57:09 +0000
+Subject: [PATCH] [daveey] fix(kanban): blocked decision cards on the hub skip
+ the admission judge
+
+A hub chat could not file a decision card at all (t_01a1cf9334ff49bc): kanban_create with
+initial_status='blocked' + human_request was refused 4x with placement_unavailable. The blocked
+status/human_request are courier-uncarried options, so structural_reason made the card an explicit
+hub pin, the judge denied it ("no hub-only capability is required"), and the refusal then told the
+caller to "use placement='local'" -- which is what it had passed.
+
+- A hub-candidate card created blocked on a human_request (placement omitted/auto/local/here) is
+  created with no judge call. Its work goes where a denied card goes (worker queue or worker-first,
+  hub:write for hub-state wording), so after unblock it runs in the pool, never on a hub slot. The
+  hub_admission event records skipped=blocked_decision_card. With no pool it is created here.
+- Still judged: ready cards, an explicit hub pin, runs_on machine:hub / hub-only labels, force_hub,
+  and decision cards with another structural keep-local (host workspace, other board).
+- A hub-origin stay-here refusal names alternatives that work there (omit placement -> pool,
+  hub_reason, or a blocked decision card) instead of placement='local'.
+---
+ hermes_cli/kanban_hub_admission_placement.py  |  78 ++++++++-
+ ...est_kanban_hub_admission_decision_cards.py | 153 ++++++++++++++++++
+ tools/kanban_tools.py                         |   3 +-
+ tools/kanban_tools_placement.py               |  16 +-
+ 4 files changed, 243 insertions(+), 7 deletions(-)
+ create mode 100644 tests/test_kanban_hub_admission_decision_cards.py
+
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index e1973834c4..016bb6eb10 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -165,6 +165,8 @@ def describe(verdict):
+         return ""
+     if verdict.get("forced"):
+         return f"hub admission: forced by operator (session {verdict.get('session') or '?'})"
++    if verdict.get("skipped"):
++        return f"hub admission: not judged ({(verdict.get('why') or verdict['skipped'])[:160]})"
+     if verdict.get("admit"):
+         return f"hub admission: admitted, {verdict.get('need')}: \"{(verdict.get('evidence') or '')[:120]}\""
+     return f"hub admission: denied ({(verdict.get('why') or '')[:160]})"
+@@ -352,6 +354,10 @@ def apply(args, decision, gateway, cfg, *, origin_intent=None, queue=True, machi
+         # at the origin only explicit hub pins are, so non-hub origins make zero model calls.
+         elif not local_hub and not (explicit and is_hub(destination, cfg)):
+             return decision
++    routed = _decision_shortcut(args, decision, gateway, cfg, labels=labels, machine_hub=machine_hub, pin=pin,
++                                queue=queue, machine_ok=machine_ok)
++    if routed is not None:
++        return routed
+     if structural_reason({**args, "runs_on": None}, cfg):
+         explicit = True  # a host workspace, other board or uncarried option cannot go to the pool
+     if args.get("force_hub"):
+@@ -368,7 +374,7 @@ def apply(args, decision, gateway, cfg, *, origin_intent=None, queue=True, machi
+     if verdict.admit:
+         return {**decision, "hub_admission": audit}
+     if explicit:
+-        return {"where": "refuse", "why": verdict.why, "hub_admission": audit, "pin": "hub"}
++        return _refusal(args, verdict, audit, cfg, on_hub=on_hub, machine_hub=machine_hub, pin=pin, labels=labels)
+     requires = args.get("requires") or []
+     requires = [requires] if isinstance(requires, str) else list(requires)
+     # Board contract (hermes-hub #90): requires hub:write -> capability:hub-write at reservation and
+@@ -387,6 +393,76 @@ def apply(args, decision, gateway, cfg, *, origin_intent=None, queue=True, machi
+     return out
+ 
+ 
++def _decision_shortcut(args, decision, gateway, cfg, *, labels, machine_hub, pin, queue, machine_ok):
++    """:func:`decision_card_route` for a hub-candidate decision card the caller did not pin to the hub, else None."""
++    if machine_hub or labels is not None or is_hub(pin, cfg) or args.get("force_hub") or not is_decision_card(args):
++        return None
++    return decision_card_route(args, decision, gateway, cfg, queue=queue, machine_ok=machine_ok)
++
++
++def _refusal(args, verdict, audit, cfg, *, on_hub, machine_hub, pin, labels):
++    """A denied explicit hub card; a hub-origin stay-here refusal carries alternatives that work on the hub."""
++    from hermes_cli.kanban_placement import structural_reason
++    out = {"where": "refuse", "why": verdict.why, "hub_admission": audit, "pin": "hub"}
++    if on_hub and not machine_hub and not is_hub(pin, cfg):
++        out["remedy"] = hub_stay_remedy(structural_reason({**args, "runs_on": None}, cfg), labels)
++    return out
++
++
++DECISION_CARD = "blocked_decision_card"
++DECISION_WHY = ("blocked decision card (initial_status='blocked' + human_request): it holds no slot while it "
++                "waits for the answer, so the hub admission judge is not consulted; once unblocked it runs {where}")
++
++
++def is_decision_card(args):
++    """A card created blocked on a ``human_request``: it waits for David and holds no slot meanwhile."""
++    ask = args.get("human_request")
++    return (str(args.get("initial_status") or "").strip().lower() == "blocked"
++            and isinstance(ask, dict) and bool(ask))
++
++
++def decision_card_route(args, decision, gateway, cfg, *, queue=True, machine_ok=None):
++    """Placement for a hub decision card, made with no judge call; ``None`` when it must still be judged.
++
++    The ask itself takes no slot. Its work, after unblock, goes where a denied card goes (the worker queue or
++    worker-first), so skipping the judge never puts unjudged work on a hub slot. A card with a structural
++    keep-local beyond the ask itself (host workspace, other board, ...) would run on the hub after unblock, so it
++    is still judged. With no worker pool the card is created here, as every hub card was before admission.
++    t_01a1cf9334ff49bc: a hub chat could not file a decision card at all. [daveey]
++    """
++    from hermes_cli.kanban_placement import portable_reason, structural_reason
++    view = {k: v for k, v in args.items() if k not in ("initial_status", "human_request")}
++    if structural_reason({**view, "runs_on": None}, cfg):
++        return None
++    requires = args.get("requires") or []
++    requires = [requires] if isinstance(requires, str) else list(requires)
++    if portable_reason(view, cfg):
++        requires = list(dict.fromkeys([*requires, "hub:write"]))  # hub-state wording: the pool needs hub-admin
++    elif not args.get("requires"):
++        requires = None
++    audit = {"admit": False, "need": None, "evidence": "", "skipped": DECISION_CARD,
++             "why": DECISION_WHY.format(where="in the worker pool")}
++    out = pool_route(view, cfg, gateway, audit, requires, queue=queue, machine_ok=machine_ok)
++    if out.get("runs_on") is None and gateway not in (cfg.get("worker_pools") or {}):
++        why = DECISION_WHY.format(where="here (no worker pool is configured)")
++        return {**decision, "why": why, "hub_admission": {**audit, "why": why}}
++    return out
++
++
++def hub_stay_remedy(structural, labels):
++    """Refusal text for a hub-origin card the judge denied: alternatives that work here, never ``placement='local'``."""
++    if labels is not None:
++        first = "drop runs_on (or name labels a pool worker carries) so the card joins the worker pool"
++    elif structural:
++        first = (f"remove what keeps it on this host ({structural}) and omit placement so the card joins the "
++                 "worker pool")
++    else:
++        first = "omit placement (or pass placement='auto') so the card joins the worker pool"
++    return (f"On the hub, placement='local' is a hub slot and needs an admit. Instead: {first}; or pass "
++            "hub_reason quoting what only the hub can do; or, for a question to David, create it with "
++            "initial_status='blocked' and a human_request (it takes no slot and is never judged).")
++
++
+ def pool_route(args, cfg, gateway, audit, requires, *, queue=True, machine_ok=None):
+     """Where a denied card goes: the worker queue (``runs_on: [<pool label>, ...]``) when ``queue``
+     and ``kanban.placement.worker_queue`` names a live label for this gateway, else worker-first.
+diff --git a/tests/test_kanban_hub_admission_decision_cards.py b/tests/test_kanban_hub_admission_decision_cards.py
+new file mode 100644
+index 0000000000..a853171f4d
+--- /dev/null
++++ b/tests/test_kanban_hub_admission_decision_cards.py
+@@ -0,0 +1,153 @@
++"""Blocked decision cards on the hub skip the hub admission judge (t_01a1cf9334ff49bc). [daveey]
++
++A card created ``initial_status='blocked'`` with a ``human_request`` holds no slot while it waits for David, so it
++is created wherever the caller is with no judge call. Its work, once unblocked, goes to the worker pool (the
++same route a denied card takes), so the skip never puts unjudged work on a hub slot. A hub-origin refusal names
++an alternative that works there, never ``placement='local'`` (which is what the caller passed).
++"""
++if not __name__.startswith("tests."): raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")  # unittest-discovery guard
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_hub_admission as judge
++from hermes_cli import kanban_placement as placement
++from tests.hermes_cli import hub_judge_support
++from tests.hermes_cli import test_kanban_portable_reason_audit as audit_support
++from tools import kanban_tools as kt
++
++kanban_home = audit_support.kanban_home
++hub_judge = hub_judge_support.hub_judge
++
++POOLS = {"worker_pools": {"hub": ["worker-1"]}}
++QUEUE_CFG = {**POOLS, "worker_queue": {"hub": "pool:worker"}}
++ASK = {"action": "Reply A or B in this chat. Unblock = build the pick; archive = drop it.",
++       "why_human": "a product choice only David can make", "interaction": "reply",
++       "scope": "this decision only", "evidence": "two designs were drafted"}
++HUB_TEXT = "Pick a retention window for ~/.hermes/logs on the hub"
++
++
++@pytest.fixture
++def gate(monkeypatch):
++    calls = []
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
++
++    def fake(fields, *, hub_reason=None):
++        calls.append((fields, hub_reason))
++        return judge.Verdict(admit=False, why="no hub-only capability is required")
++    monkeypatch.setattr(judge, "admit", fake)
++    return calls
++
++
++def decide(fields, cfg=POOLS, machine_ok=None):
++    return placement.decide(fields, self_gw="hub", cfg=cfg, live=lambda _: None, carries=True,
++                            machine_ok=machine_ok)
++
++
++def decision_card(**extra):
++    return {"title": HUB_TEXT, "initial_status": "blocked", "human_request": dict(ASK), **extra}
++
++
++@pytest.mark.parametrize("pin", [None, "auto", "local", "here", " Local "])
++def test_blocked_decision_card_on_hub_makes_no_judge_call(gate, pin):
++    fields = decision_card(**({"placement": pin} if pin is not None else {}))
++    result = decide(fields)
++    assert gate == []
++    assert result["where"] == "local"
++    # After unblock the work goes to the pool, never to a hub slot.
++    assert result.get("placement_policy") == "worker-first-v1"
++    assert "hub:write" in result["requires"]
++    assert result["hub_admission"]["skipped"] == "blocked_decision_card"
++
++
++def test_blocked_decision_card_follows_worker_queue(gate):
++    result = decide(decision_card(), cfg=QUEUE_CFG, machine_ok=lambda label: label == "pool:worker")
++    assert gate == []
++    assert result["runs_on"][0] == "pool:worker"
++    assert "capability:hub-write" in result["runs_on"]
++    assert "placement_policy" not in result
++
++
++def test_blocked_decision_card_without_pool_is_created_here(gate):
++    result = placement.decide(decision_card(), self_gw="hub", cfg={})
++    assert gate == []
++    assert result["where"] == "local"
++
++
++@pytest.mark.parametrize("fields", [
++    {"title": HUB_TEXT},  # ready card with hub wording
++    {"title": HUB_TEXT, "initial_status": "blocked"},  # blocked with no human_request
++    decision_card(placement="hub"),  # explicit hub pin: the caller asked for a hub slot
++    decision_card(runs_on=["machine:hub"]),
++    decision_card(workspace_kind="dir", workspace_path="/srv/x"),  # host workspace: it would run here later
++])
++def test_cards_that_would_take_a_hub_slot_are_still_judged(gate, fields):
++    decide(fields)
++    assert len(gate) == 1
++
++
++def test_nonhub_decision_card_unchanged(gate):
++    result = placement.decide(decision_card(), self_gw="mac", cfg=POOLS, live=lambda _: None, carries=True)
++    assert gate == []
++    assert "hub_admission" not in result
++
++
++@pytest.mark.parametrize("pin", ["local", "here"])
++def test_hub_local_pin_refusal_names_a_working_alternative(gate, pin):
++    result = decide({"title": HUB_TEXT, "placement": pin})
++    assert result["where"] == "refuse"
++    from tools.kanban_tools_placement import _placement_refused
++    error = json.loads(_placement_refused(result.get("pin", "hub"), result.get("why", ""),
++                                          hub_admission=result.get("hub_admission"),
++                                          remedy=result.get("remedy")))["error"]
++    assert "Use placement='local'" not in error
++    assert "omit placement" in error and "hub_reason" in error and "initial_status='blocked'" in error
++
++
++# --- the kanban_create tool on the hub gateway --------------------------------------------------
++
++
++@pytest.fixture
++def on_hub(kanban_home, monkeypatch, hub_judge):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
++    monkeypatch.setattr(kt, "_persisted_identity", lambda: "default")
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
++    hub_judge.admit_next = False
++    return hub_judge
++
++
++@pytest.mark.parametrize("pin", [None, "auto", "local"])
++def test_tool_creates_blocked_decision_card_on_hub_without_judge(on_hub, pin):
++    """The 11-12 repro: four refusals of a pure decision card from a hub chat."""
++    args = {"title": "Decide: keep or drop the nightly digest", "requires": [],
++            "initial_status": "blocked", "human_request": dict(ASK),
++            **({"placement": pin} if pin is not None else {})}
++    result = json.loads(kt._handle_create(args))
++    assert result.get("ok"), result
++    assert result["status"] == "blocked"
++    assert on_hub.calls == []
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, result["task_id"])
++    assert task.status == "blocked"
++    assert task.placement_policy == "worker-first-v1"
++
++
++def test_tool_ready_card_with_hub_wording_is_still_judged(on_hub):
++    result = json.loads(kt._handle_create({"title": HUB_TEXT, "requires": []}))
++    assert result.get("ok"), result
++    assert len(on_hub.calls) == 1
++
++
++def test_tool_local_pin_refusal_on_hub_names_working_alternative(on_hub):
++    result = json.loads(kt._handle_create({"title": HUB_TEXT, "requires": [], "placement": "local"}))
++    assert not result.get("ok") and result.get("code") == "placement_unavailable", result
++    assert len(on_hub.calls) == 1
++    assert "Use placement='local'" not in result["error"]
++    assert "omit placement" in result["error"]
++    # Following the named alternative works: omitting placement enrolls the card in the pool.
++    retried = json.loads(kt._handle_create({"title": HUB_TEXT, "requires": []}))
++    assert retried.get("ok"), retried
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 53865720a9..3fd88032ce 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1488,7 +1488,8 @@ def _place_remote(args: dict, *, assignee: str, skills, parents, project_id, ses
+         target = decision["where"]
+         if target == "refuse":
+             return _placement_refused(decision.get("pin", "hub"), decision.get("why", ""),
+-                                      hub_admission=decision.get("hub_admission")), None
++                                      hub_admission=decision.get("hub_admission"),
++                                      remedy=decision.get("remedy")), None
+         if target == "local":
+             local = _local_placement(kp, view, decision, machine_ok=machine_ok, note_local_pin=note_local_pin)
+             stranded = _runstate.stranded_create((local or {}).get("runs_on"))
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index d2e7fe3fef..c328d1748d 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -89,12 +89,17 @@ def _placement_origin(conn, creator_task_id: Optional[str], session_id: Optional
+     return {"session_id": session_id, "origin_profile": None}
+ 
+ 
+-def _placement_refused(pin: str, why: str, *, hub_admission=None) -> str:
+-    """[daveey] A caller-pinned gateway cannot be honoured: say so instead of creating the card here."""
++def _placement_refused(pin: str, why: str, *, hub_admission=None, remedy=None) -> str:
++    """[daveey] A caller-pinned gateway cannot be honoured: say so instead of creating the card here.
++
++    ``remedy`` replaces the generic alternatives when they cannot work: on the hub a denied stay-here card was
++    told to "use placement='local'", which is what it had passed (t_01a1cf9334ff49bc)."""
++    alternatives = remedy or (
++        "Use placement='local' (or omit it) to create the card on this "
++        "gateway, or create it on the target with `hermes-hub create-task <gateway> ...`.")
+     return tool_error(
+         f"placement={pin!r} was not honoured and no card was created: {why}. A pinned gateway is never "
+-        "silently replaced by a local card. Use placement='local' (or omit it) to create the card on this "
+-        "gateway, or create it on the target with `hermes-hub create-task <gateway> ...`.",
++        f"silently replaced by a local card. {alternatives}",
+         code="placement_unavailable", placement=pin, created=False,
+         **({"hub_admission": hub_admission} if hub_admission else {}))
+ 
+@@ -107,7 +112,8 @@ def _admission_refused(marker_placement) -> None:
+         return
+     from tools.kanban_tools import _Reject
+     raise _Reject("", payload=_placement_refused(marker_placement.get("pin", "hub"), marker_placement.get("why", ""),
+-                                                 hub_admission=marker_placement.get("hub_admission")))
++                                                 hub_admission=marker_placement.get("hub_admission"),
++                                                 remedy=marker_placement.get("remedy")))
+ 
+ 
+ def _effective_requires(marker_placement, args: dict):
+-- 
+2.43.0
+

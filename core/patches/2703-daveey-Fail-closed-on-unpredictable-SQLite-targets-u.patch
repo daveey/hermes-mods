@@ -1,0 +1,292 @@
+From 10b860a6ea5cb29c7029cc1b61fb5b0aa4421f81 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:07:41 +0000
+Subject: [PATCH] [daveey] Fail closed on unpredictable SQLite targets under
+ offline reservations
+
+A file: URI with an escaped NUL (SQLite truncates the name there), a custom VFS,
+a remote authority or a connection factory that substitutes its own path could
+open a file other than the one the reservation check predicted. Treat
+unpredictable URIs as conflicting with every raw reservation, re-check the file
+SQLite actually opened before any statement runs, and make the header probe wait
+for a foreign reservation as it used to wait for the registry lock.
+---
+ hermes_cli/sqlite_offline_reservations.py     | 31 +++++--
+ hermes_cli/sqlite_safe_read.py                | 54 +++++++----
+ .../test_sqlite_offline_reservations.py       | 16 ++--
+ .../test_sqlite_reservation_adversarial.py    | 92 +++++++++++++++++++
+ 4 files changed, 158 insertions(+), 35 deletions(-)
+
+diff --git a/hermes_cli/sqlite_offline_reservations.py b/hermes_cli/sqlite_offline_reservations.py
+index 108fb48828..d509c8e68c 100644
+--- a/hermes_cli/sqlite_offline_reservations.py
++++ b/hermes_cli/sqlite_offline_reservations.py
+@@ -9,22 +9,35 @@ from __future__ import annotations
+ import os
+ from pathlib import Path
+ import threading
+-from urllib.parse import parse_qs, unquote, urlsplit
++from urllib.parse import parse_qs, unquote_to_bytes, urlsplit
+ 
+ 
+ _active: list[tuple[str, int, threading.Event]] = []
++# The target cannot be predicted before SQLite parses it: exclude every reservation.
++UNKNOWN = object()
+ 
+ 
+ def database_key(path, *, uri=False):
+-    value = os.fsdecode(path)
+-    if uri and value.startswith("file:"):
+-        parsed = urlsplit(value)
+-        value = unquote(parsed.path)
+-        if parse_qs(parsed.query).get("mode") == ["memory"]:
++    """Canonical file SQLite will open for *path*; ``None`` when nothing on disk, ``UNKNOWN``
++    when SQLite's own parsing could pick a file this prediction would miss."""
++    try:
++        value = os.fsdecode(path)
++        if uri and value.startswith("file:"):
++            parsed = urlsplit(value)
++            query = parse_qs(parsed.query, keep_blank_values=True)
++            # SQLite decodes bytes and stops at an escaped NUL; a VFS may map names anywhere.
++            raw = unquote_to_bytes(parsed.path)
++            if (os.name == "nt" or b"\x00" in raw or "vfs" in query
++                    or parsed.netloc not in ("", "localhost")):
++                return UNKNOWN
++            value = os.fsdecode(raw)
++            if query.get("mode") == ["memory"]:
++                return None
++        if value in ("", ":memory:"):
+             return None
+-    if value in ("", ":memory:"):
+-        return None
+-    return str(Path(value).resolve())
++        return str(Path(value).resolve())
++    except (OSError, RuntimeError, ValueError):
++        return UNKNOWN
+ 
+ 
+ def overlaps(left, right):
+diff --git a/hermes_cli/sqlite_safe_read.py b/hermes_cli/sqlite_safe_read.py
+index 053bda678e..a1cae32102 100644
+--- a/hermes_cli/sqlite_safe_read.py
++++ b/hermes_cli/sqlite_safe_read.py
+@@ -224,13 +224,17 @@ def connect_tracked(
+                                uri=tracking_path is None and kwargs.get("uri", False))
+     # An arbitrary opener may ignore path and run SQL before returning. Without
+     # an explicit tracking_path, conservatively exclude every raw reservation.
+-    with _tracking_access(wait_for_tracking, key=key,
+-                          unknown=connect_fn is not None and tracking_path is None):
++    unknown = key is offline.UNKNOWN or (connect_fn is not None and tracking_path is None)
++    with _tracking_access(wait_for_tracking, key=key, unknown=unknown):
+         conn = opener(str(path), **kwargs)
+         try:
+             resolved = _key(tracking_path) if tracking_path is not None else _canonical_db_path(conn)
+             if resolved is None:
+                 return conn  # in-memory / unnamed: nothing on disk to byte-probe
++            if resolved != key and offline.conflicts(resolved):
++                # SQLite (or a factory) opened a reserved file the prediction missed. Nothing
++                # has read it yet; refuse before any statement can.
++                raise _tracking_busy()
+             if not isinstance(conn, _TrackingMixin):
+                 # The opener substituted its own factory and discarded ours (test doubles
+                 # simulating FTS5-less runtimes do this). Retag the instance's class so close()
+@@ -311,24 +315,34 @@ def read_header_bytes_preopen(path: Path | str, *, length: int = 100, force: boo
+     cannot be opened between deciding "nothing is live" and closing this descriptor."""
+     from hermes_cli import sqlite_offline_reservations as offline
+ 
+-    with _live_lock:
+-        if offline.conflicts(_key(path), raw=True):
+-            return None  # a restore may currently be replacing this file
+-        if not force and _live_main_key(_key(path)) is not None:
+-            logger.debug(
+-                "refusing byte-level read of %s: a live connection exists in "
+-                "this process and close() would cancel its POSIX locks",
+-                path)
+-            return None
+-        try:
+-            # Untracked read-only caches may still hold SQLite locks. On POSIX use a
+-            # never-closed descriptor even when this registry is empty (or force=True).
+-            if hasattr(os, "pread"):
+-                return read_header_lock_safe(path, length=length)
+-            with open(path, "rb") as handle:
+-                return handle.read(length)
+-        except OSError:
+-            return None
++    recursive = getattr(_live_lock, "_is_owned", lambda: True)()
++    while True:
++        with _live_lock:
++            pending = offline.conflicts(_key(path), raw=True)
++            if not pending:
++                return _read_header_registered(path, length, force)
++            if recursive or offline.owns_reservation():
++                return None  # cannot wait for the other owner without pinning the registry
++        pending[0][2].wait()  # a restore may be replacing this file: read it afterwards
++
++
++def _read_header_registered(path, length, force):
++    """Body of :func:`read_header_bytes_preopen` (caller holds ``_live_lock``, no reservation)."""
++    if not force and _live_main_key(_key(path)) is not None:
++        logger.debug(
++            "refusing byte-level read of %s: a live connection exists in "
++            "this process and close() would cancel its POSIX locks",
++            path)
++        return None
++    try:
++        # Untracked read-only caches may still hold SQLite locks. On POSIX use a
++        # never-closed descriptor even when this registry is empty (or force=True).
++        if hasattr(os, "pread"):
++            return read_header_lock_safe(path, length=length)
++        with open(path, "rb") as handle:
++            return handle.read(length)
++    except OSError:
++        return None
+ 
+ 
+ @contextlib.contextmanager
+diff --git a/tests/hermes_cli/test_sqlite_offline_reservations.py b/tests/hermes_cli/test_sqlite_offline_reservations.py
+index 784ecabecc..3d4744bd0a 100644
+--- a/tests/hermes_cli/test_sqlite_offline_reservations.py
++++ b/tests/hermes_cli/test_sqlite_offline_reservations.py
+@@ -49,20 +49,20 @@ def test_same_thread_wait_refuses_and_nested_raw_cleanup(tmp_path):
+         pass
+ 
+ 
+-def test_waiting_open_and_header_refusal(tmp_path, monkeypatch):
++def test_waiting_open_and_header_probe_wait_for_reservation(tmp_path, monkeypatch):
+     from hermes_cli import sqlite_offline_reservations as offline
+ 
+     path = tmp_path / "board.db"
+     seed = sqlite3.connect(path)
+     seed.execute("CREATE TABLE example (value)")
+     seed.close()
+-    attempted = threading.Event()
++    attempted, probed = threading.Event(), threading.Event()
+     original = offline.conflicts
+ 
+     def observe(*args, **kwargs):
+         pending = original(*args, **kwargs)
+-        if pending and not kwargs.get("raw"):
+-            attempted.set()
++        if pending:
++            (probed if kwargs.get("raw") else attempted).set()
+         return pending
+ 
+     monkeypatch.setattr(offline, "conflicts", observe)
+@@ -76,8 +76,12 @@ def test_waiting_open_and_header_refusal(tmp_path, monkeypatch):
+             pending = pool.submit(open_close)
+             assert attempted.wait(5)
+             assert not pending.done()
+-            assert pool.submit(tracking.read_header_bytes_preopen, path).result(5) is None
+-        pending.result(5)
++        pending.result(5)  # opened and closed again: the probe below races no live handle
++        with tracking.offline_file_access(path):
++            probing = pool.submit(tracking.read_header_bytes_preopen, path)
++            assert probed.wait(5)
++            assert not probing.done()
++        assert probing.result(5).startswith(b"SQLite")
+     header = tracking.read_header_bytes_preopen(path)
+     assert header is not None and header.startswith(b"SQLite")
+ 
+diff --git a/tests/hermes_cli/test_sqlite_reservation_adversarial.py b/tests/hermes_cli/test_sqlite_reservation_adversarial.py
+index 1d07f68a77..2b5e506663 100644
+--- a/tests/hermes_cli/test_sqlite_reservation_adversarial.py
++++ b/tests/hermes_cli/test_sqlite_reservation_adversarial.py
+@@ -156,3 +156,95 @@ def test_recursive_registry_wait_refuses_without_pinning_owner(tmp_path):
+         finally:
+             release.set()
+         pending.result(3)
++
++
++@pytest.mark.parametrize("escape", ["%00suffix", "%00"])
++def test_uri_truncated_by_sqlite_cannot_bypass_reservation(tmp_path, monkeypatch, escape):
++    path = tmp_path / "board.db"
++    target = f"{path.as_uri()}{escape}?mode=rwc"
++    # Pin SQLite's own parsing (NUL ends the name) below the test I/O guard, which refuses
++    # every NUL URI because it cannot verify one.
++    probe = getattr(sqlite3.connect, "__wrapped__", sqlite3.connect)(target, uri=True)
++    try:
++        assert probe.execute("PRAGMA database_list").fetchone()[2] == str(path.resolve())
++    finally:
++        probe.close()
++    assert offline.database_key(target, uri=True) is offline.UNKNOWN
++    reached = []
++    monkeypatch.setattr(sqlite3, "connect", lambda *a, **k: reached.append(a))
++    with tracking.offline_file_access(tmp_path / "unrelated.bin"):
++        with pytest.raises(sqlite3.OperationalError) as caught:
++            tracking.connect_tracked(target, uri=True, wait_for_tracking=False)
++        assert caught.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
++    with tracking.offline_file_access(path):
++        with pytest.raises(sqlite3.OperationalError) as caught:
++            tracking.connect_tracked(target, uri=True, wait_for_tracking=False)
++        assert caught.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
++    assert reached == []
++    assert not tracking.has_live_connection(path)
++
++
++def test_factory_substituting_reserved_path_is_refused_and_closed(tmp_path):
++    reserved = tmp_path / "reserved.db"
++    opened = []
++
++    class Substituting(sqlite3.Connection):
++        def __init__(self, _database, *args, **kwargs):
++            super().__init__(str(reserved), *args, **kwargs)
++            opened.append(self)
++
++    with tracking.offline_file_access(reserved):
++        with pytest.raises(sqlite3.OperationalError) as caught:
++            tracking.connect_tracked(tmp_path / "other.db", factory=Substituting,
++                                     wait_for_tracking=False)
++        assert caught.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
++        assert len(opened) == 1
++        with pytest.raises(sqlite3.ProgrammingError):
++            opened[0].execute("SELECT 1")  # the refused handle was closed, not leaked
++    assert not tracking.has_live_connection(reserved)
++
++
++def test_recursive_registry_owner_cannot_wait_for_raw_reservation(tmp_path):
++    path = tmp_path / "board.db"
++    reserved, release = threading.Event(), threading.Event()
++
++    def owner():
++        with tracking.offline_file_access(path):
++            reserved.set()
++            assert release.wait(3)
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        pending = pool.submit(owner)
++        assert reserved.wait(3)
++        try:
++            with tracking._live_lock:
++                with pytest.raises(tracking.LiveConnectionError):
++                    with tracking.offline_file_access(path):
++                        pytest.fail("recursive registry owner admitted")
++                assert tracking.read_header_bytes_preopen(path) is None
++        finally:
++            release.set()
++        pending.result(3)
++
++
++def test_waiting_manual_registration_follows_reservation(tmp_path, monkeypatch):
++    path = tmp_path / "board.db"
++    attempted = threading.Event()
++    original = offline.conflicts
++
++    def observe(*args, **kwargs):
++        pending = original(*args, **kwargs)
++        if pending:
++            attempted.set()
++        return pending
++
++    monkeypatch.setattr(offline, "conflicts", observe)
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        with tracking.offline_file_access(path):
++            pending = pool.submit(tracking.track_connection, path)
++            assert attempted.wait(3)
++            assert not pending.done()
++            assert not tracking.has_live_connection(path)
++        pending.result(3)
++    assert tracking.has_live_connection(path)
++    tracking.untrack_connection(path)
+-- 
+2.43.0
+

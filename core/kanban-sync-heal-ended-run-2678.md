@@ -1,6 +1,6 @@
 # Owner sync repair never reopens a card over its ended run
 
-Patches: **2596, 2625**.
+Patches: **2596, 2625, 2710–2712**.
 
 ## Behavior
 
@@ -29,6 +29,15 @@ Patches: **2596, 2625**.
 
 Source coverage, **not run in this mirror** (the mirror pass only verifies patch replay and tree equality; it does not rerun these tests): `tests/hermes_cli/test_kanban_sync_terminal_regress.py` and `tests/hermes_cli/test_kanban_sync_running_heal.py`. Entry path: the module API `kanban_sync_client.repair_divergence` and `sync_board` rounds against a fake Board service (a pool worker ends a run, a stale copy is stored on the Board, the owner's next rounds pull, heal and push), plus `heal_running_over_ended_run` directly. Covered: a done-and-completed and a blocked-to-todo regression no longer reopen the card; a real uncaptured edit of a running card with an open run is still sent; the heal for done and the todo fallback, parks restored to blocked, review and scheduled, a park left by a later event falling back to `todo`, the event's run uid reaching the Board, the heal reported once and not looped, an open run left alone, a held `claim_lock` or lease keeping the card `running`, and no adoption of a terminal replica over a live claim. Entry paths no test drives: a real Board service, the `hermes kanban` CLI and the dispatcher around the sync round are **untested**.
 
+## Follow-up 2710–2712: the park lands where its own event recorded it
+
+- Behavior (2710): the park decision uses the card's last lifecycle move since the run's park event. The triage sweeps (`agent_block_escalated`, `ask_rechecked`, `supervisor_escalated`) count as leaving the park, and a later park event (the wake invariant's scheduled to blocked) lands that park. Events are ordered by origin time (second, then the uid's UUIDv7 millisecond, then local id), so a same-second unblock that arrived before its block is not missed. A malformed event payload reads as no payload, and each card heals in its own try, so one failing card never aborts the round. The "still reads running after one heal" warning logs once per (task, run) per process. A restored blocked park takes `block_kind` and `human_request` from its own event; a restored scheduled park clears `human_request`. The wake rows are not task columns, so a stale copy cannot touch them.
+- Behavior (2711): a `kanban_continue` wait (run outcome `continued`) counts as a park and lands the `status` its own event recorded (scheduled), so it is no longer healed to `todo` and re-dispatched before its wake; a no-wait continue that went straight back to `ready` falls through to `todo`. A review reopened to ready (`review_reopened`, no payload) is a move out of the park: `_LEFT_PARK` now carries every resume lifecycle move (`review_reopened`, `triage_swept`, `gave_up`, `reclaimed`, `status`). `block_task` now records `status` (where the block landed) in the `blocked` event payload and the heal prefers it, so an exhausted-budget block that lands triage heals to triage; older events fall back to the `continuation_exhausted` / `goal_unachievable` re-kind. A metadata-only `blocked` event (human-request migration re-filing an ask) is not a move. A non-v7 uid no longer reorders same-second events, and a restored blocked ask re-syncs its resolved-check probe row.
+- Behavior (2712): assignment routing records `status='todo'` in the block event payload next to `supervisor_task_id`, so a stale running copy over an assignment-routed run end heals to `todo` behind its supervisor, not `blocked` where the supervisor's completion never promotes it. A `block_loop_detected` end is still reclaimed to `todo`, not parked (documented in code).
+- How it works: all in `kanban_sync_divergence._parked_status` and the once-gate (Python parse, plus `CASE json_valid` in SQL); `kanban_db.block_task` writes the extra payload field; `kanban_assignment_routing.route()` sets it for the todo landing.
+- Code: `hermes_cli/kanban_sync_divergence.py`, `hermes_cli/kanban_db.py`, `hermes_cli/kanban_assignment_routing.py`.
+- Tests: source coverage, not run in this mirror: `tests/hermes_cli/test_kanban_sync_running_heal.py` (sweeps leaving a park, wake-invariant park, same-second ordering, malformed payload, per-card isolation, restored block/schedule fields, continued runs, every resume move, exhausted-budget block, metadata-only block, resolved-check probe row, non-v7 uid, assignment-routed block), `tests/hermes_cli/test_kanban_block_kinds.py` (block events record where the block landed) and `tests/hermes_cli/test_kanban_assignment_routing.py` (a small assertion addition). Entry path: the same sync-round and `heal_running_over_ended_run` APIs as above against a fake Board service. A real Board service and the `hermes kanban` CLI are **untested**.
+
 ## Applying
 
 Use the [README full replay procedure](README.md#applying). These patches are not independent of earlier core patches; apply the whole series in order.
@@ -37,7 +46,7 @@ Use the [README full replay procedure](README.md#applying). These patches are no
 
 - Primary (owner) boards only: the heal is not run for non-primary boards.
 - A heal the Board outvotes (the other side's clock is ahead) is logged and left alone after its first attempt.
-- Parks restored only when the park's own event exists and nothing lifecycle-moving followed it; otherwise the card goes `todo`.
+- Parks restored only when the park's own event exists and no later lifecycle move followed it (2710–2712 widened what counts as a move and what a park lands as: a continue wait, a recorded landing status, triage); otherwise the card goes `todo`.
 - Cards already stuck before this patch are healed on the next owner round; the stale-claim sweep never saw them.
 
 ## Plugin

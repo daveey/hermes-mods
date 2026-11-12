@@ -1,0 +1,326 @@
+From 53c8685517ca77347d7abe2f646cfa21bdb62895 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:49:18 +0000
+Subject: [PATCH] [daveey] Kanban wake: a queued wake is relabelled from live
+ card state when the drain claims it
+
+PR #1305 relabelled a stale premise (chat_wait_unclaimed, blocked, crashed, ...) only when a later
+wake folded into the queued row. A row nothing folded into ran with the text it was built with:
+MacBook row 3605 (2026-11-12) would have told its chat that t_01a1ce7ed2addb09, claimed ~15 min
+earlier, had no worker.
+
+execute_admission now rebuilds a claimed kanban-wake row's text from its stored kanban_cards with
+the fold's own refresh_card/compose path, just before the turn is built, beside the stale block-ask
+refresh (same in-memory payload, never the stored row). Every card keeps its
+"[kanban] Task <id> <kind>." line. An unreadable board, another producer's row, or text that no
+longer has the shape its cards built leaves the text unchanged.
+
+Task: t_01a1cfc175c64298
+---
+ gateway/kanban_wake_fold.py            |  89 ++++++++++++++--
+ gateway/session_ingress.py             |  11 +-
+ tests/gateway/test_kanban_wake_fold.py | 136 +++++++++++++++++++++++++
+ 3 files changed, 226 insertions(+), 10 deletions(-)
+
+diff --git a/gateway/kanban_wake_fold.py b/gateway/kanban_wake_fold.py
+index b63991bbad..109111c954 100644
+--- a/gateway/kanban_wake_fold.py
++++ b/gateway/kanban_wake_fold.py
+@@ -137,10 +137,10 @@ def _live_task(card):
+         return task.status, summary.strip()
+ 
+ 
+-def refresh_card(card):
++def refresh_card(card, *, strict=False):
+     """``card`` with its live status applied: a wake whose premise no longer holds (an unclaimed wait
+     since claimed or done, a block since resolved) is relabelled with the card's current status. An
+-    unreadable board leaves the card as delivered."""
++    unreadable board leaves the card as delivered, or raises when ``strict``."""
+     kinds = card.get('kinds') or []
+     premises = [kind for kind in kinds if kind in _PREMISE_HOLDS]
+     if not card.get('task_id') or not premises:
+@@ -149,6 +149,8 @@ def refresh_card(card):
+         status, result = _live_task(card)
+     except Exception:  # health: allow BLE001 -- a live read is best effort: the wake still goes in as delivered
+         logger.debug('kanban wake fold: live state of %s unreadable', card['task_id'], exc_info=True)
++        if strict:
++            raise
+         return card
+     if status is None:
+         return card
+@@ -169,6 +171,82 @@ def refresh_card(card):
+     return {**card, 'kinds': [{'done': 'completed'}.get(status, status)], 'text': '\n'.join(out).rstrip()}
+ 
+ 
++def _compose(cards, guidance, *, strict=False):
++    """The turn text of a batch of ``cards`` (each live-refreshed), with the trailing ``guidance``."""
++    parts = [refresh_card(card, strict=strict)['text'] for card in cards]
++    if len(cards) > 1:
++        parts.insert(0, _FOLD_HEADER.format(count=len(cards)))
++    if guidance:
++        parts.append(guidance)
++    return '\n\n'.join(parts)
++
++
++def _head_at(text, task_id, pos):
++    """Offset of card ``task_id``'s ``[kanban] Task <id> `` line at or after ``pos``, or -1."""
++    head = f'[kanban] Task {task_id} '
++    at = text.find(head, pos)
++    while at > 0 and text[at - 1] != '\n':
++        at = text.find(head, at + 1)
++    return at
++
++
++def _guidance(text, cards):
++    """What follows the last card in ``text`` (a row built by ``_compose`` from ``cards``, each card
++    rendered as delivered or relabelled), or ``None`` when ``text`` does not have that shape."""
++    if len(cards) > 1 and not text.startswith(_FOLD_HEADER.format(count=len(cards))):
++        return None
++    pos = 0
++    for card in cards:  # every card's head line, in order: the batch these cards built
++        if card.get('task_id') and _LEGACY_HEAD.match(card['text']):
++            pos = _head_at(text, card['task_id'], pos)
++            if pos < 0:
++                return None
++    last = cards[-1]
++    lines = last['text'].rstrip().split('\n')
++    rest = lines[1:] if _LEGACY_HEAD.match(lines[0]) else lines
++    tail = '\n'.join(rest).rstrip()
++    if tail:  # refresh_card keeps every line after the head, in order, at the end of the card
++        end = text.find(tail, pos)
++        if end < 0:
++            return None
++        end += len(tail)
++    else:  # a one-line card: its head, then a relabel's Note and Result lines when present
++        end = text.find('\n', pos)
++        end = len(text) if end < 0 else end
++        for prefix in ('Note: an earlier wake for this card said', 'Result: '):
++            if text.startswith(prefix, end + 1):
++                nxt = text.find('\n', end + 1)
++                end = len(text) if nxt < 0 else nxt
++    if text[end:end + 1] not in ('', '\n'):
++        return None
++    return text[end:].strip()
++
++
++def refresh_claimed(payload):
++    """Rebuild a claimed Kanban wake's text in place from its cards' live state, before it becomes a
++    turn (``session_ingress.execute_admission``). A lone wake that no later wake folded into was
++    otherwise drained with the premise it was built with, however long it waited (row 3605 on
++    2026-11-12 told its chat a card claimed 15 min earlier had no worker). Only the in-memory claim
++    payload changes, never the stored row. Any other row, a row whose text no longer has the shape
++    its cards built, and an unreadable board leave the text as it was."""
++    try:
++        if not isinstance(payload, dict) or not isinstance(payload.get('text'), str):
++            return
++        descriptor = _descriptor(payload)
++        if not descriptor.get('kanban_cards') or _producer(descriptor.get('identity')) != PRODUCER:
++            return
++        cards = card_metadata(descriptor)['kanban_cards']
++        if not any(kind in _PREMISE_HOLDS for card in cards for kind in card.get('kinds') or []):
++            return  # outcome-only batch: nothing can have gone stale, so no board read
++        guidance = _guidance(payload['text'], cards)
++        if guidance is not None:
++            # Strict: an unreadable card would fall back to its as-delivered text and undo the
++            # relabel the fold already made, so any unreadable card leaves the whole text as it was.
++            payload['text'] = _compose(cards, guidance, strict=True)
++    except Exception:  # health: allow BLE001 -- a refresh must never cost the wake itself
++        logger.warning('kanban wake: claim-time relabel skipped; delivering the wake unchanged', exc_info=True)
++
++
+ def fold_into(event, waiting, identity):
+     """Rewrite ``event`` (the new wake) as the batch of ``waiting``'s cards and its own, live-refreshed.
+     Blocking: it reads the Kanban board, so callers run it off the event loop."""
+@@ -181,12 +259,7 @@ def fold_into(event, waiting, identity):
+         old_cards[0]['text'] = old_cards[0]['text'][:-len(guidance)].rstrip()
+     # The stored cards stay as delivered; the live relabel is redone each time the batch is rebuilt.
+     cards = _merge(old_cards, new_cards)
+-    parts = [refresh_card(card)['text'] for card in cards]
+-    if len(cards) > 1:
+-        parts.insert(0, _FOLD_HEADER.format(count=len(cards)))
+-    if guidance:
+-        parts.append(guidance)
+-    event.text = '\n\n'.join(parts)
++    event.text = _compose(cards, guidance)
+     event.metadata['kanban_cards'] = cards
+     event.metadata['automation_identities'] = sorted({
+         *(descriptor.get('identities') or [waiting['request_id']]),
+diff --git a/gateway/session_ingress.py b/gateway/session_ingress.py
+index 9896c203a1..9e298f4267 100644
+--- a/gateway/session_ingress.py
++++ b/gateway/session_ingress.py
+@@ -277,8 +277,15 @@ def row_turn_author(policy, row):
+ async def execute_admission(authority, ref, row):
+     busy_turn_started(row['admission_id'])
+     from hermes_cli.kanban_stale_ask import refresh_payload
+-    # [daveey] a queued producer block notice re-reads its card (read-only sqlite, off the loop) before it is shown
+-    await asyncio.to_thread(refresh_payload, row['payload'])
++    from gateway.kanban_wake_fold import refresh_claimed
++
++    def refresh(payload):
++        # [daveey] A queued Kanban wake is rebuilt from its cards' live state (a premise such as
++        # "ready with no worker" since claimed is relabelled), then a producer block notice re-reads
++        # its card's ask. Both read sqlite read-only, off the loop, and change only this in-memory payload.
++        refresh_claimed(payload)
++        refresh_payload(payload)
++    await asyncio.to_thread(refresh, row['payload'])
+     from gateway.session_completion_notes import note_if_unviewed
+     noted = await note_if_unviewed(authority, ref, row)  # #134889 LC-7: no viewer, no turn
+     if noted is not None:
+diff --git a/tests/gateway/test_kanban_wake_fold.py b/tests/gateway/test_kanban_wake_fold.py
+index 696cdd124f..8c27051725 100644
+--- a/tests/gateway/test_kanban_wake_fold.py
++++ b/tests/gateway/test_kanban_wake_fold.py
+@@ -7,6 +7,7 @@ real Kanban board; nothing claims (``_schedule`` is disabled), so every admitted
+ exactly as it does behind a running turn.
+ """
+ import inspect
++import json
+ 
+ import pytest
+ 
+@@ -278,6 +279,141 @@ async def test_a_wake_past_the_card_cap_queues_alone_instead_of_being_refused(tm
+         authority.db.close()
+ 
+ 
++async def _drain(authority, row, monkeypatch):
++    """Run the queued ``row`` the way the drain does once it claims it; return the turn's text."""
++    from gateway.session_ingress import execute_admission
++    from gateway.session_contract import SessionRef
++    seen = []
++
++    async def turn(event):
++        seen.append(event.text)
++        return 'ok'
++    monkeypatch.setattr(authority.runner, '_handle_message', turn)
++    descriptor = kanban_wake_fold._descriptor(row['payload'])
++    await execute_admission(authority, SessionRef(authority.profile_id, descriptor['owner']), row)
++    assert seen, 'the queued wake never ran as a turn'
++    return seen[0]
++
++
++@pytest.mark.asyncio
++async def test_a_lone_unclaimed_wait_claimed_before_the_drain_runs_with_its_live_status(tmp_path, monkeypatch, board):
++    """Row 3605 (2026-11-12, chat 20261026_170127_f07c32) waited behind a running turn with no later
++    wake to fold into it, so it would have told the chat a card claimed 15 min earlier had no worker."""
++    authority, adapter, source, queued, _human = await _local_chat(tmp_path, monkeypatch)
++    try:
++        tid = board('waited on')
++        await _wake(adapter, source, tid, 'chat_wait_unclaimed')
++        [row] = _automation(queued())
++        stored = json.loads(json.dumps(row['payload']))
++        _claim(tid)
++        text = await _drain(authority, row, monkeypatch)
++        assert text.startswith(f'[kanban] Task {tid} claimed by a worker (running).\n')
++        assert 'Note: an earlier wake for this card said "is ready with no worker claiming it"' in text
++        assert 'Live status: running.' in text and f'Title: card {tid}' in text
++        assert text.count(GUIDANCE) == 1 and text.endswith(GUIDANCE)
++        [after] = [r for r in list_session_admissions(authority.db, session_id=stored['local_automation_v1']['owner'],
++                                                     pending_only=False) if r['admission_id'] == row['admission_id']]
++        assert after['payload'] == stored  # the stored row is never rewritten
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_a_lone_wait_whose_premise_still_holds_runs_byte_identical(tmp_path, monkeypatch, board):
++    authority, adapter, source, queued, _human = await _local_chat(tmp_path, monkeypatch)
++    try:
++        tid = board('still waiting')
++        await _wake(adapter, source, tid, 'chat_wait_unclaimed')
++        [row] = _automation(queued())
++        original = row['payload']['text']
++        assert await _drain(authority, row, monkeypatch) == original
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_a_folded_row_is_relabelled_again_at_the_claim(tmp_path, monkeypatch, board):
++    """Folded while both cards still waited; one is claimed and the other completed before the drain."""
++    authority, adapter, source, queued, _human = await _local_chat(tmp_path, monkeypatch)
++    try:
++        first, second, done = board('first'), board('second'), board('done meanwhile')
++        await _wake(adapter, source, first, 'chat_wait_unclaimed')
++        await _wake(adapter, source, done, 'chat_wait_unclaimed')
++        _claim(second)
++        await _wake(adapter, source, second, 'chat_wait_unclaimed')  # relabelled running at fold time
++        [row] = _automation(queued())
++        assert f'[kanban] Task {first} is ready with no worker claiming it.' in row['payload']['text']
++        _claim(first)
++        _complete(done, 'shipped it')
++        text = await _drain(authority, row, monkeypatch)
++        assert text.startswith('[IMPORTANT: 3 Kanban task updates arrived')
++        assert text.count('Kanban task updates arrived') == 1
++        assert f'[kanban] Task {first} claimed by a worker (running).' in text
++        assert f'[kanban] Task {done} completed.' in text and 'Result: shipped it' in text
++        assert f'[kanban] Task {second} claimed by a worker (running).' in text
++        assert 'is ready with no worker claiming it.\n' not in text
++        assert text.count('Note: an earlier wake for this card said') == 3
++        assert text.count(GUIDANCE) == 1 and text.endswith(GUIDANCE)
++    finally:
++        authority.db.close()
++
++
++@pytest.mark.asyncio
++async def test_an_unreadable_board_leaves_the_claimed_wake_unchanged(tmp_path, monkeypatch, board):
++    """Even a relabel the fold already made stays: the as-delivered card text never comes back."""
++    authority, adapter, source, queued, _human = await _local_chat(tmp_path, monkeypatch)
++    try:
++        first, second = board('waited on'), board('claimed before its wake folded')
++        await _wake(adapter, source, first, 'chat_wait_unclaimed')
++        _claim(second)
++        await _wake(adapter, source, second, 'chat_wait_unclaimed')
++        [row] = _automation(queued())
++        original = row['payload']['text']
++        assert f'[kanban] Task {second} claimed by a worker (running).' in original
++        _claim(first)
++
++        def unreadable(card):
++            raise OSError('board unreadable')
++        monkeypatch.setattr(kanban_wake_fold, '_live_task', unreadable)
++        assert await _drain(authority, row, monkeypatch) == original
++    finally:
++        authority.db.close()
++
++
++def test_refresh_claimed_leaves_unparsable_or_foreign_rows_alone(tmp_path, monkeypatch, board):
++    tid = board('waited on')
++    _claim(tid)
++    body = f'[kanban] Task {tid} is ready with no worker claiming it.\nTitle: x\nBoard: default'
++    card = {'task_id': tid, 'board': '', 'kinds': ['chat_wait_unclaimed'], 'text': body}
++    identity = json.dumps(['kanban-wake', 'x'])
++    # A row whose text no longer contains the stored card (a producer truncated it) is left as is.
++    odd = {'text': 'something else\n\n' + GUIDANCE,
++           'local_automation_v1': {'identity': identity, 'kanban_cards': [card]}}
++    before = json.loads(json.dumps(odd))
++    kanban_wake_fold.refresh_claimed(odd)
++    assert odd == before
++    # Another producer's row is never touched, cards or not.
++    other = {'text': body, 'local_automation_v1': {'identity': json.dumps(['loop-tick', 'x']), 'kanban_cards': [card]}}
++    kanban_wake_fold.refresh_claimed(other)
++    assert other['text'] == body
++    # A typed row is never touched.
++    typed = {'text': body}
++    kanban_wake_fold.refresh_claimed(typed)
++    assert typed == {'text': body}
++    # The native envelope relabels the same way.
++    native = {'text': body + '\n\n' + GUIDANCE,
++              'native_text_v1': {'automation': {'identity': identity, 'kanban_cards': [card]}}}
++    kanban_wake_fold.refresh_claimed(native)
++    assert native['text'].startswith(f'[kanban] Task {tid} claimed by a worker (running).\n')
++    assert native['text'].endswith('Board: default\n\n' + GUIDANCE)
++    # A one-line card (the TUI owner's notice) with no guidance.
++    line = f'[kanban] Task {tid} is ready with no worker claiming it.'
++    tui = {'text': line, 'local_automation_v1': {'identity': identity, 'kanban_cards': [{**card, 'text': line}]}}
++    kanban_wake_fold.refresh_claimed(tui)
++    assert tui['text'].startswith(f'[kanban] Task {tid} claimed by a worker (running).\nNote: ')
++    assert tui['text'].endswith('Live status: running.')
++
++
+ def test_the_relabel_reads_the_notifiers_db_under_the_env_pin(tmp_path, monkeypatch, board):
+     """A card on a non-default board relabels from the DB the notifier read it from: on a box that pins
+     ``HERMES_KANBAN_DB`` that is the pinned file, never a per-slug DB the read would create."""
+-- 
+2.43.0
+

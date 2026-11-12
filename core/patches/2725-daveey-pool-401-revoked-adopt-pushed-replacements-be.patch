@@ -1,0 +1,405 @@
+From 3b8c3dc3d6f22a924104c0c902ba6bd8da83fd73 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:58:43 +0000
+Subject: [PATCH] [daveey] pool 401 revoked: adopt pushed replacements before
+ giving up; a 401 whose siblings heal exits 75, not 78
+
+2026-11-12 11:31Z: the hub re-minted 5 pooled Anthropic accounts, revoking the tokens every worker
+held until its next pull. Running workers rotated through the pool (3x 401 revoked, 2x 429 weekly),
+ran out of entries and surfaced the last error, a 401, as failure_reason=auth -> exit 78
+(terminal_provider); the dispatcher gave 31 cards up on the first death.
+
+- credential_auth_recovery: when refresh and rotation both fail, re-read auth.json for every
+  auth-benched pushed row and continue on a replacement that landed meanwhile.
+- _mark_exhausted records bench_token_fp, the token generation a 401/403 was seen on, so a row
+  whose newer pair arrived through the persist merge is no longer treated as revoked.
+- nonretryable auth result carries auth_pool_transient when any sibling is quota-benched, untried
+  or replaced on disk; turn_exit books it as KANBAN_RATE_LIMIT_EXIT_CODE (requeue, no failure).
+  Every entry auth-dead after the re-read stays terminal (78).
+---
+ agent/credential_auth_recovery.py             |  11 +-
+ agent/credential_pool.py                      |   9 +-
+ agent/credential_pool_pushed.py               |  78 ++++++-
+ agent/turn_recovery.py                        |   5 +
+ fixture/cache/plugin_hooks.json               |   2 +-
+ hermes_cli/turn_exit.py                       |   4 +-
+ .../hermes_cli/test_kanban_pool_auth_wall.py  | 192 ++++++++++++++++++
+ 7 files changed, 292 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pool_auth_wall.py
+
+diff --git a/agent/credential_auth_recovery.py b/agent/credential_auth_recovery.py
+index 15f112315f..02836de0d3 100644
+--- a/agent/credential_auth_recovery.py
++++ b/agent/credential_auth_recovery.py
+@@ -138,7 +138,16 @@ def recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_con
+     refreshed = pool.try_refresh_matching(**refresh_kwargs)
+     if refreshed is None:
+         # Refresh failed; rotate (the failed entry is already marked exhausted).
+-        return (True, False) if rotate_and_swap(401, "auth refresh failed") else (False, has_retried_429)
++        if rotate_and_swap(401, "auth refresh failed"):
++            return True, False
++        # Nothing left to rotate to: a row revoked earlier may have its minter-pushed replacement on disk.
++        from agent.credential_pool_pushed import adopt_pushed_replacements
++        replacement = adopt_pushed_replacements(pool, getattr(agent, "model", None))
++        if replacement is not None and agent._swap_credential(replacement) is not False:
++            log.info("Credential 401 — pool exhausted; adopted pushed replacement for pool entry %s",
++                     getattr(replacement, "id", "?"))
++            return True, False
++        return False, has_retried_429
+     refreshed_id = getattr(refreshed, "id", None)
+     if nous:
+         episode = _episode(agent, provider, refreshed_id or entry_id)
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index 36112c45f1..acfeb0c6cd 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -1168,11 +1168,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+         # Carry the classifier's verdict so the cooldown is sized by what
+         # actually failed (a billing 403 must not get the sole-credential
+         # transient cooldown); absent a classification, clear a stale one.
+-        updated_extra = dict(entry.extra)
+-        if failure_reason:
+-            updated_extra["failure_reason"] = failure_reason
+-        else:
+-            updated_extra.pop("failure_reason", None)
++        updated_extra = {k: v for k, v in entry.extra.items() if k != "failure_reason"}
++        updated_extra.update({"failure_reason": failure_reason} if failure_reason else {})
++        # The generation this failure was seen on: a later token for the row is not under the bench. [daveey]
++        updated_extra["bench_token_fp"] = fingerprint_secret_value(entry.access_token) if entry.access_token else None
+         return self._adopt(
+             entry,
+             persist=persist,
+diff --git a/agent/credential_pool_pushed.py b/agent/credential_pool_pushed.py
+index 79777a8e9d..729be574fb 100644
+--- a/agent/credential_pool_pushed.py
++++ b/agent/credential_pool_pushed.py
+@@ -1,7 +1,11 @@
+-"""Quota policy for externally minted OAuth token replacements."""
++"""Quota and auth policy for externally minted OAuth token replacements."""
+ from __future__ import annotations
+ 
++import logging
+ import time
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
+ 
+ 
+ def has_live_quota_mark(entry) -> bool:
+@@ -17,3 +21,75 @@ def has_live_quota_mark(entry) -> bool:
+         and _is_codex_rate_limit_shaped(
+             entry.last_error_code, entry.last_error_reason, entry.last_error_message)
+     )
++
++
++def _auth_benched(entry) -> bool:
++    from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED
++    return entry.last_status == STATUS_DEAD or (
++        entry.last_status == STATUS_EXHAUSTED and entry.last_error_code in (401, 403))
++
++
++def _bench_predates_token(entry) -> bool:
++    """The row's 401/403 was seen on an earlier token generation (``bench_token_fp``) than it holds now.
++
++    A peer's newer pair can reach the row through the pool's own persist merge, which keeps the bench."""
++    from agent.credential_pool import fingerprint_secret_value
++    seen = (entry.extra or {}).get("bench_token_fp")
++    return bool(seen and entry.access_token and fingerprint_secret_value(entry.access_token) != seen)
++
++
++def adopt_pushed_replacements(pool: Any, model: Optional[str] = None):
++    """Re-read auth.json for every auth-benched pushed row; the first one now serviceable, or None.
++
++    A minter (the hub's cred-relay) re-minting accounts revokes the tokens every worker holds until
++    its next pull. Rotation walks the in-memory pool, whose revoked rows stay benched for minutes even
++    after their replacement lands on disk, so a pool whose other accounts are quota-walled reads as
++    empty. For a refresh-less row the re-read is the only renewal there is.
++    """
++    from agent.credential_pool import _MARK_OK, STATUS_OK, CredentialPool
++    from agent.credential_pool_model_cooldowns import model_cooldown_until
++    if not isinstance(pool, CredentialPool):
++        return None
++    with pool._lock:
++        for entry in list(pool._enabled_entries()):
++            if not _auth_benched(entry) or entry.auth_type != "oauth" or (entry.refresh_token or "").strip():
++                continue
++            adopted = pool._adopt_pushed_norefresh_row(entry)
++            if adopted is entry and _bench_predates_token(entry) and not has_live_quota_mark(entry):
++                adopted = pool._adopt(entry, **_MARK_OK)
++            if adopted is entry or adopted.last_status not in (None, STATUS_OK):
++                continue
++            if model_cooldown_until(adopted, model) is not None:
++                continue
++            pool._current_id = adopted.id
++            return adopted
++    return None
++
++
++def auth_wall_is_transient(pool: Any) -> bool:
++    """False only when every enabled entry is auth-dead after a re-read of auth.json.
++
++    An account that is merely quota/billing-benched, cooling down for a model, or whose token was
++    replaced on disk since it failed comes back without an operator, so a 401 on its sibling is not
++    the configuration error that parks a Kanban card (2026-11-12 11:31Z: 31 cards gave up).
++    """
++    from agent.credential_pool import CredentialPool
++    if not isinstance(pool, CredentialPool):
++        return False
++    try:
++        from hermes_cli.auth import read_credential_pool
++        disk = {row.get("id"): row for row in read_credential_pool(pool.provider) if isinstance(row, dict)}
++    except (OSError, ValueError, RuntimeError):
++        logger.debug("auth wall: auth.json re-read failed for %s", pool.provider, exc_info=True)
++        disk = {}
++    with pool._lock:
++        entries = list(pool._enabled_entries())
++    if len(entries) < 2:
++        return False  # a sole credential has no sibling to wait on
++    for entry in entries:
++        token = (disk.get(entry.id) or {}).get("access_token")
++        if isinstance(token, str) and token.strip() and token != entry.access_token:
++            return True  # a replacement was pushed since this row failed
++        if not _auth_benched(entry) or _bench_predates_token(entry):
++            return True
++    return False
+diff --git a/agent/turn_recovery.py b/agent/turn_recovery.py
+index 1097f65437..f9e526acb1 100644
+--- a/agent/turn_recovery.py
++++ b/agent/turn_recovery.py
+@@ -1137,6 +1137,11 @@ def nonretryable_client_error_result(
+         # exhausted request repair). Preserve that terminal verdict for auto-continue.
+         "failure_retryable": False,
+     })
++    if classified.reason == FailoverReason.auth:
++        from agent.credential_pool_pushed import auth_wall_is_transient
++        if auth_wall_is_transient(getattr(agent, "_credential_pool", None)):
++            # A sibling account is only quota-benched or was re-minted: the card waits, not parks.
++            result["auth_pool_transient"] = True
+     if _keep_partial:
+         result["partial"] = True
+     _stamp_limit_reset(result, agent, api_error, classified)
+diff --git a/fixture/cache/plugin_hooks.json b/fixture/cache/plugin_hooks.json
+index e8b4a20309..7082a48837 100644
+--- a/fixture/cache/plugin_hooks.json
++++ b/fixture/cache/plugin_hooks.json
+@@ -1 +1 @@
+-{"version": 1, "fingerprint": "f80ee98b8d860bf21115216a1403d411f2ef49924c5c236acd27969d8b718e1d", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
++{"version": 1, "fingerprint": "ad9548781c10c26a1b1a73f283000fb2f41e8b9e7de3b7d8f4142b136b10a809", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/hermes_cli/turn_exit.py b/hermes_cli/turn_exit.py
+index 4029a6194b..45100caca5 100644
+--- a/hermes_cli/turn_exit.py
++++ b/hermes_cli/turn_exit.py
+@@ -33,7 +33,9 @@ def turn_exit_code(
+         return 0
+     if kanban_worker:
+         reason = result.get("failure_reason")
+-        if reason in transient_reasons:
++        # A 401 on one pooled account whose siblings come back on their own (``auth_pool_transient``,
++        # agent/credential_pool_pushed.py) is a wait, not a configuration error.
++        if reason in transient_reasons or (reason == "auth" and result.get("auth_pool_transient")):
+             from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+             return KANBAN_RATE_LIMIT_EXIT_CODE
+         if reason in terminal_reasons:
+diff --git a/tests/hermes_cli/test_kanban_pool_auth_wall.py b/tests/hermes_cli/test_kanban_pool_auth_wall.py
+new file mode 100644
+index 0000000000..e06c3c7fa0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pool_auth_wall.py
+@@ -0,0 +1,192 @@
++"""A revoked token on one pooled account must not give the card up (2026-11-12 11:31Z storm).
++
++The hub re-minted five pooled Anthropic accounts at 11:30:13Z, which revoked the access tokens every
++worker still held until its next pull. Each running worker got ``401 OAuth access token has been
++revoked``, rotated through the pool (the other accounts were 429-benched for the model), ran out of
++entries, and surfaced the LAST error, a 401. ``failure_reason="auth"`` mapped to
++``KANBAN_TERMINAL_PROVIDER_EXIT_CODE`` (78), and the dispatcher gave 31 cards up on their first
++death (14 to triage). Only a pool whose every account is auth-dead after a re-read is a terminal
++configuration problem; one whose other accounts are only quota-benched heals by itself.
++
++Real pool store under a sandboxed HERMES_HOME and the real dispatcher; only the SDK client builder is
++stubbed.
++"""
++
++from __future__ import annotations
++
++import json
++import time
++from unittest.mock import patch
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++
++MODEL = "claude-opus-5-5"
++REVOKED = "Error code: 401 - {'type': 'error', 'error': {'type': 'authentication_error', " \
++          "'message': 'OAuth access token has been revoked.'}}"
++
++
++class _StubClient:
++    def __init__(self, key=None):
++        self.key = key
++        self.is_closed = False
++
++    def close(self):
++        self.is_closed = True
++
++
++class _Http(Exception):
++    def __init__(self, status_code, message):
++        super().__init__(message)
++        self.status_code = status_code
++
++
++def _pushed(id_, token, priority, **extra):
++    """A hub-minted row: no refresh token, renewed only by the minter's push."""
++    return {"id": id_, "label": id_, "auth_type": "oauth", "priority": priority, "source": "manual:hub_minted",
++            "access_token": token, "expires_at_ms": int(time.time() * 1000) + 8 * 3_600_000, **extra}
++
++
++def _quota_benched(id_, token, priority):
++    now = time.time()
++    return _pushed(id_, token, priority, last_status="exhausted", last_status_at=now, last_error_code=429,
++                   last_error_reason="quota", model_cooldowns={MODEL: now + 5 * 86400})
++
++
++def _revoked(id_, token, priority):
++    """A row benched on a 401 for ``token`` (by this or a peer process: the bench is persisted)."""
++    from agent.credential_pool import fingerprint_secret_value
++    return _pushed(id_, token, priority, last_status="exhausted", last_status_at=time.time(),
++                   last_error_code=401, last_error_reason="auth", bench_token_fp=fingerprint_secret_value(token))
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: pid == "anthropic")
++    monkeypatch.setattr("agent.anthropic_credentials.read_hermes_oauth_credentials", lambda: None)
++    monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: None)
++    from hermes_cli import kanban_workspace_jobs
++    monkeypatch.setattr(kanban_workspace_jobs.psutil, "process_iter", lambda: iter(()))
++    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    kb.init_db()
++    return home
++
++
++def _write_pool(home, rows):
++    (home / "auth.json").write_text(json.dumps({"version": 1, "credential_pool": {"anthropic": rows}}))
++
++
++def _agent_on(entry_id):
++    from agent.credential_pool import load_pool
++    from run_agent import AIAgent
++    pool = load_pool("anthropic")
++    agent = AIAgent.__new__(AIAgent)
++    agent.provider, agent.model, agent.api_mode = "anthropic", MODEL, "anthropic_messages"
++    agent.base_url = agent._anthropic_base_url = "https://api.anthropic.com"
++    agent._oauth_1m_beta_disabled = False
++    agent.model_routing = None
++    agent._credential_pool = pool
++    agent._anthropic_client = _StubClient()
++    with patch("agent.anthropic_adapter.build_anthropic_client", side_effect=lambda k, *a, **kw: _StubClient(k)):
++        assert agent._swap_credential(next(e for e in pool.entries() if e.id == entry_id)) is True
++    return agent
++
++
++def _recover_from_revoked(agent):
++    """The 401 recovery the conversation loop runs: refresh the failing entry, else rotate."""
++    from agent.agent_runtime_helpers import recover_with_credential_pool
++    from agent.error_classifier import FailoverReason
++    with patch("agent.anthropic_adapter.build_anthropic_client", side_effect=lambda k, *a, **kw: _StubClient(k)):
++        recovered, _ = recover_with_credential_pool(
++            agent, status_code=401, has_retried_429=False, classified_reason=FailoverReason.auth,
++            error_context={"message": REVOKED})
++    return recovered
++
++
++def _worker_exit_code(agent):
++    """The turn the worker surfaces once recovery found nothing, and the exit code it books."""
++    from agent.error_classifier import classify_api_error
++    from agent.turn_recovery import nonretryable_client_error_result
++    from hermes_cli.turn_exit import turn_exit_code
++    from tests.agent.test_failed_turn_chat_copy import _Agent
++
++    stub = _Agent()
++    stub.provider, stub.model, stub._credential_pool = "anthropic", MODEL, agent._credential_pool
++    error = _Http(401, REVOKED)
++    classified = classify_api_error(error, provider="anthropic", model=MODEL)
++    result = nonretryable_client_error_result(
++        stub, error, classified, status_code=401, api_kwargs=None, api_messages=[], messages=[],
++        conversation_history=None, api_call_count=1, approx_tokens=10, provider="anthropic",
++        base_url="https://api.anthropic.com", model=MODEL)
++    assert result["failure_reason"] == "auth"
++    return turn_exit_code(result, kanban_worker=True)
++
++
++def _dispatch_worker_death(code):
++    with kbc.connect() as conn:
++        host = kb._claimer_id().split(":", 1)[0]
++        tid = kb.create_task(conn, title="worker on the pool", assignee="a", max_retries=5)
++        kb.claim_task(conn, tid, claimer=f"{host}:w0")
++        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (72000, tid))
++        conn.commit()
++        kbd._record_worker_exit(72000, code << 8)
++        kbd.detect_crashed_workers(conn)
++        task = kb.get_task(conn, tid)
++        gave_up = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,)).fetchone()
++        return task, gave_up
++
++
++def test_revoked_account_with_a_healthy_sibling_rotates_in_place(home):
++    _write_pool(home, [_pushed("acct-A", "sk-ant-oat01-revoked", 0), _pushed("acct-B", "sk-ant-oat01-ok", 1)])
++    agent = _agent_on("acct-A")
++    assert _recover_from_revoked(agent) is True
++    assert agent._credential_pool_entry_id == "acct-B"
++
++
++def test_revoked_account_beside_quota_benched_ones_requeues_the_card_without_giving_up(home):
++    """The 11:31Z shape: the revoked account is the last error, the rest are 429-benched for the model."""
++    _write_pool(home, [_pushed("acct-A", "sk-ant-oat01-revoked", 0), _quota_benched("acct-C", "sk-ant-oat01-c", 1),
++                       _quota_benched("acct-D", "sk-ant-oat01-d", 2)])
++    agent = _agent_on("acct-A")
++    assert _recover_from_revoked(agent) is False  # nothing left to rotate to right now
++
++    code = _worker_exit_code(agent)
++    assert code == kb.KANBAN_RATE_LIMIT_EXIT_CODE, code
++
++    task, gave_up = _dispatch_worker_death(code)
++    assert gave_up is None
++    assert task.status == "ready" and task.consecutive_failures == 0
++
++
++def test_revoked_sibling_whose_replacement_was_pushed_meanwhile_recovers_in_the_turn(home):
++    """Every other entry is 429-walled and an earlier-revoked one has its replacement on disk now:
++    the re-read adopts it and the turn continues on it."""
++    _write_pool(home, [_pushed("acct-A", "sk-ant-oat01-revoked", 0), _revoked("acct-B", "sk-ant-oat01-b-old", 1),
++                       _quota_benched("acct-C", "sk-ant-oat01-c", 2)])
++    agent = _agent_on("acct-A")
++    _write_pool(home, [_pushed("acct-A", "sk-ant-oat01-revoked", 0), _pushed("acct-B", "sk-ant-oat01-b-new", 1),
++                       _quota_benched("acct-C", "sk-ant-oat01-c", 2)])
++    assert _recover_from_revoked(agent) is True
++    assert agent._credential_pool_entry_id == "acct-B"
++    assert agent._anthropic_api_key == "sk-ant-oat01-b-new"
++
++
++def test_every_account_revoked_after_a_reread_stays_terminal(home):
++    _write_pool(home, [_pushed("acct-A", "sk-ant-oat01-revoked", 0), _revoked("acct-B", "sk-ant-oat01-b-old", 1)])
++    agent = _agent_on("acct-A")
++    assert _recover_from_revoked(agent) is False
++
++    code = _worker_exit_code(agent)
++    assert code == kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE
++
++    task, gave_up = _dispatch_worker_death(code)
++    assert gave_up is not None and task.status != "ready"
+-- 
+2.43.0
+

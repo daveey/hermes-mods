@@ -11,6 +11,8 @@ Patches:
 - `patches/0251-kanban-guard-hold-notice-file-a-fix-card-for-default.patch`: the notice files a fix card for the default assignee instead of posting to the Inbox.
 - `patches/0312-fix-kanban-release-rejected-merge-queue-PRs-to-repai.patch`: completed merge-queue rejections release repair workers, with the rejection reason quoted once on the card.
 
+Follow-up patch **2719** (see the last section) is appended after the series above.
+
 Extends `kanban-park-invariants.md` and `kanban-pr-unblock.md` (the respawn guard itself).
 
 ## Behavior
@@ -243,3 +245,31 @@ Source commit notes (first paragraph of each message, privacy-normalized):
 Landed with the source commits; not rerun by this mirror pass unless the verification report lists them. Names are tests each patch added; a file with no names was modified only.
 
 - `tests/hermes_cli/test_kanban_reopen_dispatch.py`: `test_cli_reopen_after_success_dispatches_once`, `test_dashboard_done_to_ready_still_dispatches`, `test_reopen_authorizes_one_rerun_only`, `test_same_second_reopen_stays_guarded`, `test_unrelated_or_malformed_events_stay_guarded`, `test_open_parent_still_gates_reopened_child`, `test_pr_owner_reopen_resumes_its_pr_once`, `test_reopen_without_newer_reopen_keeps_pr_guard`, `test_fenced_worker_shell_cannot_reopen`, `test_same_second_reopen_keeps_pr_guard`
+
+
+## Follow-up 2719: a re-review linked after the owner's checkpoint releases `active_pr` once
+
+Patch **2719**. Mirror entries: 2719.
+
+### Behavior
+
+- An owner that parked on a dependency review keeps its `review_checkpoint` (the awaited parents and captured PRs). If that review requested changes and someone else (an orchestrator, a chat) linked a fresh review card with `kanban_link`, the parent set no longer equalled the checkpoint's, so the owner stayed `active_pr`-held even after the re-review approved the exact current head.
+- Now a parent absent from the checkpoint counts as awaited when all hold: every `linked`/`unlinked` event for it on the owner's card is strictly after the park (same-second or earlier links stay held); it completed on a claimed run after the park with verdict approve or a change request; its metadata names a checkpointed PR via `pr` or `reviewed_pr`; and its `reviewed_sha` equals that PR's current GitHub `headRefOid`. Such parents join the named-awaited union.
+- Fail closed: unreadable link payloads or times, an unknown head (`gh` failure), a running or archived-unrun review, a missing PR name, a `head` key instead of `reviewed_sha`, and a pre-park link in the history keep the hold. Every other `resumes_review` check is unchanged, the next claim consumes the continuation, and a crash or reclaim re-arms `active_pr`.
+
+### How it works
+
+`resumes_review` (`kanban_dependency_review.py`) now requires only that the checkpointed parents all remain linked (in checkpoint order) instead of exact set equality, then calls `late_review_parents` for the rest. New `kanban_dependency_review_relink.py` implements `_linked_after`, `_current_head_review` and `pr_head`, which runs `gh pr view <url> --json headRefOid` through the existing `gh` argv helper (timeout 20 s) and caches results, failures included, for 60 s.
+
+### Code
+
+`hermes_cli/kanban_dependency_review.py`, `hermes_cli/kanban_dependency_review_relink.py` (new), `tests/hermes_cli/conftest.py` (keeps the head lookup offline by default).
+
+### Tests
+
+Source coverage, **not run in this mirror**: `tests/hermes_cli/test_kanban_dependency_review_relink.py`. Entry path: `kanban_db_dispatch.check_respawn_guard` and `resumes_review` on a temporary board with the GitHub head monkeypatched: release once at the current head (approve or request changes) and re-arm after claim/reclaim; stays held for another PR, stale head, no PR name, `head` key, non-approve verdict, still-running, unknown head, pre-park or same-second link, malformed link payload or time, archived unrun review, missing link event, and mangled checkpoint parents; a re-review joining a split two-PR review union; `pr_head` parsing and caching with a faked `subprocess.run`. A live `gh` call is **untested**.
+
+### Gotchas
+
+- The head check needs `gh` working on the dispatcher host; without it the late parent never counts and the hold stays.
+- A link made before the park but missing from the checkpoint does not count, even if its review approves the current head.

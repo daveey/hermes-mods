@@ -1,0 +1,629 @@
+From cb5ff8d4113320f9028b41d3a194ffe5ba318bfc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:19:52 +0000
+Subject: [PATCH] [daveey] Reserve offline SQLite paths without pinning board
+ cleanup
+
+---
+ hermes_cli/sqlite_offline_reservations.py     |  54 ++++++
+ hermes_cli/sqlite_safe_read.py                |  90 +++++++---
+ .../test_kanban_reader_close_isolation.py     |   8 +-
+ .../test_kanban_tracking_contention.py        | 107 ++++++++++++
+ .../test_sqlite_offline_reservations.py       | 101 +++++++++++
+ .../test_sqlite_reservation_adversarial.py    | 158 ++++++++++++++++++
+ 6 files changed, 491 insertions(+), 27 deletions(-)
+ create mode 100644 hermes_cli/sqlite_offline_reservations.py
+ create mode 100644 tests/hermes_cli/test_kanban_tracking_contention.py
+ create mode 100644 tests/hermes_cli/test_sqlite_offline_reservations.py
+ create mode 100644 tests/hermes_cli/test_sqlite_reservation_adversarial.py
+
+diff --git a/hermes_cli/sqlite_offline_reservations.py b/hermes_cli/sqlite_offline_reservations.py
+new file mode 100644
+index 0000000000..108fb48828
+--- /dev/null
++++ b/hermes_cli/sqlite_offline_reservations.py
+@@ -0,0 +1,54 @@
++"""Path reservations for raw SQLite I/O; registry operations need the caller's mutex.
++
++Completion uses an Event rather than reacquiring that mutex: a legacy caller may
++wait for a reservation while recursively owning the registry mutex. No SQLite
++handle can be opened between checking a reservation and registering its handle.
++"""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++import threading
++from urllib.parse import parse_qs, unquote, urlsplit
++
++
++_active: list[tuple[str, int, threading.Event]] = []
++
++
++def database_key(path, *, uri=False):
++    value = os.fsdecode(path)
++    if uri and value.startswith("file:"):
++        parsed = urlsplit(value)
++        value = unquote(parsed.path)
++        if parse_qs(parsed.query).get("mode") == ["memory"]:
++            return None
++    if value in ("", ":memory:"):
++        return None
++    return str(Path(value).resolve())
++
++
++def overlaps(left, right):
++    return left == right or any(
++        left == right + suffix or right == left + suffix
++        for suffix in ("-wal", "-shm")
++    )
++
++
++def active():
++    _active[:] = [entry for entry in _active if not entry[2].is_set()]
++    return _active
++
++
++def conflicts(key, *, raw=False, unknown=False):
++    ident = threading.get_ident()
++    return [entry for entry in active()
++            if (unknown or (key is not None and overlaps(key, entry[0])))
++            and (not raw or entry[1] != ident)]
++
++
++def owns_reservation():
++    return any(entry[1] == threading.get_ident() for entry in active())
++
++
++def reserve(key, finished):
++    _active.append((key, threading.get_ident(), finished))
+diff --git a/hermes_cli/sqlite_safe_read.py b/hermes_cli/sqlite_safe_read.py
+index d7983e0e6b..053bda678e 100644
+--- a/hermes_cli/sqlite_safe_read.py
++++ b/hermes_cli/sqlite_safe_read.py
+@@ -68,7 +68,7 @@ def _canonical_db_path(conn: sqlite3.Connection) -> Optional[str]:
+ def track_connection(path: Path | str) -> None:
+     """Record that this process holds a connection to *path* (prefer :func:`connect_tracked`; this
+     is for callers managing their own connection objects, and for tests)."""
+-    with _live_lock:
++    with _tracking_access(True, key=_key(path)):
+         _track_key(_key(path))
+ 
+ 
+@@ -178,16 +178,33 @@ def _tracking_factory(factory: type) -> type:
+     return cached
+ 
+ 
++def _tracking_busy():
++    exc = sqlite3.OperationalError("database is locked: SQLite tracking registry is busy")
++    exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
++    return exc
++
++
+ @contextlib.contextmanager
+-def _tracking_access(blocking):
+-    if not _live_lock.acquire(blocking=blocking):
+-        exc = sqlite3.OperationalError("database is locked: SQLite tracking registry is busy")
+-        exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+-        raise exc
+-    try:
+-        yield
+-    finally:
+-        _live_lock.release()
++def _tracking_access(blocking, *, key=None, unknown=False):
++    from hermes_cli import sqlite_offline_reservations as offline
++
++    # An Event wait cannot release an outer recursive acquisition. Refuse
++    # rather than pinning an owner that needs the registry to finish its body.
++    recursive = getattr(_live_lock, "_is_owned", lambda: True)()
++    while True:
++        if not _live_lock.acquire(blocking=blocking):
++            raise _tracking_busy()
++        try:
++            pending = offline.conflicts(key, unknown=unknown)
++            if not pending:
++                yield
++                return
++            must_refuse = not blocking or recursive or offline.owns_reservation()
++        finally:
++            _live_lock.release()
++        if must_refuse:
++            raise _tracking_busy()
++        pending[0][2].wait()
+ 
+ 
+ def connect_tracked(
+@@ -201,7 +218,14 @@ def connect_tracked(
+     opener = connect_fn if connect_fn is not None else sqlite3.connect
+     kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
+ 
+-    with _tracking_access(wait_for_tracking):
++    from hermes_cli import sqlite_offline_reservations as offline
++
++    key = offline.database_key(tracking_path if tracking_path is not None else path,
++                               uri=tracking_path is None and kwargs.get("uri", False))
++    # An arbitrary opener may ignore path and run SQL before returning. Without
++    # an explicit tracking_path, conservatively exclude every raw reservation.
++    with _tracking_access(wait_for_tracking, key=key,
++                          unknown=connect_fn is not None and tracking_path is None):
+         conn = opener(str(path), **kwargs)
+         try:
+             resolved = _key(tracking_path) if tracking_path is not None else _canonical_db_path(conn)
+@@ -285,7 +309,11 @@ def read_header_bytes_preopen(path: Path | str, *, length: int = 100, force: boo
+     sanctioned byte-level read of a database file, for first-open validation (real SQLite? zeroed?
+     overwritten?). Check and open/read/close run together under ``_live_lock`` so a connection
+     cannot be opened between deciding "nothing is live" and closing this descriptor."""
++    from hermes_cli import sqlite_offline_reservations as offline
++
+     with _live_lock:
++        if offline.conflicts(_key(path), raw=True):
++            return None  # a restore may currently be replacing this file
+         if not force and _live_main_key(_key(path)) is not None:
+             logger.debug(
+                 "refusing byte-level read of %s: a live connection exists in "
+@@ -305,19 +333,35 @@ def read_header_bytes_preopen(path: Path | str, *, length: int = 100, force: boo
+ 
+ @contextlib.contextmanager
+ def offline_file_access(path: Path | str, *, what: str = "read"):
+-    """Hold the connection-lifecycle lock across a raw read of a database file: checking
+-    :func:`has_live_connection` and *then* doing raw I/O is a check/use race (a connection opened
+-    in between loses its POSIX locks to the raw ``close()``). Held only for the raw I/O."""
+-    with _live_lock:
+-        main = _live_main_key(_key(path))
+-        if main is not None:
+-            subject = "it" if main == _key(path) else f"its main database {main}"
+-            raise LiveConnectionError(
+-                f"Refusing to {what} {path}: a connection to {subject} is still open "
+-                "in this process, and raw file access would cancel that "
+-                "connection's POSIX advisory locks. Close all database "
+-                "handles (stop the gateway/dashboard) and retry.")
++    """Reserve the file against new tracked opens, without locking unrelated I/O.
++
++    Check and reservation publication share the open/registration mutex. Real
++    close/untrack remains atomic under that mutex, but never waits for raw I/O.
++    """
++    from hermes_cli import sqlite_offline_reservations as offline
++
++    key = _key(path)
++    recursive = getattr(_live_lock, "_is_owned", lambda: True)()
++    finished = threading.Event()
++    try:
++        while True:
++            with _live_lock:
++                main = _live_main_key(key)
++                if main is not None:
++                    raise LiveConnectionError(
++                        f"Refusing to {what} {path}: a connection to {main} is still open "
++                        "in this process, and raw file access would cancel its POSIX locks.")
++                pending = offline.conflicts(key, raw=True)
++                if not pending:
++                    offline.reserve(key, finished)
++                    break
++                if recursive or offline.owns_reservation():
++                    raise LiveConnectionError("nested offline file access would wait on another owner")
++            pending[0][2].wait()
+         yield
++    finally:
++        # Completion cannot depend on a waiter releasing a recursive registry lock.
++        finished.set()
+ 
+ 
+ # ---------------------------------------------------------------------------------------------
+diff --git a/tests/hermes_cli/test_kanban_reader_close_isolation.py b/tests/hermes_cli/test_kanban_reader_close_isolation.py
+index 2d180ed999..e95667ae96 100644
+--- a/tests/hermes_cli/test_kanban_reader_close_isolation.py
++++ b/tests/hermes_cli/test_kanban_reader_close_isolation.py
+@@ -73,7 +73,7 @@ def test_reader_close_does_not_wait_for_busy_native_opener(tmp_path, monkeypatch
+         activity._reset_cache_for_tests()
+ 
+ 
+-def test_untracked_reader_close_while_native_open_waits_for_file_probe(tmp_path, monkeypatch):
++def test_untracked_reader_close_while_native_open_waits_for_registry(tmp_path, monkeypatch):
+     from hermes_cli import sqlite_safe_read
+ 
+     path = tmp_path / "board.db"
+@@ -102,14 +102,14 @@ def test_untracked_reader_close_while_native_open_waits_for_file_probe(tmp_path,
+         conn = connect_with_identity(path, timeout=30)
+         conn.close()
+ 
+-    other = tmp_path / "other.bin"
+-    other.write_bytes(b"data")
+     with ThreadPoolExecutor(max_workers=2) as pool:
+         reading = pool.submit(read)
+         assert ready.wait(10)
+         entered.clear()
+         try:
+-            with sqlite_safe_read.offline_file_access(other):
++            # Pin registry contention explicitly: unrelated raw I/O no longer
++            # owns this mutex. Keep the blocked-open assertion below unchanged.
++            with sqlite_safe_read._live_lock:
+                 opening = pool.submit(native)
+                 assert entered.wait(10)
+                 # Synchronize on the tracking-open boundary, not a sleep.
+diff --git a/tests/hermes_cli/test_kanban_tracking_contention.py b/tests/hermes_cli/test_kanban_tracking_contention.py
+new file mode 100644
+index 0000000000..f4b482d526
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_tracking_contention.py
+@@ -0,0 +1,107 @@
++"""Unrelated offline I/O must not pin a board's reader cleanup lock."""
++from concurrent.futures import ThreadPoolExecutor
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import kanban_dispatch_owner as owner
++from hermes_cli import kanban_generation as generation
++from hermes_cli import kanban_lockguard as guard
++from hermes_cli import sqlite_safe_read as tracking
++
++
++@pytest.mark.parametrize("operation", ["close", "failed_open", "recovery"])
++def test_tracking_wait_releases_board_for_idle_reader(tmp_path, monkeypatch, operation):
++    path = tmp_path / "board.db"
++    seed = sqlite3.connect(path)
++    seed.execute("PRAGMA journal_mode=WAL")
++    seed.close()
++    reader = guard.connect(path, check_same_thread=False)
++    ready, proceed, attempted = (threading.Event() for _ in range(3))
++    real_lock = tracking._live_lock
++    worker_ident = []
++
++    class ObservedTrackingLock:
++        def acquire(self, *args, **kwargs):
++            if worker_ident and threading.get_ident() == worker_ident[0] and proceed.is_set():
++                attempted.set()
++            return real_lock.acquire(*args, **kwargs)
++
++        def release(self):
++            real_lock.release()
++
++        def __enter__(self):
++            self.acquire()
++            return self
++
++        def __exit__(self, *_):
++            self.release()
++
++    monkeypatch.setattr(tracking, "_live_lock", ObservedTrackingLock())
++    original_prepare = generation.prepare_connection
++
++    def prepare(conn, timeout):
++        original_prepare(conn, timeout)
++        if operation == "failed_open":
++            ready.set()
++            assert proceed.wait(5)
++            raise ValueError("injected preparation failure")
++
++    monkeypatch.setattr(generation, "prepare_connection", prepare)
++
++    def work():
++        worker_ident.append(threading.get_ident())
++        if operation == "failed_open":
++            with pytest.raises(ValueError, match="injected"):
++                owner.connect_with_identity(path, timeout=0.1)
++            return
++        conn = owner.connect_with_identity(path, timeout=0.1)
++        ready.set()
++        assert proceed.wait(5)
++        try:
++            if operation == "close":
++                conn.close()
++            else:
++                conn._hermes_generation_shm = (-1, -1)
++                try:
++                    replacement = guard.connect(path, timeout=0.1)
++                except sqlite3.OperationalError as exc:
++                    assert generation.is_busy(exc)
++                else:
++                    replacement.close()
++        finally:
++            conn.close()
++
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        pending = pool.submit(work)
++        assert ready.wait(5)
++        with tracking.offline_file_access(tmp_path / "unrelated.db"):
++            proceed.set()
++            assert attempted.wait(5)
++            closing = pool.submit(reader.close)
++            # Record before releasing offline I/O; always release it before assertions/cleanup.
++            try:
++                closing.result(timeout=0.5)
++                closed = True
++            except TimeoutError:
++                closed = False
++        pending.result(timeout=5)
++        closing.result(timeout=5)
++    assert closed, f"{operation} propagated global tracking wait to idle reader close"
++    assert not tracking.has_live_connection(path)
++
++
++def test_lifecycle_busy_does_not_retry_readwrite(tmp_path, monkeypatch):
++    calls = []
++
++    def busy(database, **kwargs):
++        calls.append(database)
++        raise generation.BoardLifecycleBusy()
++
++    monkeypatch.setattr(guard, "connect", busy)
++    with pytest.raises(generation.BoardLifecycleBusy) as raised:
++        generation.open_ro(tmp_path / "board.db")
++    assert raised.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
++    assert len(calls) == 1
++    assert calls[0].endswith("?mode=ro")
+diff --git a/tests/hermes_cli/test_sqlite_offline_reservations.py b/tests/hermes_cli/test_sqlite_offline_reservations.py
+new file mode 100644
+index 0000000000..784ecabecc
+--- /dev/null
++++ b/tests/hermes_cli/test_sqlite_offline_reservations.py
+@@ -0,0 +1,101 @@
++"""Raw-I/O reservations exclude same-file opens without pinning unrelated closes."""
++from concurrent.futures import ThreadPoolExecutor
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import sqlite_safe_read as tracking
++
++
++@pytest.mark.parametrize("suffix", ["", "-wal", "-shm"])
++@pytest.mark.parametrize("alias", ["plain", "uri", "symlink"])
++def test_reserved_file_refuses_open_before_allocation(tmp_path, suffix, alias):
++    path = tmp_path / "space board.db"
++    sqlite3.connect(path).close()
++    target = path
++    options = {}
++    if alias == "uri":
++        target = path.as_uri() + "?mode=ro"
++        options["uri"] = True
++    elif alias == "symlink":
++        target = tmp_path / "alias.db"
++        target.symlink_to(path)
++    with tracking.offline_file_access(str(path) + suffix):
++        with pytest.raises(sqlite3.OperationalError) as caught:
++            tracking.connect_tracked(target, wait_for_tracking=False, **options)
++        assert caught.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
++        other = tracking.connect_tracked(tmp_path / "other.db", wait_for_tracking=False)
++        other.close()
++    conn = tracking.connect_tracked(target, **options)
++    conn.close()
++    assert not tracking.has_live_connection(path)
++
++
++def test_same_thread_wait_refuses_and_nested_raw_cleanup(tmp_path):
++    path = tmp_path / "board.db"
++    with pytest.raises(ValueError, match="body"):
++        with tracking.offline_file_access(path):
++            with tracking.offline_file_access(str(path) + "-wal"):
++                with pytest.raises(sqlite3.OperationalError):
++                    tracking.connect_tracked(path)
++            raise ValueError("body")
++    conn = tracking.connect_tracked(path)
++    with pytest.raises(tracking.LiveConnectionError):
++        with tracking.offline_file_access(path):
++            pytest.fail("live handle allowed raw access")
++    conn.close()
++    with tracking.offline_file_access(path):
++        pass
++
++
++def test_waiting_open_and_header_refusal(tmp_path, monkeypatch):
++    from hermes_cli import sqlite_offline_reservations as offline
++
++    path = tmp_path / "board.db"
++    seed = sqlite3.connect(path)
++    seed.execute("CREATE TABLE example (value)")
++    seed.close()
++    attempted = threading.Event()
++    original = offline.conflicts
++
++    def observe(*args, **kwargs):
++        pending = original(*args, **kwargs)
++        if pending and not kwargs.get("raw"):
++            attempted.set()
++        return pending
++
++    monkeypatch.setattr(offline, "conflicts", observe)
++
++    def open_close():
++        conn = tracking.connect_tracked(path)
++        conn.close()
++
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        with tracking.offline_file_access(path):
++            pending = pool.submit(open_close)
++            assert attempted.wait(5)
++            assert not pending.done()
++            assert pool.submit(tracking.read_header_bytes_preopen, path).result(5) is None
++        pending.result(5)
++    header = tracking.read_header_bytes_preopen(path)
++    assert header is not None and header.startswith(b"SQLite")
++
++
++def test_completion_does_not_need_registry_lock(tmp_path):
++    path = tmp_path / "board.db"
++    reserved, finish = threading.Event(), threading.Event()
++
++    def raw():
++        with tracking.offline_file_access(path):
++            reserved.set()
++            assert finish.wait(5)
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        pending = pool.submit(raw)
++        assert reserved.wait(5)
++        with tracking._live_lock:
++            finish.set()
++            pending.result(5)
++            conn = tracking.connect_tracked(path)
++            conn.close()
+diff --git a/tests/hermes_cli/test_sqlite_reservation_adversarial.py b/tests/hermes_cli/test_sqlite_reservation_adversarial.py
+new file mode 100644
+index 0000000000..1d07f68a77
+--- /dev/null
++++ b/tests/hermes_cli/test_sqlite_reservation_adversarial.py
+@@ -0,0 +1,158 @@
++"""Reservation admission, cancellation and recursive-owner regression cases."""
++from concurrent.futures import ThreadPoolExecutor
++import sqlite3
++import threading
++import time
++
++import pytest
++
++from hermes_cli import sqlite_safe_read as tracking
++from hermes_cli import sqlite_offline_reservations as offline
++
++
++def test_unrelated_board_open_progress_and_same_file_budget(tmp_path):
++    from hermes_cli.kanban_dispatch_owner import connect_with_identity
++
++    path = tmp_path / "reserved.db"
++
++    def open_close(target):
++        conn = connect_with_identity(target, timeout=0.1)
++        conn.close()
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        with tracking.offline_file_access(path):
++            pool.submit(open_close, tmp_path / "other.db").result(3)
++            start = time.monotonic()
++            with pytest.raises(sqlite3.OperationalError) as caught:
++                pool.submit(open_close, path).result(3)
++            assert caught.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
++            assert time.monotonic() - start < 2
++            assert not tracking.has_live_connection(path)
++
++
++def test_same_path_raw_owners_serialize(tmp_path, monkeypatch):
++    path = tmp_path / "reserved.db"
++    waiting = threading.Event()
++    original = offline.conflicts
++
++    def observe(*args, **kwargs):
++        pending = original(*args, **kwargs)
++        if pending:
++            waiting.set()
++        return pending
++
++    monkeypatch.setattr(offline, "conflicts", observe)
++
++    def raw():
++        with tracking.offline_file_access(path):
++            return "entered"
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        with tracking.offline_file_access(path):
++            pending = pool.submit(raw)
++            assert waiting.wait(3)
++            assert not pending.done()
++        assert pending.result(3) == "entered"
++
++
++def test_cross_owner_nested_cycle_refuses(tmp_path):
++    barrier = threading.Barrier(2)
++    release = threading.Barrier(2)
++
++    def raw(first, second):
++        with tracking.offline_file_access(first):
++            barrier.wait(3)
++            try:
++                with pytest.raises(tracking.LiveConnectionError):
++                    with tracking.offline_file_access(second):
++                        pytest.fail("cross-owner nested reservation admitted")
++                with pytest.raises(sqlite3.OperationalError):
++                    tracking.connect_tracked(second)
++            finally:
++                release.wait(3)
++
++    left, right = tmp_path / "left", tmp_path / "right"
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        a = pool.submit(raw, left, right)
++        b = pool.submit(raw, right, left)
++        a.result(5)
++        b.result(5)
++
++
++def test_unknown_custom_opener_refuses_before_allocation(tmp_path):
++    calls = []
++
++    def custom(path, **kwargs):
++        calls.append(path)
++        return sqlite3.connect(path, **kwargs)
++
++    with tracking.offline_file_access(tmp_path / "reserved.db"):
++        with pytest.raises(sqlite3.OperationalError):
++            tracking.connect_tracked(tmp_path / "other.db", connect_fn=custom)
++        assert calls == []
++        conn = tracking.connect_tracked(tmp_path / "other.db", connect_fn=custom,
++                                        tracking_path=tmp_path / "other.db")
++        conn.close()
++        assert len(calls) == 1
++
++
++def test_reserve_interruption_cleans_published_entry(tmp_path, monkeypatch):
++    path = tmp_path / "board.db"
++    original = offline.reserve
++
++    def interrupted(*args):
++        original(*args)
++        raise KeyboardInterrupt("after publish")
++
++    with monkeypatch.context() as patch:
++        patch.setattr(offline, "reserve", interrupted)
++        with pytest.raises(KeyboardInterrupt):
++            with tracking.offline_file_access(path):
++                pytest.fail("entered after interrupt")
++    conn = tracking.connect_tracked(path, wait_for_tracking=False)
++    conn.close()
++
++
++@pytest.mark.parametrize("target", ["file:relative%20board.db?mode=rwc", "file:relative%20board.db?cache=private"])
++def test_relative_uri_resolves_to_reserved_target(tmp_path, monkeypatch, target):
++    monkeypatch.chdir(tmp_path)
++    with tracking.offline_file_access(tmp_path / "relative board.db"):
++        with pytest.raises(sqlite3.OperationalError):
++            tracking.connect_tracked(target, uri=True, wait_for_tracking=False)
++
++
++@pytest.mark.parametrize("target", [":memory:", "file::memory:?cache=shared", "file:named?mode=memory&cache=shared", ""])
++def test_memory_and_temporary_databases_do_not_conflict(tmp_path, target):
++    with tracking.offline_file_access(tmp_path / "named"):
++        conn = tracking.connect_tracked(target, uri=True, wait_for_tracking=False)
++        conn.close()
++
++
++def test_manual_tracking_cannot_publish_during_reservation(tmp_path):
++    path = tmp_path / "board.db"
++    with tracking.offline_file_access(path):
++        with pytest.raises(sqlite3.OperationalError):
++            tracking.track_connection(path)
++    assert not tracking.has_live_connection(path)
++
++
++def test_recursive_registry_wait_refuses_without_pinning_owner(tmp_path):
++    path = tmp_path / "board.db"
++    reserved, release = threading.Event(), threading.Event()
++
++    def owner():
++        with tracking.offline_file_access(path):
++            reserved.set()
++            assert release.wait(3)
++            assert not tracking.has_live_connection(path)
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        pending = pool.submit(owner)
++        assert reserved.wait(3)
++        try:
++            with tracking._live_lock:
++                with pytest.raises(sqlite3.OperationalError):
++                    tracking.connect_tracked(path)
++        finally:
++            release.set()
++        pending.result(3)
+-- 
+2.43.0
+

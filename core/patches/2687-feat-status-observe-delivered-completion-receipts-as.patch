@@ -1,0 +1,1325 @@
+From 5dea5b2a590bf8eb0d563fed12bb67c0e70ee18b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:27:15 +0000
+Subject: [PATCH] feat(status): observe delivered completion receipts as done
+ evidence via the landed receipt seam [daveey]
+
+Pure completion verdict extracted from observe_owner_task, batched receipt/verifier
+reads, and a done adapter for session_tasks and sidebar counts. Done requires a
+verified, admitted, all-delivered receipt bound to the exact closing run.
+No new store, writer, schema or outcome precedence.
+---
+ hermes_cli/kanban_completion_inputs.py        | 143 ++++
+ .../kanban_completion_receipt_projection.py   |  77 ++-
+ hermes_cli/kanban_execution_observations.py   |  10 +-
+ hermes_cli/kanban_execution_receipt.py        | 127 ++++
+ hermes_cli/kanban_origin_ledger.py            | 102 +--
+ hermes_cli/kanban_session_activity.py         |   9 +
+ .../kanban_session_activity_recent_done.py    |  26 +-
+ .../test_kanban_execution_receipt.py          | 624 ++++++++++++++++++
+ 8 files changed, 1058 insertions(+), 60 deletions(-)
+ create mode 100644 hermes_cli/kanban_completion_inputs.py
+ create mode 100644 hermes_cli/kanban_execution_receipt.py
+ create mode 100644 tests/hermes_cli/test_kanban_execution_receipt.py
+
+diff --git a/hermes_cli/kanban_completion_inputs.py b/hermes_cli/kanban_completion_inputs.py
+new file mode 100644
+index 0000000000..e00d385252
+--- /dev/null
++++ b/hermes_cli/kanban_completion_inputs.py
+@@ -0,0 +1,143 @@
++"""Batched, read-only inputs of the owner's completion verdict.
++
++``kanban_origin_ledger.completion_verdict`` is the single verdict. This module only reads the rows it
++needs for many cards at once inside the caller's transaction: at most five SELECTs per 500 cards (tasks,
++latest completion, latest run, id-bound judge/acceptance events, and archive events only when an
++archived card is present), plus the board's cached receipt epoch. It adds no store and never writes.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from typing import NamedTuple
++
++from hermes_cli.kanban_origin_ledger import _receipt_epoch, completion_verdict
++
++CHUNK = 500
++MAX_PAYLOAD = 32768
++
++
++class Completion(NamedTuple):
++    status: str | None
++    verified: bool
++    legacy: bool
++    event_id: int | None
++    event_run_id: int | None
++    run_id: int | None
++    run_uid: str | None
++    assignee: str | None
++    session_id: str | None
++
++
++def _columns(conn, table):
++    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
++
++
++def _select(columns, prefix, wanted):
++    return ",".join(f"{prefix}{c}" if c in columns else f"NULL AS {c}" for c in wanted)
++
++
++def _rows(conn, sql, args):
++    cursor = conn.execute(sql, args)
++    cursor.row_factory = sqlite3.Row
++    return cursor
++
++
++def read_completions(conn, ids) -> dict[str, Completion]:
++    """``{task_id: Completion}`` for every id that exists; the verdict fails closed per card."""
++    ids = list(dict.fromkeys(ids))
++    out: dict[str, Completion] = {}
++    if not ids:
++        return out
++    task_cols, run_cols, event_cols = (_columns(conn, t) for t in ("tasks", "task_runs", "task_events"))
++    if not task_cols or not event_cols or not run_cols:
++        return out
++    task_fields = _select(task_cols, "t.", ("id", "status", "completed_at", "current_run_id", "goal_mode",
++                                            "completion_contract", "title", "body", "assignee", "session_id"))
++    run_fields = _select(run_cols, "r.", ("id", "task_id", "uid", "status", "outcome", "ended_at", "summary"))
++    event_fields = ",".join(("e.id", "e.task_id", "e.run_id", "e.kind", "e.created_at",
++                             f"substr(e.payload,1,{MAX_PAYLOAD + 1}) AS payload"))
++    epoch = []
++    for start in range(0, len(ids), CHUNK):
++        chunk = ids[start:start + CHUNK]
++        marks = ",".join("?" for _ in chunk)
++        tasks = {r["id"]: r for r in _rows(conn, f"SELECT {task_fields} FROM tasks t WHERE t.id IN ({marks})", chunk)}
++        completed = {r["task_id"]: r for r in _rows(
++            conn, f"SELECT * FROM (SELECT {event_fields}, ROW_NUMBER() OVER (PARTITION BY e.task_id ORDER BY e.id DESC) "
++                  f"AS _rank FROM task_events e WHERE e.task_id IN ({marks}) AND e.kind='completed') WHERE _rank=1",
++            chunk)}
++        runs = {r["task_id"]: r for r in _rows(
++            conn, f"SELECT * FROM (SELECT {run_fields}, ROW_NUMBER() OVER (PARTITION BY r.task_id ORDER BY r.id DESC) "
++                  f"AS _rank FROM task_runs r WHERE r.task_id IN ({marks})) WHERE _rank=1", chunk)}
++        archived_ids = [t for t, r in tasks.items() if r["status"] == "archived" and t in completed]
++        archived = {}
++        if archived_ids:
++            amarks = ",".join("?" for _ in archived_ids)
++            archived = {r["task_id"]: r for r in _rows(
++                conn, f"SELECT * FROM (SELECT {event_fields}, ROW_NUMBER() OVER (PARTITION BY e.task_id "
++                      f"ORDER BY e.id DESC) AS _rank FROM task_events e WHERE e.task_id IN ({amarks}) "
++                      "AND e.kind='archived') WHERE _rank=1", archived_ids)}
++        refs = set()
++        for row in completed.values():
++            try:
++                payload = _payload(row["payload"])
++            except ValueError:
++                continue  # that card's verdict fails closed in _completion
++            for key in ("pr_acceptance_event_id", "goal_verified_event_id"):
++                if type(payload.get(key)) is int:
++                    refs.add(payload[key])
++        bound = {}
++        if refs:
++            rmarks = ",".join("?" for _ in refs)
++            bound = {r["id"]: r for r in _rows(
++                conn, f"SELECT {event_fields} FROM task_events e WHERE e.id IN ({rmarks}) "
++                      "AND e.kind IN ('pr_acceptance','goal_verified')", sorted(refs))}
++        for tid, task in tasks.items():
++            out[tid] = _completion(conn, tid, task, completed.get(tid), runs.get(tid), archived.get(tid), bound, epoch)
++    return out
++
++
++def _payload(raw):
++    """Decoded event payload; oversized or malformed payloads are not evidence (fail closed)."""
++    if raw is None:
++        return {}
++    if not isinstance(raw, str) or len(raw) > MAX_PAYLOAD:
++        raise ValueError("completion payload unavailable")
++    value = json.loads(raw)
++    if not isinstance(value, dict):
++        raise ValueError("completion payload is not an object")
++    return value
++
++
++def _completion(conn, tid, task, event, run, archived, bound, epoch):
++    row = (task["status"], task["completed_at"], task["current_run_id"], task["goal_mode"],
++           task["completion_contract"])
++    event_t = None if event is None else (event["id"], event["run_id"], event["created_at"], event["payload"])
++    run_t = None if run is None else (run["id"], run["status"], run["outcome"], run["ended_at"], run["summary"])
++    archived_t = None if archived is None else (archived["id"], archived["payload"])
++
++    def bound_event(kind, event_id, before):
++        found = bound.get(event_id)
++        if found is None or found["task_id"] != tid or found["kind"] != kind or not event_id < before:
++            return None
++        return found["payload"], found["run_id"]
++
++    def receipt_epoch():
++        if not epoch:
++            epoch.append(_receipt_epoch(conn))
++        return epoch[0]
++
++    try:
++        verified, legacy, _terminal = completion_verdict(
++            tid, row, event_t, run_t, archived_t, bound_event=bound_event,
++            current_task=lambda: (task["title"], task["body"]), receipt_epoch=receipt_epoch)
++    except (ValueError, TypeError):
++        verified = legacy = False  # one card's malformed evidence is unverified, never a failed batch
++    return Completion(task["status"], verified, legacy, None if event is None else event["id"],
++                      None if event is None else event["run_id"], None if run is None else run["id"],
++                      None if run is None else run["uid"], task["assignee"], task["session_id"])
++
++
++def read_verdicts(conn, ids) -> dict[str, tuple[bool, bool]]:
++    """``{task_id: (verified, legacy)}``, the same verdict ``observe_owner_task`` publishes."""
++    return {tid: (c.verified, c.legacy) for tid, c in read_completions(conn, ids).items()}
+diff --git a/hermes_cli/kanban_completion_receipt_projection.py b/hermes_cli/kanban_completion_receipt_projection.py
+index 9fbbc01d73..3d8968f827 100644
+--- a/hermes_cli/kanban_completion_receipt_projection.py
++++ b/hermes_cli/kanban_completion_receipt_projection.py
+@@ -8,6 +8,7 @@ from __future__ import annotations
+ import json
+ import math
+ import re
++import sqlite3
+ 
+ from hermes_completion_receipt import validate_completion_receipt
+ 
+@@ -70,23 +71,17 @@ def validate_receipt_source(value, receipt, *, expected_ref=None):
+                                      'attached_from_workspace') if key in out}
+ 
+ 
+-def read_completed(conn, task_id, *, gateway, board):
+-    """Return receipt plus source-qualified provenance, or None (legacy/invalid).
+-
+-    Caller supplies the authoritative source namespace, not the observing host.
+-    Source event/run UIDs survive replica integer remapping; integer fallbacks
+-    are explicitly store-local. This is a projection, never a second writer.
+-    """
+-    if not gateway or not board:
+-        raise ValueError("completion_receipt: projection requires the source gateway and board")
++def _receipt_columns(conn):
+     run_columns = {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
+-    run_uid = "r.uid" if "uid" in run_columns else "NULL"
+-    row = conn.execute(
+-        f"SELECT e.*, r.metadata AS receipt_metadata, r.outcome AS receipt_outcome, "
+-        f"{run_uid} AS receipt_run_uid FROM task_events e "
+-        "LEFT JOIN task_runs r ON r.id=e.run_id AND r.task_id=e.task_id "
+-        "WHERE e.task_id=? AND e.kind='completed' ORDER BY e.created_at DESC,e.id DESC LIMIT 1",
+-        (task_id,)).fetchone()
++    return "r.uid" if "uid" in run_columns else "NULL"
++
++
++_COMPLETED_FIELDS = ("r.metadata AS receipt_metadata, r.outcome AS receipt_outcome, "
++                     "{run_uid} AS receipt_run_uid")
++
++
++def _completed_receipt(row, task_id, *, gateway, board):
++    """Project one latest ``completed`` event row (with its run) into receipt + source, or None."""
+     if row is None or row["receipt_outcome"] != "completed":
+         return None
+     try:
+@@ -122,6 +117,56 @@ def read_completed(conn, task_id, *, gateway, board):
+     return {"completion_receipt": receipt, "completion_receipt_source": source}
+ 
+ 
++def read_completed(conn, task_id, *, gateway, board):
++    """Return receipt plus source-qualified provenance, or None (legacy/invalid).
++
++    Caller supplies the authoritative source namespace, not the observing host.
++    Source event/run UIDs survive replica integer remapping; integer fallbacks
++    are explicitly store-local. This is a projection, never a second writer.
++    """
++    if not gateway or not board:
++        raise ValueError("completion_receipt: projection requires the source gateway and board")
++    fields = _COMPLETED_FIELDS.format(run_uid=_receipt_columns(conn))
++    row = conn.execute(
++        f"SELECT e.*, {fields} FROM task_events e "
++        "LEFT JOIN task_runs r ON r.id=e.run_id AND r.task_id=e.task_id "
++        "WHERE e.task_id=? AND e.kind='completed' ORDER BY e.created_at DESC,e.id DESC LIMIT 1",
++        (task_id,)).fetchone()
++    return _completed_receipt(row, task_id, gateway=gateway, board=board)
++
++
++def read_completed_many(conn, task_ids, *, board, gateway):
++    """:func:`read_completed` for many tasks in a fixed number of SELECTs per 500 (never one per task).
++
++    ``gateway`` is the fallback source namespace, exactly as :func:`read_inventory` uses it: a synced
++    task's ``created_on`` wins. Returns ``{task_id: result-or-None}`` for every requested id.
++    """
++    if not gateway or not board:
++        raise ValueError("completion_receipt: projection requires the source gateway and board")
++    ids = list(dict.fromkeys(task_ids))
++    out = {tid: None for tid in ids}
++    if not ids:
++        return out
++    fields = _COMPLETED_FIELDS.format(run_uid=_receipt_columns(conn))
++    created_on = "created_on" in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    for start in range(0, len(ids), 500):
++        chunk = ids[start:start + 500]
++        marks = ",".join("?" for _ in chunk)
++        sources = {r[0]: r[1] for r in conn.execute(
++            f"SELECT id, {'created_on' if created_on else 'NULL'} FROM tasks WHERE id IN ({marks})", chunk)}
++        cursor = conn.execute(
++            f"SELECT * FROM (SELECT e.*, {fields}, ROW_NUMBER() OVER (PARTITION BY e.task_id "
++            "ORDER BY e.created_at DESC, e.id DESC) AS _rank FROM task_events e "
++            "LEFT JOIN task_runs r ON r.id=e.run_id AND r.task_id=e.task_id "
++            f"WHERE e.task_id IN ({marks}) AND e.kind='completed') WHERE _rank=1", chunk)
++        cursor.row_factory = sqlite3.Row
++        for row in cursor:
++            tid = row["task_id"]
++            source = (sources.get(tid) or gateway)
++            out[tid] = _completed_receipt(row, tid, gateway=source, board=board)
++    return out
++
++
+ def remote_fields(task, *, gateway, profile, board, task_id):
+     """Transport admitted historical facts, never a fresh completion verdict.
+ 
+diff --git a/hermes_cli/kanban_execution_observations.py b/hermes_cli/kanban_execution_observations.py
+index 22f65802b1..317d33ba3b 100644
+--- a/hermes_cli/kanban_execution_observations.py
++++ b/hermes_cli/kanban_execution_observations.py
+@@ -20,6 +20,7 @@ _log = logging.getLogger(__name__)
+ ADAPTER_ERRORS = (OSError, RuntimeError, LookupError, ArithmeticError, TypeError, ValueError, AttributeError,
+                   ImportError, sqlite3.Error)
+ 
++DONE_PREFIX = "done:"
+ _STATE = {"running": "running", "ready": "queued", "todo": "queued", "scheduled": "waiting",
+           "blocked": "waiting", "triage": "waiting", "review": "waiting", "done": "done",
+           "failed": "failed", "cancelled": "cancelled", "archived": "cancelled"}
+@@ -82,6 +83,10 @@ def card(row, *, gateway=None, profile=None, now=None):
+     reported done cannot become verified completion here.
+     """
+     now = time.time() if now is None else now
++    done = row.get("_execution_done")
++    if isinstance(done, dict) and not row.get("remote"):
++        # Positive delivered-completion evidence (kanban_execution_receipt); nothing else is ever 'done'.
++        return project(done, now=now, source_class="sidebar")
+     source = row.get("_execution_source")
+     if isinstance(source, dict) and not row.get("remote"):
+         from hermes_cli.kanban_execution_source import raw
+@@ -164,6 +169,7 @@ def add_cards(rows, *, now=None):
+         _merge(row, [observation])
+         row.pop("_execution_event", None)
+         row.pop("_execution_source", None)
++        row.pop("_execution_done", None)
+         row.pop("_execution_error", None)
+     return rows
+ 
+@@ -231,7 +237,9 @@ def count_snapshot(row, keys, *, now=None, evidence=None):
+     """
+     rows = []
+     evidence = evidence or {}
+-    for key in sorted({key for key, bucket, _ in keys if bucket in {"active", "blocked"}}):
++    # ``done:`` evidence is a done-bucket observation: it is attached, never counted as open work.
++    done = {key for key in evidence if key.startswith(DONE_PREFIX)}
++    for key in sorted({key for key, bucket, _ in keys if bucket in {"active", "blocked"}} | done):
+         if key in evidence:
+             rows.append({"_raw": evidence[key]})
+             continue
+diff --git a/hermes_cli/kanban_execution_receipt.py b/hermes_cli/kanban_execution_receipt.py
+new file mode 100644
+index 0000000000..fd803b4d9b
+--- /dev/null
++++ b/hermes_cli/kanban_execution_receipt.py
+@@ -0,0 +1,127 @@
++"""Done-work observations from the landed completion-receipt seam; no store, writer or precedence.
++
++A card is observed ``done`` only when ALL hold: the owner's completion verdict is verified (not the
++legacy release basis), the admitted ``completion_receipt`` (``kanban_completion_receipt_projection``)
++has every item ``delivered``, and receipt, verified completion event and closing run are one exact,
++qualified execution. Anything else yields no record here: the caller's existing path keeps it
++``unknown/unverified_completion``. Archive and cancellation are never success. The receipt is
++re-derived from append-only owner rows; when freshness lapses ``project`` keeps it as history.
++"""
++from __future__ import annotations
++
++from hermes_cli.execution_observations import epoch
++
++DONE_TTL_SECONDS = 180
++
++
++def _delivered(receipt):
++    items = receipt.get("items") if isinstance(receipt, dict) else None
++    return bool(items) and all(isinstance(i, dict) and i.get("disposition") == "delivered" for i in items)
++
++
++def done_raw(tid, fact, bundle, *, board, gateway, profile, observed_at):
++    """Raw v1 done observation for one card, or None when delivery is not established. Pure."""
++    if fact is None or fact.status != "done" or not fact.verified or fact.legacy or not bundle:
++        return None
++    if not (gateway and profile and board and epoch(observed_at)):
++        return None
++    receipt, source = bundle["completion_receipt"], bundle["completion_receipt_source"]
++    if not _delivered(receipt) or source.get("ref") != f"@task:{board}@{gateway}/{tid}":
++        return None
++    # One execution: the receipt's event and run are the verified completion's, which closed the latest run.
++    if not (type(fact.event_id) is int and fact.event_id == source["event_id"]
++            and fact.event_run_id is not None and fact.event_run_id == source["run_id"] == fact.run_id):
++        return None
++    if fact.run_uid:
++        if source.get("run_uid") != fact.run_uid:
++            return None
++        run_id = fact.run_uid
++    elif source.get("run_uid") is None:
++        run_id = fact.run_id  # unsynced board: the local run id is the portable-enough attempt
++    else:
++        return None
++    identity = {"gateway": gateway, "profile": profile, "board": board, "kind": "card", "work_id": tid,
++                "run_id": run_id}
++    ref = f"{source['ref']}#event:{source.get('event_uid') or source['event_id']}"
++    owner = {"gateway": gateway, "profile": profile}
++    if fact.assignee:
++        owner["assignee"] = fact.assignee
++    if fact.session_id:
++        owner["session"] = fact.session_id
++    return {"version": 1, "identity": identity, "owner": owner, "state": "done", "source": "kanban.card",
++            "source_revision": ref, "evidence_refs": [ref], "observed_at": observed_at,
++            "valid_until": observed_at + DONE_TTL_SECONDS, "last_activity": source["completed_at"],
++            "last_activity_kind": "completed", "last_progress": None, "last_progress_kind": None,
++            "last_progress_ref": None, "wait": None,
++            "delivery_receipt": {"verified": True, "disposition": "delivered", "evidence_ref": ref,
++                                 "identity": dict(identity)}}
++
++
++def assemble_done(conn, ids, *, board, gateway, profile, observed_at):
++    """``{task_id: raw}`` for the done cards among ``ids`` whose delivery is established.
++
++    A fixed number of SELECTs per 500 cards inside the caller's read transaction, and only for ids
++    the caller already knows are done. Must run on an authoritative LOCAL board, like
++    ``kanban_execution_source.assemble``: a pulled mirror cannot attest its owner.
++    """
++    from hermes_cli.kanban_completion_inputs import read_completions
++    from hermes_cli.kanban_completion_receipt_projection import read_completed_many
++
++    ids = list(dict.fromkeys(ids))
++    if not ids or not (gateway and profile):
++        return {}
++    facts = read_completions(conn, ids)
++    candidates = [tid for tid, f in facts.items() if f.status == "done" and f.verified and not f.legacy]
++    bundles = read_completed_many(conn, candidates, board=board, gateway=gateway)
++    out = {}
++    for tid in candidates:
++        raw = done_raw(tid, facts[tid], bundles.get(tid), board=board, gateway=gateway, profile=profile,
++                       observed_at=observed_at)
++        if raw is not None:
++            out[tid] = raw
++    return out
++
++
++def counts_done(conn, *, board, gateway, profile, observed_at, counted_sub_clause, authority, window):
++    """Sidebar/collector entry: ``(pairs, {task_id: raw})`` for done cards of linked sessions in ``window``.
++
++    Reads inside the board's existing count transaction: two SELECTs for the (session, card) pairs and the
++    constant batch of :func:`assemble_done`. Optional evidence: any adapter failure, or a non-authoritative
++    mirror (``authority`` raises), yields nothing, so done is simply not observed (never inferred).
++    """
++    from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS
++    from hermes_cli.kanban_session_activity_recent_done import done_pairs_on
++
++    try:
++        authority(conn)
++        pairs = done_pairs_on(conn, observed_at - window, counted_sub_clause)
++        raws = assemble_done(conn, {tid for _, tid in pairs}, board=board, gateway=gateway, profile=profile,
++                             observed_at=observed_at)
++    except ADAPTER_ERRORS:
++        import logging
++        logging.getLogger(__name__).debug("done evidence unavailable for board %s", board, exc_info=True)
++        return [], {}
++    return [(sid, tid) for sid, tid in pairs if tid in raws], raws
++
++
++def attach_done(conn, found, *, board, gateway, profile, observed_at):
++    """Task-list entry: set ``_execution_done`` on listed done cards whose delivery is established.
++
++    A failed read marks only those done cards ``_execution_error`` (explicit unknown); open cards and asks
++    are untouched. Rows already failed by the open-card read are left to that failure.
++    """
++    from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS
++
++    ids = [tid for tid, row in found.items() if row.get("status") == "done" and not row.get("_execution_error")]
++    if not ids:
++        return
++    try:
++        raws = assemble_done(conn, ids, board=board, gateway=gateway, profile=profile, observed_at=observed_at)
++    except ADAPTER_ERRORS:
++        import logging
++        logging.getLogger(__name__).debug("done evidence unavailable for board %s", board, exc_info=True)
++        for tid in ids:
++            found[tid]["_execution_error"] = True
++        return
++    for tid, raw in raws.items():
++        found[tid]["_execution_done"] = raw
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 16fc65e71f..9bc4994f6b 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -111,42 +111,20 @@ def obligations(path: Path, *, gateway: str, profile: str, sessions: list[str])
+     return result
+ 
+ 
+-def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> dict:
+-    """Attach owner evidence during the collector's existing read transaction.
+-
+-    The collector must call this on the owner, never on a replica. A completion
+-    event is evidence of the core lifecycle gate; status alone (including an
+-    archive) is not. Goal-mode also requires a current, completion-bound
+-    judge-success receipt; unavailable judges never supply release evidence.
++def completion_verdict(task_id, row, event, run, archived, *, bound_event, current_task, receipt_epoch):
++    """Whether a terminal owner record carries verified completion evidence: ``(verified, legacy, terminal)``.
++
++    Pure over rows already read, so a single card and a whole batch share one verdict. ``row`` is
++    ``(status, completed_at, current_run_id, goal_mode, completion_contract)``; ``event`` the latest
++    ``completed`` event ``(id, run_id, created_at, payload)``; ``run`` the latest run
++    ``(id, status, outcome, ended_at, summary)``; ``archived`` the latest ``archived`` event
++    ``(id, payload)``. Lookups return pre-read data and are invoked only where the gate needs them:
++    ``bound_event(kind, event_id, before_id)`` is that task's ``kind`` event with that id, earlier than
++    the completion, as ``(payload, run_id)``; ``current_task()`` is ``(title, body)``;
++    ``receipt_epoch()`` is the board's first judge receipt ``(id, created_at)`` or None.
+     """
+-    if not conn.in_transaction:
+-        raise ValueError('origin_observation_snapshot_required')
+-    row = conn.execute(
+-        "SELECT status,completed_at,current_run_id,goal_mode,completion_contract FROM tasks WHERE id=?",
+-        (task['id'],)).fetchone()
+-    if row is None or row[0] != task.get('status'):
+-        raise ValueError('origin_observation_task_changed')
+-    supplied = task.get('origin_bindings', [])
+-    has_intents = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='origin_creation_intents'").fetchone()
+-    authoritative = [json.loads(r[0]) for r in conn.execute(
+-        'SELECT binding_json FROM origin_creation_intents WHERE task_id=?', (task['id'],))] if has_intents else []
+-    if (not isinstance(supplied, list) or any(not isinstance(m, dict) for m in supplied)
+-            or sorted(_json({k: v for k, v in m.items() if k != 'publication_version'}) for m in supplied)
+-            != sorted(_json(m) for m in authoritative)
+-            or any(m.get('owner') != {**{k: task.get(k) for k in ('gateway', 'profile', 'board')},
+-                                       'task_id': task['id']} for m in authoritative)):
+-        raise ValueError('origin_observation_binding_changed')
+-    event = conn.execute(
+-        "SELECT id,run_id,created_at,payload FROM task_events WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
+-        (task['id'],)).fetchone()
+-    run = conn.execute(
+-        "SELECT id,status,outcome,ended_at,summary FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+-        (task['id'],)).fetchone()
+     terminal = row[0] == 'done'
+     if row[0] == 'archived' and event:
+-        archived = conn.execute(
+-            "SELECT id,payload FROM task_events WHERE task_id=? AND kind='archived' ORDER BY id DESC LIMIT 1",
+-            (task['id'],)).fetchone()
+         archive_payload = json.loads(archived[1] or '{}') if archived else None
+         terminal = bool(archived and archived[0] > event[0] and isinstance(archive_payload, dict)
+                         and archive_payload.get('source_status') == 'done')
+@@ -154,9 +132,7 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+     if event and not contract_verified:
+         completed = json.loads(event[3] or '{}')
+         acceptance_id = completed.get('pr_acceptance_event_id') if isinstance(completed, dict) else None
+-        acceptance = conn.execute(
+-            "SELECT payload,run_id FROM task_events WHERE id=? AND task_id=? AND kind='pr_acceptance' AND id<?",
+-            (acceptance_id, task['id'], event[0])).fetchone() if type(acceptance_id) is int else None
++        acceptance = bound_event('pr_acceptance', acceptance_id, event[0]) if type(acceptance_id) is int else None
+         if acceptance and acceptance[1] is not None and acceptance[1] == event[1]:
+             receipt = json.loads(acceptance[0] or '{}')
+             # [daveey] A contract_waiver is accepted only on a no_required_checks receipt (kanban_pr_acceptance_store).
+@@ -174,15 +150,13 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+     if row[3] and event:
+         completed = json.loads(event[3] or '{}')
+         receipt_id = completed.get('goal_verified_event_id') if isinstance(completed, dict) else None
+-        receipt = conn.execute(
+-            "SELECT payload,run_id FROM task_events WHERE id=? AND task_id=? AND kind='goal_verified' AND id<?",
+-            (receipt_id, task['id'], event[0])).fetchone() if type(receipt_id) is int else None
++        receipt = bound_event('goal_verified', receipt_id, event[0]) if type(receipt_id) is int else None
+         if receipt and receipt[1] is not None and receipt[1] == event[1]:
+             from hermes_cli.kanban_db import _first_line
+             from hermes_cli.kanban_goal_receipt import digest
+             proof = json.loads(receipt[0] or '{}')
+             subject = proof.get('subject') if isinstance(proof, dict) else None
+-            current = conn.execute('SELECT title,body FROM tasks WHERE id=?', (task['id'],)).fetchone()
++            current = current_task()
+             recorded = (completed.get('summary') or completed.get('result') or '').strip()
+             judged = subject.get('evidence') if isinstance(subject, dict) else None
+             # [daveey] The completed event keeps only the handoff's first line (400 chars). A longer or multi-line
+@@ -195,7 +169,7 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+                 and run is not None and run[0] == event[1]
+                 and judged == (run[4] or '').strip()))
+             goal_verified = bool(isinstance(subject, dict) and proof.get('snapshot') == digest(subject)
+-                                 and subject.get('task_id') == task['id']
++                                 and subject.get('task_id') == task_id
+                                  and subject.get('title') == current[0] and subject.get('body') == current[1]
+                                  and subject.get('contract') == row[4]
+                                  and evidence_ok)
+@@ -210,7 +184,7 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+         # event (when the board still has it) must be the one that closed this run; a board whose completion
+         # events were lost keeps only the closing run, which ``complete_task`` writes in the same transaction.
+         # Receipt-era cards and boards that never recorded a receipt get no legacy pass.
+-        epoch = _receipt_epoch(conn)
++        epoch = receipt_epoch()
+         if epoch is not None:
+             if event:
+                 legacy = bool(terminal and event[0] < epoch[0] and event[1] == run[0] and event[2] >= row[1])
+@@ -220,6 +194,50 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+                 contract_ok = row[4] == 'local-only'
+             legacy = bool(legacy and contract_ok)
+             verified = legacy
++    return verified, legacy, terminal
++
++
++def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> dict:
++    """Attach owner evidence during the collector's existing read transaction.
++
++    The collector must call this on the owner, never on a replica. A completion
++    event is evidence of the core lifecycle gate; status alone (including an
++    archive) is not. Goal-mode also requires a current, completion-bound
++    judge-success receipt; unavailable judges never supply release evidence.
++    """
++    if not conn.in_transaction:
++        raise ValueError('origin_observation_snapshot_required')
++    row = conn.execute(
++        "SELECT status,completed_at,current_run_id,goal_mode,completion_contract FROM tasks WHERE id=?",
++        (task['id'],)).fetchone()
++    if row is None or row[0] != task.get('status'):
++        raise ValueError('origin_observation_task_changed')
++    supplied = task.get('origin_bindings', [])
++    has_intents = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='origin_creation_intents'").fetchone()
++    authoritative = [json.loads(r[0]) for r in conn.execute(
++        'SELECT binding_json FROM origin_creation_intents WHERE task_id=?', (task['id'],))] if has_intents else []
++    if (not isinstance(supplied, list) or any(not isinstance(m, dict) for m in supplied)
++            or sorted(_json({k: v for k, v in m.items() if k != 'publication_version'}) for m in supplied)
++            != sorted(_json(m) for m in authoritative)
++            or any(m.get('owner') != {**{k: task.get(k) for k in ('gateway', 'profile', 'board')},
++                                       'task_id': task['id']} for m in authoritative)):
++        raise ValueError('origin_observation_binding_changed')
++    event = conn.execute(
++        "SELECT id,run_id,created_at,payload FROM task_events WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
++        (task['id'],)).fetchone()
++    run = conn.execute(
++        "SELECT id,status,outcome,ended_at,summary FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
++        (task['id'],)).fetchone()
++    archived = conn.execute(
++        "SELECT id,payload FROM task_events WHERE task_id=? AND kind='archived' ORDER BY id DESC LIMIT 1",
++        (task['id'],)).fetchone() if row[0] == 'archived' and event else None
++    verified, legacy, terminal = completion_verdict(
++        task['id'], row, event, run, archived,
++        bound_event=lambda kind, event_id, before: conn.execute(
++            "SELECT payload,run_id FROM task_events WHERE id=? AND task_id=? AND kind=? AND id<?",
++            (event_id, task['id'], kind, before)).fetchone(),
++        current_task=lambda: conn.execute('SELECT title,body FROM tasks WHERE id=?', (task['id'],)).fetchone(),
++        receipt_epoch=lambda: _receipt_epoch(conn))
+     payload = {k: v for k, v in task.items()
+                if k not in ('origin_observation', 'withdrawal_notice', 'withdrawal_recipients')}
+     from hermes_cli.kanban_withdrawal_notice import publish
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index bab714dd0a..0090a8dc12 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -25,6 +25,7 @@ from hermes_cli import kanban_session_activity_revalidate as _revalidate
+ from hermes_cli import kanban_counts_scopes as _count_scopes
+ from hermes_cli.kanban_execution_source import transaction as _execution_transaction
+ from hermes_cli import kanban_session_activity_recent_done as _recent_done
++from hermes_cli import kanban_execution_receipt as _receipts
+ from hermes_cli.kanban_session_activity_origin_snapshot import remote_snapshot as _remote_snapshot
+ from hermes_cli.kanban_session_activity_hub import _hub_content_signature
+ from hermes_cli import kanban_scope_heartbeat as _scope_hb
+@@ -1324,6 +1325,10 @@ def _read_board(path: Path, *, parked: bool, stalled: bool) -> tuple[dict[str, A
+                                           for _, tid in reads["pairs"]}
+             finally:
+                 _pairs_sink = outer
++            reads["done_pairs"], reads["done_execution"] = _receipts.counts_done(
++                conn, board=_board_slug(path), gateway=gateway, profile=profile, observed_at=read_at,
++                counted_sub_clause=_counted_sub_clause, authority=_require_local_execution_authority,
++                window=ATTENTION_WINDOW_S)
+             if parked:
+                 _parked_sink.pairs = (set(), set())
+                 try:
+@@ -1353,6 +1358,8 @@ def _collect_execution_evidence(reads: dict[str, Any], path: Path) -> None:
+         value = reads.get("execution", {}).get(tid)
+         if value is not None:
+             evidence.setdefault(sid, {})[f"{_board_slug(path)}/{tid}"] = value
++    for sid, tid in reads.get("done_pairs", ()):  # observation-only done bucket, never counted
++        evidence.setdefault(sid, {})[f"done:{_board_slug(path)}/{tid}"] = reads["done_execution"][tid]
+ 
+ 
+ def _read_local_boards(active: dict[str, int], blocked: dict[str, int], unseen: dict[str, int]) -> None:
+@@ -1575,6 +1582,8 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+             _log.debug("kanban execution source failed for %s", path, exc_info=True)
+             for info in found.values():
+                 info["_execution_error"] = True
++        _receipts.attach_done(conn, found, board=_board_slug(path), gateway=gateway, profile=profile,
++                              observed_at=read_at)
+         _add_card_details(conn, found)
+         try:
+             for tid, info in _local_wait_info(conn, found).items():
+diff --git a/hermes_cli/kanban_session_activity_recent_done.py b/hermes_cli/kanban_session_activity_recent_done.py
+index 78df2f668e..b26bda4fd0 100644
+--- a/hermes_cli/kanban_session_activity_recent_done.py
++++ b/hermes_cli/kanban_session_activity_recent_done.py
+@@ -12,6 +12,30 @@ from typing import Any, Callable
+ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ 
+ 
++MAX_DONE_PAIRS = 200  # newest completions per board and statement; older ones are simply not observed
++_DONE_COND = "t.status = 'done' AND t.completed_at >= ?"
++
++
++def done_pairs_on(conn: sqlite3.Connection, since: float, counted_sub_clause: Callable[[sqlite3.Connection], str],
++                  limit: int = MAX_DONE_PAIRS) -> list[tuple[str, str]]:
++    """``(session_id, task_id)`` of the same done cards ``read_recent_done`` lists, on the caller's transaction.
++
++    Two bounded statements per board, whatever the card count: one for created links, one for tui
++    subscriptions. Newest first, capped at ``limit`` each.
++    """
++    pairs = [(str(r[0]), str(r[1])) for r in conn.execute(
++        "SELECT t.session_id, t.id FROM tasks t WHERE t.session_id IS NOT NULL AND t.session_id != '' "
++        f"AND {_DONE_COND} ORDER BY t.completed_at DESC, t.id LIMIT ?", (since, limit))]
++    try:
++        pairs.extend((str(r[0]), str(r[1])) for r in conn.execute(
++            "SELECT s.chat_id, t.id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
++            f"WHERE s.platform = 'tui' AND s.chat_id != '' AND {counted_sub_clause(conn)} AND {_DONE_COND} "
++            "ORDER BY t.completed_at DESC, t.id LIMIT ?", (since, limit)))
++    except sqlite3.Error:  # board predates notify subscriptions
++        pass
++    return list(dict.fromkeys(pairs))
++
++
+ def read_recent_done(path: Path, since: float, counted_sub_clause: Callable[[sqlite3.Connection], str],
+                      board_slug: Callable[[Path], str]) -> list[tuple[str, dict[str, Any]]]:
+     """``(session_id, card)`` for done cards completed since ``since`` that a session created or shepherds."""
+@@ -23,7 +47,7 @@ def read_recent_done(path: Path, since: float, counted_sub_clause: Callable[[sql
+         summary = ("COALESCE((SELECT r.summary FROM task_runs r WHERE r.task_id = t.id AND r.summary IS NOT NULL "
+                    "AND r.summary != '' ORDER BY r.id DESC LIMIT 1), t.result)") if has_runs else "t.result"
+         fields = f"t.id AS id, t.title AS title, t.completed_at AS completed_at, {summary} AS summary"
+-        cond = "t.status = 'done' AND t.completed_at >= ?"
++        cond = _DONE_COND
+         pairs = [(str(r["session_id"]), dict(r)) for r in conn.execute(
+             f"SELECT t.session_id AS session_id, {fields} FROM tasks t WHERE t.session_id IS NOT NULL "
+             f"AND t.session_id != '' AND {cond}", (since,))]
+diff --git a/tests/hermes_cli/test_kanban_execution_receipt.py b/tests/hermes_cli/test_kanban_execution_receipt.py
+new file mode 100644
+index 0000000000..039ee28b07
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_execution_receipt.py
+@@ -0,0 +1,624 @@
++"""Done work is observed only through the landed completion-receipt seam, driven by real producers.
++
++Cards are created, claimed and completed with the real ``kanban_db`` writers (which admit the receipt),
++then read through the real session-task and sidebar-count entry paths. No receipt store, writer or
++outcome precedence is added: the adapter consumes ``read_completed`` / ``_receipt_epoch`` evidence.
++"""
++import copy
++import json
++import sqlite3
++import time
++from contextlib import contextmanager
++from typing import Any
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_operator
++from hermes_cli import kanban_execution_observations as observations
++from hermes_cli import kanban_origin
++from hermes_cli import kanban_origin_ledger as ledger
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli.execution_observations import project
++from hermes_cli.kanban_completion_receipt_projection import read_completed, read_completed_many
++from tests.hermes_state.test_completion_receipt import receipt
++
++GATEWAY, PROFILE = "fixture-gateway", "default"
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: (GATEWAY, {GATEWAY, "away"}))
++    monkeypatch.setattr(observations, "local_scope", lambda: (GATEWAY, PROFILE))
++    activity._reset_cache_for_tests()
++    path = kb.kanban_db_path(board="default")
++    with kbc.connect_closing(path) as conn:
++        yield conn
++    activity._reset_cache_for_tests()
++
++
++def card(conn, *, contract: str | None = "local-only", goal=False, session="session"):
++    return kb.create_task(conn, title="Bounded work", assignee="coder", session_id=session,
++                          completion_contract=contract, goal_mode=goal)
++
++
++def finish(conn, tid, value: Any = "delivered", **kw):
++    assert kb.claim_task(conn, tid) is not None
++    meta = {"completion_receipt": receipt(value) if isinstance(value, str) else value} if value else None
++    assert kb.complete_task(conn, tid, summary="Finished", metadata=meta, **kw)
++    return tid
++
++
++def closing_run(conn, tid):
++    uid = "uid" if "uid" in {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")} else "NULL"
++    row = conn.execute(f"SELECT id,{uid} AS uid FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
++                       (tid,)).fetchone()
++    return row["uid"] or row["id"]
++
++
++def done_listing(tid=None):
++    rows = activity.session_tasks(["session"], statuses=("done",))
++    return {r["id"]: r for r in rows} if tid is None else next(r for r in rows if r["id"] == tid)
++
++
++def observation(row):
++    values = row["execution_observations"]
++    assert len(values) == 1
++    return values[0]
++
++
++# --- the canonical session-task entry path -------------------------------------------------------
++
++def test_real_delivered_completion_is_done_with_exact_run_and_receipt_ref(board):
++    tid = finish(board, card(board))
++    value = observation(done_listing(tid))
++    assert value["state"] == "done" and value["freshness"] == "current"
++    assert value["identity"] == {"gateway": GATEWAY, "profile": PROFILE, "board": "default", "kind": "card",
++                                 "work_id": tid, "run_id": closing_run(board, tid)}
++    receipt_ = value["delivery_receipt"]
++    assert receipt_["verified"] is True and receipt_["disposition"] == "delivered"
++    assert receipt_["identity"] == value["identity"]
++    source = read_completed(board, tid, gateway=GATEWAY, board="default")["completion_receipt_source"]
++    assert receipt_["evidence_ref"].startswith(source["ref"] + "#event:")
++    assert receipt_["evidence_ref"] in value["evidence_refs"]
++    assert value["last_progress"] is None  # a completion receipt is not heartbeat/progress evidence
++    assert not [k for k in done_listing(tid) if k.startswith("_execution")]  # internal carriers never leak
++
++
++def test_expiry_without_a_fetch_keeps_the_historical_receipt_but_not_the_done_state(board):
++    tid = finish(board, card(board))
++    value = observation(done_listing(tid))
++    stale = project(value, now=value["observed_at"] + 181)
++    assert stale["state"] == "unknown" and stale["unknown_reason"] == "source_expired"
++    assert stale["last_known_state"] == "done"
++    assert stale["delivery_receipt"] == value["delivery_receipt"]
++    assert project(value, now=value["observed_at"] + 179)["state"] == "done"
++
++
++def test_receipt_cannot_date_itself_fresh_by_being_refetched(board, monkeypatch):
++    tid = finish(board, card(board))
++    first = observation(done_listing(tid))
++    monkeypatch.setattr(activity.time, "time", lambda: first["observed_at"] + 400)
++    later = observation(done_listing(tid))
++    assert later["observed_at"] == first["observed_at"] + 400  # a read of the owner board is the source clock
++    assert project(first, now=first["observed_at"] + 400)["state"] == "unknown"
++
++
++@pytest.mark.parametrize("disposition", ["superseded", "contained", "rejected"])
++def test_nondelivered_dispositions_are_never_done(board, disposition):
++    tid = finish(board, card(board), disposition)
++    value = observation(done_listing(tid))
++    assert value["state"] == "unknown" and "delivery_receipt" not in value and value["last_known_state"] is None
++
++
++def test_mixed_item_dispositions_are_not_delivered(board):
++    mixed = receipt("delivered")
++    mixed["items"].append(receipt("rejected")["items"][0])
++    tid = finish(board, card(board), mixed)
++    value = observation(done_listing(tid))
++    assert value["state"] == "unknown" and "delivery_receipt" not in value
++
++
++def test_done_without_a_receipt_is_unspecified_not_delivered(board):
++    tid = finish(board, card(board), None)
++    value = observation(done_listing(tid))
++    assert value["state"] == "unknown" and "delivery_receipt" not in value
++
++
++def test_receipt_without_release_verification_is_not_done(board):
++    """No local-only contract and no PR acceptance: the existing verifier refuses, so does the adapter."""
++    tid = finish(board, card(board))
++    board.execute("UPDATE tasks SET completion_contract='https://github.com/example/repo/pull/7' WHERE id=?", (tid,))
++    board.commit()
++    assert read_completed(board, tid, gateway=GATEWAY, board="default") is not None
++    value = observation(done_listing(tid))
++    assert value["state"] == "unknown" and "delivery_receipt" not in value
++
++
++def test_goal_card_without_judge_receipt_is_not_done(board):
++    tid = finish(board, card(board, goal=True))
++    value = observation(done_listing(tid))
++    assert value["state"] == "unknown" and "delivery_receipt" not in value
++
++
++def test_archive_is_never_success_even_after_a_delivered_completion(board):
++    tid = finish(board, card(board))
++    assert kb.archive_task(board, tid)
++    assert board.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "archived"
++    rows = activity.session_tasks(["session"], statuses=("done", "archived"))
++    value = observation(next(r for r in rows if r["id"] == tid))
++    assert value["state"] != "done" and "delivery_receipt" not in value
++
++
++def test_archived_without_completion_is_cancelled_not_done(board):
++    tid = card(board)
++    assert kb.archive_task(board, tid)
++    rows = activity.session_tasks(["session"], statuses=("archived",))
++    assert all(v["state"] != "done" for r in rows for v in r["execution_observations"])
++
++
++def test_reopened_run_is_not_marked_done_by_the_old_receipt(board):
++    tid = finish(board, card(board))
++    old_run = closing_run(board, tid)
++    assert kanban_db_operator.reopen_done_task(board, tid, reason="more work", actor="operator")
++    assert kb.claim_task(board, tid) is not None
++    assert kb.complete_task(board, tid, summary="Second pass")  # no receipt on the new run
++    new_run = closing_run(board, tid)
++    assert new_run != old_run
++    value = observation(done_listing(tid))
++    assert value["state"] == "unknown" and "delivery_receipt" not in value
++    assert value["identity"].get("run_id") != old_run
++
++
++def test_receipt_bound_to_a_different_run_than_the_verified_completion_is_not_done(board):
++    tid = finish(board, card(board))
++    other = finish(board, card(board))
++    other_run = board.execute("SELECT run_id FROM task_events WHERE task_id=? AND kind='completed'",
++                              (other,)).fetchone()[0]
++    with kb.write_txn(board):  # a later completion event stolen onto a foreign run
++        board.execute("UPDATE task_events SET run_id=? WHERE task_id=? AND kind='completed'", (other_run, tid))
++    value = observation(done_listing(tid))
++    assert value["state"] == "unknown" and "delivery_receipt" not in value
++
++
++def test_later_unadmitted_completion_event_supersedes_the_old_receipt(board):
++    tid = finish(board, card(board))
++    run = board.execute("SELECT run_id FROM task_events WHERE task_id=? AND kind='completed'", (tid,)).fetchone()[0]
++    with kb.write_txn(board):
++        kb._append_event(board, tid, "completed", {}, run_id=run)
++    value = observation(done_listing(tid))
++    assert value["state"] == "unknown" and "delivery_receipt" not in value
++
++
++def test_tampered_receipt_metadata_is_not_done(board):
++    tid = finish(board, card(board))
++    with kb.write_txn(board):
++        board.execute("UPDATE task_runs SET metadata=? WHERE task_id=?",
++                      (json.dumps({"completion_receipt": {"version": 1, "items": []}}), tid))
++    assert observation(done_listing(tid))["state"] == "unknown"
++
++
++def test_legacy_basis_completion_never_becomes_delivered(board):
++    """The owner's legacy release basis is a release pass, not a delivery receipt."""
++    tid = finish(board, card(board), None)
++    board.execute("BEGIN")
++    try:
++        verdict = ledger.observe_owner_task(board, {"id": tid, "status": "done"}, now=1000)["origin_observation"]
++    finally:
++        board.execute("COMMIT")
++    assert verdict["verified"] is True  # contract local-only: verified, but no receipt
++    assert observation(done_listing(tid))["state"] == "unknown"
++
++
++def test_adapter_failure_is_an_explicit_unknown_and_keeps_asks(board, monkeypatch):
++    tid = finish(board, card(board))
++    from hermes_cli import kanban_execution_receipt as adapter
++
++    def boom(*a, **k):
++        raise sqlite3.DatabaseError("simulated receipt read failure")
++
++    monkeypatch.setattr(adapter, "assemble_done", boom)
++    value = observation(done_listing(tid))
++    assert value["state"] == "unknown" and "delivery_receipt" not in value
++
++
++def test_listing_open_statuses_never_reads_completion_evidence(board, monkeypatch):
++    finish(board, card(board))
++    from hermes_cli import kanban_execution_receipt as adapter
++    monkeypatch.setattr(adapter, "assemble_done", lambda *a, **k: pytest.fail("open listing read done evidence"))
++    assert activity.session_tasks(["session"]) == []
++
++
++# --- the sidebar count / checker collector entry path ----------------------------------------------
++
++def annotate():
++    rows = [{"id": "session"}]
++    activity.annotate_kanban_activity(rows)
++    return rows[0]
++
++
++def test_sidebar_counts_carry_a_done_observation_without_counting_it_as_work(board):
++    tid = finish(board, card(board))
++    row = annotate()
++    done = [v for v in row["execution_observations"] if v["state"] == "done"]
++    assert len(done) == 1 and done[0]["identity"]["work_id"] == tid
++    assert done[0]["delivery_receipt"]["verified"] is True
++    assert "kanban_active" not in row and "kanban_blocked" not in row
++
++
++def test_sidebar_done_expires_without_a_fetch_and_keeps_history(board):
++    tid = finish(board, card(board))
++    value = next(v for v in annotate()["execution_observations"] if v["identity"]["work_id"] == tid)
++    stale = project(value, now=value["observed_at"] + 600)
++    assert stale["state"] == "unknown" and stale["last_known_state"] == "done"
++    assert stale["delivery_receipt"]["verified"] is True
++
++
++def test_sidebar_omits_unverified_done_and_old_done(board, monkeypatch):
++    finish(board, card(board), None)
++    old = finish(board, card(board))
++    board.execute("UPDATE tasks SET completed_at=? WHERE id=?", (int(time.time()) - activity.ATTENTION_WINDOW_S - 5, old))
++    board.commit()
++    row = annotate()
++    assert not [v for v in row.get("execution_observations", []) if v["state"] == "done"]
++
++
++def test_sidebar_open_card_and_done_card_coexist_without_aliasing(board):
++    done = finish(board, card(board))
++    running = card(board)
++    assert kb.claim_task(board, running) is not None
++    row = annotate()
++    states = {v["identity"]["work_id"]: v["state"] for v in row["execution_observations"]}
++    assert states[done] == "done" and states[running] != "done"
++    assert row["kanban_active"] == 1
++
++
++def test_mirrored_primary_board_never_reports_done(board):
++    """A pulled mirror is not owner evidence: no fresh done (history on mirrors is not covered here)."""
++    finish(board, card(board))
++    board.execute("CREATE TABLE IF NOT EXISTS kanban_sync_state (mode TEXT)")
++    board.execute("DELETE FROM kanban_sync_state")
++    board.execute("INSERT INTO kanban_sync_state VALUES ('primary')")
++    board.commit()
++    activity._reset_cache_for_tests()
++    values = [v for r in activity.session_tasks(["session"], statuses=("done",)) for v in r["execution_observations"]]
++    assert values and all(v["state"] != "done" for v in values)
++    assert not [v for v in annotate().get("execution_observations", []) if v["state"] == "done"]
++
++
++# --- bounded reads ---------------------------------------------------------------------------------
++
++def statements_for(board, monkeypatch, call):
++    statements = []
++    original = activity.cached_ro
++
++    @contextmanager
++    def traced(path, **kwargs):
++        with original(path, **kwargs) as conn:
++            conn.set_trace_callback(statements.append)
++            try:
++                yield conn
++            finally:
++                conn.set_trace_callback(None)
++
++    monkeypatch.setattr(activity, "cached_ro", traced)
++    call()
++    return len([s for s in statements if s.lstrip().upper().startswith(("SELECT", "WITH"))])
++
++
++def test_done_read_cost_is_independent_of_card_count_for_listing_and_counts(board, monkeypatch):
++    finish(board, card(board))
++    listing = lambda: activity.session_tasks(["session"], statuses=("done",))
++    counts = lambda: (activity._reset_cache_for_tests(), annotate())
++    listing(), counts()  # one-time schema/revision warm-up is not a per-card cost
++    one_list = statements_for(board, monkeypatch, listing)
++    one_count = statements_for(board, monkeypatch, counts)
++    for _ in range(25):
++        finish(board, card(board), "delivered" if _ % 2 else "rejected")
++    activity._reset_cache_for_tests()
++    assert len(listing()) == 26
++    assert statements_for(board, monkeypatch, listing) == one_list
++    assert statements_for(board, monkeypatch, counts) == one_count
++
++
++def test_batch_reader_matches_the_per_task_seam_for_every_shape(board):
++    ids = [finish(board, card(board), v) for v in ("delivered", "superseded", "contained", "rejected", None)]
++    legacy = card(board)
++    assert kb.claim_task(board, legacy) is not None
++    unfinished = card(board)
++    with kb.write_txn(board):
++        kb._synthesize_ended_run(board, ids[0], outcome="review", summary="later review",
++                                 metadata={"completion_receipt": receipt("rejected")})
++    many = read_completed_many(board, [*ids, legacy, unfinished, "t_missing"], board="default", gateway=GATEWAY)
++    assert set(many) == {*ids, legacy, unfinished, "t_missing"}
++    for tid in many:
++        single = read_completed(board, tid, gateway=GATEWAY, board="default") if tid != "t_missing" else None
++        assert many[tid] == single, tid
++        assert copy.deepcopy(many[tid]) == many[tid]
++
++
++def test_batch_reader_requires_source_namespace(board):
++    with pytest.raises(ValueError, match="source gateway"):
++        read_completed_many(board, ["t"], board="default", gateway="")
++
++
++def test_batch_reader_uses_created_on_like_inventory(board):
++    from hermes_cli.kanban_completion_receipt_projection import read_inventory
++    tid = finish(board, card(board))
++    columns = {r[1] for r in board.execute("PRAGMA table_info(tasks)")}
++    if "created_on" in columns:
++        board.execute("UPDATE tasks SET created_on='origin-gw' WHERE id=?", (tid,))
++    many = read_completed_many(board, [tid], board="default", gateway=GATEWAY)
++    assert many[tid] == read_inventory(board, tid, board="default", gateway=GATEWAY)
++
++
++# --- the extracted pure verifier is the one verdict ------------------------------------------------
++
++def owner_verdict(conn, tid):
++    conn.execute("BEGIN")
++    try:
++        status = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++        out = ledger.observe_owner_task(conn, {"id": tid, "status": status}, now=1000)["origin_observation"]
++        return out["verified"], out.get("basis") == "legacy_completed"
++    finally:
++        conn.execute("COMMIT")
++
++
++def test_pure_verifier_and_owner_observation_agree_on_every_shape(board):
++    from hermes_cli.kanban_completion_inputs import read_verdicts
++    ids = {
++        "local": finish(board, card(board)),
++        "pr_contract": finish(board, card(board)),
++        "goal_no_proof": finish(board, card(board, goal=True)),
++    }
++    board.execute("UPDATE tasks SET completion_contract='https://github.com/example/repo/pull/7' WHERE id=?",
++                  (ids["pr_contract"],))
++    board.commit()
++    open_card = card(board)
++    verdicts = read_verdicts(board, [*ids.values(), open_card])
++    for name, tid in ids.items():
++        assert verdicts[tid] == owner_verdict(board, tid)[:2], name
++    assert verdicts[ids["local"]][0] is True and verdicts[ids["pr_contract"]][0] is False
++    assert open_card not in verdicts or verdicts[open_card][0] is False
++
++
++def test_verifier_batch_read_cost_is_constant(board, monkeypatch):
++    from hermes_cli.kanban_completion_inputs import read_verdicts
++    first = finish(board, card(board))
++    def measure(ids):
++        statements = []
++        board.set_trace_callback(statements.append)
++        try:
++            read_verdicts(board, ids)
++        finally:
++            board.set_trace_callback(None)
++        return len(statements)
++
++    one = measure([first])
++    ids = [first] + [finish(board, card(board)) for _ in range(40)]
++    assert measure(ids) == one
++
++
++# --- the pure adapter: each binding clause is load-bearing ------------------------------------------
++
++def adapter_inputs(board):
++    from hermes_cli.kanban_completion_inputs import read_completions
++    tid = finish(board, card(board))
++    fact = read_completions(board, [tid])[tid]
++    bundle = read_completed_many(board, [tid], board="default", gateway=GATEWAY)[tid]
++    return tid, fact, bundle
++
++
++def adapt_done(tid, fact, bundle, **over):
++    from hermes_cli.kanban_execution_receipt import done_raw
++    kw = {"board": "default", "gateway": GATEWAY, "profile": PROFILE, "observed_at": 1000.0, **over}
++    return done_raw(tid, fact, bundle, **kw)
++
++
++def test_pure_adapter_accepts_exactly_the_real_shape(board):
++    tid, fact, bundle = adapter_inputs(board)
++    raw = adapt_done(tid, fact, bundle)
++    assert raw["state"] == "done" and raw["valid_until"] == 1180.0
++    assert raw["identity"]["run_id"] == fact.run_id
++    assert project(raw, now=1179)["state"] == "done" and project(raw, now=1180)["state"] == "unknown"
++
++
++def test_pure_adapter_rejects_each_broken_binding(board):
++    tid, fact, bundle = adapter_inputs(board)
++    source = bundle["completion_receipt_source"]
++    broken = {
++        "archived": (fact._replace(status="archived"), bundle, {}),
++        "open": (fact._replace(status="running"), bundle, {}),
++        "unverified": (fact._replace(verified=False), bundle, {}),
++        "legacy": (fact._replace(legacy=True), bundle, {}),
++        "no fact": (None, bundle, {}),
++        "no receipt": (fact, None, {}),
++        "no gateway": (fact, bundle, {"gateway": None}),
++        "no profile": (fact, bundle, {"profile": ""}),
++        "no board": (fact, bundle, {"board": None}),
++        "bad clock": (fact, bundle, {"observed_at": float("nan")}),
++        "other gateway": (fact, bundle, {"gateway": "elsewhere"}),
++        "other board": (fact, bundle, {"board": "bb"}),
++        "event mismatch": (fact._replace(event_id=fact.event_id + 1), bundle, {}),
++        "no event": (fact._replace(event_id=None), bundle, {}),
++        "event run mismatch": (fact._replace(event_run_id=fact.event_run_id + 1), bundle, {}),
++        "closing run mismatch": (fact._replace(run_id=fact.run_id + 1), bundle, {}),
++        "uid vs none": (fact._replace(run_uid="u1"), bundle, {}),
++        "none vs uid": (fact, {**bundle, "completion_receipt_source": {**source, "run_uid": "u1"}}, {}),
++        "uid mismatch": (fact._replace(run_uid="u2"),
++                         {**bundle, "completion_receipt_source": {**source, "run_uid": "u1"}}, {}),
++    }
++    for name, (f, b, over) in broken.items():
++        assert adapt_done(tid, f, b, **over) is None, name
++    assert adapt_done("t_other", fact, bundle) is None  # the receipt ref names another task
++    mixed = copy.deepcopy(bundle)
++    mixed["completion_receipt"]["items"].append(receipt("rejected")["items"][0])
++    assert adapt_done(tid, fact, mixed) is None
++    empty = copy.deepcopy(bundle)
++    empty["completion_receipt"]["items"] = []
++    assert adapt_done(tid, fact, empty) is None
++
++
++def test_pure_adapter_portable_run_uid_identity(board):
++    tid, fact, bundle = adapter_inputs(board)
++    source = {**bundle["completion_receipt_source"], "run_uid": "run-uid-1", "event_uid": "event-uid-1"}
++    raw = adapt_done(tid, fact._replace(run_uid="run-uid-1"), {**bundle, "completion_receipt_source": source})
++    assert raw["identity"]["run_id"] == "run-uid-1"
++    assert raw["delivery_receipt"]["evidence_ref"].endswith("#event:event-uid-1")
++    assert raw["delivery_receipt"]["identity"] == raw["identity"]
++
++
++def test_pure_adapter_owner_fields_and_progress_stay_separate(board):
++    tid, fact, bundle = adapter_inputs(board)
++    raw = adapt_done(tid, fact._replace(assignee="coder", session_id="session"), bundle)
++    assert raw["owner"] == {"gateway": GATEWAY, "profile": PROFILE, "assignee": "coder", "session": "session"}
++    assert raw["last_progress"] is None and raw["last_activity_kind"] == "completed"
++    bare = adapt_done(tid, fact._replace(assignee=None, session_id=None), bundle)
++    assert bare["owner"] == {"gateway": GATEWAY, "profile": PROFILE}
++
++
++# --- batched reads agree with the per-task seam and owner verdict on adversarial evidence ------------
++
++def run_of(conn, tid, kind="completed"):
++    return conn.execute("SELECT run_id FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC",
++                        (tid, kind)).fetchone()[0]
++
++
++def test_batch_receipt_takes_the_latest_completion_across_reopen(board):
++    tid = finish(board, card(board), "delivered")
++    assert kanban_db_operator.reopen_done_task(board, tid, reason="redo", actor="operator")
++    assert kb.claim_task(board, tid) is not None
++    assert kb.complete_task(board, tid, summary="Redo", metadata={"completion_receipt": receipt("rejected")})
++    many = read_completed_many(board, [tid], board="default", gateway=GATEWAY)[tid]
++    assert many == read_completed(board, tid, gateway=GATEWAY, board="default")
++    assert many["completion_receipt"]["items"][0]["disposition"] == "rejected"
++    assert observation(done_listing(tid))["state"] == "unknown"
++
++
++def test_batch_receipt_never_borrows_another_tasks_run(board):
++    tid, other = finish(board, card(board)), finish(board, card(board))
++    foreign = run_of(board, other)
++    with kb.write_txn(board):
++        board.execute("UPDATE task_events SET run_id=? WHERE task_id=? AND kind='completed'", (foreign, tid))
++    assert read_completed(board, tid, gateway=GATEWAY, board="default") is None
++    assert read_completed_many(board, [tid, other], board="default", gateway=GATEWAY)[tid] is None
++    assert observation(done_listing(tid))["state"] == "unknown"
++
++
++def test_batch_receipt_prefers_created_on_like_the_inventory_seam(board):
++    from hermes_cli.kanban_completion_receipt_projection import read_inventory
++    tid = finish(board, card(board))
++    board.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++    board.execute("UPDATE tasks SET created_on='origin-gw' WHERE id=?", (tid,))
++    board.commit()
++    many = read_completed_many(board, [tid], board="default", gateway=GATEWAY)[tid]
++    assert many["completion_receipt_source"]["ref"] == f"@task:default@origin-gw/{tid}"
++    assert many == read_inventory(board, tid, board="default", gateway=GATEWAY)
++    # A foreign-created card is not this gateway's owner observation, so it is not observed done here.
++    assert observation(done_listing(tid))["state"] == "unknown"
++
++
++PR = "https://github.com/example/repo/pull/7"
++HEAD = "a" * 40
++
++
++def append_event(conn, tid, kind, payload, run):
++    kb._append_event(conn, tid, kind, payload, run_id=run)
++    return conn.execute("SELECT max(id) FROM task_events").fetchone()[0]
++
++
++def pr_card(conn, *, kind="pr_acceptance", owner=None, after=False, ok=True):
++    """A card whose release gate is a PR acceptance event; the fabricated event shape is parameterized."""
++    tid = card(conn, contract=PR)
++    assert kb.claim_task(conn, tid) is not None
++    payload = json.dumps({"ok": ok, "classification": "success", "pr_url": PR, "head_sha": HEAD})
++    eid = None
++    if not after:
++        with kb.write_txn(conn):
++            run = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++            eid = append_event(conn, owner or tid, kind, json.loads(payload), run)
++    with conn:
++        conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", ("local-only", tid))
++    assert kb.complete_task(conn, tid, summary="Merged", metadata={"completion_receipt": receipt()})
++    with conn:
++        conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (PR, tid))
++        if after:
++            run = run_of(conn, tid)
++            eid = append_event(conn, tid, kind, json.loads(payload), run)
++        event = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='completed'",
++                             (tid,)).fetchone()
++        body = json.loads(event[1] or "{}")
++        body["pr_acceptance_event_id"] = eid
++        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(body), event[0]))
++    return tid
++
++
++def verdict_pair(conn, tid):
++    from hermes_cli.kanban_completion_inputs import read_verdicts
++    return read_verdicts(conn, [tid])[tid], owner_verdict(conn, tid)
++
++
++def test_pr_acceptance_event_binding_is_one_verdict_for_batch_and_owner(board):
++    genuine = pr_card(board)
++    wrong_kind = pr_card(board, kind="goal_verified")
++    other = card(board)
++    foreign = pr_card(board, owner=other)
++    later = pr_card(board, after=True)
++    refused = pr_card(board, ok=False)
++    for tid in (genuine, wrong_kind, foreign, later, refused):
++        batch, owner = verdict_pair(board, tid)
++        assert batch == owner, tid
++    assert verdict_pair(board, genuine)[0] == (True, False)
++    for tid in (wrong_kind, foreign, later, refused):
++        assert verdict_pair(board, tid)[0][0] is False, tid
++    assert observation(done_listing(genuine))["state"] == "done"
++    assert observation(done_listing(later))["state"] == "unknown"
++
++
++def test_latest_completion_and_latest_run_decide_the_verdict(board):
++    mismatched, extra_run, bad = (finish(board, card(board)) for _ in range(3))
++    with kb.write_txn(board):
++        kb._append_event(board, mismatched, "completed", {}, run_id=99999)
++        board.execute("INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'running', 1)", (extra_run,))
++        board.execute("UPDATE task_events SET payload='{not json' WHERE task_id=? AND kind='completed'", (bad,))
++        board.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (PR, bad))  # gate must parse the event
++    from hermes_cli.kanban_completion_inputs import read_verdicts
++    batch = read_verdicts(board, [mismatched, extra_run, bad])
++    assert batch[mismatched] == owner_verdict(board, mismatched)[:2] == (False, False)
++    assert batch[extra_run] == owner_verdict(board, extra_run)[:2] == (False, False)
++    assert batch[bad] == (False, False)  # malformed evidence fails that card closed, not the batch
++    healthy = finish(board, card(board))
++    assert read_verdicts(board, [bad, healthy])[healthy] == (True, False)
++
++
++def test_done_pair_window_is_bounded_and_per_statement(board):
++    from hermes_cli import kanban_session_activity_recent_done as recent
++    assert recent.MAX_DONE_PAIRS <= 200
++    for _ in range(5):
++        finish(board, card(board))
++    since = time.time() - 60
++    assert len(recent.done_pairs_on(board, since, activity._counted_sub_clause)) == 5
++    assert len(recent.done_pairs_on(board, since, activity._counted_sub_clause, limit=2)) == 2
++    assert recent.done_pairs_on(board, time.time() + 60, activity._counted_sub_clause) == []
++
++
++def test_attach_done_marks_only_done_rows_on_failure_and_skips_failed_rows(board, monkeypatch):
++    from hermes_cli import kanban_execution_receipt as adapter
++    done_id, open_id, failed_id = "t_done", "t_open", "t_failed"
++    found = {done_id: {"status": "done"}, open_id: {"status": "running"},
++             failed_id: {"status": "done", "_execution_error": True}}
++    seen = []
++
++    def boom(conn, ids, **kw):
++        seen.append(list(ids))
++        raise sqlite3.DatabaseError("simulated")
++
++    monkeypatch.setattr(adapter, "assemble_done", boom)
++    adapter.attach_done(board, found, board="default", gateway=GATEWAY, profile=PROFILE, observed_at=1000.0)
++    assert seen == [[done_id]]  # open rows and rows already failed are never read
++    assert found[done_id]["_execution_error"] is True and "_execution_error" not in found[open_id]
++    assert "_execution_done" not in found[done_id]
+-- 
+2.43.0
+

@@ -1,0 +1,437 @@
+From 32749d708fb19102c81ea1c5359d120828866feb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 00:45:58 +0000
+Subject: [PATCH] fix(status): isolate optional execution adapter failures per
+ card [daveey]
+
+---
+ hermes_cli/kanban_execution_observations.py   |  27 ++-
+ hermes_cli/kanban_execution_source.py         |  40 +++-
+ hermes_cli/kanban_queue_position.py           |  32 ++-
+ hermes_cli/kanban_session_activity.py         |  33 ++-
+ ...test_kanban_execution_failure_isolation.py | 189 ++++++++++++++++++
+ 5 files changed, 299 insertions(+), 22 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_execution_failure_isolation.py
+
+diff --git a/hermes_cli/kanban_execution_observations.py b/hermes_cli/kanban_execution_observations.py
+index e8f99083ca..7d029a7e89 100644
+--- a/hermes_cli/kanban_execution_observations.py
++++ b/hermes_cli/kanban_execution_observations.py
+@@ -155,14 +155,37 @@ def add_cards(rows, *, now=None):
+         gateway = profile = None
+     for row in rows:
+         try:
+-            _merge(row, [card(row, gateway=gateway, profile=profile, now=now)])
++            if row.get("_execution_error"):
++                raise RuntimeError("execution source unavailable")
++            observation = card(row, gateway=gateway, profile=profile, now=now)
+         except ADAPTER_ERRORS:
+             _log.debug("execution observation unavailable for card %s", row.get("id"), exc_info=True)
++            observation = failed_card(row, gateway=gateway, profile=profile, now=now)
++        _merge(row, [observation])
+         row.pop("_execution_event", None)
+         row.pop("_execution_source", None)
++        row.pop("_execution_error", None)
+     return rows
+ 
+ 
++def _project(value, *, now, **kw):
++    out = project(value, now=now, **kw)
++    if value.get("unknown_reason") == "adapter_error":
++        out.update(state="unknown", unknown_reason="adapter_error")
++    return out
++
++
++def failed_card(row, *, gateway=None, profile=None, now=None):
++    """Explicit unknown for a card whose adapter failed: never absent, never a state, keeps its own ask."""
++    from hermes_cli.kanban_execution_source import unknown_raw
++    source = row.get("_execution_source")
++    source = source if isinstance(source, dict) else {}
++    value = unknown_raw(row, {**source, "gateway": source.get("gateway") or gateway,
++                              "profile": source.get("profile") or profile,
++                              "board": source.get("board") or row.get("board")})
++    return _project(value, now=time.time() if now is None else now, source_class="sidebar")
++
++
+ _HISTORY = ("human_request", "retained_human_requests", "delivery_receipt", "historical_delivery_receipts")
+ 
+ 
+@@ -220,7 +243,7 @@ def count_snapshot(row, keys, *, now=None, evidence=None):
+         else:
+             rows.append({"id": parts[-1]})
+     now = time.time() if now is None else now
+-    observations = [project(value["_raw"], now=now) if "_raw" in value else card(value, now=now) for value in rows]
++    observations = [_project(value["_raw"], now=now) if "_raw" in value else card(value, now=now) for value in rows]
+     if row.get("kanban_unknown"):
+         observations.extend(_carry_history(row.get("execution_observations"), now))
+         observations.append(project({"version": 1, "source": "kanban.counts", "state": "unknown"}, now=now))
+diff --git a/hermes_cli/kanban_execution_source.py b/hermes_cli/kanban_execution_source.py
+index e15df93d4c..8850dc6e5c 100644
+--- a/hermes_cli/kanban_execution_source.py
++++ b/hermes_cli/kanban_execution_source.py
+@@ -7,6 +7,7 @@ No commands, arbitrary event payloads, or event prose enter public observations.
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import sqlite3
+ import time
+ from contextlib import contextmanager
+@@ -14,6 +15,7 @@ from contextlib import contextmanager
+ from hermes_cli.execution_observations import epoch, human_request_valid, same_json
+ 
+ MAX_HISTORY = 128
++_log = logging.getLogger(__name__)
+ MAX_PAYLOAD = 32768
+ _TASK_FIELDS = ('id', 'status', 'assignee', 'session_id', 'current_run_id', 'block_kind', 'human_request', 'created_on')
+ # Only landing rules traced to the corresponding writers. Ambiguous transitions
+@@ -152,7 +154,9 @@ def _event_id(event, synced):
+     if not synced:
+         return event['id']
+     meta = event['_payload'].get('_recovery_history_v1')
+-    return meta.get('identity') if isinstance(meta, dict) else event.get('uid')
++    value = meta.get('identity') if isinstance(meta, dict) else event.get('uid')
++    # Only a non-empty string is provable (and hashable); anything else is an unprovable identity.
++    return value if isinstance(value, str) and value else None
+ 
+ 
+ def _tip(events, runs, synced):
+@@ -247,6 +251,40 @@ def _wait(result, row, source, event):
+     result['wait'] = wait if wait.get('predicate') else None
+ 
+ 
++def unknown_raw(row, source=None, *, gateway=None, profile=None, board=None):
++    """Explicit unknown card observation for an adapter failure; grants no state, clock or authority.
++
++    Keeps the qualified identity (no run/generation) and the row's own human ask with probe fields
++    stripped, so an optional adapter failing never erases an outstanding request.
++    """
++    source = source if isinstance(source, dict) else {}
++    gateway = source.get('gateway', gateway)
++    profile = source.get('profile', profile)
++    board = source.get('board', board)
++    board = board if board is not None else row.get('board')
++    identity = {'gateway': gateway, 'profile': profile, 'board': board, 'kind': 'card', 'work_id': row.get('id')}
++    result = {'version': 1, 'identity': identity, 'owner': {'gateway': gateway, 'profile': profile},
++              'state': 'unknown', 'source': 'kanban.card', 'observed_at': None, 'valid_until': None,
++              'source_revision': None, 'evidence_refs': [], 'last_progress': None, 'wait': None,
++              'last_activity': None, 'last_activity_kind': None, 'unknown_reason': 'adapter_error'}
++    request = row.get('human_request')
++    request = _payload(request) if isinstance(request, str) else request
++    if isinstance(request, dict):
++        result['human_request'] = {k: v for k, v in request.items() if k not in ('resolved_check', 'resolved_check_every')}
++    return result
++
++
++def safe_raw(row, source):
++    """:func:`raw`, but one card's adapter failure degrades to :func:`unknown_raw`, not its whole read."""
++    from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS
++    try:
++        return raw(row, source)
++    except ADAPTER_ERRORS:
++        _log.debug('execution source unavailable for card %s', row.get('id'), exc_info=True)
++        task = source.get('task') if isinstance(source, dict) else None
++        return unknown_raw({**row, **task} if isinstance(task, dict) else row, source)
++
++
+ def raw(row, source):
+     """Strict phase identity and exact wait, distinct from observation/activity/progress."""
+     row = {**row, **source['task']}
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 4cdd9a8367..54d515b397 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -342,19 +342,33 @@ def detail_fields(conn, task, board=None):
+     except Exception:  # health: allow BLE001 -- diagnostics cannot fail a card read
+         capacity = evidence._unknown("observation_unavailable")
+     observation = capacity.get("execution_observation")
+-    from dataclasses import asdict
+-    from hermes_cli.kanban_execution_observations import add_cards
+-    from hermes_cli.kanban_execution_source import assemble, transaction
+-    from hermes_cli.kanban_execution_observations import local_scope
+-    gateway, profile = local_scope()
+-    with transaction(conn) as read_at:
+-        sources = assemble(conn, [task.id], board=board or "default", gateway=gateway, profile=profile, observed_at=read_at)
+-    work = add_cards([{**asdict(task), "board": board or "default", "_execution_source": sources.get(task.id)}])[0]["execution_observations"]
+-    out.update(capacity_evidence=capacity, execution_observations=([observation] if observation else []) + work)
++    out.update(capacity_evidence=capacity,
++               execution_observations=([observation] if observation else []) + _work_observations(conn, task, board))
+     out["capacity_note"] = evidence.describe(capacity)
+     return out
+ 
+ 
++def _work_observations(conn, task, board):
++    """Optional card evidence for a detail read: any adapter failure is an explicit unknown, never a failed read."""
++    from dataclasses import asdict
++    from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS, add_cards, failed_card, local_scope
++    from hermes_cli.kanban_execution_source import assemble, transaction
++    row = {**asdict(task), "board": board or "default"}
++    try:
++        gateway, profile = local_scope()
++        with transaction(conn) as read_at:
++            sources = assemble(conn, [task.id], board=board or "default", gateway=gateway, profile=profile,
++                               observed_at=read_at)
++        row["_execution_source"] = sources.get(task.id)
++        return add_cards([row])[0].get("execution_observations", [])
++    except ADAPTER_ERRORS:
++        _log.debug("kanban queue position: execution observation unavailable for %s", task.id, exc_info=True)
++        try:
++            return [failed_card(row)]
++        except ADAPTER_ERRORS:
++            return []
++
++
+ def print_field(place: Optional[dict[str, Any]], queue_reason: Any, field) -> None:
+     """The text ``queue:`` line, unless the worker-pool ``queue_reason`` line already took it."""
+     if place and not queue_reason:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 06a3ebcbdf..8c09c38811 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1372,12 +1372,19 @@ def _read_board(path: Path, *, parked: bool, stalled: bool) -> tuple[dict[str, A
+                 reads["blocked"] = _counts_on(conn, BLOCKED_STATUSES)
+                 reads["blocked_pairs"] = _pairs_sink
+                 reads["pairs"] = reads["active_pairs"] | reads["blocked_pairs"]
+-                from hermes_cli.kanban_execution_source import assemble, raw
+-                from hermes_cli.kanban_execution_observations import local_scope
++                from hermes_cli.kanban_execution_source import assemble, safe_raw, unknown_raw
++                from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS, local_scope
+                 gateway, profile = local_scope()
+-                sources = assemble(conn, {tid for _, tid in reads["pairs"]}, board=_board_slug(path),
+-                                   gateway=gateway, profile=profile, observed_at=read_at)
+-                reads["execution"] = {tid: raw(source["task"], source) for tid, source in sources.items()}
++                try:
++                    sources = assemble(conn, {tid for _, tid in reads["pairs"]}, board=_board_slug(path),
++                                       gateway=gateway, profile=profile, observed_at=read_at)
++                    reads["execution"] = {tid: safe_raw(source["task"], source) for tid, source in sources.items()}
++                except ADAPTER_ERRORS:
++                    # Optional evidence only: legacy counts and asks stay; each card is an explicit unknown.
++                    _log.debug("kanban execution source failed for %s", path, exc_info=True)
++                    reads["execution"] = {tid: unknown_raw({"id": tid}, gateway=gateway, profile=profile,
++                                                           board=_board_slug(path))
++                                          for _, tid in reads["pairs"]}
+             finally:
+                 _pairs_sink = outer
+             if parked:
+@@ -1613,12 +1620,18 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+         except sqlite3.Error:  # board predates notify subscriptions
+             pass
+         from hermes_cli.kanban_execution_source import assemble
+-        from hermes_cli.kanban_execution_observations import local_scope
++        from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS, local_scope
+         gateway, profile = local_scope()
+-        sources = assemble(conn, found, board=_board_slug(path), gateway=gateway, profile=profile,
+-                           observed_at=read_at)
+-        for tid, source in sources.items():
+-            found[tid]["_execution_source"] = source
++        try:
++            sources = assemble(conn, found, board=_board_slug(path), gateway=gateway, profile=profile,
++                               observed_at=read_at)
++            for tid, source in sources.items():
++                found[tid]["_execution_source"] = source
++        except ADAPTER_ERRORS:
++            # Optional evidence: the task list and asks stay; each card becomes an explicit unknown.
++            _log.debug("kanban execution source failed for %s", path, exc_info=True)
++            for info in found.values():
++                info["_execution_error"] = True
+         _add_card_details(conn, found)
+         try:
+             for tid, info in _local_wait_info(conn, found).items():
+diff --git a/tests/hermes_cli/test_kanban_execution_failure_isolation.py b/tests/hermes_cli/test_kanban_execution_failure_isolation.py
+new file mode 100644
+index 0000000000..42bfd1d48e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_execution_failure_isolation.py
+@@ -0,0 +1,189 @@
++"""Optional execution-observation adapter failures never break legacy output or erase human asks.
++
++Regression for the 29b07d review (M1-M3): one malformed synced event, or an adapter exception, must
++degrade only that card to an explicit unknown observation. Isolated temp-DB fixtures only.
++"""
++import json
++import sqlite3
++from contextlib import contextmanager
++
++import pytest
++
++from hermes_cli import kanban_execution_observations as observations
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_execution_source as source
++from hermes_cli import kanban_queue_position as queue
++from hermes_cli import kanban_session_activity as activity
++from tests.hermes_cli import test_kanban_capacity_harness as harness
++from tests.hermes_cli import test_kanban_session_activity as fixtures
++
++kanban_root = fixtures.kanban_root
++capacity_board = harness.capacity_board
++
++REQUEST = {"action": "Approve", "why_human": "Owner needed", "interaction": "approval",
++           "scope": "fixture", "evidence": "fixture", "resolved_check": "private command"}
++
++
++def _meta(identity, predecessors=()):
++    return {"status": "ready", "_recovery_history_v1": {"identity": identity, "predecessors": predecessors}}
++
++
++@pytest.fixture
++def two_cards(kanban_root, monkeypatch):
++    """`card` (session) carries a malformed event; `other` (session2) holds an unrelated outstanding ask."""
++    monkeypatch.setattr(observations, "local_scope", lambda: ("fixture-gateway", "default"))
++    monkeypatch.setattr(activity.time, "time", lambda: 1000)
++    path = kanban_root / "kanban.db"
++    fixtures._make_full_board(path, [("card", "Work", "ready", "agent", "session", 10, None, None),
++                                     ("other", "Other", "ready", "agent", "session2", 10, None, None)])
++    with sqlite3.connect(path) as conn:
++        conn.execute("ALTER TABLE tasks ADD COLUMN block_kind TEXT")
++        conn.execute("ALTER TABLE tasks ADD COLUMN human_request TEXT")
++        conn.execute("UPDATE tasks SET status='blocked', block_kind='needs_input', human_request=? WHERE id='other'",
++                     (json.dumps(REQUEST),))
++        conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, "
++                     "created_at INTEGER, payload TEXT, uid TEXT)")
++    return path
++
++
++def _bad_event(path, payload):
++    with sqlite3.connect(path) as conn:
++        conn.execute("INSERT INTO task_events VALUES (1, 'card', NULL, 'promoted', 10, ?, 'u1')", (json.dumps(payload),))
++
++
++MALFORMED = [
++    _meta(["x"]), _meta({"a": 1}), _meta(7), _meta(None),
++    _meta("ok", [["nested"]]), _meta("ok", "not-a-list"), _meta("ok", [{"a": 1}]), _meta("ok", [3]),
++]
++
++
++@pytest.mark.parametrize("payload", MALFORMED, ids=range(len(MALFORMED)))
++def test_malformed_event_identity_is_unknown_and_leaves_other_session_ask(two_cards, payload):
++    _bad_event(two_cards, payload)
++    other, bad = [{"id": "session2"}], [{"id": "session"}]
++    activity.annotate_kanban_activity(other)
++    activity.annotate_kanban_activity(bad)
++    assert not other[0].get("kanban_unknown") and other[0]["kanban_blocked"] == 1
++    assert not bad[0].get("kanban_unknown") and bad[0]["kanban_active"] == 1
++    states = {(v["source"], v["state"]) for v in bad[0]["execution_observations"]}
++    assert ("kanban.card", "unknown") in states
++    assert not any(v["state"] in {"running", "done"} for v in bad[0]["execution_observations"])
++
++
++def test_malformed_event_counts_snapshot_does_not_raise(two_cards):
++    _bad_event(two_cards, MALFORMED[0])
++    assert activity._all_counts(include_snapshot=True) is not None
++
++
++def test_source_raw_failure_is_per_card_unknown(two_cards, monkeypatch):
++    real = source.raw
++
++    def flaky(row, src):
++        if row["id"] == "card":
++            raise ValueError("fixture adapter failure")
++        return real(row, src)
++    monkeypatch.setattr(source, "raw", flaky)
++    other, bad = [{"id": "session2"}], [{"id": "session"}]
++    activity.annotate_kanban_activity(other)
++    activity.annotate_kanban_activity(bad)
++    assert not other[0].get("kanban_unknown") and other[0]["kanban_blocked"] == 1
++    assert not bad[0].get("kanban_unknown") and bad[0]["kanban_active"] == 1
++    unknown = [v for v in bad[0]["execution_observations"] if v["source"] == "kanban.card"]
++    assert unknown and unknown[0]["state"] == "unknown" and unknown[0]["unknown_reason"] == "adapter_error"
++
++
++def test_assemble_failure_keeps_legacy_counts_and_marks_cards_unknown(two_cards, monkeypatch):
++    def boom(*a, **kw):
++        raise sqlite3.OperationalError("fixture assemble failure")
++    monkeypatch.setattr(source, "assemble", boom)
++    other = [{"id": "session2"}]
++    activity.annotate_kanban_activity(other)
++    assert not other[0].get("kanban_unknown") and other[0]["kanban_blocked"] == 1
++    assert activity._all_counts(include_snapshot=True) is not None
++
++
++@pytest.mark.parametrize("fault", ["malformed", "raw", "assemble"])
++def test_session_tasks_card_failure_is_explicit_unknown_with_ask(two_cards, monkeypatch, fault):
++    if fault == "malformed":
++        with sqlite3.connect(two_cards) as conn:
++            conn.execute("UPDATE tasks SET session_id='session' WHERE id='other'")
++        _bad_event(two_cards, MALFORMED[0])
++    elif fault == "raw":
++        monkeypatch.setattr(source, "raw", lambda *a, **kw: (_ for _ in ()).throw(TypeError("fixture")))
++    else:
++        def boom(*a, **kw):
++            raise sqlite3.OperationalError("fixture assemble failure")
++        monkeypatch.setattr(source, "assemble", boom)
++    rows = {r["id"]: r for r in activity.session_tasks(["session", "session2"], statuses=("ready", "blocked"))}
++    assert set(rows) == {"card", "other"}
++    for tid in ("card", "other"):
++        work = [v for v in rows[tid].get("execution_observations", []) if v["source"] == "kanban.card"]
++        if tid == "card" or fault != "malformed":
++            assert len(work) == 1 and work[0]["state"] == "unknown", (tid, work)
++    other = next(v for v in rows["other"]["execution_observations"] if v["source"] == "kanban.card")
++    if fault != "malformed":
++        assert other["human_request"]["action"] == "Approve"
++        assert "resolved_check" not in other["human_request"]
++        assert other["unknown_reason"] == "adapter_error"
++
++
++def test_add_cards_adapter_failure_attaches_unknown_not_nothing(monkeypatch):
++    monkeypatch.setattr(source, "raw", lambda *a, **kw: (_ for _ in ()).throw(KeyError("fixture")))
++    row = {"id": "t1", "board": "b", "status": "blocked", "human_request": json.dumps(REQUEST),
++           "_execution_source": {"task": {}}}
++    [out] = observations.add_cards([row], now=5)
++    [value] = out["execution_observations"]
++    assert value["source"] == "kanban.card" and value["state"] == "unknown"
++    assert value["unknown_reason"] == "adapter_error" and value["human_request"]["action"] == "Approve"
++    assert "_execution_source" not in out
++
++
++@contextmanager
++def _faults(monkeypatch, fault):
++    if fault == "raw":
++        monkeypatch.setattr(source, "raw", lambda *a, **kw: (_ for _ in ()).throw(ValueError("fixture")))
++    elif fault == "assemble":
++        monkeypatch.setattr(source, "assemble",
++                            lambda *a, **kw: (_ for _ in ()).throw(sqlite3.OperationalError("fixture")))
++    else:
++        monkeypatch.setattr(observations, "local_scope",
++                            lambda: (_ for _ in ()).throw(sqlite3.OperationalError("fixture")))
++    yield
++
++
++@pytest.mark.parametrize("fault", ["raw", "assemble", "scope"])
++def test_detail_fields_survives_adapter_failure(capacity_board, monkeypatch, fault):
++    conn, ids, _ = capacity_board
++    monkeypatch.setattr(queue, "_running_and_limit", lambda *a: (0, 4))
++    with _faults(monkeypatch, fault):
++        out = queue.detail_fields(conn, kb.get_task(conn, ids[0]), "default")
++    assert "capacity_evidence" in out and "capacity_note" in out and "queue" in out
++    work = [v for v in out["execution_observations"] if v["source"] == "kanban.card"]
++    assert len(work) == 1 and work[0]["state"] == "unknown"
++
++
++@pytest.mark.parametrize("fault", ["raw", "assemble"])
++def test_tool_cli_rest_detail_survive_adapter_failure(capacity_board, monkeypatch, capsys, fault):
++    from argparse import Namespace
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++    from hermes_cli import kanban as cli
++    from tests.plugins.test_kanban_foreign_card_api import _load_plugin_router
++    from tools.kanban_show import show
++
++    _, ids, _ = capacity_board
++    monkeypatch.setattr(queue, "_running_and_limit", lambda *a: (0, 4))
++    app = FastAPI()
++    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
++    with _faults(monkeypatch, fault), TestClient(app) as client:
++        tool = json.loads(show({"task_id": ids[0]}))
++        assert cli._cmd_show(Namespace(task_id=ids[0], json=True, board=None)) == 0
++        command = json.loads(capsys.readouterr().out)
++        response = client.get(f"/api/plugins/kanban/tasks/{ids[0]}")
++        assert response.status_code == 200
++        for payload in (tool, command, response.json()):
++            assert payload["task"]["id"] == ids[0] and "capacity_evidence" in payload
++            assert "comments" in payload and "events" in payload
++            work = [v for v in payload["execution_observations"] if v["source"] == "kanban.card"]
++            assert len(work) == 1 and work[0]["state"] == "unknown"
++        assert cli._cmd_show(Namespace(task_id=ids[0], json=False, board=None)) == 0
+-- 
+2.43.0
+

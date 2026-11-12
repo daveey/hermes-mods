@@ -1,6 +1,6 @@
 # One worker queue (`pool:worker`) for portable cards
 
-Patches: **2585–2587, 2636, 2637, 2662, 2678**.
+Patches: **2585–2587, 2636, 2637, 2662, 2678, 2698**.
 
 ## Behavior
 
@@ -29,6 +29,13 @@ Patches: **2585–2587, 2636, 2637, 2662, 2678**.
 ## Tests
 
 Source coverage, **not run in this mirror** (the mirror pass only verifies patch replay and tree equality; it does not rerun these tests): `tests/hermes_cli/test_kanban_pool_queue.py`, `test_kanban_pool_carried_inputs.py`, `test_kanban_coordination_placement.py`, `test_kanban_access_contract_shape.py`, `test_kanban_declared_access.py` (and a one-line edit to `test_kanban_operator_call.py`). Entry path: the placement, move and park module APIs and the create front doors with a faked machine registry; direct `create_task` placement (2678) is driven through `kb.create_task`. 2587 is a refactor with no test of its own. A real Board, real multi-machine claiming and the Board-side `worker_placement` reservation are **untested**; the claim of free-slot pickup by another worker is not proven by these tests.
+
+## Follow-up 2698: carried-input exemption fails closed on a stale registry
+
+- Behavior: the carried-input exemption (2636, 2637) reads the machine registry only while its last successful fetch is at most twice `REGISTRY_TTL_S` old. After a persistent registry outage the pool-label member set is no longer frozen: the exemption reports unreadable and the text is returned unchanged (fail closed), as for an unreadable registry. A short fetch blip inside that age keeps the exemption. Before, one good fetch followed by failed fetches kept serving the last snapshot, so the exemption could cover a host its receipt never verified.
+- How it works: `kanban_worker_node` records `ok_at` (monotonic time of the last successful fetch, cleared by `set_registry_fetch`) and adds `registry_fresh(max_age_s)`, which returns the snapshot only when `ok_at` is within the age. `kanban_carried_evidence._label_members` calls `registry_fresh(2 * REGISTRY_TTL_S)`. `registry()` and the dispatcher's last-known-good path are unchanged.
+- Code: `hermes_cli/kanban_carried_evidence.py`, `hermes_cli/kanban_worker_node.py`.
+- Tests: source coverage, not run in this mirror: `tests/hermes_cli/test_kanban_pool_carried_inputs.py` (stale snapshot fails closed, a short blip keeps the exemption, the dispatcher's registry keeps its last known good value). Entry path: the carried-evidence module API and `kanban_worker_node.registry*` against a faked registry fetch and clock. Real registry outages and the create front doors under a stale registry are **untested**.
 
 ## Applying
 

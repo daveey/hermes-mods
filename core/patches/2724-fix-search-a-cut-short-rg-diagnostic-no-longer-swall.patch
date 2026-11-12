@@ -1,0 +1,108 @@
+From 9a196bae583363e3953fd9a67afd879068392f2e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:25:16 +0000
+Subject: [PATCH] fix(search): a cut-short rg diagnostic no longer swallows the
+ first match
+
+rg writes each diagnostic in several write() calls ("rg: ", path, ": ",
+"Permission denied", ...). The native lane kills rg at the result bound, so
+the kill can land mid-diagnostic. The kept stderr then ended without a
+newline and was prepended to stdout, fusing the fragment with the first
+match line; the parser read that line as a diagnostic and the bounded search
+returned limit-1 results.
+
+Drop an unterminated stderr tail when we killed rg (it names nothing
+reliably), newline-terminate it otherwise.
+
+Deflakes tests/tools/test_search_unreadable_bound.py::
+test_many_unreadable_dirs_do_not_eat_the_result_budget[content-kwargs2]
+(CI run 43214920121: "assert 2 == 3"). The new fake-rg test reproduces the
+cut deterministically and is red on the base.
+
+Kanban: t_01a1cfb454667991
+---
+ tests/tools/test_search_unreadable_bound.py | 21 +++++++++++++++++++++
+ tools/file_operations_search.py             | 21 ++++++++++++++++-----
+ 2 files changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/tests/tools/test_search_unreadable_bound.py b/tests/tools/test_search_unreadable_bound.py
+index 9339c1e268..d07b876da8 100644
+--- a/tests/tools/test_search_unreadable_bound.py
++++ b/tests/tools/test_search_unreadable_bound.py
+@@ -68,6 +68,27 @@ def test_many_unreadable_dirs_do_not_eat_the_result_budget(locked_tree, target,
+     assert "(+59 more)" in (full.warning or "")
+ 
+ 
++def test_rg_killed_mid_diagnostic_keeps_the_first_match(tmp_path, monkeypatch):
++    # rg writes one diagnostic in several write() calls, so the kill at the bound can
++    # land mid-line. That unterminated stderr fragment must not swallow the first match.
++    root = tmp_path
++    fake_rg = tmp_path / "fake-rg"
++    fake_rg.write_text(
++        "#!/bin/sh\n"
++        f"printf 'rg: {root}/d00: Permission' >&2\n"
++        f"for i in 0 1 2 3 4; do echo \"{root}/zz/f$i.log:1:needle\"; done\n"
++        "exec sleep 60\n")
++    fake_rg.chmod(0o755)
++    ops = ShellFileOperations(LocalEnvironment(cwd=str(root)), cwd=str(root))
++    if not ops._native_read_enabled():
++        pytest.skip("native rg lane only")
++    monkeypatch.setattr(ops, "_has_command", lambda cmd: True)
++    monkeypatch.setattr(ops, "_resolve_command", lambda cmd: str(fake_rg) if cmd == "rg" else None)
++    result = ops.search("needle", path=str(root), target="content", limit=3)
++    assert result.error is None
++    assert [m.path for m in result.matches] == [f"{root}/zz/f{i}.log" for i in range(3)]
++
++
+ def test_find_fallback_names_the_unreadable_dir(locked_tree, monkeypatch):
+     ops = ShellFileOperations(LocalEnvironment(cwd=str(locked_tree)), cwd=str(locked_tree))
+     real_has = ops._has_command
+diff --git a/tools/file_operations_search.py b/tools/file_operations_search.py
+index dd5bc7c50a..ec1965ffcb 100644
+--- a/tools/file_operations_search.py
++++ b/tools/file_operations_search.py
+@@ -366,6 +366,19 @@ def _drain_stderr_capped(pipe, chunks: list[bytes], omitted: list[int]) -> None:
+         kept += len(raw)
+ 
+ 
++def _kept_stderr_text(chunks: list[bytes], omitted: int, killed: bool) -> str:
++    """Kept stderr as newline-terminated lines, ready to prepend to stdout. rg writes one
++    diagnostic in several write() calls, so killing it at the bound can cut the last line
++    short; that fragment is dropped (it names nothing reliably), and any other unterminated
++    tail gets a newline, so it never fuses with the first stdout line and hides a match."""
++    if chunks and not chunks[-1].endswith(b"\n"):
++        chunks = chunks[:-1] if killed else chunks[:-1] + [chunks[-1] + b"\n"]
++    text = b"".join(chunks).decode("utf-8", errors="replace")
++    if omitted:
++        text += _omitted_diagnostics_line(omitted) + "\n"
++    return text
++
++
+ def _parse_search_context_line(line: str) -> tuple[str, int, str] | None:
+     """Parse a ``path-line-content`` context line using the RIGHTMOST numeric
+     separator (filenames may contain ``-<digits>-`` segments):
+@@ -659,7 +672,8 @@ class SearchMixin:
+             if time.monotonic() > deadline:
+                 exit_code = 124
+                 break
+-        if proc.poll() is None:
++        killed = proc.poll() is None
++        if killed:
+             _kill_process_group_posix(proc)  # native lane is POSIX-only (gate above)
+         proc.wait()
+         drainer.join()
+@@ -669,10 +683,7 @@ class SearchMixin:
+             err_drainer.join()
+             if proc.stderr is not None:
+                 proc.stderr.close()
+-            err_text = b"".join(err_chunks).decode("utf-8", errors="replace")
+-            if err_omitted[0]:
+-                err_text = err_text.rstrip("\n") + "\n" + _omitted_diagnostics_line(err_omitted[0]) + "\n"
+-            stdout = err_text + stdout
++            stdout = _kept_stderr_text(err_chunks, err_omitted[0], killed) + stdout
+         if exit_code == 124:
+             return ExecuteResult(stdout=stdout + f"\n[Command timed out after {timeout}s]", exit_code=124)
+         if exit_code == 130:
+-- 
+2.43.0
+

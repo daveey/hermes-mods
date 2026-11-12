@@ -1,0 +1,790 @@
+From 804b5253c8177b672d52dc1d034fbd2509af7060 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 04:44:37 +0000
+Subject: [PATCH] feat(status): unify persisted and registry child activity
+ identity [daveey]
+
+---
+ .../process-subagent-observations.test.ts     |  19 +-
+ .../src/store/session-dot-state.test.ts       |   4 +-
+ docs/execution-observations-v1.md             |  28 +++
+ hermes_cli/kanban_db_dispatch.py              |  13 +-
+ hermes_cli/subagent_session_activity.py       |  96 ++++++++++
+ .../turn_process_execution_observations.py    |  47 +++--
+ hermes_cli/web_routers/profiles.py            |   4 +
+ hermes_cli/web_routers/sessions.py            |   2 +
+ tests/fixtures/subagent_profile_parity.py     |  42 +++++
+ .../test_subagent_session_activity.py         | 175 ++++++++++++++++++
+ ...est_turn_process_execution_observations.py |  26 +--
+ .../test_process_subagent_observation_rpc.py  |  37 +++-
+ tui_gateway/methods_projects.py               |   2 +
+ tui_gateway/methods_subagents.py              |   2 +-
+ 14 files changed, 447 insertions(+), 50 deletions(-)
+ create mode 100644 hermes_cli/subagent_session_activity.py
+ create mode 100644 tests/fixtures/subagent_profile_parity.py
+ create mode 100644 tests/hermes_cli/test_subagent_session_activity.py
+
+diff --git a/apps/desktop/src/store/process-subagent-observations.test.ts b/apps/desktop/src/store/process-subagent-observations.test.ts
+index 3bef74aeda..8ec77d911d 100644
+--- a/apps/desktop/src/store/process-subagent-observations.test.ts
++++ b/apps/desktop/src/store/process-subagent-observations.test.ts
+@@ -18,8 +18,9 @@ import { $subagentsBySession, reconcileSubagentSnapshot, upsertSubagent } from '
+ // Real source adapters, not a second table of expected observations. No production reads or clocks.
+ const records = JSON.parse(execFileSync('python3', ['-c', `
+ import json
+-from hermes_cli.turn_process_execution_observations import process, subagent
++from hermes_cli.turn_process_execution_observations import process, registry_subagent as subagent
+ class Child:
++    session_id = "child-a"
+     def get_activity_summary(self): return {"last_activity_ts": 1000}
+ p=process({"id":"proc-a", "pid":71, "host_start_time":81, "observed_at":1000, "source":"process.registry"}, gateway="edge", profile="work", session="owner", now=1001)
+ s=subagent({"subagent_id":"child-a", "delegation_id":"batch-a", "owner_agent_session_id":"owner", "started_at":900, "status":"running", "agent":Child()}, gateway="edge", profile="work", now=1001)
+@@ -38,6 +39,22 @@ afterEach(() => {
+ })
+ 
+ describe('process/subagent source to sidebar consumers', () => {
++  it('merges the actual SQLite and registry child producers as one sidebar execution', () => {
++    const sample = JSON.parse(execFileSync('python3', ['tests/fixtures/subagent_profile_parity.py'], {
++      cwd: resolve(process.cwd(), '../..'), encoding: 'utf8',
++      env: { ...process.env, PYTHONPATH: resolve(process.cwd(), '../..') },
++    }))
++    const stamped = sample.row as SessionInfo
++    expect(stamped.execution_observations).toEqual([sample.registry])
++    vi.useFakeTimers(); vi.setSystemTime(sample.now * 1000)
++    $sessions.set([stamped])
++    setLiveWorkRosterSource(gatewayRouteState(null, 'work').key,
++      [{ session_id: 'owner', subagents: 1, background: 0, execution_observations: [sample.registry] }],
++      sample.now * 1000, ['owner'])
++    expect(rowExecution(stamped, sample.now)).toMatchObject({ live: 1, unknown: 0 })
++    expect(rowExecution(stamped, 1181)).toMatchObject({ live: 0, unknown: 1 })
++  })
++
+   it('counts one non-launch-profile process once across real row, RPC and roster producers', () => {
+     const sample = JSON.parse(execFileSync('python3', ['tests/fixtures/process_profile_parity.py'], {
+       cwd: resolve(process.cwd(), '../..'), encoding: 'utf8',
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index beff64d957..4051caab1f 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -187,8 +187,8 @@ describe('hasLiveTurn', () => {
+ describe('$delegatingSessionIds', () => {
+   const subagent = (status: SubagentProgress['status']): SubagentProgress => ({
+     executionObservations: status === 'running' ? [{
+-      version: 1, identity: { gateway: 'edge', profile: 'default', session: 'owner', kind: 'subagent', work_id: 'sub-1', generation: 'delegation=batch:start=1000' },
+-      owner: { gateway: 'edge', profile: 'default', session: 'owner' }, state: 'running', source: 'subagent.registry',
++      version: 1, identity: { gateway: 'edge', profile: 'default', session: 'owner', kind: 'subagent', work_id: 'sub-1', generation: 'session=sub-1' },
++      owner: { gateway: 'edge', profile: 'default', session: 'owner' }, state: 'running', source: 'subagent.activity',
+       source_revision: 'sub-1@1000', observed_at: Date.now() / 1000, valid_until: Date.now() / 1000 + 180, evidence_refs: ['sub-1']
+     }] : [],
+     id: 'sub-1',
+diff --git a/docs/execution-observations-v1.md b/docs/execution-observations-v1.md
+index a486eaaca8..6c9ac23fc5 100644
+--- a/docs/execution-observations-v1.md
++++ b/docs/execution-observations-v1.md
+@@ -1,5 +1,33 @@
+ # Execution observations v1 (capacity adapter)
+ 
++## Canonical child activity
++
++`turn_process_execution_observations.subagent` is the pure normalizer for
++`{child_session_id, parent_session_id, activity_at, started_at, live}`. Both registry
++RPCs and `subagent_session_activity.annotate_subagent_activity(rows)` produce source
++`subagent.activity`: gateway/profile/parent session, `work_id=<child session id>`,
++`generation=session=<child session id>`. Registry ids, delegation ids, PIDs and spawn
++timestamps never identify this execution. The registry adapter reads the child's
++actual `session_id` and original `_parent_session_id`; legacy records without an
++actual child id remain unknown. Equal activity clocks normalize to identical records,
++including source revision and evidence refs, irrespective of reservation/spawn time.
++
++The persisted reader runs on the existing session-list, profile stamps/bootstrap and
++project-tree annotation cadence, never inside `subagent.list`. It uses URI `mode=ro`,
++one batched SELECT per profile state.db per three-second cache (including failures),
++and discovers unended children started within six hours. Stale activity expires after
++180 seconds without a fetch; activity is never substantive progress. Finished rows
++are absent after cache refresh. Read failures produce unknown, not an empty inventory.
++The old `subagent.registry` source remains in replacement sets for mixed versions.
++
++Managed-worker children are owner-reserved in the owner's profile state.db by
++`gateway.session_worker_child.reserve_child_execution`. `ChildSessionStore` then
++persists `session.activity` via `worker.persist`; the local worker need not open a
++state.db. Observe these rows at the owner gateway, not the worker host. Persist-disabled
++children, inaccessible owner stores and children outside the discovery window are
++not complete inventory coverage; absence never proves zero children or completion.
++No new timer, store, migration, writer or lifecycle policy is introduced.
++
+ Optional `execution_observations[]` is additive advisory evidence. Existing outcomes,
+ completion/origin release receipts, admission and structured human requests remain
+ authoritative and unchanged. Missing optional fields never erase outstanding work.
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 72635ae868..5fc4d08f48 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -105,7 +105,6 @@ DEFAULT_GUARD_HOLD_CAP_LONG_SECONDS = 6 * 3600
+ _GUARD_HOLD_SHORT_CAP_REASONS = frozenset({"blocker_auth"})
+ _GUARD_HOLD_EXEMPT_REASONS = frozenset({"shared_blocker", "model_provider_mismatch", "model_pin_not_in_routing_registry", "subscription_quota_reset"})
+ 
+-
+ def _env_seconds(name: str, default: int) -> int:
+     try:
+         return max(0, int(os.environ.get(name, "") or default))
+@@ -155,16 +154,12 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
+ @dataclass
+ class DispatchResult:
+     """Outcome of a single ``dispatch`` pass.
+-
+     ``kanban.default_assignee`` applied this tick before spawning (#27145). Surfaces the auto-assignment to
+     telemetry / CLI / dashboard so the operator can see when the dispatcher is acting on the fallback rule
+-    ``kanban.max_in_progress_per_profile`` (#21582). Each entry is ``(task_id, assignee,
+-    current_running_count)``. NOT an operator-actionable failure — the task will be picked up on a
+-    subsequent tick when the assignee has capacity. Separate bucket so telemetry / dashboards can show "this
+-    profile is busy" vs
+-    the board's dispatch lock (issue #35240). A losing dispatcher does no DB writes this tick — the lock
+-    holder is making progress on the same board. This is the steady-state signal that a single-writer guard
+-    is
++    ``kanban.max_in_progress_per_profile`` (#21582): ``(task_id, assignee, current_running_count)``.
++    NOT an operator-actionable failure — the task will be picked up on a subsequent tick when the assignee
++    has capacity. Separate bucket so telemetry / dashboards can show "this profile is busy" vs the board's
++    dispatch lock (issue #35240). A losing dispatcher does no DB writes this tick; the holder is progressing.
+     """
+ 
+     scheduling_admitted: bool = False
+diff --git a/hermes_cli/subagent_session_activity.py b/hermes_cli/subagent_session_activity.py
+new file mode 100644
+index 0000000000..313c6b7562
+--- /dev/null
++++ b/hermes_cli/subagent_session_activity.py
+@@ -0,0 +1,96 @@
++"""Read-only persisted child activity, on the existing session annotation cadence.
++
++One SELECT per profile store per three seconds, no lifecycle/liveness claims from absence.
++Unended children older than the six-hour discovery window and persist-disabled children are
++not covered; stale rows inside the window remain explicit unknown observations.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import threading
++import time
++from pathlib import Path
++
++from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS, local_scope
++from hermes_cli.turn_process_execution_observations import SUBAGENT_SOURCES, replace, subagent
++
++_log = logging.getLogger(__name__)
++_lock = threading.Lock()
++_cache = {}
++_WINDOW = 6 * 3600
++
++
++def _profile_paths():
++    from hermes_constants import get_hermes_home
++    from hermes_cli.turn_process_execution_observations import profile_for_state_path
++
++    home = Path(get_hermes_home())
++    root = home.parent.parent if home.parent.name == "profiles" else home
++    paths = [root / "state.db", *sorted((root / "profiles").glob("*/state.db"))]
++    return [(profile_for_state_path(path), path) for path in paths]
++
++
++def _children(path, now):
++    mono = time.monotonic()
++    with _lock:
++        cached = _cache.get(path)
++        if cached is not None and mono < cached[0]:
++            return cached[1]
++        # URI mode=ro never creates a store or invokes migrations. A read failure is
++        # unknown, not a successful empty inventory; do not fall back to mode=rw.
++        try:
++            conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.2)
++            try:
++                rows = conn.execute(
++                    "SELECT id, parent_session_id, last_activity_at, started_at FROM sessions "
++                    "WHERE source='subagent' AND parent_session_id IS NOT NULL AND ended_at IS NULL "
++                    "AND started_at >= ?", (now - _WINDOW,)).fetchall()
++            finally:
++                conn.close()
++        except (sqlite3.Error, OSError, ValueError):
++            rows = None
++        _cache[path] = (mono + 3, rows)
++        return rows
++
++
++def annotate_subagent_activity(rows):
++    """Append canonical observations, never count a missing/failed store as zero work."""
++    if not rows:
++        return rows
++    now = time.time()
++    try:
++        gateway, _ = local_scope()
++        paths = _profile_paths()
++    except ADAPTER_ERRORS:
++        _log.debug("subagent scope unavailable", exc_info=True)
++        gateway, paths = None, []
++    by_profile = {}
++    for profile, path in paths:
++        children = _children(path, now)
++        by_profile[profile] = (children or [], "subagent_store_unavailable" if children is None else None)
++    for row in rows:
++        profile = row.get("profile") or "default"
++        children, error = by_profile.get(profile, ([], "subagent_store_unavailable"))
++        parents = {row.get("id"), row.get("_lineage_root_id"), *(row.get("_lineage_ids") or ())}
++        observations = [subagent({"child_session_id": child, "parent_session_id": parent,
++                                 "activity_at": activity, "started_at": started, "live": True},
++                                gateway=gateway, profile=profile, now=now)
++                        for child, parent, activity, started in children if parent in parents]
++        if error:
++            # A source-level unknown has no fabricated execution identity. Preserve
++            # known children so a failed read cannot erase their last source clocks.
++            previous = row.get("execution_observations") or []
++            observations.extend({**o, "state": "unknown", "unknown_reason": error}
++                                for o in previous if isinstance(o, dict) and o.get("source") in SUBAGENT_SOURCES)
++            unknown = subagent({"parent_session_id": row.get("id"), "live": True},
++                               gateway=gateway, profile=profile, now=now)
++            unknown["unknown_reason"] = error
++            observations.append(unknown)
++        replace(row, SUBAGENT_SOURCES, observations)
++    return rows
++
++
++def _reset_cache_for_tests():
++    with _lock:
++        _cache.clear()
+diff --git a/hermes_cli/turn_process_execution_observations.py b/hermes_cli/turn_process_execution_observations.py
+index 147c0b4ea6..0ec317196f 100644
+--- a/hermes_cli/turn_process_execution_observations.py
++++ b/hermes_cli/turn_process_execution_observations.py
+@@ -17,8 +17,9 @@ _log = logging.getLogger(__name__)
+ 
+ TURN_SOURCE = "turn.lease"
+ PROCESS_SOURCES = frozenset({"process.registry", "process.checkpoint"})
+-SUBAGENT_SOURCE = "subagent.registry"
+-SUBAGENT_SOURCES = frozenset({SUBAGENT_SOURCE})
++SUBAGENT_SOURCE = "subagent.activity"
++# Replace old producer records during mixed-version rollout, never treat their ids as child ids.
++SUBAGENT_SOURCES = frozenset({SUBAGENT_SOURCE, "subagent.registry"})
+ OWNED_SOURCES = frozenset({TURN_SOURCE}) | PROCESS_SOURCES | SUBAGENT_SOURCES
+ 
+ 
+@@ -118,24 +119,32 @@ def activity_clock(record):
+     return value if _finite(value) else None
+ 
+ 
+-def subagent(record, *, gateway, profile, now):
+-    """Delegate registry record: ``subagent_id, delegation_id, started_at, status, owner_agent_session_id``
+-    (+ the live ``agent``). Identity is the subagent id qualified by delegation and spawn time; the
+-    owner is the durable conversation that commissioned it.
++def registry_subagent(record, *, gateway, profile, now):
++    """Adapt registry records without inventing child ids for legacy/half-built agents."""
++    agent = record.get("agent")
++    parent = getattr(agent, "_parent_session_id", None)
++    parent = parent if ident(parent) else record.get("owner_agent_session_id")
++    return subagent({"child_session_id": getattr(agent, "session_id", None),
++                     "parent_session_id": parent, "activity_at": activity_clock(record),
++                     "started_at": record.get("started_at"), "live": record.get("status") == "running"},
++                    gateway=gateway, profile=profile, now=now)
++
++
++def subagent(evidence, *, gateway, profile, now):
++    """Pure canonical child projection shared by registry and persisted producers.
+ 
+-    A running child is dated by its OWN activity clock (``last_activity_ts``: finite, not future, not before
+-    spawn); a wedged child's clock stops and the observation expires with no fetch. Without a usable clock the
+-    spawn time dates it and it expires. Request time never dates it. Activity, ``tool_count`` and ``last_tool``
+-    are never progress.
++    Spawn times differ between adapters: they are fallback clocks, never identity. Equal child
++    activity clocks yield identical records. Registry/delegation ids cannot enter canonical refs.
++    Activity is not progress; missing child identity is unknown, never a fabricated PID/id.
+     """
+-    work_id, delegation = record.get("subagent_id"), record.get("delegation_id")
+-    owner, started = record.get("owner_agent_session_id"), record.get("started_at")
+-    generation = f"delegation={delegation}:start={started}" if ident(delegation) and _finite(started) else None
++    work_id, owner = evidence.get("child_session_id"), evidence.get("parent_session_id")
++    started, activity = evidence.get("started_at"), evidence.get("activity_at")
++    generation = f"session={work_id}" if ident(work_id) else None
+     reference = f"{SUBAGENT_SOURCE}/{work_id}"
+-    activity = activity_clock(record)
+-    if not (activity is not None and _finite(started) and started <= activity <= now):
++    if not (_finite(activity) and activity <= now):
+         activity = None
+-    observed = activity if activity is not None else (started if _finite(started) else None)
++    activity = float(activity) if activity is not None else None
++    observed = activity if activity is not None else (float(started) if _finite(started) else None)
+     raw = {"version": 1, "identity": _identity("subagent", work_id, gateway, profile,
+                                                owner if ident(owner) else None, generation),
+            "owner": _owner(gateway, profile, owner if ident(owner) else None), "state": "running",
+@@ -144,10 +153,10 @@ def subagent(record, *, gateway, profile, now):
+            "valid_until": observed + SOURCE_TTLS["sidebar"] if observed is not None else None,
+            "last_activity": activity, "last_progress": None, "last_progress_kind": None,
+            "last_progress_ref": None, "wait": None}
+-    if record.get("status") != "running":
++    if evidence.get("live") is not True:
+         raw.update(state="unknown", unknown_reason="subagent_not_running")
+-    elif not (ident(owner) and ident(delegation)):
+-        raw.update(state="unknown", unknown_reason="missing_subagent_owner_or_delegation")
++    elif not (ident(owner) and ident(work_id)):
++        raw.update(state="unknown", unknown_reason="missing_subagent_child_or_parent")
+     return project(raw, now=now, source_class="sidebar")
+ 
+ 
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index 98a7d9936b..8e93a4836d 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -38,6 +38,7 @@ from hermes_cli.kanban_session_activity import annotate_kanban_activity, one_ann
+ from hermes_cli.cron_session_activity import annotate_cron_activity
+ from hermes_cli.goal_session_activity import annotate_goal_activity
+ from hermes_cli.process_session_activity import annotate_background_activity
++from hermes_cli.subagent_session_activity import annotate_subagent_activity
+ from hermes_cli.turn_session_activity import annotate_turn_activity
+ from hermes_cli.review_session_activity import annotate_review_wait
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+@@ -495,6 +496,7 @@ def get_profiles_sessions(
+     annotate_cron_activity(window)
+     annotate_background_activity(window)
+     annotate_turn_activity(window)
++    annotate_subagent_activity(window)
+     annotate_review_wait(window)
+     return {"sessions": window, "total": sum(totals.values()), "profile_totals": totals,
+             "limit": limit, "offset": offset, "errors": errors,
+@@ -548,6 +550,7 @@ def get_profiles_session_stamps(ids: str = Query(..., max_length=8000), profile:
+     stamp_outcome_rows(_tag_rows(rows, name, now))
+     stamp_automated(rows, home)
+     base = [set(row) for row in rows]
++    annotate_subagent_activity(rows)
+     annotate_review_wait(annotate_turn_activity(annotate_background_activity(annotate_cron_activity(
+         annotate_goal_activity(annotate_kanban_activity(rows))))))
+     out = []
+@@ -646,6 +649,7 @@ def get_profiles_sessions_sidebar(
+         rows[key].sort(key=_recency, reverse=True)
+         win = _pinned_window(rows[key], 0, cap[key])
+         _strip_session_list_rows(win)
++        annotate_subagent_activity(win)
+         return annotate_review_wait(annotate_turn_activity(annotate_background_activity(annotate_cron_activity(
+             annotate_goal_activity(annotate_kanban_activity(win))))))
+ 
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index da5e03974b..fa9c955691 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -29,6 +29,7 @@ from hermes_cli.kanban_session_activity import annotate_kanban_activity, session
+ from hermes_cli.cron_session_activity import annotate_cron_activity
+ from hermes_cli.goal_session_activity import annotate_goal_activity
+ from hermes_cli.process_session_activity import annotate_background_activity, stop_session_process
++from hermes_cli.subagent_session_activity import annotate_subagent_activity
+ from hermes_cli.turn_session_activity import annotate_turn_activity
+ from hermes_cli.review_session_activity import annotate_review_wait
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+@@ -314,6 +315,7 @@ def _list_sessions_payload(
+             annotate_cron_activity(sessions)
+             annotate_background_activity(sessions)
+             annotate_turn_activity(sessions)
++            annotate_subagent_activity(sessions)
+             annotate_review_wait(sessions)
+             # ``storage`` tells an empty page apart from an unreadable store (#72046); same
+             # ``{profile: "corrupt"}`` shape as the /api/profiles/sessions* lists.
+diff --git a/tests/fixtures/subagent_profile_parity.py b/tests/fixtures/subagent_profile_parity.py
+new file mode 100644
+index 0000000000..ed04d2885b
+--- /dev/null
++++ b/tests/fixtures/subagent_profile_parity.py
+@@ -0,0 +1,42 @@
++"""Actual persisted and registry subagent producers, shared by renderer/Python tests."""
++import json
++import os
++import sys
++import tempfile
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++
++def sample():
++    from hermes_cli import subagent_session_activity as activity
++    from hermes_cli.turn_process_execution_observations import registry_subagent
++    from hermes_state import SessionDB
++
++    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:
++        home = Path(directory)
++        work = home / "profiles" / "work"
++        work.mkdir(parents=True)
++        db = SessionDB(work / "state.db")
++        try:
++            db.create_session("owner", source="cli")
++            db.create_session("child-a", source="subagent", parent_session_id="owner")
++            db.touch_session_activity("child-a", 1000)
++            child = SimpleNamespace(session_id="child-a", _parent_session_id="owner",
++                                    get_activity_summary=lambda: {"last_activity_ts": 1000})
++            with (patch.dict(os.environ, {"HERMES_HOME": str(home)}),
++                  patch.object(activity, "local_scope", return_value=("edge", "default")),
++                  patch.object(activity.time, "time", return_value=1001)):
++                activity._reset_cache_for_tests()
++                row = activity.annotate_subagent_activity([{"id": "owner", "profile": "work"}])[0]
++                registry = registry_subagent({"agent": child, "owner_agent_session_id": "owner",
++                                              "started_at": 900, "status": "running"},
++                                             gateway="edge", profile="work", now=1001)
++                return {"row": row, "registry": registry, "now": 1001}
++        finally:
++            db.close()
++            activity._reset_cache_for_tests()
++
++
++if __name__ == "__main__":
++    sys.__stdout__.write(json.dumps(sample()) + "\n")
+diff --git a/tests/hermes_cli/test_subagent_session_activity.py b/tests/hermes_cli/test_subagent_session_activity.py
+new file mode 100644
+index 0000000000..af29bad080
+--- /dev/null
++++ b/tests/hermes_cli/test_subagent_session_activity.py
+@@ -0,0 +1,175 @@
++"""Real SQLite producer and existing sidebar annotation entry paths."""
++import json
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import subagent_session_activity as activity
++from hermes_cli.execution_observations import identity_key, select
++from hermes_cli.turn_process_execution_observations import registry_subagent
++from hermes_state import SessionDB
++
++
++@pytest.fixture
++def stored(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    db = SessionDB(home / "state.db")
++    db.create_session("parent", source="cli")
++    db.create_session("child", source="subagent", parent_session_id="parent")
++    now = 200000.0
++    with sqlite3.connect(home / "state.db") as conn:
++        conn.execute("UPDATE sessions SET started_at=?, last_activity_at=? WHERE id='child'", (now - 100, now))
++    monkeypatch.setattr(activity.time, "time", lambda: now + 5)
++    monkeypatch.setattr(activity, "local_scope", lambda: ("edge", "default"))
++    activity._reset_cache_for_tests()
++    yield SimpleNamespace(home=home, db=db, now=now)
++    db.close()
++    activity._reset_cache_for_tests()
++
++
++def _observations(rows):
++    return [o for o in rows[0].get("execution_observations", []) if o.get("source") == "subagent.activity"]
++
++
++def test_real_registry_and_sqlite_records_are_byte_identical_and_merge(stored):
++    child = SimpleNamespace(session_id="child", _parent_session_id="parent",
++                            get_activity_summary=lambda: {"last_activity_ts": stored.now})
++    registry = registry_subagent({"agent": child, "owner_agent_session_id": "obsolete-owner",
++                                  "subagent_id": "registry-only", "delegation_id": "batch",
++                                  "started_at": stored.now - 90, "status": "running"},
++                                 gateway="edge", profile="default", now=stored.now + 5)
++    (persisted,) = _observations(activity.annotate_subagent_activity([{"id": "parent"}]))
++    assert json.dumps(registry, sort_keys=True) == json.dumps(persisted, sort_keys=True)
++    assert identity_key(registry["identity"]) == identity_key(persisted["identity"])
++    assert select([registry, persisted], identity=registry["identity"], now=stored.now + 5)["state"] == "running"
++    assert registry["identity"]["generation"] == "session=child"
++    assert registry["last_progress"] is None
++
++
++@pytest.mark.parametrize("age,state", [(5, "running"), (170, "running"), (181, "unknown")])
++def test_wedged_child_ages_without_refetch(stored, monkeypatch, age, state):
++    activity.annotate_subagent_activity([{"id": "parent"}])
++    monkeypatch.setattr(activity.time, "time", lambda: stored.now + age)
++    (obs,) = _observations(activity.annotate_subagent_activity([{"id": "tip", "_lineage_ids": ["parent"]}]))
++    assert obs["state"] == state
++    assert obs["observed_at"] == stored.now
++    if state == "unknown":
++        assert obs["unknown_reason"] == "source_expired"
++
++
++def test_finished_children_absent_and_profile_ids_never_alias(stored):
++    path = stored.home / "profiles" / "work" / "state.db"
++    path.parent.mkdir(parents=True)
++    other = SessionDB(path)
++    other.create_session("parent", source="cli")
++    other.create_session("child", source="subagent", parent_session_id="parent")
++    other.touch_session_activity("child", stored.now)
++    default, work = activity.annotate_subagent_activity([{"id": "parent"}, {"id": "parent", "profile": "work"}])
++    a, b = default["execution_observations"][0], work["execution_observations"][0]
++    assert identity_key(a["identity"]) != identity_key(b["identity"])
++    stored.db.end_session("child", "completed")
++    activity._reset_cache_for_tests()
++    assert not _observations(activity.annotate_subagent_activity([{"id": "parent"}]))
++    other.close()
++
++
++def test_read_only_batched_cache_and_no_wal_growth(stored, monkeypatch):
++    real = sqlite3.connect
++    queries = []
++    modes = []
++
++    def connect(database, **kwargs):
++        modes.append(database)
++        conn = real(database, **kwargs)
++        conn.set_trace_callback(queries.append)
++        return conn
++
++    monkeypatch.setattr(activity.sqlite3, "connect", connect)
++    wal = stored.home / "state.db-wal"
++    before = wal.stat().st_size if wal.exists() else 0
++    activity.annotate_subagent_activity([{"id": "parent"}] * 600)
++    activity.annotate_subagent_activity([{"id": "parent"}])
++    assert len([q for q in queries if q.startswith("SELECT")]) == 1
++    assert all(uri.endswith("?mode=ro") for uri in modes)
++    assert (wal.stat().st_size if wal.exists() else 0) == before
++
++
++def test_failed_and_missing_stores_are_unknown_not_empty(stored):
++    row = activity.annotate_subagent_activity([{"id": "parent"}])[0]
++    activity._reset_cache_for_tests()
++    # Closed/unavailable store, with retained source clocks from the previous read.
++    stored.db.close()
++    (stored.home / "state.db").rename(stored.home / "gone.db")
++    activity.annotate_subagent_activity([row])
++    observations = row["execution_observations"]
++    assert any(o.get("unknown_reason") == "subagent_store_unavailable" for o in observations)
++    assert any(o.get("observed_at") == stored.now for o in observations)
++    assert not (stored.home / "state.db").exists()
++
++
++def test_sidebar_stamps_real_entry_path(stored, monkeypatch):
++    from hermes_cli.web_routers import profiles
++
++    monkeypatch.setattr(profiles, "_cron_profile_home", lambda name: (name, stored.home))
++    monkeypatch.setattr(profiles, "_read_profile_db", lambda name, home, errors, read: read(stored.db))
++    response = profiles.get_profiles_session_stamps(ids="parent", profile="default")
++    (obs,) = _observations(response["sessions"])
++    assert obs["state"] == "running" and obs["identity"]["work_id"] == "child"
++
++
++def test_project_tree_real_annotate_entry_path(stored):
++    from tui_gateway.methods_projects import _annotate_tree_activity
++
++    rows = _annotate_tree_activity([{"id": "parent", "profile": "default"}])
++    (obs,) = _observations(rows)
++    assert obs["state"] == "running" and obs["identity"]["session"] == "parent"
++
++
++def test_session_list_real_entry_path(stored, monkeypatch):
++    from hermes_cli.web_routers import sessions
++    from hermes_cli.session_list_flight import SESSION_LIST_CACHE
++
++    monkeypatch.setattr(sessions, "_session_db_path_for_profile", lambda profile: stored.home / "state.db")
++    monkeypatch.setattr(sessions, "_open_session_db_for_profile",
++                        lambda profile, read_only: SessionDB(stored.home / "state.db", read_only=True))
++    SESSION_LIST_CACHE.clear()
++    response = sessions.get_sessions(limit=20, offset=0, min_messages=0, archived="exclude", order="recent",
++                                     source=None, sources=None, exclude_sources="cron", cwd_prefix=None,
++                                     full=False, profile=None)
++    parent = next(row for row in response["sessions"] if row["id"] == "parent")
++    assert _observations([parent])[0]["identity"]["work_id"] == "child"
++    SESSION_LIST_CACHE.clear()
++
++
++def test_managed_worker_owner_reserved_child_and_activity_receipt_are_visible(stored):
++    import hermes_state_runtime as runtime
++    from tests.hermes_state import test_runtime_worker_children as children
++
++    db = stored.db
++    epoch = runtime.begin_runtime_epoch(db, instance_id="boot")
++    runtime.register_worker_execution(db, epoch=epoch, execution_id="worker", session_id="parent", generation=0,
++                                      kind="compute", adoption_secret="fixture-secret")
++    child = children._reserve(db, epoch, 1)["child"]
++    runtime.mutate_worker_execution(db, epoch=epoch, execution_id=child["execution_id"],
++                                    session_id=child["session_id"], generation=0, sequence=1,
++                                    operation="session.activity", payload={"ts": stored.now, "description": "tool", "provenance": None})
++    activity._reset_cache_for_tests()
++    observations = _observations(activity.annotate_subagent_activity([{"id": "parent"}]))
++    managed = next(o for o in observations if o["identity"]["work_id"] == child["session_id"])
++    assert managed["state"] == "running" and managed["observed_at"] == stored.now
++    assert managed["identity"]["generation"] == "session=" + child["session_id"]
++
++
++def test_legacy_registry_missing_child_id_and_invalid_clocks_are_unknown():
++    record = {"subagent_id": "legacy", "owner_agent_session_id": "parent", "started_at": 1000, "status": "running"}
++    observation = registry_subagent(record, gateway="edge", profile="default", now=1005)
++    assert observation["state"] == "unknown"
++    assert observation["identity"].get("work_id") is None
++    from hermes_cli.turn_process_execution_observations import subagent
++    for clock in (None, float("nan"), float("inf"), 9000, "1000", True):
++        obs = subagent({"child_session_id": "child", "parent_session_id": "parent", "activity_at": clock,
++                        "live": True}, gateway="edge", profile="default", now=1005)
++        assert obs["state"] == "unknown" and obs["observed_at"] is None
+diff --git a/tests/hermes_cli/test_turn_process_execution_observations.py b/tests/hermes_cli/test_turn_process_execution_observations.py
+index 8eaa98c84f..8b67ad77c9 100644
+--- a/tests/hermes_cli/test_turn_process_execution_observations.py
++++ b/tests/hermes_cli/test_turn_process_execution_observations.py
+@@ -317,11 +317,12 @@ def test_in_process_sandbox_registry_entry_is_unknown_in_the_sidebar_but_still_c
+ 
+ def _child_record(**extra):
+     return {"subagent_id": "c1", "delegation_id": "d1", "started_at": 1000.0, "status": "running",
+-            "owner_agent_session_id": "owner", "agent": None, **extra}
++            "owner_agent_session_id": "owner", "agent": _Agent({}), **extra}
+ 
+ 
+ class _Agent:
+     def __init__(self, summary):
++        self.session_id = "child-session"
+         self.summary = summary
+ 
+     def get_activity_summary(self):
+@@ -331,13 +332,13 @@ class _Agent:
+ 
+ 
+ def test_subagent_adapter_dates_a_running_child_by_its_activity_clock_never_by_request_time():
+-    from hermes_cli.turn_process_execution_observations import subagent
++    from hermes_cli.turn_process_execution_observations import registry_subagent as subagent
+ 
+     live = _child_record(agent=_Agent({"last_activity_ts": 1900.0}))
+     obs = subagent(live, gateway="gw-1", profile="default", now=1950.0)
+     assert obs["state"] == "running" and obs["observed_at"] == 1900.0 and obs["last_activity"] == 1900.0
+-    assert obs["identity"] == {"kind": "subagent", "work_id": "c1", "gateway": "gw-1", "profile": "default",
+-                               "session": "owner", "generation": "delegation=d1:start=1000.0"}
++    assert obs["identity"] == {"kind": "subagent", "work_id": "child-session", "gateway": "gw-1", "profile": "default",
++                               "session": "owner", "generation": "session=child-session"}
+     assert obs["last_progress"] is None
+     # The clock froze (wedged child): it expires on its own while the request clock keeps moving.
+     wedged = subagent(live, gateway="gw-1", profile="default", now=1900.0 + 180)
+@@ -345,11 +346,11 @@ def test_subagent_adapter_dates_a_running_child_by_its_activity_clock_never_by_r
+     assert wedged["last_known_state"] == "running" and wedged["observed_at"] == 1900.0
+ 
+ 
+-@pytest.mark.parametrize("agent", [None, _Agent(RuntimeError("x")), _Agent({}), _Agent({"last_activity_ts": "9"}),
+-                                   _Agent({"last_activity_ts": float("nan")}), _Agent({"last_activity_ts": 500.0}),
++@pytest.mark.parametrize("agent", [_Agent(RuntimeError("x")), _Agent({}), _Agent({"last_activity_ts": "9"}),
++                                   _Agent({"last_activity_ts": float("nan")}),
+                                    _Agent({"last_activity_ts": 5000.0})])
+ def test_subagent_adapter_falls_back_to_spawn_time_for_a_missing_or_invalid_clock(agent):
+-    from hermes_cli.turn_process_execution_observations import subagent
++    from hermes_cli.turn_process_execution_observations import registry_subagent as subagent
+ 
+     fresh = subagent(_child_record(agent=agent), gateway="gw-1", profile="default", now=1010.0)
+     assert fresh["state"] == "running" and fresh["observed_at"] == 1000.0 and fresh["last_activity"] is None
+@@ -357,11 +358,12 @@ def test_subagent_adapter_falls_back_to_spawn_time_for_a_missing_or_invalid_cloc
+     assert old["state"] == "unknown" and old["unknown_reason"] == "source_expired"
+ 
+ 
+-@pytest.mark.parametrize("change", [{"delegation_id": None}, {"owner_agent_session_id": ""}, {"started_at": None},
+-                                    {"status": "completed"}, {"subagent_id": ""}])
++@pytest.mark.parametrize("change", [{"agent": None}, {"owner_agent_session_id": ""},
++                                    {"status": "completed"}])
+ def test_subagent_adapter_unknown_without_exact_identity_owner_or_running_status(change):
+-    from hermes_cli.turn_process_execution_observations import subagent
++    from hermes_cli.turn_process_execution_observations import registry_subagent as subagent
+ 
+-    obs = subagent(_child_record(agent=_Agent({"last_activity_ts": 1990.0}), **change),
+-                   gateway="gw-1", profile="default", now=2000.0)
++    record = _child_record(agent=_Agent({"last_activity_ts": 1990.0}))
++    record.update(change)
++    obs = subagent(record, gateway="gw-1", profile="default", now=2000.0)
+     assert obs["state"] == "unknown"
+diff --git a/tests/tui_gateway/test_process_subagent_observation_rpc.py b/tests/tui_gateway/test_process_subagent_observation_rpc.py
+index 75142511b6..9d593dc325 100644
+--- a/tests/tui_gateway/test_process_subagent_observation_rpc.py
++++ b/tests/tui_gateway/test_process_subagent_observation_rpc.py
+@@ -5,6 +5,7 @@ import subprocess
+ import sys
+ import threading
+ import time
++from pathlib import Path
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -201,6 +202,29 @@ def _roster(rt):
+     return {e["session_id"]: e for e in rt.call("subagent.roster")["sessions"]}
+ 
+ 
++def test_real_rpc_and_persisted_annotation_use_identical_child_records(runtime, monkeypatch):
++    from hermes_cli import subagent_session_activity as activity
++    from tui_gateway import server
++
++    now = time.time()
++    record = _child(runtime, activity=now - 3, started=now - 600)
++    record["agent"]._parent_session_id = "parent-a"
++    db = server._get_db()
++    assert db is not None
++    db.create_session("child-session", source="subagent", parent_session_id="parent-a")
++    db.touch_session_activity("child-session", now - 3)
++    monkeypatch.setattr(activity, "_profile_paths", lambda: [("default", Path(db.db_path))])
++    monkeypatch.setattr(activity, "local_scope", lambda: ("gw-1", "default"))
++    monkeypatch.setattr(activity.time, "time", lambda: now)
++    activity._reset_cache_for_tests()
++    try:
++        persisted = activity.annotate_subagent_activity([{"id": "parent-a"}])[0]["execution_observations"]
++        assert persisted == _subagents(runtime)["c1"]["execution_observations"]
++        assert persisted == _roster(runtime)["parent-a"]["execution_observations"]
++    finally:
++        activity._reset_cache_for_tests()
++
++
+ @pytest.mark.parametrize("path", ["list", "roster"])
+ def test_running_child_is_dated_by_its_own_activity_clock_on_both_paths(runtime, path):
+     now = time.time()
+@@ -212,10 +236,10 @@ def test_running_child_is_dated_by_its_own_activity_clock_on_both_paths(runtime,
+         row = _roster(runtime)["parent-a"]
+         assert row["subagents"] == 1 and row["background"] == 0
+     (obs,) = row["execution_observations"]
+-    assert obs["state"] == "running" and obs["freshness"] == "current" and obs["source"] == "subagent.registry"
+-    assert obs["identity"]["kind"] == "subagent" and obs["identity"]["work_id"] == "c1"
++    assert obs["state"] == "running" and obs["freshness"] == "current" and obs["source"] == "subagent.activity"
++    assert obs["identity"]["kind"] == "subagent" and obs["identity"]["work_id"] == "child-session"
+     assert obs["identity"]["session"] == "parent-a" and obs["identity"]["gateway"] == "gw-1"
+-    assert obs["identity"]["generation"].startswith("delegation=d1:start=")
++    assert obs["identity"]["generation"] == "session=child-session"
+     assert obs["observed_at"] == now - 3 and obs["last_activity"] == now - 3 and obs["valid_until"] == now - 3 + 180
+     assert obs["last_progress"] is None
+ 
+@@ -249,7 +273,7 @@ def test_child_missing_delegation_or_owner_or_not_running_is_unknown(runtime):
+     _child(runtime, "noowner", owner=None, activity=now - 1)
+     _child(runtime, "done", status="completed", activity=now - 1)
+     rows = _subagents(runtime)
+-    assert rows["nodeleg"]["execution_observations"][0]["state"] == "unknown"
++    assert rows["nodeleg"]["execution_observations"][0]["state"] == "running"  # delegation id is not child identity
+     assert rows["noowner"]["execution_observations"][0]["state"] == "unknown"
+     assert rows["done"]["execution_observations"][0]["unknown_reason"] == "subagent_not_running"
+ 
+@@ -258,9 +282,10 @@ def test_reused_child_id_never_aliases_the_previous_generation(runtime):
+     now = time.time()
+     _child(runtime, activity=now - 2, started=now - 100, delegation="d-old")
+     old = _subagents(runtime)["c1"]["execution_observations"][0]["identity"]
+-    _child(runtime, activity=now - 1, started=now - 50, delegation="d-new")
++    record = _child(runtime, activity=now - 1, started=now - 50, delegation="d-new")
++    record["agent"].session_id = "new-child-session"
+     new = _subagents(runtime)["c1"]["execution_observations"][0]["identity"]
+-    assert old["work_id"] == new["work_id"] and old["generation"] != new["generation"]
++    assert old["work_id"] != new["work_id"] and old["generation"] != new["generation"]
+ 
+ 
+ def test_one_broken_child_beside_a_fresh_child_stays_unknown_without_hiding_it(runtime):
+diff --git a/tui_gateway/methods_projects.py b/tui_gateway/methods_projects.py
+index 9099a5639c..4c8ad8693b 100644
+--- a/tui_gateway/methods_projects.py
++++ b/tui_gateway/methods_projects.py
+@@ -375,7 +375,9 @@ def _annotate_tree_activity(sessions: list[dict]) -> list[dict]:
+         from hermes_cli.kanban_session_activity import annotate_kanban_activity
+         from hermes_cli.process_session_activity import annotate_background_activity
+         from hermes_cli.review_session_activity import annotate_review_wait
++        from hermes_cli.subagent_session_activity import annotate_subagent_activity
+         from hermes_cli.turn_session_activity import annotate_turn_activity
++        annotate_subagent_activity(sessions)
+         annotate_review_wait(annotate_turn_activity(annotate_background_activity(annotate_cron_activity(
+             annotate_goal_activity(annotate_kanban_activity(sessions))))))
+     except Exception:  # the tree must render without them
+diff --git a/tui_gateway/methods_subagents.py b/tui_gateway/methods_subagents.py
+index 99be74f536..ff61ed7cd7 100644
+--- a/tui_gateway/methods_subagents.py
++++ b/tui_gateway/methods_subagents.py
+@@ -53,7 +53,7 @@ def _visible_subagent_records(session_id, transport, owner):
+ def _subagent_observation(record, profile):
+     """One v1 observation for a registry record (own activity clock, else spawn time); None on adapter failure."""
+     from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS, local_scope
+-    from hermes_cli.turn_process_execution_observations import subagent
++    from hermes_cli.turn_process_execution_observations import registry_subagent as subagent
+ 
+     try:
+         gateway, local_profile = local_scope()
+-- 
+2.43.0
+

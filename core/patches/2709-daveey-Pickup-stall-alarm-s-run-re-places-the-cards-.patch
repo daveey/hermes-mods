@@ -1,0 +1,687 @@
+From 8665aa9858dd136e07c134b89c5af59e854c7e3d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:02:12 +0000
+Subject: [PATCH] [daveey] Pickup-stall alarm's run re-places the cards it
+ lists off the stalled machine
+
+The alarm about machine M tells its run to re-place cards that cannot wait for M,
+but the run had no supported way: worker shells are fenced from kanban move and
+kanban_move(task_id=<other>) refused any card the run's own task did not create
+(t_01a1cea829121562; the red sweep re-placed three by hand on 11-11).
+
+kanban_pickup_stall_repin grants the alarm's own run kanban_move(task_id=<t>,
+runs_on=[machine:<X>]) when every condition holds: the caller is an open alarm the
+detector filed on M (M read from its pickup-stall:<M>: key); the alarm lists t (its
+per-card key, a '- <id> (' body line, or a detector comment from M); t is ready,
+unclaimed, has no run and is still pinned machine:M; runs_on is exactly one other
+machine eligible now by the alarm placement rules (_takes_work: active, unheld,
+copies cards, carries t's capabilities and profile; _ready_now: not draining, seen
+recently, a free slot). A card another gateway created goes through the operator
+call, which applies the same scope on its request side for an alarm caller.
+Nothing reads or writes a registry hold. The hold and budget alarm texts and _tail
+now name the supported command.
+---
+ hermes_cli/kanban_creator_repin.py            |  11 +-
+ hermes_cli/kanban_operator_call.py            |   5 +
+ hermes_cli/kanban_pickup_stall.py             |  28 +-
+ hermes_cli/kanban_pickup_stall_repin.py       | 193 +++++++++++
+ .../test_kanban_pickup_stall_repin.py         | 319 ++++++++++++++++++
+ tools/kanban_tools_schemas.py                 |   2 +
+ 6 files changed, 546 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/kanban_pickup_stall_repin.py
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_stall_repin.py
+
+diff --git a/hermes_cli/kanban_creator_repin.py b/hermes_cli/kanban_creator_repin.py
+index 084f5027bd..754be8890c 100644
+--- a/hermes_cli/kanban_creator_repin.py
++++ b/hermes_cli/kanban_creator_repin.py
+@@ -56,12 +56,17 @@ def creator_repin(conn: sqlite3.Connection, task_id: str, env_task: str, *, runs
+             stranded = stranded_refusal(conn, task_id)
+             if stranded is None:
+                 return stranded_reroute(conn, task_id, env_task, runs_on=runs_on, reason=reason, hub=hub)
++            from hermes_cli import kanban_pickup_stall_repin as stall
++            stalled = stall.refusal(conn, task_id, env_task, runs_on)
++            if stalled is None:
++                return stall.move(conn, task_id, env_task, runs_on=runs_on, reason=reason, hub=hub)
+             return {"ok": False, "reason_code": "not_creator_task",
+                     "error": f"worker is scoped to task {env_task}; it may move another card only to repin a "
+                              f"worker-first card its own task created (or, as its generated repin-owner "
+-                             f"supervisor, its one listed orphaned card), or to re-route a ready card whose "
+-                             f"runs_on no enrolled machine carries, and {task_id} is none of these ({refusal}; "
+-                             f"{stranded})"}
++                             f"supervisor, its one listed orphaned card; or, as a pickup-stall alarm, a card it "
++                             f"lists off the stalled machine), or to re-route a ready card whose runs_on no "
++                             f"enrolled machine carries, and {task_id} is none of these ({refusal}; {stranded}; "
++                             f"pickup-stall alarm: {stalled})"}
+     if not repin.applies(conn, task_id):
+         # The creator is the likeliest worker to find its own stranded child: the reroute open to every
+         # worker is open to it too.
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index 6f5f2d3aed..52904d954a 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -307,6 +307,8 @@ def preflight_op(conn: sqlite3.Connection, requester: str, op: dict) -> dict:
+         human = None
+         if op["action"] == "unblock" and rep is not None:
+             human = rep.execute("SELECT human_request, block_kind FROM tasks WHERE id = ?", (target,)).fetchone()
++        from hermes_cli import kanban_pickup_stall_repin as stall
++        alarm_scope = stall.operator_refusal(conn, rep, requester, op)  # None unless an alarm asks
+     if not home:
+         return refuse("no_home", f"{target} has no created_on; no gateway owns it")
+     if home == _own_gateway(conn):
+@@ -315,6 +317,9 @@ def preflight_op(conn: sqlite3.Connection, requester: str, op: dict) -> dict:
+         return refuse("terminal", f"{target} is {status}")
+     if op["action"] == "move" and status == "running":
+         return refuse("running", f"{target} is running; only its own run may move it (kanban_move)")
++    if alarm_scope is not None:
++        return refuse("pickup_stall_scope", f"a pickup-stall alarm moves only a card it lists, off the stalled "
++                                            f"machine, to one eligible now: {alarm_scope}")
+     if op["action"] == "unblock":
+         if status != "blocked":
+             return refuse("not_blocked", f"{target} is {status}, not blocked")
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index 777e1614a9..777c599afa 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -210,6 +210,7 @@ def _minutes(since_ms: int, now_ms: int) -> int:
+ def _tail(conn, own: str) -> str:
+     """The repair runs on another machine (:func:`alarm_placement`), so name where ``own``'s machine-local
+     evidence lives instead of saying "on this host"."""
++    from hermes_cli import kanban_pickup_stall_repin as repin
+     from hermes_cli import kanban_worker_node as wn
+     try:
+         replica = str(wn._replica_path(conn))
+@@ -221,8 +222,9 @@ def _tail(conn, own: str) -> str:
+             "Board row from any machine: `Hub(load_identity()).row_evidence(<board>, 'tasks', <card>)`. Check "
+             "`kanban.sync.pickup`, the machine registry entry (labels, hold, pickup), profiles, capabilities and "
+             "dispatcher capacity, fix the cause (or re-place the card on a machine that can run it), and verify the "
+-            "card is imported and claimed. Do not claim a cause the recorded evidence does not show, and never lift "
+-            "or shorten a registry hold you did not set. This is agent-owned repair, not a human decision.")
++            "card is imported and claimed. " + repin.howto(own) + " Do not claim a cause the recorded evidence "
++            "does not show, and never lift or shorten a registry hold you did not set. This is agent-owned repair, "
++            "not a human decision.")
+ 
+ 
+ # --- where the alarm runs ------------------------------------------------------------------------------------
+@@ -242,15 +244,22 @@ def _free_slots(entry: Mapping[str, Any]) -> Optional[int]:
+     return cap - int(active)
+ 
+ 
+-def _can_host(name: str, entry: Optional[Mapping[str, Any]], own: str, need: set[str]) -> bool:
+-    """Another active, unheld machine that copies cards, carries ``need`` and reaches the hub (it is the operator
+-    lane, or attests ``capability:hub-write``): re-placing or handing off another gateway's card goes through it."""
++def _takes_work(name: str, entry: Optional[Mapping[str, Any]], own: str, need: set[str]) -> bool:
++    """Another active, unheld machine that copies cards and carries ``need`` (also the rule for where an alarm's
++    run may re-place a stalled card: :mod:`hermes_cli.kanban_pickup_stall_repin`)."""
+     from hermes_cli import kanban_worker_node as wn
+     if name == own or not entry or entry.get("state", "active") != "active" or entry.get("hold") \
+             or not wn.advertises_pickup(entry):
+         return False
+-    labels = wn.effective_labels(entry, name)
+-    return need <= labels and (name == OPERATOR_LANE or HUB_ACCESS in labels)
++    return need <= wn.effective_labels(entry, name)
++
++
++def _can_host(name: str, entry: Optional[Mapping[str, Any]], own: str, need: set[str]) -> bool:
++    """:func:`_takes_work`, and reaches the hub (it is the operator lane, or attests ``capability:hub-write``):
++    re-placing or handing off another gateway's card goes through it."""
++    from hermes_cli import kanban_worker_node as wn
++    return _takes_work(name, entry, own, need) and (name == OPERATOR_LANE
++                                                    or HUB_ACCESS in wn.effective_labels(entry, name))
+ 
+ 
+ def _ready_now(entry: Mapping[str, Any], now_ms: int) -> bool:
+@@ -358,10 +367,11 @@ _HOST_GROUPS = {
+     "budget_exhausted": (QUEUE_FULL, "Pickup queue full on {own}",
+                          "the last pickup skip of each is budget_exhausted (no spawn slot on {own}). Decide "
+                          "whether the queue drains on its own (running cards near done) or work must move to a "
+-                         "machine with slots."),
++                         "machine with slots (the kanban_move command below)."),
+     "hold": ("hold", "Pickup held on {own}",
+              "{own} is on hold in the machine registry, so it takes no Board work. An operator set that on "
+-             "purpose: do not lift it; re-place cards that cannot wait for the hold to end."),
++             "purpose: do not lift it; re-place cards that cannot wait for the hold to end with the kanban_move "
++             "command below."),
+     "registry": ("registry", "Pickup blind on {own}: machine registry unavailable",
+                  "{own} could not read the machine registry, so its pickup copies nothing. Restore registry access "
+                  "(Board identity, network) and confirm the next pass imports the cards."),
+diff --git a/hermes_cli/kanban_pickup_stall_repin.py b/hermes_cli/kanban_pickup_stall_repin.py
+new file mode 100644
+index 0000000000..4f3ed245bf
+--- /dev/null
++++ b/hermes_cli/kanban_pickup_stall_repin.py
+@@ -0,0 +1,193 @@
++"""A pickup-stall alarm's run re-places exactly the cards it lists, off the stalled machine. [daveey]
++
++t_01a1cea829121562 (2026-11-12): the alarm (:mod:`hermes_cli.kanban_pickup_stall`) about machine M runs on another
++machine and tells its agent to re-place cards that cannot wait for M. That agent had no supported way to: worker
++shells are fenced from ``hermes kanban move``, ``kanban_move(task_id=<other>)`` was granted only to a card's creator
++task or its ``repin-owner`` supervisor, and the stalled cards were created by other cards or chats. The red sweep
++re-placed them by hand.
++
++The grant (:func:`refusal`) is the alarm's own run moving one target with ``kanban_move(task_id=<target>,
++runs_on=["machine:<X>"], reason=...)``. Every condition must hold, each read on the board the move would write:
++
++* the caller is an open alarm the detector filed: ``created_by`` the detector, ``created_on`` M, idempotency key
++  ``pickup-stall:<M>:...`` (M is read from the key, never from the arguments);
++* the target is one the alarm lists: the card its per-card key names, or a ``- <id> (`` line in its body or in a
++  detector comment (``_refresh_targets``);
++* the target is still ready and unclaimed, with no current run, and still pinned ``machine:<M>`` (only off M);
++* ``runs_on`` is exactly ``["machine:<X>"]``, X is not M, and X is eligible now by the alarm placement rules
++  (active, unheld, copies cards, carries the target's ``capability:<requires>`` and ``profile:<assignee>``, not
++  draining, seen recently, a free card slot).
++
++The move itself is the ordinary queued move (``kanban_move.move_queued``) with its own guards. Nothing here reads
++or writes a registry hold, so a hold is never lifted or shortened. A target another gateway created is moved through
++the operator call (``kanban_operator_call``), and the same scope is checked on its request side for an alarm caller
++(:func:`operator_refusal`).
++"""
++from __future__ import annotations
++
++import re
++import sqlite3
++from typing import Any, Mapping, Optional
++
++_LISTED = re.compile(r"^- (t_[0-9A-Za-z_]+) \(", re.MULTILINE)
++CLOSED = ("done", "archived")
++
++
++def howto(own: str) -> str:
++    """The supported re-place command, as alarm prose (``_tail`` and the hold text name it)."""
++    return (f"To re-place a listed card off {own}, call the kanban_move TOOL from this alarm's run (not the shell: "
++            f"`hermes kanban move` is fenced in worker shells): kanban_move(task_id=\"<listed card>\", "
++            "runs_on=[\"machine:<X>\"], reason=\"...\"), where X is another machine eligible now (active, unheld, "
++            "free slot, the card's profile and capabilities). When the card was created on another gateway, "
++            "kanban_move answers foreign_card: send the same move as kanban_supervisor_request(ops=[{\"op\": "
++            "\"operator\", \"action\": \"move\", \"task_id\": \"<listed card>\", \"runs_on\": [\"machine:<X>\"], "
++            f"\"reason\": \"...\"}}]). Only the cards this alarm lists, only while they are ready and pinned to {own}, "
++            f"and never back to {own}.")
++
++
++def _cols(row: Any) -> set:
++    return set(row.keys()) if row is not None else set()
++
++
++def alarm_own(alarm: Any) -> Optional[str]:
++    """M for an open alarm the detector filed (``alarm``: a ``tasks`` row), else None."""
++    from hermes_cli import kanban_pickup_stall as kps
++    if alarm is None or alarm["created_by"] != kps.DETECTOR or alarm["status"] in CLOSED:
++        return None
++    key = alarm["idempotency_key"] or ""
++    if not key.startswith(kps.KEY_PREFIX):
++        return None
++    own = key[len(kps.KEY_PREFIX):].split(":", 1)[0]
++    if not own or ("created_on" in _cols(alarm) and alarm["created_on"] != own):
++        return None
++    return own
++
++
++def listed_targets(conn: sqlite3.Connection, alarm: Any, own: str) -> set:
++    """The cards ``alarm`` lists: its per-card key's card, and ``- <id> (`` lines its body or detector comments
++    carry (comments another gateway wrote do not count)."""
++    from hermes_cli import kanban_pickup_stall as kps
++    rest = (alarm["idempotency_key"] or "")[len(kps.KEY_PREFIX) + len(own) + 1:]
++    out = {rest.rsplit(":", 1)[0]}  # a per-card alarm's card (a host-wide slug names no card)
++    out.update(_LISTED.findall(alarm["body"] or ""))
++    try:
++        has_origin = "origin_gateway" in {r[1] for r in conn.execute("PRAGMA table_info(task_comments)")}
++        sql = ("SELECT body" + (", origin_gateway" if has_origin else "") + " FROM task_comments "
++               "WHERE task_id = ? AND author = ?")
++        for row in conn.execute(sql, (alarm["id"], kps.DETECTOR)).fetchall():
++            if has_origin and row[1] not in (None, own):
++                continue
++            out.update(_LISTED.findall(row[0] or ""))
++    except sqlite3.OperationalError:
++        pass
++    return out
++
++
++def _need(target: Any) -> set:
++    import json
++    try:
++        requires = json.loads(target["requires"]) if target["requires"] else []
++    except (TypeError, ValueError):
++        requires = []
++    return {f"capability:{r}" for r in requires if isinstance(r, str)} | {f"profile:{target['assignee']}"}
++
++
++def eligible_now(name: str, own: str, machines: Optional[Mapping[str, Mapping[str, Any]]], need: set,
++                 now_ms: int) -> Optional[str]:
++    """None when ``name`` may take a card off ``own`` now (``kanban_pickup_stall`` placement rules), else why not."""
++    from hermes_cli import kanban_pickup_stall as kps
++    if machines is None:
++        return "the machine registry is unreadable"
++    entry = machines.get(name) or {}
++    if not kps._takes_work(name, entry, own, need):
++        return (f"{name} cannot take it (it is {own}, not registered, retired, held, takes no pickup, or lacks "
++                f"{', '.join(sorted(need))})")
++    if not kps._ready_now(entry, now_ms):
++        return f"{name} is not eligible now (draining, not seen recently, or no free card slot)"
++    return None
++
++
++def scope_refusal(conn: sqlite3.Connection, alarm: Any, target: Any, runs_on: Any, *,
++                  machines: Optional[Mapping[str, Mapping[str, Any]]], now_ms: int) -> Optional[str]:
++    """None when ``alarm``'s run may move ``target`` (rows, ``conn`` holds the alarm's comments) to ``runs_on``."""
++    from hermes_cli import kanban_worker_node as wn
++    own = alarm_own(alarm)
++    if own is None:
++        return "not an open pickup-stall alarm filed by the detector"
++    if target is None or target["id"] not in listed_targets(conn, alarm, own):
++        return f"the target is not a card this alarm about {own} lists"
++    cols = _cols(target)
++    if target["status"] != "ready" or any(target[c] for c in ("claim_lock", "lease_holder", "current_run_id")
++                                          if c in cols):
++        return f"{target['id']} is {target['status']} or claimed; only a ready, unclaimed card is re-placed"
++    if f"machine:{own}" not in (wn._parse(target["runs_on"]) or []):
++        return f"{target['id']} is no longer pinned to machine:{own}"
++    try:
++        labels = list(wn.normalize_runs_on(runs_on) or [])
++    except ValueError as exc:
++        return str(exc)
++    if len(labels) != 1 or not labels[0].startswith("machine:"):
++        return "runs_on must be exactly one machine:<X> label"
++    name = labels[0].split(":", 1)[1]
++    if name == own:
++        return f"the card must leave {own}"
++    return eligible_now(name, own, machines, _need(target), now_ms)
++
++
++def _registry_machines() -> Optional[Mapping[str, Mapping[str, Any]]]:
++    from hermes_cli import kanban_worker_node as wn
++    reg = wn.registry()
++    return None if reg is None else (reg.get("machines") or {})
++
++
++def refusal(conn: sqlite3.Connection, task_id: str, env_task: str, runs_on: Any, *,
++            machines: Any = False, now_ms: Optional[int] = None) -> Optional[str]:
++    """None when ``env_task`` (the caller's alarm) may move local card ``task_id`` to ``runs_on``; else why not."""
++    from hermes_cli import kanban_pickup_stall as kps
++    alarm = conn.execute("SELECT * FROM tasks WHERE id = ?", (env_task,)).fetchone()
++    if alarm_own(alarm) is None:
++        return "not an open pickup-stall alarm filed by the detector"
++    target = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    from hermes_cli import kanban_capability_routing as kcr
++    if target is None or kcr.card_home(conn, task_id) is not None:  # absent, or only a pickup copy here
++        return (f"{task_id} is not on this gateway's board; a card another gateway created is moved with "
++                "kanban_supervisor_request(ops=[{op: 'operator', action: 'move', task_id, runs_on, reason}])")
++    return scope_refusal(conn, alarm, target, runs_on,
++                         machines=_registry_machines() if machines is False else machines,
++                         now_ms=kps._now_ms() if now_ms is None else now_ms)
++
++
++def move(conn: sqlite3.Connection, task_id: str, env_task: str, *, runs_on: Any, reason: str,
++         machines: Any = False, hub: Any = None) -> dict[str, Any]:
++    """The granted move (``move_queued``'s result), re-checking the scope first."""
++    from hermes_cli import kanban_move as km
++    from hermes_cli import kanban_worker_node as wn
++    pool = _registry_machines() if machines is False else machines
++    why = refusal(conn, task_id, env_task, runs_on, machines=pool)
++    if why is not None:
++        return {"ok": False, "reason_code": "pickup_stall_scope", "error": why}
++    alarm = conn.execute("SELECT * FROM tasks WHERE id = ?", (env_task,)).fetchone()
++    return km.move_queued(conn, task_id, runs_on=list(wn.normalize_runs_on(runs_on) or []), reason=reason,
++                          machines=pool, hub=hub,
++                          event_extra={"pickup_stall_alarm": env_task, "stalled_machine": alarm_own(alarm)})
++
++
++def operator_refusal(conn: sqlite3.Connection, rep: Optional[sqlite3.Connection], requester: str,
++                     op: Mapping[str, Any], *, machines: Any = False, now_ms: Optional[int] = None) -> Optional[str]:
++    """Request side of an operator-call move: None for a caller that is no alarm (no change), else the alarm
++    scope's refusal for the foreign target as the replica shows it."""
++    from hermes_cli import kanban_pickup_stall as kps
++    if op.get("action") != "move":
++        return None
++    alarm = conn.execute("SELECT * FROM tasks WHERE id = ?", (requester,)).fetchone()
++    if alarm_own(alarm) is None:
++        return None
++    target = None
++    if rep is not None:
++        try:
++            target = rep.execute("SELECT * FROM tasks WHERE id = ?", (op.get("task_id"),)).fetchone()
++        except sqlite3.OperationalError:
++            target = None
++    return scope_refusal(conn, alarm, target, op.get("runs_on"),
++                         machines=_registry_machines() if machines is False else machines,
++                         now_ms=kps._now_ms() if now_ms is None else now_ms)
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_repin.py b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+new file mode 100644
+index 0000000000..b52b0ca5af
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+@@ -0,0 +1,319 @@
++"""A pickup-stall alarm's run re-places exactly the cards it lists, off the stalled machine. [daveey]
++
++t_01a1cea829121562 (2026-11-12): the alarm about machine M (here worker-1) runs elsewhere and says to re-place cards
++that cannot wait for M, but its run had no supported way: worker shells are fenced from ``hermes kanban move`` and
++``kanban_move(task_id=<other>)`` refused every card the run's own task did not create. The grant
++(``kanban_pickup_stall_repin``) moves only a card the alarm lists, only while it is ready and pinned to M, and only to
++one other machine eligible now. The end-to-end tests fail on the code before it (``not_creator_task``); the unit
++tests kill one mutant per scope condition.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_pickup_stall as kps
++from hermes_cli import kanban_pickup_stall_repin as rp
++from hermes_cli import kanban_worker_node as wn
++from hermes_cli.kanban_db_connect import connect
++from tests.hermes_cli import test_kanban_operator_call as oc
++from tests.hermes_cli import test_kanban_pickup_alarm_placement as place
++from tests.hermes_cli import test_kanban_pickup_stall as stall
++from tests.hermes_cli import test_kanban_worker_node as support
++
++M, X = "worker-1", "worker-2"
++NOW = 1_800_000_000_000
++svc = support.svc
++fleet = oc.fleet
++
++
++def _worker(name, **kw):
++    return place._worker(name, last_seen=NOW, **kw)
++
++
++def _machines(**over):
++    pool = {M: _worker(M, hold=True), X: _worker(X), "hub": place._hub(last_seen=NOW)}
++    for name, change in over.items():
++        name = name.replace("_", "-")
++        pool[name] = None if change is None else {**pool.get(name, _worker(name)), **change}
++    return {n: e for n, e in pool.items() if e is not None}
++
++
++# --- unit: one test per scope condition ----------------------------------------------------------------------------
++
++class Board:
++    def __init__(self, tmp_path):
++        self.conn = connect(tmp_path / "board.db")
++        have = {r[1] for r in self.conn.execute("PRAGMA table_info(tasks)")}
++        for col in ("created_on", "runs_on", "lease_holder"):  # the synced-board columns
++            if col not in have:
++                self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
++        self.conn.commit()
++        self.target = self.card("stalled work", runs_on=[f"machine:{M}"])
++        self.unlisted = self.card("unlisted work", runs_on=[f"machine:{M}"])
++        self.alarm = self.card(f"Pickup held on {M}: oldest {self.target}", created_by=kps.DETECTOR, created_on=M,
++                               key=f"{kps.KEY_PREFIX}{M}:hold:{NOW}",
++                               body=f"1 card(s) pinned...\n\n- {self.target} (stalled work), ready 15 min, last skip hold")
++
++    def card(self, title, *, runs_on=None, created_by="default", created_on="hub", key=None, body=None, **kw):
++        tid = kb.create_task(self.conn, title=title, assignee="default", created_by=created_by, body=body,
++                             idempotency_key=key, **kw)
++        with kb.write_txn(self.conn):
++            self.conn.execute("UPDATE tasks SET created_on = ?, runs_on = ? WHERE id = ?",
++                              (created_on, json.dumps(runs_on) if runs_on else None, tid))
++        return tid
++
++    def set(self, tid, **cols):
++        with kb.write_txn(self.conn):
++            for col, value in cols.items():
++                self.conn.execute(f"UPDATE tasks SET {col} = ? WHERE id = ?", (value, tid))
++
++    def why(self, target=None, runs_on=(f"machine:{X}",), machines=None, alarm=None):
++        return rp.refusal(self.conn, target or self.target, alarm or self.alarm, list(runs_on),
++                          machines=_machines() if machines is None else machines, now_ms=NOW)
++
++
++@pytest.fixture
++def board(tmp_path):
++    b = Board(tmp_path)
++    yield b
++    b.conn.close()
++
++
++def test_a_listed_ready_card_pinned_to_the_stalled_machine_may_go_to_an_eligible_machine(board):
++    assert board.why() is None
++
++
++@pytest.mark.parametrize("col,value", [
++    ("created_by", "default"),                               # not the detector's card
++    ("status", "done"), ("status", "archived"),              # a closed alarm grants nothing
++    ("idempotency_key", f"repin-owner:{M}:hold:1"),          # not a pickup-stall key
++    ("idempotency_key", f"pickup-stale:{M}:hold:1"),         # same length, not the prefix (M would parse)
++    ("idempotency_key", f"{kps.KEY_PREFIX}:hold:1"),         # no machine in the key
++    ("created_on", "worker-5"),                              # filed by another gateway than M
++])
++def test_only_an_open_alarm_the_detector_filed_on_the_stalled_machine_grants(board, col, value):
++    board.set(board.alarm, **{col: value})
++    assert board.why() is not None
++
++
++def test_the_stalled_machine_comes_from_the_key_not_from_the_caller(board):
++    # An alarm about worker-3 cannot move a card off worker-1 (the card is not pinned to its machine).
++    board.set(board.alarm, idempotency_key=f"{kps.KEY_PREFIX}worker-3:hold:1", created_on="worker-3")
++    assert "no longer pinned to machine:worker-3" in board.why()
++
++
++def test_only_a_card_the_alarm_lists(board):
++    assert "lists" in board.why(target=board.unlisted)
++
++
++def test_a_per_card_alarm_lists_the_card_its_key_names(board):
++    alarm = board.card(f"Pickup stalled: {board.unlisted}", created_by=kps.DETECTOR, created_on=M,
++                       key=f"{kps.KEY_PREFIX}{M}:{board.unlisted}:{NOW}", body="Card ... has been ready")
++    assert board.why(target=board.unlisted, alarm=alarm) is None
++    assert "lists" in board.why(target=board.target, alarm=alarm)
++
++
++def test_a_host_wide_alarm_lists_only_its_body_and_comment_lines(board):
++    assert board.why(target=board.unlisted) is not None and board.why() is None
++
++
++@pytest.mark.parametrize("author,origin,listed", [
++    (kps.DETECTOR, None, True), (kps.DETECTOR, M, True),
++    ("default", None, False),          # any other author (an agent) cannot add targets
++    (kps.DETECTOR, "worker-5", False),  # a detector-named comment another gateway wrote
++])
++def test_a_later_target_is_listed_only_by_the_detectors_own_comment(board, author, origin, listed):
++    with kb.write_txn(board.conn):  # as synced: the writing gateway, or NULL when the Board did not say
++        board.conn.execute(
++            "INSERT INTO task_comments (task_id, author, body, created_at, origin_gateway) VALUES (?, ?, ?, 0, ?)",
++            (board.alarm, author, f"Additional targets for this pickup cause:\n\n- {board.unlisted} (unlisted "
++                                  "work), ready 11 min", origin))
++    assert (board.why(target=board.unlisted) is None) is listed
++
++
++@pytest.mark.parametrize("cols", [
++    {"status": "running"}, {"status": "blocked"}, {"status": "todo"},
++    {"claim_lock": "host:1"}, {"current_run_id": 7},
++])
++def test_only_a_ready_unclaimed_card_without_a_run(board, cols):
++    board.set(board.target, **cols)
++    assert board.why() is not None
++
++
++def test_a_card_with_a_lease_holder_is_not_moved(board):
++    board.set(board.target, lease_holder=X)
++    assert board.why() is not None
++
++
++@pytest.mark.parametrize("pin", [None, '["machine:worker-3"]', '["linux"]'])
++def test_only_a_card_still_pinned_to_the_stalled_machine(board, pin):
++    board.set(board.target, runs_on=pin)
++    assert board.why() is not None
++
++
++@pytest.mark.parametrize("runs_on", [
++    [f"machine:{M}"],                       # back onto M
++    ["linux"],                              # no machine named: the Board could pick M again
++    [f"machine:{X}", "linux"],              # exactly one machine label, nothing else
++    [f"machine:{X}", "machine:worker-3"],
++    [], ["Bad Label"],
++])
++def test_runs_on_is_exactly_one_other_machine(board, runs_on):
++    assert board.why(runs_on=runs_on) is not None
++
++
++@pytest.mark.parametrize("change", [
++    None,                                   # not in the registry
++    {"state": "retired"}, {"hold": True}, {"pickup": None},
++    {"labels": ["linux", "capability:file"]},  # no profile:default
++    {"metrics": {"active_card_runs": 0, "drain_active": 1}},
++    {"last_seen": NOW - 301_000},
++    {"metrics": {"active_card_runs": 10}},  # no free slot
++])
++def test_the_new_machine_must_be_eligible_now(board, change):
++    assert board.why(machines=_machines(**{X: change})) is not None
++
++
++def test_the_new_machine_needs_the_cards_required_capabilities(board):
++    board.set(board.target, requires=json.dumps(["gpu"]))
++    assert "capability:gpu" in board.why()
++    assert board.why(machines=_machines(**{X: {"labels": [*_worker(X)["labels"], "capability:gpu"]}})) is None
++
++
++def test_the_hub_lane_without_hub_write_is_a_valid_target(board):
++    assert board.why(runs_on=["machine:hub"]) is None  # hub-write is the alarm's need, not the card's
++
++
++def test_an_unreadable_registry_refuses(board):
++    assert "unreadable" in rp.refusal(board.conn, board.target, board.alarm, [f"machine:{X}"], machines=None,
++                                      now_ms=NOW)
++
++
++def test_a_card_not_on_this_board_or_only_a_pickup_copy_points_at_the_operator_call(board, monkeypatch):
++    assert "kanban_supervisor_request" in board.why(target="t_absent")
++    from hermes_cli import kanban_capability_routing as kcr
++    monkeypatch.setattr(kcr, "card_home", lambda conn, tid: "hub")
++    assert "kanban_supervisor_request" in board.why()
++
++
++def test_the_scope_never_reads_or_writes_a_hold():
++    import inspect
++    src = inspect.getsource(rp)
++    assert "set_registry" not in src and "\"hold\"" not in src and "'hold'" not in src
++
++
++# --- end to end through the kanban_move tool (fails before: not_creator_task) --------------------------------------
++
++@pytest.fixture
++def held(tmp_path, monkeypatch, svc):
++    """worker-1 (M) is held; the hub runs its alarm and holds the stalled cards; worker-2 is eligible now."""
++    from hermes_cli import kanban_db_dispatch as kbd
++    from hermes_cli import kanban_db_sync as sync
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    hub = support.Gateway(tmp_path, support.HUB, svc, monkeypatch, pickup="explicit")
++    worker = support.Gateway(tmp_path, M, svc, monkeypatch, pickup="true")
++    # worker-2 has no hub-write, so the alarm goes to the hub lane, but the cards it lists may go to worker-2.
++    place._registry(monkeypatch, held=True, other=False, hub=place._hub())
++    monkeypatch.setitem(support.MACHINES, X, {**place._worker(X), "labels": ["linux", *place.NEED]})
++    try:
++        a, b = stall._pinned(hub, title="a"), stall._pinned(hub, title="b")
++        hub.round()
++        worker.round()
++        worker.enter()
++        wn.pickup(worker.conn, budget=4)
++        stall._age(worker, a, 900)
++        stall._age(worker, b, 700)
++        [alarm] = kps.sweep(worker.conn)
++        assert place._pin(worker.conn, alarm) == [f"machine:{support.HUB}"]
++        worker.round()
++        hub.round()
++        hub.tick()
++        assert kb.get_task(hub.conn, alarm).status == "running"
++        unlisted = stall._pinned(hub, title="never listed")
++        hub.enter()
++        monkeypatch.setenv("HERMES_KANBAN_TASK", alarm)
++        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb._current_run_id(hub.conn, alarm)))
++        monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
++        yield hub, worker, alarm, (a, b), unlisted
++    finally:
++        for g in (hub, worker):
++            g.conn.close()
++        sync.set_lease_client(None)
++        wn.set_registry_fetch(None)
++
++
++def _move(task_id, runs_on):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_move({"task_id": task_id, "runs_on": runs_on, "reason": f"{M} is on hold",
++                                       "checkpoint": "n/a"}))
++
++
++def test_the_alarms_run_re_places_each_listed_card_and_keeps_running(held):
++    hub, _worker_gw, alarm, cards, _unlisted = held
++    body = kb.get_task(hub.conn, alarm).body
++    assert "kanban_move(task_id=" in body and "kanban_supervisor_request" in body  # the alarm names the command
++    for tid in cards:
++        out = _move(tid, [f"machine:{X}"])
++        assert out.get("ok") is True, out
++        assert place._pin(hub.conn, tid) == [f"machine:{X}"]
++        [moved] = [json.loads(e[0]) for e in hub.conn.execute(
++            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'moved'", (tid,))]
++        assert moved["pickup_stall_alarm"] == alarm and moved["stalled_machine"] == M
++    assert kb.get_task(hub.conn, alarm).status == "running"  # moving another card never ends this run
++    assert support.MACHINES[M]["hold"] is True  # the hold is the operator's: never lifted or shortened
++
++
++def test_the_alarms_run_may_not_move_an_unlisted_card_or_back_onto_the_stalled_machine(held):
++    hub, _worker_gw, _alarm, (a, _b), unlisted = held
++    out = _move(unlisted, [f"machine:{X}"])
++    assert out.get("ok") is not True and "lists" in out["error"], out
++    out = _move(a, [f"machine:{M}"])
++    assert out.get("ok") is not True and f"leave {M}" in out["error"], out
++    assert place._pin(hub.conn, unlisted) == place._pin(hub.conn, a) == [f"machine:{M}"]
++
++
++def test_the_hold_alarm_text_names_the_supported_command():
++    assert "kanban_move command below" in kps._HOST_GROUPS["hold"][2]
++    text = rp.howto(M)
++    assert "kanban_move(task_id=" in text and "\"action\": \"move\"" in text and f"never back to {M}" in text
++
++
++# --- the operator-call route for a card another gateway created ----------------------------------------------------
++
++def test_an_alarm_caller_gets_the_same_scope_on_an_operator_call_move(fleet, monkeypatch):
++    from hermes_cli import kanban_supervisor_requests as ksr
++    f = fleet
++    for c in (f.h, f.rep):
++        if "runs_on" not in {r[1] for r in c.execute("PRAGMA table_info(tasks)")}:
++            c.execute("ALTER TABLE tasks ADD COLUMN runs_on TEXT")
++            c.commit()
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET runs_on = ? WHERE id = ?", (json.dumps([f"machine:{M}"]), f.target))
++    f.board()
++    with kb.write_txn(f.w):  # the caller's card is the alarm M's detector filed (a pickup copy on worker-5)
++        f.w.execute("UPDATE tasks SET created_by = ?, created_on = ?, idempotency_key = ?, body = ? WHERE id = ?",
++                    (kps.DETECTOR, M, f"{kps.KEY_PREFIX}{M}:hold:1", f"- {f.target} (hub-owned card), ready",
++                     f.caller))
++    monkeypatch.setattr(rp, "_registry_machines", lambda: _machines())
++
++    def ask(runs_on, target=None):
++        out = ksr.submit(f.w, env_task=f.caller, env_run=str(f.run_id), dry_run=True, ops=[
++            {"op": "operator", "action": "move", "task_id": target or f.target, "runs_on": runs_on,
++             "reason": f"{M} is on hold"}])
++        return out["ops"][0]
++
++    assert ask([f"machine:{X}"])["verdict"] == "supervisor"
++    assert ask([f"machine:{M}"]).get("code") == "pickup_stall_scope"
++    other = f.card(f.h, "not listed")
++    with kb.write_txn(f.h):
++        f.h.execute("UPDATE tasks SET runs_on = ? WHERE id = ?", (json.dumps([f"machine:{M}"]), other))
++    f.board()
++    assert ask([f"machine:{X}"], target=other).get("code") == "pickup_stall_scope"
++    # A caller that is no alarm keeps the plain operator-call rules.
++    with kb.write_txn(f.w):
++        f.w.execute("UPDATE tasks SET created_by = 'default' WHERE id = ?", (f.caller,))
++    assert ask([f"machine:{M}"])["verdict"] == "supervisor"
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index f045bfbece..5761e4ae91 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -464,6 +464,8 @@ KANBAN_MOVE_SCHEMA = _schema(
+         "origin instead; your own run continues. Second exception: task_id = a READY, unclaimed card of this "
+         "gateway whose runs_on no enrolled machine carries (stranded: e.g. ['hermes-hub']) may be re-routed by any "
+         "worker to labels a machine does carry (e.g. ['machine:hub']); the old labels are kept in a comment. "
++        "Third: a pickup-stall alarm's run may move a ready card its alarm lists off the stalled machine to "
++        "runs_on = [\"machine:<X>\"] for one other machine eligible now. "
+         "Every other card is refused."
+     ),
+     {
+-- 
+2.43.0
+

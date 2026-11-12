@@ -1,0 +1,165 @@
+From 2cfdbeedc216f5a2869ca624c2da8a4546983629 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:08:29 +0000
+Subject: [PATCH] [daveey] fix(kanban): carried-input exemption fails closed on
+ a stale machine registry snapshot
+
+registry() keeps its last good snapshot while fetches fail, so after one
+good fetch a persistent outage froze the pool:worker member set and the
+carried-input exemption could cover a host its receipt never verified.
+Add registry_fresh(max_age_s), which returns the snapshot only when the
+last successful fetch is that recent, and use it (2 * REGISTRY_TTL_S) in
+_label_members. registry() and the dispatcher's last-known-good path are
+unchanged. PR #1384 review note 3.
+---
+ hermes_cli/kanban_carried_evidence.py         |  8 ++-
+ hermes_cli/kanban_worker_node.py              | 22 ++++++--
+ .../test_kanban_pool_carried_inputs.py        | 53 +++++++++++++++++++
+ 3 files changed, 78 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_carried_evidence.py b/hermes_cli/kanban_carried_evidence.py
+index 2ca566b1c9..a537e3a0b5 100644
+--- a/hermes_cli/kanban_carried_evidence.py
++++ b/hermes_cli/kanban_carried_evidence.py
+@@ -19,10 +19,14 @@ PATH_TOKEN = re.compile(r"(?<![\w/])(?:/home/[^/\s`\"']+|~)/\.hermes/kanban/(?:e
+ 
+ 
+ def _label_members(labels: set[str]) -> set[str] | None:
+-    """Every registry machine carrying any of ``labels``; None (fail closed) when unreadable or a label is empty."""
++    """Every registry machine carrying any of ``labels``; None (fail closed) when unreadable, stale or a label is empty.
++
++    Stale = no successful registry fetch within two TTLs: a membership frozen by an outage would miss a machine
++    labelled since, so its receipt could appear to cover every destination. [daveey]
++    """
+     from hermes_cli import kanban_worker_node as wn
+     try:
+-        snapshot = wn.registry()
++        snapshot = wn.registry_fresh(2 * wn.REGISTRY_TTL_S)
+     except Exception:  # health: allow BLE001 -- no sync identity (SyncUnavailable) or broken registry: fail closed
+         return None
+     machines = snapshot.get("machines") if isinstance(snapshot, dict) else None
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index a3dea51293..4cd8df9a54 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -47,7 +47,7 @@ DEFAULT_PICKUP_BATCH = 4
+ # rows, so ship's land gate refused) are refilled by kanban_pickup_history.
+ _CHILD_TABLES = ("task_runs", "task_comments", "task_attachments", "task_events")
+ 
+-_REGISTRY: dict[str, Any] = {"at": None, "value": None, "retry": False}
++_REGISTRY: dict[str, Any] = {"at": None, "value": None, "retry": False, "ok_at": None}
+ _REGISTRY_LOCK = threading.Lock()
+ _FETCH: Optional[Callable[[], Mapping[str, Any]]] = None
+ 
+@@ -211,7 +211,7 @@ def set_registry_fetch(fn: Optional[Callable[[], Mapping[str, Any]]]) -> None:
+     global _FETCH
+     with _REGISTRY_LOCK:
+         _FETCH = fn
+-        _REGISTRY.update(at=None, value=None, retry=False)
++        _REGISTRY.update(at=None, value=None, retry=False, ok_at=None)
+ 
+ 
+ def registry() -> Optional[Mapping[str, Any]]:
+@@ -223,6 +223,21 @@ def registry() -> Optional[Mapping[str, Any]]:
+         return _registry_locked()
+ 
+ 
++def registry_fresh(max_age_s: float) -> Optional[Mapping[str, Any]]:
++    """:func:`registry`, but None unless its last successful fetch is within ``max_age_s``.
++
++    ``registry()`` keeps the last good snapshot through an outage (the Board still
++    authorizes every lease). A caller that must not act on a frozen membership,
++    such as the carried-input exemption, reads this instead and fails closed. [daveey]
++    """
++    with _REGISTRY_LOCK:
++        value = _registry_locked()
++        ok_at = _REGISTRY.get("ok_at")
++    if ok_at is None or time.monotonic() - ok_at > max_age_s:
++        return None
++    return value
++
++
+ def _registry_locked() -> Optional[Mapping[str, Any]]:
+     now = time.monotonic()
+     ttl = REGISTRY_RETRY_S if _REGISTRY.get('retry') else REGISTRY_TTL_S
+@@ -240,7 +255,8 @@ def _registry_locked() -> Optional[Mapping[str, Any]]:
+         _log.info("kanban worker node: machine registry unavailable (%s: %s)", type(exc).__name__, exc)
+         return _REGISTRY["value"]
+     value = {"me": raw.get("me"), "machines": {m["name"]: m for m in raw.get("machines") or [] if m.get("name")}}
+-    _REGISTRY.update(at=time.monotonic(), value=value, retry=False)
++    now = time.monotonic()
++    _REGISTRY.update(at=now, value=value, retry=False, ok_at=now)
+     return value
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_pool_carried_inputs.py b/tests/hermes_cli/test_kanban_pool_carried_inputs.py
+index c4260acd63..b9632d531c 100644
+--- a/tests/hermes_cli/test_kanban_pool_carried_inputs.py
++++ b/tests/hermes_cli/test_kanban_pool_carried_inputs.py
+@@ -139,6 +139,7 @@ def test_registry_without_sync_identity_fails_closed(carried, monkeypatch):
+ def test_text_without_carried_path_never_reads_the_registry(monkeypatch):
+     calls = []
+     monkeypatch.setattr(wn, "registry", lambda: calls.append(1))  # counted, since _label_members swallows raises
++    monkeypatch.setattr(wn, "registry_fresh", lambda *_: calls.append(1), raising=False)
+     body = "Implement the approved plan."
+     assert ce.without_carried_inputs(body, {"worker_queue": {"hub": POOL}}) == body
+     assert kp.portable_reason({"title": "Implement plan", "body": body}, {"worker_queue": {"hub": POOL}}) is None
+@@ -151,3 +152,55 @@ def test_denied_card_queue_labels_skip_a_verified_carried_path(carried):
+     args = {"title": "Implement plan", "body": carried["body"], "assignee": "default"}
+     out = hap.pool_route(args, cfg, "hub", {}, None, machine_ok=lambda _: True)
+     assert out["runs_on"] == [POOL], out
++
++
++# --- PR 1384 review note 3: a stale registry snapshot fails closed -----------------------------------------------
++
++class _Clock:
++    """``wn.time`` stand-in: a hand-moved ``monotonic``, everything else from :mod:`time`."""
++
++    def __init__(self):
++        self.now = 1000.0
++
++    def monotonic(self):
++        return self.now
++
++    def __getattr__(self, name):
++        return getattr(time, name)
++
++
++@pytest.fixture
++def stale(carried, monkeypatch):
++    """One good fetch (``pool:worker`` = {worker-2}, covered by the receipt), then every fetch fails."""
++    clock = _Clock()
++    monkeypatch.setattr(wn, "time", clock)
++    machines = [_machine("hub", ["linux"]), _machine("worker-2", ["linux", POOL])]
++    state = {"up": True}
++
++    def fetch():
++        if not state["up"]:
++            raise OSError("board unreachable")
++        return {"me": "hub", "machines": machines}
++
++    wn.set_registry_fetch(fetch)
++    cfg = {"worker_queue": {"hub": POOL}}
++    assert NAME not in ce.without_carried_inputs(carried["body"], cfg)  # fresh: exempt
++    state["up"] = False
++    return {**carried, "clock": clock, "cfg": cfg, "machines": machines}
++
++
++def test_stale_registry_snapshot_fails_closed(stale):
++    # A worker-3 labelled pool:worker during the outage would be invisible to a frozen snapshot.
++    stale["clock"].now += 2 * wn.REGISTRY_TTL_S + 1
++    assert ce.without_carried_inputs(stale["body"], stale["cfg"]) == stale["body"]
++
++
++def test_short_registry_blip_keeps_the_exemption(stale):
++    stale["clock"].now += wn.REGISTRY_TTL_S + 1  # the refetch is due and fails, but the last success is recent
++    assert NAME not in ce.without_carried_inputs(stale["body"], stale["cfg"])
++
++
++def test_dispatcher_registry_keeps_last_known_good(stale):
++    stale["clock"].now += 10 * wn.REGISTRY_TTL_S
++    snapshot = wn.registry()
++    assert snapshot is not None and set(snapshot["machines"]) == {"hub", "worker-2"}
+-- 
+2.43.0
+

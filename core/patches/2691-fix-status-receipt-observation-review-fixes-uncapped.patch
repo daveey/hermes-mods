@@ -1,0 +1,188 @@
+From 94bb89b41160f1ff344915d6c9e0c0cf4affc578 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 05:27:53 +0000
+Subject: [PATCH] fix(status): receipt observation review fixes (uncapped
+ verdict inputs, per-card isolation, latest-id completion, stale done is
+ unknown) [daveey]
+
+---
+ hermes_cli/kanban_completion_inputs.py        | 11 ++-
+ .../kanban_completion_receipt_projection.py   |  4 +-
+ hermes_cli/kanban_execution_observations.py   |  2 +
+ .../test_kanban_execution_receipt_review.py   | 84 +++++++++++++++++++
+ 4 files changed, 93 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_execution_receipt_review.py
+
+diff --git a/hermes_cli/kanban_completion_inputs.py b/hermes_cli/kanban_completion_inputs.py
+index e00d385252..1db981d332 100644
+--- a/hermes_cli/kanban_completion_inputs.py
++++ b/hermes_cli/kanban_completion_inputs.py
+@@ -14,7 +14,6 @@ from typing import NamedTuple
+ from hermes_cli.kanban_origin_ledger import _receipt_epoch, completion_verdict
+ 
+ CHUNK = 500
+-MAX_PAYLOAD = 32768
+ 
+ 
+ class Completion(NamedTuple):
+@@ -56,7 +55,7 @@ def read_completions(conn, ids) -> dict[str, Completion]:
+                                             "completion_contract", "title", "body", "assignee", "session_id"))
+     run_fields = _select(run_cols, "r.", ("id", "task_id", "uid", "status", "outcome", "ended_at", "summary"))
+     event_fields = ",".join(("e.id", "e.task_id", "e.run_id", "e.kind", "e.created_at",
+-                             f"substr(e.payload,1,{MAX_PAYLOAD + 1}) AS payload"))
++                             "e.payload"))
+     epoch = []
+     for start in range(0, len(ids), CHUNK):
+         chunk = ids[start:start + CHUNK]
+@@ -98,10 +97,10 @@ def read_completions(conn, ids) -> dict[str, Completion]:
+ 
+ 
+ def _payload(raw):
+-    """Decoded event payload; oversized or malformed payloads are not evidence (fail closed)."""
++    """Decoded event payload; malformed payloads are not evidence (fail closed). Never size-capped: the\n    owner verdict reads the whole payload, so the batch must too."""
+     if raw is None:
+         return {}
+-    if not isinstance(raw, str) or len(raw) > MAX_PAYLOAD:
++    if not isinstance(raw, str):
+         raise ValueError("completion payload unavailable")
+     value = json.loads(raw)
+     if not isinstance(value, dict):
+@@ -131,8 +130,8 @@ def _completion(conn, tid, task, event, run, archived, bound, epoch):
+         verified, legacy, _terminal = completion_verdict(
+             tid, row, event_t, run_t, archived_t, bound_event=bound_event,
+             current_task=lambda: (task["title"], task["body"]), receipt_epoch=receipt_epoch)
+-    except (ValueError, TypeError):
+-        verified = legacy = False  # one card's malformed evidence is unverified, never a failed batch
++    except Exception:  # any one card's bad evidence is unverified, never a failed batch
++        verified = legacy = False
+     return Completion(task["status"], verified, legacy, None if event is None else event["id"],
+                       None if event is None else event["run_id"], None if run is None else run["id"],
+                       None if run is None else run["uid"], task["assignee"], task["session_id"])
+diff --git a/hermes_cli/kanban_completion_receipt_projection.py b/hermes_cli/kanban_completion_receipt_projection.py
+index 3d8968f827..3242180615 100644
+--- a/hermes_cli/kanban_completion_receipt_projection.py
++++ b/hermes_cli/kanban_completion_receipt_projection.py
+@@ -130,7 +130,7 @@ def read_completed(conn, task_id, *, gateway, board):
+     row = conn.execute(
+         f"SELECT e.*, {fields} FROM task_events e "
+         "LEFT JOIN task_runs r ON r.id=e.run_id AND r.task_id=e.task_id "
+-        "WHERE e.task_id=? AND e.kind='completed' ORDER BY e.created_at DESC,e.id DESC LIMIT 1",
++        "WHERE e.task_id=? AND e.kind='completed' ORDER BY e.id DESC LIMIT 1",
+         (task_id,)).fetchone()
+     return _completed_receipt(row, task_id, gateway=gateway, board=board)
+ 
+@@ -156,7 +156,7 @@ def read_completed_many(conn, task_ids, *, board, gateway):
+             f"SELECT id, {'created_on' if created_on else 'NULL'} FROM tasks WHERE id IN ({marks})", chunk)}
+         cursor = conn.execute(
+             f"SELECT * FROM (SELECT e.*, {fields}, ROW_NUMBER() OVER (PARTITION BY e.task_id "
+-            "ORDER BY e.created_at DESC, e.id DESC) AS _rank FROM task_events e "
++            "ORDER BY e.id DESC) AS _rank FROM task_events e "
+             "LEFT JOIN task_runs r ON r.id=e.run_id AND r.task_id=e.task_id "
+             f"WHERE e.task_id IN ({marks}) AND e.kind='completed') WHERE _rank=1", chunk)
+         cursor.row_factory = sqlite3.Row
+diff --git a/hermes_cli/kanban_execution_observations.py b/hermes_cli/kanban_execution_observations.py
+index 317d33ba3b..e670a73206 100644
+--- a/hermes_cli/kanban_execution_observations.py
++++ b/hermes_cli/kanban_execution_observations.py
+@@ -86,6 +86,8 @@ def card(row, *, gateway=None, profile=None, now=None):
+     done = row.get("_execution_done")
+     if isinstance(done, dict) and not row.get("remote"):
+         # Positive delivered-completion evidence (kanban_execution_receipt); nothing else is ever 'done'.
++        if row.get("stale"):  # a replayed busy-board list is not a current owner read
++            done = {**done, "state": "unknown", "last_known_state": "done", "unknown_reason": "source_unavailable"}
+         return project(done, now=now, source_class="sidebar")
+     source = row.get("_execution_source")
+     if isinstance(source, dict) and not row.get("remote"):
+diff --git a/tests/hermes_cli/test_kanban_execution_receipt_review.py b/tests/hermes_cli/test_kanban_execution_receipt_review.py
+new file mode 100644
+index 0000000000..928a731d25
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_execution_receipt_review.py
+@@ -0,0 +1,84 @@
++"""Review findings F1-F4 of the completion-receipt observation milestone, driven by real producers."""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_operator
++from hermes_cli import kanban_execution_observations as observations
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli.execution_observations import project
++from hermes_cli.kanban_completion_inputs import read_completions, read_verdicts
++from hermes_cli.kanban_completion_receipt_projection import read_completed, read_completed_many
++from hermes_cli.kanban_execution_receipt import done_raw
++from hermes_cli.kanban_goal_receipt import GoalVerification
++from tests.hermes_cli.test_kanban_execution_receipt import (
++    GATEWAY, annotate, board, card, done_listing, finish, observation, owner_verdict)
++from tests.hermes_state.test_completion_receipt import receipt
++
++
++def goal_finish(conn, *, body="small body", handoff="Finished"):
++    tid = kb.create_task(conn, title="Goal", body=body, assignee="coder", session_id="session",
++                         completion_contract="local-only", goal_mode=True)
++    assert kb.claim_task(conn, tid) is not None
++    proof = GoalVerification.for_handoff(kb.get_task(conn, tid), handoff)
++    assert kb.complete_task(conn, tid, summary=handoff, metadata={"completion_receipt": receipt("delivered")},
++                            goal_verification=proof)
++    return tid
++
++
++@pytest.mark.parametrize("kwargs", [{}, {"body": "x" * 40000}, {"handoff": "Finished\n" + "y" * 40000}],
++                         ids=["small", "large-body", "large-handoff"])
++def test_f1_verified_goal_card_has_one_verdict_at_any_payload_size(board, kwargs):
++    tid = goal_finish(board, **kwargs)
++    assert owner_verdict(board, tid) == (True, False)
++    assert read_verdicts(board, [tid])[tid] == (True, False)
++    assert observation(done_listing(tid))["state"] == "done"
++
++
++def test_f2_one_cards_malformed_evidence_does_not_blank_other_done_cards(board):
++    healthy = finish(board, card(board))
++    bad = goal_finish(board)
++    with board:
++        ev = board.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='completed'", (bad,)).fetchone()
++        body = json.loads(ev[1])
++        body["summary"] = 5
++        board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(body), ev[0]))
++    activity._reset_cache_for_tests()
++    assert read_verdicts(board, [healthy, bad]) == {healthy: (True, False), bad: (False, False)}
++    states = {t: [v["state"] for v in r["execution_observations"]] for t, r in done_listing().items()}
++    assert states[healthy] == ["done"] and states[bad] == ["unknown"]
++    done = [v for v in annotate().get("execution_observations", []) if v["state"] == "done"]
++    assert [v["identity"]["work_id"] for v in done] == [healthy]
++
++
++def test_f3_clock_step_back_between_completions_still_observes_done(board, monkeypatch):
++    tid = finish(board, card(board))
++    assert kanban_db_operator.reopen_done_task(board, tid, reason="redo", actor="operator")
++    real = time.time
++    monkeypatch.setattr(time, "time", lambda: real() - 3600)
++    finish(board, tid)
++    monkeypatch.setattr(time, "time", real)
++    activity._reset_cache_for_tests()
++    latest = board.execute("SELECT max(id) FROM task_events WHERE task_id=? AND kind='completed'", (tid,)).fetchone()[0]
++    assert read_completed(board, tid, gateway=GATEWAY, board="default")["completion_receipt_source"]["event_id"] == latest
++    assert read_completed_many(board, [tid], board="default", gateway=GATEWAY)[tid][
++        "completion_receipt_source"]["event_id"] == latest
++    assert read_verdicts(board, [tid])[tid] == owner_verdict(board, tid) == (True, False)
++    assert observation(done_listing(tid))["state"] == "done"
++
++
++def test_f4_stale_replay_of_a_done_row_is_unknown_and_keeps_the_receipt(board):
++    tid = finish(board, card(board))
++    now = time.time()
++    raw = done_raw(tid, read_completions(board, [tid])[tid],
++                   read_completed_many(board, [tid], board="default", gateway=GATEWAY)[tid],
++                   board="default", gateway=GATEWAY, profile="default", observed_at=now)
++    current = observations.card({"id": tid, "status": "done", "_execution_done": raw}, now=now + 10)
++    assert current["state"] == "done"
++    stale = observations.card({"id": tid, "status": "done", "stale": True, "_execution_done": raw}, now=now + 10)
++    assert stale["state"] == "unknown" and stale["unknown_reason"] == "source_unavailable"
++    assert stale["last_known_state"] == "done"
++    assert stale["delivery_receipt"] == current["delivery_receipt"]
++    assert project(stale, now=now + 10)["state"] == "unknown"
+-- 
+2.43.0
+

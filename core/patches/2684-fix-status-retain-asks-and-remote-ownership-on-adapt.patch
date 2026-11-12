@@ -1,0 +1,181 @@
+From a2253c7f196c9059aac75dc5f2c491fa9b8f408d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:14:12 +0000
+Subject: [PATCH] fix(status): retain asks and remote ownership on adapter
+ failure
+
+N1: carry human_request from the existing count SELECTs into board assemble fallback, without another query. N2: remote failed_card uses only remote gateway and owner_profile (legacy profile only when owner_profile absent), never local defaults or unrelated source ownership.
+
+Root (happened): fallback reconstruction discarded count-row asks and reused local ownership for remote rows. Evidence: failure-isolation-review.md N1/N2 and regression RED logs; assemble ask failed with KeyError, and all 24 remote fault/owner/source cases failed ownership assertions before correction.
+
+Root (not caught): prior assemble test asserted only legacy counts; add_cards failure fixture covered only local rows. Strengthen real multi-session counts and exercise remote session_tasks for missing, partial and conflicting owner fields.
+
+Recurrence: first N1/N2 occurrence identified by exact-head ade594f review; inspected recent adapter/activity history (ade594f, 29b07d). Countermeasure proof: nice bash scripts/run_tests.sh over failure isolation, card observations, source snapshot, session activity, source safety, golden and show-current-run: 420 passed, exit 0. Logs and full command/hash evidence in parent workspace n1-n2-*.log; no lifecycle, clock or policy changes.
+---
+ hermes_cli/kanban_execution_observations.py   | 10 ++--
+ hermes_cli/kanban_session_activity.py         | 36 ++++++-------
+ ...test_kanban_execution_failure_isolation.py | 53 +++++++++++++++++--
+ 3 files changed, 74 insertions(+), 25 deletions(-)
+
+diff --git a/hermes_cli/kanban_execution_observations.py b/hermes_cli/kanban_execution_observations.py
+index 7d029a7e89..22f65802b1 100644
+--- a/hermes_cli/kanban_execution_observations.py
++++ b/hermes_cli/kanban_execution_observations.py
+@@ -180,9 +180,13 @@ def failed_card(row, *, gateway=None, profile=None, now=None):
+     from hermes_cli.kanban_execution_source import unknown_raw
+     source = row.get("_execution_source")
+     source = source if isinstance(source, dict) else {}
+-    value = unknown_raw(row, {**source, "gateway": source.get("gateway") or gateway,
+-                              "profile": source.get("profile") or profile,
+-                              "board": source.get("board") or row.get("board")})
++    if row.get("remote"):
++        source = {"gateway": row.get("gateway"), "profile": row.get("owner_profile", row.get("profile")),
++                  "board": row.get("board")}
++    else:
++        source = {**source, "gateway": source.get("gateway") or gateway,
++                  "profile": source.get("profile") or profile, "board": source.get("board") or row.get("board")}
++    value = unknown_raw(row, source)
+     return _project(value, now=time.time() if now is None else now, source_class="sidebar")
+ 
+ 
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 8c09c38811..6f006c36af 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -208,27 +208,24 @@ def _read_counts(path: Path, statuses: tuple[str, ...] = ACTIVE_STATUSES) -> dic
+         conn.close()
+ 
+ 
+-def _counts_on(conn: sqlite3.Connection, statuses: tuple[str, ...] = ACTIVE_STATUSES) -> dict[str, int]:
+-    if "session_id" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++def _counts_on(conn: sqlite3.Connection, statuses: tuple[str, ...] = ACTIVE_STATUSES, *, tasks=None) -> dict[str, int]:
++    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    if "session_id" not in cols:
+         return {}  # explicitly supported pre-session schema, not a failed read
+     match, params = _status_filter(conn, statuses)
+-    pairs: set[tuple[str, str]] = {
+-        (str(sid), str(tid)) for sid, tid in conn.execute(
+-            f"SELECT session_id, id FROM tasks t WHERE session_id IS NOT NULL "
+-            f"AND session_id != '' AND {match}",
+-            params,
+-        )
+-    }
++    request = "t.human_request" if "human_request" in cols else "NULL"
++    rows = list(conn.execute(
++        f"SELECT session_id, id, {request} FROM tasks t WHERE session_id IS NOT NULL "
++        f"AND session_id != '' AND {match}", params))
+     try:
+-        pairs.update(
+-            (str(sid), str(tid)) for sid, tid in conn.execute(
+-                f"SELECT s.chat_id, t.id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
+-                f"WHERE s.platform = 'tui' AND s.chat_id != '' AND {_counted_sub_clause(conn)} AND {match}",
+-                params,
+-            )
+-        )
++        rows.extend(conn.execute(
++            f"SELECT s.chat_id, t.id, {request} FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
++            f"WHERE s.platform = 'tui' AND s.chat_id != '' AND {_counted_sub_clause(conn)} AND {match}", params))
+     except sqlite3.Error:  # board predates notify subscriptions
+         pass
++    pairs = {(str(sid), str(tid)) for sid, tid, _ in rows}
++    if tasks is not None:
++        tasks.update({str(tid): {"id": str(tid), "human_request": request} for _, tid, request in rows})
+     counts: dict[str, int] = {}
+     for sid, _tid in pairs:
+         counts[sid] = counts.get(sid, 0) + 1
+@@ -1367,9 +1364,10 @@ def _read_board(path: Path, *, parked: bool, stalled: bool) -> tuple[dict[str, A
+                 complete = False
+             outer, _pairs_sink = _pairs_sink, set()
+             try:
+-                reads["active"] = _counts_on(conn, ACTIVE_STATUSES)
++                tasks = {}
++                reads["active"] = _counts_on(conn, ACTIVE_STATUSES, tasks=tasks)
+                 reads["active_pairs"], _pairs_sink = _pairs_sink, set()
+-                reads["blocked"] = _counts_on(conn, BLOCKED_STATUSES)
++                reads["blocked"] = _counts_on(conn, BLOCKED_STATUSES, tasks=tasks)
+                 reads["blocked_pairs"] = _pairs_sink
+                 reads["pairs"] = reads["active_pairs"] | reads["blocked_pairs"]
+                 from hermes_cli.kanban_execution_source import assemble, safe_raw, unknown_raw
+@@ -1382,7 +1380,7 @@ def _read_board(path: Path, *, parked: bool, stalled: bool) -> tuple[dict[str, A
+                 except ADAPTER_ERRORS:
+                     # Optional evidence only: legacy counts and asks stay; each card is an explicit unknown.
+                     _log.debug("kanban execution source failed for %s", path, exc_info=True)
+-                    reads["execution"] = {tid: unknown_raw({"id": tid}, gateway=gateway, profile=profile,
++                    reads["execution"] = {tid: unknown_raw(tasks[tid], gateway=gateway, profile=profile,
+                                                            board=_board_slug(path))
+                                           for _, tid in reads["pairs"]}
+             finally:
+diff --git a/tests/hermes_cli/test_kanban_execution_failure_isolation.py b/tests/hermes_cli/test_kanban_execution_failure_isolation.py
+index 42bfd1d48e..fdede9b308 100644
+--- a/tests/hermes_cli/test_kanban_execution_failure_isolation.py
++++ b/tests/hermes_cli/test_kanban_execution_failure_isolation.py
+@@ -96,9 +96,21 @@ def test_assemble_failure_keeps_legacy_counts_and_marks_cards_unknown(two_cards,
+     def boom(*a, **kw):
+         raise sqlite3.OperationalError("fixture assemble failure")
+     monkeypatch.setattr(source, "assemble", boom)
+-    other = [{"id": "session2"}]
+-    activity.annotate_kanban_activity(other)
+-    assert not other[0].get("kanban_unknown") and other[0]["kanban_blocked"] == 1
++    rows = [{"id": "session"}, {"id": "session2"}]
++    activity.annotate_kanban_activity(rows)
++    work, other = rows
++    assert work["kanban_active"] == 1 and not work.get("kanban_unknown")
++    assert other["kanban_blocked"] == 1 and not other.get("kanban_unknown")
++    for row, tid in ((work, "card"), (other, "other")):
++        [value] = [v for v in row["execution_observations"] if v["source"] == "kanban.card"]
++        assert value["identity"]["work_id"] == tid
++        assert value["state"] == "unknown" and value["unknown_reason"] == "adapter_error"
++        assert value["observed_at"] is None and value["valid_until"] is None
++        if tid == "other":
++            assert value["human_request"]["action"] == "Approve"
++            assert "resolved_check" not in value["human_request"]
++        else:
++            assert not value.get("human_request")
+     assert activity._all_counts(include_snapshot=True) is not None
+ 
+ 
+@@ -138,6 +150,41 @@ def test_add_cards_adapter_failure_attaches_unknown_not_nothing(monkeypatch):
+     assert "_execution_source" not in out
+ 
+ 
++@pytest.mark.parametrize("owner", [
++    {"gateway": "REMOTE-GW", "owner_profile": "remote-profile"},
++    {"gateway": "REMOTE-GW"},
++    {"owner_profile": "remote-profile"},
++    {},
++    {"gateway": "REMOTE-GW", "owner_profile": None, "profile": "not-the-owner"},
++    {"gateway": "REMOTE-GW", "profile": "legacy-remote-profile"},
++])
++@pytest.mark.parametrize("fault", ["card", "source"])
++@pytest.mark.parametrize("execution_source", [None, {"gateway": "wrong-source", "profile": "wrong-profile"}])
++def test_remote_session_tasks_adapter_failure_preserves_exact_owner(
++        kanban_root, monkeypatch, owner, fault, execution_source):
++    monkeypatch.setattr(observations, "local_scope", lambda: ("LOCAL-GW", "local-profile"))
++    row = {"id": "remote-card", "key": "remote/board/card", "board": "remote-board", "remote": True,
++           "session": "remote-session", "status": "blocked", "human_request": json.dumps(REQUEST),
++           "_execution_source": execution_source, **owner}
++    if fault == "card":
++        monkeypatch.setattr(observations, "card", lambda *a, **kw: (_ for _ in ()).throw(ValueError("fixture")))
++    else:
++        row["_execution_error"] = True
++    monkeypatch.setattr(activity, "_remote_cards", lambda *a: [dict(row)])
++    [out] = activity.session_tasks(["remote-session"])
++    [value] = out["execution_observations"]
++    for key, expected in (("gateway", owner.get("gateway")),
++                          ("profile", owner.get("owner_profile", owner.get("profile")))):
++        assert value["identity"].get(key) == expected
++        assert value["owner"].get(key) == expected
++    assert value["identity"]["work_id"] == "remote-card"
++    assert value["identity"]["board"] == "remote-board"
++    assert value["state"] == "unknown" and value["unknown_reason"] == "adapter_error"
++    assert value["observed_at"] is None and value["valid_until"] is None
++    assert value["human_request"]["action"] == "Approve"
++    assert "resolved_check" not in value["human_request"]
++
++
+ @contextmanager
+ def _faults(monkeypatch, fault):
+     if fault == "raw":
+-- 
+2.43.0
+

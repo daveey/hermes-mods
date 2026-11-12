@@ -1,0 +1,597 @@
+From 32bfa4ef29f0dec98f8f3d1b12063729802ca521 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 09:15:17 +0000
+Subject: [PATCH] fix(status): retain asks and historical receipts on uncertain
+ selection [daveey]
+
+---
+ .../src/lib/execution-observations.test.ts    |  37 ++++-
+ .../desktop/src/lib/execution-observations.ts | 136 +++++++++++++++---
+ docs/execution-observations-v1.md             |  38 ++++-
+ hermes_cli/execution_observations.py          | 110 +++++++++++---
+ .../fixtures/execution-observations-v1.json   |  19 +++
+ .../test_execution_observation_golden.py      |  27 +++-
+ 6 files changed, 320 insertions(+), 47 deletions(-)
+
+diff --git a/apps/desktop/src/lib/execution-observations.test.ts b/apps/desktop/src/lib/execution-observations.test.ts
+index 813f7ef39b..18e689758e 100644
+--- a/apps/desktop/src/lib/execution-observations.test.ts
++++ b/apps/desktop/src/lib/execution-observations.test.ts
+@@ -20,6 +20,8 @@ interface Case extends Patch {
+   expected_absent?: string[]
+   identity?: unknown
+   items?: Item[]
++  repeat_count?: number
++  outstanding?: number
+   values_raw?: unknown
+ }
+ 
+@@ -66,6 +68,13 @@ function subset(actual: unknown, expected: unknown): boolean {
+ 
+ function present(value: unknown, path: string): boolean {
+   for (const key of path.split('.')) {
++    if (Array.isArray(value) && /^\d+$/.test(key)) {
++      if (Number(key) >= value.length) {return false}
++      value = value[Number(key)]
++
++      continue
++    }
++
+     if (!isObject(value) || !Object.hasOwn(value, key)) {return false}
+ 
+     value = value[key]
+@@ -116,7 +125,8 @@ describe('shared execution observation semantic contract', () => {
+ 
+   for (const test of selectCases) {
+     it(`select: ${test.id}`, () => {
+-      const values = 'values_raw' in test ? clone(test.values_raw) : test.items!.map(itemInput)
++      const items = 'values_raw' in test ? clone(test.values_raw) : test.items!.map(itemInput)
++      const values = test.repeat_count ? Array.from({ length: test.repeat_count }, () => (items as unknown[])[0]) : items
+       const before = clone(values)
+       const identity = test.identity ?? fixture.base.identity
+       const result = selectExecutionObservation(values as unknown[], clone(identity), test.now as number, cls(test))
+@@ -127,8 +137,29 @@ describe('shared execution observation semantic contract', () => {
+       if (Array.isArray(values) && !test.values_raw) {
+         const again = selectExecutionObservation([...values].reverse(), clone(identity), test.now as number, cls(test))
+ 
+-        expect(again.state).toBe(result.state)
+-        expect(again.unknown_reason).toBe(result.unknown_reason)
++        expect(again).toEqual(result)
++      }
++
++      if (test.outstanding !== undefined) {
++        for (const observation of [result, projectExecutionObservation(result, test.now as number),
++          selectExecutionObservation([result], identity, test.now as number)]) {
++          expect(observation.retained_human_requests).toEqual(result.retained_human_requests)
++          expect(observation.historical_delivery_receipts).toEqual(result.historical_delivery_receipts)
++
++          for (const request of observation.retained_human_requests as Record<string, unknown>[]) {
++            expect(request).not.toHaveProperty('resolved_check')
++            expect(request).not.toHaveProperty('resolved_check_every')
++          }
++
++          const summary = summarizeExecutionObservations([observation], test.now as number)
++          expect(summary.outstanding_human_requests).toBe(test.outstanding)
++          expect(summary.counts.unknown).toBe(1)
++          expect(summary.counts.done).toBe(0)
++          expect(summarizeExecutionObservations(summary.observations, test.now as number)).toEqual(summary)
++          const doubled = summarizeExecutionObservations([observation, observation], test.now as number)
++          expect(doubled.outstanding_human_requests).toBe(2 * test.outstanding)
++          expect(doubled.counts.unknown).toBe(2)
++        }
+       }
+     })
+   }
+diff --git a/apps/desktop/src/lib/execution-observations.ts b/apps/desktop/src/lib/execution-observations.ts
+index b1056b8364..766a7d3a07 100644
+--- a/apps/desktop/src/lib/execution-observations.ts
++++ b/apps/desktop/src/lib/execution-observations.ts
+@@ -133,7 +133,7 @@ function progress(out: ExecutionObservation, now: number): void {
+     at <= now &&
+     typeof kind === 'string' &&
+     PROGRESS_KINDS.includes(kind) &&
+-    text(ref) &&
++    nonblank(ref) &&
+     isObject(evidence) &&
+     get(evidence, 'successful') === true &&
+     get(evidence, 'evidence_ref') === ref &&
+@@ -194,19 +194,27 @@ function humanRequest(value: unknown, waitKind?: unknown): boolean {
+   return true
+ }
+ 
+-/** Private probe commands never enter an observation; the input is not mutated. */
+-function stripProbes(raw: Record<string, unknown>): Record<string, unknown> {
+-  const request = get(raw, 'human_request')
+-
+-  if (!isObject(request) || !PROBE_FIELDS.some(k => has(request, k))) {return raw}
+-
++/** Private probe commands never enter singular or retained visible requests. */
++function stripRequest(request: unknown): unknown {
++  if (!isObject(request)) {return request}
+   const kept: Record<string, unknown> = {}
+ 
+   for (const k of Object.keys(request)) {
+     if (!PROBE_FIELDS.includes(k)) {Object.defineProperty(kept, k, { value: request[k], enumerable: true, writable: true, configurable: true })}
+   }
+ 
+-  return { ...raw, human_request: kept }
++  return kept
++}
++
++function stripProbes(raw: Record<string, unknown>): Record<string, unknown> {
++  const out = { ...raw }
++
++  if (has(raw, 'human_request')) {out.human_request = stripRequest(get(raw, 'human_request'))}
++  const retained = get(raw, 'retained_human_requests')
++
++  if (Array.isArray(retained)) {out.retained_human_requests = retained.map(stripRequest)}
++
++  return out
+ }
+ 
+ function freshness(source: Record<string, unknown>, now: number, sourceClass: ObservationSourceClass): ExecutionObservation {
+@@ -288,9 +296,8 @@ function freshness(source: Record<string, unknown>, now: number, sourceClass: Ob
+   return out
+ }
+ 
+-function delivered(out: ExecutionObservation): boolean {
+-  const receipt = get(out, 'delivery_receipt')
+-  const key = executionIdentityKey(get(out, 'identity'))
++function receiptValid(receipt: unknown, identity: unknown): boolean {
++  const key = executionIdentityKey(identity)
+ 
+   return (
+     key !== null &&
+@@ -302,10 +309,91 @@ function delivered(out: ExecutionObservation): boolean {
+   )
+ }
+ 
++function delivered(out: ExecutionObservation): boolean {
++  return receiptValid(get(out, 'delivery_receipt'), get(out, 'identity'))
++}
++
++/** Typed structural key shared with Python: code-point text, IEEE-754 number bits.
++ * Canonical ordering is not evidence authority. Bool differs from number; -0/0 share a key. */
++function jsonOrder(value: unknown): string {
++  if (value === null) {return 'n'}
++
++  if (typeof value === 'boolean') {return value ? 'b1' : 'b0'}
++
++  if (typeof value === 'number') {
++    const bytes = new Uint8Array(8)
++    new DataView(bytes.buffer).setFloat64(0, value === 0 ? 0 : value)
++
++    return 'd' + Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
++  }
++
++  if (typeof value === 'string') {return 's' + Array.from(value, c => c.codePointAt(0)!.toString(16).padStart(8, '0')).join('') + ';'}
++
++  if (Array.isArray(value)) {return 'a[' + value.map(jsonOrder).join('') + ']'}
++
++  if (isObject(value)) {
++    const keys = Object.keys(value).sort((a, b) => jsonOrder(a) < jsonOrder(b) ? -1 : jsonOrder(a) > jsonOrder(b) ? 1 : 0)
++
++    return 'o{' + keys.map(k => jsonOrder(k) + jsonOrder(value[k])).join('') + '}'
++  }
++
++  return 'x'
++}
++
++function unique(values: unknown[]): unknown[] {
++  const byKey = new Map(values.map(v => [jsonOrder(v), v]))
++
++  return [...byKey.keys()].sort().map(k => copy(byKey.get(k)))
++}
++
++function array(out: ExecutionObservation, field: string): unknown[] {
++  const value = get(out, field)
++
++  return Array.isArray(value) ? value : []
++}
++
++function requests(out: ExecutionObservation): unknown[] {
++  const retained = array(out, 'retained_human_requests').filter(v => humanRequest(v))
++
++  if (humanRequest(get(out, 'human_request'), waitKind(out))) {retained.push(out.human_request)}
++
++  return unique(retained)
++}
++
++function receipts(out: ExecutionObservation): unknown[] {
++  return unique([...array(out, 'historical_delivery_receipts'), get(out, 'delivery_receipt')].filter(v => receiptValid(v, get(out, 'identity'))))
++}
++
++function preserve(out: ExecutionObservation, matches: Record<string, unknown>[], now: number, sourceClass: ObservationSourceClass): ExecutionObservation {
++  if (out.state !== 'unknown') {return out}
++  const projected = matches.map(v => projectExecutionObservation(v, now, sourceClass))
++  const asks = unique(projected.flatMap(requests))
++  const historical = unique(projected.flatMap(receipts))
++  out.retained_human_requests = asks
++  out.historical_delivery_receipts = historical
++
++  const fields: [string, unknown[], boolean][] = [
++    ['human_request', asks, humanRequest(get(out, 'human_request'), waitKind(out))],
++    ['delivery_receipt', historical, delivered(out)]
++  ]
++
++  for (const [field, values, valid] of fields) {
++    if (!valid) {
++      delete out[field]
++
++      if (values.length === 1) {out[field] = copy(values[0])}
++    }
++  }
++
++  if (historical.length > 0) {out.last_known_state = 'done'}
++
++  return out
++}
++
+ /** Never claim done without a matching verified delivered receipt, whatever the source of the value. */
+ function lastKnown(out: ExecutionObservation): ExecutionObservation {
+   const known = out.last_known_state
+-  const valid = stateOf(known) && known !== 'unknown' && (known !== 'done' || delivered(out))
++  const valid = stateOf(known) && known !== 'unknown' && (known !== 'done' || receipts(out).length > 0)
+ 
+   out.last_known_state = valid ? known : null
+ 
+@@ -371,18 +459,22 @@ export function selectExecutionObservation(
+ 
+   if (matches.length === 0) {return projectExecutionObservation(base, now, sourceClass)}
+ 
+-  if (matches.some(v => !epoch(get(v, 'observed_at')))) {
+-    return unknown(projectExecutionObservation(base, now, sourceClass), 'invalid_candidate_timing')
+-  }
+-
+-  const latestAt = Math.max(...matches.map(v => get(v, 'observed_at') as number))
+-  const latest = matches.filter(v => get(v, 'observed_at') === latestAt)
++  let out: ExecutionObservation
+ 
+-  if (latest.slice(1).some(v => !sameJson(v, latest[0])) || matches.slice(1).some(v => !sameJson(get(v, 'source'), get(matches[0], 'source')))) {
+-    return unknown(projectExecutionObservation(base, now, sourceClass), 'conflicting_source_evidence')
++  if (matches.some(v => !epoch(get(v, 'observed_at')))) {
++    out = unknown(projectExecutionObservation(base, now, sourceClass), 'invalid_candidate_timing')
++  } else {
++    const latestAt = matches.reduce((at, v) => Math.max(at, get(v, 'observed_at') as number), 0)
++    const latest = matches.filter(v => get(v, 'observed_at') === latestAt)
++
++    if (latest.slice(1).some(v => !sameJson(v, latest[0])) || matches.slice(1).some(v => !sameJson(get(v, 'source'), get(matches[0], 'source')))) {
++      out = unknown(projectExecutionObservation(base, now, sourceClass), 'conflicting_source_evidence')
++    } else {
++      out = projectExecutionObservation(latest[0], now, sourceClass)
++    }
+   }
+ 
+-  return projectExecutionObservation(latest[0], now, sourceClass)
++  return preserve(out, matches, now, sourceClass)
+ }
+ 
+ export function summarizeExecutionObservations(values: readonly unknown[], now: number, sourceClass: ObservationSourceClass = 'sidebar') {
+@@ -393,7 +485,7 @@ export function summarizeExecutionObservations(values: readonly unknown[], now:
+   for (const observation of observations) {
+     counts[observation.state]++
+ 
+-    if (humanRequest(observation.human_request, waitKind(observation))) {outstanding++}
++    outstanding += requests(observation).length
+   }
+ 
+   return { observations, counts, outstanding_human_requests: outstanding, uncertain: observations.length === 0 || counts.unknown > 0 }
+diff --git a/docs/execution-observations-v1.md b/docs/execution-observations-v1.md
+index 34fd967de4..ad44fb900c 100644
+--- a/docs/execution-observations-v1.md
++++ b/docs/execution-observations-v1.md
+@@ -54,14 +54,14 @@ and treats `version: true` as unsupported.
+   names are invalid. `required_sources: null` is invalid.
+ - `unknown_reason` is kept only when a nonempty string, else `source_unknown`.
+ - **Human requests**: `resolved_check`/`resolved_check_every` are stripped from
+-  `human_request` on projector entry (input untouched), before validation and output;
+-  all other fields and expired asks are retained. Visible semantics (five text fields,
++  `human_request` and each `retained_human_requests` entry on projector entry (input
++  untouched), before validation and output; all other fields and expired asks are retained. Visible semantics (five text fields,
+   interaction set, 2-6 distinct `{label<=60, value<=120}` choices by code point) are
+   implemented identically in both languages. `needs_user` with a `time`,
+   `dependency` or `transient` wait is unknown (`invalid_human_wait`).
+   `summarize(...).outstanding_human_requests` counts retained valid requests
+   regardless of freshness or state (a request with such a nonhuman wait is not valid).
+-- **Progress** needs an explicit successful, referenced evidence record and
++- **Progress** needs an explicit successful, nonblank referenced evidence record and
+   `last_progress <= observed_at` and `<= now`; kinds are never coerced.
+ - **last_known_state** is a known non-unknown state or null, and `done` survives only
+   with a matching verified `delivered` receipt (also for stale and legacy input). The
+@@ -72,6 +72,38 @@ and treats `version: true` as unsupported.
+   JSON equality (bool is not a number; 7 equals 7.0).
+ - TS output is a deep copy (own keys defined as data, so `__proto__` is inert).
+ 
++### Unknown selection preserves outstanding evidence
++
++When `select` has exact identity-matched candidates but its result is `unknown`, it
++projects each matched candidate before collecting evidence. Conflicts, invalid timing,
++future-dated winners and expiration do not resolve an outstanding human request or
++revoke verified historical delivery. The additive result fields are:
++
++- `retained_human_requests`: every distinct valid visible request, including previously
++  retained requests. Singular requests accompanied by nonhuman waits are excluded.
++- `historical_delivery_receipts`: every distinct verified `delivered` receipt whose
++  identity matches the selected execution, including previously historical receipts.
++
++Both arrays use structural JSON-semantic deduplication, independent of object property
++order (7 and 7.0 coincide; booleans, missing/null and array order remain distinct).
++They have a canonical typed structural ordering, using code-point string encoding and
++IEEE-754 number bits with zero normalized. This is deterministic, **not** an ordering
++of authority, chronology, request resolution or execution outcomes. Only exact matched
++candidates contribute: another gateway, profile, board, run or generation is fenced out.
++
++A valid already-selected singular `human_request` / `delivery_receipt` stays selected.
++Otherwise a unique retained value also fills its singular field; multiple distinct values
++stay in the arrays without inventing a winner. Matching verified historical receipts
++support `last_known_state: done`, but **never** change `state: unknown` to current success.
++Re-projection preserves these arrays and strips their private request probes again.
++Summarization counts the union of valid retained and singular requests **per observation**
++without double counting, while work state counts remain one per observation. Historical
++receipts are not additional completed work.
++
++This change does not wire a consumer. Two review notes remain explicit future design:
++expected-identity mismatch output retains its existing shape, and no-match selection
++retains its existing reason rather than adding a new no-match reason.
++
+ ## Diagnostics
+ 
+ Concurrent diagnostics carry `code`, `native_code`, `phase`, `evidence_ref`.
+diff --git a/hermes_cli/execution_observations.py b/hermes_cli/execution_observations.py
+index 3a2645a4dd..1c1ebb4882 100644
+--- a/hermes_cli/execution_observations.py
++++ b/hermes_cli/execution_observations.py
+@@ -7,6 +7,7 @@ from __future__ import annotations
+ 
+ from copy import deepcopy
+ import math
++import struct
+ 
+ VERSION = 1
+ MAX_SAFE_INTEGER = 9007199254740991
+@@ -208,7 +209,7 @@ def _progress(out, now):
+     kind, ref = out.get("last_progress_kind"), out.get("last_progress_ref")
+     valid = (epoch(at) and epoch(now) and epoch(observed) and at <= observed and at <= now
+              and isinstance(kind, str) and kind in PROGRESS_KINDS
+-             and isinstance(ref, str) and bool(ref)
++             and nonblank(ref)
+              and isinstance(evidence, dict) and evidence.get("successful") is True
+              and evidence.get("evidence_ref") == ref
+              and epoch(evidence.get("observed_at")) and evidence["observed_at"] == at)
+@@ -245,13 +246,19 @@ def human_request_valid(value, *, wait_kind=None):
+     return True
+ 
+ 
++def _strip_request(value):
++    return {k: v for k, v in value.items() if k not in PROBE_FIELDS} if isinstance(value, dict) else value
++
++
+ def _strip_probes(value):
+-    """Private probe commands never enter an observation: copy without them, original untouched."""
++    """Private probe commands never enter singular or retained visible requests."""
+     raw = value if isinstance(value, dict) else {}
+-    request = raw.get("human_request")
+-    if not isinstance(request, dict) or not any(k in request for k in PROBE_FIELDS):
+-        return raw
+-    return {**raw, "human_request": {k: v for k, v in request.items() if k not in PROBE_FIELDS}}
++    out = dict(raw)
++    if "human_request" in raw:
++        out["human_request"] = _strip_request(raw["human_request"])
++    if isinstance(raw.get("retained_human_requests"), list):
++        out["retained_human_requests"] = [_strip_request(v) for v in raw["retained_human_requests"]]
++    return out
+ 
+ 
+ def _wait_kind(out):
+@@ -259,19 +266,83 @@ def _wait_kind(out):
+     return wait.get("kind") if isinstance(wait, dict) else None
+ 
+ 
+-def _delivered(out):
+-    receipt = out.get("delivery_receipt")
+-    key = identity_key(out.get("identity"))
++def _receipt_valid(receipt, identity):
++    key = identity_key(identity)
+     return (key is not None and isinstance(receipt, dict) and receipt.get("verified") is True
+             and receipt.get("disposition") == "delivered"
+             and nonblank(receipt.get("evidence_ref")) and identity_key(receipt.get("identity")) == key)
+ 
+ 
++def _delivered(out):
++    return _receipt_valid(out.get("delivery_receipt"), out.get("identity"))
++
++
++def _json_order(value):
++    """Typed structural key, shared with TS: code-point text and IEEE-754 number bits.
++
++    Object key order is irrelevant, bool differs from number, and -0/0 and 7/7.0
++    share keys. The ordering is canonical, not a ranking of evidence authority.
++    """
++    if value is None:
++        return "n"
++    if isinstance(value, bool):
++        return "b1" if value else "b0"
++    if isinstance(value, (int, float)):
++        return "d" + struct.pack(">d", 0.0 if value == 0 else value).hex()
++    if isinstance(value, str):
++        return "s" + value.encode("utf-32-be", errors="surrogatepass").hex() + ";"
++    if isinstance(value, list):
++        return "a[" + "".join(_json_order(v) for v in value) + "]"
++    if isinstance(value, dict):
++        return "o{" + "".join(_json_order(k) + _json_order(value[k]) for k in sorted(value, key=_json_order)) + "}"
++    return "x"
++
++
++def _unique(values):
++    by_key = {_json_order(v): v for v in values}
++    return [deepcopy(by_key[k]) for k in sorted(by_key)]
++
++
++def _array(out, field):
++    value = out.get(field)
++    return value if isinstance(value, list) else []
++
++
++def _requests(out):
++    retained = [v for v in _array(out, "retained_human_requests") if human_request_valid(v)]
++    if human_request_valid(out.get("human_request"), wait_kind=_wait_kind(out)):
++        retained.append(out["human_request"])
++    return _unique(retained)
++
++
++def _receipts(out):
++    return _unique(v for v in [*_array(out, "historical_delivery_receipts"), out.get("delivery_receipt")]
++                   if _receipt_valid(v, out.get("identity")))
++
++
++def _preserve(out, matches, now, source_class):
++    if out["state"] != "unknown":
++        return out
++    projected = [project(v, now=now, source_class=source_class) for v in matches]
++    asks = _unique(v for candidate in projected for v in _requests(candidate))
++    receipts = _unique(v for candidate in projected for v in _receipts(candidate))
++    out.update(retained_human_requests=asks, historical_delivery_receipts=receipts)
++    for field, values, valid in (("human_request", asks, human_request_valid(out.get("human_request"), wait_kind=_wait_kind(out))),
++                                 ("delivery_receipt", receipts, _delivered(out))):
++        if not valid:
++            out.pop(field, None)
++            if len(values) == 1:
++                out[field] = deepcopy(values[0])
++    if receipts:
++        out["last_known_state"] = "done"
++    return out
++
++
+ def _last_known(out):
+     """Never claim done without a matching verified delivered receipt, whatever the source of the value."""
+     known = out.get("last_known_state")
+     valid = isinstance(known, str) and known in STATES - {"unknown"}
+-    out["last_known_state"] = known if valid and (known != "done" or _delivered(out)) else None
++    out["last_known_state"] = known if valid and (known != "done" or bool(_receipts(out))) else None
+ 
+ 
+ def _project(value, now, source_class, expected_identity):
+@@ -324,13 +395,16 @@ def select(values, *, identity, now, source_class="sidebar"):
+     if not matches:
+         return project(base, now=now, source_class=source_class)
+     if any(not epoch(v.get("observed_at")) for v in matches):
+-        return _unknown(project(base, now=now, source_class=source_class), "invalid_candidate_timing")
+-    latest_at = max(v["observed_at"] for v in matches)
+-    latest = [v for v in matches if v["observed_at"] == latest_at]
+-    if (any(not same_json(v, latest[0]) for v in latest[1:])
+-            or any(not same_json(v.get("source"), matches[0].get("source")) for v in matches[1:])):
+-        return _unknown(project(base, now=now, source_class=source_class), "conflicting_source_evidence")
+-    return project(latest[0], now=now, source_class=source_class)
++        out = _unknown(project(base, now=now, source_class=source_class), "invalid_candidate_timing")
++    else:
++        latest_at = max(v["observed_at"] for v in matches)
++        latest = [v for v in matches if v["observed_at"] == latest_at]
++        if (any(not same_json(v, latest[0]) for v in latest[1:])
++                or any(not same_json(v.get("source"), matches[0].get("source")) for v in matches[1:])):
++            out = _unknown(project(base, now=now, source_class=source_class), "conflicting_source_evidence")
++        else:
++            out = project(latest[0], now=now, source_class=source_class)
++    return _preserve(out, matches, now, source_class)
+ 
+ 
+ def summarize(values, *, now, source_class="sidebar"):
+@@ -346,6 +420,6 @@ def summarize(values, *, now, source_class="sidebar"):
+     outstanding = 0
+     for observation in observations:
+         counts[observation["state"]] += 1
+-        outstanding += human_request_valid(observation.get("human_request"), wait_kind=_wait_kind(observation))
++        outstanding += len(_requests(observation))
+     return {"observations": observations, "counts": counts, "outstanding_human_requests": outstanding,
+             "uncertain": not observations or bool(counts["unknown"])}
+diff --git a/schemas/fixtures/execution-observations-v1.json b/schemas/fixtures/execution-observations-v1.json
+index 0a0caa4303..432d2f6c71 100644
+--- a/schemas/fixtures/execution-observations-v1.json
++++ b/schemas/fixtures/execution-observations-v1.json
+@@ -28,6 +28,8 @@
+     "last_progress": null
+   },
+   "cases": [
++    {"id":"blank-progress-reference", "set":{"last_progress":999,"last_progress_kind":"test_result","last_progress_ref":" \ufeff\t","progress_evidence":{"successful":true,"observed_at":999,"evidence_ref":" \ufeff\t"}},"expected":{"last_progress":null,"last_progress_ref":null}},
++    {"id":"retained-probes-sanitized", "set":{"state":"unknown","retained_human_requests":[{"action":"Choose","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1","resolved_check":"secret","resolved_check_every":30}]}, "expected":{"retained_human_requests":[{"action":"Choose"}]},"expected_absent":["retained_human_requests.0.resolved_check"]},
+     {"id": "prototype-source-class", "set": {"required_sources": [{"observed_at": 900, "valid_until": 1000, "source_class": "toString"}]}, "expected": {"state": "unknown", "unknown_reason": "invalid_required_source_class"}},
+     {"id": "array-state", "set": {"state": ["running"]}, "expected": {"state": "unknown", "unknown_reason": "unsupported_state"}},
+     {"id": "null-required-sources", "set": {"required_sources": null}, "expected": {"state": "unknown", "unknown_reason": "invalid_required_sources"}},
+@@ -235,6 +237,23 @@
+     {"id": "stale-cancelled-not-delivered", "now": 1180, "set": {"state": "cancelled"}, "expected": {"state": "unknown", "freshness": "stale", "last_known_state": "cancelled"}}
+   ],
+   "select_cases": [
++    {"id":"preserve-selected-receipt", "now":1001,"items":[{"set":{"observed_at":1002,"delivery_receipt":{"verified":true,"disposition":"delivered","evidence_ref":"receipt:2","identity":{"gateway":"edge","profile":"work","board":"tasks","kind":"card","work_id":"task-a","run_id":7}}}},{"set":{"delivery_receipt":{"verified":true,"disposition":"delivered","evidence_ref":"receipt:1","identity":{"gateway":"edge","profile":"work","board":"tasks","kind":"card","work_id":"task-a","run_id":7}}}}],"expected":{"state":"unknown","last_known_state":"done","delivery_receipt":{"evidence_ref":"receipt:2"},"historical_delivery_receipts":[{"evidence_ref":"receipt:1"},{"evidence_ref":"receipt:2"}]},"outstanding":0},
++    {"id":"preserve-canonical-prefix-keys", "now":1001,"items":[{"set":{"human_request":{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1","extra":{"a":1,"aa":2,"😀":true,"\ue000":false}}}},{"set":{"human_request":{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1","extra":{"aa":1,"a":2,"\ue000":false,"😀":true}}}}],"expected":{"state":"unknown","retained_human_requests":[{"extra":{"a":2,"aa":1}},{"extra":{"a":1,"aa":2}}]},"outstanding":2},
++    {"id":"preserve-multiple-historical-receipts", "now":1001,"items":[{"set":{"delivery_receipt":{"verified":true,"disposition":"delivered","evidence_ref":"receipt:2","identity":{"gateway":"edge","profile":"work","board":"tasks","kind":"card","work_id":"task-a","run_id":7}}}},{"set":{"delivery_receipt":{"verified":true,"disposition":"delivered","evidence_ref":"receipt:1","identity":{"gateway":"edge","profile":"work","board":"tasks","kind":"card","work_id":"task-a","run_id":7}}}},{"set":{"delivery_receipt":{"identity":{"run_id":7.0,"work_id":"task-a","kind":"card","board":"tasks","profile":"work","gateway":"edge"},"evidence_ref":"receipt:1","disposition":"delivered","verified":true}}}],"expected":{"state":"unknown","last_known_state":"done","historical_delivery_receipts":[{"evidence_ref":"receipt:1"},{"evidence_ref":"receipt:2"}]},"expected_absent":["delivery_receipt"],"outstanding":0},
++    {"id":"preserve-nested-json-distinct", "now":1001,"items":[{"set":{"human_request":{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1","extra":[true,{"x":null}]}}},{"set":{"human_request":{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1","extra":[1,{"x":null}]}}},{"set":{"human_request":{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1","extra":[1,{}]}}}],"expected":{"state":"unknown","retained_human_requests":[{"extra":[true,{"x":null}]},{"extra":[1,{"x":null}]},{"extra":[1,{}]}]},"outstanding":3},
++    {"id":"preserve-prior-retained-evidence", "now":1001,"items":[{"set":{"observed_at":null,"retained_human_requests":[{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1","resolved_check":"private"},{"action":" "}],"historical_delivery_receipts":[{"verified":true,"disposition":"delivered","evidence_ref":"receipt:1","identity":{"gateway":"edge","profile":"work","board":"tasks","kind":"card","work_id":"task-a","run_id":7}},{"verified":true,"disposition":"delivered","evidence_ref":"foreign","identity":{"gateway":"edge","profile":"work","board":"tasks","kind":"card","work_id":"task-a","run_id":8}}]}}],"expected":{"state":"unknown","last_known_state":"done","retained_human_requests":[{"action":"A"}],"historical_delivery_receipts":[{"evidence_ref":"receipt:1"}]},"outstanding":1},
++    {"id":"preserve-foreign-scopes-fenced", "now":1001,"items":[{"set":{"observed_at":null}}, {"set":{"identity.profile":"foreign","human_request":{"action":"foreign","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1"}}},{"set":{"identity.gateway":"foreign","human_request":{"action":"foreign","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1"}}},{"set":{"identity.board":"foreign","human_request":{"action":"foreign","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1"}}}],"expected":{"state":"unknown","retained_human_requests":[],"historical_delivery_receipts":[]},"outstanding":0},
++    {"id":"select-large-candidate-array", "now":1001,"items":[{}],"repeat_count":150000,"expected":{"state":"running"}},
++    {"id":"preserve-conflicting-asks", "now":1001,"items":[{"set":{"human_request":{"action":"B","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:2","resolved_check":"private"}}},{"set":{"human_request":{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1"}}}],"expected":{"state":"unknown","unknown_reason":"conflicting_source_evidence","retained_human_requests":[{"action":"A"},{"action":"B"}],"historical_delivery_receipts":[]},"expected_absent":["human_request"],"outstanding":2},
++    {"id":"preserve-invalid-timing", "now":1001,"items":[{"set":{"observed_at":null}},{"set":{"human_request":{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1","resolved_check":"private","resolved_check_every":20}}}],"expected":{"state":"unknown","unknown_reason":"invalid_candidate_timing","human_request":{"action":"A"},"retained_human_requests":[{"action":"A"}]},"outstanding":1},
++    {"id":"preserve-future-winner", "now":1001,"items":[{"set":{"observed_at":1002}},{"set":{"human_request":{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1"}}}],"expected":{"state":"unknown","unknown_reason":"clock_inconsistent","human_request":{"action":"A"},"retained_human_requests":[{"action":"A"}]},"outstanding":1},
++    {"id":"preserve-differing-sources", "now":1001,"items":[{"set":{"source":"other"}},{"set":{"human_request":{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1"}}}],"expected":{"state":"unknown","unknown_reason":"conflicting_source_evidence","retained_human_requests":[{"action":"A"}]},"outstanding":1},
++    {"id":"preserve-expired-ask", "now":1180,"items":[{"set":{"human_request":{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1"}}}],"expected":{"state":"unknown","freshness":"stale","human_request":{"action":"A"},"retained_human_requests":[{"action":"A"}]},"outstanding":1},
++    {"id":"preserve-json-dedup", "now":1001,"items":[{"set":{"source_revision":"conflict","human_request":{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1","extra":{"n":7,"b":true}}}},{"set":{"human_request":{"extra":{"b":true,"n":7.0},"evidence":"request:1","scope":"task","interaction":"reply","why_human":"Preference","action":"A","resolved_check":"private"}}}],"expected":{"state":"unknown","retained_human_requests":[{"action":"A","extra":{"n":7,"b":true}}],"human_request":{"action":"A"}},"outstanding":1},
++    {"id":"preserve-selected-singular", "now":1001,"items":[{"set":{"observed_at":1002,"human_request":{"action":"B","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:2"}}},{"set":{"human_request":{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1"}}}],"expected":{"state":"unknown","human_request":{"action":"B"},"retained_human_requests":[{"action":"A"},{"action":"B"}]},"outstanding":2},
++    {"id":"preserve-verified-historical-receipt", "now":1001,"items":[{}, {"set":{"state":"done","delivery_receipt":{"verified":true,"disposition":"delivered","evidence_ref":"receipt:1","identity":{"gateway":"edge","profile":"work","board":"tasks","kind":"card","work_id":"task-a","run_id":7}}}}],"expected":{"state":"unknown","last_known_state":"done","delivery_receipt":{"evidence_ref":"receipt:1"},"historical_delivery_receipts":[{"evidence_ref":"receipt:1"}]},"outstanding":0},
++    {"id":"preserve-foreign-candidates-fenced", "now":1001,"items":[{"set":{"observed_at":null}}, {"set":{"identity.run_id":8,"human_request":{"action":"foreign","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1"},"delivery_receipt":{"verified":true,"disposition":"delivered","evidence_ref":"receipt:1","identity":{"gateway":"edge","profile":"work","board":"tasks","kind":"card","work_id":"task-a","run_id":8}}}}],"expected":{"state":"unknown","last_known_state":null,"retained_human_requests":[],"historical_delivery_receipts":[]},"expected_absent":["human_request","delivery_receipt"],"outstanding":0},
++    {"id":"preserve-reject-nonhuman-and-invalid", "now":1001,"items":[{"set":{"observed_at":null,"human_request":{"action":"A","why_human":"Preference","interaction":"reply","scope":"task","evidence":"request:1"},"wait":{"kind":"dependency"}}},{"set":{"human_request":{"action":" "},"delivery_receipt":{"verified":false,"disposition":"delivered","evidence_ref":"receipt:1","identity":{"gateway":"edge","profile":"work","board":"tasks","kind":"card","work_id":"task-a","run_id":7}}}}],"expected":{"state":"unknown","last_known_state":null,"retained_human_requests":[],"historical_delivery_receipts":[]},"outstanding":0},
+     {"id": "select-older-arrival-ignored", "items": [{}, {"set": {"state": "queued", "observed_at": 999, "source_revision": "event:41"}}], "expected": {"state": "running", "source_revision": "event:42"}, "now": 1001},
+     {"id": "select-older-arrival-ignored-reversed", "items": [{"set": {"state": "queued", "observed_at": 999, "source_revision": "event:41"}}, {}], "expected": {"state": "running", "source_revision": "event:42"}, "now": 1001},
+     {"id": "select-run-rollover-new", "items": [{}, {"set": {"identity.run_id": 8, "state": "queued", "source_revision": "event:50"}}], "expected": {"state": "queued", "identity": {"run_id": 8}}, "now": 1001, "identity": {"gateway": "edge", "profile": "work", "board": "tasks", "kind": "card", "work_id": "task-a", "run_id": 8}},
+diff --git a/tests/hermes_cli/test_execution_observation_golden.py b/tests/hermes_cli/test_execution_observation_golden.py
+index 7deb720695..083d3eb8df 100644
+--- a/tests/hermes_cli/test_execution_observation_golden.py
++++ b/tests/hermes_cli/test_execution_observation_golden.py
+@@ -50,6 +50,11 @@ def subset(actual, expected):
+ 
+ def present(value, path):
+     for key in path.split("."):
++        if isinstance(value, list) and key.isdecimal():
++            if int(key) >= len(value):
++                return False
++            value = value[int(key)]
++            continue
+         if not isinstance(value, dict) or key not in value:
+             return False
+         value = value[key]
+@@ -84,6 +89,9 @@ def test_shared_semantics(case):
+ def test_shared_select(case):
+     values = deepcopy(case["values_raw"]) if "values_raw" in case else [item_input(i) for i in case["items"]]
+     before = deepcopy(values)
++    if "repeat_count" in case:
++        values *= case["repeat_count"]
++        before *= case["repeat_count"]
+     identity = case.get("identity", FIXTURE["base"]["identity"])
+     actual = select(values, identity=deepcopy(identity), now=case["now"], source_class=case.get("source_class", "sidebar"))
+     check(actual, case)
+@@ -91,7 +99,24 @@ def test_shared_select(case):
+     if isinstance(values, list) and not case.get("values_raw"):  # arrival order never changes the verdict
+         again = select(list(reversed(values)), identity=deepcopy(identity), now=case["now"],
+                        source_class=case.get("source_class", "sidebar"))
+-        assert subset(again, {k: actual[k] for k in ("state", "unknown_reason") if k in actual})
++        assert same_json(again, actual)
++    if "outstanding" in case:
++        for observation in (actual, project(actual, now=case["now"]),
++                            select([actual], identity=identity, now=case["now"])):
++            assert same_json(observation.get("retained_human_requests"), actual.get("retained_human_requests"))
++            assert same_json(observation.get("historical_delivery_receipts"), actual.get("historical_delivery_receipts"))
++            assert all(not any(k in request for k in ("resolved_check", "resolved_check_every"))
++                       for request in observation["retained_human_requests"])
++            summary = summarize([observation], now=case["now"])
++            assert summary["outstanding_human_requests"] == case["outstanding"]
++            assert summary["counts"]["unknown"] == 1
++            assert summary["counts"]["done"] == 0
++            repeated = summarize(summary["observations"], now=case["now"])
++            assert same_json(repeated, summary)
++            doubled = summarize([observation, observation], now=case["now"])
++            assert doubled["outstanding_human_requests"] == 2 * case["outstanding"]
++            assert doubled["counts"]["unknown"] == 2
++
+ 
+ 
+ @pytest.mark.parametrize("case", FIXTURE["summarize_cases"], ids=lambda case: case["id"])
+-- 
+2.43.0
+

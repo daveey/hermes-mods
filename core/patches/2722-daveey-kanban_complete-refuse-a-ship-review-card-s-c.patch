@@ -1,0 +1,391 @@
+From 2e870e8f710ee3427a9bf09fffa979f15fa8f189 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:26:21 +0000
+Subject: [PATCH] [daveey] kanban_complete: refuse a ship review card's
+ completion that ship cannot read
+
+`hermes-core-wt ship --review-task` lands a core PR only when the review card's
+completion metadata carries exactly `verdict` ("approve"), a 40-hex `reviewed_sha`
+equal to the PR head and `reviewed_pr`. Reviewers completed with `review_verdict`,
+`review_outcome`, `reviewed_head` or a bare PR number instead. The card showed done
+and approved, ship refused it later ("completion metadata verdict is None") and a
+whole new review card was filed for the same head (PR1349, PR1222, PR1123).
+
+New `hermes_cli/kanban_review_contract.py`, called from the kanban_complete tool
+before the goal judge and any write:
+- A card states the contract when its body names a core-fork pull request
+  (daveey/hermes or example-org/hermes), `reviewed_pr` and the head key
+  (`reviewed_sha`, or `reviewed_head` as some briefs misnamed it). Ship-filed and
+  re-issued review cards do; so did the misnamed briefs that caused the re-issues.
+- On such a card, a completion that is a review result (any of verdict,
+  review_verdict, review_outcome, reviewed_sha, reviewed_head, reviewed_pr,
+  approved, approval) must carry `verdict` in {approve, request_changes}, a
+  lowercase 40-hex `reviewed_sha` and `reviewed_pr` as a pull URL or owner/repo#n.
+  Otherwise it is refused with rejection class `review_contract`, naming each bad
+  key and the alias that is not read; nothing changes, so the same run retries.
+- Left alone: cards without the contract, a landing handoff (`published_pr`), and
+  a completion with no review key (a card that only discusses the contract).
+
+Layer: core, not the kanban-honest-done plugin. Pool workers run most review cards
+and have no kanban-honest-done installed (hermes-worker-3's plugins.enabled lists
+11 guards, not it), so a plugin gate would miss the hosts where the gap happens.
+Ship is unchanged: no aliases, no inferred sha, exact-head check as before.
+
+Proof:
+- New tests/tools/test_kanban_review_contract.py (50 tests). The three tool-path
+  tests (review_verdict only; no reviewed_sha; reviewed_head instead) fail with the
+  tools/kanban_tools.py wiring reverted, and the file fails to import on main.
+  A correct completion and a card without the contract complete.
+- Mutants: 26 by exact anchor (contract detection clauses, repo restriction and
+  case fold, published_pr/review-key exemptions, each key check, fullmatch vs
+  match/search, isinstance guards, alias hints, tool raise, rejection class
+  registration): all killed.
+- 176 passed across 7 files (review contract, complete parents/receipt/rejection
+  class, kanban_tools, watch park, foreign card writes).
+- Read-only replay (mode=ro) of the latest completed run of every card completed
+  in the last 14 days on the default-board replica (kanban/sync-shadow/default.db):
+  5549 cards, 465 state the contract, 21 would have been refused (verdict 6,
+  reviewed_pr 11, reviewed_sha 2, both 2). 3 of those 21 later needed a re-issued
+  review of the same head (t_01a1ce2d6a3b3e75 PR1123, t_01a1ce6e03114795 PR1222,
+  t_01a1cf47771fda0d PR1349); a fourth (t_01a1cf5a827ae485 PR1342,
+  reviewed_pr=1342) completed during this work. 3 contract cards completed
+  without review keys or with published_pr and stay unaffected. Of the 191 runs
+  with `review_verdict` in 14 days, 4 were on contract cards and 13 on cards
+  naming a core PR; the rest were other repositories' reviews.
+---
+ hermes_cli/kanban_review_contract.py       |  91 ++++++++++
+ tests/tools/test_kanban_review_contract.py | 200 +++++++++++++++++++++
+ tools/kanban_tools.py                      |   5 +
+ 3 files changed, 296 insertions(+)
+ create mode 100644 hermes_cli/kanban_review_contract.py
+ create mode 100644 tests/tools/test_kanban_review_contract.py
+
+diff --git a/hermes_cli/kanban_review_contract.py b/hermes_cli/kanban_review_contract.py
+new file mode 100644
+index 0000000000..afddfc9155
+--- /dev/null
++++ b/hermes_cli/kanban_review_contract.py
+@@ -0,0 +1,91 @@
++"""Ship review contract: refuse a review card's completion that ``hermes-core-wt ship`` cannot read. [daveey]
++
++``hermes-core-wt ship --review-task <card>`` lands a core PR only when the review card's completion metadata
++carries ``verdict == "approve"``, a 40-hex ``reviewed_sha`` equal to the PR head and ``reviewed_pr``. Review
++workers completed with ``review_verdict``, ``review_outcome`` or ``reviewed_head`` instead; the card showed done
++and approved, ship refused it later and a whole new review card was filed for the same head.
++
++This module catches that gap at completion time, while the reviewer can still fix it in the same run:
++
++- A card *states the contract* when its body names a pull request of the core fork, ``reviewed_pr`` and the
++  head key (``reviewed_sha``, or the ``reviewed_head`` some briefs misnamed it). Ship-filed and re-issued review
++  cards do; so do hand-filed ones whose brief misnamed a key (``review_verdict``, ``reviewed_head``), which is
++  exactly the case to fix. A verdict word is not required: one reviewer-lane brief asked for none and the reviewer
++  wrote ``review_outcome``.
++- On such a card, a completion whose metadata looks like a review result (any review key) must carry exactly
++  ``verdict`` in {approve, request_changes}, a lowercase 40-hex ``reviewed_sha`` and ``reviewed_pr`` naming the
++  pull. A landing/implementation handoff (``published_pr``) and a completion with no review key at all (a card
++  that only discusses the contract) are not review results and are left alone.
++
++Ship itself is unchanged: it accepts no aliases and infers no sha.
++"""
++
++from __future__ import annotations
++
++import re
++from typing import Any, Optional
++
++from hermes_cli.kanban_db_dispatch_pr_policy import BUILTIN_GITHUB_REPO_ALIASES
++
++REJECTION = "review_contract"
++VERDICTS = ("approve", "request_changes")
++CORE_REPOS = frozenset(r.lower() for pair in BUILTIN_GITHUB_REPO_ALIASES.items() for r in pair)
++_SHA40 = re.compile(r"[0-9a-f]{40}")
++_PULL = re.compile(r"github\.com/(?P<repo>[\w.-]+/[\w.-]+)/pull/\d+", re.IGNORECASE)
++_PR_REF = re.compile(r"(?:https://github\.com/[\w.-]+/[\w.-]+/pull/\d+|[\w.-]+/[\w.-]+#\d+)")
++# Keys a reviewer uses for its verdict or the reviewed head: their presence makes the completion a review result.
++_REVIEW_KEYS = ("verdict", "review_verdict", "review_outcome", "reviewed_sha", "reviewed_head", "reviewed_pr",
++                "approved", "approval")
++
++
++def states_contract(body: Optional[str]) -> bool:
++    """True when ``body`` asks for the ship review metadata on a core-fork pull request."""
++    text = body or ""
++    if "reviewed_pr" not in text:
++        return False
++    if "reviewed_sha" not in text and "reviewed_head" not in text:
++        return False
++    return any(m.group("repo").lower() in CORE_REPOS for m in _PULL.finditer(text))
++
++
++def is_review_result(metadata: Any) -> bool:
++    """True when the completion metadata reports a review (a review key) and is not a landing handoff."""
++    if not isinstance(metadata, dict) or metadata.get("published_pr"):
++        return False
++    return any(key in metadata for key in _REVIEW_KEYS)
++
++
++def problems(metadata: Any) -> list[str]:
++    """What ship could not read in ``metadata``; empty when the three keys are exact."""
++    md = metadata if isinstance(metadata, dict) else {}
++    out = []
++    verdict = md.get("verdict")
++    if verdict not in VERDICTS:
++        named = [k for k in ("review_verdict", "review_outcome", "approved", "approval") if k in md]
++        hint = f" ({', '.join(named)} is not read)" if named else ""
++        out.append(f"verdict: metadata.verdict is {verdict!r}; it must be exactly \"approve\" or "
++                   f"\"request_changes\"{hint}")
++    sha = md.get("reviewed_sha")
++    if not (isinstance(sha, str) and _SHA40.fullmatch(sha)):
++        hint = " (reviewed_head is not read)" if "reviewed_head" in md else ""
++        out.append(f"reviewed_sha: metadata.reviewed_sha is {sha!r}; it must be the full 40-hex lowercase head "
++                   f"you reviewed{hint}")
++    pr = md.get("reviewed_pr")
++    if not (isinstance(pr, str) and _PR_REF.fullmatch(pr)):  # exact: ship compares the string as it is
++        out.append(f"reviewed_pr: metadata.reviewed_pr is {pr!r}; it must name the pull, "
++                   "https://github.com/<owner>/<repo>/pull/<n>")
++    return out
++
++
++def refusal(body: Optional[str], metadata: Any) -> Optional[str]:
++    """The refusal text for a contract card's unreadable review completion, else None."""
++    if not states_contract(body) or not is_review_result(metadata):
++        return None
++    found = problems(metadata)
++    if not found:
++        return None
++    return ("kanban_complete refused: this card states the ship review contract, and `hermes-core-wt ship "
++            "--review-task` reads only metadata.verdict, metadata.reviewed_sha and metadata.reviewed_pr. "
++            + "; ".join(found) + ". Nothing changed: retry kanban_complete with the same summary and metadata "
++            "that also carries {\"verdict\": \"approve\" | \"request_changes\", \"reviewed_sha\": \"<40-hex head>\", "
++            "\"reviewed_pr\": \"https://github.com/<owner>/<repo>/pull/<n>\"}.")
+diff --git a/tests/tools/test_kanban_review_contract.py b/tests/tools/test_kanban_review_contract.py
+new file mode 100644
+index 0000000000..d2a0a36772
+--- /dev/null
++++ b/tests/tools/test_kanban_review_contract.py
+@@ -0,0 +1,200 @@
++"""Ship review contract gate on kanban_complete. [daveey]
++
++`hermes-core-wt ship --review-task` reads only metadata.verdict / reviewed_sha / reviewed_pr. Review workers completed
++contract cards with `review_verdict`, `review_outcome` or `reviewed_head`; the card showed done and approved, ship
++refused it later and a new review card was filed for the same head (PR1349, PR1222, PR1123). The completion is now
++refused while the reviewer can still fix it.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_review_contract as krc
++
++SHA = "2abb5479f9d9ddfe4ddab49df44d69e8867e8f25"
++PR = "https://github.com/example-org/hermes/pull/1349"
++# The ship-filed review card's own body line (hermes-core-wt-land request_review_card).
++SHIP_BODY = (f"Independent exact-head review of {PR} at **{SHA}**.\n\nFinish with kanban_complete metadata exactly:\n"
++             f'  {{"verdict": "approve" | "request_changes", "reviewed_sha": "{SHA}", "reviewed_pr": "{PR}"}}\n')
++# The real PR1349 review brief (t_01a1cf47771fda0d) asked for the wrong key itself; it still states the contract.
++MISNAMED_BODY = (f"Do an independent exact-head review of PR {PR} at head **{SHA}**.\n"
++                 f'Approve with kanban_complete metadata `{{"review_verdict": "approve", "reviewed_sha": "{SHA}", '
++                 f'"reviewed_pr": "{PR}"}}`')
++# PR1123's first brief named reviewed_head and no reviewed_sha (t_01a1ce2d6a3b3e75).
++HEAD_BODY = ("Exact-head review of https://github.com/daveey/hermes/pull/1123 at 3ee406abf686.\n"
++             "Complete with `reviewed_pr=https://github.com/daveey/hermes/pull/1123`, `reviewed_head=<sha>`, "
++             "`verdict` approve or request_changes.")
++GOOD = {"verdict": "approve", "reviewed_sha": SHA, "reviewed_pr": PR}
++
++
++# --- contract detection --------------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("body", [SHIP_BODY, MISNAMED_BODY, HEAD_BODY,
++                                  SHIP_BODY.replace("example-org/hermes", "Daveey/Hermes")])
++def test_states_contract(body):
++    assert krc.states_contract(body)
++
++
++@pytest.mark.parametrize("body", [
++    None, "",
++    # This card's own body: discusses the keys but names no core-fork pull request.
++    "refuse kanban_complete unless the metadata block with `verdict` / `reviewed_sha` / `reviewed_pr` is exact",
++    # Another repository's review keeps its own contract (myapp accepts APPROVE).
++    SHIP_BODY.replace("example-org/hermes", "example-org/myapp"),
++    SHIP_BODY.replace("daveey-hermes", "daveey-hermes-mods"),
++    # A core PR without a reviewed head key, or without reviewed_pr, is not the ship contract.
++    SHIP_BODY.replace("reviewed_sha", "head"),
++    SHIP_BODY.replace("reviewed_pr", "pr"),
++])
++def test_does_not_state_contract(body):
++    assert not krc.states_contract(body)
++
++
++# --- metadata problems ---------------------------------------------------------------------------------------
++
++def test_exact_metadata_has_no_problems():
++    assert krc.problems(GOOD) == []
++    assert krc.problems({**GOOD, "verdict": "request_changes"}) == []
++    assert krc.problems({**GOOD, "reviewed_pr": "example-org/hermes#1349"}) == []
++
++
++@pytest.mark.parametrize("md,key,hint", [
++    ({"review_verdict": "approve", "reviewed_sha": SHA, "reviewed_pr": PR}, "verdict", "review_verdict is not read"),
++    ({"review_outcome": "approved", "reviewed_sha": SHA, "reviewed_pr": PR}, "verdict", "review_outcome is not read"),
++    ({"approved": True, "reviewed_sha": SHA, "reviewed_pr": PR}, "verdict", "approved is not read"),
++    ({"approval": "yes", "reviewed_sha": SHA, "reviewed_pr": PR}, "verdict", "approval is not read"),
++    ({**GOOD, "verdict": "APPROVE"}, "verdict", "'APPROVE'"),
++    ({**GOOD, "verdict": "changes_requested"}, "verdict", "'changes_requested'"),
++    ({"verdict": "approve", "reviewed_head": SHA, "reviewed_pr": PR}, "reviewed_sha", "reviewed_head is not read"),
++    ({**GOOD, "reviewed_sha": SHA[:10]}, "reviewed_sha", repr(SHA[:10])),
++    ({**GOOD, "reviewed_sha": SHA + "0"}, "reviewed_sha", "40-hex lowercase"),
++    ({**GOOD, "reviewed_sha": SHA.upper()}, "reviewed_sha", "40-hex lowercase"),
++    ({**GOOD, "reviewed_sha": None}, "reviewed_sha", "None"),
++    ({**GOOD, "reviewed_pr": 1349}, "reviewed_pr", "1349"),
++    ({**GOOD, "reviewed_pr": "the PR"}, "reviewed_pr", "'the PR'"),
++    ({**GOOD, "reviewed_pr": f" {PR}"}, "reviewed_pr", "must name the pull"),
++    ({**GOOD, "reviewed_pr": f"{PR}/files"}, "reviewed_pr", "must name the pull"),
++    ({k: v for k, v in GOOD.items() if k != "reviewed_pr"}, "reviewed_pr", "None"),
++])
++def test_problems_name_the_key(md, key, hint):
++    found = krc.problems(md)
++    assert len(found) == 1, found
++    assert found[0].startswith(f"{key}: metadata.{key} is ")
++    assert hint in found[0]
++
++
++def test_no_alias_hint_without_alias():
++    found = krc.problems({"reviewed_sha": SHA, "reviewed_pr": PR, "summary_verdict": "x"})
++    assert found == ['verdict: metadata.verdict is None; it must be exactly "approve" or "request_changes"']
++    found = krc.problems({"verdict": "approve", "reviewed_pr": PR})
++    assert "is not read" not in found[0]
++
++
++def test_non_dict_metadata_names_every_key():
++    assert [p.split(":")[0] for p in krc.problems(None)] == ["verdict", "reviewed_sha", "reviewed_pr"]
++    assert [p.split(":")[0] for p in krc.problems(["verdict"])] == ["verdict", "reviewed_sha", "reviewed_pr"]
++
++
++# --- refusal composition -------------------------------------------------------------------------------------
++
++def test_refusal_on_contract_card():
++    msg = krc.refusal(MISNAMED_BODY, {"review_verdict": "approve", "reviewed_sha": SHA, "reviewed_pr": PR})
++    assert msg and "metadata.verdict is None" in msg and "review_verdict is not read" in msg
++    assert '"verdict": "approve" | "request_changes"' in msg and "Nothing changed" in msg
++
++
++def test_refusal_none_for_exact_metadata():
++    assert krc.refusal(SHIP_BODY, GOOD) is None
++
++
++def test_refusal_none_without_contract():
++    assert krc.refusal("Fix the sidebar. Done when tests pass.", {"review_verdict": "approve"}) is None
++
++
++@pytest.mark.parametrize("md", [
++    None, {}, {"changed_files": ["a.py"], "tests_run": 3},  # a card that only discusses the contract
++    {"published_pr": PR, "reviewed_head": SHA, "landed_sha": SHA},  # the landing handoff of an implementation card
++])
++def test_refusal_none_when_not_a_review_result(md):
++    assert krc.refusal(SHIP_BODY, md) is None
++
++
++@pytest.mark.parametrize("key", ["verdict", "review_verdict", "review_outcome", "reviewed_sha", "reviewed_head",
++                                 "reviewed_pr", "approved", "approval"])
++def test_each_review_key_makes_a_review_result(key):
++    assert krc.is_review_result({key: "x"})
++    assert krc.refusal(SHIP_BODY, {key: "x"})
++
++
++# --- through the kanban_complete tool ------------------------------------------------------------------------
++
++@pytest.fixture
++def board(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    from pathlib import Path as _Path
++    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
++    from hermes_cli import kanban_db as kb
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return kb
++
++
++def _claim(kb, monkeypatch, body):
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="Independent exact-head review PR1349", body=body, assignee="test-worker")
++        kb.claim_task(conn, tid)
++        run_id = kb._current_run_id(conn, tid)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++    return tid
++
++
++def _complete(metadata):
++    from tools import kanban_tools as kt
++    return json.loads(kt._handle_complete({"summary": "APPROVE: reviewed at the exact head", "metadata": metadata}))
++
++
++def _status(kb, tid):
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect() as conn:
++        return kb.get_task(conn, tid).status
++
++
++@pytest.mark.parametrize("bad,key", [
++    ({"review_verdict": "approve", "reviewed_sha": SHA, "reviewed_pr": PR}, "metadata.verdict"),
++    ({"verdict": "approve", "reviewed_pr": PR}, "metadata.reviewed_sha"),
++    ({"verdict": "approve", "reviewed_head": SHA, "reviewed_pr": PR}, "metadata.reviewed_sha"),
++])
++def test_tool_refuses_unreadable_review_then_accepts_fix(board, monkeypatch, bad, key):
++    from tools import kanban_tools as kt
++    tid = _claim(board, monkeypatch, MISNAMED_BODY)
++    out = _complete(bad)
++    assert out.get("error") and out["rejection"] == "review_contract"
++    assert out["rejection"] in kt.COMPLETE_REJECTION_CLASSES
++    assert key in out["error"]
++    assert _status(board, tid) == "running"  # nothing changed: the same run retries
++    ok = _complete(dict(GOOD))
++    assert ok.get("ok") is not False and not ok.get("error"), ok
++    assert _status(board, tid) == "done"
++
++
++def test_tool_accepts_exact_review(board, monkeypatch):
++    tid = _claim(board, monkeypatch, SHIP_BODY)
++    out = _complete(dict(GOOD))
++    assert not out.get("error"), out
++    assert _status(board, tid) == "done"
++
++
++def test_tool_leaves_cards_without_contract_alone(board, monkeypatch):
++    tid = _claim(board, monkeypatch, "Fix the sidebar scroll. Done when its tests pass.")
++    out = _complete({"review_verdict": "approve", "reviewed_head": "abc"})
++    assert not out.get("error"), out
++    assert _status(board, tid) == "done"
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 3fd88032ce..4c3fdb33d8 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -164,6 +164,7 @@ COMPLETE_REJECTION_CLASSES = frozenset({
+     "stale_run",      # run superseded, card already terminal, or unknown id
+     "not_running",    # card waits (scheduled/todo/ready) with no run: archive it or re-park it as a watch [daveey]
+     "foreign_card",   # card exists here only as a Board replica copy; its owner gateway must write it [daveey]
++    "review_contract",  # ship review card completed without metadata ship can read [daveey]
+     "pr_acceptance",  # completion contract's PR CI acceptance refused (pr_acceptance event ok=false)
+     "parents",        # unsatisfied parent dependencies
+     "not_owner",      # delegate child / other task / unbound run id
+@@ -900,6 +901,10 @@ def _handle_complete(args: dict, **kw) -> str:
+         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
+         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
+         task = kb.get_task(conn, tid)
++        from hermes_cli import kanban_review_contract as _krc  # [daveey] a review ship cannot read: fix it now
++        unreadable = _krc.refusal(getattr(task, "body", None), metadata)
++        if unreadable:
++            raise _Reject(unreadable, _krc.REJECTION)
+         goal_verification = _goal_gate("kanban_complete", task, tid, (summary or result or "").strip(), conn=conn)
+         try:
+             run_id = _worker_run_id(tid)
+-- 
+2.43.0
+

@@ -1,6 +1,6 @@
 # Kanban wakes queued behind a busy turn fold into one turn
 
-Patches: **2597–2600, 2655**.
+Patches: **2597–2600, 2655, 2726**.
 
 ## Behavior
 
@@ -29,6 +29,13 @@ Patches: **2597–2600, 2655**.
 
 Source coverage, **not run in this mirror** (the mirror pass only verifies patch replay and tree equality; it does not rerun these tests): `tests/gateway/test_kanban_wake_fold.py`, `tests/hermes_cli/test_kanban_notify.py` (2597: the notifier's wake call carries `kanban_card`). Entry path: `gateway.wake.deliver_wake` with a `kanban_card` on a local session and on a Discord-style adapter session, reading the FIFO via `list_session_admissions` (five wakes fold into one turn; a prompt queued after a wake is never jumped, including with a stale tail read; a claimed row is untouched; relabel of a completed unclaimed wait; one line per card; process-completion folding unchanged and never crossing a wake; pre-upgrade row folds; over-cap wake queues alone; relabel reads the env-pinned DB; `card_metadata` rejects malformed cards; every wake kind has a status label). The real notifier-to-gateway path end to end, other platform adapters, the locale strings' rendering, and the TUI-owner `kanban_cards` metadata are **untested**; the docs change is not tested.
 
+## Follow-up 2726: a queued wake is relabelled when the drain claims it
+
+- Behavior: a wake that nothing folded into used to run with the text it was built with, however long it waited (a card claimed minutes earlier could still be announced as having no worker). When the drain claims a `kanban-wake` row, its text is now rebuilt from the row's stored cards and their live state, with the same relabel and compose path the fold uses; every card keeps its `[kanban] Task <id> <kind>.` line and the trailing guidance. Only the in-memory claim payload changes, never the stored row. An outcome-only batch makes no board read. An unreadable board (any card), another producer's row, a row without stored cards, or text that no longer has the shape its cards built leaves the text unchanged.
+- How it works: `kanban_wake_fold.refresh_claimed(payload)` validates the descriptor and producer, extracts the guidance suffix with `_guidance` (matching each card's head line in order), and recomposes with `_compose(cards, guidance, strict=True)`; `refresh_card` gains `strict` so an unreadable card raises instead of undoing the relabel. `fold_into` now uses the same `_compose`. `session_ingress.execute_admission` calls it, then the block-ask refresh, in one off-loop thread.
+- Code: `gateway/kanban_wake_fold.py`, `gateway/session_ingress.py`.
+- Tests: source coverage, not run in this mirror: `tests/gateway/test_kanban_wake_fold.py`. Entry path: `execute_admission` on a claimed row against a temporary board (lone stale unclaimed wait relabelled; a still-true premise byte-identical; a folded row relabelled again; unreadable board unchanged) and `refresh_claimed` directly (unparsable and foreign rows untouched). A real gateway drain with a live notifier and other platform adapters are **untested**.
+
 ## Applying
 
 Use the [README full replay procedure](README.md#applying). These patches are not independent of earlier core patches; apply the whole series in order.
@@ -36,7 +43,7 @@ Use the [README full replay procedure](README.md#applying). These patches are no
 ## Gotchas
 
 - The fold lock is per process (`wake_lock`); a second gateway process admitting to the same session is only guarded by the store's write guard, which makes the loser queue alone.
-- Folded rows keep each card's stored text as delivered; the live relabel is redone each time the batch is rebuilt.
+- Folded rows keep each card's stored text as delivered; the live relabel is redone each time the batch is rebuilt, and (2726) again at claim time for every wake row, folded or not.
 - Folding applies only when the waiting row has no `display_kind`.
 - Related: [kanban-stale-block-ask-refresh-2678.md](kanban-stale-block-ask-refresh-2678.md) refreshes a block notice's ask when its row is executed.
 

@@ -1,0 +1,399 @@
+From 6e903137fc390ec629436475233c495606ab86a9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 11:22:13 +0000
+Subject: [PATCH] [daveey] fix(kanban): restore a Board-restored card's hub
+ delivery subscriptions from its chat links
+
+kanban_notify_subs is machine-local, so a worker reprovisioned from the Board
+(worker-1, 2026-11-11 ~21:43Z) got its cards and task_chat_links back but no
+platform='hub' subscriptions. The hermes-hub collector derives a card's
+published `sessions` (and the notifier its deliveries) only from those rows:
+100 of 215 restored cards were republished with sessions=[] and their origin
+chats on other gateways stopped hearing from them (t_01a1cf4cfd7eb125).
+
+The sync apply now records an own-partition card it inserts into a primary
+live board file (our own cards are only ever inserted by the feed on a
+restore) in the local-only kanban_restored_cards, and each new
+task_chat_links row of such a card that existed at the restore, is
+unreleased and names a chat on another gateway with an exact profile gets
+its `<gw>/<profile>/<session>` hub subscription back: caught up (no replay),
+reason origin for a created link and shepherd for a shepherd link, owning
+wins for one chat. NULL profile is never widened to 'default'; released,
+local-gateway, placeholder/headless, archived, replica (sync-shadow),
+link-only (sync-links) and foreign picked-up copies are skipped, and a link
+that arrives later for a card this file already held never resurrects a
+subscription retired on purpose.
+
+Chosen over (b) deriving sessions from links in the hermes-hub collector,
+which would fix publication but leave notice delivery dead and ship through a
+separate repo, and (c) syncing kanban_notify_subs, whose cursors/in-flight
+columns are per-machine delivery state.
+
+Tests: tests/hermes_cli/test_kanban_sync_restore_origin_subs.py (RED 4/5 on
+the base: restored subs [] and the installed collector published
+sessions=[]; GREEN 5/5), plus 76 kanban sync/chat-link/worker-node/notify/
+origin test files, 1242 passed.
+---
+ hermes_cli/kanban_db_sync.py                  |   5 +
+ hermes_cli/kanban_restore_chat_subs.py        | 106 +++++++++
+ .../test_kanban_sync_restore_origin_subs.py   | 212 ++++++++++++++++++
+ 3 files changed, 323 insertions(+)
+ create mode 100644 hermes_cli/kanban_restore_chat_subs.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_restore_origin_subs.py
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 273b9c7774..a3ecf9ca3f 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1254,6 +1254,8 @@ def _upsert_task(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: A
+         conn.execute(f"INSERT INTO tasks ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+                      (ch.uid, *cols.values(), ch.version))
+         changed = set(cols)
++        from hermes_cli.kanban_restore_chat_subs import note_restored_task
++        note_restored_task(conn, ch.uid, cols.get("created_on"), own)  # our own card back from the Board
+     else:
+         changed = {c for c, v in cols.items() if old[c] != v}
+         assignments = ", ".join(f"{c} = ?" for c in cols)
+@@ -1355,6 +1357,9 @@ def _upsert_row(conn: sqlite3.Connection, ch: RemoteChange, own: str, result: Ap
+                  (ch.uid, *cols.values()))
+     if table == "task_events" and ch.fields.get("kind") in ("archive_requested", "capability_owner_archive_requested"):
+         result.wake_dispatcher = True  # a stop request (kanban_remote_stop) or forwarded owner archive to apply
++    if table == "task_chat_links":
++        from hermes_cli.kanban_restore_chat_subs import restore_link_sub
++        restore_link_sub(conn, cols, own)  # a restored card's hub delivery (kanban_notify_subs does not sync)
+     return True
+ 
+ 
+diff --git a/hermes_cli/kanban_restore_chat_subs.py b/hermes_cli/kanban_restore_chat_subs.py
+new file mode 100644
+index 0000000000..7ed8ab9c5c
+--- /dev/null
++++ b/hermes_cli/kanban_restore_chat_subs.py
+@@ -0,0 +1,106 @@
++"""Rebuild a restored card's hub delivery subscriptions from its synced chat links. [daveey]
++
++``kanban_notify_subs`` is machine-local: the Board carries a card's ``task_chat_links`` but not the ``platform='hub'``
++subscription (``<gw>/<profile>/<session>``) its owner wrote with it. Both the notifier (delivery into a chat on
++another gateway) and the hermes-hub collector (a card's published ``sessions``) read only that subscription. A worker
++reprovisioned from the Board (worker-1, 2026-11-11 ~21:43Z) got its cards and their links back and republished 100 of
++215 cards with ``sessions: []``; the hub then saw open cards whose origin chats had vanished (t_01a1cf4cfd7eb125).
++
++The sync apply calls two hooks, both inside its transaction:
++
++- :func:`note_restored_task` when it inserts a card this gateway owns (``created_on`` = it, or unset) into a primary
++  live board file. Our own cards are created here, never inserted by the feed (their echo only clears the outbox),
++  so such an insert is a restore: the file lost the card (a reprovisioned or rebuilt machine) and the Board gave it
++  back. The card is recorded with the restore time in the local-only ``kanban_restored_cards``.
++- :func:`restore_link_sub` when it inserts a new ``task_chat_links`` row. For a recorded card, an unreleased link to
++  a chat on ANOTHER gateway that existed at the restore (``created_at`` not after it) gets its hub subscription
++  back: exact gateway, profile and session, caught up (``last_event_id`` = the card's newest event, no replay), with
++  ``reason`` ``origin`` for a ``created`` link (owning: children inherit it) and ``shepherd`` for a ``shepherd`` link.
++
++Never rebuilt: a NULL/empty profile (no exact chat; ``<profile or 'default'>`` would guess, and NULL is never a
++wildcard), a released link, a chat on this gateway (a ``tui`` destination, not a hub one), a placeholder or headless
++session, an archived card, a link that arrives later for a card this file already held (that chat's subscription may
++have been retired on purpose), the replica copy (``sync-shadow``) and link-only files (``sync-links``), and foreign
++copies a worker node picks up (their owner delivers). Two links for one chat give one subscription; owning wins.
++"""
++
++from __future__ import annotations
++
++import json
++import re
++import sqlite3
++import time
++from pathlib import Path
++from typing import Any, Mapping, Optional
++
++MARKER_DDL = ("CREATE TABLE IF NOT EXISTS kanban_restored_cards "
++              "(task_id TEXT PRIMARY KEY, restored_at INTEGER NOT NULL)")
++# A link written on another gateway just before the restore may carry a slightly later clock.
++CLOCK_SKEW_S = 300
++_REASON = {"created": "origin", "shepherd": "shepherd"}
++
++
++def _live_board_file(conn: sqlite3.Connection) -> bool:
++    from hermes_cli import kanban_db_sync as sync
++    key = sync._db_key(conn)
++    return bool(key) and Path(key).parent.name not in (sync.SHADOW_DIR, sync.LINKS_DIR)
++
++
++def note_restored_task(conn: sqlite3.Connection, task_id: str, created_on: Any, own: str) -> None:
++    """Record that the feed just inserted ``task_id``, a card this gateway owns, into this live board file."""
++    if created_on not in (None, "", own) or not _live_board_file(conn):
++        return
++    from hermes_cli import kanban_db_sync as sync
++    if sync.board_mode(conn) != "primary":
++        return
++    conn.execute(MARKER_DDL)
++    conn.execute("INSERT OR IGNORE INTO kanban_restored_cards (task_id, restored_at) VALUES (?, ?)",
++                 (task_id, int(time.time())))
++
++
++_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
++
++
++def _safe(part: Any) -> bool:
++    """One ``<gw>/<profile>/<session>`` segment the hermes-hub collector accepts (its ``parse_shepherd``)."""
++    return isinstance(part, str) and bool(_NAME.fullmatch(part))
++
++
++def restore_link_sub(conn: sqlite3.Connection, cols: Mapping[str, Any], own: str) -> Optional[str]:
++    """Write the hub subscription a just-inserted link of a restored card stands for; returns its chat id."""
++    task_id = cols.get("task_id")
++    if not task_id or not conn.execute(
++            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_restored_cards'").fetchone():
++        return None
++    marker = conn.execute("SELECT restored_at FROM kanban_restored_cards WHERE task_id = ?", (task_id,)).fetchone()
++    if marker is None:
++        return None
++    gateway, profile, session = cols.get("chat_gateway"), cols.get("chat_profile"), cols.get("chat_session")
++    reason = _REASON.get(str(cols.get("kind") or ""))
++    if reason is None or cols.get("released") or not gateway or gateway == own:
++        return None
++    if not all(_safe(p) for p in (gateway, profile, session)):
++        return None  # NULL/empty profile included: never widened to 'default'
++    if int(cols.get("created_at") or 0) > int(marker[0]) + CLOCK_SKEW_S:
++        return None
++    status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if status is None or status[0] == "archived":
++        return None
++    from hermes_cli.kanban_db_notify import is_headless_session
++    from hermes_cli.kanban_placement import is_placeholder_session
++    chat_id = f"{gateway}/{profile}/{session}"
++    if is_placeholder_session(str(session)) or is_headless_session(chat_id, gateway=gateway, profile=profile):
++        return None
++    metadata = json.dumps({"reason": reason, "restored": "board"}, sort_keys=True, separators=(",", ":"))
++    conn.execute(
++        "INSERT OR IGNORE INTO kanban_notify_subs "
++        "(task_id, platform, chat_id, thread_id, delivery_mode, delivery_metadata, created_at, last_event_id) "
++        "VALUES (?, 'hub', ?, '', 'notify', ?, ?, COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))",
++        (task_id, chat_id, metadata, int(time.time()), task_id))
++    if reason == "origin":  # provenance only upgrades (add_notify_sub's rule): the chat's created link owns it
++        conn.execute(
++            "UPDATE kanban_notify_subs SET delivery_metadata = json_set(delivery_metadata, '$.reason', 'origin') "
++            "WHERE task_id = ? AND platform = 'hub' AND chat_id = ? AND thread_id = '' "
++            "AND json_valid(delivery_metadata) AND json_extract(delivery_metadata, '$.reason') = 'shepherd' "
++            "AND json_extract(delivery_metadata, '$.restored') = 'board'", (task_id, chat_id))
++    return chat_id
+diff --git a/tests/hermes_cli/test_kanban_sync_restore_origin_subs.py b/tests/hermes_cli/test_kanban_sync_restore_origin_subs.py
+new file mode 100644
+index 0000000000..c8a733ec8b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_restore_origin_subs.py
+@@ -0,0 +1,212 @@
++"""A board file restored from the Board gets back the hub delivery subscriptions its chat links stand for.
++
++A worker reprovisioned from the Board (worker-1, 2026-11-11) got its cards and their ``task_chat_links`` back,
++but ``kanban_notify_subs`` is machine-local and does not sync. The hermes-hub collector builds a card's
++``sessions`` (and the notifier its deliveries) only from those subscriptions, so the restored owner republished
++100 of 215 cards with ``sessions: []`` and stopped notifying their origin chats (t_01a1cf4cfd7eb125). [daveey]
++"""
++
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli.kanban_chat_links import link_uid
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, OTHER, BOARD = "worker-1", "macbook", "default"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True)
++
++
++def _open(kanban_home, svc):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    sync.set_mode(conn, "primary")
++    return conn
++
++
++@pytest.fixture
++def live(kanban_home, svc):
++    conn = _open(kanban_home, svc)
++    previous = sync.set_lease_client(ksc.HubLeaseClient(svc.hub(ME)))
++    try:
++        yield conn
++    finally:
++        sync.set_lease_client(previous)
++        conn.close()
++
++
++def _round(kanban_home, svc):
++    return ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++
++
++def _reprovision(kanban_home, svc, live):
++    """A fresh machine with the same gateway name: no board file, no replica; the Board holds everything."""
++    live.close()
++    ksc.reset_board_watch()
++    for path in kanban_home.rglob("*.db*"):
++        path.unlink()
++    for path in (kanban_home / "kanban" / sync.SHADOW_DIR).glob("*") if (kanban_home / "kanban").exists() else ():
++        path.unlink()
++    conn = _open(kanban_home, svc)
++    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++    _round(kanban_home, svc)
++    return conn
++
++
++def _hub_subs(conn, task_id):
++    return sorted((r[0], json.loads(r[1] or "{}").get("reason"))
++                  for r in conn.execute("SELECT chat_id, delivery_metadata FROM kanban_notify_subs "
++                                        "WHERE task_id = ? AND platform = 'hub'", (task_id,)))
++
++
++def _collector_sessions(conn, task_id):
++    """What the hermes-hub collector publishes for a card's ``sessions`` from its subscriptions (``hermes_hub.py``
++    ``collect_tasks``: platform 'hub' rows, ``<gw>/<profile>/<session>``, uncounted reasons excluded)."""
++    out = []
++    for (chat_id,) in conn.execute(
++            "SELECT chat_id FROM kanban_notify_subs WHERE task_id = ? AND platform = 'hub' AND CASE WHEN "
++            "json_valid(delivery_metadata) THEN COALESCE(json_extract(delivery_metadata, '$.reason'), '') "
++            "NOT IN ('touch', 'send_refused') ELSE 1 END ORDER BY chat_id", (task_id,)):
++        gw, profile, session = chat_id.split("/")
++        out.append({"gw": gw, "profile": profile, "session": session, "rel": "shepherd"})
++    return out
++
++
++def test_a_card_restored_from_the_board_publishes_its_origin_chat_again(live, svc, kanban_home):
++    tid = kb.create_task(live, title="origin card", assignee="worker", chat_origin="hub/default/chat-a")
++    assert _hub_subs(live, tid) == [("hub/default/chat-a", "origin")]
++    _round(kanban_home, svc)
++
++    restored = _reprovision(kanban_home, svc, live)
++    try:
++        assert kb.get_task(restored, tid) is not None
++        assert [tuple(r) for r in restored.execute(
++            "SELECT chat_gateway, chat_profile, chat_session, released FROM task_chat_links WHERE task_id = ?",
++            (tid,))] == [("hub", "default", "chat-a", 0)]
++        # Before the fix: [] (the subscription stayed on the old machine) and the collector published sessions=[].
++        assert _hub_subs(restored, tid) == [("hub/default/chat-a", "origin")]
++        assert _collector_sessions(restored, tid) == [
++            {"gw": "hub", "profile": "default", "session": "chat-a", "rel": "shepherd"}]
++        # Caught up: the restored subscription never replays the card's history into the chat.
++        assert restored.execute(
++            "SELECT last_event_id = (SELECT MAX(id) FROM task_events WHERE task_id = ?) FROM kanban_notify_subs "
++            "WHERE task_id = ?", (tid, tid)).fetchone()[0] == 1
++        _round(kanban_home, svc)  # idempotent: a second round writes nothing more
++        assert _hub_subs(restored, tid) == [("hub/default/chat-a", "origin")]
++    finally:
++        restored.close()
++
++
++def test_restore_keeps_exact_identities_and_skips_released_null_profile_and_local_chats(live, svc, kanban_home):
++    tid = kb.create_task(live, title="card", assignee="worker", chat_origin="hub/alice/chat-a")
++    rows = [  # (gateway, profile, session, kind, released)
++        ("hub", "alice", "chat-a", "shepherd", 0),     # same chat as the origin: one subscription, owning wins
++        (OTHER, "default", "chat-b", "shepherd", 0),   # an observer on another gateway
++        (OTHER, None, "chat-null", "created", 0),      # NULL profile: no exact chat, never a wildcard
++        (OTHER, "default", "chat-gone", "shepherd", 1),  # released: the chat no longer has the card
++        (ME, None, "local-chat", "shepherd", 0),       # this gateway's own chat is no hub destination
++    ]
++    with kbc.write_txn(live):
++        for gw, profile, session, kind, released in rows:
++            live.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                         "released, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
++                         (link_uid(tid, gw, profile, session, kind), tid, gw, profile, session, kind, released))
++    _round(kanban_home, svc)
++
++    restored = _reprovision(kanban_home, svc, live)
++    try:
++        assert restored.execute("SELECT COUNT(*) FROM task_chat_links WHERE task_id = ?", (tid,)).fetchone()[0] == 6
++        assert _hub_subs(restored, tid) == [("hub/alice/chat-a", "origin"), (f"{OTHER}/default/chat-b", "shepherd")]
++        sessions = _collector_sessions(restored, tid)
++        assert len(sessions) == len({(s["gw"], s["profile"], s["session"]) for s in sessions})  # no duplicates
++        assert all(s["profile"] not in (None, "", "None") for s in sessions)
++        assert not restored.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id = ? AND platform = 'tui'",
++                                    (tid,)).fetchone()
++    finally:
++        restored.close()
++
++
++def test_a_link_arriving_for_an_existing_card_does_not_resurrect_a_removed_subscription(live, svc, kanban_home):
++    tid = kb.create_task(live, title="card", assignee="worker", chat_origin="hub/default/chat-a")
++    _round(kanban_home, svc)
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_notify_subs WHERE task_id = ? AND platform = 'hub'", (tid,))
++    # Another gateway re-sends the same link row (its reconcile), and a second link for the card.
++    hub = svc.hub(OTHER)
++    stamp = f"{time.time_ns() // 1_000_000 + 1000:013d}-0000-{OTHER}"
++    for n, (session, kind) in enumerate((("chat-a", "created"), ("chat-c", "shepherd"))):
++        uid = link_uid(tid, "hub", "default", session, kind)
++        res = hub.ops(BOARD, [{"client_op_id": f"other-{n}", "op": "upsert", "table": "task_chat_links", "uid": uid,
++                               "hlc": stamp, "fields": {"task_id": tid, "chat_gateway": "hub", "chat_profile": "default",
++                                                        "chat_session": session, "kind": kind, "released": 0,
++                                                        "created_at": 2}}])
++        assert res["results"][0]["status"] == "applied", res
++    _round(kanban_home, svc)
++    # The existing row is not a restore. A new link for a card this file already held is not either: only a
++    # card materialized from the Board in the same apply gets its subscriptions rebuilt.
++    assert _hub_subs(live, tid) == []
++
++
++def test_reconcile_after_a_rebuild_that_lost_the_card_restores_its_subscription(live, svc, kanban_home):
++    tid = kb.create_task(live, title="card", assignee="worker", chat_origin="hub/default/chat-a")
++    _round(kanban_home, svc)
++    # A corruption rebuild lost the card, its links and its subscription without capture (no outbox, no delete).
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying = 1")
++        for table in ("kanban_notify_subs", "task_chat_links", "task_events", "task_runs"):
++            live.execute(f"DELETE FROM {table} WHERE task_id = ?", (tid,))
++        live.execute("DELETE FROM tasks WHERE id = ?", (tid,))
++        live.execute("UPDATE kanban_sync_state SET applying = 0")
++    report = ksc.reconcile(BOARD, kanban_home / "kanban.db", hub=svc.hub(ME))
++    assert report["restored"].get("tasks") == 1 and report["restored"].get("task_chat_links") == 1
++    assert _hub_subs(live, tid) == [("hub/default/chat-a", "origin")]
++
++
++def test_the_replica_copy_and_foreign_cards_get_no_subscriptions(live, svc, kanban_home):
++    tid = kb.create_task(live, title="card", assignee="worker", chat_origin="hub/default/chat-a")
++    hub = svc.hub(OTHER)
++    stamp = f"{time.time_ns() // 1_000_000 + 1000:013d}-0000-{OTHER}"
++    hub.ops(BOARD, [
++        {"client_op_id": "f-card", "op": "upsert", "table": "tasks", "uid": "t_foreign", "hlc": stamp,
++         "fields": {"title": "theirs", "status": "running", "created_at": 1, "created_on": OTHER}},
++        {"client_op_id": "f-link", "op": "upsert", "table": "task_chat_links",
++         "uid": link_uid("t_foreign", "hub", "default", "chat-f", "created"), "hlc": stamp,
++         "fields": {"task_id": "t_foreign", "chat_gateway": "hub", "chat_profile": "default", "chat_session": "chat-f",
++                    "kind": "created", "released": 0, "created_at": 1}}])
++    _round(kanban_home, svc)
++    replica = ksc.open_shadow(BOARD, ME)
++    try:
++        assert replica.execute("SELECT COUNT(*) FROM task_chat_links WHERE task_id = 't_foreign'").fetchone()[0] == 1
++        assert replica.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0] == 0
++    finally:
++        replica.close()
++    restored = _reprovision(kanban_home, svc, live)
++    try:
++        assert kb.get_task(restored, "t_foreign") is None
++        assert not restored.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id = 't_foreign'").fetchone()
++        assert _hub_subs(restored, tid) == [("hub/default/chat-a", "origin")]
++        replica = ksc.open_shadow(BOARD, ME)
++        try:
++            assert replica.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0] == 0
++        finally:
++            replica.close()
++    finally:
++        restored.close()
+-- 
+2.43.0
+

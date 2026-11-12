@@ -1,0 +1,100 @@
+From 5505d09f58595dfd71720501c318f56c36a2de69 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:00:44 +0000
+Subject: [PATCH] [daveey] Quota episode: a lifted wall still checks the base
+ route walled elsewhere
+
+Review of PR #1400: when every wall was lifted on this gateway, decision() admitted (None, None) without the
+walled-elsewhere check on the base route, so a card moved off codex onto Opus and walled there on A was
+admitted on B onto codex while codex was walled. Now only a class route (allocated against this pool) admits
+outright; a concrete base route goes through _walled_elsewhere and the alternate/hold path.
+---
+ hermes_cli/kanban_quota_episode.py            | 14 ++++----
+ .../test_kanban_quota_episode_gateway.py      | 36 +++++++++++++++++++
+ 2 files changed, 44 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_quota_episode.py b/hermes_cli/kanban_quota_episode.py
+index be876969d7..62c395f0b9 100644
+--- a/hermes_cli/kanban_quota_episode.py
++++ b/hermes_cli/kanban_quota_episode.py
+@@ -235,18 +235,17 @@ def decision(conn, task, *, lane='ready', cfg=None, base=None, now=None):
+     outstanding = _outstanding(conn, task.id, state, now)
+     if not outstanding:
+         return None, None
++    state = max(outstanding, key=lambda s: s['until'])
++    held = 'subscription_quota_reset' if state['hinted'] else 'rate_limit_cooldown'
+     try:
+         outstanding = [wall for wall in outstanding if not _served_here(conn, task, wall, now)]
+     except sqlite3.Error:
+         raise
+     except Exception:
+         logger.warning('kanban quota: local pool check failed for %s; keeping its walls', task.id, exc_info=True)
+-    if not outstanding:
+-        # Every wall was another gateway's (or a stale one of ours) and this pool has room now: admit.
+-        # If the run hits the wall here, its own new episode holds it on this gateway.
+-        return None, None
+-    state = max(outstanding, key=lambda s: s['until'])
+-    held = 'subscription_quota_reset' if state['hinted'] else 'rate_limit_cooldown'
++    # Every wall was another gateway's (or a stale one of ours) and this pool has room now. The base route
++    # still goes through the walled-elsewhere check below; a run that hits the wall here records a new episode.
++    lifted = not outstanding
+     walls, unknown = {}, False
+     for wall in outstanding:
+         names = _providers(wall)
+@@ -257,6 +256,9 @@ def decision(conn, task, *, lane='ready', cfg=None, base=None, now=None):
+     try:
+         base = base or resolve_model_tier(conn, task, lane=lane, cfg=cfg)
+         target = _base_route(task, base)
++        if target is None and lifted:
++            # A class route: the worker allocates it against this gateway's live pool, which has room.
++            return None, None
+         if target is not None and not unknown and target[1] not in walls:
+             # A provider this episode never hit may still be walled (another card's wall, the live pool):
+             # admitting it would send a card moved off codex, then walled on anthropic, back to codex.
+diff --git a/tests/hermes_cli/test_kanban_quota_episode_gateway.py b/tests/hermes_cli/test_kanban_quota_episode_gateway.py
+index ecac3cf4c7..2fd7a257a6 100644
+--- a/tests/hermes_cli/test_kanban_quota_episode_gateway.py
++++ b/tests/hermes_cli/test_kanban_quota_episode_gateway.py
+@@ -196,3 +196,39 @@ def test_live_quota_room_needs_a_live_entry(monkeypatch):
+         raise OSError('unreadable')
+     monkeypatch.setattr(credential_pool, 'load_pool', boom)
+     assert walls.live_quota_room('anthropic', 'claude-opus-5-5') is False
++
++
++@pytest.mark.parametrize('evidence', ['provider_file', 'live_pool'])
++def test_lifted_foreign_wall_still_honours_base_route_walled_elsewhere(
++        board, monkeypatch, all_assignees_spawnable, evidence):
++    """Review of PR #1400: lifting every wall must not skip the walled-elsewhere check on the base route.
++
++    A card moved off codex onto Opus and walled there on A must not be admitted on B (Opus room) onto its
++    codex base route while codex is walled by the provider file or B's live pool."""
++    from hermes_cli.kanban_quota_episode import episode
++    from tests.hermes_cli.test_kanban_quota_episode import reap
++    from tests.hermes_cli.test_kanban_quota_episode_walls import _clock as _walls_clock, _hub_tier
++    clock = _walls_clock(monkeypatch)
++    config, _ = routing(monkeypatch)
++    config['model_routing']['enabled'] = False
++    _hub_tier(monkeypatch)
++    codex_reset = clock[0] + 55 * 3600
++    if evidence == 'provider_file':
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'openai-codex': float(codex_reset)})
++        monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
++    else:
++        monkeypatch.setattr(walls, 'active_walls', lambda **_k: {})
++        monkeypatch.setattr(walls, 'live_quota_wall',
++                            lambda provider, model: float(codex_reset) if provider == 'openai-codex' else None)
++    monkeypatch.setattr(walls, 'live_quota_room', lambda provider, model: provider == 'anthropic')
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='moved to anthropic then walled there on A', assignee='a')
++        reap(conn, tid, text='Anthropic usage limit resets in ~11h', provider='anthropic',
++             fields={'route_provider': 'anthropic', 'route_model': 'claude-opus-5-5'})
++        assert episode(conn, tid)['providers'] == ['anthropic']
++        monkeypatch.setattr(kb, '_host_prefix', lambda: 'worker-b:')
++        clock[0] += 301
++        seen = []
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: seen.append((task.model_override, task.provider_override)))
++        # Codex (the base route) is walled elsewhere: never spawn into it. Opus (room here) or a hold are fine.
++        assert ('gpt-6-astra', 'openai-codex') not in seen, seen
+-- 
+2.43.0
+

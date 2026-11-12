@@ -1,0 +1,328 @@
+From e1085f81a3de75233d37b33b6b6604658f00a7a9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:23:22 +0000
+Subject: [PATCH] [daveey] hub admission: create reports the denied card's pool
+ placement, not the pre-judge marker
+
+`hermes kanban create --json` on the hub printed
+`placement: {where: local, why: "home gateway marker: mentions '~/.hermes/l'"}` for a card
+the admission judge had denied and queued for pool:worker + capability:hub-write
+(self-heal t_01a1cfae6c9413c8, defect agent-aaab0fddf3). Agents read `where: local` /
+`runs_where: here` as a hub pin and re-placed the card by hand.
+
+- kanban_hub_admission_placement.denied_placement: one report for a denied card built from
+  its persisted route: where=pool, runs_on or placement_policy, why naming the verdict, the
+  verdict itself, and a "runs on ..., not on the hub; do not re-place it" note.
+- CLI: cli_create_fields records the persisted (normalized) route on the plan; cli_report
+  replaces the marker diagnostic for a denied card (JSON + human output, which now prints the
+  note); an admitted card keeps its local report unchanged.
+- kanban_create tool: placement/note come from the task row's runs_on (when the board has
+  that column) and placement_policy for a denied card; runs_where says "worker pool: ..."
+  for a denied queued card.
+
+Test: tests/test_kanban_hub_admission_create_report.py (hub origin, fake judge deny,
+~/.hermes/logs body; Board primary queue, non-primary and unsynced worker-first; admitted
+controls for CLI and tool).
+---
+ hermes_cli/kanban.py                          |   4 +-
+ hermes_cli/kanban_hub_admission_placement.py  |  35 +++++
+ hermes_cli/kanban_placement_diagnostics.py    |   2 +
+ ...test_kanban_hub_admission_create_report.py | 137 ++++++++++++++++++
+ tools/kanban_tools_placement.py               |  27 ++++
+ 5 files changed, 203 insertions(+), 2 deletions(-)
+ create mode 100644 tests/test_kanban_hub_admission_create_report.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 2d3b8fdbe8..4dd0a9cb57 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -459,7 +459,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+         return _err(f"kanban: {exc.code}: {exc}", 2)
+     origin_binding = None
+     # [daveey] Hub admission (a model call) runs before any connection/write lock.
+-    from hermes_cli.kanban_hub_admission_placement import cli_create_fields, cli_preflight
++    from hermes_cli.kanban_hub_admission_placement import cli_create_fields, cli_preflight, cli_report
+     assignee = (args.assignee or (_profile_author() if in_worker or _agent_invoked() else None)
+                 or _cli_default_assignee(args))
+     plan, refused_rc = cli_preflight(args, body, ws_kind, ws_path, getattr(args, "board", None)
+@@ -553,7 +553,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             placement = preflight(conn, task_id, board=getattr(args, "board", None))
+         task = kb.get_task(conn, task_id)
+     from hermes_cli.kanban_placement_diagnostics import cli_creation, cli_json_fields, print_cli_creation
+-    creation_placement = cli_creation(args, body, ws_kind, ws_path, board, task, skip=idem_hit)
++    creation_placement = cli_report(cli_creation(args, body, ws_kind, ws_path, board, task, skip=idem_hit), plan)
+     contract_extra = _contract_cli.create_warning_fields(task, skip=idem_hit, stderr=True)
+     unlinked_warning = None
+     if not in_worker and not session_id and not idem_hit and _agent_invoked():
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index 016bb6eb10..c3e7ab183e 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -276,13 +276,34 @@ def with_admission(audit, plan):
+     return audit
+ 
+ 
++def denied_placement(verdict, *, runs_on=None, placement_policy=None):
++    """The create report for a card admission denied and re-enrolled in the pool, else None.
++
++    Built from what was persisted (``runs_on`` / ``placement_policy``), never the pre-judge marker
++    diagnostic: ``where: local`` / "home gateway marker" for a pooled card read as a hub pin and
++    invited manual re-placement (self-heal t_01a1cfae6c9413c8). ``note`` is a reply-level sentence.
++    """
++    if not isinstance(verdict, dict) or verdict.get("admit") is not False or not (runs_on or placement_policy):
++        return None
++    if runs_on:
++        route, target = {"runs_on": list(runs_on)}, f"a worker matching runs_on={list(runs_on)} via the board lease"
++    else:
++        route, target = {"placement_policy": placement_policy}, "the worker pool (waiting_for_worker_capacity)"
++    return {"where": "pool", **route, "why": f"hub admission denied ({verdict.get('why') or '?'}); queued for {target}",
++            "hub_admission": verdict,
++            "note": f"Hub admission denied this card a hub slot: it runs on {target}, not on the hub. "
++                    "Do not re-place or re-create it."}
++
++
+ def cli_create_fields(conn, plan, args, body, workspace_kind, workspace_path, board, *, assignee):
+     """``create_task`` placement kwargs for ``hermes kanban create`` from the preflight ``plan``.
+ 
+     A denied card the plan queued (``runs_on: [<pool label>, ...]``) keeps that queue only on a Board
+     primary (``runs_on`` is a Board placement field); elsewhere it is enrolled worker-first instead.
++    The persisted route is recorded on ``plan["persisted"]`` for the create report (:func:`cli_report`).
+     """
+     from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
+     from hermes_cli.kanban_worker_placement import POLICY, cli_audit, cli_runs_on
+ 
+     policy, runs_on = plan.get("placement_policy"), plan.get("runs_on")
+@@ -290,12 +311,26 @@ def cli_create_fields(conn, plan, args, body, workspace_kind, workspace_path, bo
+         policy, runs_on = (POLICY if plan.get("hub_admission") else policy), None
+     if policy is None and runs_on is None:
+         runs_on = cli_runs_on(conn, args, body, workspace_kind, workspace_path, board, assignee=assignee)
++    try:  # the labels exactly as create_task persists them (sorted, deduplicated)
++        persisted = wn.normalize_runs_on(runs_on)
++    except ValueError:
++        persisted = runs_on  # create_task rejects them before any write
++    plan["persisted"] = {"runs_on": persisted, "placement_policy": policy}
+     return {"requires": plan.get("requires", getattr(args, "requires", None)), "runs_on": runs_on,
+             "placement_policy": policy,
+             "placement_audit": with_admission(cli_audit(args, body, workspace_kind, workspace_path, board,
+                                                         assignee=assignee), plan)}
+ 
+ 
++def cli_report(diagnostic, plan):
++    """``hermes kanban create``'s placement report after admission: a denied card reports the pool it
++    was persisted to; any other card (admitted included) keeps the local diagnostic unchanged."""
++    verdict = (plan or {}).get("hub_admission")
++    if not diagnostic or not verdict:
++        return diagnostic
++    return denied_placement(verdict, **((plan or {}).get("persisted") or {})) or diagnostic
++
++
+ def cli_plan(args, body, workspace_kind, workspace_path, board, *, assignee=None):
+     """``hermes kanban create``: the worker-first decision plus admission, computed before any write."""
+     from hermes_cli import kanban_placement as kp
+diff --git a/hermes_cli/kanban_placement_diagnostics.py b/hermes_cli/kanban_placement_diagnostics.py
+index e8b6a74ad8..54868987e3 100644
+--- a/hermes_cli/kanban_placement_diagnostics.py
++++ b/hermes_cli/kanban_placement_diagnostics.py
+@@ -93,3 +93,5 @@ def cli_json_fields(diagnostic) -> dict:
+ def print_cli_creation(diagnostic) -> None:
+     if diagnostic:
+         print(f"Placement: {diagnostic['why']}")
++        if diagnostic.get("note"):  # a hub-admission-denied card: where it runs instead [daveey]
++            print(diagnostic["note"])
+diff --git a/tests/test_kanban_hub_admission_create_report.py b/tests/test_kanban_hub_admission_create_report.py
+new file mode 100644
+index 0000000000..556f7d759e
+--- /dev/null
++++ b/tests/test_kanban_hub_admission_create_report.py
+@@ -0,0 +1,137 @@
++"""A card hub admission denied reports its final pool placement, not the pre-judge marker. [daveey]
++
++Self-heal t_01a1cfae6c9413c8 (defect agent-aaab0fddf3): ``hermes kanban create --json`` on the hub
++printed ``placement: {where: local, why: "home gateway marker: mentions '~/.hermes/l'"}`` for a card
++the judge had denied and queued for ``pool:worker`` + ``capability:hub-write``. Agents read
++``where: local`` / ``runs_where: here (hub)`` as a hub pin and re-placed the card by hand.
++Fake judge only (never a live model).
++"""
++if not __name__.startswith("tests."): raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")  # unittest-discovery guard
++import argparse
++import json
++
++import pytest
++
++from hermes_cli import kanban as cli
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_placement as placement
++from tests.hermes_cli import hub_judge_support
++from tests.hermes_cli import test_kanban_portable_reason_audit as audit_support
++from tests.hermes_cli import test_kanban_worker_policy_db as fixtures
++from tools import kanban_tools as kt
++
++conn = fixtures.conn
++kanban_home = audit_support.kanban_home
++hub_judge = hub_judge_support.hub_judge
++MARKED = "Read ~/.hermes/logs/agent.log on the hub and summarise the errors"
++QUEUE_CFG = {"worker_pools": {"hub": []}, "worker_queue": {"hub": "pool:worker"}}
++
++
++def _cli_create(*argv):
++    parser = argparse.ArgumentParser()
++    cli.build_parser(parser.add_subparsers())
++    return cli._cmd_create(parser.parse_args(["kanban", "create", *argv]))
++
++
++@pytest.fixture
++def hub(monkeypatch, hub_judge):
++    monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
++    monkeypatch.setattr(placement, "_machine_picks_up", lambda label: label == "pool:worker")
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
++    return hub_judge
++
++
++def _assert_pool(report, *, queued):
++    assert report["where"] == "pool", report
++    assert "home gateway marker" not in report["why"]
++    assert "fake judge denies" in report["why"]
++    assert report["hub_admission"]["admit"] is False
++    if queued:
++        assert {"pool:worker", "capability:hub-write"} <= set(report["runs_on"])
++    else:
++        assert report["placement_policy"] == "worker-first-v1" and not report.get("runs_on")
++
++
++@pytest.mark.parametrize("mode,queued", [("primary", True), ("off", False)])
++def test_cli_json_reports_the_denied_card_in_the_pool(conn, hub, monkeypatch, capsys, mode, queued):
++    monkeypatch.setattr(placement, "config", lambda: QUEUE_CFG)
++    monkeypatch.setattr(sync, "board_mode", lambda _conn: mode)
++    hub.admit_next = False
++    assert _cli_create("t", "--body", MARKED, "--json") == 0
++    out = json.loads(capsys.readouterr().out)
++    _assert_pool(out["placement"], queued=queued)
++    assert "not on the hub" in out["placement"]["note"]
++    with kbc.connect_closing() as db:  # the report matches what was persisted
++        raw = db.execute("SELECT runs_on, placement_policy FROM tasks WHERE id = ?", (out["id"],)).fetchone()
++    assert (json.loads(raw[0]) if raw[0] else None) == out["placement"].get("runs_on")
++    assert raw[1] == out["placement"].get("placement_policy")
++
++
++def test_cli_human_output_names_the_pool(conn, hub, monkeypatch, capsys):
++    monkeypatch.setattr(placement, "config", lambda: QUEUE_CFG)
++    monkeypatch.setattr(sync, "board_mode", lambda _conn: "primary")
++    hub.admit_next = False
++    assert _cli_create("t", "--body", MARKED) == 0
++    text = capsys.readouterr().out
++    assert "home gateway marker" not in text
++    assert "hub admission denied" in text and "pool:worker" in text
++
++
++def test_cli_admitted_card_still_reports_local(conn, hub, monkeypatch, capsys):
++    """Control: an admitted card stays on the hub and says so."""
++    monkeypatch.setattr(placement, "config", lambda: QUEUE_CFG)
++    monkeypatch.setattr(sync, "board_mode", lambda _conn: "primary")
++    hub.admit_next = True
++    assert _cli_create("t", "--body", MARKED, "--json") == 0
++    out = json.loads(capsys.readouterr().out)
++    assert out["placement"]["where"] == "local"
++    assert "home gateway marker" in out["placement"]["why"]
++    assert not out["placement"].get("runs_on")
++    with kbc.connect_closing() as db:
++        task = kb.get_task(db, out["id"])
++    assert task is not None and task.placement_policy is None
++
++
++@pytest.fixture
++def tool_hub(kanban_home, hub, monkeypatch):
++    from hermes_cli import kanban_sync_client as ksc
++    (kanban_home / "config.yaml").write_text(
++        "kanban:\n  sync:\n    enabled: true\n  placement:\n    worker_pools:\n      hub: []\n"
++        "    worker_queue:\n      hub: pool:worker\n")
++    kb.init_db()
++    with kbc.connect(kanban_home / "kanban.db") as db:
++        ksc.ensure_identity(db, "default", "hub")
++        sync.set_mode(db, "primary")
++    monkeypatch.setattr(kt, "_persisted_identity", lambda: "default")
++    return hub
++
++
++def test_tool_result_reports_the_denied_card_in_the_pool(tool_hub):
++    tool_hub.admit_next = False
++    result = json.loads(kt._handle_create({"title": "t", "body": MARKED, "requires": []}))
++    assert result.get("ok"), result
++    _assert_pool(result["placement"], queued=True)
++    assert "pool" in result["runs_where"] and "here" not in result["runs_where"]
++    assert "not on the hub" in result["note"]
++
++
++def test_tool_unsynced_board_reports_the_worker_pool(kanban_home, hub, monkeypatch):
++    """A board with no Board sync has no runs_on column: the denied card is worker-first."""
++    (kanban_home / "config.yaml").write_text("kanban:\n  placement:\n    worker_pools:\n      hub: []\n")
++    monkeypatch.setattr(kt, "_persisted_identity", lambda: "default")
++    hub.admit_next = False
++    result = json.loads(kt._handle_create({"title": "t", "body": MARKED, "requires": []}))
++    assert result.get("ok"), result
++    _assert_pool(result["placement"], queued=False)
++    assert result["runs_where"].startswith("worker pool")
++
++
++def test_tool_admitted_card_still_runs_here(tool_hub):
++    tool_hub.admit_next = True
++    result = json.loads(kt._handle_create({"title": "t", "body": MARKED, "requires": []}))
++    assert result.get("ok"), result
++    assert result["placement"]["where"] == "local"
++    assert result["runs_where"] == "here (hub)"
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index c328d1748d..710bd20471 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -160,11 +160,36 @@ def _local_placement(kp, view: dict, decision: dict, *, machine_ok, note_local_p
+     return placement
+ 
+ 
++def _denied_fields(conn, task_id: str, marker_placement: dict) -> Optional[dict]:
++    """``placement`` + ``note`` for a card hub admission denied: the pool route it was persisted with,
++    never the pre-judge ``where: local`` (self-heal t_01a1cfae6c9413c8). None for any other card. [daveey]"""
++    import json
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_hub_admission_placement import denied_placement
++
++    verdict = marker_placement.get("hub_admission")
++    if not isinstance(verdict, dict) or verdict.get("admit") is not False:
++        return None
++    # runs_on is a Board column: an unsynced board has none (its denied cards are worker-first).
++    cols = "runs_on, placement_policy" if "runs_on" in sync.table_columns(conn, "tasks") else "NULL, placement_policy"
++    row = conn.execute(f"SELECT {cols} FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    report = denied_placement(verdict, runs_on=json.loads(row[0]) if row and row[0] else None,
++                              placement_policy=row[1] if row else None)
++    if report is None:
++        return None
++    note = report.pop("note")
++    if marker_placement.get("requires") is not None:
++        report["requires"] = marker_placement["requires"]
++    return {"placement": report, "note": note}
++
++
+ def _marker_placement_fields(conn, new_tid: str, marker_placement: Optional[dict], session_id: Optional[str],
+                              origin_profile: Optional[str] = None) -> dict:
+     """Result fields for a card a placement marker kept here; a deferred card records its forward. [daveey]"""
+     if not marker_placement:
+         return {}
++    if denied := _denied_fields(conn, new_tid, marker_placement):
++        return denied
+     if marker_placement.get("defer"):
+         # Run on the routed gateway once the parents finish (kanban_placement_forward).
+         from hermes_cli import kanban_placement_forward as _kpf
+@@ -230,6 +255,8 @@ def _runs_where(runs_on, pinned_machine, marker_placement) -> str:
+     if runs_on is not None:
+         if pinned_machine:
+             return f"{pinned_machine} via the board lease (runs_on={runs_on})"
++        if ((marker_placement or {}).get("hub_admission") or {}).get("admit") is False:
++            return f"worker pool: a machine matching runs_on={runs_on} via the board lease (hub admission denied)"
+         return f"a machine matching runs_on={runs_on} via the board lease"
+     if marker_placement and marker_placement.get("defer"):
+         return f"{marker_placement['defer']} once its parents finish"
+-- 
+2.43.0
+

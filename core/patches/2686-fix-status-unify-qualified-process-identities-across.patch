@@ -1,0 +1,272 @@
+From 502e0f1d1b258befff51d194f780a2d5d997a1e1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:35:36 +0000
+Subject: [PATCH] fix(status): unify qualified process identities across
+ producers [daveey]
+
+F1: one registry process was stamped with launch profile on session rows but served profile on RPC/roster; exact-identity selection counted it twice. Prefer the row profile only where registry scope is missing, retain named route/checkpoint ownership, and exclude recorded foreign profiles from tagged rows.
+
+The real cross-producer test also found same-probe copies conflicting because their request-derived age_seconds differed. Re-project copies at the consumer clock before exact-identity selection; retain actual state/source conflicts and profile separation.
+
+Root (happened): row annotations fell back to launch-global scope while RPCs used served scope. Root (not caught): earlier source/consumer fixtures called the projector directly rather than exercising the real registry, row annotation and dispatcher together. Recurrence: reviewed d6d88ccd420 and earlier producer history 29b07d639a6; this is the first F1 correction.
+
+Proof: tests on d6d88ccd420 fail for default/work identity mismatch, live=2 instead of 1, derived-age conflict, and same-session-id cross-profile qualification. Final canonical run: 60 Python passed; 381 Vitest passed; scripts/check 16 checks passed; renderer tsc passed with 4 GiB heap. Shared executable fixture uses real SQLite, child PID/birth, registry, row annotation, process.list dispatcher and subagent.roster.
+---
+ apps/desktop/src/store/live-work-roster.ts    |  6 +-
+ .../process-subagent-observations.test.ts     | 26 +++++++
+ hermes_cli/process_session_activity.py        | 17 ++++-
+ tests/fixtures/process_profile_parity.py      | 74 +++++++++++++++++++
+ ...est_turn_process_execution_observations.py | 21 ++++++
+ .../test_process_subagent_observation_rpc.py  | 14 ++++
+ 6 files changed, 154 insertions(+), 4 deletions(-)
+ create mode 100644 tests/fixtures/process_profile_parity.py
+
+diff --git a/apps/desktop/src/store/live-work-roster.ts b/apps/desktop/src/store/live-work-roster.ts
+index 2f106c6882..9bd238c1f2 100644
+--- a/apps/desktop/src/store/live-work-roster.ts
++++ b/apps/desktop/src/store/live-work-roster.ts
+@@ -1,6 +1,6 @@
+ import { atom } from 'nanostores'
+ 
+-import { executionIdentityKey, selectExecutionObservation, summarizeExecutionObservations } from '@/lib/execution-observations'
++import { executionIdentityKey, projectExecutionObservation, selectExecutionObservation, summarizeExecutionObservations } from '@/lib/execution-observations'
+ 
+ import { lineageAliases } from './session'
+ 
+@@ -206,7 +206,9 @@ export function selectWorkObservations(records: readonly unknown[], now: number)
+  continue }
+ 
+     const group = groups.get(key) ?? { identity, records: [] }
+-    group.records.push(record)
++    // RPC and row projections of the same cached probe have different derived ages.
++    // Re-project at one consumer clock before comparing snapshots; real evidence conflicts remain.
++    group.records.push(projectExecutionObservation(record, now))
+     groups.set(key, group)
+   }
+ 
+diff --git a/apps/desktop/src/store/process-subagent-observations.test.ts b/apps/desktop/src/store/process-subagent-observations.test.ts
+index a83709ef49..3bef74aeda 100644
+--- a/apps/desktop/src/store/process-subagent-observations.test.ts
++++ b/apps/desktop/src/store/process-subagent-observations.test.ts
+@@ -38,6 +38,32 @@ afterEach(() => {
+ })
+ 
+ describe('process/subagent source to sidebar consumers', () => {
++  it('counts one non-launch-profile process once across real row, RPC and roster producers', () => {
++    const sample = JSON.parse(execFileSync('python3', ['tests/fixtures/process_profile_parity.py'], {
++      cwd: resolve(process.cwd(), '../..'), encoding: 'utf8',
++      env: { ...process.env, PYTHONPATH: resolve(process.cwd(), '../..') },
++    }))
++
++    vi.useFakeTimers(); vi.setSystemTime(sample.now * 1000)
++    const stamped = sample.row as SessionInfo
++    $sessions.set([stamped])
++    setLiveWorkRosterSource(gatewayRouteState(null, 'work').key, sample.roster, sample.now * 1000, ['owner'])
++    expect(rowExecution(stamped, sample.now)).toMatchObject({ live: 1, unknown: 0 })
++    reconcileBackgroundProcesses('owner', sample.processes)
++    expect(rowExecution(stamped, sample.now)).toMatchObject({ live: 1, unknown: 0 })
++    expect(stamped.background_active).toBe(1)
++  })
++
++  it('dedupes derived ages but preserves real same-time conflicts and profile isolation', () => {
++    const current = records[0]
++    const stamped: SessionInfo = { ...row, execution_observations: [{ ...current, age_seconds: 0 }, { ...current, age_seconds: 1 }] }
++    expect(rowExecution(stamped, 1001)).toMatchObject({ live: 1, unknown: 0 })
++    stamped.execution_observations = [current, { ...current, state: 'queued' }]
++    expect(rowExecution(stamped, 1001)).toMatchObject({ live: 0, unknown: 1 })
++    stamped.execution_observations = [current, { ...current, identity: { ...(current.identity as object), profile: 'default' } }]
++    expect(rowExecution(stamped, 1001)).toMatchObject({ live: 2, unknown: 0 })
++  })
++
+   it('owner-qualified roster reaches row projection; failed reads retain unknown, including initial failure', () => {
+     vi.useFakeTimers(); vi.setSystemTime(1001000)
+     $sessions.set([row])
+diff --git a/hermes_cli/process_session_activity.py b/hermes_cli/process_session_activity.py
+index 1bbd63d9a0..0406045696 100644
+--- a/hermes_cli/process_session_activity.py
++++ b/hermes_cli/process_session_activity.py
+@@ -107,6 +107,14 @@ def _detail(proc_id: str, command: Any, started_at: Any, pid: Any) -> dict[str,
+     return out
+ 
+ 
++def _registry_profile(session_key: str) -> str | None:
++    """A named multiplex route qualifies its owner; legacy ``agent:main`` does not."""
++    parts = session_key.split(":")
++    if len(parts) < 3 or parts[0] != "agent" or parts[1] == "main":
++        return None
++    return "main" if parts[1] == "main~" else parts[1]
++
++
+ def _collect() -> dict[str, frozenset[str]]:
+     global _details, _evidence
+     details: dict[str, dict[str, Any]] = {}
+@@ -124,7 +132,8 @@ def _collect() -> dict[str, frozenset[str]]:
+                     "owner_task_id": s.owner_task_id, "task_id": s.task_id}
+             pairs.update((sid, s.id) for sid in _owner_ids(item))
+             details[s.id] = _detail(s.id, s.command, s.started_at, s.pid)
+-            evidence[s.id] = {"id": s.id, "pid": s.pid, "host_start_time": s.host_start_time, "profile": None,
++            evidence[s.id] = {"id": s.id, "pid": s.pid, "host_start_time": s.host_start_time,
++                              "profile": _registry_profile(s.session_key),
+                               "pid_scope": s.pid_scope, "source": "process.registry", "observed_at": time.time(),
+                               "owners": frozenset(_owner_ids(item))}
+     except Exception:
+@@ -205,6 +214,10 @@ def annotate_background_activity(rows: list[dict[str, Any]]) -> list[dict[str, A
+     for row in rows:
+         ids = set(_row_ids(row))
+         procs = set().union(*(owned.get(sid, ()) for sid in ids))
++        # A row supplies missing registry scope, never overrides recorded foreign ownership.
++        if row.get("profile"):
++            procs = {p for p in procs if not evidence.get(p, {}).get("profile")
++                     or evidence[p]["profile"] == row["profile"]}
+         try:
+             observations = []
+             for proc_id in sorted(procs):
+@@ -212,7 +225,7 @@ def annotate_background_activity(rows: list[dict[str, Any]]) -> list[dict[str, A
+                 if entry is None:
+                     continue
+                 owners = sorted(entry["owners"] & ids)
+-                observations.append(process(entry, gateway=gateway, profile=entry["profile"] or local_profile,
++                observations.append(process(entry, gateway=gateway, profile=entry["profile"] or row.get("profile") or local_profile,
+                                             session=owners[0] if owners else None, now=now))
+             replace(row, PROCESS_SOURCES, observations)
+         except ADAPTER_ERRORS:
+diff --git a/tests/fixtures/process_profile_parity.py b/tests/fixtures/process_profile_parity.py
+new file mode 100644
+index 0000000000..d0fcf2da90
+--- /dev/null
++++ b/tests/fixtures/process_profile_parity.py
+@@ -0,0 +1,74 @@
++"""Real non-launch-profile process producers shared by Python and renderer regression tests."""
++import json
++import subprocess
++import sys
++import tempfile
++import threading
++import time
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++
++def sample():
++    from hermes_cli import kanban_execution_observations as keo
++    from hermes_cli import process_session_activity as psa
++    from hermes_state import SessionDB
++    from tools.process_registry import ProcessRegistry, ProcessSession
++    from tui_gateway import launch_profile_policy, server
++    import tools.process_registry as pr
++
++    with tempfile.TemporaryDirectory() as directory:
++        home = Path(directory)
++        work = home / "profiles" / "work"
++        work.mkdir(parents=True)
++        (work / "config.yaml").write_text("{}\n")
++        db = SessionDB(db_path=work / "state.db")
++        db.create_session("owner", source="desktop")
++        launch_db = SessionDB(db_path=home / "state.db")
++        registry = ProcessRegistry()
++        frames, arrived = [], threading.Event()
++
++        def write(frame):
++            frames.append(frame)
++            arrived.set()
++            return True
++
++        transport = SimpleNamespace(write=write)
++        owner = {"session_key": "owner", "history": [], "transport": transport, "profile_home": work}
++        child = subprocess.Popen([sys.executable, "-c", "import threading; threading.Event().wait(60)"])
++        try:
++            registry._running["proc-a"] = ProcessSession(
++                id="proc-a", command="wait", session_key="owner", parent_session_id="owner", pid=child.pid,
++                started_at=time.time(), host_start_time=ProcessRegistry._safe_host_start_time(child.pid))
++            with (patch.dict("os.environ", {"HERMES_HOME": str(home)}),
++                  patch.object(pr, "process_registry", registry),
++                  patch.object(keo, "local_scope", return_value=("edge", "default")),
++                  patch.object(server, "_sessions", {"ui-owner": owner}),
++                  patch.object(server, "_hermes_home", home),
++                  patch.object(server, "_served_profile_homes", {work}),
++                  patch.object(server, "_get_db", return_value=launch_db),
++                  patch.object(launch_profile_policy, "_snapshot", None)):
++                psa._reset_cache_for_tests()
++                row = psa.annotate_background_activity([{"id": "owner", "profile": "work"}])[0]
++                roster = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "subagent.roster",
++                                                "params": {"profile": "work"}})
++                response = server.dispatch({"id": 2, "method": "process.list", "params": {"session_id": "ui-owner"}},
++                                           transport=transport)
++                if response is None:
++                    assert arrived.wait(10), "process.list did not answer"
++                    response = frames[-1]
++                assert "error" not in response, response
++                assert "error" not in roster, roster
++                return {"row": row, "roster": roster["result"]["sessions"],
++                        "processes": response["result"]["processes"], "now": time.time()}
++        finally:
++            child.kill()
++            child.wait()
++            db.close()
++            launch_db.close()
++            psa._reset_cache_for_tests()
++
++
++if __name__ == "__main__":
++    sys.__stdout__.write(json.dumps(sample()) + "\n")
+diff --git a/tests/hermes_cli/test_turn_process_execution_observations.py b/tests/hermes_cli/test_turn_process_execution_observations.py
+index 986607b50c..8eaa98c84f 100644
+--- a/tests/hermes_cli/test_turn_process_execution_observations.py
++++ b/tests/hermes_cli/test_turn_process_execution_observations.py
+@@ -210,6 +210,27 @@ def test_checkpoint_process_identity_is_birth_qualified_and_owned_by_matching_se
+     assert set(rows[0]["background_processes"][0]) <= {"id", "command", "started_at", "pid"}
+ 
+ 
++@pytest.mark.parametrize("profile,namespace", [("work", "work"), ("main", "main~")])
++def test_profile_qualified_processes_do_not_cross_same_session_id_rows(home, sleeper, profile, namespace):
++    import tools.process_registry as pr
++
++    checkpoint, registered = sleeper(), sleeper()
++    path = home / "profiles" / profile / "processes.json"
++    path.parent.mkdir(parents=True)
++    path.write_text(json.dumps([_entry("proc_checkpoint", checkpoint.pid)]))
++    pr.process_registry._running["proc_registry"] = ProcessSession(
++        id="proc_registry", command="wait", session_key=f"agent:{namespace}:local:dm:42", parent_session_id="s_own",
++        pid=registered.pid, host_start_time=ProcessRegistry._safe_host_start_time(registered.pid))
++    rows = psa.annotate_background_activity([
++        {"id": "s_own", "profile": "default"}, {"id": "s_own", "profile": profile},
++        {"id": "s_own", "profile": "other"}])
++    assert {v["identity"]["work_id"] for v in rows[1]["execution_observations"]} == {"proc_checkpoint", "proc_registry"}
++    assert all(v["identity"]["profile"] == profile for v in rows[1]["execution_observations"])
++    for row in (rows[0], rows[2]):
++        assert not row.get("execution_observations")
++        assert not row.get("background_active")
++
++
+ def test_profile_checkpoint_gets_its_profile(home, sleeper):
+     live = sleeper()
+     path = home / "profiles" / "work" / "processes.json"
+diff --git a/tests/tui_gateway/test_process_subagent_observation_rpc.py b/tests/tui_gateway/test_process_subagent_observation_rpc.py
+index 4ab63e7ecd..75142511b6 100644
+--- a/tests/tui_gateway/test_process_subagent_observation_rpc.py
++++ b/tests/tui_gateway/test_process_subagent_observation_rpc.py
+@@ -104,6 +104,20 @@ def _child(rt, sid="c1", *, activity=None, started=None, delegation="d1", owner=
+     return rt.active[sid]
+ 
+ 
++def test_nonlaunch_profile_row_rpc_and_roster_share_one_process_identity():
++    import runpy
++    from pathlib import Path
++
++    sample = runpy.run_path(str(Path(__file__).parents[1] / "fixtures" / "process_profile_parity.py"))["sample"]()
++    stamp = sample["row"]["execution_observations"][0]
++    roster = sample["roster"][0]["execution_observations"][0]
++    rpc = sample["processes"][0]["execution_observations"][0]
++    assert stamp["state"] == roster["state"] == rpc["state"] == "running"
++    assert stamp["identity"] == roster["identity"] == rpc["identity"]
++    assert stamp["identity"]["profile"] == "work"
++    assert sample["row"]["background_active"] == sample["roster"][0]["background"] == 1
++
++
+ # ── process.list ────────────────────────────────────────────────────────────────────────────────
+ 
+ 
+-- 
+2.43.0
+

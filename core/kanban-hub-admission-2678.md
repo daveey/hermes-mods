@@ -1,6 +1,6 @@
 # Evidence-checked hub admission judge
 
-Patches: **2604–2620, 2646–2648**.
+Patches: **2604–2620, 2646–2648, 2708, 2720, 2721**.
 
 ## Behavior
 
@@ -38,6 +38,27 @@ Entry paths driven: the module API `kanban_hub_admission.admit` with a stubbed m
 Per test-only entry: 2610 covers the `kanban_create` tool paths listed above; 2618 makes the placement diagnostics suite expect the (fake-admitted) hub admission receipt on hub keeps. 2608 and 2609 also adjust legacy placement suites to run under the fake judge.
 
 **Untested**: a live model call and a real subscription pool; a real Board; the `kanban_show` output (`hub:` line, queue-note addition) beyond the `latest_verdict` helper; the CLI/tool help text; the `kanban_cli_body.py` and `kanban_tools_attach_url.py` extractions beyond the create paths above.
+
+## Follow-up 2708: blocked decision cards skip the judge
+
+- Behavior: a hub-candidate card created blocked on a `human_request` (`initial_status='blocked'`, placement omitted, `auto`, `local` or `here`) is created with no judge call, so a hub chat can file a decision card. Its work goes where a denied card goes (worker queue or worker-first, `hub:write` added for hub-state wording), so after unblock it runs in the pool, never on a hub slot; the `hub_admission` event records `skipped=blocked_decision_card` (shown as "not judged" in the verdict line). With no worker pool the card is created here. Still judged: ready cards, an explicit hub pin, `runs_on` `machine:hub` or hub-only labels, `force_hub`, and decision cards with another structural keep-local (host workspace, other board). A denied hub stay-here refusal now names working alternatives (omit placement to join the pool, `hub_reason`, or a blocked decision card) instead of telling the caller to use `placement='local'`.
+- How it works: `kanban_hub_admission_placement` gains `is_decision_card`, `decision_card_route` (reuses `pool_route`), `_decision_shortcut` called in `apply` before judging, `_refusal` and `hub_stay_remedy`; `describe` renders skipped verdicts. The refusal's `remedy` is passed through `tools/kanban_tools.py` into `_placement_refused` (`kanban_tools_placement.py`).
+- Code: `hermes_cli/kanban_hub_admission_placement.py`, `tools/kanban_tools.py`, `tools/kanban_tools_placement.py`.
+- Tests: source coverage, not run in this mirror: `tests/test_kanban_hub_admission_decision_cards.py`. Entry path: `kanban_hub_admission_placement.apply` with a fake judge and the `kanban_create` tool handler on a hub gateway (no judge call for decision cards, queue vs worker-first vs no pool, ready and structural cards still judged, non-hub unchanged, the refusal's alternatives). The CLI create path for decision cards is **untested**.
+
+## Follow-up 2720: the hub judges a foreign hub-bound card at pickup
+
+- Behavior: a card created elsewhere (for example on a pool worker whose core predates the gate) that only the hub can claim (`runs_on` `machine:<hub>`, or labels no active worker carries) and that has no admit verdict is judged by the hub at pickup, before it is copied and claimed. Admitted: copied, with a `hub_admission` event (entry `pickup`). Denied: copied only to record the verdict, re-placed on the hub's worker queue by the creation-time deny route (`pool_route`; `hub:write` added for a home-gateway marker) with a `moved` event citing it, and never claimed on the hub. A structural keep or no worker queue: the verdict is recorded and the card stays pinned, never re-judged on that placement. An unavailable judge leaves the card on the Board with a pickup-skip reason, retried next tick, with one outage per tick rather than one timeout per card. A card already carrying a verdict (created payload or event) is not judged again; a card a worker can claim is not judged; a non-hub gateway copies everything unjudged. Dispatch also refuses a foreign hub-bound copy with no admit verdict (`hub_admission_missing`), so no other import path can claim one. Cards already running are not touched.
+- How it works: new `kanban_hub_admission_pickup.screen` runs before `import_cards` in `kanban_worker_node.pickup`, judging outside any write transaction (no model call inside one); `hub_bound` implements the rule above; the verdict is read from the created payload, then events. `dispatch_refusals` (`local_refusals`) carries the backstop.
+- Code: `hermes_cli/kanban_hub_admission_pickup.py` (new), `hermes_cli/kanban_worker_node.py`.
+- Tests: source coverage, not run in this mirror: `tests/hermes_cli/test_kanban_hub_admission_pickup.py`. Entry path: `screen` and the pickup and dispatch refusal paths on a fake hub gateway with a fake judge (judge-and-deny never claimed, no queue, no model call inside a transaction, deny route target, admitted and previously admitted cards, unavailable judge, claimable card, dispatch refusal, `hub_bound` rules, non-hub gateway). A real Board and real pool workers creating the cards are **untested**.
+
+## Follow-up 2721: create reports the denied card's pool placement
+
+- Behavior: for a card the judge denied and queued for the pool, `hermes kanban create` (JSON and human output) and the `kanban_create` tool now report the persisted route (`where=pool`, `runs_on` or `placement_policy`, a `why` naming the verdict, the verdict, and a note that it runs on the pool, not the hub, and must not be re-placed) instead of the pre-judge marker (`where: local`). The tool's `runs_where` reads "worker pool: ..." for a denied queued card. An admitted card keeps its local report unchanged.
+- How it works: `kanban_hub_admission_placement.denied_placement` builds the report; `cli_create_fields` records the normalized persisted route on the plan, `cli_report` swaps it in for a denied card, and `kanban_placement_diagnostics` prints the note; the tool reads `runs_on` (when the board has that column) and `placement_policy` from the task row.
+- Code: `hermes_cli/kanban.py`, `hermes_cli/kanban_hub_admission_placement.py`, `hermes_cli/kanban_placement_diagnostics.py`, `tools/kanban_tools_placement.py`.
+- Tests: source coverage, not run in this mirror: `tests/test_kanban_hub_admission_create_report.py`. Entry path: the CLI create command (JSON and human) on a hub gateway with a fake judge, and the `kanban_create` tool (primary queue, non-primary and unsynced worker-first, admitted controls). A real Board is **untested**.
 
 ## Applying
 

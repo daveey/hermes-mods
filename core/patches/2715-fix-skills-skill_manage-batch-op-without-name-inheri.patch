@@ -1,0 +1,235 @@
+From ac635ea88b40091773b0fb2ea1156f711568a2fc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:49:59 +0000
+Subject: [PATCH] fix(skills): skill_manage batch op without 'name' inherits
+ the one skill its siblings name [daveey]
+
+Problem: a batch that patches a skill and writes the reference file it links,
+with 'name' on only one of the two ops, was refused
+`operations[<n>] needs a 'name' (the skill it targets).` and cost a full
+resend of the payload (2 sessions this week, both a patch + write_file pair
+on a single skill).
+
+Why 1: _validate_batch_ops resolved each op's target as
+  op.name or the legacy top-level name, nothing else
+  (tools/skill_manager_batch.py:100).
+Why 2: the advertised shape is name-per-op and has no call-level target, so
+  a model writing "one change to one skill" repeats the name on every op by
+  hand; the provider does not enforce the schema's `required`, so a dropped
+  name reaches the tool.
+Why 3: the validator treated a target it could read off the sibling ops
+  (every named op in the call names the same skill) as missing.
+Root (happened): the batch validator had no rule for the unambiguous
+  single-target batch.
+Root (not caught): the batch tests inject the name into every op
+  (`_call` does op.setdefault("name", name)), so no test ever sent a
+  partially named batch.
+Recurrence: first fix for this signature; no earlier card or commit.
+
+Fix:
+- A nameless op inherits the skill when every named op in the call targets
+  exactly one skill; its result row says `name_inherited: true`.
+- Several named targets, or none: still refused before anything is written,
+  and the error now names the targets and says to resend with 'name' on
+  every op.
+- The staged (approval) payload stores the resolved name on every op, so the
+  approver's per-op diff shows the real target instead of no skill.
+
+Proof: tests/tools/test_skill_batch_name_inherit.py, 9 tests. Without the
+source change 5 fail (both live shapes return the exact error above);
+with it all pass.
+---
+ tests/tools/test_skill_batch_name_inherit.py | 125 +++++++++++++++++++
+ tools/skill_manager_batch.py                 |  22 +++-
+ 2 files changed, 144 insertions(+), 3 deletions(-)
+ create mode 100644 tests/tools/test_skill_batch_name_inherit.py
+
+diff --git a/tests/tools/test_skill_batch_name_inherit.py b/tests/tools/test_skill_batch_name_inherit.py
+new file mode 100644
+index 0000000000..305a74ef63
+--- /dev/null
++++ b/tests/tools/test_skill_batch_name_inherit.py
+@@ -0,0 +1,125 @@
++"""skill_manage batch: an op without 'name' inherits the one skill its sibling ops name.
++
++Seen live: a patch on a skill plus the write_file for the reference it links, with 'name' on
++only one of them, was refused ``operations[<n>] needs a 'name'`` and cost a full resend.
++"""
++import importlib
++import json
++
++import pytest
++
++SK = ("---\nname: {n}\ndescription: Use when probing batch ops. Behavior.\n---\n"
++      "# Probe\nStep 1.\n")
++
++
++@pytest.fixture
++def smt(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
++    (tmp_path / "skills").mkdir()
++    import tools.skill_manager_tool as mod
++    importlib.reload(mod)
++    for n in ("probe", "other"):
++        r = json.loads(mod.skill_manage(action="", name="", operations=[
++            {"action": "create", "name": n, "content": SK.format(n=n)}]))
++        assert r["success"], r
++    return mod, tmp_path / "skills"
++
++
++def _run(mod, ops, name=""):
++    return json.loads(mod.skill_manage(action="", name=name, operations=ops))
++
++
++WRITE = {"action": "write_file", "file_path": "references/a.md", "file_content": "a"}
++PATCH = {"action": "patch", "old_string": "Step 1.", "new_string": "Step 1. See references/a.md."}
++
++
++@pytest.mark.parametrize("ops", [
++    [dict(WRITE), dict(PATCH, name="probe")],   # live sample: operations[0] nameless
++    [dict(PATCH, name="probe"), dict(WRITE)],   # live sample: operations[1] nameless
++], ids=["nameless-first", "nameless-second"])
++def test_nameless_op_inherits_the_single_named_skill(smt, ops):
++    mod, skills = smt
++    r = _run(mod, ops)
++    assert r["success"], r
++    assert [row["name"] for row in r["results"]] == ["probe", "probe"]
++    flagged = [bool(row.get("name_inherited")) for row in r["results"]]
++    assert flagged == [not op.get("name") for op in ops]
++    assert (skills / "probe" / "references" / "a.md").read_text() == "a"
++    assert "See references/a.md." in (skills / "probe" / "SKILL.md").read_text()
++    assert not (skills / "other" / "references").exists()
++
++
++def test_nameless_op_among_several_skills_is_refused_and_nothing_is_written(smt):
++    mod, skills = smt
++    r = _run(mod, [dict(PATCH, name="probe"), dict(WRITE),
++                   {"action": "write_file", "name": "other", "file_path": "references/b.md",
++                    "file_content": "b"}])
++    assert r["success"] is False
++    assert r["error"].startswith("operations[1] needs a 'name' (the skill it targets)")
++    assert "other, probe" in r["error"]
++    assert "Step 1.\n" in (skills / "probe" / "SKILL.md").read_text()
++    assert not (skills / "probe" / "references").exists()
++    assert not (skills / "other" / "references").exists()
++
++
++def test_batch_with_no_name_anywhere_is_still_refused(smt):
++    mod, skills = smt
++    r = _run(mod, [dict(WRITE), dict(PATCH)])
++    assert r["success"] is False
++    assert r["error"].startswith("operations[0] needs a 'name' (the skill it targets).")
++    assert not (skills / "probe" / "references").exists()
++
++
++def test_non_string_name_is_not_a_target(smt):
++    mod, skills = smt
++    r = _run(mod, [dict(WRITE), dict(PATCH, name=["probe"])])
++    assert r["success"] is False, r
++    assert not (skills / "probe" / "references").exists()
++
++
++def test_top_level_name_still_wins_and_is_not_flagged_inherited(smt):
++    mod, skills = smt
++    r = _run(mod, [dict(WRITE), dict(PATCH, name="probe")], name="other")
++    assert r["success"], r
++    assert [row["name"] for row in r["results"]] == ["other", "probe"]
++    assert not any("name_inherited" in row for row in r["results"])
++    assert (skills / "other" / "references" / "a.md").exists()
++
++
++def test_staged_batch_carries_the_inherited_name_for_the_approval_diff(smt, monkeypatch):
++    mod, skills = smt
++    import tools.write_approval as wa
++    importlib.reload(wa)
++    staged = {}
++    real_gate = mod._run_write_gate
++
++    def gate(build_staging):
++        staged["payload"], staged["gist"] = build_staging(wa)
++        return json.dumps({"success": True, "staged": True})
++
++    monkeypatch.setattr(mod, "_run_write_gate", gate)
++    r = _run(mod, [dict(WRITE), dict(PATCH, name="probe")])
++    assert r.get("staged") is True, r
++    assert [op["name"] for op in staged["payload"]["operations"]] == ["probe", "probe"]
++    assert not (skills / "probe" / "references").exists()  # staged, not applied
++    diff = wa.skill_pending_diff({"payload": staged["payload"]})
++    assert "+Step 1. See references/a.md." in diff
++    monkeypatch.setattr(mod, "_run_write_gate", real_gate)
++    replay = json.loads(mod.apply_skill_pending(staged["payload"]))
++    assert replay["success"], replay
++    assert (skills / "probe" / "references" / "a.md").read_text() == "a"
++
++
++def test_empty_name_counts_as_nameless_not_as_a_second_target(smt):
++    mod, skills = smt
++    r = _run(mod, [dict(WRITE, name=""), dict(PATCH, name="probe")])
++    assert r["success"], r
++    assert (skills / "probe" / "references" / "a.md").exists()
++
++
++def test_fully_named_batch_rows_are_unchanged(smt):
++    mod, _ = smt
++    r = _run(mod, [dict(WRITE, name="probe"), dict(PATCH, name="probe")])
++    assert r["success"], r
++    assert not any("name_inherited" in row for row in r["results"])
+diff --git a/tools/skill_manager_batch.py b/tools/skill_manager_batch.py
+index 5db367c23a..2d358afd9c 100644
+--- a/tools/skill_manager_batch.py
++++ b/tools/skill_manager_batch.py
+@@ -90,6 +90,12 @@ def _validate_batch_ops(operations, default_name, tool_error):
+     def fail(i, msg):
+         return None, tool_error(f"operations[{i}]{msg}", success=False)
+     names = []
++    # Models name the skill on one op and drop it on its sibling (a patch plus the reference
++    # file it links). When every named op targets ONE skill the nameless op can only mean that
++    # skill, so it inherits it; with several targets the guess would be a write to the wrong skill.
++    named = sorted({op["name"] for op in operations
++                    if isinstance(op, dict) and isinstance(op.get("name"), str) and op["name"]})
++    sole_name = named[0] if len(named) == 1 else None
+     for i, op in enumerate(operations):
+         if not isinstance(op, dict) or not op.get("action"):
+             return fail(i, " needs an 'action'.")
+@@ -97,9 +103,14 @@ def _validate_batch_ops(operations, default_name, tool_error):
+         if act not in _BATCH_OP_ACTIONS:
+             return fail(i, f": unknown action '{act}'. Batchable: "
+                            f"{', '.join(sorted(_BATCH_OP_ACTIONS))}; delete must be sole.")
+-        nm = op.get("name") or default_name
++        nm = op.get("name") or default_name or sole_name
+         if not nm:
+-            return fail(i, " needs a 'name' (the skill it targets).")
++            if named:
++                return fail(i, " needs a 'name' (the skill it targets): the other ops in this call "
++                               f"target several skills ({', '.join(named)}), so it cannot be inferred. "
++                               "Resend the same call with 'name' set on every op.")
++            return fail(i, " needs a 'name' (the skill it targets). Resend the same call with "
++                           "'name' set on every op.")
+         # Reject a misfiled op here, before any sibling is applied: a runtime failure on
+         # op[1] would first apply op[0] and then roll the whole batch back.
+         if (shape_err := _op_shape_error(act, op)) is not None:
+@@ -246,7 +257,10 @@ def _skill_manage_batch(operations, default_name: str | None = None, task_id: st
+         def _staging(wa):
+             acts = ", ".join(op["action"] for op in operations)
+             gist = f"batch({len(operations)} ops: {acts}) on {', '.join(sorted(set(names)))}"
+-            return {"action": "batch", "operations": operations}, gist
++            # Stage the RESOLVED target on every op: the approver's per-op diff reads op['name'],
++            # and a nameless (inherited) op would otherwise preview against no skill at all.
++            staged_ops = [{**op, "name": names[i]} for i, op in enumerate(operations)]
++            return {"action": "batch", "operations": staged_ops}, gist
+         staged = _smt._run_write_gate(_staging)
+         if staged is not None:
+             return staged
+@@ -297,6 +311,8 @@ def _skill_manage_batch(operations, default_name: str | None = None, task_id: st
+                     return json.dumps(fail, ensure_ascii=False)
+                 entry = {"name": names[i], "action": op["action"],
+                          "file_path": op.get("file_path"), "success": True}
++                if not op.get("name") and not default_name:
++                    entry["name_inherited"] = True  # say which skill a nameless op landed in
+                 # Advisory payloads (linter findings, org-sharing note) ride on the op result; the
+                 # compact success row otherwise hides them and the model never sees a finding.
+                 entry.update({k: parsed[k] for k in _ADVISORY_KEYS if parsed.get(k) is not None})
+-- 
+2.43.0
+

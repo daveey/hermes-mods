@@ -1,6 +1,6 @@
 # Kanban quota episodes and clock-held dispatch warnings
 
-Patches: 1592 1594 1595 1606
+Patches: 1592 1594 1595 1606 2716 2717
 
 - `patches/1592-fix-kanban-stuck-warning-names-clock-held-deadlines-.patch`
 - `patches/1594-daveey-kanban-honour-quota-wall-reset-deadlines-per-.patch`
@@ -94,6 +94,15 @@ Untested:
 - Explicit assertion that quota notices never wake an origin turn; the patch excludes the event from wake kinds, while delivery tests cover notification collection.
 
 These were not rerun by the mirror pass.
+
+## Follow-up 2716, 2717: another gateway's wall holds only while this pool agrees
+
+- **Behavior (2716):** a hinted quota wall recorded by one gateway came from that gateway's own OAuth pool, but admission held the card on every gateway until the deadline. Now a wall is dropped when this gateway did not just see it (the walled run's claim lock belongs to another host, or this gateway's own wall is older than `LOCAL_WALL_TRUST_SECONDS`, 30 minutes) and this pool has positive room for every walled provider on the concrete model. For a class wall (`class:<name>`) the class's routes for that provider in the assignee's `model_routing` policy are checked. Room means a live OAuth entry with no quota or bench cooldown (`quota_room`, `live_quota_room`): an empty, dead, auth-benched or unreadable pool never lifts a wall. A wall this gateway just saw, and a wall with no recorded provider, still hold. If the run then hits the wall here, its new episode holds it on this gateway.
+- **Behavior (2717):** when every wall is lifted this way, a concrete base route still goes through the walled-elsewhere check (provider-file or live-pool walls) and the alternate/hold path, so a card moved off one provider and walled on another elsewhere is not admitted back onto a provider that is walled. Only a class route (allocated against this pool at spawn) is admitted outright.
+- **How it works:** `kanban_quota_episode.py` adds `_wall_origin` (recorded time from the stored `quota_episode` event or the run end; local when the run's `claimed` lock matches `is_local_claim`, or no lock exists), `_wall_models` and `_served_here`; `decision()` filters outstanding walls through `_served_here` (non-database errors keep the walls and log a warning, database errors propagate). 2717 computes the held reason before filtering and replaces the early return with a `lifted` flag. `agent/model_routing_unavailable.py` splits the pool scan into `_quota_scan`, with `quota_room` beside `quota_unavailable`; `kanban_provider_walls.live_quota_room` wraps it and returns False for `auto`, class selectors and read errors.
+- **Code:** `agent/model_routing_unavailable.py`, `hermes_cli/kanban_provider_walls.py`, `hermes_cli/kanban_quota_episode.py`.
+- **Tests:** source coverage, **not run in this mirror**: `tests/hermes_cli/test_kanban_quota_episode_gateway.py` (new) and `tests/agent/test_subscription_quota_exhaustion.py` (`test_quota_room_is_positive_evidence_only`). Entry path: `kanban_db_dispatch.check_respawn_guard` and `dispatch_once` on a temporary board, with the pool room check and provider walls monkeypatched and another host simulated by changing the claim prefix: a wall recorded on one gateway admits on another with room and still holds on the recorder; no room keeps the hold; the own-wall trust window boundary; a class wall checks the concrete route; an unknown-provider wall holds everywhere; `live_quota_room` with an empty or unreadable pool; 2717's provider-file and live-pool walled-codex cases assert only that the walled base route is never spawned. A real credential pool across two gateways and the synced event transport are **untested**.
+- **Gotchas:** pools are per gateway, so a wall's deadline is no longer authoritative fleet-wide; the 30-minute trust window applies to this gateway's own walls. The "external walls are not merged into persisted episode deadlines" gotcha below is unchanged.
 
 ## Applying
 

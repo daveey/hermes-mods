@@ -1,6 +1,6 @@
 # Pickup-stall detector: hold windows and time pinned to this machine
 
-Patches: **2624, 2639**.
+Patches: **2624, 2639, 2709**.
 
 ## Behavior
 
@@ -19,6 +19,13 @@ Patches: **2624, 2639**.
 ## Tests
 
 Source coverage, **not run in this mirror** (the mirror pass only verifies patch replay and tree equality; it does not rerun these tests): `tests/hermes_cli/test_kanban_pickup_stall.py`. Entry path: the pickup-stall detector module API against a fake machine registry and a temporary replica database, plus `expected_hold` directly. Covered: a hold inside its stated window (and a rollout hold with no stated release) filing nothing, then filing once expired; an operator hold with no release still filing; the release rule across times and a missing start; a card moved here (`moved` and `placement_repinned`) not stalled yet, stalling from the move and reporting that wait; an older move, a move naming another machine, a non-placement event and a malformed payload not moving the clock. `pool_pinned` and `pool_unpinned` events, the real gateway scheduler and a live registry are **untested**.
+
+## Follow-up 2709: the alarm's run may re-place the cards it lists
+
+- Behavior: a pickup-stall alarm tells its run to re-place cards that cannot wait for the stalled machine M, and the run can now do it: `kanban_move(task_id=<t>, runs_on=["machine:<X>"])` is allowed for the alarm's own run when all hold: the caller is an open alarm the detector filed on M (M is read from its `pickup-stall:<M>:` key, never from the caller); the alarm lists `t` (its per-card key, a `- <id> (` body line, or a detector comment from M); `t` is ready, unclaimed, has no run and no lease holder, and is still pinned `machine:M`; `runs_on` is exactly one other machine eligible now (active, unheld, copies cards, carries the card's capabilities and profile, not draining, seen recently, a free slot). Anything else is refused. A card another gateway created goes through the operator call, which applies the same scope on its request side for an alarm caller (refusal code `pickup_stall_scope`). Nothing reads or writes a registry hold. The hold and budget alarm texts and the alarm tail now name the supported `kanban_move` command; the move tool schema describes the third allowed case.
+- How it works: new `kanban_pickup_stall_repin` (`refusal`, `move`, `operator_refusal`, `howto`); `kanban_creator_repin` consults it before refusing a move of a card the caller did not create and extends its refusal text; `kanban_operator_call` calls `operator_refusal` for an alarm requester. In `kanban_pickup_stall`, the former `_can_host` split into `_takes_work` (the eligibility rule shared with the alarm placement) and `_can_host` (that plus reaching the hub).
+- Code: `hermes_cli/kanban_pickup_stall_repin.py` (new), `hermes_cli/kanban_creator_repin.py`, `hermes_cli/kanban_operator_call.py`, `hermes_cli/kanban_pickup_stall.py`, `tools/kanban_tools_schemas.py`.
+- Tests: source coverage, not run in this mirror: `tests/hermes_cli/test_kanban_pickup_stall_repin.py`. Entry path: the scope module API on a temporary board, the alarm run's `kanban_move`, and an operator-call move with an alarm requester, against a fake registry. Covered: each condition above (alarm key and open state, listing by key, body or detector comment, ready/unclaimed/no run/lease, still pinned to M, exactly one other eligible machine, capabilities, hub lane target, unreadable registry), no hold read or written, the hold alarm text. A live gateway, real dispatcher and real registry are **untested**.
 
 ## Applying
 

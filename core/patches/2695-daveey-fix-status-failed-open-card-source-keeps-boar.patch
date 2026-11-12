@@ -1,0 +1,179 @@
+From 24da80b9b232519c0d76c843cb96cc878c6d3f1b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 09:06:47 +0000
+Subject: [PATCH] [daveey] fix(status): failed open-card source keeps
+ board-root owner identity and the independent receipt
+
+Review t_01a1cea80dbe0cc1 findings 2 and 3. The task-list failure path stamped local cards with
+the reader's active profile (C9) and dropped a readable delivery receipt. Stamp the board-root
+scope before assemble, read receipts whenever owner authority holds (a mirror still attests
+nothing), and let add_cards project a verified receipt despite the open-card failure.
+
+RED: 2 new tests fail at 44e7ffa52b (profile coder != default; done -> unknown).
+GREEN: 4 files, 107 passed.
+---
+ hermes_cli/kanban_execution_observations.py   |  7 +++-
+ hermes_cli/kanban_execution_receipt.py        |  5 ++-
+ hermes_cli/kanban_session_activity.py         | 13 +++++-
+ .../test_kanban_execution_receipt.py          | 41 +++++++++++++++++--
+ 4 files changed, 58 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_execution_observations.py b/hermes_cli/kanban_execution_observations.py
+index 7426c40672..be5487c885 100644
+--- a/hermes_cli/kanban_execution_observations.py
++++ b/hermes_cli/kanban_execution_observations.py
+@@ -199,7 +199,8 @@ def add_cards(rows, *, now=None):
+         gateway = profile = None
+     for row in rows:
+         try:
+-            if row.get("_execution_error"):
++            if row.get("_execution_error") and not isinstance(row.get("_execution_done"), dict):
++                # An independent, readable delivery receipt survives an open-card source failure.
+                 raise RuntimeError("execution source unavailable")
+             observation = card(row, gateway=gateway, profile=profile, now=now)
+         except ADAPTER_ERRORS:
+@@ -210,6 +211,7 @@ def add_cards(rows, *, now=None):
+         row.pop("_execution_source", None)
+         row.pop("_execution_done", None)
+         row.pop("_execution_error", None)
++        row.pop("_execution_scope", None)
+     return rows
+ 
+ 
+@@ -225,6 +227,9 @@ def failed_card(row, *, gateway=None, profile=None, now=None):
+     from hermes_cli.kanban_execution_source import unknown_raw
+     source = row.get("_execution_source")
+     source = source if isinstance(source, dict) else {}
++    scope = row.get("_execution_scope")
++    if isinstance(scope, dict):  # the reader's board-root owner scope, never the active profile (C9)
++        source = {**scope, **{k: v for k, v in source.items() if v is not None}}
+     if row.get("remote"):
+         source = {"gateway": row.get("gateway"), "profile": row.get("owner_profile", row.get("profile")),
+                   "board": row.get("board")}
+diff --git a/hermes_cli/kanban_execution_receipt.py b/hermes_cli/kanban_execution_receipt.py
+index fd803b4d9b..192a90cc3d 100644
+--- a/hermes_cli/kanban_execution_receipt.py
++++ b/hermes_cli/kanban_execution_receipt.py
+@@ -108,11 +108,12 @@ def attach_done(conn, found, *, board, gateway, profile, observed_at):
+     """Task-list entry: set ``_execution_done`` on listed done cards whose delivery is established.
+ 
+     A failed read marks only those done cards ``_execution_error`` (explicit unknown); open cards and asks
+-    are untouched. Rows already failed by the open-card read are left to that failure.
++    are untouched. A receipt is independent of the open-card read, so it is still read for rows that
++    read failed; only a failed receipt read leaves them unknown.
+     """
+     from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS
+ 
+-    ids = [tid for tid, row in found.items() if row.get("status") == "done" and not row.get("_execution_error")]
++    ids = [tid for tid, row in found.items() if row.get("status") == "done"]
+     if not ids:
+         return
+     try:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 74608f5c99..9941c37687 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1571,8 +1571,16 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+         from hermes_cli.kanban_execution_source import assemble
+         from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS, card_scope
+         gateway, profile = card_scope(path)
++        for info in found.values():  # board-root owner scope, kept for the failure path too (C9)
++            info["_execution_scope"] = {"gateway": gateway, "profile": profile, "board": _board_slug(path)}
+         try:
+             _require_local_execution_authority(conn)
++            authority = True
++        except ADAPTER_ERRORS:
++            authority = False  # a pulled mirror attests neither open nor delivered cards
++        try:
++            if not authority:
++                raise RuntimeError("local execution authority unavailable")
+             sources = assemble(conn, found, board=_board_slug(path), gateway=gateway, profile=profile,
+                                observed_at=read_at)
+             for tid, source in sources.items():
+@@ -1582,8 +1590,9 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+             _log.debug("kanban execution source failed for %s", path, exc_info=True)
+             for info in found.values():
+                 info["_execution_error"] = True
+-        _receipts.attach_done(conn, found, board=_board_slug(path), gateway=gateway, profile=profile,
+-                              observed_at=read_at)
++        if authority:  # receipts are independent of the open-card read, but not of owner authority
++            _receipts.attach_done(conn, found, board=_board_slug(path), gateway=gateway, profile=profile,
++                                  observed_at=read_at)
+         _add_card_details(conn, found)
+         try:
+             for tid, info in _local_wait_info(conn, found).items():
+diff --git a/tests/hermes_cli/test_kanban_execution_receipt.py b/tests/hermes_cli/test_kanban_execution_receipt.py
+index 0ca3fdcccf..d7d13220b6 100644
+--- a/tests/hermes_cli/test_kanban_execution_receipt.py
++++ b/tests/hermes_cli/test_kanban_execution_receipt.py
+@@ -20,7 +20,7 @@ from hermes_cli import kanban_execution_observations as observations
+ from hermes_cli import kanban_origin
+ from hermes_cli import kanban_origin_ledger as ledger
+ from hermes_cli import kanban_session_activity as activity
+-from hermes_cli.execution_observations import project
++from hermes_cli.execution_observations import identity_key, project
+ from hermes_cli.kanban_completion_receipt_projection import read_completed, read_completed_many
+ from tests.hermes_state.test_completion_receipt import receipt
+ 
+@@ -227,6 +227,40 @@ def test_adapter_failure_is_an_explicit_unknown_and_keeps_asks(board, monkeypatc
+     assert value["state"] == "unknown" and "delivery_receipt" not in value
+ 
+ 
++def _open_source_fails(monkeypatch):
++    from hermes_cli import kanban_execution_source as source
++
++    def boom(*a, **k):
++        raise sqlite3.OperationalError("simulated open-card source failure")
++    monkeypatch.setattr(source, "assemble", boom)
++
++
++def test_open_card_source_failure_keeps_the_independent_receipt(board, monkeypatch):
++    tid = finish(board, card(board))
++    _open_source_fails(monkeypatch)
++    value = observation(done_listing(tid))
++    assert value["state"] == "done" and value["delivery_receipt"]["verified"] is True
++    assert value["identity"]["profile"] == PROFILE
++    assert not [k for k in done_listing(tid) if k.startswith("_execution")]
++
++
++def test_failed_source_identity_is_the_board_root_owner_not_the_reader(board, monkeypatch):
++    """C9 on the failure path: a reader running as another profile never stamps its own profile."""
++    open_tid, done_tid = card(board), finish(board, card(board))
++    monkeypatch.setattr(observations, "local_scope", lambda: (GATEWAY, "coder"))
++    _open_source_fails(monkeypatch)
++    rows = {r["id"]: r for r in activity.session_tasks(["session"], statuses=("ready", "todo", "done"))}
++    assert {open_tid, done_tid} <= set(rows)
++    failed = observation(rows[open_tid])
++    assert failed["state"] == "unknown" and failed["unknown_reason"] == "adapter_error"
++    assert failed["identity"]["profile"] == "default" and failed["owner"]["profile"] == "default"
++    assert failed["identity"]["gateway"] == GATEWAY and failed["identity"]["board"] == "default"
++    assert observation(rows[done_tid])["identity"]["profile"] == "default"
++    counted = [v for v in annotate()["execution_observations"] if v["identity"]["work_id"] == open_tid]
++    assert counted and {v["identity"]["profile"] for v in counted} == {"default"}
++    assert {identity_key(v["identity"]) for v in counted} == {identity_key(failed["identity"])}
++
++
+ def test_listing_open_statuses_never_reads_completion_evidence(board, monkeypatch):
+     finish(board, card(board))
+     from hermes_cli import kanban_execution_receipt as adapter
+@@ -607,7 +641,7 @@ def test_done_pair_window_is_bounded_and_per_statement(board):
+     assert recent.done_pairs_on(board, time.time() + 60, activity._counted_sub_clause) == []
+ 
+ 
+-def test_attach_done_marks_only_done_rows_on_failure_and_skips_failed_rows(board, monkeypatch):
++def test_attach_done_marks_only_done_rows_on_failure_and_reads_open_source_failures(board, monkeypatch):
+     from hermes_cli import kanban_execution_receipt as adapter
+     done_id, open_id, failed_id = "t_done", "t_open", "t_failed"
+     found = {done_id: {"status": "done"}, open_id: {"status": "running"},
+@@ -620,6 +654,7 @@ def test_attach_done_marks_only_done_rows_on_failure_and_skips_failed_rows(board
+ 
+     monkeypatch.setattr(adapter, "assemble_done", boom)
+     adapter.attach_done(board, found, board="default", gateway=GATEWAY, profile=PROFILE, observed_at=1000.0)
+-    assert seen == [[done_id]]  # open rows and rows already failed are never read
++    # open rows are never read; a done row whose open-card read failed still has an independent receipt
++    assert seen == [[done_id, failed_id]]
+     assert found[done_id]["_execution_error"] is True and "_execution_error" not in found[open_id]
+     assert "_execution_done" not in found[done_id]
+-- 
+2.43.0
+
