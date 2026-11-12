@@ -1,0 +1,217 @@
+From 08aa4e2b2dd6ff396d03bf546d17084d865a5f05 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:52:04 +0000
+Subject: [PATCH] [daveey] Withdraw prepared approvals when Desktop pauses for
+ update
+
+Terminal batches wait for consent before registering in-flight execution, so the mid-tool watcher skipped their 300-second approval waits. Withdraw unanswered requests using existing first-settlement semantics, only for resumable paused turns. Never grant consent; retain re-ask notice and ordinary boundary persistence.
+
+Proof: new wait regression RED before fix; 185 tests across 13 pause/batch files GREEN. Hook/Stop guard mutant fails both controls; resumability mutant fails opt-out control. Real AIAgent two-terminal preparation test persists both results, executes neither command and pauses without another model call.
+---
+ .../tui_gateway/test_update_pause_approval.py | 147 ++++++++++++++++++
+ tui_gateway/update_pause.py                   |   2 +
+ tui_gateway/update_pause_approval.py          |  25 +++
+ 3 files changed, 174 insertions(+)
+ create mode 100644 tests/tui_gateway/test_update_pause_approval.py
+ create mode 100644 tui_gateway/update_pause_approval.py
+
+diff --git a/tests/tui_gateway/test_update_pause_approval.py b/tests/tui_gateway/test_update_pause_approval.py
+new file mode 100644
+index 0000000000..bb1653172f
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_approval.py
+@@ -0,0 +1,147 @@
++"""Approval preparation can block before a tool is registered in flight."""
++import threading
++
++import pytest
++
++from agent import update_pause_cancel
++from tests.tui_gateway import test_update_pause_clarify as helpers
++from tools import approval
++from tools.approval_gateway_wait import _await_gateway_decision
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import record_turn_start
++
++env = helpers.env
++
++
++def test_real_desktop_batch_pauses_without_executing_unapproved_commands(tmp_path, monkeypatch):
++    from tests.tui_gateway import test_update_pause_mid_tool as mid
++    from tests.agent import test_terminal_batch_timeout_continues as batch
++    from gateway.session_context import clear_session_vars
++    from tools.terminal_scope import reset_terminal_scope, set_terminal_scope
++    from tools.terminal_tool_lifecycle import cleanup_vm
++    from tui_gateway import server
++
++    key = "session-key"
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: helpers.CFG)
++    monkeypatch.setattr(up, "MID_TOOL_POLL_S", 0.05)
++    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *a, **k: None)
++    monkeypatch.setattr("tools.approval_context._get_approval_mode", lambda: "manual")
++    monkeypatch.setattr("tools.approval_context._get_approval_timeout", lambda: 5)
++    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
++    monkeypatch.delenv("HERMES_SINGLE_QUERY", raising=False)
++    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
++    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
++    monkeypatch.setattr(approval, "_yolo_active", lambda: False)
++    monkeypatch.setattr(approval, "_command_findings", lambda command: [("probe", "test consent")])
++    agent = mid._make_agent(tmp_path, "terminal")
++    session = mid._session(agent, tmp_path)
++    session["source"] = "desktop"
++    monkeypatch.setattr(server, "_sessions", {key: session})
++    tokens = server._set_session_context(key)
++    from tools.approval_context import set_current_session_key, reset_current_session_key
++    approval_token = set_current_session_key(key)
++    scope = set_terminal_scope({"TERMINAL_ENV": "local", "TERMINAL_CWD": str(tmp_path)})
++    seen = []
++
++    def notify(data):
++        seen.append(update_pause_cancel.in_flight(agent))
++        helpers._request_pause(tmp_path)
++
++    approval.register_gateway_notify(key, notify)
++    record_turn_start(tmp_path, key, "probe")
++    paths = [tmp_path / "first", tmp_path / "second"]
++    # A harmless command whose chmod shape requires consent; no command may run.
++    calls = [batch._call(f"c{i}", f"touch '{p}'; chmod 777 '{p}'") for i, p in enumerate(paths)]
++    try:
++        result = mid._run_turn(agent, session, [mid._response(*calls), mid._response()])
++        assert seen and seen[0] == {}, "must exercise preparation before in-flight registration"
++        assert result.get("paused_for_update") == up.PAUSE_REASON
++        assert not any(p.exists() for p in paths)
++        rows = mid._durable_tools(tmp_path)
++        assert set(rows) == {"c0", "c1"}
++        assert all("update" in row for row in rows.values())
++        assert approval.list_gateway_approvals(key) == []
++        assert agent.client.chat.completions.create.call_count == 1
++    finally:
++        approval.unregister_gateway_notify(key)
++        reset_terminal_scope(scope)
++        cleanup_vm(key)
++        reset_current_session_key(approval_token)
++        clear_session_vars(tokens)
++        agent.close()
++
++
++def _pending(monkeypatch, key):
++    monkeypatch.setattr("tools.approval_context._get_approval_timeout", lambda: 30)
++    published = threading.Event()
++    box = {}
++    settled = []
++
++    def notify(data):
++        box["request_id"] = data["request_id"]
++        approval.register_gateway_settle(key, data["request_id"], settled.append)
++        published.set()
++
++    def wait():
++        box["result"] = _await_gateway_decision(key, notify, {"command": "probe", "pattern_key": "probe"})
++
++    thread = threading.Thread(target=wait)
++    thread.start()
++    assert published.wait(10)
++    return thread, box, settled
++
++
++def _cleanup(thread, box, key):
++    approval.withdraw_gateway_approval(key, box["request_id"], "test cleanup")
++    thread.join(10)
++    assert not thread.is_alive()
++
++
++def test_pause_withdraws_approval_even_before_execution_starts(env, monkeypatch):
++    key = "session-key"
++    thread, box, settled = _pending(monkeypatch, key)
++    try:
++        assert update_pause_cancel.in_flight(env.session["agent"]) == {}
++        helpers._request_pause(env.home)
++        up.mid_tool_cancel_step(env.session, key, env.session["agent"], {})
++        thread.join(2)
++        assert not thread.is_alive(), "pre-execution approval still blocks update pause"
++        result = box["result"]
++        assert result["choice"] is None
++        assert "update" in result["cancelled"] and "again" in result["cancelled"]
++        assert settled == ["session_closed"]
++        assert approval.list_gateway_approvals(key) == []
++        assert approval.resolve_gateway_approval(key, "once", request_id=box["request_id"]) == 0
++        # A continuation must publish a new, unanswered request, not inherit consent.
++        from hermes_cli import admission_fence
++        admission_fence.clear_pause_request(env.home)
++        again, new_box, new_settled = _pending(monkeypatch, key)
++        try:
++            up.mid_tool_cancel_step(env.session, key, env.session["agent"], {})
++            assert new_box["request_id"] != box["request_id"]
++            assert approval.has_blocking_approval(key) and new_settled == []
++        finally:
++            _cleanup(again, new_box, key)
++    finally:
++        _cleanup(thread, box, key)
++
++
++@pytest.mark.parametrize("case", ["no_pause", "no_hook", "opted_out", "other_session", "stop"])
++def test_nonpausing_turn_keeps_pending_approval(env, monkeypatch, case):
++    key = "other-session" if case == "other_session" else "session-key"
++    thread, box, settled = _pending(monkeypatch, key)
++    try:
++        if case != "no_pause":
++            helpers._request_pause(env.home)
++        if case == "no_hook":
++            env.session["agent"].step_boundary_pause = None
++        if case == "opted_out":
++            record_turn_start(env.home, "session-key", "prompt", auto_continue=False)
++        if case == "stop":
++            env.session["agent"]._interrupt_requested = True
++        up.mid_tool_cancel_step(env.session, "session-key", env.session["agent"], {})
++        assert approval.has_blocking_approval(key)
++        assert settled == []
++    finally:
++        _cleanup(thread, box, key)
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 200d9562a3..f0ed8d2861 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -362,6 +362,8 @@ def mid_tool_cancel_step(session: dict, marker_key: str, agent: Any, state: dict
+     if not pause_requested(session):
+         state.clear()  # a later request starts its own grace (and may cancel again)
+         return None
++    from tui_gateway.update_pause_approval import withdraw_for_update
++    withdraw_for_update(session, marker_key, agent)
+     if state.get("cancelled"):
+         return None  # one cancel per request: the turn pauses at the next boundary
+     now = _mono()
+diff --git a/tui_gateway/update_pause_approval.py b/tui_gateway/update_pause_approval.py
+new file mode 100644
+index 0000000000..703cbb3613
+--- /dev/null
++++ b/tui_gateway/update_pause_approval.py
+@@ -0,0 +1,25 @@
++"""Withdraw unanswered Desktop approvals so an update can reach the next boundary."""
++from tools import approval
++
++NOTICE = ("Hermes is pausing this turn for an update. This approval was withdrawn unanswered; "
++          "the command was not approved. Ask for approval again after the turn continues.")
++
++
++def withdraw_for_update(session: dict, marker_key: str, agent) -> None:
++    """Approval preparation runs before tool execution/in-flight registration.
++
++    Use the queue's first-settlement lock, never manufacture a deny or consent.
++    A batch can publish more approvals after this poll; subsequent polls must
++    keep withdrawing until it reaches the normal durable boundary pause.
++    """
++    from tui_gateway import update_pause as up
++
++    if getattr(agent, "step_boundary_pause", None) is None or getattr(agent, "_interrupt_requested", False):
++        return
++    pending = approval.list_gateway_approvals(marker_key)
++    if not pending or up.not_resumable_reason(session, marker_key):
++        return
++    for item in pending:
++        if approval.withdraw_gateway_approval(marker_key, item["request_id"], NOTICE):
++            up.logger.info("core-update pause: session %s withdrew pending approval %s unanswered",
++                           marker_key, item["request_id"])
+-- 
+2.43.0
+

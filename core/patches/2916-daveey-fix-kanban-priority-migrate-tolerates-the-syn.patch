@@ -1,0 +1,371 @@
+From abf75b3f2ce7358a2944856c657bd2ea13be9567 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:14:57 +0000
+Subject: [PATCH] [daveey] fix(kanban): priority migrate tolerates the sync
+ clamp (clamp-equivalent CAS, capped restore)
+
+Run 2 of the operator priority migrate (op c314f72a, 2026-11-12 17:04Z) was
+refused on the hub: apply and the guarded restore both said "priorities changed;
+capture a new manifest". The manifest is captured from the raw Board snapshot
+(old=59000) but the sync pull's `_local_fields` stores `bounded(priority)` on
+every received upsert, including an equal-version re-send, with no event and no
+outbox op. 17 hub-origin above-cap rows read 1000 locally while the Board kept
+the raw value, so the CAS could never pass and a re-capture would see the same
+raw value again.
+
+Approach (b): apply and restore treat a stored PRIORITY_CAP as holding an
+above-cap manifest original (`kanban_priority.at_value`). Any other drift still
+refuses. A guarded restore without --allow-legacy-rollback writes
+min(old, PRIORITY_CAP) instead of refusing, so it never raises a card above the
+cap; the flag still restores the exact legacy value. Canonical verify-restore
+accepts the capped value. Rows the clamp touched but apply never wrote are left
+alone by restore (no raise).
+---
+ docs/kanban-priority-rollout.md               |  25 ++--
+ hermes_cli/kanban_priority.py                 |  11 ++
+ hermes_cli/kanban_priority_executor.py        |  43 ++++--
+ hermes_cli/kanban_priority_prepare.py         |   9 +-
+ .../test_kanban_priority_clamp_equivalent.py  | 131 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_priority_cli.py  |   4 +-
+ .../test_kanban_priority_executor.py          |  10 +-
+ 7 files changed, 205 insertions(+), 28 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_priority_clamp_equivalent.py
+
+diff --git a/docs/kanban-priority-rollout.md b/docs/kanban-priority-rollout.md
+index 173b47a341..5d27e760a6 100644
+--- a/docs/kanban-priority-rollout.md
++++ b/docs/kanban-priority-rollout.md
+@@ -86,12 +86,21 @@ attachment tasks must already belong to their corresponding writers.
+ ```sh
+ hermes kanban --board default supervisor-requests --priority-operation migrate \
+   --writer origin-a --host-map-file /absolute/operator-host-map.json \
+-  --exception EXCEPTION_LOW --exception EXCEPTION_HIGH --allow-legacy-rollback
++  --exception EXCEPTION_LOW --exception EXCEPTION_HIGH
+ ```
+ 
+ Alternatively pass the JSON directly with `--host-map '{...}'` (exactly one map
+-flag). `--allow-legacy-rollback` explicitly permits automatic guarded recovery
+-of above-cap originals; omit it only if refusing that policy rollback is intended.
++flag). `--allow-legacy-rollback` makes the automatic guarded recovery restore
++above-cap originals exactly (a policy rollback). Without it, recovery restores
++them at the cap (1000), which ranks identically because effective priority is
++capped at read time, so a guarded restore never raises a card above the cap.
++Prefer omitting it.
++
++Apply and restore treat a stored value of exactly 1000 as holding an above-cap
++manifest original (clamp equivalence, `kanban_priority.at_value`): the sync pull
++bounds every received priority in place with no event or outbox op, so an
++origin's replica can read 1000 while the Board, and therefore the manifest, keeps
++the raw legacy value. Any other difference is still a refusing edit.
+ Do not pass separate task, backup, manifest, attachment or digest flags to migrate.
+ 
+ Before a run, check the map against the live origins with the read-only
+@@ -227,13 +236,13 @@ Save stdout as the durable operation report. No credentials or lineage are clear
+ 
+    ```sh
+    hermes kanban --board default supervisor-requests --priority-operation restore \
+-     --writer ORIGIN --attachment-id LOCAL_ATTACHMENT_ID --digest SHA256 \
+-     --allow-legacy-rollback
++     --writer ORIGIN --attachment-id LOCAL_ATTACHMENT_ID --digest SHA256
+    ```
+ 
+-   The explicit flag acknowledges policy rollback when restoring above-cap old
+-   values; coordinate cap-aware import/deployment policy first or imports may
+-   immediately clip restored values. Restore requires exact owned membership and
++   Without `--allow-legacy-rollback` an above-cap original is restored at the cap
++   (1000, same effective rank). The explicit flag restores the exact legacy value
++   (policy rollback); the sync pull may clip it again on any replica. Restore
++   requires exact owned membership and
+    target-value CAS, just like apply (new cards also cause refusal). It never
+    reverts lifecycle state, lease, parents or runs. Publish and read back restore
+    through normal sync too.
+diff --git a/hermes_cli/kanban_priority.py b/hermes_cli/kanban_priority.py
+index 5afdf58f5d..573dad1c07 100644
+--- a/hermes_cli/kanban_priority.py
++++ b/hermes_cli/kanban_priority.py
+@@ -11,6 +11,17 @@ def bounded(value: int) -> int:
+     return min(PRIORITY_CAP, int(value))
+ 
+ 
++def at_value(stored: int, recorded: int) -> bool:
++    """Whether a stored priority still holds a recorded one, up to the cap clamp.
++
++    The sync pull stores ``bounded()`` of every received priority without an event,
++    so a replica of an above-cap legacy value reads PRIORITY_CAP while the Board
++    keeps the raw value. Both rank identically (effective priority is capped at
++    read time); any other difference is a real edit.
++    """
++    return stored == recorded or (recorded > PRIORITY_CAP and stored == PRIORITY_CAP)
++
++
+ def bound_reopened(conn, task_id: str) -> None:
+     """Bound an opened legacy row in the caller's transaction, retaining its audit."""
+     from hermes_cli import kanban_db as kb
+diff --git a/hermes_cli/kanban_priority_executor.py b/hermes_cli/kanban_priority_executor.py
+index 22502f3452..a754deaef9 100644
+--- a/hermes_cli/kanban_priority_executor.py
++++ b/hermes_cli/kanban_priority_executor.py
+@@ -34,14 +34,10 @@ def apply_attached(conn, attachment_id: int, digest: str, *, writer: str,
+         if hashlib.sha256(data).hexdigest() != digest:
+             raise ValueError("manifest digest mismatch")
+         from hermes_cli.kanban_priority_manifest import validate
+-        from hermes_cli.kanban_priority import PRIORITY_CAP
++        from hermes_cli.kanban_priority import PRIORITY_CAP, at_value
+         manifest = validate(json.loads(data))
+         if manifest["board_id"] != identity.get("board_id"):
+             raise ValueError("manifest belongs to a different board")
+-        rows = [r for r in manifest["rows"] if r["origin"] == writer]
+-        if undo and any(r["old"] > PRIORITY_CAP for r in rows) and not allow_legacy_rollback:
+-            raise ValueError("restoring above-cap values requires explicit legacy policy rollback")
+-        source, target = ("new", "old") if undo else ("old", "new")
+         unknown = conn.execute("SELECT id FROM tasks WHERE status NOT IN ('done','archived') "
+                                "AND (created_on IS NULL OR created_on='') LIMIT 1").fetchone()
+         if unknown is not None:
+@@ -50,20 +46,39 @@ def apply_attached(conn, attachment_id: int, digest: str, *, writer: str,
+         observed = [dict(r) for r in conn.execute("SELECT id,priority,created_on,status FROM tasks")]
+         rows, report = classify(manifest['rows'], observed, writer=writer)
+         live = {r['id']: r['priority'] for r in observed}
+-        if all(live[r["id"]] == r[target] for r in rows):
+-            return {"changed": 0, "writer": writer, "manifest_sha256": digest, **report}
+-        if any(live[r["id"]] != r[source] for r in rows):
+-            raise ValueError("priorities changed; capture a new manifest")
++        # A row holds its manifest value, or for an above-cap original also the
++        # cap: the sync pull bounds every received priority in place (no event,
++        # no outbox op) while the Board keeps the raw value the manifest captured.
++        if undo:
++            if all(at_value(live[r["id"]], r["old"]) for r in rows):
++                return {"changed": 0, "writer": writer, "manifest_sha256": digest, **report}
++            if any(live[r["id"]] != r["new"] for r in rows):
++                raise ValueError("priorities changed; capture a new manifest")
++        else:
++            if all(live[r["id"]] == r["new"] for r in rows):
++                return {"changed": 0, "writer": writer, "manifest_sha256": digest, **report}
++            if any(not at_value(live[r["id"]], r["old"]) for r in rows):
++                raise ValueError("priorities changed; capture a new manifest")
+         for row in rows:
+             current = live[row["id"]]
+-            if current == row[target]:
++            # Only the explicit legacy policy rollback restores above the cap.
++            if not undo:
++                value = row["new"]
++            elif allow_legacy_rollback:
++                value = row["old"]
++            else:
++                value = min(PRIORITY_CAP, row["old"])
++            if current == value:
+                 continue
+-            conn.execute("UPDATE tasks SET priority=? WHERE id=?", (row[target], row["id"]))
+-            kb._append_event(conn, row["id"], "reprioritized", {
+-                "priority": row[target], "previous_priority": current,
++            conn.execute("UPDATE tasks SET priority=? WHERE id=?", (value, row["id"]))
++            payload = {
++                "priority": value, "previous_priority": current,
+                 "reason": "priority normalization rollback" if undo else "priority normalization v2",
+                 "manifest_sha256": digest,
+-            })
++            }
++            if value != (row["old"] if undo else row["new"]):
++                payload["manifest_priority"] = row["old"]  # capped legacy original, kept for audit
++            kb._append_event(conn, row["id"], "reprioritized", payload)
+             changes.append(row["id"])
+     for task_id in changes:
+         kb.notify_task_updated(conn, task_id, ["priority"])
+diff --git a/hermes_cli/kanban_priority_prepare.py b/hermes_cli/kanban_priority_prepare.py
+index 4fd20a546d..a188df2bf7 100644
+--- a/hermes_cli/kanban_priority_prepare.py
++++ b/hermes_cli/kanban_priority_prepare.py
+@@ -27,8 +27,13 @@ def verify(hub, manifest: dict, *, undo: bool = False) -> dict:
+     except ValueError as exc:
+         raise ValueError(f'canonical {exc}') from exc
+     actual = {r['id']: (r['created_on'], r['priority']) for r in rows}
+-    target = "old" if undo else "new"
+-    if any(actual[r['id']] != (r['origin'], r[target]) for r in active):
++    from hermes_cli.kanban_priority import at_value
++    # A restore without the legacy policy rollback lands an above-cap original at
++    # the cap; that is the restored state, not drift (see executor.apply_attached).
++    def holds(row) -> bool:
++        origin, value = actual[row['id']]
++        return origin == row['origin'] and (at_value(value, row['old']) if undo else value == row['new'])
++    if not all(holds(r) for r in active):
+         raise ValueError("canonical ownership, membership or priorities differ from manifest")
+     return {"verified": len(active), "board_id": manifest["board_id"],
+             "direction": "restore" if undo else "apply", **report}
+diff --git a/tests/hermes_cli/test_kanban_priority_clamp_equivalent.py b/tests/hermes_cli/test_kanban_priority_clamp_equivalent.py
+new file mode 100644
+index 0000000000..15fcf36177
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_priority_clamp_equivalent.py
+@@ -0,0 +1,131 @@
++"""A sync pull's cap clamp must not strand the priority migration's value CAS.
++
++Incident 2026-11-12 (op c314f72a, run 2): the global manifest captured raw Board
++values (old=59000), but the hub's local copy of the same rows had been clamped
++to PRIORITY_CAP by ``kanban_db_sync._local_fields`` on an equal-version re-send,
++with no event and no outbox op. Apply and the guarded restore then both refused
++with "priorities changed; capture a new manifest", and a re-capture could never
++succeed because the Board keeps the raw value.
++"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_priority import PRIORITY_CAP
++from tests.hermes_cli import test_kanban_priority_executor as plan_helpers
++from tests.hermes_cli import test_kanban_priority_migration as helpers
++from tests.hermes_cli import test_kanban_sync_client as sync_helpers
++
++kanban_home = sync_helpers.kanban_home
++conn = sync_helpers.live
++
++
++def resend_from_board(conn, task_id, priority):
++    """The Board re-sends an unchanged full row (equal version) carrying its raw priority."""
++    from hermes_cli.kanban_db_sync import RemoteChange, apply_remote_changes
++    version = conn.execute("SELECT COALESCE(sync_version, 1) FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
++    conn.execute("UPDATE tasks SET sync_version=? WHERE id=?", (version, task_id))
++    conn.commit()
++    change = RemoteChange(seq=1, table="tasks", uid=task_id, op="upsert", fields={"priority": priority},
++                          version=version, hlc=f"0000000000002-0000-{sync_helpers.OTHER}",
++                          origin_gateway=sync_helpers.OTHER)
++    apply_remote_changes(conn, [change], new_cursor=1, observers=False)
++
++
++def staged_then_clamped(conn):
++    ids, attachment, digest = plan_helpers.setup_plan(conn)  # manifest old = [10000, 10000, 50000]
++    resend_from_board(conn, ids[2], 50000)
++    return ids, attachment, digest
++
++
++def reprioritized(conn, task_id):
++    return conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='reprioritized'",
++                        (task_id,)).fetchone()[0]
++
++
++def test_sync_resend_clamps_the_local_row_silently(conn):
++    """The precondition the migration must tolerate: clamped locally, raw on the Board, no event."""
++    ids, _, _ = staged_then_clamped(conn)
++    assert helpers.priorities(conn, ids) == [10000, 10000, PRIORITY_CAP]
++    assert reprioritized(conn, ids[2]) == 0
++
++
++def test_apply_after_sync_clamp_does_not_refuse(conn):
++    from hermes_cli import kanban_priority_executor as executor
++    ids, attachment, digest = staged_then_clamped(conn)
++    result = executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)
++    assert result["changed"] == 2
++    assert helpers.priorities(conn, ids) == [450, 10000, 900]
++    event = kb.list_events(conn, ids[2])[-1]
++    assert event.kind == "reprioritized"
++    assert event.payload["previous_priority"] == PRIORITY_CAP  # the value actually replaced, not the manifest's
++    assert executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)["changed"] == 0
++
++
++def test_guarded_restore_never_raises_above_cap_without_legacy_flag(conn):
++    from hermes_cli import kanban_priority_executor as executor
++    ids, attachment, digest = staged_then_clamped(conn)
++    executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)
++    result = executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME, undo=True)
++    assert result["changed"] == 2
++    assert helpers.priorities(conn, ids) == [PRIORITY_CAP, 10000, PRIORITY_CAP]
++    assert executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME, undo=True)["changed"] == 0
++    # A capped restore is the clamp-equivalent "old" state: apply can run again.
++    assert executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)["changed"] == 2
++    assert helpers.priorities(conn, ids) == [450, 10000, 900]
++
++
++def test_legacy_flag_restores_exact_originals_only_for_rows_apply_wrote(conn):
++    from hermes_cli import kanban_priority_executor as executor
++    ids, attachment, digest = staged_then_clamped(conn)
++    executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)
++    executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME, undo=True, allow_legacy_rollback=True)
++    assert helpers.priorities(conn, ids) == [10000, 10000, 50000]
++
++
++@pytest.mark.parametrize("allow_legacy_rollback", [False, True])
++def test_restore_of_a_never_applied_clamped_origin_is_a_noop(conn, allow_legacy_rollback):
++    """Run 2's guarded restore: apply refused, so restore must not refuse nor raise the clamped row."""
++    from hermes_cli import kanban_priority_executor as executor
++    ids, attachment, digest = staged_then_clamped(conn)
++    result = executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME, undo=True,
++                                     allow_legacy_rollback=allow_legacy_rollback)
++    assert result["changed"] == 0
++    assert helpers.priorities(conn, ids) == [10000, 10000, PRIORITY_CAP]
++
++
++@pytest.mark.parametrize("undo", [False, True])
++def test_a_real_edit_still_refuses(conn, undo):
++    """Clamp equivalence is exactly PRIORITY_CAP for an above-cap original; any other drift still refuses."""
++    from hermes_cli import kanban_priority_executor as executor
++    ids, attachment, digest = staged_then_clamped(conn)
++    if undo:
++        executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)
++    conn.execute("UPDATE tasks SET priority=? WHERE id=?", (PRIORITY_CAP - 1, ids[2]))
++    conn.commit()
++    before = helpers.priorities(conn, ids)
++    with pytest.raises(ValueError, match="priorities changed"):
++        executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME, undo=undo)
++    assert helpers.priorities(conn, ids) == before
++
++
++def test_clamp_equivalence_is_only_for_above_cap_originals():
++    from hermes_cli.kanban_priority import at_value
++    assert at_value(PRIORITY_CAP, 59000) and at_value(59000, 59000) and at_value(PRIORITY_CAP, PRIORITY_CAP)
++    assert not at_value(PRIORITY_CAP, 950)  # a raise of an in-band value is an edit
++    assert not at_value(PRIORITY_CAP - 1, 59000) and not at_value(900, 59000)
++
++
++def test_canonical_verify_restore_accepts_the_capped_restore():
++    from hermes_cli import kanban_priority_migration as migration
++    from hermes_cli import kanban_priority_prepare as prepare
++    from tests.hermes_cli.test_kanban_priority_verify import Canonical
++    rows = [{"id": "a", "priority": 59000, "created_on": "hub", "status": "ready"},
++            {"id": "b", "priority": 300, "created_on": "hub", "status": "ready"}]
++    manifest = migration.plan_global(rows, board_id="board", exceptions=[])
++    capped = [dict(rows[0], priority=PRIORITY_CAP), rows[1]]
++    assert prepare.verify(Canonical(capped), manifest, undo=True)["verified"] == 2
++    assert prepare.verify(Canonical(rows), manifest, undo=True)["verified"] == 2
++    with pytest.raises(ValueError, match="canonical"):
++        prepare.verify(Canonical(capped), manifest)  # apply direction stays exact
++    with pytest.raises(ValueError, match="canonical"):
++        prepare.verify(Canonical([rows[0], dict(rows[1], priority=PRIORITY_CAP)]), manifest, undo=True)
+diff --git a/tests/hermes_cli/test_kanban_priority_cli.py b/tests/hermes_cli/test_kanban_priority_cli.py
+index 88804a4d3e..f1213d0972 100644
+--- a/tests/hermes_cli/test_kanban_priority_cli.py
++++ b/tests/hermes_cli/test_kanban_priority_cli.py
+@@ -36,7 +36,9 @@ def test_cli_stage_apply_restore(conn, tmp_path, capsys):
+               '--writer', sync_helpers.ME]
+     assert cli.run(conn, args('--priority-operation', 'apply', *common)) == 0
+     assert helpers.helpers.priorities(conn, ids) == [899, 10000, 900]
+-    assert cli.run(conn, args('--priority-operation', 'restore', *common)) != 0
++    assert cli.run(conn, args('--priority-operation', 'restore', *common)) == 0  # capped: never above 1000
++    assert helpers.helpers.priorities(conn, ids) == [1000, 10000, 1000]
++    assert cli.run(conn, args('--priority-operation', 'apply', *common)) == 0
+     assert cli.run(conn, args('--priority-operation', 'restore', '--allow-legacy-rollback', *common)) == 0
+     assert helpers.helpers.priorities(conn, ids) == [10000, 10000, 50000]
+ 
+diff --git a/tests/hermes_cli/test_kanban_priority_executor.py b/tests/hermes_cli/test_kanban_priority_executor.py
+index 51bc6b983f..b922a849f4 100644
+--- a/tests/hermes_cli/test_kanban_priority_executor.py
++++ b/tests/hermes_cli/test_kanban_priority_executor.py
+@@ -123,12 +123,16 @@ def test_attached_manifest_is_validated_not_trusted(conn, mutation):
+     assert helpers.priorities(conn, ids) == before
+ 
+ 
+-def test_restore_requires_explicit_policy_rollback_and_cas(conn):
++def test_restore_caps_without_explicit_policy_rollback_and_keeps_cas(conn):
+     from hermes_cli import kanban_priority_executor as executor
+     ids, attachment, digest = setup_plan(conn)
+     executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)
+-    with pytest.raises(ValueError, match="explicit legacy policy rollback"):
+-        executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME, undo=True)
++    # Without the legacy flag a guarded restore never raises a card above the cap.
++    assert executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME, undo=True)["changed"] == 2
++    assert helpers.priorities(conn, ids) == [1000, 10000, 1000]
++    event = kb.list_events(conn, ids[2])[-1]
++    assert (event.payload["priority"], event.payload["manifest_priority"]) == (1000, 50000)
++    executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME)
+     assert helpers.priorities(conn, ids) == [450, 10000, 900]
+     result = executor.apply_attached(conn, attachment, digest, writer=sync_helpers.ME,
+                                      undo=True, allow_legacy_rollback=True)
+-- 
+2.43.0
+

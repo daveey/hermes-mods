@@ -1,0 +1,584 @@
+From efd9c1bca1c6bf79438b3b4d95457f44336eba76 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:01:01 +0000
+Subject: [PATCH] [daveey] kanban: courier and origin-bound creates join the
+ worker queue; move --pool repins any ready worker-first card
+
+t_01a1d0571c2f07d6 (defect kanban-71e066475f): after every gateway flipped to kanban.placement.worker_queue (11-12
+12:35Z), 8 cards created by 15:20Z still got placement_policy worker-first-v1, which reserves ONE worker and writes
+runs_on [machine:worker-N]. All 8 were courier/origin-bound creates on the hub (7 with hub_admission.entry=courier):
+courier_plan's deny called pool_route(queue=False), _origin_enrollment passed queue=False, and queue_decision
+excluded origin_intent. abec81ec81 introduced the courier/origin-bound exclusion without a reason; no constraint
+was found for it: runs_on is a Board placement field the hub (a Board primary) already writes for local creates,
+the courier envelope stores create_task options (runs_on included) immutably, and origin binding is a notify
+subscription independent of execution placement.
+
+- courier_plan: a deny takes pool_route with the queue (pool:worker + capability:hub-write), worker-first only
+  without a live label; it refuses only when neither is possible (it used to refuse whenever the hub had no
+  worker_pools entry, even with a live queue label).
+- _prior_landing: a replayed courier request rebuilds the queued runs_on, so a lost reply does not raise
+  origin_creation_conflict.
+- _origin_enrollment uses the queue like a local create; new _landing_placement applies a queued runs_on for
+  courier and origin-bound creates (the tool applied marker runs_on only on the routed path).
+- queue_decision no longer excludes origin_intent.
+- kanban_worker_repin: move --pool of a ready worker-first card (started or not) is a Board repin to
+  [pool:worker, *coordination labels]; the origin repin keeps its unstarted rule. The Board's repinWorker already
+  accepts any valid labels for a ready, unleased card of its creator, so no Board change is needed. Scheduled
+  cards stay refused (the Board requires ready); move them once they wake.
+
+Tests (tests/hermes_cli/test_kanban_pool_queue.py, test_kanban_worker_repin.py): courier deny -> [pool:worker,
+capability:hub-write] and replay; origin-bound tool create -> [pool:worker]; started worker-first card moves --pool;
+explicit pins, hub-pinned denies and no-queue-no-pool denies still refuse/win. 12 red on 59acb8fc0f, green on head;
+16 mutants of the added conditions: 15 killed, 1 equivalent (_pool_target's `extra - {label}`: required_labels
+never returns the pool label; kept for parity with pool_route).
+---
+ hermes_cli/kanban_hub_admission_placement.py |  18 ++-
+ hermes_cli/kanban_move.py                    |   2 +-
+ hermes_cli/kanban_worker_placement.py        |   8 +-
+ hermes_cli/kanban_worker_repin.py            |  67 ++++++---
+ tests/hermes_cli/test_kanban_pool_queue.py   | 145 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_worker_repin.py |  88 +++++++++++
+ tools/kanban_tools.py                        |   8 +-
+ tools/kanban_tools_placement.py              |  19 ++-
+ 8 files changed, 318 insertions(+), 37 deletions(-)
+
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index c3e7ab183e..edb9ea35d1 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -62,6 +62,8 @@ def _prior_landing(conn, request_id):
+     out = {"where": "local", "why": "courier replay", **({"hub_admission": audit} if audit else {})}
+     if options.get("placement_policy") == POLICY:
+         out.update(placement_policy=POLICY, why=WAITING, requires=options.get("requires"))
++    elif options.get("runs_on"):
++        out.update(runs_on=list(options["runs_on"]), requires=options.get("requires"))  # a queued deny
+     return out if audit or out.get("placement_policy") else {}
+ 
+ 
+@@ -69,8 +71,9 @@ def courier_plan(conn, args, runs_on, *, cfg=None, gateway=None, request_id=None
+     """A courier create landing on the hub: ``None`` (not hub-bound) or the admission placement.
+ 
+     Runs in the receiving ``kanban_create`` before its write transaction, before the card can be
+-    claimed. Admitted: ``{"hub_admission": audit}`` (stays here). Denied: worker-first enrollment
+-    with ``requires`` + ``hub:write``; ``where="refuse"`` when it cannot go to the pool. A request
++    claimed. Admitted: ``{"hub_admission": audit}`` (stays here). Denied: :func:`pool_route` with
++    ``requires`` + ``hub:write`` (the worker queue, else worker-first enrollment), as a local deny;
++    ``where="refuse"`` when it cannot go to the pool. A request
+     already applied reuses its stored placement and makes no model call.
+     """
+     from hermes_cli import kanban_placement as kp
+@@ -98,12 +101,15 @@ def courier_plan(conn, args, runs_on, *, cfg=None, gateway=None, request_id=None
+     audit = {**asdict(verdict), "entry": "courier"}
+     if verdict.admit:
+         return {"hub_admission": audit}
+-    if pinned or gateway not in (cfg.get("worker_pools") or {}):
+-        return {"where": "refuse", "why": verdict.why, "hub_admission": audit, "pin": "hub"}
+     requires = args.get("requires") or []
+     requires = [requires] if isinstance(requires, str) else list(requires)
+-    # Courier creation never takes the worker queue (queue_decision's own rule): worker-first.
+-    return pool_route(args, cfg, gateway, audit, list(dict.fromkeys([*requires, "hub:write"])), queue=False)
++    if pinned:
++        return {"where": "refuse", "why": verdict.why, "hub_admission": audit, "pin": "hub"}
++    # The worker queue exactly as for a local deny (t_01a1d0571c2f07d6); worker-first only without a live label.
++    out = pool_route(args, cfg, gateway, audit, list(dict.fromkeys([*requires, "hub:write"])))
++    if out.get("runs_on") is None and gateway not in (cfg.get("worker_pools") or {}):
++        return {"where": "refuse", "why": verdict.why, "hub_admission": audit, "pin": "hub"}
++    return out
+ 
+ 
+ def gate_move(conn, task_id, runs_on, *, cfg=None):
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 0da674524a..3cae7ff2ba 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -250,7 +250,7 @@ def move_queued(conn: sqlite3.Connection, task_id: str, *, runs_on: Any, reason:
+     from hermes_cli import kanban_worker_repin as repin
+     if repin.applies(conn, task_id):
+         # A worker-first card's placement is Board-owned: a local relabel would be stripped, so only the Board's
+-        # explicit repin to the origin is supported (kanban_worker_repin); every other target refuses.
++        # explicit repin (to the worker queue, or to the origin) is supported (kanban_worker_repin).
+         try:
+             labels = wn.normalize_runs_on(runs_on)
+         except ValueError as exc:
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index df3f2f2910..d71e46473c 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -59,14 +59,16 @@ def queue_decision(args, cfg, gateway, pin, origin_intent, machine_ok=None):
+     """``runs_on: [<pool label>, *coordination labels]`` for a portable card of a ``worker_queue`` gateway, or None.
+ 
+     One queue instead of a machine pin: no worker is chosen at creation, so a held or full worker never strands the
+-    card while another has free slots. None (legacy routing applies) for a pin, an explicit ``runs_on``, courier
+-    creation, non-portable work, or when no active, unheld machine carries the label. [daveey]
++    card while another has free slots. None (legacy routing applies) for a pin, an explicit ``runs_on``,
++    non-portable work, or when no active, unheld machine carries the label. Courier and origin-bound creates queue
++    too: chat ownership pins storage, not execution (t_01a1d0571c2f07d6). [daveey]
+     """
+     from hermes_cli import kanban_placement as placement
+     from hermes_cli import kanban_placement_coordination as coordination
+ 
++    del origin_intent  # kept for callers; it does not change execution routing
+     label = placement._Cfg(cfg).queue_label(gateway)
+-    if not label or pin not in ("", "auto") or args.get("runs_on") is not None or origin_intent is not None:
++    if not label or pin not in ("", "auto") or args.get("runs_on") is not None:
+         return None
+     if placement.portable_reason(args, cfg):
+         return None
+diff --git a/hermes_cli/kanban_worker_repin.py b/hermes_cli/kanban_worker_repin.py
+index cd9199f59b..d4b711a3e0 100644
+--- a/hermes_cli/kanban_worker_repin.py
++++ b/hermes_cli/kanban_worker_repin.py
+@@ -1,5 +1,5 @@
+-"""Explicit repin of an unstarted worker-first card back to its origin: ``hermes kanban move <id> --runs-on
+-machine:<origin>``. [daveey]
++"""Explicit Board repin of a worker-first card: to the worker queue (``hermes kanban move <id> --pool``), or of an
++unstarted card back to its origin (``--runs-on machine:<origin>``). [daveey]
+ 
+ A ``worker-first-v1`` card's ``runs_on`` and ``placement_policy`` are Board-owned: the Board refuses an ordinary
+ field edit (``placement_fenced``) and the outbox strips ``runs_on`` from a policy card's push
+@@ -10,10 +10,11 @@ exact acknowledged revision; it clears the policy and its reservation and sets t
+ 
+ Scope (everything else refuses and writes nothing):
+ 
+-* the card is ``worker-first-v1``, ``ready``, created on this gateway, with no local claim, no Board lease, no
+-  ``started_at`` and no run row (never started anywhere);
+-* the target is exactly ``[machine:<this gateway>]`` (the origin); another target is refused
+-  ``repin_unavailable`` instead of a local relabel the Board would strip;
++* the card is ``worker-first-v1``, ``ready``, created on this gateway, with no local claim and no Board lease;
++* the target is ``[<pool label>]`` (``--pool``: the Board gets ``[<pool label>, *the card's coordination labels]``,
++  so ``requires: [hub:write]`` keeps ``capability:hub-write``; a started card may go, since any worker resumes
++  it from what it pushed), or exactly ``[machine:<this gateway>]`` (the origin) for a card with no ``started_at``
++  and no run row; another target is refused ``repin_unavailable`` instead of a local relabel the Board would strip;
+ * the board is a Board primary, its ``sync_version`` is acknowledged and no task edit is pending in the outbox;
+ * the Hub identity used is this board's own gateway.
+ 
+@@ -64,6 +65,23 @@ def _board_code(detail: str) -> Optional[str]:
+     return None
+ 
+ 
++def _pool_label() -> str:
++    from hermes_cli.kanban_placement import POOL_LABEL
++    return POOL_LABEL
++
++
++def _pool_target(row: sqlite3.Row) -> Optional[list[str]]:
++    """``[<pool label>, *coordination labels]`` for the card, as the worker queue writes them at creation
++    (``requires: [hub:write]`` -> ``capability:hub-write``), or None for an action no worker is labelled for."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_placement_coordination as coordination
++    task = kb.Task.from_row(row)
++    extra = coordination.required_labels({"title": task.title, "body": task.body, "skills": task.skills,
++                                          "requires": task.requires})
++    label = _pool_label()
++    return None if extra is None else [label, *sorted(extra - {label})]
++
++
+ def eligibility(conn: sqlite3.Connection, task_id: str, labels: list[str]) -> dict[str, Any]:
+     """Local preconditions (read-only, no transaction held). ``{"ok": True, me, board, revision, previous}`` or a
+     refusal dict."""
+@@ -77,16 +95,17 @@ def eligibility(conn: sqlite3.Connection, task_id: str, labels: list[str]) -> di
+     if not me or not board:
+         return _refuse("not_synced", "this board has no Board sync identity")
+     row = conn.execute(
+-        "SELECT status, placement_policy, created_on, claim_lock, lease_holder, started_at, current_run_id, "
+-        "sync_version, runs_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        "SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+     if row is None:
+         return _refuse("not_found", f"task {task_id} not found")
+     origin = f"machine:{me}"
+-    unavailable = (f"{task_id} is placed by the worker-first policy; the only supported move is the Board repin "
+-                   f"of an unstarted ready card to its origin (--runs-on {origin})")
++    pool = labels == [_pool_label()]
++    unavailable = (f"{task_id} is placed by the worker-first policy; the supported moves are the Board repin of a "
++                   f"ready card to the worker queue (--pool) or of an unstarted ready card to its origin "
++                   f"(--runs-on {origin})")
+     if row["placement_policy"] != wp.POLICY:
+         return _refuse("repin_unavailable", f"{task_id} has unknown placement policy {row['placement_policy']!r}")
+-    if labels != [origin]:
++    if not pool and labels != [origin]:
+         return _refuse("repin_unavailable", unavailable + f"; {labels} is not that target")
+     if row["created_on"] != me:
+         return _refuse("repin_unavailable", unavailable + f"; it was created on {row['created_on']!r}, not {me}")
+@@ -94,10 +113,18 @@ def eligibility(conn: sqlite3.Connection, task_id: str, labels: list[str]) -> di
+         return _refuse("repin_unavailable", unavailable + f"; it is {row['status']}, not ready")
+     if row["claim_lock"] is not None or row["lease_holder"] is not None:
+         return _refuse("repin_unavailable", unavailable + "; it holds a claim or Board lease")
+-    started = row["started_at"] is not None or row["current_run_id"] is not None or conn.execute(
+-        "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)).fetchone() is not None
++    # A started card may join the queue: any worker resumes it from what it pushed (t_01a1d0571c2f07d6). Only the
++    # origin repin, which runs it where it was created, stays limited to cards that never started.
++    started = not pool and (row["started_at"] is not None or row["current_run_id"] is not None or conn.execute(
++        "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)).fetchone() is not None)
+     if started:
+         return _refuse("repin_unavailable", unavailable + "; it has already started")
++    if pool:
++        target = _pool_target(row)
++        if target is None:
++            return _refuse("repin_unavailable", f"{task_id} names an action no pool worker is labelled for; "
++                                                "it keeps its worker-first placement")
++        labels = target
+     if row["sync_version"] is None or conn.execute(
+             "SELECT 1 FROM kanban_sync_outbox WHERE table_name = 'tasks' AND row_uid = ? AND state = 'pending' "
+             "LIMIT 1", (task_id,)).fetchone() is not None:
+@@ -107,7 +134,8 @@ def eligibility(conn: sqlite3.Connection, task_id: str, labels: list[str]) -> di
+         previous = json.loads(row["runs_on"]) if row["runs_on"] else None
+     except (TypeError, ValueError):
+         previous = None
+-    return {"ok": True, "me": me, "board": board, "revision": int(row["sync_version"]), "previous": previous}
++    return {"ok": True, "me": me, "board": board, "revision": int(row["sync_version"]), "previous": previous,
++            "labels": labels, "matches": [] if pool else [me]}
+ 
+ 
+ def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], reason: str, *,
+@@ -136,7 +164,7 @@ def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], r
+     reply: Any = None
+     for attempt in range(CONFLICT_ATTEMPTS):
+         try:
+-            reply = hub.repin(board, task_id=task_id, expected_revision=pre["revision"], runs_on=labels)
++            reply = hub.repin(board, task_id=task_id, expected_revision=pre["revision"], runs_on=pre["labels"])
+             break
+         except client.HubError as exc:
+             if exc.status >= 500:
+@@ -168,13 +196,14 @@ def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], r
+     try:
+         with kb.write_txn(conn):
+             kb._append_event(conn, task_id, km.MOVED_EVENT, {
+-                "from_machine": me, "runs_on": labels, "previous_runs_on": pre["previous"], "reason": reason[:500],
+-                "move_no": move_no, "forced": False, "matches": [me], "queued": True, REPINNED_EVENT_FLAG: True,
++                "from_machine": me, "runs_on": pre["labels"], "previous_runs_on": pre["previous"],
++                "reason": reason[:500],
++                "move_no": move_no, "forced": False, "matches": pre["matches"], "queued": True, REPINNED_EVENT_FLAG: True,
+                 "board_version": version})
+     except sqlite3.Error:
+         pass  # the Board's own placement_repinned event still records the change
+ 
+-    out = {"ok": True, "runs_on": labels, "matches": [me], "move_no": move_no, "status": "ready",
++    out = {"ok": True, "runs_on": pre["labels"], "matches": pre["matches"], "move_no": move_no, "status": "ready",
+            REPINNED_EVENT_FLAG: True, "board_version": version, "readback": "pending"}
+     try:
+         client.pull(conn, hub, board, observers=True, partition=me)
+@@ -187,7 +216,7 @@ def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], r
+         local = json.loads(row["runs_on"]) if row and row["runs_on"] else None
+     except (TypeError, ValueError):
+         local = None
+-    if row is not None and row["placement_policy"] is None and local == labels:
++    if row is not None and row["placement_policy"] is None and local == pre["labels"]:
+         out["readback"] = "confirmed"
+         out["status"] = row["status"]
+     else:
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index e2ccc20431..43ea2c142b 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -398,3 +398,148 @@ def test_direct_create_task_keeps_pool_enrollment_when_it_cannot_queue(hub, monk
+     sync.set_mode(hub.conn, "off")  # runs_on is a Board placement field: off a primary, enroll instead
+     tid = kb.create_task(hub.conn, title="summarise the failing CI jobs", assignee="default", requires=[])
+     assert _runs_on(hub.conn, tid) is None and kb.get_task(hub.conn, tid).placement_policy == "worker-first-v1"
++
++
++# --- courier and origin-bound creates (t_01a1d0571c2f07d6) ------------------------------------------------------
++# 11-12 12:40Z-15:16Z: after every gateway flipped to the queue, 7 of 8 new worker-first cards on the hub were
++# routed (courier) creates the hub admission judge denied, and the 8th was origin-bound: both entries still took
++# worker-first, which reserves one worker and writes runs_on [machine:worker-N].
++
++def _intent(request_id):
++    return {"request_id": request_id, "owner": {"gateway": HUB, "profile": "default", "board": "default"},
++            "origin": {"gateway": "macbook", "profile": "default", "session": "s_mac"}}
++
++
++def _created(conn, tid):
++    return next(json.loads(p) for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created'", (tid,)))
++
++
++@pytest.fixture
++def judge(monkeypatch):
++    from tests.hermes_cli.hub_judge_support import FakeJudge
++    from hermes_cli import kanban_hub_admission as admission
++    fake = FakeJudge()
++    monkeypatch.setattr(admission, "admit", fake)
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
++    return fake
++
++
++@pytest.mark.parametrize("pools", [False, True])
++def test_courier_create_denied_by_hub_admission_joins_the_pool_queue(hub, judge, monkeypatch, pools):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**CFG, **({"worker_pools": {HUB: ["worker-1"]}} if pools else {})})
++    machines = [{**m, "labels": [*m["labels"], "capability:hub-write"]} if m["name"] == "worker-2" else m
++                for m in _machines(held=("worker-1",)).values()]
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": machines})  # worker-2 is a hub-write worker
++    judge.admit_next = False
++    args = {"title": "Read ~/.hermes/logs/agent.log on the hub", "requires": [], "assignee": "default"}
++    out = json.loads(kt._handle_create(dict(args), origin_intent=_intent(f"request-courier-{pools}")))
++    tid = out.get("task_id")
++    assert tid and len(judge.calls) == 1, out
++    assert sorted(_runs_on(hub.conn, tid) or []) == ["capability:hub-write", POOL], out  # never machine:worker-N
++    task = kb.get_task(hub.conn, tid)
++    assert task.placement_policy is None and "hub:write" in (task.requires or [])
++    created = _created(hub.conn, tid)
++    assert created["placement_policy"] is None and created["hub_admission"]["entry"] == "courier", created
++    # A re-applied request (lost reply) rebuilds the identical envelope: same card, no judge call, no conflict.
++    again = json.loads(kt._handle_create(dict(args), origin_intent=_intent(f"request-courier-{pools}")))
++    assert again.get("task_id") == tid and again.get("code") != "origin_creation_conflict", again
++    assert len(judge.calls) == 1
++
++
++def test_courier_create_keeps_worker_first_only_without_a_live_queue_label(hub, judge, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**CFG, "worker_pools": {HUB: ["worker-1"]}})
++    _registry(held=("worker-1", "worker-2"))  # no unheld machine carries the label
++    judge.admit_next = False
++    out = json.loads(kt._handle_create({"title": "Read ~/.hermes/logs/agent.log on the hub", "requires": [],
++                                        "assignee": "default"}, origin_intent=_intent("request-courier-held")))
++    assert _runs_on(hub.conn, out["task_id"]) is None, out
++    assert kb.get_task(hub.conn, out["task_id"]).placement_policy == "worker-first-v1"
++
++
++def test_courier_create_refuses_with_neither_a_live_queue_label_nor_a_worker_pool(hub, judge, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: dict(CFG))  # no worker_pools entry for the hub
++    _registry(held=("worker-1", "worker-2"))  # and no unheld machine carries the queue label
++    judge.admit_next = False
++    out = json.loads(kt._handle_create({"title": "Read ~/.hermes/logs/agent.log on the hub", "requires": [],
++                                        "assignee": "default"}, origin_intent=_intent("request-courier-nowhere")))
++    assert out.get("code") == "placement_unavailable" and not out.get("created"), out
++
++
++def test_courier_explicit_machine_pin_still_wins(hub, judge, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**CFG, "worker_pools": {HUB: ["worker-1"]}})
++    _registry()
++    judge.admit_next = False
++    out = json.loads(kt._handle_create({"title": "summarise CI", "requires": [], "assignee": "default",
++                                        "runs_on": ["machine:worker-2"]}, origin_intent=_intent("request-pinned")))
++    assert _runs_on(hub.conn, out["task_id"]) == ["machine:worker-2"], out
++    assert judge.calls == [] and kb.get_task(hub.conn, out["task_id"]).placement_policy is None
++
++
++@pytest.mark.parametrize("extra", [{"runs_on": [f"machine:{HUB}"]}, {"workspace_kind": "dir", "workspace_path": "/srv/x"}])
++def test_courier_create_pinned_to_the_hub_is_refused_when_denied(hub, judge, monkeypatch, extra):
++    # A denied hub pin (or a host workspace) cannot move to the queue: the creator re-places it; no card is made.
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**CFG, "worker_pools": {HUB: ["worker-1"]}})
++    _registry()
++    judge.admit_next = False
++    before = hub.conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
++    out = json.loads(kt._handle_create({"title": "Read ~/.hermes/logs/agent.log on the hub", "requires": [],
++                                        "assignee": "default", **extra},
++                                       origin_intent=_intent(f"request-pinned-deny-{sorted(extra)[0]}")))
++    assert out.get("code") == "placement_unavailable" and not out.get("created"), out
++    assert len(judge.calls) == 1
++    assert hub.conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
++
++
++@pytest.fixture
++def origin_ok(monkeypatch):
++    from hermes_cli import kanban_origin
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: (HUB, {HUB, "macbook"}))
++    monkeypatch.setattr(kanban_origin, "bind", lambda conn, tid, origin, board=None: {"origin": origin.ref})
++
++
++@pytest.mark.parametrize("pools", [False, True])
++def test_origin_bound_tool_create_joins_the_pool_queue(hub, origin_ok, monkeypatch, pools):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**CFG, **({"worker_pools": {HUB: ["worker-1"]}} if pools else {})})
++    _registry(held=("worker-1",))
++    out = json.loads(kt._handle_create({"title": "summarise the failing CI jobs", "assignee": "default",
++                                        "requires": [], "origin_session": "macbook:abc123"}))
++    assert out.get("ok") and _runs_on(hub.conn, out["task_id"]) == [POOL], out
++    assert kb.get_task(hub.conn, out["task_id"]).placement_policy is None
++    assert _created(hub.conn, out["task_id"])["placement_policy"] is None
++
++
++def test_origin_bound_explicit_pins_still_win(hub, origin_ok, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**CFG, "worker_pools": {HUB: ["worker-1"]}})
++    _registry()
++    base = {"title": "summarise the failing CI jobs", "assignee": "default", "requires": [],
++            "origin_session": "macbook:abc123"}
++    out = json.loads(kt._handle_create({**base, "runs_on": ["machine:worker-2"]}))
++    assert out.get("ok") and _runs_on(hub.conn, out["task_id"]) == ["machine:worker-2"], out
++    out = json.loads(kt._handle_create({**base, "placement": "local", "title": "summarise CI here"}))
++    assert out.get("ok") and _runs_on(hub.conn, out["task_id"]) is None, out
++    assert kb.get_task(hub.conn, out["task_id"]).placement_policy is None
++
++
++def test_queue_decision_does_not_exclude_courier_creation():
++    from hermes_cli import kanban_worker_placement as wp
++    out = wp.queue_decision({"title": "summarise CI"}, CFG, HUB, "auto", {"request_id": "r"}, lambda _label: True)
++    assert out is not None and out["runs_on"] == [POOL], out
++
++
++def test_a_callers_runs_on_beats_a_queued_landing(monkeypatch):
++    from tools import kanban_tools_placement as ktp
++    queued = {"where": "local", "runs_on": [POOL]}
++    monkeypatch.setattr(ktp, "_origin_enrollment", lambda *a, **kw: queued)
++    monkeypatch.setattr(ktp, "_courier_landing", lambda conn, args, intent, marker, runs_on, **kw: marker)
++    assert ktp._landing_placement(None, {}, object(), None, None, ["machine:worker-2"], title="t") == (
++        queued, ["machine:worker-2"])
++    assert ktp._landing_placement(None, {}, object(), None, None, None, title="t") == (queued, [POOL])
+diff --git a/tests/hermes_cli/test_kanban_worker_repin.py b/tests/hermes_cli/test_kanban_worker_repin.py
+index df6f94e0b6..9bf25800f3 100644
+--- a/tests/hermes_cli/test_kanban_worker_repin.py
++++ b/tests/hermes_cli/test_kanban_worker_repin.py
+@@ -88,6 +88,7 @@ def test_origin_repin_uses_board_cas_and_local_policy_changes_only_by_pull(gws,
+     hub = RepinHub(svc, HUB, during=lambda: seen.append(_local(origin.conn, tid)))
+     res = km.move_queued(origin.conn, tid, runs_on=["machine:hub"], reason="run it on the hub", hub=hub)
+     assert res["ok"] and res["repinned"] and res["readback"] == "confirmed", res
++    assert res["matches"] == [HUB]  # the origin repin names the machine it lands on
+     assert hub.repins == [{"task_id": tid, "expected_revision": revision, "runs_on": ["machine:hub"]}]
+     assert seen == [(wp.POLICY, None, "ready")]  # nothing local was edited before the Board answered
+     assert _local(origin.conn, tid) == (None, ["machine:hub"], "ready")
+@@ -377,3 +378,90 @@ def test_manual_and_running_cards_keep_the_generic_path(conn):
+     assert res["reason_code"] == "no_machine"  # unchanged: the generic move never targets this machine
+     for status in ("running", "done", "archived"):
+         assert not repin.applies(conn, _acknowledged(conn, status=status))
++
++
++# --- --pool: any worker-first card that is ready goes to the one worker queue (t_01a1d0571c2f07d6) -----------------
++# 11-12 13:15Z: t_01a1cf7624ae27d9 (worker-first, started once, 765 re-reservations onto one worker) could not be
++# moved: `move --pool` refused repin_unavailable, and the origin-repin workaround only covers unstarted cards.
++
++def _started(origin, tid):
++    origin.conn.execute("INSERT INTO task_runs(task_id, status, started_at) VALUES(?, 'released', 1)", (tid,))
++    origin.conn.commit()
++
++
++def test_cli_move_pool_repins_a_started_worker_first_card(gws, svc, monkeypatch):
++    from hermes_cli import kanban as kcli
++    origin, _ = gws
++    tid, revision = _policy_card(origin)
++    _started(origin, tid)
++    hubs = []
++    monkeypatch.setattr(ksc, "load_identity", lambda cfg=None: ksc.Identity("https://hub.test", "k", HUB))
++    monkeypatch.setattr(ksc, "Hub", lambda ident, *a, **kw: hubs.append(RepinHub(svc, ident.gateway)) or hubs[-1])
++    out = json.loads(kcli.run_slash(f'move {tid} --pool --reason "one worker reserved for 4 h" --json'))
++    assert out["ok"] and out["readback"] == "confirmed" and out["runs_on"] == ["pool:worker"], out
++    assert hubs[0].repins == [{"task_id": tid, "expected_revision": revision, "runs_on": ["pool:worker"]}]
++    assert _local(origin.conn, tid) == (None, ["pool:worker"], "ready")
++    [ev] = _moved(origin.conn, tid)
++    assert ev["repinned"] is True and ev["runs_on"] == ["pool:worker"] and ev["previous_runs_on"] is None, ev
++    assert out["matches"] == [] == ev["matches"]  # the queue names no machine: whichever worker is free claims it
++
++
++def test_move_pool_keeps_the_cards_coordination_labels(gws, svc):
++    origin, _ = gws
++    origin.enter()
++    tid = kb.create_task(origin.conn, title="Read ~/.hermes/logs on the hub", assignee="default",
++                         placement_policy=wp.POLICY, requires=["hub:write"])
++    origin.round()
++    origin.round()
++    hub = RepinHub(svc, HUB)
++    res = km.move_queued(origin.conn, tid, runs_on=["pool:worker"], reason="any hub-write worker", hub=hub)
++    assert res["ok"] and res["readback"] == "confirmed", res
++    target = ["pool:worker", "capability:hub-write"]
++    assert hub.repins[0]["runs_on"] == target  # only a hub-write worker claims it
++    assert res["runs_on"] == target == _moved(origin.conn, tid)[-1]["runs_on"]
++    assert _local(origin.conn, tid)[:2] == (None, target)
++
++
++@pytest.mark.parametrize("fields,code", [
++    ({"status": "todo"}, "repin_unavailable"),
++    ({"claim_lock": "local:1"}, "repin_unavailable"),
++    ({"lease_holder": "worker-1", "lease_expires": 1}, "repin_unavailable"),
++    ({"created_on": "other"}, "repin_unavailable"),
++    ({"sync_version": None}, "not_acknowledged"),
++])
++def test_move_pool_still_refuses_what_the_board_refuses(conn, fields, code):
++    tid = _acknowledged(conn, **fields)
++    res = km.move_queued(conn, tid, runs_on=["pool:worker"], reason="x", hub=NoCallHub())
++    assert res["reason_code"] == code and not res["ok"], res
++    assert not _moved(conn, tid)
++
++
++class _RecordHub(NoCallHub):
++    def __init__(self):
++        self.calls = []
++
++    def repin(self, board, **kw):
++        self.calls.append(kw)
++        raise ksc.HubError(409, json.dumps({"error": "not_claimable"}))
++
++
++@pytest.mark.parametrize("started", [{"started_at": 1}, {"current_run_id": 7}])
++def test_move_pool_of_a_started_card_reaches_the_board(conn, started):
++    tid = _acknowledged(conn, **started)
++    hub = _RecordHub()
++    res = km.move_queued(conn, tid, runs_on=["pool:worker"], reason="x", hub=hub)
++    assert [c["runs_on"] for c in hub.calls] == [["pool:worker"]], res
++    origin = km.move_queued(conn, tid, runs_on=["machine:hub"], reason="x", hub=NoCallHub())
++    assert origin["reason_code"] == "repin_unavailable" and "started" in origin["error"]  # origin repin unchanged
++
++
++def test_move_to_another_single_machine_still_refuses(conn):
++    tid = _acknowledged(conn)
++    res = km.move_queued(conn, tid, runs_on=["machine:worker-1"], reason="x", hub=NoCallHub())
++    assert res["reason_code"] == "repin_unavailable"
++
++
++def test_move_pool_refuses_a_card_whose_action_no_worker_is_labelled_for(conn):
++    tid = _acknowledged(conn, title="Run install-boards.py on the hub")
++    res = km.move_queued(conn, tid, runs_on=["pool:worker"], reason="x", hub=NoCallHub())
++    assert res["reason_code"] == "repin_unavailable" and "no pool worker" in res["error"], res
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 4c3fdb33d8..e93843b539 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -25,7 +25,7 @@ from hermes_cli.kanban_capabilities import check_tool_create, declaration_requir
+ from hermes_cli import kanban_contract_cli as _contract_cli, kanban_overlap, kanban_reason_comment as krc
+ from tools.kanban_tools_placement import (_local_placement, _machine_placement, _marker_placement_fields, _persisted_session_id,
+                                           _create_session_id, _placement_origin, _placement_refused, _runs_where,
+-                                          _effective_board_args, _origin_enrollment, _courier_landing, _pinned_note,
++                                          _effective_board_args, _origin_enrollment, _landing_placement, _pinned_note,
+                                           _admission_refused, _effective_requires, _with_admission)
+ # SSRF-checked capped download lives in a sibling; tests monkeypatch it on this module.
+ from tools.kanban_tools_attach_url import _download_url_with_cap
+@@ -1657,10 +1657,8 @@ def _handle_create(args: dict, **kw) -> str:
+             _pin = _kp.explicit_foreign_pin(args, _reg.self_gateway())
+             if _pin:
+                 return _placement_refused(_pin, "an origin-bound card is created on this gateway")
+-        marker_placement = _origin_enrollment(args, origin, marker_placement, assignee=assignee,
+-                                               skills=skills, project_id=project_id)
+-        marker_placement = _courier_landing(conn, args, origin_intent, marker_placement, runs_on, title=title,
+-                                            assignee=assignee, skills=skills, project_id=project_id)
++        marker_placement, runs_on = _landing_placement(conn, args, origin, origin_intent, marker_placement, runs_on,
++                                                       title=title, assignee=assignee, skills=skills, project_id=project_id)
+         _admission_refused(marker_placement)  # raises the typed refusal for a denied hub pin
+         try:
+             new_tid = kb.create_task(
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index 630141f08c..02847b8d7e 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -31,10 +31,23 @@ def _origin_enrollment(args, origin, marker, **effective):
+     cfg, gateway = kp.config(), kp.reg.self_gateway()
+     from hermes_cli.kanban_hub_admission_placement import apply
+     view = {**args, **effective}
++    # Execution routing is the same as a local create's (worker queue first); only storage is pinned here.
+     decision = creation_decision(view, cfg, gateway,
+-                                 kp.canonical_pin(args.get("placement") or "auto", gateway, cfg), None,
+-                                 queue=False)  # [daveey] origin-bound: the worker queue is not applied here
+-    return apply(view, decision or {"where": "local", "why": "origin-bound storage"}, gateway, cfg, queue=False)
++                                 kp.canonical_pin(args.get("placement") or "auto", gateway, cfg), None)
++    return apply(view, decision or {"where": "local", "why": "origin-bound storage"}, gateway, cfg)
++
++
++def _landing_placement(conn, args, origin, origin_intent, marker, runs_on, *, title, **effective):
++    """``(marker, runs_on)`` after origin-bound enrollment and the courier landing judgement. [daveey]
++
++    A queued outcome (``runs_on: [<pool label>, ...]``) becomes the card's ``runs_on`` unless the caller gave one;
++    t_01a1d0571c2f07d6: both entries used to take worker-first, which pins one worker.
++    """
++    marker = _origin_enrollment(args, origin, marker, **effective)
++    marker = _courier_landing(conn, args, origin_intent, marker, runs_on, title=title, **effective)
++    if runs_on is None and (marker or {}).get("runs_on"):
++        runs_on = list(marker["runs_on"])
++    return marker, runs_on
+ 
+ 
+ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
+-- 
+2.43.0
+

@@ -1,0 +1,381 @@
+From 433a5f064b13369c4b7840a39c8d7debd4e7d25c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:56:54 +0000
+Subject: [PATCH] [daveey] fix(update): active-work carries the checkpoint's
+ own verdict; a refused pause announces no restart
+
+example-host 2026-11-12 18:11Z: at the instant cap hermes-sync's census read
+`active=7 units=7 (cron,managed)`, saw no unpreservable kind and launched the
+updater; the gateway then refused the checkpoint ("unpreservable work: 1 chat
+turn (active=7, preservable managed=3, cron=3)"). Three units were Kanban cards
+and three cut cron runs; the seventh was an executing turn outside
+`_running_agents` that `_describe_active_work` pads in as a sessionless
+`managed` unit (`uncounted_runtime_work_units`), which `kanban_managed_count`
+rightly does not preserve. Unit kinds cannot carry the checkpoint's predicate.
+
+- update_checkpoint.checkpoint_work(runner, cron_cut): the checkpoint's count
+  check as one dict (active, preservable_managed, cron, preservable);
+  checkpoint_for_update uses it.
+- The unscoped `active-work` answer carries it as `checkpoint` (cron cut), so
+  an updater census decides with the same predicate. Omitted when unreadable.
+- The refusal names work outside its probes as "N other unit(s) (an unmapped
+  turn, a side agent or a managed turn that is not a Kanban card)" and names
+  chat-turn session keys again: `_running_agents` on GatewayRunner is a live
+  SessionFieldView (a Mapping), not a dict, so the keys were always dropped.
+- update_cmd_posix_pause: when every gateway refused the pause (each left the
+  set via mark_stop_refused) print "No gateway was stopped ...; nothing to
+  restart" instead of "Recovery: restarting the stopped gateways on the old
+  code"; the settle call still runs.
+
+Tests: test_update_checkpoint_census_agreement.py drives real GatewayRunner
+accounting through the hub's 18:11:25Z shape (census and refusal agree, before
+and after the turn's agent is mapped; cards + cut cron preservable; a non-card
+managed turn unpreservable; unreadable verdict omitted) and
+test_a_refused_pause_announces_no_restart runs the real _stop_gateways and
+mark_stop_refused. 5 of the 7 new tests fail on main.
+
+Card t_01a1d106ee4eacff.
+---
+ gateway/run_active_work_verb.py               |  18 ++-
+ gateway/update_checkpoint.py                  |  33 +++-
+ hermes_cli/update_cmd_posix_pause.py          |   9 +-
+ ...test_update_checkpoint_census_agreement.py | 145 ++++++++++++++++++
+ .../test_update_preswap_deadline.py           |  31 ++++
+ 5 files changed, 225 insertions(+), 11 deletions(-)
+ create mode 100644 tests/gateway/test_update_checkpoint_census_agreement.py
+
+diff --git a/gateway/run_active_work_verb.py b/gateway/run_active_work_verb.py
+index ae0560e2ac..70fb4dad16 100644
+--- a/gateway/run_active_work_verb.py
++++ b/gateway/run_active_work_verb.py
+@@ -9,6 +9,10 @@ running process instead: the same units the drain report publishes plus every li
+ turn whose agent runs under the gateway's core-update pause hook
+ (``session_update_pause_hook.update_pausable``), i.e. a pause request parks it at a step boundary with a
+ durable checkpoint. Every other unit (api, managed, cron, delegation) only finishes or is cut.
++
++An unscoped answer also carries ``checkpoint`` (``update_checkpoint.checkpoint_work`` with cron cut): whether the
++instant-update checkpoint would preserve this work, by its own count check. Unit kinds alone cannot say so: a
++``managed`` unit also stands for an unmapped turn, a side agent or a managed turn that is not a Kanban card.
+ """
+ 
+ from __future__ import annotations
+@@ -53,6 +57,18 @@ def _profile_units(runner, profile: str, units: list[dict[str, Any]]) -> list[di
+             + [{"kind": "side_agent", "pid": pid}] * sides)
+ 
+ 
++def _checkpoint_field(runner) -> dict[str, Any]:
++    """``{"checkpoint": ...}``: the instant-update checkpoint's own verdict on this work with cron cut
++    (``update_checkpoint.checkpoint_work``), so an updater census agrees with the refusal it would get
++    instead of inferring preservability from unit kinds. Empty when it cannot be read: a consumer then
++    keeps its kind-based census and the checkpoint stays the atomic gate."""
++    try:
++        from gateway.update_checkpoint import checkpoint_work
++        return {"checkpoint": checkpoint_work(runner, cron_cut=True)}
++    except Exception:  # health: allow BLE001 -- an unreadable verdict is omitted, never reported as preservable
++        return {}
++
++
+ def active_work_verb(runner, loop) -> Callable[[], dict[str, Any]]:
+     """Handler for the control socket: runs on its executor thread, reads the runner on the loop."""
+ 
+@@ -77,7 +93,7 @@ def active_work_verb(runner, loop) -> Callable[[], dict[str, Any]]:
+                                                 if u.get("profile") == profile]})
+                 else:
+                     box.append({"active_agents": runner._active_work_count(), "active_work": units,
+-                                "parked_work": runner._describe_parked_work()})
++                                "parked_work": runner._describe_parked_work(), **_checkpoint_field(runner)})
+             finally:
+                 done.set()
+ 
+diff --git a/gateway/update_checkpoint.py b/gateway/update_checkpoint.py
+index 30ecc59917..d86aa84372 100644
+--- a/gateway/update_checkpoint.py
++++ b/gateway/update_checkpoint.py
+@@ -9,6 +9,7 @@ import json
+ import os
+ import threading
+ import time
++from collections.abc import Mapping
+ from pathlib import Path
+ 
+ from hermes_constants import get_default_hermes_root, get_hermes_home
+@@ -67,11 +68,25 @@ def checkpoint_inventory():
+             "reservation_ids": sorted(known_cron_reservations())}
+ 
+ 
++def checkpoint_work(runner, *, cron_cut: bool) -> dict:
++    """The checkpoint's own arithmetic: ``preservable`` iff every unit of the work total is a confirmed
++    Kanban card or (when cron is cut) a cron run or its agent turn. The ``active-work`` verb publishes
++    the same dict, so an updater census decides with this predicate instead of guessing from unit kinds:
++    a ``managed`` unit there also covers unmapped turns, side agents and managed turns that are not
++    cards, none of which a checkpoint preserves (example-host 2026-11-12 18:11Z)."""
++    cron = runner._active_cron_job_count() + cron_turn_count(runner) if cron_cut else 0
++    managed = kanban_managed_count(runner)
++    total = runner._active_work_count()
++    return {"active": total, "preservable_managed": managed, "cron": cron,
++            "preservable": total == managed + cron}
++
++
+ def _unpreservable_work(runner, managed: int, cron: int) -> str:
+     """Name the work a checkpoint cannot carry, by kind (and session for chat turns), for the refusal
+     reason the updater prints. Best effort: the count check itself already decided."""
+     parts = []
+-    with_keys = getattr(runner, "_running_agents", None)
++    named = 0
++    with_keys = getattr(runner, "_running_agents", None)  # a live SessionFieldView on GatewayRunner, not a dict
+     probes = (("chat turn", getattr(runner, "_running_agent_count", None)),
+               ("API-server run", getattr(runner, "_active_api_run_count", None)),
+               ("deferred agent worker", getattr(runner, "_active_deferred_agent_worker_count", None)))
+@@ -83,14 +98,18 @@ def _unpreservable_work(runner, managed: int, cron: int) -> str:
+             count = 0
+         if count <= 0:
+             continue
++        named += count
+         text = f"{count} {label}{'s' if count != 1 else ''}"
+-        if label == "chat turn" and isinstance(with_keys, dict) and with_keys:
++        if label == "chat turn" and isinstance(with_keys, Mapping) and with_keys:
+             text += " (" + ", ".join(sorted(str(k) for k in with_keys)[:4]) + ")"
+         parts.append(text)
+     try:
+         total = int(runner._active_work_count())
+     except Exception:  # health: allow BLE001 -- see above
+         total = -1
++    if (other := total - managed - cron - named) > 0:
++        parts.append(f"{other} other unit{'s' if other != 1 else ''} (an unmapped turn, a side agent or "
++                     "a managed turn that is not a Kanban card)")
+     summary = "; ".join(parts) or "work the gateway cannot classify"
+     return (f"unpreservable work: {summary} (active={total}, preservable managed={managed}, cron={cron}); "
+             "retry once it finishes")
+@@ -143,15 +162,13 @@ def checkpoint_for_update(runner, loop, params):
+                 why[0] = f"{len(unknown)} admission reservation(s) not published by a cut cron run"
+                 return
+             from gateway.run_active_work_verb import _delegation_units
+-            # A cut cron run includes its agent turn on this owner (``cron_turn_count``).
+-            cron = (runner._active_cron_job_count() + cron_turn_count(runner)
+-                    if intent.get("cron_cut") is True else 0)
+             if delegations := _delegation_units(time.time()):
+                 why[0] = f"{len(delegations)} live async delegation(s) the checkpoint cannot preserve"
+                 return
+-            managed = kanban_managed_count(runner)
+-            if runner._active_work_count() != managed + cron:
+-                why[0] = _unpreservable_work(runner, managed, cron)
++            # A cut cron run includes its agent turn on this owner (``cron_turn_count``).
++            work = checkpoint_work(runner, cron_cut=intent.get("cron_cut") is True)
++            if not work["preservable"]:
++                why[0] = _unpreservable_work(runner, work["preservable_managed"], work["cron"])
+                 return
+             preserve_cron_slots(runner.config)
+             # Atomically claim permission versus the handler's timeout. Never hold
+diff --git a/hermes_cli/update_cmd_posix_pause.py b/hermes_cli/update_cmd_posix_pause.py
+index 4b3af66128..b1584e5846 100644
+--- a/hermes_cli/update_cmd_posix_pause.py
++++ b/hermes_cli/update_cmd_posix_pause.py
+@@ -1039,8 +1039,13 @@ def _pause(token: dict) -> str | None:
+     except BaseException as exc:  # health: allow BLE001 -- interruption must settle before cmd_update releases its fence
+         from hermes_cli.update_cmd_windows import _resume_windows_gateways_after_update
+         print(f"  ↷ Update deferred: {exc or type(exc).__name__}; the checkout was not changed")
+-        print("  ↻ Recovery (a separate phase after the stop deadline, not bounded by it): "
+-              f"restarting {_describe(token) or 'the stopped gateways'} on the old code...")
++        # A gateway that refused the pause left the set (``mark_stop_refused``): it was never stopped and owes
++        # no restart. Say so instead of announcing a restart of nothing (example-host 2026-11-12 18:11Z).
++        if token.get("posix_units") or token.get("unmapped") or token.get("profiles"):
++            print("  ↻ Recovery (a separate phase after the stop deadline, not bounded by it): "
++                  f"restarting {_describe(token) or 'the stopped gateways'} on the old code...")
++        else:
++            print("  ↻ No gateway was stopped (each refused or was never asked); nothing to restart")
+         try:
+             _resume_windows_gateways_after_update(token)
+         except Exception as again:  # health: allow BLE001 -- still owed: completion restarts them after the deps
+diff --git a/tests/gateway/test_update_checkpoint_census_agreement.py b/tests/gateway/test_update_checkpoint_census_agreement.py
+new file mode 100644
+index 0000000000..9575488507
+--- /dev/null
++++ b/tests/gateway/test_update_checkpoint_census_agreement.py
+@@ -0,0 +1,145 @@
++"""The ``active-work`` census and the instant-update checkpoint agree on what the checkpoint preserves.
++
++example-host 2026-11-12 18:11Z: at the instant cap hermes-sync's census read ``active=7 units=7
++(cron,managed)``, found no unpreservable kind and launched the update; 9 s later the gateway refused the
++checkpoint (``preservable managed=3, cron=3``). Three units were Kanban cards and three were cron runs; the
++seventh was an executing session outside ``_running_agents`` (a turn before its agent is mapped), which
++``_describe_active_work`` lists as a sessionless ``managed`` unit while ``kanban_managed_count`` (rightly)
++does not preserve it. Once its agent was mapped it became the "1 chat turn" the refusal named.
++
++Real ``GatewayRunner`` accounting (``_describe_active_work``, ``_active_work_count``, the legacy
++``_running_agents`` view, ``uncounted_runtime_work``, ``kanban_managed_count``, ``cron_turn_count``) over
++stub authorities; only the cron scheduler's registry and the session policy lookup are faked.
++"""
++import json
++import os
++import threading
++import time
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from gateway import session_policy
++from gateway.run import GatewayRunner
++from hermes_cli import admission_fence
++
++CRON_JOBS = ("59ba0ea8ec4f", "1676d7b6a28c", "353210256a77")
++
++
++class _Task:
++    def done(self):
++        return False
++
++
++def _live(route, source):
++    return SimpleNamespace(route=route, source=source, task=_Task(),
++                           event_stream=SimpleNamespace(execution={"execution_generation": 1}))
++
++
++def _card_worker(pid):
++    return SimpleNamespace(kanban_card=True, closed=threading.Event(), worker=(pid,))
++
++
++@pytest.fixture
++def hub(tmp_path, monkeypatch):
++    """The 18:11:25Z gateway: 3 Kanban card workers, 3 cron runs, 1 executing turn not yet mapped."""
++    from cron import scheduler
++    from gateway import update_checkpoint as checkpoint
++    monkeypatch.setattr(session_policy, "policy_for_source",
++                        lambda runner, source: SimpleNamespace(source=source))
++    monkeypatch.setattr(scheduler, "get_running_job_ids", lambda: frozenset(CRON_JOBS))
++    monkeypatch.setattr(scheduler, "get_wedged_job_ids", lambda: frozenset())
++    monkeypatch.setattr(scheduler, "get_running_job_details", lambda: [
++        {"job_id": job, "elapsed_s": 60.0, "worker_pid": None, "restart_safe": False} for job in CRON_JOBS])
++    monkeypatch.setattr("gateway.run_active_work_verb._delegation_units", lambda now: [])
++
++    sessions = {f"local-card{i}": _live(f"agent:main:kanban:{i}", "kanban") for i in range(3)}
++    sessions["local-dcf9"] = _live("agent:main:local:dm:local-dcf9", "gui")
++    authority = SimpleNamespace(sessions=sessions, _mutation_tasks=set(), _side_agents={},
++                                _managed_workers={f"local-card{i}": _card_worker(1000 + i) for i in range(3)})
++    runner = object.__new__(GatewayRunner)
++    runner.adapters = {}
++    runner.session_authorities = [authority]
++    runner.config = object()
++    runner.request_restart = Mock(return_value=True)
++
++    home = tmp_path / "home"
++    (home / "core-update").mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(checkpoint, "get_hermes_home", lambda: home)
++    monkeypatch.setattr(checkpoint, "get_default_hermes_root", lambda **kw: home)
++    monkeypatch.setattr(checkpoint, "known_cron_reservations", lambda: set())
++    monkeypatch.setattr(checkpoint, "preserve_cron_slots", Mock())
++    admission_fence.set_hold(home)
++    (home / "core-update/intent").write_text(json.dumps(
++        {"pid": os.getpid(), "kind": "unfenced", "checkpoint": True, "cron_cut": True,
++         "created_at": time.time(), "expires_at": time.time() + 120, "nonce": "episode-one"}))
++    return SimpleNamespace(runner=runner, checkpoint=checkpoint)
++
++
++def census(runner):
++    from gateway.run_active_work_verb import active_work_verb
++    return active_work_verb(runner, SimpleNamespace(call_soon_threadsafe=lambda fn: fn()))({})
++
++
++def ask_checkpoint(hub):
++    return hub.checkpoint.checkpoint_for_update(
++        hub.runner, SimpleNamespace(call_soon_threadsafe=lambda fn: fn()), {"nonce": "episode-one"})
++
++
++def test_the_census_at_the_cap_reports_the_unit_the_checkpoint_refuses(hub):
++    answer = census(hub.runner)
++    kinds = sorted({unit["kind"] for unit in answer["active_work"]})
++    # What hermes-sync logged: kinds alone show nothing the checkpoint refuses...
++    assert answer["active_agents"] == len(answer["active_work"]) == 7 and kinds == ["cron", "managed"]
++    # ...but the census now carries the checkpoint's own verdict on the same work.
++    assert answer["checkpoint"] == {"active": 7, "preservable_managed": 3, "cron": 3, "preservable": False}
++    refused = ask_checkpoint(hub)
++    assert refused["busy"] and not refused.get("pausing")
++    hub.runner.request_restart.assert_not_called()
++    assert refused["reason"].startswith("unpreservable work: 1 other unit (an unmapped turn, a side agent or a "
++                                        "managed turn that is not a Kanban card) (active=7, preservable "
++                                        "managed=3, cron=3)")
++
++
++def test_once_mapped_the_same_turn_is_a_named_chat_turn_in_both(hub):
++    """9 s later the turn's agent was mapped: census shows a chat unit, the refusal names its session key
++    (the live ``_running_agents`` is a SessionFieldView, not a dict, so the key used to be dropped)."""
++    hub.runner._running_agents["agent:main:local:dm:local-dcf9"] = SimpleNamespace()
++    answer = census(hub.runner)
++    assert [u["session"] for u in answer["active_work"] if u["kind"] == "chat"] == ["agent:main:local:dm:local-dcf9"]
++    assert answer["checkpoint"]["preservable"] is False and answer["active_agents"] == 7
++    assert ask_checkpoint(hub)["reason"].startswith(
++        "unpreservable work: 1 chat turn (agent:main:local:dm:local-dcf9) (active=7, preservable managed=3, cron=3)")
++
++
++def test_cards_and_cut_cron_alone_are_preservable_in_both(hub):
++    authority = hub.runner.session_authorities[0]
++    del authority.sessions["local-dcf9"]
++    answer = census(hub.runner)
++    assert answer["checkpoint"] == {"active": 6, "preservable_managed": 3, "cron": 3, "preservable": True}
++    assert ask_checkpoint(hub)["pausing"] is True
++
++
++def test_a_managed_turn_that_is_not_a_card_is_unpreservable_in_both(hub):
++    authority = hub.runner.session_authorities[0]
++    del authority.sessions["local-dcf9"]
++    authority._managed_workers["local-card0"].kanban_card = False  # a managed Desktop turn
++    answer = census(hub.runner)
++    assert {u["kind"] for u in answer["active_work"]} == {"cron", "managed"}
++    assert answer["checkpoint"]["preservable"] is False
++    assert "1 other unit" in ask_checkpoint(hub)["reason"]
++
++
++def test_an_unreadable_verdict_is_omitted_not_reported_preservable(hub, monkeypatch):
++    monkeypatch.setattr(hub.checkpoint, "kanban_managed_count", Mock(side_effect=RuntimeError("boom")))
++    answer = census(hub.runner)
++    assert "checkpoint" not in answer and len(answer["active_work"]) == 7
++
++
++def test_a_profile_scoped_answer_carries_no_whole_gateway_verdict(hub):
++    from gateway.run_active_work_verb import active_work_verb
++    hub.runner._served_profile_homes = {}
++    answer = active_work_verb(hub.runner, SimpleNamespace(call_soon_threadsafe=lambda fn: fn()))({"profile": "x"})
++    assert "checkpoint" not in answer
+diff --git a/tests/hermes_cli/test_update_preswap_deadline.py b/tests/hermes_cli/test_update_preswap_deadline.py
+index 02d0a296ae..518db2666f 100644
+--- a/tests/hermes_cli/test_update_preswap_deadline.py
++++ b/tests/hermes_cli/test_update_preswap_deadline.py
+@@ -407,3 +407,34 @@ def test_recovery_is_announced_as_its_own_phase(monkeypatch, capsys):
+     out = capsys.readouterr().out
+     assert resumed and "stuck" in verdict
+     assert "Recovery (a separate phase" in out
++
++
++def test_a_refused_pause_announces_no_restart(monkeypatch, capsys):
++    """example-host 2026-11-12 18:11Z: the only gateway refused the checkpoint, left the set
++    (``mark_stop_refused``) and was never stopped, yet update.log said "restarting the stopped gateways"."""
++    from hermes_cli import update_pause_record as record
++    from hermes_cli import update_cmd_windows as windows
++    monkeypatch.delenv(pause.STOP_BUSY_ENV, raising=False)
++    unit = {"kind": "systemd", "scope": "user", "unit": "hermes-gateway", "pid": 5, "home": "/h"}
++    monkeypatch.setattr(pause, "_discover_systemd", lambda: [unit])
++    monkeypatch.setattr(pause, "_discover_launchd", list)
++    monkeypatch.setattr(pause, "_left_running", lambda u, j: (u, j, []))
++    monkeypatch.setattr(pause, "_discover_bare", lambda pids: ([], []))
++    from gateway import status
++    monkeypatch.setattr(status, "get_process_start_time", lambda pid: 1)
++    monkeypatch.setattr(record, "identity", lambda pid=None: {"ct": "ct:1"})
++    for name in ("record_pause", "mark_stop_requested", "mark_stop_sent", "sync", "write"):
++        monkeypatch.setattr(record, name, lambda *a, **k: None)
++
++    def refuse(entry):
++        entry["refusal_reason"] = "gateway refused the update checkpoint: unpreservable work: 1 chat turn"
++        return False
++    monkeypatch.setattr(pause, "_ask_to_drain", refuse)  # the real _stop_gateways + mark_stop_refused run
++    resumed = []
++    monkeypatch.setattr(windows, "_resume_windows_gateways_after_update", lambda t: resumed.append(dict(t)))
++    verdict = pause._pause(pause._empty_token())
++    out = capsys.readouterr().out
++    assert "busy or cannot acknowledge an idle pause" in verdict
++    assert "restarting" not in out and "Recovery (a separate phase" not in out
++    assert "No gateway was stopped" in out
++    assert resumed and not resumed[0]["posix_units"]  # the settle still runs, with nothing owed
+-- 
+2.43.0
+

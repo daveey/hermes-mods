@@ -17,10 +17,10 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 The [2253 regex escape repair](hostname-escape-repair.md) is a **mandatory post-replay
-overlay** in the Applying recipe below, re-bound to snapshot 2909 by `repair_hostname_escapes_2909.py` (snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
+overlay** in the Applying recipe below, re-bound to snapshot 2926 by `repair_hostname_escapes_2926.py` (snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
 placement regexes; the original verifier proves historical fidelity, not regex validity.
 
-2909 patches, one entry per non-merge source commit through `79dfcc03fbd86bb2b0566c6cec520aac044148ec`.
+2926 patches, one entry per non-merge source commit through `7c2041e566300d382437e3c0fd8976219a110f14`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -29,11 +29,33 @@ follows 1281 although it sorts at position 1259 by date. Each patch is identifie
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
 Upstream exclusion tip: `e3bf4be5df04cf72dab4914b073361c71af1dbe1`; current merge-base: `78abaafcccec20a546c94e8734a70e38c08a6a69`.
-Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All forty-one published bridges remain unchanged; three source-derived integration bridges precede entries 2254, 2255 and 2256 (44 total). The bridge before 2087 excludes the six byte-identical path deltas carried by patch 2087. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Entries 2410–2491, 2492–2563, 2564–2678 and 2679–2726 and 2727–2909 contain no merges and need no new bridge. Current snapshot: [mirror-replay-2909.json](mirror-replay-2909.json), [mirror-policy-2909.json](mirror-policy-2909.json), and [executed proof](mirror-2909-verification.md). Previous snapshots: [mirror-2678-verification.md](mirror-2678-verification.md), [mirror-2563-verification.md](mirror-2563-verification.md), [mirror-2491-verification.md](mirror-2491-verification.md), [mirror-2409-verification.md](mirror-2409-verification.md), [mirror-2253-verification.md](mirror-2253-verification.md). The following links retain historical verification:
-Previous replay: [mirror-replay-2018.json](mirror-replay-2018.json) (twenty-four hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-2018.json](mirror-policy-2018.json). Executed checks: [mirror-2018-verification.md](mirror-2018-verification.md); previous snapshots: [mirror-2017-verification.md](mirror-2017-verification.md), [mirror-2016-verification.md](mirror-2016-verification.md), [mirror-2015-verification.md](mirror-2015-verification.md), [mirror-2010-verification.md](mirror-2010-verification.md), [mirror-2005-verification.md](mirror-2005-verification.md), [mirror-2004-verification.md](mirror-2004-verification.md), [mirror-1988-verification.md](mirror-1988-verification.md), [mirror-1979-verification.md](mirror-1979-verification.md), [mirror-1932-verification.md](mirror-1932-verification.md), [mirror-1923-verification.md](mirror-1923-verification.md), [mirror-1918-verification.md](mirror-1918-verification.md), [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
+Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All forty-one published bridges remain unchanged; three source-derived integration bridges precede entries 2254, 2255 and 2256 (44 total). The bridge before 2087 excludes the six byte-identical path deltas carried by patch 2087. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Entries 2410–2491, 2492–2563, 2564–2678 and 2679–2726 and 2727–2926 contain no merges and need no new bridge. Current snapshot: [mirror-replay-2926.json](mirror-replay-2926.json), [mirror-policy-2926.json](mirror-policy-2926.json), and [executed proof](mirror-2926-verification.md). Previous snapshots: [mirror-2678-verification.md](mirror-2678-verification.md), [mirror-2563-verification.md](mirror-2563-verification.md), [mirror-2491-verification.md](mirror-2491-verification.md), [mirror-2409-verification.md](mirror-2409-verification.md), [mirror-2253-verification.md](mirror-2253-verification.md). The following links retain historical verification:
+Previous replay: [mirror-replay-2018.json](mirror-replay-2018.json) (twenty-four hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-2018.json](mirror-policy-2018.json). Executed checks: [mirror-2018-verification.md](mirror-2018-verification.md); previous snapshots: [mirror-2909-verification.md](mirror-2909-verification.md), [mirror-2726-verification.md](mirror-2726-verification.md), [mirror-2017-verification.md](mirror-2017-verification.md), [mirror-2016-verification.md](mirror-2016-verification.md), [mirror-2015-verification.md](mirror-2015-verification.md), [mirror-2010-verification.md](mirror-2010-verification.md), [mirror-2005-verification.md](mirror-2005-verification.md), [mirror-2004-verification.md](mirror-2004-verification.md), [mirror-1988-verification.md](mirror-1988-verification.md), [mirror-1979-verification.md](mirror-1979-verification.md), [mirror-1932-verification.md](mirror-1932-verification.md), [mirror-1923-verification.md](mirror-1923-verification.md), [mirror-1918-verification.md](mirror-1918-verification.md), [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror follow-ups 2910–2926
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [`--up-to` refusal metric class](mirror-2926-followups.md) | 2910 | A refused `hermes update --up-to` is counted as `failure_class = up_to_refused` instead of `aborted_before_apply`. |
+| [Always-on rollover warms every unarchived board](mirror-2926-followups.md) | 2911 | The roller also warms each unarchived Kanban board the successor lists before switching traffic. |
+| [`--up-to` refusal metric class](mirror-2926-followups.md) | 2912 | Test-only: a pre-receipt `up_to_refused` stop keeps its class, creates no receipt and validates against the v4 schema. |
+| [Test-only hygiene: node-deps gate, takeover import, clarify wait](mirror-2926-followups.md) | 2913 | Test-only: the stopped-owner node-deps test now proves the pnpm shim was still gated when stopped. |
+| [Worker-queue placement for courier and origin-bound creates](mirror-2926-followups.md) | 2914 | Hub-denied courier creates and origin-bound creates join the worker queue, and `kanban move --pool` repins any ready worker-first card. |
+| [Test-only hygiene: node-deps gate, takeover import, clarify wait](mirror-2926-followups.md) | 2915 | Test-only: drop a redundant local `import os` in the foreign-namespace takeover test. |
+| [Priority migration tolerates the sync clamp](mirror-2926-followups.md) | 2916 | Priority migrate/restore treat a cap-clamped replica value as holding an above-cap manifest original; guarded restore caps instead of refusing. |
+| [Update checkpoint census agrees with the checkpoint](mirror-2926-followups.md) | 2917 | `active-work` carries the checkpoint's own verdict, refusals name unmapped units, and a refused pause announces no restart. |
+| [Cron aborted-drain latch and shared shutdown predicate](mirror-2926-followups.md) | 2918 | An aborted restart-wait drain keeps the run's shutdown latch (safe-side rerun) and the fallback shares the owner-draining predicate. |
+| [Test-only hygiene: node-deps gate, takeover import, clarify wait](mirror-2926-followups.md) | 2919 | Test-only: the clarify timeout test waits for the withdrawal frame and asserts its exact payload. |
+| [macOS state CI lane on main only for state-surface pushes](mirror-2926-followups.md) | 2920 | The standalone macOS state lane runs on main pushes only for the classifier's state surface, with a four-hourly scheduled backstop. |
+| [macOS state CI lane on main only for state-surface pushes](mirror-2926-followups.md) | 2921 | Corrects the paths-filter limit comment and asserts the filter patterns use only `*` and `**`. |
+| [Desktop update pause withdraws prepared approvals](mirror-2926-followups.md) | 2922 | A Desktop turn pausing for update withdraws unanswered approval requests (neither approving nor denying) so it can reach its boundary. |
+| [Lifecycle-scan depth exhaustion reported as an incomplete scan](mirror-2926-followups.md) | 2923 | Hitting the referenced-script depth limit on executed text now says the scan was incomplete rather than implying a detected gateway command. |
+| [Desktop unread-dot rationale comments](mirror-2926-followups.md) | 2924 | Comment-only: explains why profile and bot unread dots stay plain and what an outcome tone would require. |
+| [Desktop unread-dot rationale comments](mirror-2926-followups.md) | 2925 | Comment-only: qualifies the rationale for all-profiles scope. |
+| [Owner-terminal ask lint](owner-terminal-ask-lint-2131.md) | 2926 | Reject article-free and possessive owner-chat relays; preserve attested canonical owner-terminal actions. |
 
 ## Mirror follow-ups 2727–2909
 
@@ -1656,16 +1678,16 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **2909-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply forty-four bridges and three ancestry-only markers from `mirror-replay-2909.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **2926-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply forty-four bridges and three ancestry-only markers from `mirror-replay-2926.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip 79dfcc03fbd86bb2b0566c6cec520aac044148ec \
+  --source-tip 7c2041e566300d382437e3c0fd8976219a110f14 \
   --base e3bf4be5df04cf72dab4914b073361c71af1dbe1 \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-2909.json" \
-  --replay-plan "$MODS/core/mirror-replay-2909.json"
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-2926.json" \
+  --replay-plan "$MODS/core/mirror-replay-2926.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -1806,12 +1828,12 @@ git commit -m 'Explicit upstream integration bridge before 2255'
 git am -3 --empty=keep "${patches[@]:2254:1}"
 git apply --index --3way "$MODS/core/bridges/upstream-78abaafcccec-via-9f84f76fc8c.diff"
 git commit -m 'Explicit upstream integration bridge before 2256'
-git am -3 --empty=keep "${patches[@]:2255:654}"
+git am -3 --empty=keep "${patches[@]:2255:671}"
 # Mandatory additive repair: historical mails intentionally remain immutable.
-python3 -B "$MODS/core/repair_hostname_escapes_2909.py" --tree "$PWD"
+python3 -B "$MODS/core/repair_hostname_escapes_2926.py" --tree "$PWD"
 git add hermes_cli/kanban_placement.py
 git commit -m 'Repair historical hostname regex word boundaries'
-python3 -B "$MODS/core/repair_hostname_escapes_2909.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
+python3 -B "$MODS/core/repair_hostname_escapes_2926.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Use Git 2.51 or newer for the replay: Git 2.43's three-way merge conflicts on patch 0032 (`apps/shared/src/gateway-contract.openrpc.json`), which later Git versions merge cleanly. Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

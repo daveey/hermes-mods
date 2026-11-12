@@ -1,0 +1,92 @@
+From 26822308d7b9c4f6b6c6919adec016b779cbb98a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:35:46 +0000
+Subject: [PATCH] [daveey] cron: document aborted-drain latch and share
+ shutdown predicate
+
+Keep the per-run shutdown latch after an aborted restart-wait drain: the reasonless forwarded cancel is ambiguous, and the existing single restart-cut rerun is safer than a failure. Reuse _owner_draining in the execution fallback rather than duplicate its sticky-interrupt predicate.
+
+Proof: 47 tests pass in test_session_cron.py and test_shutdown_interrupt.py. A draining-only fallback mutant fails interrupt_only with lost-ownership ERROR instead of shutdown WARNING. Added aborted_drain coverage keeps the owner running and verifies the restart-cut result flag.
+---
+ gateway/session_cron.py            | 10 ++++++----
+ tests/gateway/test_session_cron.py | 25 +++++++++++++++++++++----
+ 2 files changed, 27 insertions(+), 8 deletions(-)
+
+diff --git a/gateway/session_cron.py b/gateway/session_cron.py
+index 9306f5adef..fe05d1b5b4 100644
+--- a/gateway/session_cron.py
++++ b/gateway/session_cron.py
+@@ -268,7 +268,11 @@ def latch_stop(authority, cancel):
+     what stopped it. The fact is latched at stop time because the run thread reads it up to a poll
+     later, after the shutdown's last phase has reset ``runner._draining`` (cron-7c04faf754: the
+     run then reported "cron fire ownership was lost" and was booked failed). The first stop wins:
+-    a latch already set by another stop (a real takeover's forwarded cancel) keeps its meaning."""
++    a latch already set by another stop (a real takeover's forwarded cancel) keeps its meaning.
++
++    This is permanent for the run, even if the restart-wait drain is aborted and the owner keeps
++    serving. A real lost-claim cancel forwarded during that drain is indistinguishable from a
++    shutdown cancel: prefer the safe-side single restart-cut rerun over booking a failure."""
+     if not cancel.is_set() and _owner_draining(authority):
+         cancel.owner_shutdown = True
+     cancel.set()
+@@ -368,12 +372,10 @@ async def execute(authority, ref, row, policy):
+             def _stopped_by_own_shutdown():
+                 if fire_interrupted_by_shutdown(job_id) or _latched_owner_shutdown(cancel, execution_id):
+                     return True
+-                runner = getattr(authority, 'runner', None)
+                 if cancel_requested(execution_id):
+                     return False
+                 # The interrupt latch outlives stop()'s ``_draining`` reset (see _restart_cut).
+-                return bool(getattr(runner, '_interrupting_remaining_work', False)
+-                            or getattr(runner, '_draining', False))
++                return _owner_draining(authority)
+ 
+             stop = _CombinedCancelEvent(
+                 CancelRequest(execution_id),
+diff --git a/tests/gateway/test_session_cron.py b/tests/gateway/test_session_cron.py
+index 652974418e..be3f8ea75f 100644
+--- a/tests/gateway/test_session_cron.py
++++ b/tests/gateway/test_session_cron.py
+@@ -254,8 +254,9 @@ async def test_draining_owner_answers_an_external_firers_cron_observation_over_t
+ 
+ 
+ @pytest.mark.asyncio
++@pytest.mark.parametrize('stop_case', ['shutdown', 'aborted_drain', 'interrupt_only'])
+ async def test_forwarded_cancel_during_owner_restart_stays_a_restart_cut_after_the_drain_ends(
+-        tmp_path, monkeypatch, caplog):
++        tmp_path, monkeypatch, caplog, stop_case):
+     """cron-7c04faf754 round 2: the fire was handed to a restart-safe worker, so this owner's
+     process holds no scheduler interrupted mark for it. The stop forwarded while the owner drains
+     for its restart must keep meaning "this owner's shutdown" after ``_stop_persist_exit_state``
+@@ -286,9 +287,25 @@ async def test_forwarded_cancel_during_owner_restart_stays_a_restart_cut_after_t
+     seen = {}
+ 
+     def run_job(job, *, extra_prompt, execution_id, cancel_event):
+-        runner._draining = True  # the owner's core-update restart drain begins mid-run
+-        asyncio.run_coroutine_threadsafe(session_cron.operation(authority, 'cancel', params, actor), loop).result(10)
+-        runner._draining = False  # _stop_persist_exit_state, before the run's next poll
++        if stop_case == 'interrupt_only':
++            # Legacy/raw cancellation has no owner_shutdown latch. Only the sticky interrupt
++            # remains after stop(), so execute's fallback must share _owner_draining's meaning.
++            cancel = authority._cron_cancellations[row['admission_id']]
++            cancel.set()
++            assert not getattr(cancel, 'owner_shutdown', False)
++            runner._interrupting_remaining_work = True
++        else:
++            runner._draining = True  # the owner's restart-wait drain begins mid-run
++            runner._running = True
++            asyncio.run_coroutine_threadsafe(session_cron.operation(authority, 'cancel', params, actor), loop).result(10)
++            runner._draining = False
++            if stop_case == 'aborted_drain':
++                # The forwarded cancel can be a real lost claim: aborting restart-wait keeps
++                # serving, but deliberately does not revoke this run's safe-side rerun latch.
++                assert runner._running and not runner._interrupting_remaining_work
++                assert authority._cron_cancellations[row['admission_id']].owner_shutdown
++            else:
++                runner._running = False  # _stop_persist_exit_state before the next poll
+         seen['reason'] = reason = cancel_reason(cancel_event)
+         seen['shutdown'] = cancel_is_shutdown(cancel_event)
+         error = CronShutdownInterrupted if seen['shutdown'] else RuntimeError
+-- 
+2.43.0
+

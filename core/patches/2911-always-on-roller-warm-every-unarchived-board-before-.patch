@@ -1,0 +1,103 @@
+From b32659eeca1761cd1c54459bf496483e01ea26d3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:27:56 +0000
+Subject: [PATCH] always-on roller: warm every unarchived board before
+ switching
+
+Live 18:41Z on example-host: right after a warm switch Desktop's reconnect read the rarely-polled
+boards (askeve, bb, runners, example-tools) cold. Board reads share 2 admission slots
+(coalesced_read max_concurrent=2), so those first reads queued the already-warm board=default
+behind them for 18-22 s (accept poll: 35 kanban/board requests over 5 s, max 22.2 s).
+
+The roll now lists the successor's /api/plugins/kanban/boards and adds GET /board for every
+unarchived slug to the warm set (best effort; no list = previous behaviour).
+
+Task: t_01a1d09123dbb9c4
+---
+ hermes_cli/always_on_rollover.py            | 24 +++++++++++++++++-
+ tests/hermes_cli/test_always_on_rollover.py | 27 +++++++++++++++++++++
+ 2 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/always_on_rollover.py b/hermes_cli/always_on_rollover.py
+index 794f2d2aa5..70a00762a7 100644
+--- a/hermes_cli/always_on_rollover.py
++++ b/hermes_cli/always_on_rollover.py
+@@ -562,7 +562,9 @@ class Roller:
+                 f" :{active_port or '-'}")
+             self._abandon(port, active_port)
+             return False
+-        warm = self.warm(port, self.replay_paths(record.get("pid") if record else None))
++        paths = self.replay_paths(record.get("pid") if record else None)
++        paths += [p for p in self.board_paths(port) if p not in paths]
++        warm = self.warm(port, paths)
+         body = self.health(port) if self.unit_active(port) else None  # it may have died while it warmed
+         if body is None:
+             log(f"roll: backend :{port} stopped answering while it warmed; keeping :{active_port or '-'}")
+@@ -590,6 +592,26 @@ class Roller:
+         return None
+ 
+     # -- warming --
++    def board_paths(self, port: int) -> list[str]:
++        """GET /board for every unarchived board the successor lists. Desktop reads the rarely-polled boards
++        on reconnect, and board reads share 2 admission slots, so one cold board queues the warm ones behind
++        its first read (live 18:41Z: board=default waited 18-22 s). Best effort: no list, no extra paths."""
++        try:
++            status, _elapsed, body = self.get(port, "/api/plugins/kanban/boards", WARM_REQUEST_TIMEOUT_S)
++        except Exception:  # health: allow BLE001 -- warming is best effort: no list, no extra paths
++            return []
++        if status != 200 or not isinstance(body, dict) or not isinstance(body.get("boards"), list):
++            return []
++        out: list[str] = []
++        for board in body["boards"]:
++            slug = board.get("slug") if isinstance(board, dict) else None
++            if not isinstance(slug, str) or not slug or board.get("archived"):
++                continue
++            url = "/api/plugins/kanban/board?board=" + urllib.parse.quote(slug, safe="")
++            if url not in out:
++                out.append(url)
++        return out
++
+     def replay_paths(self, old_pid: object) -> list[str]:
+         """The default reads plus the allowlisted GETs (with their queries) the old backend served in the
+         last two hours, from loop-watch's request_stats. Best effort: no log, no replays."""
+diff --git a/tests/hermes_cli/test_always_on_rollover.py b/tests/hermes_cli/test_always_on_rollover.py
+index 3145b44517..6de55d3812 100644
+--- a/tests/hermes_cli/test_always_on_rollover.py
++++ b/tests/hermes_cli/test_always_on_rollover.py
+@@ -257,6 +257,33 @@ def test_roll_warms_the_successor_before_switching_and_never_stops_the_old_backe
+     assert ro.is_superseded(9148)
+ 
+ 
++def test_roll_warms_every_board_on_disk_not_only_the_replayed_ones(home):
++    # Live 18:41Z: right after a switch Desktop's reconnect read the rarely-polled boards (bb, hermes, ...)
++    # cold. Board reads share 2 admission slots, so those cold first reads queued the warm board=default
++    # read for 18-22 s. Every board the successor lists must be warm before it takes traffic.
++    host = FakeHost(running={9148}, commits={9148: "a" * 40})
++    real_get = host.get
++
++    def get(port, path, timeout):
++        if path == "/api/plugins/kanban/boards" and port in host.running:
++            host.gets.append((port, path))
++            return 200, 0.01, {"boards": [{"slug": "default"}, {"slug": "bb"}, {"slug": "paint bot"},
++                                          {"slug": "old", "archived": 1}, {"slug": ""}, {"nope": 1}],
++                                "current": "default"}
++        return real_get(port, path, timeout)
++
++    ro.write_active(9148)
++    roller = make_roller(home, host)
++    roller.get = get
++    assert roller.roll("test") is True
++    warmed = [path for port, path in host.gets if port == 9149]
++    assert "/api/plugins/kanban/board?board=bb" in warmed
++    assert "/api/plugins/kanban/board?board=paint%20bot" in warmed
++    assert warmed.count("/api/plugins/kanban/board?board=default") == 2  # once per round, not duplicated
++    assert "/api/plugins/kanban/board?board=" not in warmed
++    assert "/api/plugins/kanban/board?board=old" not in warmed  # archived boards are not polled
++
++
+ def test_roll_that_never_answers_keeps_the_old_backend_active(home):
+     host = FakeHost(running={9148}, commits={9148: "a" * 40})
+     host_get = host.get
+-- 
+2.43.0
+

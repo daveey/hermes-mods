@@ -1,6 +1,22 @@
 # Owner-terminal ask lint exception
 
-Patches **2076, 2077, 2078**.
+Patches **2076, 2077, 2078, 2926**.
+
+## Article-free relay follow-up (2926)
+
+The owner-chat branch of `_RELAY` now accepts an optional article and optional
+possessive: both `From owner chat` and `In owner's Desktop chat` are refused as
+agent relays. Existing article forms remain covered. This does not broaden the
+canonical attested owner-terminal exception or reject unrelated owner-rollout wording.
+
+`tests/hermes_cli/test_kanban_owner_chat_relay.py` includes two sanitized historical
+grammar fixtures, article/possessive/surface combinations, unrelated-language negative
+controls and attested open/start owner-terminal actions. The public fixtures retain
+the grammatical trigger but omit personal actions and identifiers. In this mirror
+pass, a direct isolated pytest smoke run of that file on the fully replayed public
+tree passed **37 tests**; this is not the full project test-runner gate, and no live
+Desktop, tool or deployment verification is claimed. Apply 2926 only as part of the
+current full README replay; the validator remains core code, not a plugin.
 
 ## Behavior
 
