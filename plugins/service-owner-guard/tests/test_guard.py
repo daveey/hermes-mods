@@ -42,6 +42,36 @@ def load():
     return mod
 
 
+
+# Heredoc bodies and `#` comments are data (card t_01a1d020a0b79528). An apostrophe in either (`it's`, `don't`)
+# unbalanced the quotes, so the lexer gave up on the whole command and a command AFTER it ran unchecked; the
+# `$(...)` of an unquoted-delimiter body runs too, even beside an apostrophe. Shapes 1-7 are the card's probe.
+HEREDOC_SHAPES = [
+    "{c}",
+    "cat > /tmp/n.txt <<EOF\nall done\nEOF\n{c}",
+    "cat > /tmp/n.txt <<EOF\nit's done\nEOF\n{c}",
+    "cat > /tmp/n.txt <<'EOF'\nit's done\nEOF\n{c}",
+    "# don't skip this\n{c}",
+    "cat > /tmp/n.txt <<EOF\nok $({c})\nEOF",
+    "cat > /tmp/n.txt <<EOF\nit's $({c})\nEOF",
+    "cat > /tmp/n.txt <<-EOF\n\tit's done\n\tEOF\n{c}",
+    "cat > /tmp/a <<A; cat > /tmp/b <<'B'\nit's a\nA\nit's b\nB\n{c}",
+    "cat > /tmp/n.txt <<\\EOF\nit's\nEOF\n{c}",
+    "cat > /tmp/n.txt <<\"EOF\"\nit's\nEOF\n{c}",
+    "cat > /tmp/n.txt <<EOF\nit's `{c}`\nEOF",
+    "echo hi # it's a note\n{c}",
+    "{c}\necho don't",
+    "bash <<'EOF'\n# it's here\n{c}\nEOF",
+]
+HEREDOC_ALLOWED = [
+    "cat > /tmp/n.txt <<EOF\nit's done\nEOF\n{safe}",
+    "# don't worry\n{safe}",
+    "cat > /tmp/n.txt <<EOF\nit's $(date)\nEOF",
+    "cat > /tmp/n.txt <<'EOF'\nit's $({c})\nEOF",
+    "cat > /tmp/n.txt <<EOF\nit's \\$({c})\nEOF",
+]
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -311,6 +341,24 @@ class Systemd(Base):
         self.assertIn(f"card {OWNER}", self.verdict(code, tool="execute_code"))
         code = "import os\nos.system(\"echo '$(systemctl --user stop my-collector.service)'\")\n"
         self.assertIsNone(self.verdict(code, tool="execute_code"))
+
+    # Heredoc bodies and `#` comments (card t_01a1d020a0b79528): an apostrophe in either made the segmenter fall
+    # back to a whitespace split, which lost every separator, so a stop AFTER them was never at command position.
+    def test_heredoc_and_comment_apostrophes_hide_no_stop(self):
+        def run(argv, timeout=5):
+            if argv[:2] == ["systemctl", "--user"] and "show" in argv:
+                return 0, f"Environment=FOO=1 HERMES_OWNER_CARD={OWNER}\nWorkingDirectory=/nonexistent\nExecStart=\n"
+            return (1, "") if argv[0] in ("launchctl", "systemctl") else real(argv, timeout)
+        real = self.g.run_cmd
+        self.g.run_cmd = run
+        for shape in HEREDOC_SHAPES:
+            cmd = shape.format(c="systemctl --user stop my-collector.service")
+            self.assertEqual({a.get("unit") for a in self.g.extract_actions(cmd)}, {"my-collector.service"}, cmd)
+            self.assertIn(f"card {OWNER}", self.verdict(cmd))
+        for shape in HEREDOC_ALLOWED:
+            cmd = shape.format(c="systemctl --user stop my-collector.service", safe="ls plugins")
+            self.assertEqual(self.g.extract_actions(cmd), [], cmd)
+            self.assertIsNone(self.verdict(cmd), cmd)
 
 
 class ExecuteCode(Base):

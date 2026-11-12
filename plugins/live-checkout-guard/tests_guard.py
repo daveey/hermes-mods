@@ -609,3 +609,91 @@ def test_unknown_cwd_ln_and_git_not_crashing(env, monkeypatch):
     assert not term("ln -s /x $LCG_NOPE/y", env.live)
     assert not term("cd $LCG_NOPE && ln -s /x y && git stash", env.live)
     assert blocked(term(f"cd $LCG_NOPE; cd {env.live}; echo > f", env.other))
+
+
+# Heredoc bodies and `#` comments are data (card t_01a1d020a0b79528). An apostrophe in either (`it's`, `don't`)
+# unbalanced the quotes, so the lexer gave up on the whole command and a command AFTER it ran unchecked; the
+# `$(...)` of an unquoted-delimiter body runs too, even beside an apostrophe. Shapes 1-7 are the card's probe.
+HEREDOC_SHAPES = [
+    "{c}",
+    "cat > /tmp/n.txt <<EOF\nall done\nEOF\n{c}",
+    "cat > /tmp/n.txt <<EOF\nit's done\nEOF\n{c}",
+    "cat > /tmp/n.txt <<'EOF'\nit's done\nEOF\n{c}",
+    "# don't skip this\n{c}",
+    "cat > /tmp/n.txt <<EOF\nok $({c})\nEOF",
+    "cat > /tmp/n.txt <<EOF\nit's $({c})\nEOF",
+    "cat > /tmp/n.txt <<-EOF\n\tit's done\n\tEOF\n{c}",
+    "cat > /tmp/a <<A; cat > /tmp/b <<'B'\nit's a\nA\nit's b\nB\n{c}",
+    "cat > /tmp/n.txt <<\\EOF\nit's\nEOF\n{c}",
+    "cat > /tmp/n.txt <<\"EOF\"\nit's\nEOF\n{c}",
+    "cat > /tmp/n.txt <<EOF\nit's `{c}`\nEOF",
+    "echo hi # it's a note\n{c}",
+    "{c}\necho don't",
+    "bash <<'EOF'\n# it's here\n{c}\nEOF",
+]
+HEREDOC_ALLOWED = [
+    "cat > /tmp/n.txt <<EOF\nit's done\nEOF\n{safe}",
+    "# don't worry\n{safe}",
+    "cat > /tmp/n.txt <<EOF\nit's $(date)\nEOF",
+    "cat > /tmp/n.txt <<'EOF'\nit's $({c})\nEOF",
+    "cat > /tmp/n.txt <<EOF\nit's \\$({c})\nEOF",
+]
+
+
+LC_RM = "rm on plugins/foo.py, inside the live checkout"
+
+
+@pytest.mark.parametrize("shape", HEREDOC_SHAPES)
+def test_heredoc_and_comment_apostrophes_hide_no_command(env, shape):
+    cmd = shape.format(c="rm -f plugins/foo.py")
+    assert guard.check_shell(cmd, str(env.live)) == LC_RM, cmd
+    assert blocked(term(cmd, env.live)), cmd
+
+
+# The quoted-delimiter `$(...)` control (HEREDOC_ALLOWED[3]) is left out: this guard's documented conservative
+# body scan may refuse it.
+@pytest.mark.parametrize("shape", HEREDOC_ALLOWED[:3] + HEREDOC_ALLOWED[4:])
+def test_heredoc_and_comment_data_stays_allowed(env, shape):
+    cmd = shape.format(c="rm -f plugins/foo.py", safe="ls plugins")
+    assert guard.check_shell(cmd, str(env.live)) is None, cmd
+    assert not term(cmd, env.live), cmd
+
+
+def test_heredoc_body_scan_stays_conservative(env):
+    # documented over-approximation, kept: a body is still scanned as commands, now each body on its own
+    for cmd in ["cat > /tmp/s.sh <<'EOF'\nrm -f plugins/foo.py\nEOF", "cat > /tmp/s.sh <<EOF\nrm -f plugins/foo.py\nEOF"]:
+        assert guard.check_shell(cmd, str(env.live)) == LC_RM, cmd
+
+
+def test_split_heredocs_rules():
+    split = guard._split_heredocs
+    assert split("cat <<EOF\nit's\nEOF\nls") == ("cat <<EOF\nls", [("it's", False)])
+    assert split("cat <<'EOF'\nit's $(rm x)\nEOF") == ("cat <<'EOF'\n", [("it's $(rm x)", True)])
+    assert split("cat <<EOF\nit's $(rm x) `rm y` \\$(rm z)\nEOF")[0] == "cat <<EOF\nrm x\nrm y\n"
+    assert split("cat <<A; cat <<-B\none\nA\n\ttwo\n\tB\nls")[0] == "cat <<A; cat <<-B\nls"
+    assert split("bash -s <<'EOF'\nrm x # it's\nEOF\nls")[0] == "bash -s <<'EOF'\nrm x \nls"
+    assert split("cat <<EOF | sh\nrm x\nEOF")[0] == "cat <<EOF | sh\nrm x\n"
+    assert split("echo $((1<<2)) '#' a#b # c's\nls") == ("echo $((1<<2)) '#' a#b \nls", [])
+    assert split("x=\"$(cat <<EOF\nit's\nEOF\n)\"; ls")[0] == "x=\"$(cat <<EOF\n)\"; ls"
+    assert split("cat <<<\"it's\"") == ("cat <<<\"it's\"", [])
+    assert split("cat <<EOF\nnever ends") == ("cat <<EOF\n", [("never ends", False)])
+
+
+def test_lexable_keeps_the_lines_that_run():
+    import shlex
+    assert guard._lexable("echo ok\necho don't\nrm x", shlex.split) == "echo ok\nrm x"
+    assert guard._lexable("echo 'a\nb'\nrm x", shlex.split) == "echo 'a\nb'\nrm x"
+    dropped = []
+    assert guard._lexable("echo it's", shlex.split, dropped) == "" and dropped == ["echo it's"]
+
+
+def test_shared_heredoc_block_is_byte_identical():
+    plugins = Path(__file__).resolve().parents[1]
+    start, end = "# ---- heredoc bodies, comments, partial lexing", "# ---- end of the shared heredoc block"
+    blocks = {}
+    for rel in ["live-checkout-guard/guard.py", "mac-heavy-guard/guard.py", "busy-tree-guard/guard.py",
+                "sqlite-live-guard/guard.py", "service-owner-guard/__init__.py", "evidence-clobber-guard/guard.py",
+                "coach/agent_rules.py"]:
+        src = (plugins / rel).read_text()
+        blocks[rel] = src[src.index(start):src.index(end)]
+    assert len(set(blocks.values())) == 1, sorted(blocks)

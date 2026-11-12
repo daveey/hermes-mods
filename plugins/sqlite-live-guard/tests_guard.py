@@ -687,3 +687,46 @@ def test_double_quoted_substitution_execute_code():
     # (no single-quoted negative here: check_python's regex literal scan already reads the inner '...' of
     # os.system("echo '$(rm ...)'") as its own command, a pre-existing over-approximation of that path)
     assert not blocked("execute_code", code="import os\nos.system('out=\"$(git status 2>&1)\"')")
+
+
+# Heredoc bodies and `#` comments are data (card t_01a1d020a0b79528). An apostrophe in either (`it's`, `don't`)
+# unbalanced the quotes, so the lexer gave up on the whole command and a command AFTER it ran unchecked; the
+# `$(...)` of an unquoted-delimiter body runs too, even beside an apostrophe. Shapes 1-7 are the card's probe.
+HEREDOC_SHAPES = [
+    "{c}",
+    "cat > /tmp/n.txt <<EOF\nall done\nEOF\n{c}",
+    "cat > /tmp/n.txt <<EOF\nit's done\nEOF\n{c}",
+    "cat > /tmp/n.txt <<'EOF'\nit's done\nEOF\n{c}",
+    "# don't skip this\n{c}",
+    "cat > /tmp/n.txt <<EOF\nok $({c})\nEOF",
+    "cat > /tmp/n.txt <<EOF\nit's $({c})\nEOF",
+    "cat > /tmp/n.txt <<-EOF\n\tit's done\n\tEOF\n{c}",
+    "cat > /tmp/a <<A; cat > /tmp/b <<'B'\nit's a\nA\nit's b\nB\n{c}",
+    "cat > /tmp/n.txt <<\\EOF\nit's\nEOF\n{c}",
+    "cat > /tmp/n.txt <<\"EOF\"\nit's\nEOF\n{c}",
+    "cat > /tmp/n.txt <<EOF\nit's `{c}`\nEOF",
+    "echo hi # it's a note\n{c}",
+    "{c}\necho don't",
+    "bash <<'EOF'\n# it's here\n{c}\nEOF",
+]
+HEREDOC_ALLOWED = [
+    "cat > /tmp/n.txt <<EOF\nit's done\nEOF\n{safe}",
+    "# don't worry\n{safe}",
+    "cat > /tmp/n.txt <<EOF\nit's $(date)\nEOF",
+    "cat > /tmp/n.txt <<'EOF'\nit's $({c})\nEOF",
+    "cat > /tmp/n.txt <<EOF\nit's \\$({c})\nEOF",
+]
+
+
+@pytest.mark.parametrize("shape", HEREDOC_SHAPES)
+def test_heredoc_and_comment_apostrophes_hide_no_command(shape):
+    cmd = shape.format(c="rm -f ~/.hermes/state.db")
+    assert plugin.guard.check_shell(cmd) == RM_STATE, cmd
+    assert blocked("terminal", command=cmd), cmd
+
+
+@pytest.mark.parametrize("shape", HEREDOC_ALLOWED)
+def test_heredoc_and_comment_data_stays_allowed(shape):
+    cmd = shape.format(c="rm -f ~/.hermes/state.db", safe="ls plugins")
+    assert plugin.guard.check_shell(cmd) is None, cmd
+    assert not blocked("terminal", command=cmd), cmd

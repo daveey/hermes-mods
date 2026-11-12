@@ -281,7 +281,10 @@ terminal/execute-code guard checks. Existing
   only literal arguments are. A tool called by name through another route (e.g. an MCP tool that writes files) is not covered.
 - Subshell/`cd` scoping is flattened: `(cd root; …)` leaves later segments thinking cwd is root (can over-block);
   checkout-write checks scan heredoc bodies as if they were commands (can over-block text containing
-  `git commit` while cwd is root). The separate update rule skips data heredocs. It remains lexical:
+  `git commit` while cwd is root), each body on its own: an apostrophe in a body or a `#` comment (`it's`) no longer
+  hides the commands after it, and the `$(...)`/backticks of an unquoted-delimiter body are scanned as the commands
+  they are. A line whose quotes never close is judged by its whitespace words; the lines around it are still parsed.
+  The separate update rule skips data heredocs. It remains lexical:
   unusual shell grammars, arbitrary scripts and dynamic commands are not a security boundary.
 - Wrapper option tables cover the common wrappers above; an unknown wrapper or option that takes a value can still hide
   the real command.

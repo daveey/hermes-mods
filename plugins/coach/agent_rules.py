@@ -601,26 +601,281 @@ def _prefix_is_shell_runner(cmd: str, start: int) -> bool:
     return _SHELL_RUNNER_SEP.match(cmd[lo - 1]) is not None
 
 
-def _strip_heredocs(cmd: str) -> str:
-    """Drop heredoc bodies (they are stdin data, not commands), except when fed to a shell (`bash <<EOF`)."""
-    out, pos = [], 0
-    while True:
-        m = HEREDOC_RE.search(cmd, pos)
-        if not m:
-            out.append(cmd[pos:])
-            return "".join(out)
-        nl = cmd.find("\n", m.end())
-        if nl < 0:
-            out.append(cmd[pos:])
-            return "".join(out)
-        line_start = cmd.rfind("\n", 0, m.start()) + 1
-        feeds_shell = re.search(r"(?:^|[\s;&|(])(?:ba|z|da)?sh(?=\s|$)", cmd[line_start:m.start()]) is not None
-        end = re.compile(r"^\t*" + re.escape(m.group(2)) + r"[ \t]*$", re.M).search(cmd, nl + 1)
-        body_end = end.end() if end else len(cmd)
-        out.append(cmd[pos:nl + 1])
-        if feeds_shell:
-            out.append(cmd[nl + 1:body_end])
-        pos = body_end
+# ---- heredoc bodies, comments, partial lexing ----------------------------------------------------------------
+# Byte-identical in live-checkout-guard, mac-heavy-guard, busy-tree-guard, sqlite-live-guard, service-owner-guard,
+# evidence-clobber-guard and coach/agent_rules.py (each plugin loads standalone). Change every copy together.
+
+_HD_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "mksh", "ssh"})
+_HD_PIPED_SHELL = re.compile(r"\|&?\s*(?:(?:sudo|env|exec|command|nohup)\s+(?:-\S+\s+)*)*(?:\S*/)?"
+                             r"(?:ba|z|da|k|mk)?sh(?![\w.-])")
+_HD_WORD_BREAK = " \t\r\n;&|()<>"
+
+
+def _hd_word_start(text: str, i: int) -> bool:
+    return i == 0 or text[i - 1] in _HD_WORD_BREAK
+
+
+def _hd_arith_end(text: str, i: int) -> int:
+    """Index just past the `((...))` whose first `(` is at i (the end of text when it never closes)."""
+    depth, n = 0, len(text)
+    while i < n:
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _hd_subst_end(text: str, i: int) -> int:
+    """Index just past the `)` closing a `$(` whose body starts at i, by command rules (quotes are quotes)."""
+    depth, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+        elif c == "'":
+            j = text.find("'", i + 1)
+            if j < 0:
+                return n
+            i = j + 1
+        elif c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\":
+                    i += 2
+                elif text.startswith("$(", i):
+                    i = _hd_subst_end(text, i + 2)
+                else:
+                    i += 1
+            i += 1
+        elif text.startswith("$(", i):
+            i = _hd_subst_end(text, i + 2)
+        elif c == "(":
+            depth += 1
+            i += 1
+        elif c == ")":
+            if depth == 0:
+                return i + 1
+            depth -= 1
+            i += 1
+        else:
+            i += 1
+    return n
+
+
+def _hd_substitutions(body: str) -> list:
+    """The command text of each `$(...)` and backtick substitution in an unquoted-delimiter heredoc body.
+
+    Heredoc rules: `'` and `"` are literal characters (`it's $(rm x)` runs rm), `\\$`, `` \\` `` and `\\\\` are
+    escapes, `$((...))` is arithmetic. Inside a substitution quotes start fresh, as in bash."""
+    found, i, n = [], 0, len(body)
+    while i < n:
+        c = body[i]
+        if c == "\\":
+            i += 2
+        elif body.startswith("$((", i):
+            i = _hd_arith_end(body, i + 1)
+        elif body.startswith("$(", i):
+            j = _hd_subst_end(body, i + 2)
+            found.append(body[i + 2:j - 1] if j <= n and body[j - 1:j] == ")" else body[i + 2:])
+            i = j
+        elif c == "`":
+            j = i + 1
+            while j < n and body[j] != "`":
+                j += 2 if body[j] == "\\" else 1
+            found.append(re.sub(r"\\([\\`$])", r"\1", body[i + 1:j]))
+            i = j + 1
+        else:
+            i += 1
+    return found
+
+
+def _hd_feeds_shell(prefix: str, rest: str) -> bool:
+    """True when a heredoc is read by a shell, so its body runs as code: a shell word (`bash`, `sudo -u x sh -s`,
+    `ssh host`) in the command before the operator (`prefix`), or a pipe into one after it (`rest`)."""
+    import shlex
+    if _HD_PIPED_SHELL.search(rest):
+        return True
+    seg = re.split(r"[;&|(]", prefix)[-1]
+    try:
+        words = shlex.split(seg)
+    except ValueError:
+        words = seg.split()
+    return any(os.path.basename(w) in _HD_SHELLS for w in words)
+
+
+def _split_heredocs(text: str, _level: int = 0) -> tuple:
+    """(code, bodies) of shell `text`, by bash rules: the command text a shell parses, and the heredoc bodies.
+
+    `code` is `text` without heredoc bodies, their terminator lines and `#` comments (a `#` that begins a word
+    outside quotes, to the end of its line). Text after a terminator stays code. A body is data, so an apostrophe
+    in it (`it's done`) can no longer unbalance the quotes of the commands after it. Every `<<WORD`/`<<-WORD` form
+    is handled (bare, 'quoted', "quoted", \\escaped), several on one line in order, `<<-` tab stripping, an
+    unterminated body to the end. Two kinds of body still reach `code`:
+    - a body fed to a shell (`_hd_feeds_shell`) is code that runs: it is split recursively and kept;
+    - each `$(...)`/backtick substitution of an unquoted-delimiter body runs before the command does: its command
+      text is appended as its own line (`_hd_substitutions`).
+    `bodies` lists every other body as (text, quoted delimiter), for a guard that scans data conservatively.
+    Quotes that never close leave the rest of `text` as code, unchanged (see `_lexable`)."""
+    if "<<" not in text and "#" not in text:
+        return text, []
+    out, bodies, pending, stack = [], [], [], []
+    n, i, line_start = len(text), 0, 0
+
+    def take_bodies(i: int) -> int:
+        for delim, strip_tabs, quoted, op_start, nl in pending:
+            lines = []
+            while i < n:
+                e = text.find("\n", i)
+                e = n if e < 0 else e
+                line = text[i:e]
+                i = min(e + 1, n)
+                if strip_tabs:
+                    line = line.lstrip("\t")
+                if line.rstrip("\r") == delim:
+                    break
+                lines.append(line)
+            body = "\n".join(lines)
+            if _hd_feeds_shell(text[line_start:op_start], text[op_start:nl]):
+                runs = [body]
+            else:
+                bodies.append((body, quoted))
+                runs = [] if quoted else _hd_substitutions(body)
+            for run in runs:
+                sub_code, sub_bodies = _split_heredocs(run, _level + 1) if _level < 16 else (run, [])
+                out.append(sub_code + "\n")
+                bodies.extend(sub_bodies)
+        pending.clear()
+        return i
+
+    while i < n:
+        c = text[i]
+        top = stack[-1] if stack else ""
+        if top == '"':
+            if c == "\\":
+                out.append(text[i:i + 2])
+                i += 2
+                continue
+            if c == '"':
+                stack.pop()
+            elif text.startswith("$((", i):
+                j = _hd_arith_end(text, i + 1)
+                out.append(text[i:j])
+                i = j
+                continue
+            elif text.startswith("$(", i):
+                stack.append(0)
+                out.append("$(")
+                i += 2
+                continue
+            elif c == "`":
+                stack.append("`")
+            out.append(c)
+            i += 1
+            continue
+        if c == "\\":
+            out.append(text[i:i + 2])
+            i += 2
+        elif c == "'" or text.startswith("$'", i):
+            j = i + 1 + (c == "$")
+            while j < n and text[j] != "'":
+                j += 2 if c == "$" and text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif c == '"':
+            stack.append('"')
+            out.append(c)
+            i += 1
+        elif c == "`" and top == "`":
+            stack.pop()
+            out.append(c)
+            i += 1
+        elif isinstance(top, int) and c in "()":
+            if c == ")" and top == 0:
+                stack.pop()
+            else:
+                stack[-1] += 1 if c == "(" else -1
+            out.append(c)
+            i += 1
+        elif text.startswith("$((", i) or (text.startswith("((", i) and _hd_word_start(text, i)):
+            j = _hd_arith_end(text, i + (c == "$"))
+            out.append(text[i:j])
+            i = j
+        elif c == "#" and _hd_word_start(text, i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("<<", i) and not text.startswith("<<<", i) and (i == 0 or text[i - 1] != "<"):
+            k = i + 2
+            strip_tabs = text.startswith("-", k)
+            k += strip_tabs
+            while k < n and text[k] in " \t":
+                k += 1
+            word, quoted, w = [], False, k
+            while w < n and text[w] not in _HD_WORD_BREAK:
+                if text[w] in "'\"":
+                    e = text.find(text[w], w + 1)
+                    e = n if e < 0 else e
+                    word.append(text[w + 1:e])
+                    quoted, w = True, e + 1
+                elif text[w] == "\\":
+                    word.append(text[w + 1:w + 2])
+                    quoted, w = True, w + 2
+                else:
+                    word.append(text[w])
+                    w += 1
+            if w == k:  # `<<` with no word: not a heredoc (bash reports it)
+                out.append("<<")
+                i += 2
+                continue
+            nl = text.find("\n", w)
+            pending.append(("".join(word), strip_tabs, quoted, i, n if nl < 0 else nl))
+            out.append(text[i:w])
+            i = w
+        elif c == "\n":
+            out.append(c)
+            i += 1
+            if pending:
+                i = take_bodies(i)
+            line_start = i
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out), bodies
+
+
+def _lexable(text: str, lex, dropped: Optional[list] = None) -> str:
+    """`text` when `lex(text)` lexes it; otherwise the part of it that does, never nothing.
+
+    A quote that never closes (`echo don't`) makes a lexer raise ValueError for the whole text, but bash has
+    already run every line before it. So keep each run of whole lines that lexes on its own, joining a line with
+    the following ones (up to 32) while a multi-line quote may close; a line no run closes is dropped (appended to
+    `dropped` when given, for a guard that judges it some other way) and the scan resumes at the next line."""
+    try:
+        lex(text)
+        return text
+    except ValueError:
+        pass
+    lines, keep, i = text.split("\n"), [], 0
+    while i < len(lines):
+        for j in range(i, min(len(lines), i + 32)):
+            chunk = "\n".join(lines[i:j + 1])
+            try:
+                lex(chunk)
+            except ValueError:
+                continue
+            keep.append(chunk)
+            i = j + 1
+            break
+        else:
+            if dropped is not None:
+                dropped.append(lines[i])
+            i += 1
+    return "\n".join(keep)
+
+# ---- end of the shared heredoc block ---------------------------------------------------------------------------
 
 
 def _mask_quoted(cmd: str) -> str:
@@ -727,7 +982,7 @@ def shell_code(cmd: str) -> str:
     """The parts of a terminal command the shell executes: $HOME expanded, heredoc bodies and quoted data blanked."""
     cmd = HOME_VAR_RE.sub(lambda _: str(Path.home()), cmd or "")
     cmd = re.sub(r"(?m)^[ \t]*#.*$", "", cmd)  # whole-line comments are notes, not commands
-    return _mask_quoted(_strip_heredocs(cmd))
+    return _mask_quoted(_split_heredocs(cmd)[0])
 
 
 def redirect_writes_into(cmd: str, workdir: str, root: str) -> bool:

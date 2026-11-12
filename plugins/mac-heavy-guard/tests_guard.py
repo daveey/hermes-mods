@@ -696,3 +696,52 @@ def test_double_quoted_substitution_runs_like_unquoted(cmd):
 def test_inert_substitution_shapes_stay_allowed(cmd):
     assert guard.check_shell(cmd, os.path.expanduser("~")) is None, cmd
     assert not blocked("terminal", command=cmd), cmd
+
+
+# Heredoc bodies and `#` comments are data (card t_01a1d020a0b79528). An apostrophe in either (`it's`, `don't`)
+# unbalanced the quotes, so the lexer gave up on the whole command and a command AFTER it ran unchecked; the
+# `$(...)` of an unquoted-delimiter body runs too, even beside an apostrophe. Shapes 1-7 are the card's probe.
+HEREDOC_SHAPES = [
+    "{c}",
+    "cat > /tmp/n.txt <<EOF\nall done\nEOF\n{c}",
+    "cat > /tmp/n.txt <<EOF\nit's done\nEOF\n{c}",
+    "cat > /tmp/n.txt <<'EOF'\nit's done\nEOF\n{c}",
+    "# don't skip this\n{c}",
+    "cat > /tmp/n.txt <<EOF\nok $({c})\nEOF",
+    "cat > /tmp/n.txt <<EOF\nit's $({c})\nEOF",
+    "cat > /tmp/n.txt <<-EOF\n\tit's done\n\tEOF\n{c}",
+    "cat > /tmp/a <<A; cat > /tmp/b <<'B'\nit's a\nA\nit's b\nB\n{c}",
+    "cat > /tmp/n.txt <<\\EOF\nit's\nEOF\n{c}",
+    "cat > /tmp/n.txt <<\"EOF\"\nit's\nEOF\n{c}",
+    "cat > /tmp/n.txt <<EOF\nit's `{c}`\nEOF",
+    "echo hi # it's a note\n{c}",
+    "{c}\necho don't",
+    "bash <<'EOF'\n# it's here\n{c}\nEOF",
+]
+HEREDOC_ALLOWED = [
+    "cat > /tmp/n.txt <<EOF\nit's done\nEOF\n{safe}",
+    "# don't worry\n{safe}",
+    "cat > /tmp/n.txt <<EOF\nit's $(date)\nEOF",
+    "cat > /tmp/n.txt <<'EOF'\nit's $({c})\nEOF",
+    "cat > /tmp/n.txt <<EOF\nit's \\$({c})\nEOF",
+]
+
+
+@pytest.mark.parametrize("shape", HEREDOC_SHAPES)
+def test_heredoc_and_comment_apostrophes_hide_no_command(shape):
+    cmd = shape.format(c="docker build -t x .")
+    assert guard.check_shell(cmd, os.path.expanduser("~")), cmd
+    assert blocked("terminal", command=cmd), cmd
+
+
+@pytest.mark.parametrize("shape", HEREDOC_ALLOWED + [
+    "ssh host <<'EOF'\nit's remote\ndocker build -t x .\nEOF", "python3 - <<'EOF'\nprint(\"it's\")\nEOF"])
+def test_heredoc_and_comment_data_stays_allowed(shape):
+    cmd = shape.format(c="docker build -t x .", safe="ls plugins")
+    assert guard.check_shell(cmd, os.path.expanduser("~")) is None, cmd
+    assert not blocked("terminal", command=cmd), cmd
+
+
+def test_command_after_ssh_heredoc_with_apostrophe_is_checked():
+    cmd = "ssh host <<'EOF'\nit's remote\nEOF\ndocker build -t x ."
+    assert guard.check_shell(cmd, os.path.expanduser("~")), cmd
