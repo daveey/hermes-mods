@@ -1076,6 +1076,14 @@ async function performTaskRequest(req, origin, conns) {
     // predate the field ignore it (and keep recording human).
     const writerSession = String(sender.session_id || '').slice(0, 200)
     const post = { body, author, writer_kind: 'agent', ...(writerSession ? { writer_session: writerSession } : {}) }
+    // kanban-d1b921f32e: the origin gateway verified this comment carries the user's reply (cross_task
+    // relays_user_message). Pass it on only for the sending session; the receiving core stores it as sent
+    // (cores that predate the field ignore it).
+    const relay = args.relayed_human
+    if (relay && typeof relay === 'object' && writerSession && String(relay.session || '') === writerSession &&
+        Number.isInteger(Number(relay.message_id)) && Number.isFinite(Number(relay.at))) {
+      post.relayed_human = { session: writerSession, message_id: Number(relay.message_id), at: Math.trunc(Number(relay.at)) }
+    }
     try {
       await api(target.connectionId, `/api/plugins/kanban/tasks/${enc(target.taskId)}/comments${target.board ? `?board=${enc(target.board)}` : ''}`, {
         method: 'POST',

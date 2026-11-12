@@ -15,6 +15,7 @@ import uuid
 if __package__:
     from . import relay_files as rf
     from . import board_tasks as bt
+    from . import relay_human as rh
 else:  # pytest imports this hyphen-named plugin dir without a parent package
     import importlib.util as _ilu
     from pathlib import Path as _Path
@@ -27,6 +28,7 @@ else:  # pytest imports this hyphen-named plugin dir without a parent package
 
     rf = _load_sibling("relay_files")
     bt = _load_sibling("board_tasks")
+    rh = _load_sibling("relay_human")
 
 TOOLSET = "session_mentions"
 PICKUP_TIMEOUT = 30.0  # Desktop drains every ~3s; no claim by then = Desktop not running
@@ -195,7 +197,9 @@ TASK_SCHEMA = {
         "a ready card carries `task.queue` (its lane and how many cards are ahead), so a long wait "
         "reads as queued, not stuck.\n"
         "- action=comment: add `message` as a comment on `target`, attributed to this session. A card "
-        "reachable only as a replica copy is refused with `rejection: foreign_card` naming its owner.\n"
+        "reachable only as a replica copy is refused with `rejection: foreign_card` naming its owner. "
+        "When the message passes on the user's reply to a card that asked them, set "
+        "`relays_user_message: true`: the card then counts it as a human answer (once per user message).\n"
         "Reading or commenting does not tie the task to this session; `hermes-hub adopt-task` does that when "
         "this session really owns the work.\n"
         "Requires the Hermes Desktop app to be running (it relays the request)."
@@ -210,6 +214,7 @@ TASK_SCHEMA = {
             "status": {"type": "string", "description": "list: comma-separated statuses to keep."},
             "gateway": {"type": "string", "description": "list: only this gateway (name or id)."},
             "message": {"type": "string", "description": "comment: the comment text."},
+            "relays_user_message": {"type": "boolean", "description": "comment: true when `message` passes on the user's reply from this chat to a card that asked them."},
             "limit": {"type": "integer", "description": "list: max rows (default 20); read: max comments/events (default 10)."},
         },
         "required": ["action"],
@@ -237,6 +242,14 @@ def handle_task(args: dict, session_id: str | None = None, *, timeout_seconds: f
         return _err("message is required for comment — pass the text as `message`")
     if bt.enabled():
         return json.dumps(bt.handle(args))
+    args.pop("relayed_human", None)  # only the origin's own proof below may set it, never the model
+    if action == "comment" and rh.requested(args):
+        # kanban-d1b921f32e: this gateway holds the chat's transcript, so it proves the relay here.
+        relayed, refusal = rh.stamp(str(args["target"]), session_id, base=rf.root(),
+                                    state_db=rf._hermes_home() / "state.db", write=rf.atomic_write)
+        if refusal:
+            return _err(refusal)
+        args["relayed_human"] = relayed
     out = _relay(f"task_{action}", args, session_id, 0, **({"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}))
     return out
 
@@ -260,7 +273,7 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
         "id": rid,
         "action": action,
         "route": route,
-        "args": {k: args.get(k) for k in ("target", "query", "gateway", "message", "limit", "status") if args.get(k) not in (None, "")},
+        "args": {k: args.get(k) for k in ("target", "query", "gateway", "message", "limit", "status", "relayed_human") if args.get(k) not in (None, "")},
         "wait_for_reply": wait,
         "sender": _sender_info(session_id),
         "created_at": time.time(),

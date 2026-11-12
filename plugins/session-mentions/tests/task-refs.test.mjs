@@ -132,6 +132,22 @@ test('courier task_comment: the agent cannot pick its own provenance; no sender 
   assert.deepEqual(post.body, { body: 'ping', author: 'cross-gateway agent', writer_kind: 'agent' })
 })
 
+test('courier task_comment: an origin-verified relay of the user reply rides along, only for the sending session', async () => {
+  // kanban-d1b921f32e: the card's no-progress budget counts a relayed_human comment as David's answer.
+  const calls = []
+  const m = await load({ state, connections: async () => conns }, fakeApi(calls))
+  const relayed_human = { session: 'sess-chat', message_id: 42, at: 1700.9 }
+  await m.performRequest({ action: 'task_comment', args: { target: '@task:bb@mac-mini/t_bbbb2222', message: 'David: left ring', relayed_human }, sender: { title: 'Chat', session_id: 'sess-chat' } }, 'local', conns)
+  const post = calls.find(c => c.method === 'POST')
+  assert.deepEqual(post.body.relayed_human, { session: 'sess-chat', message_id: 42, at: 1700 })
+  assert.equal(post.body.writer_kind, 'agent')
+
+  const calls2 = []
+  const m2 = await load({ state, connections: async () => conns }, fakeApi(calls2))
+  await m2.performRequest({ action: 'task_comment', args: { target: '@task:bb@mac-mini/t_bbbb2222', message: 'x', relayed_human: { session: 'other', message_id: 1, at: 1 } }, sender: { session_id: 'sess-chat' } }, 'local', conns)
+  assert.equal(calls2.find(c => c.method === 'POST').body.relayed_human, undefined)
+})
+
 test('courier task_read: a gateway that errors (503 draining) is reported unreachable+retryable, never "not found"', async () => {
   const base = fakeApi()
   const draining = new Set(['mac-mini'])
