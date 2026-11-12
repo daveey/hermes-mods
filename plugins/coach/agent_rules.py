@@ -1090,6 +1090,80 @@ def _seg_words(seg: str) -> list:
     return [w for w in words if w.strip("()")]
 
 
+def _sed_edit_files(args: list) -> list:
+    """File operands of `sed ARGS`: drops options, each `-e`/`-f`/`-l` argument, and the script word (the first
+    operand when no `-e`/`-f` gave one). GNU sed permutes, so options may follow operands until `--`."""
+    operands, scripted, i, opts = [], False, 0, True
+    while i < len(args):
+        w = args[i]
+        i += 1
+        if not opts or w == "-" or not w.startswith("-"):
+            operands.append(w)
+        elif w == "--":
+            opts = False
+        elif w.startswith("--"):
+            name = w[2:].split("=", 1)[0]
+            if name in ("expression", "file", "line-length"):
+                scripted = scripted or name != "line-length"
+                if "=" not in w:
+                    i += 1
+        else:
+            for k, c in enumerate(w[1:], 1):
+                if c == "i":  # -i[SUFFIX]: the rest of the cluster is the backup suffix
+                    break
+                if c in "efl":
+                    scripted = scripted or c != "l"
+                    if k == len(w) - 1:
+                        i += 1
+                    break
+    return operands if scripted else operands[1:]
+
+
+def _perl_edit_files(args: list) -> list:
+    """File operands of `perl ARGS`: drops switches, each `-e`/`-E` program (and `-I` dir), and the program file
+    when no `-e`/`-E` was given. Switch parsing stops at the first operand or `--`, as in perl."""
+    scripted, i = False, 0
+    while i < len(args):
+        w = args[i]
+        if w == "--":
+            i += 1
+            break
+        if not w.startswith("-") or w == "-":
+            break
+        i += 1
+        k = 1
+        while k < len(w):
+            c = w[k]
+            if c in "eEI":
+                scripted = scripted or c != "I"
+                if k == len(w) - 1:
+                    i += 1
+                break
+            if c in "iMmxCdDF":  # the rest of the cluster is this switch's argument
+                break
+            k += 1
+            if c in "0l":  # -0[octal] / -0xHEX / -l[octal]
+                if c == "0" and w[k:k + 1] in ("x", "X"):
+                    k += 1
+                    while k < len(w) and w[k] in "0123456789abcdefABCDEF":
+                        k += 1
+                while k < len(w) and w[k].isdigit():
+                    k += 1
+    rest = args[i:]
+    return rest if scripted else rest[1:]
+
+
+def _inplace_edit_files(words: list) -> list:
+    """The file operands a `sed -i` / `perl -pi` segment rewrites: the script is data, not a write target."""
+    for n, w in enumerate(words):
+        prog = os.path.basename(w)
+        if prog == "sed":
+            return _sed_edit_files(words[n + 1:])
+        if prog == "perl":
+            return _perl_edit_files(words[n + 1:])
+    return [w for w in words[1:] if not w.startswith("-")]
+
+
 def _terminal_live_write(raw: str, cmd: str, wd: str, root: str) -> Optional[str]:
     """A file write into the live tree by a terminal command: an output redirect, `sed -i`/`perl -pi`,
     cp/mv/tee/rm-style file commands, `git stash/apply/rm/mv`, or a Python heredoc / `-c` script that writes a
@@ -1102,8 +1176,8 @@ def _terminal_live_write(raw: str, cmd: str, wd: str, root: str) -> Optional[str
     for m in INPLACE_EDIT_RE.finditer(cmd):
         seg = _segment(cmd, m.start())
         d = _target_dir(cmd, m.start(), "", wd) or ""
-        for w in _seg_words(seg)[1:]:
-            hit = None if w.startswith("-") else _live_write_target(w, d, root)
+        for w in _inplace_edit_files(_seg_words(seg)):
+            hit = _live_write_target(w, d, root)
             if hit:
                 return f"`{m.group(1).strip()}` of `{hit}`"
     for m in FILE_CMD_RE.finditer(cmd):
