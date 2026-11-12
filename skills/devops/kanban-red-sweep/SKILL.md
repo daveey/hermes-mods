@@ -74,7 +74,8 @@ sign-in steps and protected-file Allows are never guessed. A rejected guard is n
 - `complete` is also checked against the card's acceptance. When it's refused because the acceptance still has open
   steps (live checks, a PR on a moved repo), comment the corrected premise and unblock so the owner finishes. Don't force it.
 - A child can't complete before its blocked parent. When you've done the parent's work yourself, complete the parent first.
-- Cards whose dependents wait on them: unblocking or completing promotes the children. Check them.
+- Cards whose dependents wait on them: unblocking or completing promotes the children. Check them, queue position
+  included: a promoted card keeps its old low priority and sits behind the queue you just cleared for its parent.
 - A card you unblock may sit `ready` behind a full worker pool. Read the queue head first
   (`select id,priority from tasks where status='ready' order by priority desc limit 10`) and set
   `hermes kanban edit <id> --priority <above the head of that list>` in the same turn, for every card you
@@ -90,6 +91,16 @@ sign-in steps and protected-file Allows are never guessed. A rejected guard is n
   above `kanban.admission.cpu_busy_below_pct`; `ps --sort=-pcpu` names the job). A `ping_pong` move refusal means
   the card already left that machine: read its `moved` event reason (e.g. the worker lacks a hub-only tool) before
   forcing it back.
+- A "ready, no worker" notice is not proof the card never started. Read its last events first
+  (`select kind,payload from task_events where task_id=? and kind in ('spawned','worker_lost','oom_killed')`):
+  after `oom_killed`/`worker_lost` a plain bump repeats the crash. Name the killed process from the kernel log
+  (`journalctl -k | grep -i 'out of memory'`) and the last log file in the card's workspace, find the surviving
+  worktree, and comment cause, worktree path and a capped first command for the next run, then bump.
+- `no such task ... not imported here; last pickup skip: ...` on the hub means the card lives on the gateway that
+  created it (a worker's run filed it pinned to the hub). `hermes kanban edit` here fails with "unknown id" and a
+  twin `kanban_create` is refused `create_overlap`; set its priority on the origin box instead (`cross_task` read
+  names the gateway; `aws ssm send-command` with `sudo -u ubuntu -i bash -lc "hermes kanban edit <id> --priority N"`,
+  instance role, us-west-2). It still imports only when a hub slot frees.
 - A `ready` card that already ran and has an open PR: before bumping it, read `hermes kanban show <id>`
   Diagnostics and the PR (`gh pr view <N> --json state,mergeStateStatus,statusCheckRollup`). A hold of
   `respawn_guarded: active_pr` keeps the card from restarting until its PR merges or closes, so no priority
