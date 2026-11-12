@@ -13,6 +13,10 @@ D. completing its own card while the body/comments name an origin chat (``origin
 F. (any session) ``hermes kanban edit <id> --body`` that adds acceptance-waiver text or drops an acceptance sentence,
    unless the new body cites ``user message <id>`` that David typed in THIS chat (state.db, compression lineage).
    Authority quoted from another chat, a card or a notice is refused (acceptance.py; t_7e2ee45c 2026-11-10).
+G. completing (or ``kanban_request_review``-ing) its own card with a handoff that turns a failed acceptance
+   threshold into a waiver or a guessed pass: structured ``metadata.acceptance_results`` (a pass without or against
+   its observed value, a fail without a preregistered ``IF FAIL <check>:`` branch, waived without a body waiver) or
+   prose ("check 4 failed; waived", "treated as a pass"). thresholds.py (red-sweep acceptance-waiver-owner-decision).
 E. (any session, not only workers) ``kanban_create`` whose title/body names an origin chat on ANOTHER gateway
    (``origin ... @session:<profile>@<gw>/<id>``) without ``origin_session`` binding it: the chat would never see it.
 
@@ -48,6 +52,7 @@ logger = logging.getLogger(__name__)
 SHELL_TOOLS = {"terminal", "process_manage", "process", "run_in_user_terminal"}
 PY_TOOLS = {"execute_code"}
 COMPLETE_TOOLS = {"kanban_complete"}
+REVIEW_TOOLS = {"kanban_request_review"}
 
 
 def _strip(name: str) -> str:
@@ -82,6 +87,11 @@ def classify(tool_name: str, args: Any, own: str, paths_fn=None) -> Optional[str
             return None
         summary = str(args.get("summary") or args.get("result") or "")
         return core.check_complete(own, summary, paths_fn(), metadata=args.get("metadata"))
+    if name in REVIEW_TOOLS:
+        target = str(args.get("task_id") or own)
+        if target != own:
+            return None
+        return core.check_review(own, str(args.get("summary") or ""), paths_fn(), metadata=args.get("metadata"))
     if name in SHELL_TOOLS:
         cmd = " ; ".join(str(args.get(k) or "") for k in ("command", "input", "data"))
         return core.check_shell(cmd, own, paths_fn)
