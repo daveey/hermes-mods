@@ -15,6 +15,8 @@ Five anti-patterns, measured in the user's own history (coach gap report 2026-10
                scope limit in the user's ask ("analysis only", "just tell me", "don't change anything") skips it
                before the judge runs. A reply that hands the problem to another owner (session/card/worker) this
                turn never checked or messaged fires deterministically, before the judge (`unverified_owner`).
+- claimed_mutation (deterministic): "I moved / archived / unblocked <card>" when no board write of that card
+               succeeded this turn or the turn before (agent-182d2d699c).
 
 Layer 1 (here, zero latency) are cheap regex prefilters; Layer 2 is an LLM judge (aux task
 `coach_reply`) that sees the user's ask, the turn's tool log and the reply. Only a judge verdict
@@ -575,6 +577,192 @@ def owner_source(reply: str, tool_log: Optional[list] = None, board: Optional[li
     if any("(replica)" in l for l in lines):
         return "replica"
     return "board" if lines else "none"
+
+
+# ── claimed_mutation (self-heal agent-182d2d699c) ─────────────────────────────────────────────────────────────────────
+# Hub 20261112_002413_39be4c msg 1202305: 'The card is "Workers: recover and alert when the user service manager dies",
+# and I moved it to the pool.' No call in that turn (or the session) moved that card: the bulk moves covered other ids.
+# Its first real move, 33 min later, was refused ("is running: its worker moves it"), and only then was the claim
+# corrected. The `unverified` judge scores done/fixed claims only. This deterministic check holds a reply sentence in
+# the first person past tense ("I moved / re-placed / archived / unblocked / reprioritized / reassigned ...", "I
+# raised/bumped its priority") that names a card by `t_…` id or by a double-quoted title (resolved on this host's
+# boards), when neither this turn's tool log nor the previous turn's shows a successful mutation of that card: a
+# `hermes kanban move|archive|unblock|edit|reassign|assign|promote|reclaim` or a kanban_* write tool naming the id,
+# with no `<- ERROR` after it and no refusal in its `<- MUT` line (agent_rules.mutation_result_line). Board read
+# errors and titles no board has are fail-open.
+CLAIMED_MUTATION_RE = re.compile(
+    r"\b(?:I|we)(?:['\u2019]ve| have| had)?\s+(?:(?:also|just|now|then|already|since|finally|instead)\s+)?"
+    r"(?P<verb>moved|re-placed|re-?pinned|archived|unblocked|re-?prioriti[sz]ed|re-?assigned|promoted|raised|bumped)"
+    r"\b", re.I)
+_CM_PRIORITY_VERBS = ("raised", "bumped")
+_CM_PRIORITY_RE = re.compile(r"\bpriorit(?:y|ies)\b", re.I)
+# reported speech or a correction of an earlier claim ("I told you earlier I had moved this, and I had not")
+_CM_CORRECTION_RE = re.compile(
+    r"\b(?:I|we) (?:told you|said|claimed|reported|wrote|thought)\b|\bcorrection\b|\b(?:had|have|did|was) not\b"
+    r"|\b(?:hadn['\u2019]t|haven['\u2019]t|didn['\u2019]t|wasn['\u2019]t)\b|\bclaimed_mutation\b", re.I)
+_CM_TITLE_RE = re.compile(r'"([^"\n]{6,200})"|\u201c([^\u201d\n]{6,200})\u201d')
+_CM_FENCE_RE = re.compile(r"```.*?```|^>.*$", re.DOTALL | re.MULTILINE)
+# Board writes: CLI verbs and kanban_* tools (reads and comments move nothing).
+_CM_CLI_RE = re.compile(r"\bhermes(?:-hub)?['\",\s]+(?:-p['\",\s]+\S+['\",\s]+)?kanban\b[^\n;|&]*?\b(?:move|archive|"
+                        r"unblock|edit|reassign|assign|promote|reclaim|unarchive|retry|create)\b")
+_CM_READ_TOOLS = ("kanban_show", "kanban_list", "kanban_attachments", "kanban_comment", "kanban_heartbeat")
+_CM_TOOL_RE = re.compile(r"^\s*->\s*(?:mcp__)?(kanban_\w+)\(")
+_CM_TOOL_CALL_RE = re.compile(r"[\"']name[\"']\s*:\s*[\"'](?:mcp__)?(kanban_\w+)[\"']")
+_CM_MUT_RE = re.compile(r"^\s*<-\s*MUT\b(?:\s+ok=(?P<ok>\S*))?(?:\s+refused=(?P<refused>\S*))?")
+CLAIMED_MUTATION_NUDGE = (
+    "[coach] claimed_mutation: your reply says you {verb} card {card} (\"{evidence}\"), but no successful {verb_base} "
+    "for that card ran this turn or the turn before: the tool log has no `hermes kanban` write or kanban_* call naming "
+    "it, or that call was refused. Verify on the board (`hermes kanban show {card_id}`), then either make the "
+    "change now and report its real result, or correct the claim in plain words.")
+_CM_BASE = {"moved": "move", "re-placed": "re-placement", "repinned": "re-pin",
+            "re-pinned": "re-pin", "archived": "archive", "unblocked": "unblock", "reprioritized": "priority change",
+            "reprioritised": "priority change", "re-prioritized": "priority change",
+            "re-prioritised": "priority change", "reassigned": "reassignment", "re-assigned": "reassignment",
+            "promoted": "promotion", "raised": "priority change", "bumped": "priority change"}
+
+
+def _cm_same(a: str, b: str) -> bool:
+    """Same card: equal, or one id is a prefix (8+ hex) of the other (replies shorten ids)."""
+    return a == b or (min(len(a), len(b)) >= 10 and (a.startswith(b) or b.startswith(a)))
+
+
+def _cm_mutation_call(line: str) -> bool:
+    s = line or ""
+    if not s.lstrip().startswith("->"):
+        return False
+    m = _CM_TOOL_RE.match(s)
+    if m:
+        return m.group(1) not in _CM_READ_TOOLS
+    if re.match(r"^\s*->\s*(?:mcp__)?tool_call\(", s):
+        return any(n not in _CM_READ_TOOLS for n in _CM_TOOL_CALL_RE.findall(s))
+    return bool(re.match(r"^\s*->\s*(?:terminal|execute_code)\(", s) and _CM_CLI_RE.search(s))
+
+
+def mutated_cards(tool_log: Optional[list]) -> tuple[set, set]:
+    """(ok, failed): card ids a board write in `tool_log` changed, and ids whose write errored or was refused. A
+    call's `<- MUT ok=… refused=…` line (agent_rules.mutation_result_line) decides per id; without one, an `<- ERROR`
+    after the call fails every id it names."""
+    lines = list(tool_log or [])
+    ok: set = set()
+    bad: set = set()
+    i = 0
+    while i < len(lines):
+        line = lines[i] or ""
+        if not line.lstrip().startswith("->"):
+            i += 1
+            continue
+        ids = set(NAMED_CARD_RE.findall(line))
+        j, err, mut = i + 1, False, None
+        while j < len(lines) and not (lines[j] or "").lstrip().startswith("->"):
+            s = (lines[j] or "").lstrip()
+            if s.startswith("<- ERROR"):
+                err = True
+            m = _CM_MUT_RE.match(s)
+            if m:
+                mut = m
+            j += 1
+        # the MUT line decides (it saw the whole call; the `->` line keeps 140 chars); without one, a call that
+        # reads as a board write counts unless it errored
+        if mut:
+            ok |= {c for c in (mut.group("ok") or "").split(",") if c}
+            bad |= {c for c in (mut.group("refused") or "").split(",") if c}
+        elif _cm_mutation_call(line):
+            if err:
+                bad |= ids
+            else:
+                ok |= ids
+        i = j
+    return ok, bad
+
+
+def card_ids_for_title(title: str, dbs: Optional[list] = None) -> list[str]:
+    """Ids of cards titled `title` (case-insensitive, trimmed) on this host's boards, then its replicas of other
+    gateways' boards; [] when none match. With no exact match, a title of 20+ chars also matches a stored title it
+    starts, cut at a " (", " -", " —" or ":" (replies drop the parenthetical: "… manager dies" for "… manager dies
+    (worker-1 sat dead 25 min)", agent-182d2d699c). Raises nothing: an unreadable board is skipped."""
+    t = " ".join((title or "").split()).strip(" .")
+    if not t:
+        return []
+    paths = list(dbs) if dbs is not None else list(_board_dbs())
+    if dbs is None:
+        try:
+            paths += list(_cache.load_sibling(_HERE, "agent_rules").shadow_dbs())
+        except Exception:
+            pass
+    exact: list[str] = []
+    prefix: list[str] = []
+    like = t.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    for path in paths:
+        try:
+            conn = _ro_connect(path, timeout=2)
+            try:
+                rows = conn.execute("select id, title from tasks where lower(trim(title)) like ? escape '\\'",
+                                    (like,)).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            continue
+        for cid, stored in rows:
+            s = " ".join(str(stored or "").split()).strip(" .")
+            rest = s[len(t):]
+            if not rest:
+                exact.append(str(cid))
+            elif len(t) >= 20 and re.match(r"\s*(?:\(|[-\u2013\u2014:]\s)|:", rest):
+                prefix.append(str(cid))
+    return list(dict.fromkeys(exact or prefix))
+
+
+def claimed_mutation(reply: str, tool_log: Optional[list] = None, prev_log: Optional[list] = None,
+                     card_titles: Optional[Callable[[str], list]] = None) -> Optional[dict]:
+    """{"evidence", "card", "verb"} for the first reply sentence claiming in the first person past tense that the
+    agent moved/archived/unblocked/re-placed/reprioritized/reassigned a card it names (by `t_…` id or double-quoted
+    title), when neither `tool_log` nor `prev_log` shows a successful board write of that card; else None.
+    Future tense, third person, negations, corrections, code and `>` quotes pass. `card_titles(title) -> [ids]`
+    defaults to card_ids_for_title; a lookup error or an unknown title passes (fail-open)."""
+    text = _CM_FENCE_RE.sub(" ", reply or "")
+    if not CLAIMED_MUTATION_RE.search(text):
+        return None
+    lookup = card_titles or card_ids_for_title
+    done: Optional[tuple] = None
+    for sent in _SENTENCE_END.split(text):
+        m = next((m for m in CLAIMED_MUTATION_RE.finditer(sent)
+                  if sum(sent[:m.start()].count(q) for q in _DQUOTES) % 2 == 0), None)
+        if not m or _CM_CORRECTION_RE.search(sent):
+            continue
+        verb = m.group("verb").lower()
+        if verb in _CM_PRIORITY_VERBS and not _CM_PRIORITY_RE.search(sent[m.end():]):
+            continue
+        cards: list[tuple[list, str]] = [([c], c) for c in dict.fromkeys(NAMED_CARD_RE.findall(sent))]
+        for tm in _CM_TITLE_RE.finditer(sent):
+            title = tm.group(1) or tm.group(2)
+            try:
+                ids = list(lookup(title) or [])
+            except Exception:
+                ids = []
+            if ids:  # several cards share the title: a write of any of them backs the claim
+                cards.append((ids, f"\"{title}\" ({', '.join(ids[:3])})"))
+        if not cards:
+            continue
+        if done is None:
+            ok_now, bad_now = mutated_cards(tool_log)
+            ok_prev, _ = mutated_cards(prev_log)
+            done = (ok_now | ok_prev, bad_now)
+        ok, _bad = done
+        for ids, shown in cards:
+            if any(_cm_same(cid, o) for cid in ids for o in ok):
+                continue
+            return {"evidence": " ".join(sent.split()).strip(" -*\t")[:240], "card": shown, "card_id": ids[0],
+                    "verb": verb}
+    return None
+
+
+def claimed_mutation_nudge(hit: dict) -> str:
+    verb = hit.get("verb") or "moved"
+    return CLAIMED_MUTATION_NUDGE.format(verb=verb, verb_base=_CM_BASE.get(verb, "change"), card=hit.get("card"),
+                                         card_id=hit.get("card_id") or hit.get("card"),
+                                         evidence=(hit.get("evidence") or "")[:160])
+
+
 # ── agent-a0262d55e5: a stall comment on a card that never starts ─────────────────────────────────────────────────
 # Hub 20261031_064851_d0f106: "the rollout is waiting on card t_01a19f3049f432d5, ready but has not started. I've
 # flagged it as the immediate blocker." The turn's only action on that card was a kanban_comment; it had sat ready
@@ -1669,9 +1857,9 @@ def command_copy_nudge(evidence: str, user_ask: str = "") -> str:
 
 
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
-         "laptop_job", "skipped_live", "merge_forecast", "future_clock")
+         "laptop_job", "skipped_live", "merge_forecast", "future_clock", "claimed_mutation")
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
-                 "laptop_job", "skipped_live", "merge_forecast", "future_clock")
+                 "laptop_job", "skipped_live", "merge_forecast", "future_clock", "claimed_mutation")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
 # report_only_capped: the screen alone when a second opinion was due but unavailable (daily cap hit, error); confirms
@@ -3199,6 +3387,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
           human_asks: Optional[Callable[[], list]] = None,
           audit: Optional[Callable[[dict], None]] = None,
           card_status: Optional[Callable[[str], Optional[str]]] = None,
+          card_titles: Optional[Callable[[str], list]] = None,
           capped_nudge: bool = True,
           report_only_fallback: str = REPORT_ONLY_FALLBACK,
           prev_turn: Optional[dict] = None, deny_quoted: bool = False, platform: str = "",
@@ -3294,6 +3483,15 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "future_clock", "p": 1.0, "evidence": phrase, "reason": "future_clock",
                     "verdict": {"future_clock": 1.0, "evidence": phrase},
                     "nudge": future_clock_nudge(phrase, now=now)}
+    if not only or "claimed_mutation" in only:
+        try:
+            cm = claimed_mutation(reply, tool_log, prev_log=(prev_turn or {}).get("rich"), card_titles=card_titles)
+        except Exception:
+            cm = None  # fail-open: a board read or parse error never holds a reply
+        if cm:  # deterministic: a claimed card move/archive/unblock no write this turn made (agent-182d2d699c)
+            return {"rule": "claimed_mutation", "p": 1.0, "evidence": cm["evidence"], "reason": "claimed_mutation",
+                    "card": cm["card_id"], "verdict": {"claimed_mutation": 1.0, "evidence": cm["evidence"]},
+                    "nudge": claimed_mutation_nudge(cm)}
     if (not only or "report_only" in only) and not scoped:
         closed = card_closed(tool_log)
         tail = CARD_CLOSED_TAIL if closed else ""
@@ -3553,6 +3751,7 @@ BACKTEST_RULES: dict = {"credit_ask": lambda r: credit_ask(r, []), "laptop_job":
                         "skipped_live": lambda r: skipped_live(r, []),
                         "merge_forecast": lambda r: merge_forecast(r, []),
                         "future_clock": lambda r, at=None: future_clock(r, now=at),
+                        "claimed_mutation": lambda r: (claimed_mutation(r, []) or {}).get("evidence"),
                         "recommend_stall": lambda r: recommend_stall(r)}
 # Rules that compare the reply with the clock: the backtest passes each reply's own timestamp as `at`.
 BACKTEST_AT_RULES = ("future_clock",)

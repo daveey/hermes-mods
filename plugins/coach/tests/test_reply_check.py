@@ -112,7 +112,8 @@ def test_settings_defaults(monkeypatch):
     monkeypatch.delenv("COACH_REPLY_THRESHOLDS", raising=False)
     cfg = rc.settings()
     assert cfg["rules"] == ["handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask",
-                            "credit_ask", "laptop_job", "skipped_live", "merge_forecast", "future_clock"] and cfg["threshold"] == 0.7
+                            "credit_ask", "laptop_job", "skipped_live", "merge_forecast", "future_clock",
+                            "claimed_mutation"] and cfg["threshold"] == 0.7
     assert cfg["thresholds"] == {"report_only": 0.5, "report_only_screen": 0.85, "report_only_capped": 0.92}
 
 

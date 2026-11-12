@@ -1537,6 +1537,86 @@ def _shell_text(name: str, a: dict) -> str:
     return str(a.get("command") or "") if name == "terminal" else str(a.get("code") or "")
 
 
+# agent-182d2d699c: a reply said "I moved it to the pool" about a card no call moved, and the real move later was
+# refused ("is running: its worker moves it") inside a command that still exited 0, so no `<- ERROR` line marked it.
+# After a board write (a `hermes kanban move|archive|unblock|edit|...` command, or a kanban_* write tool, direct or via
+# tool_call) one `   <- MUT ok=<ids> refused=<ids>` line records which named cards it changed, from the whole call
+# (the `->` line keeps only 140 chars of a bulk command). reply_check.claimed_mutation reads it.
+MUTATION_CLI_RE = re.compile(r"\bhermes(?:-hub)?['\",\s]+(?:-p['\",\s]+\S+['\",\s]+)?kanban\b[^\n;|&]*?\b(?:move|archive|"
+                             r"unblock|edit|reassign|assign|promote|reclaim|unarchive|retry|create)\b")
+# a create (tool or CLI): the new id is only in its result
+MUTATION_CREATE_RE = re.compile(r"\bhermes(?:-hub)?['\",\s]+(?:-p['\",\s]+\S+['\",\s]+)?kanban['\",\s]+create\b")
+# a line that speaks for the whole call even without naming a card ("kanban move: ...", "Error: ...", "usage: ...")
+MUTATION_GENERIC_RE = re.compile(r"^\s*(?:kanban \w+:|hermes(?: kanban)?:|error\b|usage:|traceback\b)", re.I)
+MUTATION_READ_TOOLS = ("kanban_show", "kanban_list", "kanban_attachments", "kanban_comment", "kanban_heartbeat")
+MUTATION_REFUSAL_RE = re.compile(
+    r"\brefus\w*|\bcannot\b|\bcan['\u2019]t\b|\bcould ?n['\u2019]?o?t\b|\bnot allowed\b|\bforbidden\b|\bdenied\b"
+    r"|\bunknown id\b|\bno such\b|\bnot found\b|\bits worker moves it\b|\bfailed\b|\berror\b|\bforeign_card\b",
+    re.I)
+MUTATION_DONE_RE = re.compile(r"^\s*(?:Moved|Archived|Unblocked|Edited|Reassigned|Assigned|Promoted|Reclaimed|"
+                              r"Unarchived|Retried|Re-?placed)\b", re.I)
+MUT_IDS_MAX = 30
+
+
+def mutation_result_line(tool: str, args: Any, result: Any, status: Optional[str] = None) -> Optional[str]:
+    """`   <- MUT ok=<ids> refused=<ids>` for a Kanban board write naming cards, else None. Per card: refused when a
+    result line naming it (or, for a one-card call, any line) reads as a refusal; else changed when the call did not
+    fail or a result line says it was (`Moved t_…`)."""
+    name = (tool or "").rsplit("__", 1)[-1]
+    a = args if isinstance(args, dict) else {}
+    creates = False
+    if name in ("terminal", "execute_code"):
+        text = _shell_text(name, a)
+        if not MUTATION_CLI_RE.search(text):
+            return None
+        creates = not _CARD_ID_RE.search(text) and bool(MUTATION_CREATE_RE.search(text))
+    elif name == "tool_call":
+        calls = [c for c in (a.get("calls") or []) if isinstance(c, dict)]
+        writes = [c for c in calls if str(c.get("name") or "").rsplit("__", 1)[-1].startswith("kanban_")
+                  and str(c.get("name") or "").rsplit("__", 1)[-1] not in MUTATION_READ_TOOLS]
+        if not writes:
+            return None
+        creates = any(str(c.get("name") or "").rsplit("__", 1)[-1] == "kanban_create" for c in writes)
+        # a create's parents/body ids are not changed by it; the other writes' ids are
+        text = json.dumps([c for c in writes if str(c.get("name") or "").rsplit("__", 1)[-1] != "kanban_create"],
+                          default=str)
+    elif name.startswith("kanban_") and name not in MUTATION_READ_TOOLS:
+        creates = name == "kanban_create"
+        text = "" if creates else json.dumps(a, default=str)
+    else:
+        return None
+    ids = list(dict.fromkeys(_CARD_ID_RE.findall(text)))
+    d = _as_dict(result)
+    if d is not None and name in ("terminal", "execute_code"):
+        out = str(d.get("output") or "")
+    else:  # a tool's JSON result: drop empty error fields so `"error": null` is not read as a refusal
+        out = re.sub(r"[\"'](?:error|failed|refused)[\"']\s*:\s*(?:null|None|false|False|0|\"\"|''|\[\])", "",
+                     str(result or ""))
+    bad_call = failed(name, result, status)
+    # a create names its new card only in the result ("I archived it and opened t_NEW")
+    arg_ids = set(_CARD_ID_RE.findall(json.dumps(a, default=str)))
+    created = ([c for c in dict.fromkeys(_CARD_ID_RE.findall(out)) if c not in ids and c not in arg_ids]
+               if creates and not bad_call else [])
+    if not ids:
+        return f"   <- MUT ok={','.join(created[:MUT_IDS_MAX])}" if created else None
+    lines = out.splitlines()
+    ok, refused = [], []
+    for cid in ids:
+        # lines naming the card; for a one-card call also a generic line ("kanban move: ...", "Error: ..."), never
+        # an unrelated read's output ("queue: ... this machine cannot lease it")
+        mine = [l for l in lines if cid in l] or (
+            [l for l in lines if MUTATION_GENERIC_RE.match(l)] if len(ids) == 1 else [])
+        if any(MUTATION_DONE_RE.search(l) for l in mine if cid in l):
+            ok.append(cid)
+        elif any(MUTATION_REFUSAL_RE.search(l) for l in mine) or bad_call:
+            refused.append(cid)
+        else:
+            ok.append(cid)
+    ok += [c for c in created if c not in ok]
+    return (f"   <- MUT ok={','.join(ok[:MUT_IDS_MAX])}"
+            + (f" refused={','.join(refused[:MUT_IDS_MAX])}" if refused else ""))
+
+
 def saved_read_files(tool: str, args: Any) -> list:
     """File names a `hermes-hub tasks ... > <file>` call saved its card list to (agent-a8184f8541)."""
     name = (tool or "").rsplit("__", 1)[-1]
@@ -2746,6 +2826,13 @@ class AgentCoach:
             if park:  # this turn parked its run: reply_check.lifecycle_park (agent-9f966b0682)
                 s["turn_log"].append(park)
                 s.setdefault("turn_rich", deque(maxlen=60)).append(park)
+        try:  # which named cards a board write changed or was refused (reply_check.claimed_mutation)
+            mut = mutation_result_line(tool, args, result, status)
+        except Exception:
+            mut = None
+        if mut:
+            s["turn_log"].append(mut)
+            s.setdefault("turn_rich", deque(maxlen=60)).append(mut)
         if is_kanban_call(tool, args):  # sticky across turns until the next Kanban call answers
             s["kanban_db_down"] = bool(failed(tool, result, status) and KANBAN_DB_DOWN.search(str(result)))
 
