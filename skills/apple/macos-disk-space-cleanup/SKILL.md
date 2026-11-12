@@ -23,12 +23,19 @@ description: Use when a Mac is low on disk. Find, clean, ask first.
    - App log dirs that grow huge, e.g. `~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/Logs` (5.7 GB seen). Delete files older than a day: `find <dir> -type f -mtime +1 -delete`.
    - `~/.cache/huggingface/hub/tmp*`: leftovers from aborted downloads. Check `pgrep -f huggingface` first.
    - Leftovers from retired services: LaunchAgent plists (including `LaunchAgents/disabled/`), their `~/Library/Logs/<label>` dirs and helper scripts. Confirm with `launchctl list` that nothing is loaded.
+   - A CI runner checkout that no job uses any more, such as `_work/<old repo name>` after a repo rename. The next checkout rebuilds it, so it is a rebuildable item under standing approval, not a work dir to ask about. First prove all of these with reads that write nothing (see the pitfall on reading a checkout):
+     - no job log since the rename names the path, and `lsof +D <dir>` is empty;
+     - there are no local branches ahead of the remote and no stash, and every untracked file is ignored;
+     - the ignored files are only regenerable caches or scripts;
+     - HEAD is on the remote;
+     - either no `Runner.Worker` is running, or the running job's workspace is a different dir.
+   - **An open ask on the same path:** if a For you request or a blocked card covers it, comment on it or withdraw it in the same turn you delete. On Nov 11, two agents asked David about the mini's old `_work/hermes` while a third deleted it under standing approval. His queue kept the moot ask for 18 more minutes, and one chat still told him it needed his yes.
 5a. **Check for an external drive** (`diskutil list external`, `df -h | grep Volumes`). If one has free space, offer to *move* stale repos and archives there rather than delete them. Find stale repos by last commit date with `git log -1 --format=%cs`.
    - **Never move CI runners or other live, I/O-heavy state to an external/USB disk.** That includes `~/ci-runner-*`, `actions-runner*`, any runner `_work`, and Docker/OrbStack data. This is David's standing rule (2026-11-11).
      - Why: moving the mini's `ci-runner-hermes-state` to `/Volumes/External` slowed the required macOS CI job from about 10 min to 34 min. The USB disk did about 150 tps, and checkout went from 10 s to 164–398 s. It had to be moved back.
      - launchd also can't open log paths there (TCC, EX_CONFIG 78).
      - Free space elsewhere, or ask about the target instead.
-5. **Ask once before deleting app state, VMs or work dirs.** Use a single multi-select `clarify` question. Each option gives the size and what happens if it's deleted, e.g. 'redownloads when used', 'rebuilt on next CI job', 'old images and volumes lost'. Never touch the user's own project data, source trees or running VM disks without asking.
+5. **Ask once before deleting app state, VMs or work dirs.** An unused CI checkout that passes step 4's checks is not one of these. Use a single multi-select `clarify` question. Each option gives the size and what happens if it's deleted, e.g. 'redownloads when used', 'rebuilt on next CI job', 'old images and volumes lost'. Never touch the user's own project data, source trees or running VM disks without asking.
 6. **Re-run `df`** and report.
 7. **Check Done means** (below), fix at most 2 rounds, then report what still fails.
 
