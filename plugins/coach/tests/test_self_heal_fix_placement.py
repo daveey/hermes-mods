@@ -196,14 +196,17 @@ def test_cron_fingerprint_is_evidence_not_a_host_requirement(store):
     assert kp.portable_reason(fix, POOL_CFG) is None
 
 
-def test_non_split_fix_keeps_symptom_title(store, monkeypatch):
+def test_non_split_fix_keeps_symptom_in_evidence_not_title(store, monkeypatch):
     monkeypatch.setattr(sh, "split_fix", lambda *args: False)
     symptom = "cron job failed through ssh"
     sh.LaneState(store.root).update(FP, symptom=symptom)
     b = Board()
     sh.file_fix(FP, store=store, runner=b, now=NOW, budget_fn=OPEN)
     assert len(b.creates()) == 1
-    assert fields(b.creates()[0])["title"] == f"{sh.FIX_TITLE} {symptom}"
+    card = fields(b.creates()[0])
+    assert card["title"] == f"{sh.FIX_TITLE} {sh.incident_title(symptom)}"
+    assert symptom not in card["title"]
+    assert symptom in card["body"]
 
 
 

@@ -462,7 +462,9 @@ def test_hostile_symptoms_never_enter_emitted_titles(core, store, symptom, monke
     assert pe.strip_markers(symptom) in got[0]["body"]
     for title in [p["fields"]["title"] for p in rec.payloads] + [got[0]["title"]]:
         assert core.kp.portable_reason({"title": title, "body": ""}, {}) is None
-        assert re.fullmatch(r"[A-Za-z -]+(?:\(read-only\))?: incident [0-9a-f]{12}", title)
+        assert (title == f"{sh.FIX_TITLE} defect {FP.rsplit('-', 1)[-1]}"
+                or re.fullmatch(r"[A-Za-z -]+(?:\(read-only\))?: incident [0-9a-f]{12}", title))
+        assert symptom not in title
 
 
 @pytest.mark.parametrize("which", ["watchdog", "owner"])
