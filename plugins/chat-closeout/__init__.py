@@ -1496,7 +1496,9 @@ def _session_scope(sid: str) -> tuple[Optional[Path], str]:
     return None, "default"
 
 
-_HERMES_SID = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6,}$")
+# Interactive ids (YYYYMMDD_HHMMSS_hex) and Desktop/worker local creation receipts
+# (hermes_state_keys.local_identity: "local-" + sha256 hex).
+_HERMES_SID = re.compile(r"^(?:\d{8}_\d{6}_[0-9a-f]{6,}|local-[0-9a-f]{64})$")
 
 
 def _session_gone(sid: str) -> bool:
