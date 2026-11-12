@@ -73,6 +73,139 @@ def _followups(home):
     return core.open_followups(home, home / "state.db", CHAT)
 
 
+SUPERSEDED = (
+    "Superseded—not delivered: per operator direction, closed PR1140 unmerged after verifying published state "
+    "bridge d0bf6fb81 plus core PR1162 address the same circular wait. Replacement owner "
+    "t_01a1ccafa8c9530d retains landing and live Mac verification…"
+)
+SUCCESSOR = "t_01a1ccafa8c9530d"
+
+
+def _successor(home, status="running", other_board=False):
+    path = home / "kanban" / "boards" / "other" / "kanban.db" if other_board else home / "kanban.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as c:
+        if other_board:
+            c.executescript((HERE / "kanban_schema.sql").read_text())
+        c.execute("INSERT INTO tasks(id,title,body,assignee,status,created_at,workspace_kind) VALUES (?,?,?,?,?,?,?)",
+                  (SUCCESSOR, "Replacement", "Land fix", "default", status, 1, "scratch"))
+
+
+@pytest.mark.parametrize("status", ["running", "done"])
+@pytest.mark.parametrize("other_board", [False, True])
+def test_superseded_handoff_with_existing_successor_is_not_reported(home, status, other_board):
+    _child(home, summary=SUPERSEDED, body="Fix circular wait", comments=())
+    _successor(home, status, other_board)
+    _say(home, "user", f"Kanban {CHILD} done")
+    assert _followups(home) == []
+
+
+def test_superseded_handoff_missing_successor_is_reported_without_send_instruction(home):
+    _child(home, summary=SUPERSEDED, body="Fix circular wait", comments=())
+    _say(home, "user", f"Kanban {CHILD} done")
+    [item] = _followups(home)
+    assert not item["undelivered"]
+    assert "successor" in core.render_followups([item])
+    assert "perform exactly the recorded action" not in core.render_followups([item])
+    assert core.drop_announced([item], f"Kanban {CHILD} done") == [item]
+
+
+def test_minted_unsent_summary_alone_still_reported(home):
+    _child(home, summary="Invite link minted but NOT sent; the parent session sends it", body="Mint invite", comments=())
+    _say(home, "user", f"Kanban {CHILD} done")
+    assert _followups(home)[0]["undelivered"]
+
+
+@pytest.mark.parametrize("in_comment", [False, True])
+def test_superseded_summary_does_not_hide_plain_kept_delivery(home, in_comment):
+    instruction = "do NOT send it yourself, the parent session sends it"
+    _child(home, summary=SUPERSEDED, body="Fix it" if in_comment else instruction,
+           comments=(instruction,) if in_comment else ())
+    _successor(home)
+    _say(home, "user", f"Kanban {CHILD} done")
+    assert _followups(home)[0]["undelivered"]
+
+
+def test_successor_does_not_hide_missed_notice(home):
+    _child(home, summary=SUPERSEDED, body="Fix it", comments=())
+    _successor(home)
+    [item] = _followups(home)
+    assert item["missed_notice"] and not item["undelivered"]
+
+
+@pytest.mark.parametrize("summary", ["Fix not delivered", "Feature never delivered", "Superseded—not delivered"])
+def test_bare_nondelivery_is_not_a_send(summary):
+    assert not core.undelivered_handoff(summary)
+
+
+@pytest.mark.parametrize("summary", ["Message not delivered to Alex", "Invite link not delivered to recipient",
+                                      "Not sent to Alex", "minted but NOT sent", "parent session sends it"])
+def test_real_nondelivery_still_detected(summary):
+    assert core.undelivered_handoff(summary)
+
+
+@pytest.mark.parametrize("quoted", ['"do NOT send it yourself, the parent session sends it"',
+                                    '`do NOT send it yourself, the parent session sends it`',
+                                    '“do NOT send it yourself, the parent session sends it”',
+                                    "'do NOT send it yourself, the parent session sends it'",
+                                    '"do NOT send it yourself,\nthe parent session sends it"',
+                                    '```text\ndo NOT send it yourself, the parent session sends it\n```'])
+def test_quoted_acceptance_examples_do_not_keep_delivery(home, quoted):
+    body = f"Fix parser.\n## Acceptance\n- **Tests**: {quoted} must still count."
+    _child(home, body=body, summary="Fixed parser", comments=())
+    _say(home, "user", f"Kanban {CHILD} done")
+    assert _followups(home) == []
+    assert core.obligation_hint("kanban_create", {"body": body}, json.dumps({"task_id": CHILD})) is None
+    assert core.kept_obligation(body + "\n## Delivery\nThe parent session sends it to Alex.")
+
+
+ISSUE_BODY = '''## Problem (observed 11-11 15:16–16:24 PST, chat 20261026_235722_bef6c6)
+Card t_01a1cc49c9159c60 completed with this handoff:
+
+> "Superseded—not delivered: per operator direction, closed PR1140 unmerged after verifying published state bridge d0bf6fb81 plus core PR1162 address the same circular wait. Replacement owner t_01a1ccafa8c9530d retains landing and live Mac verification…"
+
+It records no send. "Not delivered" means the card's own fix was superseded, and the remaining work has an open owner card.
+
+Even so, every turn of the chat got this reminder: "its handoff is explicitly NOT delivered yet … perform exactly the recorded action". Two things in `plugins/follow-through/core.py` cause it:
+- `_UNDELIVERED` matches the bare phrase "not delivered" (`undelivered_handoff`).
+- A comment `follow-through: nothing sent …` did not clear it, because `_RESOLVED_MARKER` only accepts SENT, DELIVERED, DONE or CANCELLED. It stopped only after an explicit `follow-through: DONE` comment.
+
+This is a false notice, and it pushes the agent toward sends nobody asked for.
+
+## Fix (repo: daveey/hermes-mods, public; follow its AGENTS.md)
+1. In `open_followups`, when the summary path is the only reason (not `kept_obligation` from body or comments), do not report the card if:
+   - the handoff names a replacement or successor owner card (for example "Replacement owner t_…", "superseded by t_…", "owner t_… retains …"); and
+   - that card exists on any board the hook reads (open or done).
+2. Narrow `_UNDELIVERED`, so "not delivered" counts only when it refers to a message or artifact for a recipient. Examples that must still count: "minted but NOT sent", "not sent to <recipient>", "parent session sends".
+3. Leave the `kept_obligation` path and the missed-notice path unchanged.
+
+## Acceptance
+- **Tests**, in the plugin's existing test file, using real fixture DBs and no mocks of the code under test:
+  1. The exact handoff above, with the owner card present: not reported.
+  2. The same handoff with the owner card absent: reported.
+  3. "Invite link minted but NOT sent; the parent session sends it": reported.
+  4. A body that keeps the delivery for the parent ("do NOT send it yourself, the parent session sends it") plus a superseded summary: still reported.
+  5. The plugin's existing tests pass.
+- **Live:** after the change is deployed to the MacBook, a scratch-board fixture card completed with a superseded handoff gets no follow-through reminder in a test chat, and a minted-but-not-sent fixture still gets one. Archive the fixtures afterwards.
+- **Report:** the commit SHA on hermes-mods main and the test output.'''
+
+
+def test_issue_body_is_test_spec_not_kept_obligation(home):
+    _child(home, body=ISSUE_BODY, summary="Fixed classifier", comments=())
+    _say(home, "user", f"Kanban {CHILD} done")
+    assert _followups(home) == []
+    assert core.obligation_hint("kanban_create", {"body": ISSUE_BODY}, json.dumps({"task_id": CHILD})) is None
+
+
+@pytest.mark.parametrize("phrase", [f"superseded by {SUCCESSOR}", f"owner {SUCCESSOR} retains landing",
+                                    f"successor owner card {SUCCESSOR}"])
+def test_successor_phrasings_suppress_summary_delivery_only(home, phrase):
+    _child(home, summary=f"Invite not sent. {phrase}", body="Build it", comments=())
+    _successor(home)
+    _say(home, "user", f"Kanban {CHILD} done")
+    assert _followups(home) == []
+
+
 # 1. child returns an artifact but explicitly has not delivered it
 def test_undelivered_handoff_is_reported_with_its_recorded_instruction(home):
     _child(home)

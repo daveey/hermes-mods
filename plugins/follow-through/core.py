@@ -33,17 +33,58 @@ _KEEP = re.compile(
     re.I)
 
 
+def _instruction_text(text: str) -> str:
+    """Exclude quoted test data, not plain instructions or quoted delivery authority elsewhere."""
+    chunks, pending, test_level = [], [], None
+
+    def flush():
+        block = "".join(pending)
+        # Fences first; then inline/multiline quoted test strings.
+        block = re.sub(r'```.*?```|~~~.*?~~~|`[^`]*`|"[^"]*"|“[^”]*”|(?<!\w)\'[^\']*\'(?!\w)',
+                       " ", block, flags=re.S)
+        chunks.append(block)
+        pending.clear()
+
+    for line in text.splitlines(keepends=True):
+        heading = re.match(r"^\s*(#{1,6})\s+(.+)", line)
+        if heading:
+            level, title = len(heading[1]), heading[2]
+            if test_level is not None and level <= test_level:
+                flush()
+                test_level = None
+            if re.search(r"\b(?:tests?|acceptance)\b", title, re.I):
+                test_level = level if test_level is None else test_level
+        if test_level is not None:
+            pending.append(line)
+        elif re.search(r"\b(?:examples?|test strings)\b", line, re.I):
+            pending.append(line)
+            flush()
+        else:
+            chunks.append(line)
+    flush()
+    return "".join(chunks)
+
+
 def kept_obligation(text: str) -> bool:
     """True when a card body/comment says the PARENT (not the worker) will deliver something later."""
-    return bool(text and _KEEP.search(text))
+    return bool(text and _KEEP.search(_instruction_text(text)))
 
 
 # --- 2. undelivered handoff ---------------------------------------------------------------------------------
 _UNDELIVERED = re.compile(
-    r"\b(?:not|never)\s+(?:yet\s+)?(?:been\s+)?(?:sent|delivered|messaged|posted|forwarded|shared)\b"
+    r"\b(?:not|never)\s+(?:yet\s+)?(?:been\s+)?(?:sent|messaged|posted|forwarded|shared)\b"
+    r"|\b(?:message|invite|link|email|artifact|file|report|document)\b[^.\n]{0,60}"
+    r"\b(?:not|never)\s+(?:yet\s+)?(?:been\s+)?delivered\b"
+    r"|\b(?:not|never)\s+(?:yet\s+)?(?:been\s+)?delivered\s+(?:the\s+)?"
+    r"(?:message|invite|link|email|artifact|file|report|document)\b"
     r"|\bminted\s+but\s+not\b|\bparent\s+session\s+(?:sends|delivers|will)\b|\bdid\s+not\s+send\b",
     re.I)
 _RESOLVED_MARKER = re.compile(r"follow-through:\s*(?:SENT|DELIVERED|DONE|CANCELLED)\b", re.I)
+# Explicit successor references are ownership claims, never delivery authorization.
+_SUCCESSOR = re.compile(
+    r"\b(?:replacement|successor)\s+(?:owner\s+)?(?:card\s+)?(t_[a-zA-Z0-9]+)\b"
+    r"|\bsuperseded\s+by\s+(?:card\s+)?(t_[a-zA-Z0-9]+)\b"
+    r"|\bowner\s+(t_[a-zA-Z0-9]+)\s+retains\b", re.I)
 FOLLOWUP_KEY_PREFIX = "followup:"
 # A notice the notifier claimed for a chat stays unacked until the chat's running turn ends; core treats a live
 # claim older than this as stuck (hermes_cli/kanban_db_notify.py NOTIFY_CLAIM_STALE_S). Until then it is in flight,
@@ -153,7 +194,19 @@ def open_followups(home: Path, state_db: Optional[Path], session_id: str, now: O
     now = time.time() if now is None else now
     keys = session_keys(state_db, session_id)
     found: list[dict] = []
-    for db in kanban_dbs(home):
+    dbs = kanban_dbs(home)
+    # Include every readable board, independent of subscriptions and task state.
+    known_tasks = set()
+    for db in dbs:
+        try:
+            owner_conn = _ro(db)
+            try:
+                known_tasks.update(row[0] for row in owner_conn.execute("SELECT id FROM tasks"))
+            finally:
+                owner_conn.close()
+        except sqlite3.Error:
+            pass  # Unreadable ownership must not suppress a reminder.
+    for db in dbs:
         try:
             conn = _ro(db)
         except sqlite3.Error:
@@ -187,8 +240,13 @@ def open_followups(home: Path, state_db: Optional[Path], session_id: str, now: O
                     "SELECT t.id, t.status FROM task_links l JOIN tasks t ON t.id=l.child_id WHERE l.parent_id=? "
                     "AND (t.idempotency_key LIKE ? OR lower(t.title) LIKE 'follow-up%')",
                     (tid, FOLLOWUP_KEY_PREFIX + "%")).fetchone() if "idempotency_key" in task.keys() else None
-                undelivered = undelivered_handoff(summary) or kept_obligation(task["body"] or "") or \
-                    any(kept_obligation(c or "") for c in comments)
+                kept = kept_obligation(task["body"] or "") or any(kept_obligation(c or "") for c in comments)
+                successors = {value for match in _SUCCESSOR.findall(summary) for value in match if value}
+                successors.discard(tid)  # A self-reference cannot transfer ownership.
+                has_successor = bool(successors & known_tasks)
+                unresolved_successor = bool(successors) and not has_successor and bool(
+                    re.search(r"\bsuperseded\b", summary, re.I) or undelivered_handoff(summary))
+                undelivered = kept or (undelivered_handoff(summary) and not has_successor)
                 # Only a chat already subscribed when the card completed was owed its notice. A later subscription
                 # (the chat commented on, or linked, the done card) starts past the completion event, so the
                 # notifier never sends it one: that is not a missed notice.
@@ -197,11 +255,12 @@ def open_followups(home: Path, state_db: Optional[Path], session_id: str, now: O
                 # chat's current turn ends. It counts as missed only once that claim is stale.
                 missed = owed_notice and not _in_flight(sub, ev, now) and \
                     not _seen_in_chat(state_db, keys, f"Kanban {tid} done")
-                if resolved or followup or not (undelivered or missed):
+                if resolved or followup or not (undelivered or missed or unresolved_successor):
                     continue
                 authority = [s.strip() for s in [task["body"] or "", *comments] if kept_obligation(s or "")]
                 found.append(dict(task_id=tid, title=task["title"], completed_at=ev["created_at"], event_id=ev["id"],
                                   summary=summary, undelivered=undelivered, missed_notice=missed,
+                                  unresolved_successor=unresolved_successor,
                                   authority=[_excerpt(a) for a in authority[-2:]], db=str(db)))
     found.sort(key=lambda r: -(r["completed_at"] or 0))
     return found
@@ -216,7 +275,7 @@ def drop_announced(items: list[dict], user_message: str) -> list[dict]:
     out = []
     for it in items:
         if it["missed_notice"] and f"Kanban {it['task_id']} done" in user_message:
-            if not it["undelivered"]:
+            if not it["undelivered"] and not it.get("unresolved_successor"):
                 continue
             it = dict(it, missed_notice=False)
         out.append(it)
@@ -225,6 +284,7 @@ def drop_announced(items: list[dict], user_message: str) -> list[dict]:
 
 def _excerpt(text: str, limit: int = 600) -> str:
     """The sentences around the kept-obligation match (the recorded instruction), trimmed."""
+    text = _instruction_text(text)
     m = _KEEP.search(text)
     if not m:
         return text[:limit]
@@ -241,6 +301,8 @@ def render_followups(items: list[dict]) -> str:
     lines = ["[follow-through] Unfinished follow-ups from child cards this chat is responsible for:"]
     for it in items:
         why = []
+        if it.get("unresolved_successor"):
+            why.append("its named successor owner could not be found; verify the ownership handoff")
         if it["missed_notice"]:
             why.append("its completion notice never reached this chat")
         if it["undelivered"]:

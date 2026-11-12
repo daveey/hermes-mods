@@ -28,6 +28,14 @@ finished with "invite minted but NOT sent", and nothing sent it until the user a
 It never sends anything and never widens what was authorized: the reminder quotes the instruction that was
 recorded on the card and tells the agent to ask when none was recorded.
 
+Quoted examples/test strings under Tests or Acceptance headings (or on explicitly labelled example lines) are
+not kept delivery instructions. Plain-prose parent delivery instructions still count, including on a card with a
+superseded summary. Bare "not delivered" about a software fix is not a message-delivery obligation.
+
+An explicit replacement/successor owner found on any readable board suppresses only the summary-derived delivery
+reminder. A superseded handoff naming a missing owner stays visible as an ownership-verification reminder, not an
+instruction to send. Neither case suppresses a genuinely missed completion notice or a kept delivery instruction.
+
 Convention: whoever performs a deferred delivery records
 `kanban_comment(task_id=<X>, body='follow-through: SENT via <channel> at <time>; delivery verified|not verified')`.
 That marker is the retry/duplicate guard and clears the reminder (`DELIVERED`, `DONE`, `CANCELLED` also count).
