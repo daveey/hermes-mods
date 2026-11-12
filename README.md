@@ -133,6 +133,7 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
 | [apple/local-chrome-remote-debugging](skills/apple/local-chrome-remote-debugging/) | Driving Chrome with remote debugging on macOS. |
 | [apple/macos-disk-space-cleanup](skills/apple/macos-disk-space-cleanup/) | A Mac is low on disk: find, clean, ask first. |
 | [apple/macos-dock-management](skills/apple/macos-dock-management/) | The Dock shows dead `?` icons or stale pins. |
+| [apple/macos-performance-triage](skills/apple/macos-performance-triage/) | Filter native stack samples by known wait leaves; retain SQLite work chains without mistaking stack occupancy for measured CPU usage. |
 | [autonomous-ai-agents/claude-usage-diagnostics](skills/autonomous-ai-agents/claude-usage-diagnostics/) | Claude usage runs out or sessions stick on 429s. |
 | [devops/cloud-service-decommission](skills/devops/cloud-service-decommission/) | Shutting down a hosted service to stop billing. |
 | [devops/github-ci-wait](skills/devops/github-ci-wait/) | Waiting for a pushed commit's GitHub CI or release: `wait_for_ci.py` waits on runs and tags that *contain* the commit, never the newest run (which a busy branch mostly cancels). |
