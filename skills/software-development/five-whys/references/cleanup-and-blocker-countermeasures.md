@@ -4,6 +4,8 @@ Reference for skill `five-whys`: its SKILL.md links this file from the step that
 
 ## 6. Countermeasures in proportion
 
+For automatic skill publication, verify the actual `skill_manage` post-tool path, not a direct call to its helper. Require the remote commit, a clean deployment checkout, and a timestamped publication receipt from the same worker session. A successful write alone proves none of these. Keep failed publication edits intact; test the clock-injected recovery-card fallback without writing fixture cards to the live board.
+
 For false human-blocker reports, trace **producer → stored block metadata → UI classifier → action** before
 rewriting the callout. Distinguish missing authorization from missing execution capability or authentication:
 `sudo -n` requiring a password does not establish that approval is missing. Prepare the supported interactive
