@@ -49,6 +49,11 @@ def _proc_start(pid):
         return None
 
 
+def _proc_entries():
+    """Every /proc entry; holders() scans them all. Tests narrow this seam to their own tree."""
+    return Path('/proc').iterdir()
+
+
 def holders(db: Path, extra_paths=()):
     """Linux local PID namespace only. Incomplete inspection is NOT zero holders."""
     if not Path('/proc/self/fd').is_dir():
@@ -70,7 +75,7 @@ def holders(db: Path, extra_paths=()):
         except FileNotFoundError:
             pass
     out = []
-    for proc in Path('/proc').iterdir():
+    for proc in _proc_entries():
         if not proc.name.isdigit() or int(proc.name) == os.getpid():
             continue
         pid = int(proc.name)

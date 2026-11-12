@@ -1,8 +1,14 @@
 """Real CLI fixture tests. Never point at the user's home/database/services.
 
 Run: python3 -m unittest discover -s plugins/sqlite-live-guard -p tests_swap.py -v
-For a Linux host with restricted /proc, SWAP_TEST_PRIVILEGED_SCAN=1 enables the
-helper's explicit sudo read-only scanner. Core-backed cases skip without core.
+Unprivileged runs scope the CLI's holder scan to this test process's own
+descendants (SCOPE below): the fixture DB lives in a private temp dir, so only
+processes the test starts can hold it, and other users' processes (pid 1 on a
+non-root host) can't make the scan incomplete. Production holders() still scans
+every pid and refuses an unreadable one (test_unscoped_scan_still_fails_closed).
+SWAP_TEST_PRIVILEGED_SCAN=1 (implied on GitHub Actions) instead runs the real
+whole-host scan through the helper's sudo read-only scanner.
+Core-backed cases skip without core.
 """
 import contextlib
 import fcntl
@@ -22,6 +28,27 @@ CORE = importlib.util.find_spec('gateway') is not None
 # Hosted Linux CI permits passwordless sudo; test the real scanner instead of
 # weakening production's permission-denied refusal or skipping holder coverage.
 PRIVILEGED = os.environ.get('SWAP_TEST_PRIVILEGED_SCAN') == '1' or os.environ.get('GITHUB_ACTIONS') == 'true'
+# Loads the CLI module as `m`. Unprivileged, it narrows m._proc_entries to the
+# descendants of SWAP_TEST_SCOPE_PID (the test process); the scan logic,
+# including the fail-closed refusal of an unreadable pid, runs unchanged on them.
+LOAD = ('import importlib.util,os,sys\n'
+        + f's=importlib.util.spec_from_file_location("swap",{str(SCRIPT)!r}); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n')
+SCOPE = '' if PRIVILEGED else (
+    'def _scoped(entries=m._proc_entries):\n'
+    ' root=int(os.environ["SWAP_TEST_SCOPE_PID"]); listed=list(entries()); parent={}\n'
+    ' for p in listed:\n'
+    '  if p.name.isdigit():\n'
+    '   try: parent[int(p.name)]=int((p/"stat").read_text().rsplit(")",1)[1].split()[1])\n'
+    '   except (OSError,IndexError,ValueError): pass\n'
+    ' def mine(pid):\n'
+    '  seen=set()\n'
+    '  while pid and pid not in seen:\n'
+    '   if pid==root: return True\n'
+    '   seen.add(pid); pid=parent.get(pid)\n'
+    '  return False\n'
+    ' return [p for p in listed if p.name.isdigit() and mine(int(p.name))]\n'
+    'm._proc_entries=_scoped\n')
+PREAMBLE = LOAD + SCOPE
 
 
 def database(path, sql='CREATE TABLE sessions(id TEXT PRIMARY KEY); INSERT INTO sessions VALUES("saved");'):
@@ -43,10 +70,13 @@ class SwapCLI(unittest.TestCase):
         fake = self.bin / 'systemctl'
         fake.write_text('#!' + sys.executable + '\nimport os,sys\nwith open(os.environ["UNIT_LOG"],"a") as f: f.write(" ".join(sys.argv[1:])+"\\n")\n')
         fake.chmod(0o700)
-        self.env.update(PATH=str(self.bin) + os.pathsep + os.environ['PATH'], UNIT_LOG=str(self.root / 'units.log'))
+        self.env.update(PATH=str(self.bin) + os.pathsep + os.environ['PATH'], UNIT_LOG=str(self.root / 'units.log'),
+                        SWAP_TEST_SCOPE_PID=str(os.getpid()))
+        self.launcher = self.root / 'launch.py'
+        self.launcher.write_text(PREAMBLE + 'sys.exit(m.main())\n')
 
-    def cli(self, *args, script=SCRIPT):
-        cmd = [sys.executable, str(script), '--db', str(self.db), '--replacement', str(self.replacement), '--wait', '0']
+    def cli(self, *args, script=None):
+        cmd = [sys.executable, str(script or self.launcher), '--db', str(self.db), '--replacement', str(self.replacement), '--wait', '0']
         if PRIVILEGED:
             cmd += ['--holder-scan-sudo']
         return subprocess.run(cmd + list(args), env=self.env, capture_output=True, text=True, timeout=90)
@@ -219,8 +249,7 @@ class SwapCLI(unittest.TestCase):
     def test_partial_rename_never_restarts_and_retry_refuses(self):
         # Only OS fault injection; execute the actual argparse CLI and all real SQLite paths.
         wrapper = self.root / 'fault.py'
-        wrapper.write_text('import importlib.util,sys\n'
-            + f's=importlib.util.spec_from_file_location("swap",{str(SCRIPT)!r}); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n'
+        wrapper.write_text(PREAMBLE
             + 'original=m.os.rename\ndef rename(src,dst):\n'
             + ' if str(src).endswith("staged.db"): raise OSError("fixture install rename failure")\n'
             + ' return original(src,dst)\nm.os.rename=rename\nsys.exit(m.main())\n')
@@ -268,8 +297,7 @@ class SwapCLI(unittest.TestCase):
         child = self.root / 'late_holder.py'
         child.write_text('import sys,time\nf=open(sys.argv[1],"rb")\nprint("ready",flush=True)\ntime.sleep(90)\n')
         wrapper = self.root / 'late.py'
-        wrapper.write_text('import importlib.util,subprocess,sys\n'
-            + f's=importlib.util.spec_from_file_location("swap",{str(SCRIPT)!r}); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n'
+        wrapper.write_text(PREAMBLE + 'import subprocess\n'
             + 'original=m.os.rename\nchildren=[]\ndef rename(src,dst):\n'
             + ' if str(src).endswith("staged.db"):\n'
             + f'  p=subprocess.Popen([sys.executable,{str(child)!r},str(dst)],stdout=subprocess.PIPE,text=True); children.append(p); assert p.stdout.readline().strip()=="ready"\n'
@@ -303,13 +331,21 @@ class SwapCLI(unittest.TestCase):
 
     def test_recheck_before_rename(self):
         wrapper = self.root / 'racer.py'
-        wrapper.write_text('import importlib.util,sys\n'
-            + f's=importlib.util.spec_from_file_location("swap",{str(SCRIPT)!r}); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n'
+        wrapper.write_text(PREAMBLE
             + 'original=m._policy\ndef policy(*args):\n r=original(*args); m._no_holders=lambda *a: (_ for _ in ()).throw(m.Refusal("fixture late holder")); return r\n'
             + 'm._policy=policy\nsys.exit(m.main())\n')
         result = self.cli(script=wrapper)
         self.assertEqual(result.returncode, 2)
         self.assertIn('fixture late holder', result.stderr)
+        self.assertTrue(self.db.exists())
+
+    def test_unscoped_scan_still_fails_closed(self):
+        # The test scope must not hide production's refusal of an unreadable pid.
+        if PRIVILEGED or os.access('/proc/1/fd', os.R_OK):
+            self.skipTest('every pid is readable here; no unreadable holder to refuse')
+        result = self.cli(script=SCRIPT)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('incomplete holder scan', result.stderr)
         self.assertTrue(self.db.exists())
 
 

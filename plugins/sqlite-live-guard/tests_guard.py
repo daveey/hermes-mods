@@ -254,11 +254,38 @@ def _db(path, rows):
     con.close()
 
 
+def _own_tree(entries=swap_db._proc_entries):
+    """/proc entries of this test process and its descendants: the only possible fixture holders."""
+    root, listed, parent = os.getpid(), list(entries()), {}
+    for p in listed:
+        if p.name.isdigit():
+            try:
+                parent[int(p.name)] = int((p / "stat").read_text().rsplit(")", 1)[1].split()[1])
+            except (OSError, IndexError, ValueError):
+                pass
+
+    def mine(pid):
+        seen = set()
+        while pid and pid not in seen:
+            if pid == root:
+                return True
+            seen.add(pid)
+            pid = parent.get(pid)
+        return False
+
+    return [p for p in listed if p.name.isdigit() and mine(int(p.name))]
+
+
 @pytest.fixture(autouse=True)
 def privileged_fixture_scan(monkeypatch):
+    # Privileged (CI): the real whole-host scan via sudo. Otherwise scope the scan to this test's own
+    # process tree, so another user's unreadable pid (pid 1 on a non-root host) can't abort the fixture;
+    # holders() itself still refuses any unreadable pid it is given.
     if os.environ.get('SWAP_TEST_PRIVILEGED_SCAN') == '1' or os.environ.get('GITHUB_ACTIONS') == 'true':
         real = swap_db._scan
         monkeypatch.setattr(swap_db, '_scan', lambda db, privileged=False, extra_paths=(): real(db, True, extra_paths))
+    else:
+        monkeypatch.setattr(swap_db, '_proc_entries', _own_tree)
 
 
 def test_swap_puts_replacement_in_and_keeps_originals(tmp_path):
@@ -276,7 +303,7 @@ def test_swap_puts_replacement_in_and_keeps_originals(tmp_path):
     old.close()
 
 
-def test_swap_refuses_while_a_process_holds_the_db(tmp_path):
+def test_swap_refuses_while_a_process_holds_the_db(tmp_path, capsys):
     live, rep = tmp_path / "kanban.db", tmp_path / "recovered.db"
     _db(live, ["a"])
     _db(rep, ["a", "b"])
@@ -286,6 +313,7 @@ def test_swap_refuses_while_a_process_holds_the_db(tmp_path):
     try:
         assert child.stdout.readline().strip() == "ready"
         assert swap_db.main(["--db", str(live), "--replacement", str(rep), "--wait", "0.5", "--allow-kanban"]) == 2
+        assert f"pid {child.pid} " in capsys.readouterr().err  # refused for this holder, not an incomplete scan
         con = sqlite3.connect(f"file:{live}?mode=ro", uri=True)
         assert [r[0] for r in con.execute("select id from tasks")] == ["a"]  # untouched
         con.close()
