@@ -271,14 +271,14 @@ test('draining: hover text carries the hold reason, holder and age; the row show
   const want = 'draining: disk cleanup (held by operator-a, 5m ago); finishes running cards, takes no new ones'
   const info = spare.querySelector(':scope > .hermes-fleet-info')
   assert.equal(info.textContent, 'i')
-  assert.ok(info.title.startsWith(want), info.title)
+  assert.ok(info.dataset.tip.startsWith(want), info.dataset.tip)
   assert.doesNotMatch(spare.textContent, /disk cleanup|operator-a|on hold/)
   assert.equal(spare.querySelector('.hermes-fleet-drain-label')?.textContent, 'draining')
   const slots = [...spare.querySelectorAll('.hermes-fleet-slot.is-draining')]
   assert.equal(slots.length, 3)
   for (const s of slots) assert.equal(s.title, want)
   const legacy = ui.container.querySelector('[data-machine="legacy"]')
-  assert.ok(legacy.querySelector('.hermes-fleet-info').title.startsWith('draining: no reason recorded (held by operator-b, 2h ago); finishes running cards, takes no new ones'))
+  assert.ok(legacy.querySelector('.hermes-fleet-info').dataset.tip.startsWith('draining: no reason recorded (held by operator-b, 2h ago); finishes running cards, takes no new ones'))
   await ui.close()
 })
 
