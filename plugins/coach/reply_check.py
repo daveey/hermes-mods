@@ -3120,6 +3120,8 @@ A `<- OK session <target>: last=<role> @ <ISO> (<age> ago) excerpt=...` line rec
 read. This transcript activity is not proof of a running worker: count a checked session as an active owner only
 when the recent excerpt shows progress on this fix, not just a user request or a promise. Stale (over 24 h), blocked,
 failed or completed work does not establish an active owner.
+A `<- comments <card> (...): [<when> <author>] "<head>"` line holds the newest comments of a card read this turn: a
+comment there recording the user's own decision to defer, rescope or skip an item is where that decision is recorded.
 A PREVIOUS TURN TOOL LOG, when shown, holds the checks the agent
 made one turn earlier (this turn made almost none and followed it within minutes): count them as the agent's own checks.
 
@@ -3583,6 +3585,15 @@ CONFIRM_RECOMMEND_NUDGE = (
     "irreversible or external-facing, or is new scope beyond the direction; then say exactly that.")
 
 
+# agent-a679e846ca: the judges clear an item the user chose to drop or rescope only when the reply names his decision
+# AND a tool log shows where it is recorded (REPORT_ONLY_RULE / CONFIRM_SYS). The nudge offered only fix / start /
+# propose, so an honest close-out rewrote its text ("per your instruction") without reading the record and failed
+# again. tests/test_report_only_nudge_exits.py ties each exit the rubric accepts to this wording.
+USER_DECISION_EXIT = ("If the user already chose to drop or rescope it, read the card or comment that records his "
+                      "decision this turn ({read}) and name it (card id and date) so the re-check can see it. A bare "
+                      "'per your instruction' doesn't count.")
+
+
 NUDGES = {
     "handoff": ("[coach] Before ending the turn: your message asks the user to do a step themselves ({evidence}). "
                 "The user wants agents to self-serve. Try it yourself first with what you have (shell, ssh, browser "
@@ -3607,7 +3618,8 @@ NUDGES = {
                     "fixes. Fix it now if it's small or reversible. Otherwise start it (kanban_create with acceptance "
                     "criteria, linked to this chat) and name the card by its id (t_…), so the re-check can verify "
                     "it. " + STALLED_OWNER + " If it really is the "
-                    "user's call, propose the exact fix. Don't end on the diagnosis."),
+                    "user's call, propose the exact fix. " + USER_DECISION_EXIT.format(read="kanban_show") +
+                    " Don't end on the diagnosis."),
 }
 # The session's Kanban tools can't read the board (core's "corrupt" refusal or PR #125's unreliable-view error), so
 # kanban_create from this session fails too: asking for it leaves the agent with no action that works.
@@ -3619,7 +3631,9 @@ REPORT_ONLY_KANBAN_DOWN = (
     "run `sqlite3 -readonly <board db> 'pragma quick_check'` from the terminal (read-only, no approval). If it says "
     "ok, the board is fine and this backend has a stale view: name the owner card (`hermes kanban list`/`show` in "
     "the terminal still works) or ask for the restart of this backend with action_request. If it is not ok, report "
-    "that output and ask for recovery with action_request. " + STALLED_OWNER + " Don't end on the diagnosis.")
+    "that output and ask for recovery with action_request. " + STALLED_OWNER + " " + USER_DECISION_EXIT.format(
+        read="`hermes kanban show <id>` in the terminal, a cross_task read, or the chat transcript") +
+    " Don't end on the diagnosis.")
 
 
 def kanban_db_down(tool_log: list[str]) -> bool:

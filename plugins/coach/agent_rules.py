@@ -3733,6 +3733,70 @@ def decide_go_line(tool: str, args: Any, result: Any = None, refused: bool = Fal
     return None
 
 
+# agent-a679e846ca: the report_only judges clear an item the user chose to drop or rescope only when a tool log shows
+# where his decision is recorded ("a card read or comment carrying the decision"). The OK line keeps only
+# status/run/last (`last=commented`), so a revision that read the card still showed the judge no decision. After a
+# successful card read one `<- comments` line carries that card's newest comments (who, when, the head of each).
+COMMENT_LINE_MAX = 560
+COMMENT_HEAD = 220
+COMMENTS_SHOWN = 2
+
+
+def _comments_of(task: dict, outer: dict) -> list:
+    for src in (task, outer):
+        for key in ("comments", "last_comments"):
+            got = src.get(key) if isinstance(src, dict) else None
+            if isinstance(got, list) and got:
+                return [c for c in got if isinstance(c, dict) and str(c.get("body") or "").strip()]
+    return []
+
+
+def _card_reads(obj: Any, depth: int = 0) -> list:
+    """(task, comments) for each Kanban card read in a tool result, the same shapes _tasks_in accepts."""
+    if depth > 5:
+        return []
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s[:1] not in "{[":
+            m = re.search(r"^[\[{]", s[:200], re.M)
+            s = s[m.start():] if m else ""
+        try:
+            return _card_reads(json.loads(s), depth + 1) if s[:1] in "{[" else []
+        except Exception:
+            return []
+    if isinstance(obj, list):
+        return [t for x in obj[:10] for t in _card_reads(x, depth + 1)]
+    if not isinstance(obj, dict):
+        return []
+    t = obj.get("task")
+    if isinstance(t, dict) and t.get("status"):
+        return [(t, _comments_of(t, obj))]
+    if str(obj.get("id") or "").startswith("t_") and obj.get("status"):
+        return [(obj, _comments_of(obj, {}))]
+    return [x for v in obj.values() if isinstance(v, (dict, list, str)) for x in _card_reads(v, depth + 1)]
+
+
+def comment_result_line(result: Any) -> Optional[str]:
+    """`   <- comments <card> (<shown> of <n>, newest last): [<when> <author>] "<head>" ...` for the first card read in
+    `result` that has comments, else None. Callers add it only after a successful owner read."""
+    for task, comments in _card_reads(result if isinstance(result, (dict, list)) else str(result or "")):
+        if not comments:
+            continue
+        stamped = sorted(enumerate(comments), key=lambda ic: (_ts(ic[1].get("created_at", ic[1].get("at"))) or 0,
+                                                             ic[0]))
+        segs = []
+        for _, c in stamped[-COMMENTS_SHOWN:]:
+            at = _ts(c.get("created_at", c.get("at")))
+            when = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(at)) if at else "?"
+            who = " ".join(str(c.get("author") or "?").split())[:40]
+            head = " ".join(str(c.get("body") or "").split())[:COMMENT_HEAD]
+            segs.append(f"[{when} {who}] {json.dumps(head, ensure_ascii=False)}")
+        tid = task.get("id") or "?"
+        return (f"   <- comments {tid} ({len(segs)} of {len(comments)}, newest last): "
+                + " ".join(segs))[:COMMENT_LINE_MAX]
+    return None
+
+
 def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = None,
                       saved: Any = ()) -> Optional[str]:
     """The `   <- OK ...` line for a successful owner read, else None. Callers skip failed calls. `saved`: files an
@@ -4330,6 +4394,13 @@ class AgentCoach:
             if ok:  # what a successful owner check found, for the report_only judges (agent-9516de5af8)
                 s["turn_log"].append(ok)
                 s.setdefault("turn_rich", deque(maxlen=60)).append(ok)
+                try:  # the card's newest comments: where a user's decision is recorded (agent-a679e846ca)
+                    said = comment_result_line(result)
+                except Exception:
+                    said = None
+                if said:
+                    s["turn_log"].append(said)
+                    s["turn_rich"].append(said)
             files = saved_read_files(tool, args)
             if files:  # a hub card list saved for a later filter by card id (agent-a8184f8541)
                 kept = s.setdefault("owner_read_files", deque(maxlen=8))
