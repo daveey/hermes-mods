@@ -36,8 +36,10 @@ chat open the owner-terminal flow for task <id>") puts chat refs in scope (ask-g
 split the user's answer, and the copy not consumed sits stale in For-you. Withdraw yours as soon as the card shows
 the ask was answered elsewhere or the card left `blocked`. Say an ask is withdrawn only once the withdraw result
 reads `withdrawn`; `withdraw.requestId` needs the full UUID (an 8-char prefix returns 404 "Unknown request").
-Don't add a `::user-step` marker to a reply that relays an ask you already published with `action_request`: it opens a
-second, plan-less request in For-you. When revising a request that was published with `decisionCard`, resend
+Every `::user-step` marker opens a For-you request, so wrap only a current ask, and only once. Never wrap a status
+headline or summary that asks nothing: it opens a request with nothing to answer, which reads as a duplicate of the
+real ask until withdrawn. Never wrap an ask you already published with `action_request`: that opens a second,
+plan-less request. When revising a request that was published with `decisionCard`, resend
 `aliases` holding that card's `kanban` ref (else 422 "must retain exact producer card aliases") and keep
 `scope.sourceRefs` (dropping it gives 422 "Invalid object fields"). Before saying nothing waits on the user, read the canonical list in full: when the injected
 note says it was truncated, parse the saved file it names, because the head/tail preview can hide an open request.
