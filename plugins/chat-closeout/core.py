@@ -405,13 +405,49 @@ def _later_comments(conn, left: list[str], has_runs: bool, comp: str) -> dict[st
         logger.debug("chat-closeout: later-comment read failed", exc_info=True)
         return {}
     for task_id, author, body, at in rows:
-        text = " ".join(str(body or "").split())
+        out.setdefault(task_id, []).append({'at': at, 'author': author, 'body': body})
+    return {task_id: ranked for task_id, items in out.items() if (ranked := rank_later_comments(items))}
+
+
+def rank_later_comments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Up to MAX_LATER_COMMENTS of ``items`` (``{at, author, body}``, all posted after the handoff): blank bodies
+    dropped, whitespace folded, decisions first then newest, returned oldest first."""
+    kept = []
+    for c in items:
+        text = " ".join(str(c.get('body') or "").split())
         if text:
-            out.setdefault(task_id, []).append({'at': at, 'author': str(author or "?")[:40], 'body': text})
-    for task_id, items in out.items():
-        ranked = sorted(items, key=lambda c: (not _DECISION_RE.search(c['body']), -(c['at'] or 0)))
-        out[task_id] = sorted(ranked[:MAX_LATER_COMMENTS], key=lambda c: c['at'] or 0)
-    return out
+            kept.append({'at': c.get('at'), 'author': str(c.get('author') or "?")[:40], 'body': text})
+    ranked = sorted(kept, key=lambda c: (not _DECISION_RE.search(c['body']), -(c['at'] or 0)))
+    return sorted(ranked[:MAX_LATER_COMMENTS], key=lambda c: c['at'] or 0)
+
+
+def replica_later_comments(record: Any) -> list[dict[str, Any]]:
+    """The post-handoff comments of a REMOTE card, from its hub-replica task record (t_01a1d6c01b4c0633: 8e23ae92
+    covered only local boards, so a decision commented on a card another gateway owns never reached the close-out).
+    Anchor as :func:`_later_comments`: the run's ``ended_at`` when that run carries the summary, else
+    ``completed_at``; no anchor = none. ``last_comments`` is newest last. Fail-soft: anything unreadable gives []."""
+    if not isinstance(record, dict):
+        return []
+    run = record.get('run')
+    run = run if isinstance(run, dict) else {}
+    anchor: Any = run.get('ended_at') if str(run.get('summary') or "").strip() else None
+    if anchor is None:
+        anchor = record.get('completed_at')
+    try:
+        anchor = float(anchor)
+    except (TypeError, ValueError):
+        return []
+    later = []
+    for c in record.get('last_comments') or []:
+        if not isinstance(c, dict):
+            continue
+        try:
+            at = float(c.get('at'))
+        except (TypeError, ValueError):
+            continue
+        if at > anchor:
+            later.append({**c, 'at': at})
+    return rank_later_comments(later[-_LATER_SCAN:])
 
 
 def _later_comment_lines(card: dict[str, Any], budget: int) -> list[str]:

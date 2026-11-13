@@ -81,8 +81,12 @@ whose summary is the handoff, else `completed_at`), decisions ranked before chat
 chars each, 4 KB per prompt. They print under the handoff as `later on this card (after its
 handoff): <UTC> <author>: <text>`, and every prompt logs `closeout_later_comments n=<k>`.
 The coach's report_only judges show these lines in their own section and count them as a
-card read recording the decision (self-heal agent-93112d1e96).
-`tests/test_handoff_later_comments.py`, coach `tests/test_report_only_closeout_later.py`.
+card read recording the decision (self-heal agent-93112d1e96). A remote batch card (owned
+by another gateway) carries no comments, so for one with a handoff the plugin takes them
+from the hub replica's task record (`last_comments`) after the same anchor (`run.ended_at`
+when the run has the summary, else `completed_at`), ranked and bounded the same way; an
+unreadable replica prints none. `tests/test_handoff_later_comments.py`,
+`tests/test_remote_later_comments.py`, coach `tests/test_report_only_closeout_later.py`.
 
 ## Ownership and evidence
 

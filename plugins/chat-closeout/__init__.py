@@ -628,9 +628,10 @@ def _hub_fresh() -> bool:
         return False
 
 
-def _replica_last_comments(cards: list[dict]) -> dict[int, dict]:
-    """``{id(card): newest comment}`` from the hub replica's task records (``last_comments``, newest last, written by
-    hermes-hub's collector) for remote rows, keyed like :func:`_replica_completed_at`. Read-only; fails open ({})."""
+def _replica_records(cards: list[dict]) -> dict[int, dict]:
+    """``{id(card): task record}`` from the hub replica (``last_comments`` newest last, ``run``, ``completed_at``:
+    written by hermes-hub's collector) for remote rows, keyed like :func:`_replica_completed_at`. Read-only; fails
+    open: an unreadable replica gives {}, an unreadable record is skipped."""
     path = hub_db_path()
     if path is None or not cards:
         return {}
@@ -641,16 +642,16 @@ def _replica_last_comments(cards: list[dict]) -> dict[int, dict]:
         return {}
     try:
         for card in cards:
-            rk = "/".join(str(card[k]) for k in ("profile", "board", "id") if card.get(k))
-            r = conn.execute("SELECT data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
-                             (card.get("gateway"), rk)).fetchone()
-            if r is None:
+            try:
+                rk = "/".join(str(card[k]) for k in ("profile", "board", "id") if card.get(k))
+                r = conn.execute("SELECT data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
+                                 (card.get("gateway"), rk)).fetchone()
+                data = json.loads(r[0]) if r is not None else None
+            except Exception:
+                logger.debug("chat-closeout: replica record unavailable", exc_info=True)
                 continue
-            data = json.loads(r[0])
-            comments = [c for c in data.get("last_comments") or [] if isinstance(c, dict)
-                        and str(c.get("body") or "").strip()]
-            if str(data.get("id")) == str(card["id"]) and comments:
-                out[id(card)] = {k: comments[-1].get(k) for k in ("author", "at", "body")}
+            if isinstance(data, dict) and str(data.get("id")) == str(card["id"]):
+                out[id(card)] = data
     except Exception:
         logger.debug("chat-closeout: replica comments unavailable", exc_info=True)
     finally:
@@ -659,19 +660,30 @@ def _replica_last_comments(cards: list[dict]) -> dict[int, dict]:
 
 
 def _with_latest_comments(row: dict, cards: dict) -> dict:
-    """``cards`` for the close-out prompt, with ``last_comment`` on each batch remote card that has no handoff
-    (self-heal agent-a679e846ca: such a card rendered as "(no handoff)" though its latest comment recorded the user's
-    decision). Copies, never mutates: inventory rows are core's cache. Fails open: the cards as read."""
+    """``cards`` for the close-out prompt, filled from the hub replica for batch remote cards (remote rows carry no
+    comments): ``last_comment`` on one with no handoff (self-heal agent-a679e846ca: such a card rendered as
+    "(no handoff)" though its latest comment recorded the user's decision), and ``later_comments`` (the comments
+    posted after its handoff, as the local board read gives) on one with a handoff (t_01a1d6c01b4c0633). Copies,
+    never mutates: inventory rows are core's cache. Fails open: the cards as read."""
     try:
-        want = [(tid, c) for tid in row.get("batch") or [] for c in [cards.get(tid)]
-                if c and c.get("remote") and not str(c.get("summary") or "").strip() and "last_comment" not in c]
-        got = _replica_last_comments([c for _, c in want]) if want else {}
+        remote = [(tid, c) for tid in row.get("batch") or [] for c in [cards.get(tid)] if c and c.get("remote")]
+        bare = [(tid, c) for tid, c in remote
+                if not str(c.get("summary") or "").strip() and "last_comment" not in c]
+        handed = [(tid, c) for tid, c in remote
+                  if str(c.get("summary") or "").strip() and "later_comments" not in c]
+        got = _replica_records([c for _, c in bare + handed]) if bare or handed else {}
         if not got:
             return cards
         out = dict(cards)
-        for tid, c in want:
-            if id(c) in got:
-                out[tid] = {**c, "last_comment": got[id(c)]}
+        for tid, c in bare:
+            comments = [m for m in (got.get(id(c)) or {}).get("last_comments") or []
+                        if isinstance(m, dict) and str(m.get("body") or "").strip()]
+            if comments:
+                out[tid] = {**c, "last_comment": {k: comments[-1].get(k) for k in ("author", "at", "body")}}
+        for tid, c in handed:
+            later = core.replica_later_comments(got.get(id(c)))
+            if later:
+                out[tid] = {**c, "later_comments": later}
         return out
     except Exception:
         logger.debug("chat-closeout: latest comments fill failed", exc_info=True)
