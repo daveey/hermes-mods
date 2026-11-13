@@ -1567,14 +1567,21 @@ def unjudged_outcome(o: dict) -> str:
     """agent-614ed52ae7: a reply_nudge_outcome nobody scored (resolved=None and not a screen-only `unconfirmed`
     verdict): the re-check judge gave no verdict, or the check raised. Returns its class for the fingerprint
     ("no_verdict" | "error" | "check_failed"), "" for a judged or unconfirmed outcome. It is a coach-health defect
-    (unjudged_signal), never filed under the agent whose revision went unread."""
+    (unjudged_signal), never filed under the agent whose revision went unread.
+    coach-1b2ea7d9a7: "judge_unavailable" (the re-check's model call raised, e.g. quota out: `judge_error` or evidence
+    "judge unavailable: ...") is never filed, like reply_skipped; a typed crash ("outcome check failed: <Type> at ...")
+    is "check_failed:<Type>", its own fingerprint; a legacy bare "outcome check failed" stays "check_failed"."""
     if o.get("resolved") is not None or o.get("unconfirmed") or unconfirmed_outcome(o):
         return ""
     ev = str(o.get("evidence") or "").lower()
+    if o.get("judge_error") or ev.startswith("judge unavailable"):
+        return "judge_unavailable"
     if ev.startswith("outcome check error"):
         return "error"
     if ev.startswith("outcome check failed"):
-        return "check_failed"
+        m = re.match(r"outcome check failed: (\w+)", str(o.get("evidence") or ""))
+        typ = str(o.get("error") or (m.group(1) if m else ""))
+        return f"check_failed:{typ}" if typ else "check_failed"
     return "no_verdict"
 
 
@@ -2238,6 +2245,12 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                 _coach_log(home, {"ts": now, "event": "nudge_outcome_unconfirmed", "session_id": n.get("session_id") or "",
                                   "rule": rule, "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"),
                                   "p": r.get("p"), "src": r.get("src") or "legacy_screen", **_nid(n)})
+                _mark(opened, n, "o")
+            elif unjudged_outcome(r) == "judge_unavailable":  # coach-1b2ea7d9a7: judge outage, not a defect
+                _coach_log(home, {"ts": now, "event": "nudge_outcome_judge_unavailable",
+                                  "session_id": n.get("session_id") or "", "rule": rule, "nudge_ts": n.get("ts"),
+                                  "draft_id": n.get("draft_id"), "error": r.get("error") or "",
+                                  "evidence": str(r.get("evidence") or "")[:200], **_nid(n)})
                 _mark(opened, n, "o")
             elif unjudged_outcome(r):  # agent-614ed52ae7: no verdict is a coach-health defect, not the agent's
                 cls = unjudged_outcome(r)

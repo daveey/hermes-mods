@@ -236,3 +236,25 @@ not arm unless named; an unwritable claim does not arm; the same through `regist
 processes), the TTL (expiry calls `tracemalloc.stop` exactly once at the TTL with a fake clock, the
 wall-clock UNTIL stops tracing when the monotonic clock stands still, a request before the TTL still
 reports, pre-existing tracing is never stopped), and that the cache census defaults are unchanged.
+
+## Bounded stall-time cost
+
+The stall sampler runs while the backend is already stalled, so its own cost is capped
+(`watch.py`): it reads raw frame metadata only (no `traceback.extract_stack`, whose
+`linecache.checkcache` stat per frame file is a GIL hand-off against the stalled loop),
+skips idle threads by their innermost function without walking their stacks, formats
+only after the loop has caught up, spends at most `SAMPLE_BUDGET` (5%) of the stall's
+wall time sampling (each pass's duration sets the wait before the next), takes at most
+`MAX_SAMPLES` (40) per stall and samples at most `SAMPLED_STALLS_PER_WINDOW` (30) stalls
+per 10 min; later stalls are timed only. Each stall report carries `sampling`
+(`full`/`capped`/`rate_limited`) and `watcher_cost_s`. `stall_s` ends when the loop ran
+the probe, excluding the watcher's report work. Tests: `tests_stall_cost.py`.
+
+## Journal lock never blocks the event loop
+
+The sidecar lock is shared by every loop-watch process on a host. `journal.append` waits at
+most `DIAG_LOCK_TIMEOUT_S` (0.5 s) for diagnostics and `DURABLE_LOCK_TIMEOUT_S` (5 s) for
+stats (which retry the same record), then raises `ETIMEDOUT`. Slow-request reports, which
+`ReqTrace._finish` produces on the event loop, go through `offloop_sink` to a writer
+thread with a bounded queue (64, dropped when full). Tests: `tests_journal_lock.py` hold
+the lock from another process.

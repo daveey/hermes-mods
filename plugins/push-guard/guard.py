@@ -40,6 +40,7 @@ Shared by the Hermes pre_tool_call hook (__init__.py).
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import json
 import os
@@ -110,9 +111,10 @@ def _remote_matches(url: str, remote: str) -> bool:
     return bool(url) and _slug(url) == _slug(remote)
 
 
-def _commands(cmd: str, cwd: str):
-    """Yield (cwd, words) per simple command, following `cd` and stripping env/sudo/token-broker wrappers."""
-    for seg in SEPARATORS.split(cmd or ""):
+def _commands(cmd: str, cwd: str, segments: Optional[list] = None):
+    """Yield (cwd, words) per simple command, following `cd` and stripping env/sudo/token-broker wrappers.
+    `segments` overrides the plain separator split (the cancel guard passes a quote-aware one)."""
+    for seg in (SEPARATORS.split(cmd or "") if segments is None else segments):
         try:
             words = shlex.split(seg, comments=True)
         except ValueError:
@@ -643,6 +645,164 @@ def check_graphql_merge(text: str, guards: list[dict]) -> Optional[str]:
             f"only: prefix the command with `{OVERRIDE}` and say why in your report.")
 
 
+# --- run cancels (every host, no push-guards.json needed) -----------------------------------------------------
+# A hand `gh run cancel` checks at most "status is queued", so it stops a re-run its owner card queued after the
+# canceller's read (self-heal agent-017301de5e: attempt 3 of a run diagnosed at attempt 2). The only sanctioned path
+# re-reads status AND run_attempt in the same call: github-ci-wait scripts/ci_run_cancel.py.
+
+CANCEL_OVERRIDE = "CI_CANCEL_GUARD=off"
+RUN_CANCEL_URL = re.compile(r"(?:^|/)repos/[^/\s]+/[^/\s]+/actions/runs/\d+/(?:force-)?cancel/?(?:\?\S*)?$")
+RUN_CANCEL_ANY = re.compile(r"/actions/runs/\d+/(?:force-)?cancel\b")
+# commands whose quoted argument is itself a shell command
+SHELL_WRAPPERS = {"ssh", "bash", "sh", "zsh", "dash", "hub-admin", "eval", "su", "xargs", "watch", "flock"}
+GH_GLOBAL_VALUE_OPTS = {"-R", "--repo", "--hostname"}
+CANCEL_MESSAGE = (
+    "CI CANCEL GUARD: blocked: `{what}` cancels a GitHub Actions run without checking which attempt it is on. A run "
+    "that looks stranded may be a re-run its owner card queued after your read, and a cancel sends it to the back "
+    "of the queue. Cancel only with the attempt you diagnosed: `python3 ~/code/hermes-mods/skills/devops/"
+    "github-ci-wait/scripts/ci_run_cancel.py --run-id <id> --gh-repo <owner/repo> --expect-attempt <N> --reason "
+    "'<why>'` (add --force for a cancelled run stuck queued; a superseded push run is attempt 1; superseded gate "
+    "latches: scripts/ci_latch_sweep.py). It refuses (exit 3) when the live attempt differs. Emergency only: prefix "
+    "the command with `" + CANCEL_OVERRIDE + "` and say why in your report.")
+
+
+def _gh_cancel_at(words: list[str], i: int) -> Optional[str]:
+    """The cancel `gh` at words[i] performs, or None."""
+    rest, pos, j = words[i + 1:], [], 0
+    while j < len(rest) and len(pos) < 2:
+        w = rest[j]
+        if w in GH_GLOBAL_VALUE_OPTS:
+            j += 2
+            continue
+        if not w.startswith("-"):
+            pos.append(w)
+        j += 1
+    if pos == ["run", "cancel"]:
+        return " ".join(words[i:i + 6])
+    if pos[:1] == ["api"]:
+        endpoint, method, _ = _gh_api_parse(rest[rest.index("api") + 1:])
+        if endpoint and RUN_CANCEL_URL.search(endpoint) and method != "GET":
+            return f"gh api -X POST {endpoint}"
+    return None
+
+
+def _split_unquoted(cmd: str) -> Optional[list]:
+    """Split on && || ; | and newlines outside quotes, so a quoted `a|gh run cancel` grep pattern stays one word.
+    None when a quote never closes (the caller then falls back to plain splitting, which can only refuse more)."""
+    segs, cur, quote, i = [], [], None, 0
+    while i < len(cmd):
+        c = cmd[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < len(cmd):
+                cur.append(cmd[i:i + 2])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c == "\\" and i + 1 < len(cmd):
+            cur.append(cmd[i:i + 2])
+            i += 2
+            continue
+        elif c in "'\"":
+            quote = c
+        elif c in ";|\n" or cmd.startswith("&&", i):
+            segs.append("".join(cur))
+            cur = []
+            i += 2 if cmd.startswith(("&&", "||"), i) else 1
+            continue
+        cur.append(c)
+        i += 1
+    if quote:
+        return None
+    segs.append("".join(cur))
+    return segs
+
+
+def check_run_cancel(cmd: str, depth: int = 0) -> Optional[str]:
+    """Refuse `gh run cancel`, `gh api ... /actions/runs/<id>/(force-)cancel` and curl to that endpoint."""
+    cmd = cmd or ""
+    if depth > 4 or CANCEL_OVERRIDE in cmd or "cancel" not in cmd:
+        return None
+    segs = _split_unquoted(cmd)
+    for _, words in _commands(cmd, "/", segs):
+        tool = os.path.basename(words[0])
+        for i, w in enumerate(words):
+            if os.path.basename(w) == "gh":
+                what = _gh_cancel_at(words, i)
+                if what:
+                    return what
+        if tool == "curl":
+            for w in words[1:]:
+                if RUN_CANCEL_ANY.search(w):
+                    return f"curl {w}"
+        if tool in SHELL_WRAPPERS:
+            for w in words[1:]:
+                if " " in w and "cancel" in w:
+                    what = check_run_cancel(w, depth + 1)
+                    if what:
+                        return what
+    return None
+
+
+PY_CANCEL_LITERAL = re.compile(r"""(?:"([^"\n]*\bgh\b[^"\n]*\bcancel\b[^"\n]*)"|'([^'\n]*\bgh\b[^'\n]*\bcancel\b[^'\n]*)')""")
+
+
+PY_CALLS = {"terminal", "run", "call", "check_call", "check_output", "Popen", "system", "popen", "getoutput",
+            "getstatusoutput", "create_subprocess_shell", "create_subprocess_exec", "urlopen", "Request", "post",
+            "request"}
+
+
+def _py_strings(node) -> list:
+    """String constants passed to a call: a shell string, or an argv list joined back into one."""
+    out = []
+    for arg in list(node.args) + [k.value for k in node.keywords]:
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            out.append(arg.value)
+        elif isinstance(arg, (ast.List, ast.Tuple)):
+            words = [e.value for e in arg.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+            if words:
+                out.append(shlex.join(words))
+    if node.func and isinstance(node.func, ast.Attribute) and node.func.attr in ("create_subprocess_exec",):
+        words = [a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+        out.append(shlex.join(words))
+    return out
+
+
+def check_python_run_cancel(code: str) -> Optional[str]:
+    """Cancels issued from Python: terminal()/subprocess/os shell strings and argv lists, HTTP to the endpoint.
+    Text that only names the command (print, a log grep pattern) is not a call and passes."""
+    code = code or ""
+    if CANCEL_OVERRIDE in code or "cancel" not in code:
+        return None
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        tree = None
+    if tree is None:  # unparseable: fall back to every literal that looks like a gh cancel
+        for lit in PY_CANCEL_LITERAL.findall(code):
+            what = check_run_cancel(lit[0] or lit[1])
+            if what:
+                return what
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+        if name not in PY_CALLS:
+            continue
+        for text in _py_strings(node):
+            what = check_run_cancel(text)
+            if what:
+                return what
+            if name in ("urlopen", "Request", "post", "request") and RUN_CANCEL_ANY.search(text):
+                return "an HTTP POST to /actions/runs/<id>/cancel"
+    return None
+
+
+def cancel_message(what: str) -> str:
+    return CANCEL_MESSAGE.format(what=what[:120])
+
+
 # --- entry points --------------------------------------------------------------------------------------------
 
 def check_shell(cmd: str, cwd: Optional[str] = None, guards: Optional[list[dict]] = None) -> Optional[str]:
@@ -751,7 +911,7 @@ def check_python(code: str, cwd: Optional[str] = None, guards: Optional[list[dic
 
 
 def message(why: str) -> str:
-    if why.startswith("PUSH GUARD:"):
+    if why.startswith(("PUSH GUARD:", "CI CANCEL GUARD:")):
         return why
     what, use, allow = (why.split("||") + ["", ""])[:3]
     return (f"PUSH GUARD: blocked: {what}. This branch takes code only through its merge train: run `{use}` instead "

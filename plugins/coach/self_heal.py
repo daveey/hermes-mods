@@ -1989,7 +1989,8 @@ def _unconfirmed_outcome(o: dict) -> bool:
 def nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days: int = 7) -> dict:
     """reply_nudges per rule over `days`, by their reply_nudge_outcome (agent-3ba1979f34): resolved (not filed),
     still_failing / no_outcome (filed by signals.collect_coach), unconfirmed (a screen-only report_only outcome: not
-    filed), unjudged (resolved=None, no verdict: filed as one coach defect, not in `filed`; agent-614ed52ae7), waiting (inside the grace window), untracked (a
+    filed), unjudged (resolved=None, no verdict: filed as one coach defect, not in `filed`; agent-614ed52ae7), judge_unavailable (resolved=None because the re-check's judge raised, e.g. quota out: never filed;
+    coach-1b2ea7d9a7), waiting (inside the grace window), untracked (a
     non-handoff nudge from a backend on the old plugin, no `outcome` marker: never filed). For `status`: a rule whose
     nudges never get outcomes, or never resolve, shows here."""
     root = Path(root) if root is not None else coach_root()
@@ -2029,6 +2030,10 @@ def nudge_counts(root: Optional[Path] = None, now: Optional[float] = None, days:
             outcomes.remove(o)
             k = ("resolved" if o.get("resolved") is True else
                  "unconfirmed" if _unconfirmed_outcome(o) else
+                 # coach-1b2ea7d9a7: the re-check's judge raised (quota out): not filed, counted on its own
+                 "judge_unavailable" if o.get("resolved") is None and (
+                     o.get("judge_error") or str(o.get("evidence") or "").lower().startswith("judge unavailable"))
+                 else
                  # agent-614ed52ae7: nobody scored it; it files as one coach defect, outside `filed`
                  "unjudged" if o.get("resolved") is None else "still_failing")
         elif rule != "handoff" and not n.get("outcome"):
@@ -4415,11 +4420,13 @@ def recovery_holder_card(db: str, home: Path, dbs: list) -> Optional[dict]:
 
 def _investigation_owner(lanes: dict, card: Optional[str], fp: str) -> Optional[str]:
     """The other lane whose investigation card (`card`, never its `fix_card`) is ``card``, else None. Adopting such
-    a card must wait for that lane's fix card: an investigation's completion is a proposal, nothing to verify."""
+    a card must wait for that lane's fix card: an investigation's completion is a proposal, nothing to verify.
+    A complaint alias (`complaint_owner`) never matches: it always holds card=None (set when it is aliased, and
+    filing its own card clears `complaint_owner`), so it needs no clause here."""
     if not card:
         return None
     for ofp, e in sorted(lanes.items()):
-        if ofp != fp and e.get("card") == card and e.get("fix_card") != card and not e.get("complaint_owner"):
+        if ofp != fp and e.get("card") == card and e.get("fix_card") != card:
             return ofp
     return None
 

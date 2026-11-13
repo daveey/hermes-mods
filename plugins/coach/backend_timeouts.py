@@ -12,6 +12,9 @@ probe failure) proves the request started before that wake: wall time >= the mon
 latest possible start is stamp + 1 s - N, and a sleep interval ending after it means the request lived through sleep
 (e.g. 2026-11-01 18:36:09: 40 60s-timeouts 30 s after a lid wake, all issued while the lid was shut).
 Failed/unsupported power probes suppress nothing.
+A down-gate `... is down (Timed out connecting ..., Ns ago); ... Failing fast instead of waiting for a timeout.` line
+quotes the conn's last error and no request waited: it stays in the raw and awake counts and is reported under
+`fail_fast`, but the threshold is judged on awake_count minus those lines.
 
     backend_timeouts.py [--dry-run] [--json] [--hours] [--threshold N] [--window MIN] [--home PATH] [--host NAME]
 
@@ -37,6 +40,22 @@ Saturation is judged only on timeouts the link's own traffic can explain. Two ki
   `backend-timeouts:<host>:uplink-stall`, asks for the host's network/Tailscale path, not per-path byte attribution.
 - reconnect_cascade: timeouts on a conn within 30 s after `[ssh] teardown conn:<c>` or `[slow-link] ... treating it
   as down` for it: in-flight requests and the new tunnel's backlog failing together, not traffic.
+- backend_down: timeouts on a conn while the Desktop's own down gate held it down, from
+  `[remote-down] conn:<c>::... marked down (<reason>)` to `... answered again; gate open`. While the gate is closed
+  every request fails fast with a line that quotes the first timeout ("is down (Timed out ..., 27s ago)"), so one
+  outage logs the needle once per poll on every path at once: that is the far-end backend being away (a restart, a
+  hang), not traffic filling the link (2026-11-13 12:31 PST: a core update restarted the mini's backend; 61 s down,
+  19 quoted timeouts across 7 paths, filed as "link saturation"). The episodes are reported with their reason.
+- backend_stall: a hung far-end backend. A `[ssh] teardown conn:<c>` followed by an `ssh dial +N ms` for that conn
+  with N < 5000 and then, within 120 s of a fast dial, `always-on dashboard unavailable (pid P not answering on port
+  X)` (attributed to the conn of the latest dial) or `[remote-down] conn:<c>::... trial exceeded`. A saturated link
+  would make the re-dial slow too; a fast re-dial with the backend still silent on the fresh tunnel means the far-end
+  process is stopped (2026-11-13 12:03-12:13 PST: a blocking py-spy held the hub serve for 17 min; 265 hub timeouts
+  were filed as "link saturation"). Timeouts on the conn within +/-60 s of those lines are backend_stall. A conn whose
+  shared-burst timeouts are more than half backend_stall is never a saturated conn, and when it is significant it gets
+  ONE card, key `backend-timeouts:<host>:backend-stall:<conn>` ("hung backend on conn=X"), asking for the backend
+  host's loop stalls and observer (ptrace/py-spy) commands, not byte attribution. Its leftover timeouts are the same
+  hang, so they make no path card and no generic incident card.
 --dry-run prints the report and files nothing. --hours prints a per-hour histogram of every timeout still in the
 logs (for checking past bursts). No Inbox items. Exit 2 with count:null when
 clock/coverage evidence is unresolved; this is not a healthy raw-zero receipt.
@@ -67,11 +86,17 @@ except ImportError:  # run as a script, or loaded by path: take the sibling file
     home_route = _pe.home_route
 
 NEEDLE = "Timed out connecting to Hermes backend"
+# The Desktop's down gate answers a request at once while a conn is treated as down: `... is down (<last error>, Ns
+# ago); ... Failing fast instead of waiting for a timeout.` It quotes the conn's last error, so it carries NEEDLE when
+# that error was a timeout, yet no request waited. Such a line stays in the raw and awake counts (and in
+# backend_down), but it does not count toward the incident threshold: it is an echo of one earlier timeout
+# (2026-11-13 20:31Z: 22 echoes of 2 gate-trial timeouts took a 9-timeout window to 31, over the threshold of 30).
+FAIL_FAST = "Failing fast instead of waiting for a timeout"
 STAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.]\d{3} (?:([+-]\d{2}:\d{2}) )?")
 API_RE = re.compile(r"\[hermes:api (?:[A-Z]+ )?(\S+?)\]")
 PATH_RE = re.compile(r"(/api/[^\s\]\)'\"?,:]+)")
 CONN_RE = re.compile(r"\bconn=([\w.-]+)")
-AFTER_RE = re.compile(r"Timed out connecting to Hermes backend after (\d+)ms(?:, (\d+)s ago)?")
+AFTER_RE = re.compile(r"Timed out connecting to Hermes backend after (\d+)ms(?: \([^)]*\))?(?:, (\d+)s ago)?")
 TAG_RE = re.compile(r"\[([a-z][\w:.-]*)\]")
 ID_SEG_RE = re.compile(r"^(?=.*\d)[\w.-]{8,}$|^\d+$|^t_[0-9a-f]+$")
 SLOW_LINK_RE = re.compile(r"\[slow-link\] https?://127\.0\.0\.1:(\d+)(?: is slow| timed out .*treating it as down)")
@@ -79,6 +104,14 @@ FORWARD_RE = re.compile(r"\[ssh\] forwarding 127\.0\.0\.1:(\d+) ->")
 CANCEL_RE = re.compile(r"\[ssh\] cancelled forward 127\.0\.0\.1:(\d+)")
 TEARDOWN_RE = re.compile(r"\[ssh\] teardown conn:([\w.-]+?)(?:::|[\s(]|$)")
 PROBE_SLOW_RE = re.compile(r"\[remote-timing\] conn:([\w.-]+?)::\S* dispatch probe slow")
+GATE_RE = re.compile(r"\[remote-down\] conn:([\w.-]+?)::\S* (marked down(?: \((.*)\);)?|trial exceeded|answered again)")
+GATE_KINDS = {"marked down": "gate_down", "trial exceeded": "gate_trial", "answered again": "gate_up"}
+DIAL_RE = re.compile(r"\[remote-timing\] conn:([\w.-]+?)::\S* ssh dial \+(\d+) ms")
+DASH_DOWN_RE = re.compile(r"\[ssh-lifecycle\] always-on dashboard unavailable \(pid (\d+) not answering on port (\d+)\)")
+# A `marked down (<reason>)` naming a closed or refused connection: the far end went away (a restart, a quitting
+# Desktop), it did not hang. Such an episode is backend_down, never backend_stall (2026-11-13 12:31 PST: a core update
+# restarted the mini's serve, `read ECONNRESET`, then the same fast re-dial + `not answering` lines as a hang).
+GONE_RE = re.compile(r"ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|connect failed", re.I)
 LINE_CONN_RE = re.compile(r"\bconn[:=]([\w.-]+?)(?:::|[\s)\],]|$)")
 ROTATED = 3
 DEFAULT_THRESHOLD = 30
@@ -99,7 +132,15 @@ STALL_BUCKET_S = 300    # judged per 5-minute bucket
 STALL_PAIR_S = 60       # two remote conns' stall signals start within this many seconds of each other
 LOCAL_CONNS = {"local", "primary", "?"}
 CASCADE_S = 30          # timeouts within this long after a teardown / treated-as-down are a reconnect cascade
+DOWN_EDGE_S = 2         # a timeout this close to a down episode's edges belongs to it (the line that closed the gate)
+DOWN_OPEN_S = 60        # an episode with no `answered again` ends this long after its last gate line
 PROBE_PORT_S = 2        # a `[slow-link]` line and its conn's `dispatch probe slow` line are logged together
+# Hung far-end backend: the conn is torn down, the SSH re-dial is fast (the link is fine), and then the backend still
+# does not answer on the fresh tunnel. A saturated link would make the re-dial slow too.
+STALL_DIAL_FAST_MS = 5000  # a re-dial faster than this says the link itself carries traffic
+STALL_CONFIRM_S = 120      # a `not answering` / `trial exceeded` line this soon after a fast dial confirms the hang
+BACKEND_STALL_S = 60       # timeouts within +/- this of an episode's lines are backend_stall
+BACKEND_STALL_SHARE = 0.5  # a conn whose shared-burst timeouts are more than this share backend_stall is no saturation
 CLOSED = {"done", "archived"}
 ACTIVE = {"triage", "ready", "running", "review", "blocked"}  # works the card's own text (blocked: David acts)
 
@@ -136,7 +177,20 @@ def route_of(line: str) -> str:
 
 def link_event(line: str, ts: datetime) -> Optional[tuple]:
     """(ts, kind, conn, port) for a Desktop link-state line, else None. kind: slow | down | probe_slow | teardown |
-    forward | cancel. `conn` is None when the line names only a local port."""
+    forward | cancel | gate_down | gate_trial | gate_up | dial | dash_down. `conn` is None when the line names only a
+    local port. A gate_down carries the gate's reason in the port slot, a dial its milliseconds (int), a dash_down
+    the always-on dashboard's `(pid, port)`."""
+    if "[remote-down]" in line:
+        m = GATE_RE.search(line)
+        if m:
+            return (ts, GATE_KINDS[m.group(2).split(" (", 1)[0]], m.group(1), m.group(3))
+        return None
+    if "always-on dashboard unavailable (" in line:  # an `[ssh-lifecycle]` line
+        m = DASH_DOWN_RE.search(line)
+        return (ts, "dash_down", None, (m.group(1), m.group(2))) if m else None
+    if " ssh dial +" in line:
+        m = DIAL_RE.search(line)
+        return (ts, "dial", m.group(1), int(m.group(2))) if m else None
     if "[slow-link]" in line:
         m = SLOW_LINK_RE.search(line)
         if m:
@@ -172,6 +226,8 @@ def resolve_link_events(events: list, since: Optional[datetime] = None) -> tuple
     last_teardown = None
     out, unmapped = [], 0
     for ts, kind, conn, port in events:
+        if kind in ("dial", "dash_down"):  # read by :func:`backend_stall_episodes`; they name no slow-link port
+            continue
         if kind == "forward":
             port_conn.pop(port, None)  # a fresh forward: whatever this port meant before is stale
             if conn:
@@ -185,7 +241,7 @@ def resolve_link_events(events: list, since: Optional[datetime] = None) -> tuple
             if last_teardown and (ts - last_teardown[0]).total_seconds() <= CASCADE_S:
                 port_conn.setdefault(port, last_teardown[1])
             continue
-        if kind == "probe_slow":
+        if kind == "probe_slow" or kind.startswith("gate_"):
             out.append((ts, kind, conn))
             continue
         near = {c for t, c in probes if abs((t - ts).total_seconds()) <= PROBE_PORT_S}
@@ -199,7 +255,7 @@ def resolve_link_events(events: list, since: Optional[datetime] = None) -> tuple
     return out, unmapped
 
 
-def iter_timeouts(files: list, *, strict=False, evidence=None, events=None):
+def iter_timeouts(files: list, *, strict=False, evidence=None, events=None, fail_fast=None):
     """Yield (datetime, route, conn, lookback_s) per log entry naming the timeout. Stack/continuation lines without a stamp count only
     if their entry's stamped line did not already (one entry = one timeout). With `events` (a list), link-state
     lines (:func:`link_event`) are appended to it from the same pass."""
@@ -237,6 +293,8 @@ def iter_timeouts(files: list, *, strict=False, evidence=None, events=None):
                 m = CONN_RE.search(line)
                 a = AFTER_RE.search(line)
                 lookback = (int(a.group(1)) / 1000.0 + int(a.group(2) or 0)) if a else 0.0
+                if fail_fast is not None and FAIL_FAST in line:  # still yielded; the caller sees the list grow
+                    fail_fast.append(last_ts)
                 yield last_ts, route_of(line), (m.group(1) if m else "?"), lookback
 
 
@@ -318,6 +376,11 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
     awake_since_wake: Counter = Counter()
     awake: list = []  # (ts, route, conn) of awake timeouts, classified after the pass
     link_events: list = []
+    echoes: list = []  # grows by one just before a down-gate fail-fast entry is yielded
+    seen_echoes = 0
+    ff_path: Counter = Counter()
+    ff_conn: Counter = Counter()
+    ff_awake = 0
     wake_ends = sorted(hi for _, hi in intervals)
     sleep_count = 0
     spanning_count = 0
@@ -328,7 +391,8 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
         raise ValueError('no Desktop logs found; bounded count unproven')
     evidence = {}
     for ts, route, conn, lookback in iter_timeouts(files, strict=bool(now.tzinfo), evidence=evidence,
-                                                   events=link_events):
+                                                   events=link_events, fail_fast=echoes):
+        is_echo, seen_echoes = len(echoes) > seen_echoes, len(echoes)
         if now.tzinfo and ts.tzinfo is None:
             # Any legal datetime UTC offset is strictly within +/-24 hours.
             # Exclude only when ALL possible instants are outside this window;
@@ -350,6 +414,10 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
                 awake_by_conn[conn] += 1
                 awake_since_wake[wake_bucket(ts, wake_ends)] += 1
                 awake.append((ts, route, conn))
+                ff_awake += is_echo
+            if is_echo:
+                ff_path[route] += 1
+                ff_conn[conn] += 1
             first = ts if first is None or ts < first else first
             last = ts if last is None or ts > last else last
     coverage_start = evidence.get('coverage_start')
@@ -362,11 +430,14 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
             "by_path": dict(by_path.most_common()), "by_conn": dict(by_conn.most_common()),
 
             "sleep_count": sleep_count, "sleep_spanning_count": spanning_count, "awake_count": sum(awake_by_path.values()),
+            "fail_fast": {"count": sum(ff_path.values()), "awake_count": ff_awake,
+                          "by_conn": dict(ff_conn.most_common()), "by_path": dict(ff_path.most_common())},
             "awake_by_path": dict(awake_by_path.most_common()),
             "awake_by_conn": dict(awake_by_conn.most_common()),
             "awake_since_wake": dict(awake_since_wake.most_common()),
             "awake_conn_bursts": cls["awake_conn_bursts"],
             "client_stall": cls["client_stall"], "reconnect_cascade": cls["reconnect_cascade"],
+            "backend_down": cls["backend_down"], "backend_stall": cls["backend_stall"],
             "awake_explained_by_path": cls["explained_by_path"],
             "first": first.isoformat(sep=" ") if first else None, "last": last.isoformat(sep=" ") if last else None}
 
@@ -379,10 +450,100 @@ def _burst_buckets(timeouts: list) -> dict:
     return out
 
 
+def down_episodes(resolved: list, reasons: dict, lo: datetime, now: datetime) -> list:
+    """[{conn, start, end, open, reason}] from the Desktop's down-gate lines, oldest first. An episode runs from
+    `marked down` (or, when that line is older than the retained log, the first gate line seen) to `answered again`.
+    One that never answers ends DOWN_OPEN_S after its last gate line: a Desktop that quit while a conn was down
+    logs no `answered again`, and its next launch starts with the gate open."""
+    open_eps: dict = {}
+    out = []
+
+    def close(conn, end, still_open):
+        ep = open_eps.pop(conn)
+        out.append({"conn": conn, "start": ep["start"], "end": min(end, now), "open": still_open,
+                    "reason": ep["reason"]})
+
+    for ts, kind, conn in resolved:
+        if not kind.startswith("gate_"):
+            continue
+        ep = open_eps.get(conn)
+        if ep and (ts - ep["last"]).total_seconds() > DOWN_OPEN_S and kind != "gate_up":
+            close(conn, ep["last"] + timedelta(seconds=DOWN_OPEN_S), True)
+            ep = None
+        if kind == "gate_up":
+            if ep is None:  # went down before the retained lines
+                open_eps[conn] = {"start": lo, "last": ts, "reason": None}
+            close(conn, ts, False)
+        elif ep is None:
+            open_eps[conn] = {"start": ts, "last": ts, "reason": reasons.get((ts, conn))}
+        else:
+            ep["last"] = ts
+    for conn in list(open_eps):
+        close(conn, open_eps[conn]["last"] + timedelta(seconds=DOWN_OPEN_S), True)
+    return sorted((e for e in out if e["end"] >= lo), key=lambda e: e["start"])
+
+
+def backend_stall_episodes(link_events: list, resolved: list, lo: datetime, now: datetime) -> list:
+    """[{conn, teardown, dials, confirms, events}] where a conn's far-end backend hung while its link stayed fine.
+
+    An episode starts at `[ssh] teardown conn:<c>`; before the conn's next teardown, an `ssh dial +N ms` for it with
+    N < STALL_DIAL_FAST_MS must be followed within STALL_CONFIRM_S by `always-on dashboard unavailable (pid P not
+    answering on port X)` or `[remote-down] conn:<c>::... trial exceeded`. The dashboard line names no conn: it
+    belongs to the conn of the latest dial at most STALL_CONFIRM_S before it. A slow re-dial is never a stall: a
+    saturated link slows the SSH handshake as well (2026-11-13 12:04 PST: re-dial +724 ms, then the hub's always-on
+    dashboard did not answer on the fresh tunnel for 20 s, while a blocking py-spy held the hub serve)."""
+    dials = sorted((e[0], e[2], e[3]) for e in link_events if e[1] == "dial" and lo <= e[0] <= now)
+    confirms: dict = {}  # conn -> [(ts, kind, detail)]
+    for ts, _kind, _c, pidport in (e for e in link_events if e[1] == "dash_down" and lo <= e[0] <= now):
+        prior = [d for d in dials if 0 <= (ts - d[0]).total_seconds() <= STALL_CONFIRM_S]
+        if prior:
+            confirms.setdefault(prior[-1][1], []).append((ts, "dashboard_not_answering", f"pid {pidport[0]} port {pidport[1]}"))
+    for ts, kind, conn in resolved:
+        if kind == "gate_trial" and lo <= ts <= now:
+            confirms.setdefault(conn, []).append((ts, "trial_exceeded", None))
+    teardowns: dict = {}
+    for ts, kind, conn in resolved:
+        if kind == "teardown" and lo <= ts <= now:
+            teardowns.setdefault(conn, []).append(ts)
+    gone: dict = {}  # conn -> [ts] of `marked down (<connection closed/refused>)`
+    for ts, kind, conn, reason in link_events:
+        if kind == "gate_down" and reason and GONE_RE.search(reason):
+            gone.setdefault(conn, []).append(ts)
+    out = []
+    for conn, tds in teardowns.items():
+        tds.sort()
+        for i, t0 in enumerate(tds):
+            t1 = tds[i + 1] if i + 1 < len(tds) else now
+            if any(abs((g - t0).total_seconds()) <= STALL_CONFIRM_S and g < t1 for g in gone.get(conn, ())):
+                continue  # the far end closed or refused the connection: gone (backend_down), not hung
+            # Walk the conn's dials and confirmations after the teardown, each within STALL_CONFIRM_S of the last.
+            seq = sorted([(ts, 0, ms) for ts, c, ms in dials if c == conn and t0 <= ts < t1]
+                         + [(c[0], 1, c) for c in confirms.get(conn, ()) if t0 <= c[0] < t1], key=lambda x: x[:2])
+            fast, conf, last = [], [], t0
+            for ts, is_conf, data in seq:
+                if (ts - last).total_seconds() > STALL_CONFIRM_S:
+                    break
+                if not is_conf:
+                    if data >= STALL_DIAL_FAST_MS:
+                        if not fast:
+                            break  # the first re-dial is slow: the link may be the problem
+                        continue
+                    fast.append((ts, data))
+                    last = ts
+                elif fast:
+                    conf.append(data)
+                    last = ts
+            if not fast or not conf:
+                continue
+            out.append({"conn": conn, "teardown": t0, "dials": fast, "confirms": conf,
+                        "events": sorted([t0] + [d[0] for d in fast] + [c[0] for c in conf])})
+    return sorted(out, key=lambda e: e["teardown"])
+
+
 def classify(awake: list, link_events: list, start: datetime, now: datetime) -> dict:
-    """Split awake timeouts into reconnect_cascade, client_stall and the rest; only the rest feeds
-    awake_conn_bursts (and so :func:`saturated_conns`). A timeout can be both cascade and stall: it is reported in
-    both and set aside once."""
+    """Split awake timeouts into backend_down, reconnect_cascade, client_stall and the rest; only the rest feeds
+    awake_conn_bursts (and so :func:`saturated_conns`). A timeout can be in several: it is reported in each and set
+    aside once."""
     lo = start - timedelta(seconds=STALL_BUCKET_S)
     # Ports are mapped over every retained line (a mapping learned before the window still holds until the port is
     # forwarded again); only the window's events count.
@@ -397,11 +558,24 @@ def classify(awake: list, link_events: list, start: datetime, now: datetime) -> 
         if kind in ("slow", "probe_slow"):
             signals.setdefault(conn, []).append(ts.timestamp())
 
+    episodes = down_episodes(resolved, {(e[0], e[2]): e[3] for e in link_events if e[1] == "gate_down"}, lo, now)
+    edge = timedelta(seconds=DOWN_EDGE_S)
+
     def in_cascade(ts, conn):
         return any(0 <= (ts - d).total_seconds() <= CASCADE_S for d in downs.get(conn, ()))
 
+    def in_down(ts, conn):
+        return any(e["conn"] == conn and e["start"] - edge <= ts <= e["end"] + edge for e in episodes)
+
     cascade_ids = {id(t) for t in awake if in_cascade(t[0], t[2])}
-    rest = [t for t in awake if id(t) not in cascade_ids]
+    down_ids = {id(t) for t in awake if in_down(t[0], t[2])}
+    stalls = backend_stall_episodes(link_events, resolved, lo, now)
+    near = timedelta(seconds=BACKEND_STALL_S)
+
+    def in_stall(ts, conn):
+        return any(e["conn"] == conn and any(abs(ts - x) <= near for x in e["events"]) for e in stalls)
+
+    rest = [t for t in awake if id(t) not in cascade_ids and id(t) not in down_ids]
     for conn, buckets in _burst_buckets(rest).items():
         for b, c in buckets.items():
             if len(c) >= BURST_MIN_PATHS:
@@ -416,8 +590,23 @@ def classify(awake: list, link_events: list, start: datetime, now: datetime) -> 
                         for t in (ta, tb):
                             stall_buckets.setdefault(int(t) // STALL_BUCKET_S, set()).update((a, b))
     stalled_ids = {id(t) for t in awake if int(t[0].timestamp()) // STALL_BUCKET_S in stall_buckets}
-    kept = [t for t in rest if id(t) not in stalled_ids]
-    explained = Counter(t[1] for t in awake if id(t) in cascade_ids or id(t) in stalled_ids)
+    # A hung far-end backend, judged after client_stall: independent links stalling together point at the Desktop
+    # host's uplink, and a fast re-dial between two uplink stalls says nothing about the far end (09:42 PST).
+    stall_ids = {id(t) for t in awake if id(t) not in stalled_ids and in_stall(t[0], t[2])}
+    # A conn whose shared bursts (over all its awake timeouts) are mostly backend_stall is a hung backend, not
+    # saturation: its leftover bursts belong to the same hang and are not judged as link traffic.
+    stall_share: dict = {}
+    for conn, buckets in _burst_buckets(awake).items():
+        mine = [t for t in awake if t[2] == conn]
+        # judged on its shared-burst timeouts; a conn with no bursts on all of its timeouts
+        burst = [t for t in mine if len(buckets[int(t[0].timestamp()) // BURST_BUCKET_S]) >= BURST_MIN_PATHS] or mine
+        n_stall = sum(1 for t in burst if id(t) in stall_ids)
+        if n_stall:
+            stall_share[conn] = round(n_stall / len(burst), 3)
+    stall_conns = sorted(c for c, s in stall_share.items() if s > BACKEND_STALL_SHARE)
+    kept = [t for t in rest if id(t) not in stalled_ids and id(t) not in stall_ids]
+    explained = Counter(t[1] for t in awake if id(t) in cascade_ids or id(t) in stalled_ids or id(t) in down_ids
+                        or id(t) in stall_ids)
     tz = now.tzinfo
 
     def bucket_iso(b):
@@ -432,6 +621,21 @@ def classify(awake: list, link_events: list, start: datetime, now: datetime) -> 
         "reconnect_cascade": {"count": len(cascade_ids),
                               "by_conn": dict(Counter(t[2] for t in awake if id(t) in cascade_ids).most_common()),
                               "teardowns": sum(len(v) for v in downs.values())},
+        "backend_down": {"count": len(down_ids),
+                         "by_conn": dict(Counter(t[2] for t in awake if id(t) in down_ids).most_common()),
+                         "episodes": [{"conn": e["conn"], "start": e["start"].isoformat(sep=" "),
+                                       "end": e["end"].isoformat(sep=" "),
+                                       "seconds": round((e["end"] - e["start"]).total_seconds(), 1),
+                                       "answered": not e["open"], "reason": e["reason"]}
+                                      for e in episodes if e["end"] >= start]},
+        "backend_stall": {"count": len(stall_ids),
+                          "by_conn": dict(Counter(t[2] for t in awake if id(t) in stall_ids).most_common()),
+                          "conns": stall_conns, "burst_share": stall_share,
+                          "episodes": [{"conn": e["conn"], "teardown": e["teardown"].isoformat(sep=" "),
+                                        "dials": [{"at": d[0].isoformat(sep=" "), "ms": d[1]} for d in e["dials"]],
+                                        "confirms": [{"at": c[0].isoformat(sep=" "), "kind": c[1], "detail": c[2]}
+                                                     for c in e["confirms"]]}
+                                       for e in stalls if e["events"][-1] >= start - near]},
         "explained_by_path": dict(explained.most_common()),
     }
 
@@ -443,8 +647,32 @@ def stall_dominant(rep: dict) -> bool:
 
 
 def unexplained_count(rep: dict) -> int:
-    """Awake timeouts that are neither client_stall nor reconnect_cascade."""
+    """Awake timeouts that are neither client_stall, reconnect_cascade, backend_down nor backend_stall."""
     return (rep.get("awake_count") or 0) - sum((rep.get("awake_explained_by_path") or {}).values())
+
+
+def stall_card_conns(rep: dict, threshold: int) -> list:
+    """Hung-backend conns (backend_stall `conns`) big enough for their own card: >= PATH_SHARE of the awake count,
+    or >= the threshold. Biggest first."""
+    total = rep.get("awake_count") or 0
+    by_conn = rep.get("awake_by_conn") or {}
+    found = [(-by_conn.get(c, 0), c) for c in (rep.get("backend_stall") or {}).get("conns") or ()
+             if total and (by_conn.get(c, 0) >= threshold or by_conn.get(c, 0) >= PATH_SHARE * total)]
+    return [c for _, c in sorted(found)]
+
+
+def _hung_leftover(rep: dict) -> Counter:
+    """By path: a hung-backend conn's awake timeouts outside +/- BACKEND_STALL_S of its episode lines. The same hang
+    (it lasts longer than the lines that prove it), so its conn's card owns them."""
+    out: Counter = Counter()
+    for conn in (rep.get("backend_stall") or {}).get("conns") or ():
+        out.update(((rep.get("awake_conn_bursts") or {}).get(conn) or {}).get("paths") or {})
+    return out
+
+
+def residual_count(rep: dict) -> int:
+    """Unexplained awake timeouts that no hung-backend conn owns: what the generic incident card is judged on."""
+    return unexplained_count(rep) - sum(_hung_leftover(rep).values())
 
 
 def conn_bursts(conn_buckets: dict) -> dict:
@@ -470,10 +698,11 @@ def saturated_conns(rep: dict, threshold: int) -> list:
     awake count, or >= the threshold), with >= SAT_SHARE of their timeouts in >= SAT_MIN_BURSTS shared bursts that
     span >= SAT_MIN_PATHS paths. A single slow path never qualifies: its timeouts do not co-occur with other paths."""
     total = rep.get("awake_count") or 0
+    hung = set((rep.get("backend_stall") or {}).get("conns") or ())  # a hung backend, not its link: no saturation
     found = []
     for conn, b in (rep.get("awake_conn_bursts") or {}).items():
         n = b.get("count") or 0
-        if not total or not (n >= threshold or n >= PATH_SHARE * total):
+        if conn in hung or not total or not (n >= threshold or n >= PATH_SHARE * total):
             continue
         if (len(b.get("burst_by_path") or {}) >= SAT_MIN_PATHS and (b.get("burst_buckets") or 0) >= SAT_MIN_BURSTS
                 and (b.get("in_bursts") or 0) >= SAT_SHARE * n):
@@ -579,6 +808,8 @@ Of these, {rep.get("awake_count", rep["count"])} occurred while awake and
 {rep.get("sleep_count", 0)} during positively observed sleep/darkwake intervals (of which {rep.get("sleep_spanning_count", 0)} landed
 after a wake but were issued before it).
 The threshold applies only to awake timeouts; raw count remains unchanged.
+{(rep.get("fail_fast") or {}).get("awake_count", 0)} of the awake lines are down-gate "Failing fast" lines that quote an earlier timeout (no request
+waited; by conn {(rep.get("fail_fast") or {}).get("by_conn") or "(none)"}): they stay in the counts but not in the threshold.
 Awake timeouts by backend connection: {rep.get("awake_by_conn") or "(none)"}; by time since last observed wake:
 {rep.get("awake_since_wake") or "(none)"}.
 {(chr(10) + sat + chr(10)) if sat else ""}
@@ -762,6 +993,7 @@ def significant_paths(rep: dict, threshold: int) -> list:
     conn card (:func:`saturated_conns`), so a victim path gets no card of its own."""
     total = rep.get("awake_count") or 0
     absorbed: Counter = Counter(rep.get("awake_explained_by_path") or {})  # client stall / reconnect cascade
+    absorbed.update(_hung_leftover(rep))  # a hung backend's conn card owns the rest of that conn's timeouts
     for conn in saturated_conns(rep, threshold):
         absorbed.update(rep["awake_conn_bursts"][conn].get("burst_by_path") or {})
     out = []
@@ -873,12 +1105,113 @@ def uplink_card_title(host: str) -> str:
     return f"Desktop uplink stall on {host}"
 
 
+def _episodes_md(rep: dict, conn: Optional[str] = None) -> str:
+    out = []
+    for e in (rep.get("backend_stall") or {}).get("episodes") or []:
+        if conn is not None and e["conn"] != conn:
+            continue
+        dials = ", ".join(f"{d['at']} +{d['ms']} ms" for d in e["dials"])
+        conf = ", ".join(f"{c['at']} {c['kind']}" + (f" ({c['detail']})" if c.get("detail") else "")
+                         for c in e["confirms"])
+        out.append(f"- conn={e['conn']}: teardown {e['teardown']}; re-dial {dials}; then {conf}")
+    return "\n".join(out)
+
+
+def _hung_md(rep: dict) -> str:
+    bs = rep.get("backend_stall") or {}
+    if not bs.get("count"):
+        return ""
+    return (f"Backend stall (hung far-end backend): {bs['count']} timeouts within {BACKEND_STALL_S} s of a teardown, "
+            f"a fast SSH re-dial (< {STALL_DIAL_FAST_MS} ms) and the backend still not answering on the fresh tunnel "
+            f"(by conn {bs.get('by_conn') or {}}; share of each conn's burst timeouts {bs.get('burst_share') or {}}; "
+            f"hung conns {', '.join(bs.get('conns') or []) or 'none'}).\n{_episodes_md(rep)}")
+
+
+def stall_card_title(conn: str, rep: dict, window_min: int) -> str:
+    n = (rep.get("awake_by_conn") or {}).get(conn, 0)
+    return f"Desktop hung backend on conn={conn}: {n} timeouts in {window_min} min (one card for the conn)"
+
+
+def stall_card_body(host: str, conn: str, rep: dict, probe: dict, threshold: int, window_min: int,
+                    previous: str) -> str:
+    bs = rep.get("backend_stall") or {}
+    n = (rep.get("awake_by_conn") or {}).get(conn, 0)
+    eps = [e for e in bs.get("episodes") or [] if e["conn"] == conn]
+    pids = sorted({c["detail"].split()[1] for e in eps for c in e["confirms"]
+                   if c["kind"] == "dashboard_not_answering" and c.get("detail")})
+    times = [e["teardown"] for e in eps] + [c["at"] for e in eps for c in e["confirms"]]
+    span = f"{min(times)} .. {max(times)} (UTC)" if times else f"{rep.get('first')} .. {rep.get('last')}"
+    return f"""The backend at the far end of `{conn_token(conn)}` hung; the link to it was fine. {n} of
+{rep.get('awake_count')} awake timeouts went over this conn, {bs.get('by_conn', {}).get(conn, 0)} of them within
+{BACKEND_STALL_S} s of a hang episode: the Desktop tore the conn down, re-dialled SSH in a few seconds (a saturated
+link slows the handshake too), and the backend still did not answer on the fresh tunnel. Per-path byte attribution
+will not find this: no path floods the link while the far-end process is stopped or its event loop is blocked.
+{previous}
+{home_pin_note("the hang episodes are read from the Desktop log of the host that logged the timeouts")}
+
+## Hang episodes on {conn_token(conn)}
+{_episodes_md(rep, conn) or "- (none in the window)"}
+Not-answering dashboard pid(s): {", ".join(pids) or "(not logged)"}. Window to search: {span}.
+
+## Evidence
+{_evidence(host, rep, probe, threshold, window_min)}
+
+## Do this
+1. On the backend host for `{conn}`, grep `~/.hermes/logs/agent.log*` for `event loop stalled` and
+   `loop-watch: event loop stalled` in the window above, and note which process (pid) stalled and for how long.
+2. Check `sudo journalctl --since <window start> --until <window end>` for `COMMAND=.*py-spy` or other ptrace /
+   observer commands (gdb, strace, perf, a blocking `py-spy record`/`dump` without `--nonblocking`) in the window:
+   an attached observer stops the whole process.
+3. Read the loop-watch.jsonl stall records (`loop_stacks`) for the pid ({", ".join(pids) or "the hung serve"}) to see
+   where the loop was blocked.
+4. Fix the cause (the observer, or the blocking call in the loop), not just a restart. Use the five-whys skill for
+   the chain.
+
+## Acceptance
+- After the fix, a fresh 30-minute window shows no backend stall on this conn:
+  `python3 ~/code/hermes-mods/plugins/coach/backend_timeouts.py --dry-run` shows no `{conn}` in
+  `backend_stall.by_conn`, with `window_start` later than the fix.
+- Paste that output and the stall/observer evidence in a comment before completing.
+"""
+
+
+def file_stall_card(home: Path, host: str, conn: str, now: datetime, rep: dict, probe: dict, threshold: int,
+                    window_min: int, runner: Callable) -> dict:
+    """At most one open card per hung-backend conn: reuse it (comment hourly) while open, else
+    `backend-timeouts:<host>:backend-stall:<conn>` (:2, :3, ... once the earlier one closed)."""
+    st = load_state(home)
+    bs = rep.get("backend_stall") or {}
+    still = (f"Still firing at {now.isoformat()} on {host}: hung backend on {conn_token(conn)}, "
+             f"{(bs.get('by_conn') or {}).get(conn, 0)} backend_stall of "
+             f"{(rep.get('awake_by_conn') or {}).get(conn, 0)} awake timeouts on the conn in {window_min} min.\n"
+             f"{_episodes_md(rep, conn)}")
+    out = _ensure_owner(home, st, f"{host}:backend-stall:{conn}", f"backend-timeouts:{host}:backend-stall:{conn}",
+                        now, runner, "hung backend", lambda: None,
+                        lambda previous: stall_card_body(host, conn, rep, probe, threshold, window_min, previous),
+                        stall_card_title(conn, rep, window_min), still)
+    if out.get("owner"):
+        out["task_id"] = out["owner"]
+    out["kind"] = "backend_stall"
+    out["conn"] = conn
+    return out
+
+
 def _stall_md(rep: dict) -> str:
     cs = rep.get("client_stall") or {}
     rc = rep.get("reconnect_cascade") or {}
+    bd = rep.get("backend_down") or {}
+    down = ""
+    if bd.get("count"):
+        eps = "; ".join(f"conn={e['conn']} {e['start']} for {e['seconds']} s"
+                        f"{'' if e['answered'] else ' (no answer logged)'} ({e['reason'] or 'reason not logged'})"
+                        for e in bd.get("episodes") or [])
+        down = (f"Backend down: {bd['count']} timeouts were logged while the Desktop's down gate held their conn down "
+                f"(by conn {bd.get('by_conn') or {}}); most are fail-fast lines quoting one timeout, not new ones. "
+                f"The far-end backend was away (restart or hang), which is not link traffic. Episodes: {eps}.")
+    head = "\n".join(x for x in (down, _hung_md(rep)) if x)
     if not cs.get("count") and not rc.get("count"):
-        return ""
-    return (f"Client-side stall: {cs.get('count', 0)} awake timeouts fell in 5-minute buckets where several remote "
+        return head
+    return (head + "\n" if head else "") + (f"Client-side stall: {cs.get('count', 0)} awake timeouts fell in 5-minute buckets where several remote "
             f"conns ({', '.join(cs.get('conns') or []) or 'none'}) stalled within {STALL_PAIR_S} s of each other "
             f"(buckets starting {', '.join(cs.get('buckets') or []) or 'none'}; by conn {cs.get('by_conn') or {}}).\n"
             f"Reconnect cascade: {rc.get('count', 0)} timeouts within {CASCADE_S} s after a teardown / treated-as-down "
@@ -1082,12 +1415,15 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] =
     res = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "host": host, "home": str(home),
            "dry_run": a.dry_run, "threshold": threshold, "window_min": window, **rep,
            "power": power_report, "clock": clock,
-           "over_threshold": rep["awake_count"] >= threshold, "saturated_conns": saturated_conns(rep, threshold),
+           "over_threshold": rep["awake_count"] - rep["fail_fast"]["awake_count"] >= threshold, "saturated_conns": saturated_conns(rep, threshold),
            "cards": []}
-    # Most of the window is a client-side stall: one uplink card; the generic incident (and its conn/path owners)
-    # only when what remains unexplained is over the threshold by itself.
+    # Most of the window is a client-side stall: one uplink card. A hung far-end backend: one card per hung conn.
+    # The generic incident (and its conn/path owners) only when what remains unexplained, and not owned by a hung
+    # conn's card, is over the threshold by itself.
     res["uplink_stall"] = res["over_threshold"] and stall_dominant(rep)
-    generic = res["over_threshold"] and (not res["uplink_stall"] or unexplained_count(rep) >= threshold)
+    res["backend_stall_conns"] = stall_card_conns(rep, threshold) if res["over_threshold"] else []
+    special = res["uplink_stall"] or bool(res["backend_stall_conns"])
+    generic = res["over_threshold"] and (not special or residual_count(rep) >= threshold)
     if res["over_threshold"]:
         res["host_probe"] = (probe or probe_host)()
         if not a.dry_run:
@@ -1095,6 +1431,9 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] =
             if res["uplink_stall"]:
                 res["cards"].append(file_uplink_card(home, host, now, rep, res["host_probe"], threshold, window,
                                                      runner))
+            for conn in res["backend_stall_conns"]:
+                res["cards"].append(file_stall_card(home, host, conn, now, rep, res["host_probe"], threshold,
+                                                    window, runner))
             if generic:
                 host_card = file_card(home, host, now, rep, res["host_probe"], threshold, window, runner)
                 owners = file_path_cards(home, host, now, rep, res["host_probe"], threshold, window, runner,

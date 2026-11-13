@@ -309,7 +309,7 @@ def _approval_refusal(number, data, repo=None, cwd=None, env=None):
 
 # Patch-identical update-branch carry (t_01a1d666f7d34164). `gh pr update-branch` (or `git merge origin/state`)
 # moves the head without changing the PR's own patch: #1812 (bc33e1eb82 -> 21cbd60ac5), #1837
-# (20bf041a47 -> d49e9bcfa5) and #2438 (1fd079c68f -> b1e5d5ef46) kept their stable patch-id, yet the
+# (20bf041a47 -> d49e9bcfa5) and #2438 (1fd079c68f -> b1e5d5ef46) kept their verbatim patch-id, yet the
 # exact-head gate refused all three. The base-drift gate (`_base_drift_refusal`) still applies separately.
 _CARRY_MERGES = 3            # base merges on the PR's first-parent line between the approved head and the head
 _CARRY_CANDIDATES = 2        # distinct earlier approved heads tried, newest approval first
@@ -396,18 +396,144 @@ def _gh_json(path, cwd, env) -> dict:
 
 
 def _patch_id(diff, cwd):
-    """`git patch-id --stable` of a diff text (no repository needed); _Unreadable when empty or ambiguous."""
+    """`git patch-id --verbatim` of a diff text (no repository needed); _Unreadable when empty or ambiguous.
+    Verbatim, not --stable: --stable drops whitespace, so a merge that only re-indented a PR line (a Python
+    semantic change) or put a space inside a string literal kept its id and carried (t_01a1d6b8642d50ff).
+    --verbatim still ignores line numbers and blob ids, so a clean update-branch merge keeps its id."""
     if not diff.strip():
         raise _Unreadable("a PR diff is empty")
     try:
-        p = subprocess.run(["git", "patch-id", "--stable"], input=diff, cwd=_probe_cwd(cwd),
+        p = subprocess.run(["git", "patch-id", "--verbatim"], input=diff, cwd=_probe_cwd(cwd),
                            capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as e:
         raise _Unreadable(f"`git patch-id` could not run ({type(e).__name__})")
     lines = [line.split() for line in str(p.stdout or "").splitlines() if line.strip()]
     if p.returncode != 0 or len(lines) != 1 or not _SHA.fullmatch(lines[0][0]):
-        raise _Unreadable("`git patch-id --stable` gave no single id")
+        raise _Unreadable("`git patch-id --verbatim` gave no single id")
     return lines[0][0]
+
+
+# Tree identity of each update-branch merge (t_01a1d6de4e9ec063). Patch-id hashes hunks without line numbers,
+# so a merge that moved an identical hunk (context included) elsewhere in the same file kept it and carried.
+# Each merge on the head's first-parent line must instead have exactly the tree a clean three-way merge of its
+# two parents gives over their merge base. Read through gh like the rest of the carry (no fetch, no credentials
+# in git, no cache on disk); only a path both parents changed differently is merged locally, by `git merge-file`
+# on the three blobs, and any conflict, add/add, modify/delete, symlink, submodule or oversized blob refuses.
+# That is never looser than `git merge-tree --write-tree`: it only lacks rename detection, so a rename on one
+# side meeting an edit on the other refuses (fail closed) where merge-tree would merge it.
+_MERGE_FILES = 8             # paths per merge both parents changed differently (content-merged locally)
+_MERGE_BLOB_BYTES = 1 << 20  # largest blob read for such a content merge
+_FILE_MODES = ("100644", "100755")
+
+
+def _flat_tree(sha, repo, cwd, env):
+    """{path: (mode, blob sha, size)} of every non-tree entry of commit `sha`'s tree; _Unreadable if odd."""
+    got = _gh_json(f"repos/{repo}/git/trees/{sha}?recursive=1", cwd, env)
+    entries = got.get("tree")
+    if got.get("truncated") is not False or not isinstance(entries, list):
+        raise _Unreadable(f"the tree of {sha[:10]} is truncated or unreadable")
+    out = {}
+    for e in entries:
+        if not isinstance(e, dict) or not isinstance(e.get("path"), str) or not e["path"] or not isinstance(
+                e.get("mode"), str) or not isinstance(e.get("sha"), str) or not _SHA.fullmatch(e["sha"]):
+            raise _Unreadable(f"the tree of {sha[:10]} has an unreadable entry")
+        if e.get("type") == "tree":
+            continue
+        if e.get("type") not in ("blob", "commit") or e["path"] in out:
+            raise _Unreadable(f"the tree of {sha[:10]} has an unreadable entry")
+        out[e["path"]] = (e["mode"], e["sha"], e.get("size"))
+    return out
+
+
+def _flat_trees(shas, repo, cwd, env, cache):
+    """_flat_tree of each sha; the uncached ones read in parallel (each read takes ~3 s on a 5k-path tree)."""
+    from concurrent.futures import ThreadPoolExecutor
+    todo = [s for s in dict.fromkeys(shas) if s not in cache]
+    if todo:
+        with ThreadPoolExecutor(max_workers=len(todo)) as pool:
+            futures = [pool.submit(_flat_tree, s, repo, cwd, env) for s in todo]
+            for s, future in zip(todo, futures):
+                cache[s] = future.result()   # re-raises _Unreadable
+    return [cache[s] for s in shas]
+
+
+def _blob(sha, size, repo, cwd, env):
+    import base64
+    import hashlib
+    if not isinstance(size, int) or not 0 <= size <= _MERGE_BLOB_BYTES:
+        raise _Unreadable(f"blob {sha[:10]} is over {_MERGE_BLOB_BYTES} bytes or has no size")
+    got = _gh_json(f"repos/{repo}/git/blobs/{sha}", cwd, env)
+    try:
+        if got.get("encoding") != "base64":
+            raise ValueError
+        data = base64.b64decode(str(got.get("content")))
+    except (ValueError, TypeError):
+        raise _Unreadable(f"blob {sha[:10]} is unreadable")
+    if hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() != sha:
+        raise _Unreadable(f"blob {sha[:10]} does not hash to its id")
+    return data
+
+
+def _merge_file(ours, base, theirs, cwd):
+    """Blob id of `git merge-file -p` of three byte strings, or None on a conflict."""
+    import hashlib
+    import tempfile
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    with tempfile.TemporaryDirectory(prefix="ship-only-guard-") as tmp:
+        names = []
+        for name, data in (("ours", ours), ("base", base), ("theirs", theirs)):
+            Path(tmp, name).write_bytes(data)
+            names.append(str(Path(tmp, name)))
+        try:
+            p = subprocess.run(["git", "merge-file", "-p", "-q", *names], cwd=tmp, env=env,
+                               capture_output=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise _Unreadable(f"`git merge-file` could not run ({type(e).__name__})")
+    if p.returncode != 0 or not isinstance(p.stdout, bytes):
+        return None
+    return hashlib.sha1(b"blob %d\0" % len(p.stdout) + p.stdout).hexdigest()
+
+
+def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache):
+    """Why `merge` is not the clean auto-merge of `ours` and `theirs` (its first and second parent), else ''."""
+    cmp = _gh_json(f"repos/{repo}/compare/{ours}...{theirs}", cwd, env)
+    mb = cmp.get("merge_base_commit")
+    mb = mb.get("sha") if isinstance(mb, dict) else None
+    if not isinstance(mb, str) or not _SHA.fullmatch(mb):
+        raise _Unreadable(f"the merge base of {ours[:10]} and {theirs[:10]} is unreadable")
+    base, o, t, got = _flat_trees((mb, ours, theirs, merge), repo, cwd, env, cache)
+    want, both = {}, []
+    for path in sorted(set(base) | set(o) | set(t)):
+        b, x, y = (tree[path][:2] if path in tree else None for tree in (base, o, t))
+        if x == y or y == b:
+            r = x
+        elif x == b:
+            r = y
+        else:
+            if b is None or x is None or y is None:
+                return f"both parents changed {path} (an add/add or modify/delete conflict)"
+            if not {b[0], x[0], y[0]} <= set(_FILE_MODES):
+                return f"both parents changed {path}, which is not a regular file"
+            both.append(path)
+            continue
+        if r is not None:
+            want[path] = r
+    if len(both) > _MERGE_FILES:
+        return f"{len(both)} paths need a content merge (more than {_MERGE_FILES})"
+    for path in both:
+        # Two file modes only, so at most one side changed the mode: that side's mode wins, as in git.
+        mode = t[path][0] if o[path][0] == base[path][0] else o[path][0]
+        ours_b, base_b, theirs_b = (_blob(tree[path][1], tree[path][2], repo, cwd, env) for tree in (o, base, t))
+        blob = _merge_file(ours_b, base_b, theirs_b, cwd)
+        if blob is None:
+            return f"{path} does not merge cleanly"
+        want[path] = (mode, blob)
+    have = {path: e[:2] for path, e in got.items()}
+    if have != want:
+        diff = sorted(p for p in set(have) | set(want) if have.get(p) != want.get(p))
+        return (f"its tree differs from the clean merge of {ours[:10]} and {theirs[:10]} at {diff[0]}"
+                + (f" (+{len(diff) - 1} more)" if len(diff) > 1 else ""))
+    return ""
 
 
 def _carried_approval(head, data, repo, cwd, env):
@@ -417,9 +543,13 @@ def _carried_approval(head, data, repo, cwd, env):
     (a) H0 is an ancestor of the head (`compare/H0...head` is ahead, behind 0) and every commit on the head's
         first-parent line back to H0 is a merge (at most _CARRY_MERGES) whose second parent is on `state`
         (`compare/<parent>...state` ahead or identical): the head only merged the base in;
-    (b) `git patch-id --stable` of the PR diff `compare/state...H0` equals the one of `compare/state...head`
-        (each is merge-base..sha, the PR's own patch);
-    (c) no non-bot blocking verdict, on any head, at or after that approval.
+    (b) `git patch-id --verbatim` (whitespace-sensitive) of the PR diff `compare/state...H0` equals the one of
+        `compare/state...head` (each is merge-base..sha, the PR's own patch);
+    (c) no non-bot blocking verdict, on any head, at or after that approval;
+    (d) each of those merges is a clean, unedited auto-merge: its tree (`git/trees/<sha>?recursive=1`) is
+        exactly the three-way merge of its two parents over their merge base (`compare/<first>...<second>`),
+        content-merging only paths both parents changed (`_merge_tree_refusal`). Patch-id ignores line numbers,
+        so without (d) a merge that moved an identical hunk elsewhere in the same file kept the id and carried.
     The newest _CARRY_CANDIDATES distinct approved heads are tried in turn (a comment naming the head and a
     base sha yields both); the first one's refusal reason is reported."""
     first = ""
@@ -447,7 +577,7 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
         for c in listed if isinstance(listed, list) else []:
             if isinstance(c, dict) and isinstance(c.get("sha"), str) and isinstance(c.get("parents"), list):
                 known[c["sha"]] = [p.get("sha") if isinstance(p, dict) else None for p in c["parents"]]
-        cur, bases = head, []
+        cur, bases, merges = head, [], []
         while cur != h0:
             if len(bases) >= _CARRY_MERGES:
                 return False, (f"{lead}: more than {_CARRY_MERGES} commits sit on the PR's first-parent line "
@@ -463,6 +593,7 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
                 return False, (f"{lead}: {cur[:10]} after it is not a merge of the base (a non-merge commit "
                                "changes the PR)")
             bases.append(str(parents[1]))
+            merges.append((cur, str(parents[0]), str(parents[1])))
             cur = str(parents[0])
         for parent in dict.fromkeys(bases):
             on = _gh_json(f"repos/{repo}/compare/{parent}...state", cwd, env)
@@ -476,6 +607,14 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
         return False, f"{lead}: {e}, so patch identity cannot be shown"
     if old != new:
         return False, f"{lead}: the PR's patch changed (patch-id {old[:12]} -> {new[:12]})"
+    cache = {}
+    try:
+        for merge, ours, theirs in reversed(merges):
+            why = _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache)
+            if why:
+                return False, f"{lead}: merge {merge[:10]} is not a clean, unedited merge of the base: {why}"
+    except _Unreadable as e:
+        return False, f"{lead}: {e}, so a clean merge cannot be shown"
     return True, h0
 
 
@@ -547,10 +686,22 @@ def _coupled(key, stem):
     return bool(key and stem) and (key == stem or key.startswith(stem + "_") or stem.startswith(key + "_"))
 
 
+def _skill_prose(path):
+    """Skill markdown (home/skills/**.md, skills/**.md): prose that the state/mods suites only lint file by
+    file. hermes-sync pushes live skill edits straight to state every few minutes (`sync: <host>`), so the
+    same-area rule kept refusing PRs that also touch a skill reference (#2563: 5fbd15ce4f edited
+    core-update-runtime.md). Two prose edits cannot change a check outcome the other was tested under; a
+    textual collision still fails GitHub's rebase merge (t_01a1d6b3538e8e43)."""
+    p = str(path)
+    return p.endswith(".md") and (p.startswith("home/skills/") or p.startswith("skills/"))
+
+
 def _overlap(pr, base):
     """Why the base-delta file `base` can change what the PR file `pr` was tested against, or ''."""
     if base.startswith(_WORKFLOWS) or _GLOBAL_FILE.fullmatch(base):
         return "ci"
+    if _skill_prose(pr) and _skill_prose(base):
+        return ""
     if _path_area(pr) == _path_area(base):
         return "area"
     if (pr.count("/") == base.count("/") == 1 and pr.split("/")[0] == base.split("/")[0]
@@ -650,7 +801,7 @@ def _base_drift_refusal(number, repo, data, cwd, env):
             f"Run `gh api -X PUT repos/{repo}/pulls/{number}/update-branch -f expected_head_sha={head}`, wait "
             "for green CI on the new head, then rerun the merge with --match-head-commit <new head>. The guard "
             "re-checks exact-head approval on the new head; an approval of the old head carries when the new "
-            "head only merged state and the PR's `git patch-id --stable` is unchanged.")
+            "head only merged state and the PR's `git patch-id --verbatim` is unchanged.")
 
 
 def _attribute_hits(repo, names, window, subject, cwd, env):
@@ -674,6 +825,188 @@ def _attribute_hits(repo, names, window, subject, cwd, env):
         if hit:
             out.append(f"{name}: {hit['sha'][:10]} {subject(hit)[:60]}")
     return "; ".join(out)
+
+
+# Land turn (t_01a1d6b3538e8e43). The drift rule above holds a PR until CI ran on a base with every later
+# state commit on its areas. Hot areas (hermes-sync, tests/, workflows) took a commit per CI cycle on
+# 2026-11-13, so a green, approved PR refreshed by update-branch went stale again before its next merge
+# attempt: #2563 was refused 4 times. A turn orders the landings instead of weakening the rule: the first
+# drift refusal of a green, approved PR records `refs/land-turn/pr-<N>` (a commit whose message carries the
+# PR's files and an expiry) and, until it expires or the PR closes, every OTHER state PR merge whose files
+# would drift the holder (`_overlap(holder_file, other_file)`) is refused, as is (in state's
+# scripts/state-push-guard pre-push) a direct non-sync push. The turn only ever adds refusals; any error
+# reading it fails open, because the drift compare still guards correctness.
+_TURN_PREFIX = "land-turn/pr-"
+_TURN_TTL = 5400             # one refreshed CI cycle (#2563: 10-45 min) plus the merge attempt, with slack
+_TURN_MAX = 6                # turn commits read per preflight (newest PR numbers first)
+_TURN_BUDGET = 6             # seconds of turn reads per preflight; the rest is skipped (fail open)
+_TURN_CALL_TIMEOUT = 5
+_TURN_SUBJECT = "land-turn pr="
+# After a turn expires its PR cannot take another until a further _TURN_TTL has passed (the cooling ref is
+# kept for that and then deleted by the next reader), so a PR whose area keeps drifting through exports never
+# holds its area for more than half of the time.
+
+
+def _now():
+    import time
+    return time.time()
+
+
+def _gh_call(args, cwd, env, payload=None, timeout=10):
+    """One bounded `gh api` call: (returncode, parsed JSON or None). Never raises."""
+    probe_env = dict(env)
+    probe_env["GH_PROMPT_DISABLED"] = "1"
+    argv = ["gh", "api", *args, *(["--input", "-"] if payload is not None else [])]
+    try:
+        p = subprocess.run(argv, cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True,
+                           timeout=timeout, input=json.dumps(payload) if payload is not None else None)
+    except (OSError, subprocess.SubprocessError):
+        return -1, None
+    try:
+        return p.returncode, json.loads(p.stdout) if p.stdout else None
+    except (ValueError, TypeError):
+        return p.returncode, None
+
+
+def parse_turn(message):
+    """The turn record in a land-turn commit message, or None. Shared format with state's state-push-guard:
+    subject `land-turn pr=<N>`, then one JSON line {"pr", "head", "expires", "files"}."""
+    lines = str(message or "").splitlines()
+    if not lines or not lines[0].startswith(_TURN_SUBJECT):
+        return None
+    for line in lines[1:]:
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            return None
+        ok = (isinstance(rec, dict) and isinstance(rec.get("pr"), int) and not isinstance(rec.get("pr"), bool)
+              and isinstance(rec.get("expires"), (int, float)) and not isinstance(rec.get("expires"), bool)
+              and 0 < rec["expires"] < 4_102_444_800 and isinstance(rec.get("files"), list)
+              and all(isinstance(f, str) and f for f in rec["files"]))
+        return rec if ok else None
+    return None
+
+
+def _turn_number(ref):
+    m = re.fullmatch(rf"refs/{re.escape(_TURN_PREFIX)}(\d+)", str(ref.get("ref", "")) if isinstance(ref, dict) else "")
+    return int(m.group(1)) if m else -1
+
+
+def _live_turns(repo, cwd, env):
+    """[(ref, record)] of unexpired turns; [] on any read failure (fail open).
+
+    Reads at most _TURN_MAX turn commits within _TURN_BUDGET seconds (the whole preflight shares the
+    pre_tool_call budget), newest PR numbers first. A turn past its cooldown (expires + _TURN_TTL) or with a
+    junk record is deleted here, so the ref list stays as short as the set of recent turns."""
+    import time
+    rc, refs = _gh_call([f"repos/{repo}/git/matching-refs/{_TURN_PREFIX}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+    if rc != 0 or not isinstance(refs, list):
+        return []
+    out, now, start = [], _now(), time.monotonic()
+    refs = sorted((r for r in refs if _turn_number(r) >= 0), key=_turn_number, reverse=True)
+    for ref in refs[:_TURN_MAX]:
+        if time.monotonic() - start > _TURN_BUDGET:
+            break
+        sha = ref.get("object", {}).get("sha") if isinstance(ref.get("object"), dict) else None
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            continue
+        rc, obj = _gh_call([f"repos/{repo}/git/commits/{sha}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+        if rc != 0 or not isinstance(obj, dict):
+            continue
+        rec = parse_turn(obj.get("message"))
+        if rec and rec["expires"] > now:
+            out.append((ref["ref"], rec))
+        elif rec is None or rec["expires"] + _TURN_TTL <= now:
+            _gh_call(["-X", "DELETE", f"repos/{repo}/git/{ref['ref']}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+    return out
+
+
+def turn_blocks(turn_files, files):
+    """(holder file, other file) when landing `files` would drift a holder with `turn_files`, else None."""
+    for hf in turn_files:
+        for f in files:
+            if _overlap(hf, f):
+                return hf, f
+    return None
+
+
+def _turn_hold_refusal(number, data, repo, cwd, env):
+    """Refusal while another open PR's live turn covers this PR's areas, else None (fail open)."""
+    files = [f["path"] for f in data.get("files") or [] if isinstance(f, dict) and isinstance(f.get("path"), str)]
+    for ref, rec in _live_turns(repo, cwd, env):
+        if rec["pr"] == int(number):
+            continue
+        hit = turn_blocks(rec["files"], files)
+        if not hit:
+            continue
+        rc, pr = _gh_call([f"repos/{repo}/pulls/{rec['pr']}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+        if rc != 0 or not isinstance(pr, dict):
+            continue   # cannot tell whether the holder is still open: fail open
+        if pr.get("state") != "open":
+            _gh_call(["-X", "DELETE", f"repos/{repo}/git/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+            continue   # the holder landed or closed: its turn is over
+        return (f"[ship-only-guard] Refused state merge of PR #{number}: PR #{rec['pr']} holds the state land "
+                f"turn until {_until(rec['expires'])} ({ref}), and this merge would change its area ({hit[1]} ~ "
+                f"{hit[0]}), sending it into another CI cycle. Wait until #{rec['pr']} merges or its turn "
+                "expires, then rerun the same merge command (the drift check will then ask for update-branch "
+                "if needed).")
+    return None
+
+
+def _turn_acquire(number, data, repo, cwd, env):
+    """Record this PR's land turn (best effort). Returns the expiry text, or '' when not recorded."""
+    head = str(data.get("headRefOid") or "")
+    files = [f["path"] for f in data.get("files") or [] if isinstance(f, dict) and isinstance(f.get("path"), str)]
+    if not re.fullmatch(r"[0-9a-f]{40}", head) or not files:
+        return ""
+    ref = f"{_TURN_PREFIX}{int(number)}"
+    import time
+    start = time.monotonic()
+    late = lambda: time.monotonic() - start > _TURN_BUDGET   # noqa: E731 - preflight shares the hook budget
+    rc, cur = _gh_call([f"repos/{repo}/git/ref/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+    if rc == 0 and isinstance(cur, dict):
+        sha = cur.get("object", {}).get("sha") if isinstance(cur.get("object"), dict) else None
+        rc2, obj = _gh_call([f"repos/{repo}/git/commits/{sha}"], cwd, env, timeout=_TURN_CALL_TIMEOUT) if sha else (-1, None)
+        rec = parse_turn(obj.get("message")) if rc2 == 0 and isinstance(obj, dict) else None
+        if rec and rec["expires"] > _now():
+            return _until(rec["expires"])   # one live turn per PR: a later refusal never extends it
+        if rec and rec["expires"] + _TURN_TTL > _now():
+            return ""                        # cooling down: others in its area get a window first
+    if late():
+        return ""
+    rc, hc = _gh_call([f"repos/{repo}/git/commits/{head}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+    tree = hc.get("tree", {}).get("sha") if rc == 0 and isinstance(hc, dict) and isinstance(hc.get("tree"), dict) else None
+    if not isinstance(tree, str) or late():
+        return ""
+    expires = int(_now()) + _TURN_TTL
+    rec = {"pr": int(number), "head": head, "expires": expires, "files": files}
+    rc, made = _gh_call([f"repos/{repo}/git/commits"], cwd, env, timeout=_TURN_CALL_TIMEOUT, payload={
+        "message": f"{_TURN_SUBJECT}{int(number)}\n\n{json.dumps(rec, sort_keys=True)}\n",
+        "tree": tree, "parents": [head]})
+    sha = made.get("sha") if rc == 0 and isinstance(made, dict) else None
+    if not isinstance(sha, str):
+        return ""
+    rc, _ = _gh_call([f"repos/{repo}/git/refs"], cwd, env, timeout=_TURN_CALL_TIMEOUT, payload={"ref": f"refs/{ref}", "sha": sha})
+    if rc != 0:
+        rc, _ = _gh_call(["-X", "PATCH", f"repos/{repo}/git/refs/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT,
+                         payload={"sha": sha, "force": True})
+    return _until(expires) if rc == 0 else ""
+
+
+def _until(epoch):
+    import datetime
+    return f"{datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc):%H:%M} UTC"
+
+
+def _turn_safe(fn, *args):
+    """The land turn only orders landings: any error in it adds nothing (the drift compare still guards)."""
+    try:
+        return fn(*args)
+    except Exception:
+        return None
 
 
 def _state_merge(words, repo, cwd, env):
@@ -783,8 +1116,20 @@ def _state_merge(words, repo, cwd, env):
         if bad:
             return failed(f"{len(bad)} of {len(checks)} checks not green: " + ", ".join(bad[:8])
                           + (f", +{len(bad) - 8} more" if len(bad) > 8 else ""))
-        return (_review_reply_refusal(number, data) or _approval_refusal(number, data, repo, cwd, env)
-                or _base_drift_refusal(number, repo, data, cwd, env) or True)
+        refusal = (_review_reply_refusal(number, data) or _approval_refusal(number, data, repo, cwd, env)
+                   or _turn_safe(_turn_hold_refusal, number, data, repo, cwd, env))
+        if refusal:
+            return refusal
+        drift = _base_drift_refusal(number, repo, data, cwd, env)
+        if drift and "state commit(s) landed since then" in drift:
+            # Green, approved, refused only for drift: take the land turn so the refreshed head's CI cycle
+            # is the last one (overlapping merges and direct pushes wait for it).
+            until = _turn_safe(_turn_acquire, number, data, repo, cwd, env)
+            if until:
+                drift += (f" PR #{number} now holds the state land turn until {until} (refs/{_TURN_PREFIX}"
+                          f"{number}): overlapping state PR merges and direct state pushes wait for it, so "
+                          "update-branch now and merge as soon as the new head's CI is green.")
+        return drift or True
     except (ValueError, TypeError) as e:
         return failed(f"`gh pr view {number}` returned an unexpected shape ({type(e).__name__})")
 

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, access_scope, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, owner_recommendation, access_scope, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -43,6 +43,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     physical_asks = _sib("physical_asks")
     replan = _sib("replan")
     agent_condition = _sib("agent_condition")
+    owner_recommendation = _sib("owner_recommendation")
     access_scope = _sib("access_scope")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
@@ -936,6 +937,35 @@ def _agent_condition_hold(session_id: str, tool_name: str, request: dict) -> dic
         return None
 
 
+# Process-local hold counts per (session, tool, blocked card), not per ask text: an agent rewords a held ask, and a
+# text key would restart the bound on every rewording, holding a real ask whose limit the regex misses forever.
+_OWNER_RECOMMENDATION_HELD: dict[tuple[str, str, str], int] = {}
+
+
+def _owner_recommendation_hold(session_id: str, tool_name: str, request: dict, card: str = "") -> dict | None:
+    """Hold a human_request that asks David to pick between options inside the card's limits, naming no money,
+    credential/write permission, other people, safety, threshold, human-only step or David rule (red-sweep slug
+    owner-recommendation-not-applied). Deterministic, bounded to owner_recommendation.MAX_HOLDS per (session, tool,
+    card) however the ask is reworded (blocked kanban_create: per session and tool); fails open."""
+    try:
+        hit = owner_recommendation.hit(request)
+        if hit is None:
+            return None
+        key = (session_id, tool_name, card or "")
+        n = _OWNER_RECOMMENDATION_HELD.get(key, 0)
+        if n >= owner_recommendation.MAX_HOLDS:
+            core.log_event("owner_recommendation_released", tool=tool_name, session=session_id, holds=n,
+                           quote=hit["quote"])
+            return None
+        _OWNER_RECOMMENDATION_HELD[key] = n + 1
+        core.log_event("owner_recommendation_hold", tool=tool_name, session=session_id, attempt=n,
+                       task=os.environ.get("HERMES_KANBAN_TASK") or "", quote=hit["quote"])
+        return {"action": "block", "message": owner_recommendation.HOLD_MESSAGE}
+    except Exception as e:
+        core.log_event("owner_recommendation_error", tool=tool_name, session=session_id, error=repr(e)[:300])
+        return None
+
+
 def _replan_reply_hold(session_id: str, asks: list[str], attempt: int, budget: int, reply: str = "") -> dict | None:
     """Chat-reply side of _replan_hold: bounded by the reply hold budget. An ask is read with its paragraph, since
     "Your call: which way?" carries the choice in the sentence before it."""
@@ -981,6 +1011,12 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
         conditioned = _agent_condition_hold(session_id, tool_name, request)
         if conditioned is not None:
             return conditioned
+        raw = args["human_request"]
+        recommended = _owner_recommendation_hold(session_id, tool_name, dict(
+            request, choices=raw.get("choices") if isinstance(raw, dict) else None),
+            card=next(iter(_block_card(tool_name, args)), ""))
+        if recommended is not None:
+            return recommended
         filing = _pr_filing_hold(session_id, tool_name, args, request)
         if filing is not None:
             return filing

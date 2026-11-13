@@ -223,6 +223,84 @@ def test_real_money_asks_still_fire_after_the_budget_fix():
         assert rc.credit_ask(r, []), r
 
 
+# Self-heal agent-2c90bd7aa7 (MacBook 2026-11-13 06:51 PT, msg 907746): a correct spend question about Blacksmith macOS
+# CI was held as an AI credit ask on "add about $4", and so was the revision whose disclaimer sat in an earlier
+# paragraph. Root: with no billing context a bare $ amount counted as AI credit, so every new vendor or cost estimate
+# was a false alarm. A $ amount now needs AI billing context (or credit/top-up/billing-URL wording) to count.
+CI_COST_REPLY = ("Blacksmith macOS CI spend needs your call before I enable more jobs.\n\n"
+                 "The full macOS suite on every push costs about $38/day of macOS runner time. "
+                 "The two short jobs (Native memory and real-codesign) add about $4/day.\n\n"
+                 "A) run only the two short jobs, B) run the full suite nightly, C) keep macOS CI off.")
+CI_COST_REVISED = ("This is Blacksmith build-machine spend, not AI usage, so the account pool can't cover it.\n\n"
+                   "The two short jobs (Native memory and real-codesign) add about $4/day.\n\n"
+                   "Reply A, B or C.")
+NON_AI_COSTS = (CI_COST_REPLY, CI_COST_REVISED,
+                "The two short jobs (Native memory and real-codesign) add about $4/day.",
+                "Turning both jobs on would add about $4/day in cost.",
+                "Enabling them would add about $4/day of CI runner minutes.",
+                "That would add about $12/day of Blacksmith runner time.",
+                "The nightly build would add about $3 of macOS minutes per run.")
+AI_MONEY_ASKS = ("Please add about $250 of Anthropic credit so the eval can finish.",
+                 "Add $250 of credit.",
+                 "Please add $50 of OpenAI API credit; the eval hits insufficient_quota.",
+                 "Add about $250 so the eval can run.\nhttps://console.anthropic.com/settings/billing")
+
+
+def test_non_ai_cost_estimates_are_not_credit_asks():
+    for r in NON_AI_COSTS:
+        assert rc.credit_ask(r, []) is None, r
+
+
+def test_ai_money_asks_still_fire_after_the_cost_estimate_fix():
+    for r in AI_MONEY_ASKS:
+        assert rc.credit_ask(r, []), r
+
+
+def test_pool_llm_mirror_agrees_on_cost_estimates():
+    spec2 = importlib.util.spec_from_file_location("t_pool_llm_hooks_cost", HERE.parent / "pool-llm" / "hooks.py")
+    h = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(h)
+    for r in NON_AI_COSTS + AI_MONEY_ASKS:
+        assert bool(rc.credit_ask(r, [])) == bool(h.credit_ask("kanban_block", {"reason": r})), r
+
+
+# An explicit credit word is strong money wording, so only the CI/infra billing context added for agent-2c90bd7aa7 keeps
+# these from counting as AI credit asks. Each tuple is reached by one regex alone: CI_COST_WORDING only by the
+# NON_LLM_BILLING_RE wording line (Blacksmith, runner minutes, CI time, macOS hours), CI_BILL_TARGETS only by the
+# runner(s) target in _OTHER (followed by a billing word), BUILD_MACHINE_CREDIT by either.
+CI_COST_WORDING = ("Please add $50 of credit so Blacksmith can keep running the macOS jobs.",
+                   "Please add $50 of credit so we can pay for more runner minutes.",
+                   "Please buy $40 of credit for CI time on the nightly build.",
+                   "Please add $30 of credit for macOS hours.")
+CI_BILL_TARGETS = ("Please add $50 of credit for runners billing.",
+                   "Please add $50 of credit to the runner account.")
+BUILD_MACHINE_CREDIT = ("Please add $50 of credit for the build machines.",
+                        "Please add $50 of credit for Blacksmith runner minutes so the macOS jobs can run.")
+AI_CREDIT_NEXT_TO_CI = ("Please add $50 of Anthropic credit for the Blacksmith runner minutes.",
+                        "Please add $50 of OpenAI API credit; the runners billing is separate.",
+                        "Please add $50 of Anthropic credit so the CI time eval can finish.")
+
+
+def test_credit_for_ci_cost_wording_is_not_an_ai_credit_ask():
+    for r in CI_COST_WORDING:
+        assert rc.credit_ask(r, []) is None, r
+
+
+def test_credit_for_runners_billing_is_not_an_ai_credit_ask():
+    for r in CI_BILL_TARGETS:
+        assert rc.credit_ask(r, []) is None, r
+
+
+def test_credit_for_build_machines_is_not_an_ai_credit_ask():
+    for r in BUILD_MACHINE_CREDIT:
+        assert rc.credit_ask(r, []) is None, r
+
+
+def test_ai_credit_next_to_ci_wording_still_fires():
+    for r in AI_CREDIT_NEXT_TO_CI:
+        assert rc.credit_ask(r, []), r
+
+
 CORPUS = json.loads((Path(__file__).parent / "fixtures" / "credit_ask_corpus.json").read_text())["items"]
 
 

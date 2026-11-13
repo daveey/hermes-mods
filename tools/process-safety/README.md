@@ -17,6 +17,30 @@ leave this session are deliberately excluded. An uncatchable SIGKILL/OOM of the
 injector can strand its *own* paused children; this is not a sandbox or a general
 process-tree supervisor. Use disposable containers for hostile fault injection.
 
+## py-spy guard (never stop a live process)
+
+`py_spy_nonblocking.py` is installed as `~/.local/bin/py-spy` on every host that
+runs live Hermes backends (hub, MacBook). Any `record`/`top`/`dump` that attaches
+to a PID without `--nonblocking` gets `--nonblocking` added (stderr says so);
+launched fixtures (`py-spy record -- python x.py`) and `--help` pass through. The
+real binary stays at `~/.local/share/uv/tools/py-spy/bin/py-spy` (found from the
+invoked path, so `sudo -n ~/.local/bin/py-spy` works with root's HOME), or
+`PY_SPY_REAL`.
+
+Why at the binary: on 2026-11-13 a card ran `py-spy record -r 20 -d 90 -p <serve>`
+from a generated shell script. Blocking sampling fell behind on the loaded hub and
+kept the always-on Desktop backend stopped for 17 min (its loop logged a 686 s
+stall); every Desktop request on that connection timed out. The coach
+profiler-safety hook only reads commands typed into a tool call, not scripts.
+
+```sh
+ln -sfn ~/code/hermes-mods/tools/process-safety/py_spy_nonblocking.py ~/.local/bin/py-spy
+~/.local/bin/py-spy record -p 1 --help >/dev/null   # passthrough check
+```
+
+`uv tool install --force py-spy` / `uv tool upgrade py-spy` re-creates the plain
+symlink: re-run the `ln` after either.
+
 ## SSH agent health
 
 `agent_health.py` reads systemd's user `gpg-agent.service` MainPID and ActiveState.

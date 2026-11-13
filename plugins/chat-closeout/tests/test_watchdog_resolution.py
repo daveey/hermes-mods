@@ -1,4 +1,5 @@
 """Exercise the default watchdog sink and resolver against an isolated real board."""
+import contextlib
 import importlib.util
 import os
 from pathlib import Path
@@ -11,6 +12,27 @@ spec = importlib.util.spec_from_file_location('closeout_resolution', ROOT / '__i
 plugin = importlib.util.module_from_spec(spec)
 plugin.__package__ = ''
 spec.loader.exec_module(plugin)
+
+
+@contextlib.contextmanager
+def isolate_claim_policy(monkeypatch):
+    """Point core's installation policy root at an empty fixture-owned temp dir.
+
+    Core's claim admission reads the account's installation policy, not HERMES_HOME: on a pool worker with
+    ``kanban.worker_resources.enabled`` at capacity every claim (the resolver's included) is refused
+    ``worker_capacity_full``, and a claim may register this throwaway board in the real inventory.
+    ``HERMES_TEST_POLICY_ROOT`` is honoured only under a temp root, so use tempfile's default dir.
+    """
+    with tempfile.TemporaryDirectory(prefix='closeout-policy-') as policy:
+        monkeypatch.setenv('HERMES_TEST_POLICY_ROOT', policy)
+        try:
+            from hermes_cli import worker_compute_capacity as capacity
+        except ImportError:  # older core: no host worker-resource admission to isolate
+            capacity = None
+        if capacity is not None and hasattr(capacity, '_test_policy_override'):
+            assert capacity.policy_root() == Path(os.path.realpath(policy)), (
+                f'policy override {policy} not honoured (TMPDIR outside a temp root?)')
+        yield
 
 
 @pytest.fixture
@@ -31,12 +53,13 @@ def incident(monkeypatch):
         from hermes_cli.kanban_db_connect import connect_closing
         from hermes_cli.kanban_db import kanban_db_path
         assert Path(kanban_db_path()).is_relative_to(home)
-        led = plugin.core.Ledger(home / 'ledger.db')
-        monkeypatch.setattr(plugin, 'ledger', lambda: led)
-        plugin._state.clear()
-        with connect_closing() as conn:
-            assert Path(conn.execute('PRAGMA database_list').fetchone()[2]).is_relative_to(home)
-        yield led, kb, connect_closing
+        with isolate_claim_policy(monkeypatch):
+            led = plugin.core.Ledger(home / 'ledger.db')
+            monkeypatch.setattr(plugin, 'ledger', lambda: led)
+            plugin._state.clear()
+            with connect_closing() as conn:
+                assert Path(conn.execute('PRAGMA database_list').fetchone()[2]).is_relative_to(home)
+            yield led, kb, connect_closing
 
 
 def raise_unseen(incident):

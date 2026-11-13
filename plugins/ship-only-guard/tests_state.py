@@ -10,6 +10,13 @@ spec = importlib.util.spec_from_file_location("state_guard", Path(__file__).with
 g = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(g)
 SHA = "a" * 40
+
+
+@pytest.fixture(autouse=True)
+def _no_land_turn(monkeypatch):
+    # These cases pin the preflight's other gh calls; the land turn has its own fakes in tests_turn.py.
+    monkeypatch.setattr(g, "_live_turns", lambda *a: [])
+    monkeypatch.setattr(g, "_turn_acquire", lambda *a: "")
 CMD = ["gh", "pr", "merge", "12", "--repo", "example/protected", "--rebase", "--match-head-commit", SHA]
 
 

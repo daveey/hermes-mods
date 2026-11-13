@@ -200,3 +200,121 @@ def test_teardown_cascade_is_counted_apart_and_kept_out_of_saturation(tmp_path, 
     assert out["reconnect_cascade"] == {"count": 80, "by_conn": {"hermes-hub": 80}, "teardowns": 2}
     assert out["saturated_conns"] == []
     assert out["awake_conn_bursts"] == {}
+
+
+def test_cancelled_forward_right_after_teardown_maps_its_port_to_that_conn():
+    """M3g: today's Desktop names no conn on `forwarding`/`cancelled forward`; a cancel within CASCADE_S of
+    `teardown conn:<c>` is the only thing that maps that port, so a later `[slow-link]` on it belongs to <c>."""
+    t0 = datetime(2026, 11, 13, 17, 0, tzinfo=timezone.utc)
+    timed = [
+        (0, "[ssh] forwarding 127.0.0.1:50003 -> 127.0.0.1:9147"),
+        (60, "[ssh] teardown conn:hermes-hub::default (revalidate): release"),
+        (65, "[ssh] cancelled forward 127.0.0.1:50003"),
+        (120, "[slow-link] http://127.0.0.1:50003 is slow (probe timed out with the SSH connection alive); "
+              "keeping the connection, stretching timeouts x4"),
+        # a cancel long after the teardown maps nothing
+        (200, "[ssh] cancelled forward 127.0.0.1:50004"),
+        (210, "[slow-link] http://127.0.0.1:50004 is slow (probe timed out with the SSH connection alive); "
+              "keeping the connection, stretching timeouts x4"),
+    ]
+    ev = []
+    for s, text in timed:
+        ts = t0 + timedelta(seconds=s)
+        e = bt.link_event(f"{stamp(ts)} [hermes] {text}", ts)
+        assert e is not None, text
+        ev.append(e)
+    out, unmapped = bt.resolve_link_events(ev)
+    slow = [(int((t - t0).total_seconds()), c) for t, k, c in out if k == "slow"]
+    assert slow == [(120, "hermes-hub")]
+    assert unmapped == 1
+
+
+# --- a stall-dominant window with a big unexplained rest ----------------------------------------------------------
+
+MIXED_NOW = datetime(2026, 11, 13, 14, 29, tzinfo=timezone.utc)
+
+
+def mixed_window_lines():
+    """14:10:00-14:10:19Z (one 5-minute bucket): hermes-hub and mac-mini both burst across two paths in the same
+    seconds (a client stall; hermes-hub's kanban/board twice a second): 100 timeouts. 14:20:00-14:22:50Z: 35 hub-sync
+    timeouts on hermes-hub alone, one every 5 s (no burst, no second conn): unexplained, and over the threshold of 30
+    by itself."""
+    stall = datetime(2026, 11, 13, 14, 10, tzinfo=timezone.utc)
+    lines = []
+    for s in range(20):
+        t = stall + timedelta(seconds=s)
+        lines += [timeout(t, BOARD), timeout(t, BOARD), timeout(t, BOARDS),
+                  timeout(t, INBOX, "mac-mini"), timeout(t, LABELS, "mac-mini")]
+    rest = datetime(2026, 11, 13, 14, 20, tzinfo=timezone.utc)
+    lines += [timeout(rest + timedelta(seconds=5 * k), HUB_SYNC) for k in range(35)]
+    return lines
+
+
+def run_t(home, board=None, now=MIXED_NOW, window=30, dry=False, threshold=30):
+    argv = ["--home", str(home), "--host", "laptop", "--json", "--window", str(window),
+            "--threshold", str(threshold)]
+    if dry:
+        argv.append("--dry-run")
+    return bt.main(argv, runner=board, now=now, probe=lambda: {"loadavg": [1.0, 1.0, 1.0], "backend_ps": []})
+
+
+def test_stall_dominant_window_with_unexplained_rest_over_threshold_files_uplink_and_generic_card(tmp_path, capsys):
+    """M3j (README: the generic incident card is filed only when the unexplained rest is over the threshold by
+    itself): 100 of 135 awake timeouts are a client stall, so the uplink card is filed; the other 35 are >= 30 on
+    their own, so the generic incident card is filed beside it."""
+    install(tmp_path, "\n".join(mixed_window_lines()) + "\n")
+    assert run_t(tmp_path, dry=True) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["awake_count"] == 135 and out["client_stall"]["count"] == 100
+    assert out["client_stall"]["conns"] == ["hermes-hub", "mac-mini"]
+    assert bt.unexplained_count(out) == 35 and out["uplink_stall"] is True
+
+    board = Board()
+    assert run_t(tmp_path, board=board) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert keys(board) == ["backend-timeouts:laptop:uplink-stall", bt.card_key("laptop", MIXED_NOW)], keys(board)
+    assert [c.get("kind") for c in out["cards"]] == ["uplink_stall", None]
+    assert out["cards"][1]["action"] == "created"
+
+
+def test_paths_whose_timeouts_are_all_client_stall_get_no_path_card(tmp_path, capsys):
+    """M3k: significant_paths sets client_stall/reconnect_cascade timeouts aside. kanban/board's 40 timeouts all fall
+    in the stall bucket (40 >= 20% of 135, so it would be significant on raw numbers); only hub-sync, whose 35 stand
+    apart, gets a path card while the open generic card waits (todo, no parent naming a path)."""
+    install(tmp_path, "\n".join(mixed_window_lines()) + "\n")
+    assert run_t(tmp_path, dry=True) == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["awake_by_path"][BOARD] == 40 and rep["awake_explained_by_path"][BOARD] == 40
+    assert bt.significant_paths(rep, 30) == [HUB_SYNC]
+
+    board = Board()
+    board.add("t_host", "todo", "Desktop backend timeouts: 135 in 30 min", "## Top request paths\n")
+    bt.save_state(tmp_path, {bt.card_key("laptop", MIXED_NOW): {
+        "task_id": "t_host", "sequence": 1, "created": MIXED_NOW.timestamp() - 600,
+        "last_comment": MIXED_NOW.timestamp() - 600}})
+    assert run_t(tmp_path, board=board) == 0
+    out = json.loads(capsys.readouterr().out)
+    host_card = out["cards"][-1]
+    assert host_card["task_id"] == "t_host" and host_card["action"] == "throttled"  # the generic card is filed
+    assert keys(board) == ["backend-timeouts:laptop:uplink-stall", f"backend-timeouts:laptop:{HUB_SYNC}"], keys(board)
+    assert set(host_card["path_owners"]) == {HUB_SYNC}
+
+
+def test_dispatch_probe_slow_on_two_remote_conns_alone_is_a_client_stall(tmp_path, capsys):
+    """M3o (README lists `[remote-timing] ... dispatch probe slow` as a stall signal): no `[slow-link]` line and no
+    shared burst (one path per conn, never two in the same seconds), only each conn's `dispatch probe slow` 20 s
+    apart. That bucket's timeouts are a client stall."""
+    t = datetime(2026, 11, 13, 14, 10, tzinfo=timezone.utc)
+    lines = [f"{stamp(t)} [hermes] [remote-timing] conn:hermes-hub::default dispatch probe slow (10010 ms)",
+             f"{stamp(t + timedelta(seconds=20))} [hermes] [remote-timing] conn:mac-mini::default dispatch probe "
+             "slow (9800 ms)"]
+    lines += [timeout(t + timedelta(seconds=3 * k), BOARD) for k in range(20)]
+    lines += [timeout(t + timedelta(seconds=3 * k + 1), INBOX, "mac-mini") for k in range(15)]
+    install(tmp_path, "\n".join(lines) + "\n")
+    assert run_t(tmp_path, dry=True) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["client_stall"]["unmapped_slow_links"] == 0
+    cs = out["client_stall"]
+    assert cs["conns"] == ["hermes-hub", "mac-mini"] and cs["count"] == 35, cs
+    assert cs["buckets"] == ["2026-11-13 14:10:00+00:00"]
+    assert out["uplink_stall"] is True

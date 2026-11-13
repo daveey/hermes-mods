@@ -926,9 +926,14 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             raw = rc.aux_confirm(rc.confirm_system(), rc.confirm_prompt(ask, coach.turn_rich(session_id), reply,
                                                                         prev_turn=prev, board=board))
             res = rc.parse_confirm(raw)
+            later = rc.closeout_later_lines(ask) if hasattr(rc, "closeout_later_lines") else []
             store.log({"event": "report_only_confirm", "session_id": session_id, "ok": res is not None,
                        "p": res[0] if res else None, "evidence": res[1] if res else "", **tag,
                        **({"board": [b.strip()[:200] for b in board]} if board else {}),
+                       # agent-93112d1e96: the judge saw the close-out's post-handoff card comments; a low verdict
+                       # on such a turn is recorded as resting on that board re-read.
+                       **({"closeout_later": len(later)} if later else {}),
+                       **({"decision_src": "closeout"} if later and res and res[0] < 0.5 else {}),
                        **((ref() if callable(ref) else ref) or {})})
             return res
         return confirm
@@ -1194,7 +1199,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     def _nudge_outcome(session_id, final_response, attempt=1, platform=""):
         """The continuation's check after this turn's reply_check nudge (any rule; attempt >= 1, or attempt 0 on a
         different reply after a mid-turn compaction): re-run that rule once on the revised reply and the turn's tool
-        log (same screen judge, thresholds and, for report_only, the same strong-model second opinion and daily cap as
+        log, plus the deterministic PR rules (merge_forecast, pr_state_claim) when enabled: a revision that adds a
+        stale PR claim fails the outcome and logs reply_nudge_outcome_new_claim (agent-aece75acd4) (same screen judge,
+        thresholds and, for report_only, the same strong-model second opinion and daily cap as
         the nudge: agent-e5b6dcf428), log a reply_nudge_outcome, never nudge again. Fail-open, but a nudge taken
         off the loop state always gets its outcome record. Self-heal files the outcome (signals.collect_coach), not
         the nudge (agent-e278947864, agent-3ba1979f34)."""
@@ -1231,7 +1238,15 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                    confirm=_report_only_confirm(rc, session_id, ask, final_response, prev,
                                                                 ref=nid_ref, via="outcome"),
                                    confirm_floor=rc.CONFIRM_FLOOR, human_confirm_floor=rc.human_confirm_floor(plat),
-                                   report_only_fallback=cfg.get("report_only_fallback", rc.REPORT_ONLY_FALLBACK))
+                                   report_only_fallback=cfg.get("report_only_fallback", rc.REPORT_ONLY_FALLBACK),
+                                   extra_rules=tuple(r for r in rc.NEW_CLAIM_RULES
+                                                     if r in (cfg.get("rules") or rc.NEW_CLAIM_RULES)))
+            if res.get("new_claim"):
+                # agent-aece75acd4: the revision added a stale PR claim the nudged rule never looks at
+                store.log({"event": "reply_nudge_outcome_new_claim", "session_id": session_id, "rule": rule,
+                           **_ids(n), "claim_rule": res["new_claim"]["rule"],
+                           "evidence": res["new_claim"]["evidence"], "reply": (final_response or "")[:300],
+                           **({"platform": plat} if plat else {})})
             try:
                 out_ids = (rc.evidence_ids(final_response, res.get("evidence") or "", tool_log=log_lines,
                                           user_ask=ask)
@@ -1244,10 +1259,17 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                          **({"asks": res["asks"]} if "asks" in res else {}),
                          **({"src": res["src"]} if "src" in res else {}),
                          **({"unconfirmed": True} if res.get("unconfirmed") else {}),
+                         # coach-1b2ea7d9a7: a re-check that raised says why (judge outage vs crash)
+                         **({"error": res["error"]} if res.get("error") else {}),
+                         **({"judge_error": True} if res.get("judge_error") else {}),
                          # agent-521fd3b5d4: signals.resume_lost_outcome files a failure judged on a resumed turn
                          # with no rehydrated tool log as a coach defect, not the agent's
                          **coach.resume_info(session_id),
                          **({} if attempt else {"via": "recheck"}))
+            if res.get("error"):
+                store.log({"event": "nudge_outcome_error", "session_id": session_id, "rule": rule, **_ids(n),
+                           "error": res["error"], "judge_error": bool(res.get("judge_error")),
+                           "evidence": res["evidence"], "trace": res.get("trace") or []})
             if n.get("lead") and rc.answer_dropped(n["lead"], final_response):
                 # agent-e868df5c84: the nudge took the draft's direct answer out of the reply the user sees
                 store.log({"event": "reply_nudge_answer_dropped", "session_id": session_id, "rule": rule,

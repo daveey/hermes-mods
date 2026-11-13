@@ -368,6 +368,106 @@ def read_cards(board_paths: Iterable[Path], ids: Iterable[str], light: bool = Fa
     return {key: card for key, card in found.items() if key not in ambiguous}
 
 
+# A handoff is the card's last run summary, frozen when that run ended. A decision recorded later as a comment (David
+# choosing "Close scoped" on an archived card, with no new run) never reached the close-out, so the turn and the coach
+# judge both saw the stale "needs a direct user waiver" (self-heal agent-93112d1e96). The full board read carries a
+# few comments posted after the handoff; closeout_prompt prints them under it. Decisions rank before chatter.
+MAX_LATER_COMMENTS = 2  # per card
+MAX_LATER_COMMENT_CHARS = 300  # per comment
+MAX_LATER_COMMENTS_PROMPT = 4096  # all "later on this card" lines of one prompt
+_LATER_SCAN = 20  # newest later comments ranked per card
+LATER_LINE = "  later on this card (after its handoff): "
+_DECISION_RE = re.compile(
+    r"\b(?:david|the user|user(?:'s)? (?:reply|decision|choice)|decid\w*|decision|chose|chosen|selected|"
+    r"waive\w*|approv\w*|declin\w*|reject\w*|defer\w*|rescop\w*|close scoped|relay\w*)\b", re.I)
+
+
+def _later_comments(conn, left: list[str], has_runs: bool, comp: str) -> dict[str, list[dict[str, Any]]]:
+    """``{id: [{at, author, body}]}``: up to MAX_LATER_COMMENTS comments per card created after its handoff (the end of
+    the run whose summary is the handoff, else ``completed_at``), decisions first, then oldest first. Fail-soft: a
+    board without comments (or a failed read) gives none, never a failed card read."""
+    if not left or not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_comments'").fetchone():
+        return {}
+    run_end = ("(SELECT r.ended_at FROM task_runs r WHERE r.task_id = t.id AND r.summary IS NOT NULL "
+               "AND r.summary != '' ORDER BY r.id DESC LIMIT 1)") if has_runs else "NULL"
+    ph = ",".join("?" for _ in left)
+    sql = (f"SELECT task_id, author, body, created_at FROM ("
+           f"SELECT c.task_id, c.author, c.body, c.created_at, ROW_NUMBER() OVER "
+           f"(PARTITION BY c.task_id ORDER BY c.created_at DESC, c.id DESC) AS rn "
+           f"FROM task_comments c JOIN (SELECT t.id AS tid, COALESCE({run_end}, {comp}) AS anchor "
+           f"FROM tasks t WHERE t.id IN ({ph})) a ON a.tid = c.task_id "
+           f"WHERE a.anchor IS NOT NULL AND c.created_at > a.anchor) WHERE rn <= {_LATER_SCAN}")
+    out: dict[str, list[dict[str, Any]]] = {}
+    try:
+        rows = conn.execute(sql, left).fetchall()
+    except sqlite3.Error:
+        logger.debug("chat-closeout: later-comment read failed", exc_info=True)
+        return {}
+    for task_id, author, body, at in rows:
+        out.setdefault(task_id, []).append({'at': at, 'author': author, 'body': body})
+    return {task_id: ranked for task_id, items in out.items() if (ranked := rank_later_comments(items))}
+
+
+def rank_later_comments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Up to MAX_LATER_COMMENTS of ``items`` (``{at, author, body}``, all posted after the handoff): blank bodies
+    dropped, whitespace folded, decisions first then newest, returned oldest first."""
+    kept = []
+    for c in items:
+        text = " ".join(str(c.get('body') or "").split())
+        if text:
+            kept.append({'at': c.get('at'), 'author': str(c.get('author') or "?")[:40], 'body': text})
+    ranked = sorted(kept, key=lambda c: (not _DECISION_RE.search(c['body']), -(c['at'] or 0)))
+    return sorted(ranked[:MAX_LATER_COMMENTS], key=lambda c: c['at'] or 0)
+
+
+def replica_later_comments(record: Any) -> list[dict[str, Any]]:
+    """The post-handoff comments of a REMOTE card, from its hub-replica task record (t_01a1d6c01b4c0633: 8e23ae92
+    covered only local boards, so a decision commented on a card another gateway owns never reached the close-out).
+    Anchor as :func:`_later_comments`: the run's ``ended_at`` when that run carries the summary, else
+    ``completed_at``; no anchor = none. ``last_comments`` is newest last. Fail-soft: anything unreadable gives []."""
+    if not isinstance(record, dict):
+        return []
+    run = record.get('run')
+    run = run if isinstance(run, dict) else {}
+    anchor: Any = run.get('ended_at') if str(run.get('summary') or "").strip() else None
+    if anchor is None:
+        anchor = record.get('completed_at')
+    try:
+        anchor = float(anchor)
+    except (TypeError, ValueError):
+        return []
+    later = []
+    for c in record.get('last_comments') or []:
+        if not isinstance(c, dict):
+            continue
+        try:
+            at = float(c.get('at'))
+        except (TypeError, ValueError):
+            continue
+        if at > anchor:
+            later.append({**c, 'at': at})
+    return rank_later_comments(later[-_LATER_SCAN:])
+
+
+def _later_comment_lines(card: dict[str, Any], budget: int) -> list[str]:
+    lines = []
+    for c in (card.get('later_comments') or [])[:MAX_LATER_COMMENTS]:
+        body = str(c.get('body') or "")
+        if len(body) > MAX_LATER_COMMENT_CHARS:
+            body = body[:MAX_LATER_COMMENT_CHARS - 1] + "…"
+        try:
+            when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(c.get('at'))))
+        except (TypeError, ValueError, OverflowError):
+            when = "?"
+        line = f"{LATER_LINE}{when} {c.get('author') or '?'}: {body}"
+        if len(line) > budget:
+            break
+        lines.append(line)
+        budget -= len(line)
+    return lines
+
+
 def _board_rows(path: Path, left: list[str], light: bool) -> tuple[list[dict[str, Any]], Optional[Exception]]:
     """Rows before any error, or successful rows reused at the same committed revision.
 
@@ -417,12 +517,14 @@ def _board_rows(path: Path, left: list[str], light: bool) -> tuple[list[dict[str
             except ImportError:
                 read_inventory = None  # old core: acceptance remains unspecified
             board = path.parent.name if path.parent.parent.name == 'boards' else 'default'
+            later = _later_comments(conn, left, bool(has_runs), comp)
             for r in conn.execute(full.format(ph=ph), left):
                 try:
                     historical = read_inventory(conn, r['id'], board=board) if read_inventory else None
                 except (ValueError, TypeError, ImportError, OSError, sqlite3.Error):
                     historical = None  # optional history cannot change settlement/readability
-                rows.append({**dict(r), 'parents': tuple(parents.get(r['id'], [])), **(historical or {})})
+                rows.append({**dict(r), 'parents': tuple(parents.get(r['id'], [])), **(historical or {}),
+                             **({'later_comments': later[r['id']]} if later.get(r['id']) else {})})
         return rows
 
     try:
@@ -1807,6 +1909,7 @@ def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: 
              if row.get("batch") else
              f"{TAG} This chat no longer waits on the card(s) below. This turn is the close-out:"]
     receipt_budget = 32768
+    later_budget, later_n = MAX_LATER_COMMENTS_PROMPT, 0
     batch_ids = set(row.get("batch") or []) | {str(t).rsplit("/", 1)[-1] for t in row.get("batch") or []}
     for tid in sorted(row.get("batch") or []):
         c = cards.get(tid)
@@ -1818,6 +1921,10 @@ def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: 
             state = f"blocked ({c.get('block_kind') or 'needs a human'})"
         handoff = " ".join(str(c.get("summary") or "").split())[:700] or _latest_comment_text(c) or "(no handoff)"
         lines.append(f"- {tid} [{state}] {c.get('title') or ''}{_ask_line(c, now)}\n  handoff: {handoff}")
+        later = _later_comment_lines(c, later_budget)
+        lines.extend(later)
+        later_n += len(later)
+        later_budget -= sum(len(ln) for ln in later)
         refs = _card_handoff_refs(tid, c, batch_ids) if named is not None else []
         if refs:
             live = named or {}
@@ -1863,6 +1970,12 @@ def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: 
                      "fix it now if it's small and reversible; otherwise create a linked card with acceptance "
                      "criteria and name it. List as still open only items that are the user's own call, or that "
                      "a card you checked this turn is actively running.")
+    if later_n:
+        lines.append("Each 'later on this card' line is a comment posted on that card after its handoff, re-read from "
+                     "the board this turn. A decision recorded there (the user closing, rescoping, waiving or "
+                     "deferring an item) supersedes what the handoff left open: name that decision and where it is "
+                     "recorded, and don't relist the item as open or as an ask.")
+    logger.info("chat-closeout: closeout_later_comments n=%d cards=%d", later_n, len(row.get("batch") or []))
     lines.append(
         "Write the closing answer for the user now: distinguish workflow completion from scoped artifact "
         "disposition. Preserve rejected, superseded and contained outcomes; containment is not a root-cause fix. "

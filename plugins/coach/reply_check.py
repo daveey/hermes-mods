@@ -1235,6 +1235,44 @@ def board_section(reply: str, tool_log: Optional[list], board: Optional[list] = 
             + "\n".join(lines) + "\n\n")
 
 
+# A [chat-closeout] prompt prints comments posted on a card after its frozen handoff ("later on this card (after its
+# handoff): <UTC> <author>: <text>"), re-read from the board for this turn. The judges' request excerpt keeps only the
+# head and tail of a long notice, so the David-recorded decision those lines carry fell in the cut and a correct
+# "closed by decision" reply scored report_only (self-heal agent-93112d1e96). They get their own section, as a card read.
+CLOSEOUT_LATER_MARK = "later on this card (after its handoff):"
+CLOSEOUT_LATER_MAX = 4096
+_CLOSEOUT_HEAD_RE = re.compile(r"^\s*\[chat-closeout\]", re.I)
+
+
+def closeout_later_lines(user_ask: str) -> list[str]:
+    """The "later on this card" lines of the turn's own [chat-closeout] prompt (bounded), else []. Only the anchored
+    close-out envelope counts: a human message quoting the phrase is a bare claim, not a board read."""
+    ask = user_ask or ""
+    if not _CLOSEOUT_HEAD_RE.match(ask):
+        return []
+    out, used, card = [], 0, ""
+    for ln in ask.splitlines():
+        s = ln.strip()
+        if s.startswith("- ") and re.match(r"- \S+ \[", s):
+            card = s.split()[1]
+        elif s.startswith(CLOSEOUT_LATER_MARK):
+            line = f"{card}: {s}" if card else s
+            if used + len(line) > CLOSEOUT_LATER_MAX:
+                break
+            out.append(line)
+            used += len(line)
+    return out
+
+
+def closeout_section(user_ask: str) -> str:
+    lines = closeout_later_lines(user_ask)
+    if not lines:
+        return ""
+    return ("CARD COMMENTS THE CLOSE-OUT RE-READ (Hermes's own board read for this [chat-closeout] turn: comments posted "
+            "on each card after its handoff; counts as a card read recording them, so a user decision here is a "
+            "recorded decision):\n" + "\n".join(lines) + "\n\n")
+
+
 # status_only: the user asks why it's waiting / what's going on / to finish it, and the turn only reopened, unblocked,
 # commented on or looked at cards (defect agent-38a817308d: four "reopened the card / verified ready" replies while the
 # rollout card sat unstarted for 4 days). Deterministic, before the judge: the report_only owner-check exemption
@@ -1585,16 +1623,20 @@ LLM_CREDIT_RE = re.compile(
     r"|insufficient_quota|credit balance is too low|no credits remaining|\bapi\s+credits?\b"
     r"|console\.anthropic\.com|platform\.openai\.com", re.I)
 _OTHER = (r"(?:github(?:\s+actions)?|actions|aws|ec2|vast(?:\.ai)?|cloudflare|runpod|lambda\s+labs|gcp|azure|heroku"
-          r"|vercel|netlify)")
+          r"|vercel|netlify|blacksmith|runners?|build\s+machines?)")
 NON_LLM_BILLING_RE = re.compile(
     r"\bgithub\s+actions\b|\bactions\s+minutes\b"
+    # CI/infra cost wording (self-heal agent-2c90bd7aa7: "macOS runner time" on Blacksmith)
+    r"|\bblacksmith\b|\b(?:runner|CI|macOS|build)\s+(?:minutes|time|hours)\b|\bbuild\s+machines?\b"
     r"|\b" + _OTHER + r"(?:\s+account)?\s+" + _BILL + r"\b"
     r"|\b" + _BILL + _PREP + _OTHER + r"\b", re.I)
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n")
 # Money wording that is an ask on its own; budget/balance/funds/billing/spend limit are engineering words too ("retry
 # budget", "memory budget", "time budget") and need LLM billing context nearby (self-heal agent-ddabb16633). A top-up
-# counts as the noun, not as the verb that opens the match ("top-up went through; I'll check the balance").
-_STRONG_MONEY_RE = re.compile(r"\bcredits?\b|\$\s?\d|console\.anthropic\.com|platform\.openai\.com|\bmoney ask\b", re.I)
+# counts as the noun, not as the verb that opens the match ("top-up went through; I'll check the balance"). A bare $
+# amount is not AI-credit evidence either (self-heal agent-2c90bd7aa7: "the two short jobs add about $4/day" was a
+# Blacksmith CI cost estimate): it counts only with AI billing context nearby, so an unknown vendor is not AI credit.
+_STRONG_MONEY_RE = re.compile(r"\bcredits?\b|console\.anthropic\.com|platform\.openai\.com|\bmoney ask\b", re.I)
 _TOPUP_NOUN_RE = re.compile(r"\btop[- ]?ups?\b", re.I)
 
 
@@ -1608,8 +1650,8 @@ def _about_llm_credit(text: str, m: "re.Match") -> bool:
     """The money wording at m may be about LLM provider credit. Its sentence decides first, then its paragraph: the
     billing target nearest the ask wins (LLM credit/quota wording = yes; GitHub Actions/AWS/Vast/Cloudflare billing =
     no). A scope naming neither defers outward, never to other paragraphs. With no billing context at all, only strong
-    money wording counts (credit(s), a $ amount, a top-up noun, a billing URL): a bare "add $250 of credit" does, a bare
-    budget/balance/funds/billing ("raise the retry budget", "load on the memory budget") does not."""
+    money wording counts (credit(s), a top-up noun, a billing URL): a bare "add $250 of credit" does; a bare $ amount
+    ("add about $4/day") or budget/balance/funds/billing ("raise the retry budget") does not."""
     p0 = text.rfind("\n\n", 0, m.start()) + 1
     p1 = text.find("\n\n", m.end())
     p1 = len(text) if p1 < 0 else p1
@@ -1834,8 +1876,11 @@ def skipped_live(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
 # "in a/an/N/a few" needs a time unit: "two merges in a row" is no forecast (agent-372c9408b8).
 _MF_WHEN = (r"(?:once|as\s+soon\s+as|by|at|around|within|tonight|today|tomorrow|in\s+(?:about\s+)?(?:an?|\d+|a\s+few)"
             r"\s+(?:(?:more|couple(?:\s+of)?)\s+)?(?:min(?:ute)?s?|hours?|hrs?|days?|weeks?|bit|moment)\b)")
+# An adverb may sit between the verb and its condition: "merges right after PR #1806" (agent-aece75acd4). Not
+# "only": the backtest's "ship merges only after CI is green on that exact head" describes the gate, not a PR.
+_MF_ADV = r"(?:(?:right|just|soon|immediately|straight|directly)\s+)?"
 _MF_FORECAST_RE = re.compile(
-    r"\bmerges\s+(?:(?:when|after)\b|" + _MF_WHEN + r")|\blands\s+" + _MF_WHEN
+    r"\bmerges\s+" + _MF_ADV + r"(?:(?:when|after)\b|" + _MF_WHEN + r")|\blands\s+" + _MF_ADV + _MF_WHEN
     + r"|\b(?:will|(?:I|it|we|that|this|they)[\u2019']ll|should|is\s+(?:expected|going|due)\s+to|is\s+set\s+to)\s+"
     r"(?:auto-?)?(?:merge|land|be\s+(?:auto-?)?(?:merged|landed))\b(?![-\w])(?!\s+(?:[\w/.-]+\s+){0,2}into\b)",
     re.I)
@@ -1884,11 +1929,23 @@ _PSC_CLAIM_RE = re.compile(
     r"|\b(?:it|PR|PRs|request|that|this|which)" + _APOS + r"?s?\s+not\s+(?:yet\s+)?(?:merged|landed)\b"
     r"|\bstill\s+(?:open|unmerged|un-merged|pending\s+merge|in\s+review|waiting\s+(?:on|for)\s+(?:review|checks|CI|merge))\b"
     r"|\b(?:is|are)\s+(?:still\s+)?unmerged\b"
-    r"|\b(?:awaiting|waiting\s+to)\s+(?:merge|be\s+merged|land)\b",
+    r"|\b(?:awaiting|waiting\s+to)\s+(?:merge|be\s+merged|land)\b"
+    # Positive present state (agent-aece75acd4: "That one is approved, its checks pass" about a PR merged 2.5 h
+    # earlier; agent-fd934117b4: "#1187 is approved and waiting for its macOS check" after it merged). A check
+    # claim needs a PR-ish owner ("its/required/all 12 checks", "CI"): "the ancestry check passes" is no PR state.
+    r"|\b(?:is|are|has\s+been|have\s+been)\s+(?:now\s+|already\s+)?approved\b"
+    r"|\b(?:(?:its|their|required|all|every|both|\d+|[\w#]+" + _APOS + r"s)\s+(?:(?:\d+|required|PR|CI|GitHub)\s+){0,2}"
+    r"checks?"
+    r"|(?:required\s+)?CI(?:\s+checks?)?)"
+    r"\s+(?:all\s+)?(?:pass(?:es)?|(?:is|are)\s+(?:(?:all|now)\s+)?(?:green|passing))\b"
+    r"|\b(?:queued|lined\s+up)\s+to\s+(?:merge|land)\b|\bin\s+the\s+merge\s+queue\b"
+    r"|\bwaiting\s+(?:on|for)\s+(?:its|their|the)\s+(?:[\w.+/-]+\s+){0,3}(?:checks?|jobs?|CI|builds?)\b",
     re.I)
 _PSC_IT_RE = re.compile(r"^\W*(?:it|it" + _APOS + r"s|that|this)\b", re.I)
 # The claim sits inside a condition or reported speech: "if PR 42 isn't merged yet", "the log said it isn't merged".
-_PSC_HEDGE_RE = re.compile(r"\b(?:if|whether|unless|until|once|when|in\s+case|said|says|told|showed|shows|reported|"
+_PSC_HEDGE_RE = re.compile(r"\b(?:if|whether|unless|until|once|when|after|before|as\s+soon\s+as|in\s+case|said|says|"
+                           r"suppose|imagine|requires?|needs?\s+to\s+see|has\s+to\s+see|have\s+to\s+see|must\s+see|"
+                           r"confirm|told|showed|shows|reported|"
                            r"claimed|thought|assumed|wrote|was\s+going\s+off)\b[^.;:!?]{0,60}$", re.I)
 _PSC_READ_RE = re.compile(
     _MF_CHECK_RE.pattern + r"|\bgh\s+pr\s+(?:list|merge|create|ready)\b|\bhermes-core-wt\s+(?:ship|land|lane)\b",
@@ -1903,7 +1960,8 @@ PR_STATE_CLAIM_NUDGE = (
 
 
 def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
-    """The sentence claiming a PR's present (unmerged/open) state when this turn read no PR state, else None (code
+    """The sentence claiming a PR's present state (unmerged/open, or approved/checks green/queued) when this turn
+    read no PR state, else None (code
     spans, quotes, `>` lines, questions, conditions, reported speech and replies naming pr_state_claim are ignored)."""
     text = _CODE_QUOTE.sub(" ", reply or "")
     text = _QUOTED_RE.sub(" ", text)
@@ -3076,7 +3134,8 @@ probabilities (0-1):
   job or wait that is scheduled or parked on purpose (a timed wake, retention, soak or release window) and is
   working as designed: a legitimate wait is not a problem; or the open item is one the user
   chose to defer, rescope or skip, the message names that decision, and the tool log (this turn or
-  the previous turn) shows where it is recorded (a card read or comment carrying the decision): honoring the
+  the previous turn) shows where it is recorded (a card read or comment carrying the decision, or a line
+  under CARD COMMENTS THE CLOSE-OUT RE-READ, which is Hermes's own board read of that card): honoring the
   user's own decision is not a leftover. Only the user's own recorded decision counts: an agent's own choice to wait,
   a schedule, or a bare claim that the user deferred it (nothing in either tool log) does not, and a latest request
   asking the agent to finish it overrides an earlier deferral.
@@ -3130,7 +3189,7 @@ Return ONLY one JSON object:
 
 - A Done-means tick-off line's `still failing: <what>` clause is an unresolved problem; its `n/a: <item> — <why>` clause (a checklist line that doesn't apply to this change, with the reason) is not, unless the reason admits a step that does apply was skipped or left undone.
 - problem: true if the reply mentions a defect, failure, bug, blocker, stale/wrong state, or something not working or not done that is STILL UNRESOLVED when the reply ends ("not fixed", "still broken", "remaining work", "X is outdated", "Y failed", "waiting on CI"). false if no unresolved problem is mentioned. A card, job or wait that is scheduled or parked on purpose (a timed wake, retention, soak or release window) and working as designed is not a problem by itself.
-- agent_fixable: when problem is true: could an agent with the access above plausibly fix it or start fixing it itself (true), or does it genuinely need the user (password, physical action, a decision only he can make, money) or an outside party (false)? null when problem is false. An item the user chose to defer, rescope or skip is false when the reply names that decision and a tool log shown (this turn or the previous turn) records it (a card read or comment carrying the decision); acting on it would override the user. Only the user's own recorded decision counts: an agent's own choice to wait, a schedule, or a bare claim that the user deferred it (nothing in either tool log) does not, and the latest request asking the agent to finish it overrides an earlier deferral.
+- agent_fixable: when problem is true: could an agent with the access above plausibly fix it or start fixing it itself (true), or does it genuinely need the user (password, physical action, a decision only he can make, money) or an outside party (false)? null when problem is false. An item the user chose to defer, rescope or skip is false when the reply names that decision and a tool log shown (this turn or the previous turn) records it (a card read or comment carrying the decision, or a line under CARD COMMENTS THE CLOSE-OUT RE-READ, which is Hermes's own board read of that card); acting on it would override the user. Only the user's own recorded decision counts: an agent's own choice to wait, a schedule, or a bare claim that the user deferred it (nothing in either tool log) does not, and the latest request asking the agent to finish it overrides an earlier deferral.
 - outcome (pick the best fit for the unresolved problem the reply is mainly about):
   "fixed": the agent itself fixed or changed the thing during this turn (edited code/config, ran the command that resolves it), even if final verification is pending.
   "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR). A Kanban worker that checkpointed its own card with kanban_continue this turn has started the leftovers that checkpoint carries to the card's next run. """ + STALLED_OWNER + """ Such a card (failed start attempts, parked on quota or "No eligible deep routes", "starts by itself" after a reset) is "report_only", not "started", unless the agent did the work this turn or re-placed it on a gateway that can run it. A Kanban worker's own kanban_block(kind=dependency) behind such a card is not a started fix either. """ + UNLINKED_WAIT + """
@@ -3340,7 +3399,8 @@ def confirm_prompt(user_ask: str, rich_log: list[str], reply: str, prev_turn: Op
     request = (ask[:950] + "\n[handoff middle omitted]\n" + ask[-500:]) if notice and len(ask) > 1500 else request_excerpt(ask)
     context = f"{NOTICE_CONTEXT}\n\n" if notice else ""
     return (f"{context}USER'S REQUEST (latest):\n{request}\n\nTOOL LOG THIS TURN (oldest first, real arguments, "
-            f"truncated):\n{log}\n\n{board_section(reply, rich_log, board, user_ask)}{prev_turn_section(prev_turn, rich_log)}"
+            f"truncated):\n{log}\n\n{closeout_section(ask)}{board_section(reply, rich_log, board, user_ask)}"
+            f"{prev_turn_section(prev_turn, rich_log)}"
             f"AGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
 
 
@@ -3558,7 +3618,8 @@ def judge_prompt(user_ask: str, tool_log: list[str], reply: str, prev_turn: Opti
                  board: Optional[list] = None) -> str:
     log = render_tool_log(tool_log, 5000)
     return (f"USER'S REQUEST (latest):\n{request_excerpt(user_ask)}\n\nTOOL LOG THIS TURN (oldest first, truncated):\n"
-            f"{log}\n\n{board_section(reply, tool_log, board, user_ask)}{prev_turn_section(prev_turn, tool_log)}"
+            f"{log}\n\n{closeout_section(user_ask)}{board_section(reply, tool_log, board, user_ask)}"
+            f"{prev_turn_section(prev_turn, tool_log)}"
             f"AGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
 
 
@@ -3877,7 +3938,66 @@ def handoff_outcome(reply: str, user_ask: str, tool_log: list[str], llm: Callabl
 STRONG_REPORT_ONLY_SRC = ("confirm", "closed_owner", "unverified_owner")
 
 
+NEW_CLAIM_RULES = ("merge_forecast", "pr_state_claim")
+
+
+def outcome_error(exc: BaseException, judge_error: bool, judged: bool) -> dict:
+    """coach-1b2ea7d9a7: the outcome record for a re-check that raised, typed so the collector can tell a judge
+    outage from a crash. judge_error (the exception came out of the judge/second-opinion model call itself, e.g.
+    SubscriptionQuotaUnavailable): evidence "judge unavailable: <Type>: <msg>", never filed (signals.unjudged_outcome
+    class judge_unavailable, like reply_skipped). Otherwise the re-check code crashed: "outcome check failed: <Type> at
+    <file:line>: <msg>", filed as coach defect class check_failed:<Type>. Both carry error=<Type> and `trace`, the last
+    3 traceback frames ("file:line in func"), which the caller logs as a nudge_outcome_error event."""
+    import traceback
+    name = type(exc).__name__
+    msg = " ".join(str(exc).split())[:200]
+    frames = traceback.extract_tb(exc.__traceback__)[-3:]
+    trace = [f"{os.path.basename(f.filename)}:{f.lineno} in {f.name}" for f in frames]
+    if judge_error:
+        ev = f"judge unavailable: {name}" + (f": {msg}" if msg else "")
+    else:
+        at = f" at {os.path.basename(frames[-1].filename)}:{frames[-1].lineno}" if frames else ""
+        ev = f"outcome check failed: {name}{at}" + (f": {msg}" if msg else "")
+    return {"p": None, "resolved": None, "evidence": ev, "judged": judged, "error": name, "trace": trace,
+            **({"judge_error": True} if judge_error else {})}
+
+
 def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
+                  threshold: float = 0.8, thresholds: Optional[dict] = None,
+                  wake: Optional[Callable[[], list]] = None, kanban_down: Optional[bool] = None,
+                  human_asks: Optional[Callable[[], list]] = None, prev_turn: Optional[dict] = None,
+                  confirm: Optional[Callable[[], Optional[tuple]]] = None, confirm_floor: float = CONFIRM_FLOOR,
+                  human_confirm_floor: Optional[float] = None,
+                  report_only_fallback: str = REPORT_ONLY_FALLBACK,
+                  extra_rules: Optional[tuple] = None) -> dict:
+    """_rule_outcome (the nudged rule re-run on the revision), then the deterministic PR rules (`extra_rules`,
+    default NEW_CLAIM_RULES, minus the nudged rule) on the same revision and tool log. A revision that answers the
+    nudge but adds a stale PR claim ("merges right after PR #1806. That one is approved": agent-aece75acd4) is a
+    failed outcome: resolved=False, the claim's sentence as evidence, and new_claim={"rule", "evidence"}. No second
+    nudge and no model call: both rules are regex checks."""
+    res = _rule_outcome(rule, reply, user_ask, tool_log, llm, threshold=threshold, thresholds=thresholds, wake=wake,
+                        kanban_down=kanban_down, human_asks=human_asks, prev_turn=prev_turn, confirm=confirm,
+                        confirm_floor=confirm_floor, human_confirm_floor=human_confirm_floor,
+                        report_only_fallback=report_only_fallback)
+    fns = {"merge_forecast": merge_forecast, "pr_state_claim": pr_state_claim}
+    for r in (NEW_CLAIM_RULES if extra_rules is None else extra_rules):
+        if r == rule or r not in fns:
+            continue
+        try:
+            ev = fns[r](reply, tool_log)
+        except Exception:
+            ev = None
+        if ev:
+            res = dict(res)
+            res["new_claim"] = {"rule": r, "evidence": ev[:300]}
+            if res.get("resolved") is not False:
+                res.update(resolved=False, evidence=f"{r}: {ev[:280]}", p=1.0)
+                res.pop("unconfirmed", None)
+            break
+    return res
+
+
+def _rule_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
                   threshold: float = 0.8, thresholds: Optional[dict] = None,
                   wake: Optional[Callable[[], list]] = None, kanban_down: Optional[bool] = None,
                   human_asks: Optional[Callable[[], list]] = None, prev_turn: Optional[dict] = None,
@@ -3900,7 +4020,11 @@ def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
 
     def judge(system: str, prompt: str) -> str:
         seen["called"] = True
-        raw = llm(system, prompt)
+        try:
+            raw = llm(system, prompt)
+        except Exception as exc:  # coach-1b2ea7d9a7: a judge outage (quota out) is not a broken re-check
+            seen["judge_exc"] = exc
+            raise
         seen["v"] = parse_verdict(raw)
         return raw
 
@@ -3909,7 +4033,11 @@ def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
             seen["scored"] = event
 
     def second() -> Optional[tuple]:
-        seen["c2"] = confirm() if confirm is not None else None
+        try:
+            seen["c2"] = confirm() if confirm is not None else None
+        except Exception as exc:  # the second-opinion model call: same class as the screen judge
+            seen["judge_exc"] = exc
+            raise
         return seen["c2"]
     try:
         hit = check(reply, user_ask, tool_log, judge, threshold=threshold, only=[rule], thresholds=thresholds,
@@ -3917,8 +4045,8 @@ def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
                     confirm=second if confirm is not None else None, confirm_floor=confirm_floor,
                     human_confirm_floor=human_confirm_floor, report_only_fallback=report_only_fallback, audit=audit,
                     deny_quoted=True)
-    except Exception:
-        return {"p": None, "resolved": None, "evidence": "outcome check failed", "judged": seen["called"]}
+    except Exception as exc:
+        return outcome_error(exc, judge_error=exc is seen.get("judge_exc"), judged=seen["called"])
     sc = seen["scored"] or {}
     src = {}
     if rule == "report_only":

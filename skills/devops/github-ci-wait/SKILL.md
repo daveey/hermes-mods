@@ -27,6 +27,16 @@ and record both `created_at`→completed (wall, queue included) and `run_started
 N min" target is judged on wall time unless the card says otherwise; exec time alone never closes it. A
 `workflow_dispatch` on that branch joins the same group, so dispatching doesn't help.
 
+**Cancelling a run: only via `scripts/ci_run_cancel.py --run-id ID --gh-repo O/R --expect-attempt N --reason '...'`**
+(`--force` for force-cancel). It re-reads `status` and `run_attempt` in the same call and refuses (exit 3, printing
+the live attempt) unless the run is still active and on the attempt you diagnosed; exit 4 means requested but not
+yet `completed`. A queued run whose attempt went up since your read was re-queued by its owner: leave it. A
+superseded push run is attempt 1. push-guard refuses a bare `gh run cancel` / `gh api …/runs/<id>/(force-)cancel` on
+every host and names the script (a "status is queued" check stopped an owner's fresh attempt 3, costing it its queue
+place). Superseded gate latches: `scripts/ci_latch_sweep.py` (below). PRs merged in a window, by merge time and fully
+paged: `scripts/merged_since.py --repo O/R --since <UTC ISO>` (`gh pr list --state merged --limit N` lists the
+newest-*created* PRs and drops a long-lived PR that merged in the window).
+
 Telling the user when a PR merges: green CI is one step of several; list them all from a check made that turn
 (pr-blocker-check, "Telling the user when it merges").
 
@@ -188,8 +198,8 @@ A user-approved batch through ONE full suite: acceptance is the batch's evidence
   skipped X is still not a pass.
 - A cancelled run can stay `queued` indefinitely: an aggregator job with `if: always()` ("All required checks
   pass") still needs a runner, and on busy self-hosted runners it holds the PR's concurrency group, leaving the new
-  head's run `pending`. Read back `status`/`conclusion` after `gh run cancel` before reporting it done; if stuck,
-  `gh api -X POST repos/O/R/actions/runs/<id>/force-cancel`. When asked about one latched run, sweep the whole
+  head's run `pending`. Read back `status`/`conclusion` after a cancel before reporting it done (`ci_run_cancel.py`
+  does, exit 4 = not settled); if stuck, re-run it with `--force`. When asked about one latched run, sweep the whole
   queue with `scripts/ci_latch_sweep.py OWNER/REPO` (dry run, then `--apply`): it selects only superseded-head runs
   whose open jobs are all gate/report jobs still waiting for a runner (a gate already running is left to finish), re-reads each run before cancelling, and never touches re-runs
   (`run_attempt>1`), runs with no jobs listed, or current-head runs; it exits 1 on any failed read or cancel. A `main` group

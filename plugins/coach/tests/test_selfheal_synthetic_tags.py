@@ -129,6 +129,7 @@ NOT_NOTICES = {
     "redacted": "tailnet/runner.py: redaction placeholder in command output",
     "hermes": "coach/backend_timeouts.py: parses a '[hermes] ' log prefix",
     "slow-link": "coach/backend_timeouts.py: parses the Desktop's '[slow-link] ...' desktop.log lines",
+    "remote-down": "coach/backend_timeouts.py: parses the Desktop's '[remote-down] ...' desktop.log lines",
     "ssh": "coach/backend_timeouts.py: parses the Desktop's '[ssh] forwarding/teardown ...' desktop.log lines",
     "unparseable-query-dropped": "loop-watch/reqtrace.py: placeholder in a request trace",
     "selfheal-probe": "PROBE_RE: probes must reach the probe path (selfheal_skip why=probe), not be dropped",

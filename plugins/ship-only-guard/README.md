@@ -106,16 +106,64 @@ shas are tried) counts for the head H when all hold, read through gh only:
 every commit on H's first-parent line back to H0 (at most 3; parents from that
 compare, else `gh api repos/OWNER/REPO/git/commits/<sha>`) is a merge whose
 second parent is on `state` (`compare/<parent>...state` ahead or identical);
-(b) `git patch-id --stable` of the PR diffs `compare/state...H0` and
+(b) `git patch-id --verbatim` of the PR diffs `compare/state...H0` and
 `compare/state...H` (diff media type, each merge-base..sha) is the same single
-id; (c) no non-bot blocking verdict on any head (or a verdict with no readable
-time) came at or after that approval. Any failed or odd read refuses with the
+id (whitespace-sensitive: under `--stable` a merge that only re-indented a PR
+line or put a space inside a string literal kept its id and carried); (c) no
+non-bot blocking verdict on any head (or a verdict with no readable
+time) came at or after that approval; (d) each of those merges is a clean,
+unedited auto-merge: its tree (`gh api repos/OWNER/REPO/git/trees/<sha>?recursive=1`)
+is exactly the three-way merge of its first and second parent over their merge
+base (`compare/<first>...<second>`'s `merge_base_commit`). A path only one
+parent changed takes that parent's entry; a path both changed differently is
+merged locally by `git merge-file` on the three blobs (`git/blobs/<sha>`,
+checked against their ids; at most 8 such paths, 1 MiB each). Any conflict,
+add/add, modify/delete, symlink or submodule on both sides, truncated tree or
+other odd read refuses. This only lacks `git merge-tree`'s rename detection, so
+a rename on one side meeting an edit on the other refuses rather than carries.
+Any failed or odd read refuses with the
 reason; a blocking verdict on H itself is never overridden. Base drift is
 checked separately and still applies. Why: #1812, #1837 and #2438 were refused
 although `gh pr update-branch` left their patch-id unchanged. Missing/malformed/offline,
 main/other base, changed head, pending/failed/skipped/neutral checks, a possibly
 truncated rollup, unreadable reviews/comments, an unanswered review point and a
 missing exact-head approval fail closed. This is not a blanket non-main exemption.
+
+**Why a carry needs no confirm review on the new head.** A carry does not ask
+for an `Exact-head confirmation` review on H, by design (decided in
+t_01a1d6c53d57c331, option B). A confirm review of a clean update-branch head
+only re-checks that H is the approved patch on a newer base. The guard computes
+that mechanically from GitHub's own data:
+
+- (a) shows the head only merged `state` in. H0 is an ancestor of H. Every
+  first-parent commit after H0 is a merge whose second parent is on `state`.
+- (b) shows the PR's own diff against its base is the reviewed one, byte for
+  byte and whitespace included. An edit hidden in a merge commit (an "evil
+  merge") changes that diff, and so does a conflict resolution, which alters
+  the `-` lines or the context. Either one refuses.
+- (d) shows each merge is exactly the clean auto-merge of its parents, so
+  nothing the patch-id cannot see slipped in either: patch-id hashes hunks
+  without their line numbers, and a merge that moved an identical hunk,
+  context included, to another place in the same file kept the id. Its tree
+  differs from the clean merge, so it refuses.
+- (c) means no later objection is overridden.
+
+What a reviewer could add beyond identity is how the PR behaves on the new
+base. The guard already requires an all-success check rollup on the exact head
+H, and the base-drift check below covers state moving after that; confirm
+reviewers were never asked to redo that judgment. The guard cannot verify who
+wrote a review either, because every agent posts as the same account (gate
+boundary below). A confirm comment therefore adds only a hand-copied version of
+(b).
+
+Measured on the state repo, 250 merged PRs from 2026-11-12 07:47Z to
+2026-11-13 21:07Z: 35 (14%) landed on an update-branch merge head, and 29 of
+those heads have a review or verdict comment on them. None of the 29 found a
+changed patch. The only one with findings (#1210) was a full post-merge review
+that flagged untested behaviour, not identity. Pre-merge confirms arrived a
+median of about 10 minutes after the update, time in which `state` can move
+again. Before the carry existed, #1812, #1837 and #2438 were refused for lack of
+one.
 
 **Base drift under CI.** A `pull_request` run tests a merge ref built on some
 `state` commit, not the `state` tip at merge time. The PR's recorded
@@ -168,6 +216,44 @@ unchanged, above). A missing/malformed `baseRefOid`, a missing, empty or 100-ent
 not an ancestor of `state` fail closed. Why: #2491's CI tested base 3a55357793;
 #2487 (adc4b89b37) then changed `bb_tuner_feed.py` in the same directory, #2491
 was rebase-merged without a check on the combination and state went red.
+
+Skill prose is exempt: a skill markdown file (`home/skills/**.md`, `skills/**.md`)
+on the base side never overlaps a skill markdown file in the PR, the same file
+included. The suites lint those files one at a time, and a textual collision still
+fails GitHub's rebase merge. hermes-sync pushes live skill edits straight to
+`state`, and its `sync: <host>` commit 5fbd15ce4f was one of #2563's refusals.
+Skill prose next to code (`home/skills/x/scripts/*.py`) and markdown outside
+the skill trees still overlap.
+
+**Land turn (bounded landing).** On 2026-11-13 the hot areas (`hermes-sync`,
+`tests/`, workflows) took a commit about once per CI cycle. #2563 was green and
+approved 4 times and refused 4 times; each refusal cost an update-branch and
+another CI cycle. So the first drift refusal of a green, approved PR also records
+a turn: the ref `refs/land-turn/pr-<N>` points at a commit whose message is
+`land-turn pr=<N>` plus one JSON line `{"pr", "head", "expires", "files"}`.
+The expiry is 90 minutes out (`_TURN_TTL`). A later refusal does not extend a
+live turn. After a turn expires, its PR cannot take a new one for another
+`_TURN_TTL` (the cooldown), so a PR whose area keeps drifting through sync
+exports holds that area at most half the time. Readers delete turns that are
+past their cooldown or unparseable. They read at most `_TURN_MAX` turns, newest
+PR number first, within `_TURN_BUDGET` seconds.
+While the turn is live and its PR is open, the guard refuses any other state PR
+merge with a file that would drift the holder (`_overlap(holder_file, file)`,
+the same rules as above), and names the holder and the expiry. When the holder
+has merged or closed, the turn no longer counts: the guard deletes its ref the
+next time it reads it. State's `scripts/state-push-guard` pre-push applies the
+same check to direct pushes to `state`, except hermes-sync and skills-sync exports.
+The turn only adds refusals. If the turn listing can't be read, or the turn code raises, the guard fails
+open, because the drift compare above still guards correctness. Replayed against
+the real state history of 2026-11-13 (61 merged PRs plus #2563, start times every
+5 minutes), the share of PRs that land within 2 CI cycles rose:
+
+- with a 20-minute cycle, from 79.7% to 97.2%;
+- with a 60-minute cycle, from 52.5% to 96.2%.
+
+#2563 lands within 2 cycles at every start time. The PRs still left out edit
+a path that the hosts' live sync exports, for example `hosts/daveey-mini/sync.json`
+(#2483). The simulator is attached to card t_01a1d6b3538e8e43.
 
 **Gate boundary:** this guard checks that an exact-head approval record exists;
 it does not authenticate that its author was independent (every agent posts as

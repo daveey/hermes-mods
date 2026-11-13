@@ -561,6 +561,30 @@ def default_sink(path, logger=log) -> Callable[[dict], None]:
     return sink
 
 
+_WRITER = None
+
+
+def offloop_sink(sink, writer=None) -> Callable[[dict], None]:
+    """Production wrapper for a sink called from ``_finish`` on the event loop.
+
+    slow_request reports (log line + journal append under the host-wide lock) go to a writer thread
+    through a bounded queue, dropped when full; request_stats records keep the synchronous, error-raising
+    path because only the dedicated stats thread (and shutdown) writes them."""
+    global _WRITER
+    if writer is None:
+        if _WRITER is None:
+            _WRITER = journal.OffThreadWriter()
+        writer = _WRITER
+
+    def wrapped(rep: dict) -> None:
+        if rep.get("kind") == "slow_request":
+            writer.submit(sink, rep)
+            return
+        sink(rep)
+    wrapped._loop_watch_offloop = writer  # type: ignore[attr-defined]
+    return wrapped
+
+
 def _server_trace(app):
     """Follow conventional ASGI wrappers, including a closure's named app cell.
 
