@@ -780,6 +780,153 @@ def _hd_feeds_shell(prefix: str, rest: str) -> bool:
     return not all(_hd_data_reader(words(seg)) for seg in stages)
 
 
+# ssh options that give a heredoc no local effect: flags, and value options whose value is only read.
+_HD_SSH_FLAGS = frozenset("46AaCKkNnqTtvXxY")
+_HD_SSH_VALUE_OPTS = frozenset("ilop")
+_HD_SSH_CONFIG_KEYS = frozenset({
+    "addressfamily", "batchmode", "checkhostip", "compression", "connectionattempts", "connecttimeout",
+    "forwardagent", "hostkeyalias", "identitiesonly", "identityfile", "loglevel", "numberofpasswordprompts",
+    "passwordauthentication", "port", "preferredauthentications", "pubkeyauthentication", "requesttty",
+    "sendenv", "serveralivecountmax", "serveraliveinterval", "setenv", "stricthostkeychecking", "tcpkeepalive",
+    "user"})
+_HD_REMOTE_SHELLS = frozenset({"bash", "sh", "/bin/bash", "/bin/sh", "/usr/bin/bash", "/usr/bin/sh"})
+
+
+def _hd_fixed(tok: str):
+    """The word a non-posix shlex token `tok` always becomes, or None when quoting does not prove it: unquoted
+    characters bash never expands, splits or globs (a leading `~` is one word), '...' text, "..." without $ ` \\."""
+    out, i = [], 0
+    while i < len(tok):
+        c = tok[i]
+        if c in "'\"":
+            j = tok.find(c, i + 1)
+            if j < 0 or (c == '"' and any(ch in tok[i + 1:j] for ch in "$`\\")):
+                return None
+            out.append(tok[i + 1:j])
+            i = j + 1
+        elif re.match(r"[A-Za-z0-9_.,:=/@%+-]", c) or (c == "~" and i == 0):
+            out.append(c)
+            i += 1
+        else:
+            return None
+    return "".join(out) if tok else None
+
+
+def _hd_remote_shell(before: str, line_start: int, rest: str) -> bool:
+    """True only when a heredoc is the stdin of `ssh` running a shell that reads it on the remote host, so its text
+    never runs here: `ssh [opts] HOST ['bash -s' | 'bash -l -s' | sh -s | nothing] <<'EOS'`, optionally behind
+    `NAME=v`, `env NAME=v`, `timeout DUR`, `nice -n N` or `nohup`. `before` is the text up to the `<<` operator,
+    `line_start` the index in it where the operator's line starts, `rest` that line from the operator on.
+
+    The caller applies it to a quoted delimiter only: an unquoted body expands here first. Every word of the ssh
+    stage must pass the allowlist (options without a local file, socket, log or command; a fixed host or `$NAME`;
+    a remote stdin shell with -s/-l/-e/-x/-u flags), each later `|` stage on the line must read only data, and
+    nothing before it may remap `ssh` (a function, alias, `hash -p`, PATH). Anything else is False (the body keeps
+    its local reading). This is the one permissive exit."""
+    import shlex
+
+    prefix = before[line_start:]
+    if (re.search(r"(?<![\w./-])ssh\s*\(\s*\)|\bfunction\s+ssh\b|\balias\b[^\n;&|]*\bssh=|\bhash\b[^\n;&|]*\s-\w*p"
+                  r"|\bPATH\+?=", before)
+            or re.search(r"[<>]\(", prefix + rest) or before[line_start - 2:line_start] == "\\\n"):
+        return False
+    line = prefix + rest
+    seps = list(_HD_SEPARATOR.finditer(_hd_mask(line)))
+    lead = [m for m in seps if m.end() <= len(prefix)]
+    if lead and lead[-1].group() == ")":  # `A=$(x) ssh`: the stage began before that `)`
+        return False
+    start = lead[-1].end() if lead else 0
+    after = [m for m in seps if m.start() >= len(prefix)]
+    for k, m in enumerate(after):  # later pipeline stages read the remote output: data readers only
+        if m.group() not in ("|", "|&"):
+            break
+        try:
+            reader = shlex.split(line[m.end():after[k + 1].start() if k + 1 < len(after) else len(line)])
+        except ValueError:
+            return False
+        if not reader or not _hd_data_reader(reader):
+            return False
+    try:
+        lex = shlex.shlex(line[start:after[0].start() if after else len(line)], posix=False)
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        return False
+    words, i = [], 0
+    while i < len(toks):  # redirections (the heredoc operator, `2>&1`) are not ssh's words
+        m = _HD_REDIRECT.match(toks[i])
+        if m:
+            i += 2 if m.end() == len(toks[i]) else 1
+        else:
+            words.append(toks[i])
+            i += 1
+    fixed = [w if w is not None else "\0" for w in map(_hd_fixed, words)]  # "\0": not a fixed word
+
+    def at(n: int) -> str:
+        return fixed[n] if n < len(fixed) else "\0"
+
+    assignment, j = r"[A-Za-z_]\w*=[\w.,:/@%+=-]*", 0
+    while True:  # temporary assignments and wrapper programs
+        w = at(j)
+        if re.fullmatch(assignment, w):
+            j += 1
+        elif w == "env":
+            j += 1
+            while re.fullmatch(assignment, at(j)):
+                j += 1
+        elif w == "nohup":
+            j += 1
+        elif w == "nice":
+            j += 3 if at(j + 1) == "-n" and re.fullmatch(r"-?\d+", at(j + 2)) else 1
+        elif w == "timeout":
+            j += 1
+            while at(j).startswith("-"):
+                if at(j) in ("-k", "-s") and at(j + 1) != "\0":
+                    j += 2
+                elif re.fullmatch(r"--(?:kill-after|signal)=\S+|--foreground|--preserve-status|-v|--verbose", at(j)):
+                    j += 1
+                else:
+                    return False
+            if not re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", at(j)):
+                return False
+            j += 1
+        else:
+            break
+    if at(j) not in ("ssh", "/usr/bin/ssh"):
+        return False
+    j += 1
+    while at(j).startswith("-") and at(j) != "-":
+        opt = at(j)
+        j += 1
+        if opt == "--":
+            break
+        for k, c in enumerate(opt[1:], 1):
+            if c in _HD_SSH_FLAGS:
+                continue
+            if c not in _HD_SSH_VALUE_OPTS:
+                return False
+            value = opt[k + 1:]
+            if not value:
+                value, j = at(j), j + 1
+            if value == "\0" or (c == "o" and re.split(r"[=\s]", value.strip(), maxsplit=1)[0].lower()
+                                 not in _HD_SSH_CONFIG_KEYS):
+                return False
+            break
+    host = words[j] if j < len(words) else ""
+    if not (re.fullmatch(r"[\w.@%:+][\w.@%:+-]*", at(j))
+            or re.fullmatch(r"\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})|\"\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})\"", host)):
+        return False
+    remote = fixed[j + 1:]
+    if "\0" in remote:
+        return False
+    try:
+        argv = shlex.split(" ".join(remote))  # ssh joins its remote words with spaces; the remote shell splits
+    except ValueError:
+        return False
+    return not argv or (argv[0] in _HD_REMOTE_SHELLS and all(
+        re.fullmatch(r"-[slexu]+|--login|--noprofile|--norc", a) for a in argv[1:]))
+
+
 def _hd_subst_data(text: str, openers: tuple) -> bool:
     """True when every command substitution enclosing a heredoc (`openers`: the index of each enclosing `$(`,
     backtick, `<(` or `>(`, outermost first) hands its output to a data consumer (`_hd_data_reader` with
@@ -946,7 +1093,7 @@ def _hd_var_run_re(name: str):
     return _hd_exec_re(r"\$(?:" + re.escape(name) + r"(?!\w)|\{" + re.escape(name) + r"[}:\-+=?/%^,\[@])")
 
 
-def _split_heredocs(text: str, _level: int = 0) -> tuple:
+def _split_heredocs(text: str, _level: int = 0, remote_heredocs: bool = False) -> tuple:
     """(code, bodies) of shell `text`, by bash rules: the command text a shell parses, and the heredoc bodies.
 
     `code` is `text` without heredoc bodies, their terminator lines and `#` comments (a `#` that begins a word
@@ -961,6 +1108,8 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
     - each `$(...)`/backtick substitution of an unquoted-delimiter body runs before the command does: its command
       text is appended as its own line (`_hd_substitutions`).
     `bodies` lists every other body as (text, quoted delimiter), for a guard that scans data conservatively.
+    With `remote_heredocs` (a guard of this host's files only), a quoted-delimiter body that a shell reads on an ssh
+    host (`_hd_remote_shell`) is in neither: it never runs or is read here.
     Quotes that never close leave the rest of `text` as code, unchanged (see `_lexable`)."""
     if "<<" not in text and "#" not in text:
         return text, []
@@ -981,17 +1130,21 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
                     break
                 lines.append(line)
             body = "\n".join(lines)
-            if _hd_feeds_shell(text[line_start:op_start], text[op_start:nl]) or not _hd_subst_data(text, openers):
+            before, rest = text[:op_start], text[op_start:nl]
+            if remote_heredocs and quoted and _hd_subst_data(text, openers) \
+                    and _hd_remote_shell(before, line_start, rest):
+                runs = []  # read by a shell on the ssh host: neither local code nor a local data body
+            elif _hd_feeds_shell(text[line_start:op_start], rest) or not _hd_subst_data(text, openers):
                 runs = [body]
             else:
                 bodies.append((body, quoted))
                 runs = [] if quoted else _hd_substitutions(body)
-                written.extend((path, body, at) for path in _hd_written(text[line_start:op_start], text[op_start:nl]))
+                written.extend((path, body, at) for path in _hd_written(text[line_start:op_start], rest))
                 name = _hd_assigned(text, openers)
                 if name:
                     assigned.append((name, body, at))
             for run in runs:
-                sub_code, sub_bodies = _split_heredocs(run, _level + 1) if _level < 16 else (run, [])
+                sub_code, sub_bodies = _split_heredocs(run, _level + 1, remote_heredocs) if _level < 16 else (run, [])
                 out.append(sub_code + "\n")
                 bodies.extend(sub_bodies)
         pending.clear()
@@ -1126,7 +1279,7 @@ def _split_heredocs(text: str, _level: int = 0) -> tuple:
                 or re.compile(r"(?:^|[;&|(`])\s*" + p, re.M).search(code, at) or _hd_file_run_re(path).search(masked, at):
             ran.append(body)
     for body in ran:
-        sub_code, sub_bodies = _split_heredocs(body, _level + 1) if _level < 16 else (body, [])
+        sub_code, sub_bodies = _split_heredocs(body, _level + 1, remote_heredocs) if _level < 16 else (body, [])
         code += "\n" + sub_code + "\n"
         bodies.extend(sub_bodies)
     return code, bodies

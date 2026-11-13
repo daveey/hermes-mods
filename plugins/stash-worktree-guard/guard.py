@@ -903,6 +903,65 @@ class _Parser:
         return ("case", word.text, arms, self.parse_redirs())
 
 
+# Unquoted characters that bash never expands, splits or globs.
+_AWK_PLAIN_CHAR = re.compile(r"[A-Za-z0-9_.,:=/@%+-]")
+
+
+def _awk_fixed_word(raw: str) -> Optional[str]:
+    """The argv word ``raw`` always becomes, or None when quoting does not prove it: only unquoted
+    characters bash never expands, splits or globs, '...' text, and "..." text without $, ` or \\."""
+    out, i = [], 0
+    while i < len(raw):
+        c = raw[i]
+        if c in "'\"":
+            j = raw.find(c, i + 1)
+            if j < 0 or (c == '"' and any(ch in raw[i + 1:j] for ch in "$`\\")):
+                return None
+            out.append(raw[i + 1:j])
+            i = j + 1
+        elif _AWK_PLAIN_CHAR.fullmatch(c):
+            out.append(c)
+            i += 1
+        else:
+            return None
+    return "".join(out) if raw else None
+
+
+def _awk_program_inert(words: list) -> bool:
+    """True only when the awk argv ``words`` (command word first) runs one fixed program that has
+    no command primitive, so pipe input and operands are only data to it.
+
+    Every word up to and including the program must pass the allowlist first: options ``-F SEP``,
+    ``-FSEP``, ``-v NAME=VAL``, ``-vNAME=VAL`` and ``--``, each a fixed word (``_awk_fixed_word``).
+    Any other option (``-f``, ``-e``, ``-i``, ``-l``, ``-E``, ``-W``, ``--source`` ...) may load
+    program text from a file or stdin, and an unknown word may split into a program: both give the
+    conservative answer. Words after the program are operands (input files or NAME=VAL), which awk
+    never runs. The program is inert without ``system``, a pipe (``|``, ``|&``) or gawk's ``@``
+    (indirect calls, ``@include``, ``@load``). This is the one permissive exit."""
+    fixed = [_awk_fixed_word(w) for w in words[1:]]
+    program, k = None, 0
+    while k < len(fixed):
+        word = fixed[k]
+        if word is None:
+            break
+        if word == "--":
+            program = fixed[k + 1] if k + 1 < len(fixed) else None
+            break
+        if word in ("-F", "-v"):
+            value = fixed[k + 1] if k + 1 < len(fixed) else None
+            if value is None or (word == "-v" and not re.match(r"[A-Za-z_]\w*=", value)):
+                break
+            k += 2
+            continue
+        if (word.startswith("-F") and len(word) > 2) or re.match(r"-v[A-Za-z_]\w*=", word):
+            k += 1
+            continue
+        if not word.startswith("-"):
+            program = word
+        break
+    return program is not None and not re.search(r"system|\||@", program)
+
+
 def _literal(raw: str) -> str:
     """Quote removal without expansion (the shell word as written)."""
     try:
@@ -1978,7 +2037,10 @@ class _Analyzer:
         # Keep a conservative primitive gate (including pipes in strings/comments), then
         # inspect string literals plus restore evidence, never parse the awk program as sh.
         # Gawk also permits indirect calls (@fn(...)), including an indirect system().
-        awk_runs_commands = bool(re.search(r"\bsystem\s*\(|\||@", awk_text))
+        # A fixed inert program (allowlisted options, one quoted program word without a
+        # primitive) cannot run anything, so its input and operands are only data.
+        awk_runs_commands = (bool(re.search(r"\bsystem\s*\(|\||@", awk_text))
+                             and not _awk_program_inert(raw))
         if is_awk and awk_runs_commands:
             for match in re.finditer(r'"((?:\\.|[^"\\])*)"', awk_text):
                 self.shadow_string(match[1], st, depth)
