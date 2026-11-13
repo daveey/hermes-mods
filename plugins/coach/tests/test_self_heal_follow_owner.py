@@ -110,3 +110,76 @@ def test_adopting_a_fix_card_is_unchanged(store, monkeypatch):
     sh._adopt_signature_card(payload(ADOPTER), ADOPTER, store, NOW, sig_owner_fn=lambda sig: [dict(card)])
     st = sh.LaneState(store.root).get(ADOPTER)
     assert st["fix_card"] == "t_0000f1c5" and not st.get("follow_owner")
+
+
+# Clause pins (mutants that survived 663610d5's 700 self-heal tests, t_01a1d6503e0f9237).
+
+def test_investigation_owner_is_another_lane_whose_card_is_not_its_fix():
+    """Only ANOTHER lane's open investigation is followed: never the asking lane itself, and never a lane whose
+    card is also its fix_card (that card is a fix, adopted as one)."""
+    lanes = {ADOPTER: {"status": "stale", "card": INV, "fix_card": None},
+             OWNER: {"status": "approved", "card": "t_0000f1c5", "fix_card": "t_0000f1c5"}}
+    assert sh._investigation_owner(lanes, INV, ADOPTER) is None
+    assert sh._investigation_owner(lanes, "t_0000f1c5", ADOPTER) is None
+    assert sh._investigation_owner(lanes, INV, OWNER) == ADOPTER
+
+
+def test_owner_card_that_is_its_fix_card_is_adopted_as_the_fix(store, monkeypatch):
+    """The hub holds such lanes (card == fix_card, 10 on 11-13): that card is the fix, so the adopter verifies it."""
+    monkeypatch.setattr(sh, "budget", OPEN)
+    sh.LaneState(store.root).update(OWNER, status="approved", card=INV, fix_card=INV, component="agent")
+    adopt_by_signature(store)
+    st = sh.LaneState(store.root).get(ADOPTER)
+    assert st["fix_card"] == INV and not st.get("follow_owner") and not st.get("follow_card")
+
+
+@pytest.mark.parametrize("ended", ["stale", "reverted"])
+def test_owner_ended_with_a_dead_fix_card_makes_the_follower_stale(store, monkeypatch, ended):
+    """Contract: a follower takes only a live (approved) or landed (fixed) fix card. An owner that went stale or was
+    reverted keeps its fix_card on the lane, but that fix was abandoned or rolled back: following it would verify
+    nothing that holds. The follower goes stale instead, so the next occurrence refiles."""
+    monkeypatch.setattr(sh, "budget", OPEN)
+    owner_proposed(store)
+    adopt_by_signature(store)
+    sh.LaneState(store.root).update(OWNER, status=ended, fix_card="t_0000dead", closed_at=NOW + 30)
+    sh.reconcile(store, runner=Board(status={INV: "done", "t_0000dead": "done"}), now=NOW + 60)
+    st = sh.LaneState(store.root).get(ADOPTER)
+    assert st["status"] == "stale" and not st.get("fix_card") and not st.get("follow_owner")
+    assert not events(store, "selfheal_follow_owner_fix", ADOPTER)
+    assert not events(store, "selfheal_verify_filed", ADOPTER)
+
+
+def test_occurrence_on_a_waiting_follower_comments_on_the_followed_card(store, monkeypatch):
+    """A follower has no card of its own and no fix_card yet: the followed investigation holds the evidence."""
+    monkeypatch.setattr(sh, "budget", OPEN)
+    owner_proposed(store)
+    adopt_by_signature(store)
+    st = sh.LaneState(store.root).get(ADOPTER)
+    assert not st.get("card") and not st.get("fix_card") and st["follow_card"] == INV
+    board = Board()
+    r = sh._open_card_comment(payload(ADOPTER), st, store, runner=board)
+    assert r == {"action": "skip", "card": INV, "why": "occurrence added to the open card"}
+    assert [a[:4] for a in board.calls] == [["hermes", "kanban", "comment", INV]]
+
+
+def test_one_lane_failing_to_follow_does_not_stop_the_others(store, monkeypatch):
+    monkeypatch.setattr(sh, "budget", OPEN)
+    owner_proposed(store)
+    bad = "agent-00000000bad"
+    lane = sh.LaneState(store.root)
+    lane.update(bad, status="approved", fix_card=None, follow_owner=OWNER, follow_card=INV, component="agent")
+    adopt_by_signature(store)
+    lane.update(OWNER, status="approved", fix_card="t_0000f1c5")
+    real = sh._follow_owner_fix
+
+    def follow(lane, store, fp, st, lanes, now):
+        if fp == bad:
+            raise RuntimeError("corrupt lane")
+        return real(lane, store, fp, st, lanes, now)
+
+    monkeypatch.setattr(sh, "_follow_owner_fix", follow)
+    assert list(lane.read()).index(bad) < list(lane.read()).index(ADOPTER)  # the bad lane comes first
+    sh.reconcile(store, runner=Board(), now=NOW + 60)
+    assert lane.get(ADOPTER)["fix_card"] == "t_0000f1c5"
+    err = events(store, "selfheal_follow_owner_error", bad)
+    assert len(err) == 1 and err[0]["error"] == "corrupt lane"
