@@ -1710,11 +1710,52 @@ def _receipt_lines(card: dict[str, Any]) -> list[str]:
             + json.dumps(source, ensure_ascii=True, separators=(',', ':'))]
 
 
-def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: Optional[float] = None) -> str:
+# A receipt-less handoff is prose frozen at completion: "still open: David must approve X (t_...)". By the close-out
+# that card may be done, and relisting it as open was the self-heal agent-f82d813de9 incident. Every card id such a
+# handoff names is re-read for the prompt and printed with its live status next to the handoff.
+_HANDOFF_REF_RE = re.compile(r"\bt_[0-9a-f]{8,32}\b")
+MAX_HANDOFF_REFS = 8  # per card
+MAX_HANDOFF_REFS_TOTAL = 24  # per prompt (one bounded board read)
+
+
+def _card_handoff_refs(tid: str, card: Optional[dict[str, Any]], batch: set) -> list[str]:
+    if not card or "completion_receipt" in card:
+        return []
+    refs = [r for r in dict.fromkeys(_HANDOFF_REF_RE.findall(str(card.get("summary") or "")))
+            if r != tid.rsplit("/", 1)[-1] and r not in batch]
+    return refs[:MAX_HANDOFF_REFS]
+
+
+def handoff_refs(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> list[str]:
+    """Card ids that the batch's receipt-less handoffs name, outside the batch: what to re-read for the prompt."""
+    batch = set(row.get("batch") or []) | {str(t).rsplit("/", 1)[-1] for t in row.get("batch") or []}
+    out: list[str] = []
+    for tid in sorted(row.get("batch") or []):
+        out += _card_handoff_refs(tid, cards.get(tid), batch)
+    return list(dict.fromkeys(out))[:MAX_HANDOFF_REFS_TOTAL]
+
+
+def _live_ref_text(ref: str, card: Optional[dict[str, Any]]) -> str:
+    if card is None:
+        return f"{ref} [not found on any board this turn: unknown, not open]"
+    state = card.get("status") or "?"
+    if ask_of(card):
+        state = "blocked: needs the user"
+    elif state == "blocked":
+        state = f"blocked ({card.get('block_kind') or '?'})"
+    title = " ".join(str(card.get("title") or "").split())[:100]
+    result = " ".join(str(card.get("summary") or "").split())[:160]
+    return f"{ref} [{state}] {title}" + (f": {result}" if result and is_settled(card) else "")
+
+
+def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: Optional[float] = None,
+                    named: Optional[dict[str, dict[str, Any]]] = None) -> str:
+    """``named``: the cards :func:`handoff_refs` lists, read for this prompt (None = not read: no live lines)."""
     lines = [f"{TAG} Every kanban card this chat handed work to has settled. This turn is the close-out:"
              if row.get("batch") else
              f"{TAG} This chat no longer waits on the card(s) below. This turn is the close-out:"]
     receipt_budget = 32768
+    batch_ids = set(row.get("batch") or []) | {str(t).rsplit("/", 1)[-1] for t in row.get("batch") or []}
     for tid in sorted(row.get("batch") or []):
         c = cards.get(tid)
         if c is None:
@@ -1725,6 +1766,11 @@ def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: 
             state = f"blocked ({c.get('block_kind') or 'needs a human'})"
         handoff = " ".join(str(c.get("summary") or "").split())[:700] or "(no handoff)"
         lines.append(f"- {tid} [{state}] {c.get('title') or ''}{_ask_line(c, now)}\n  handoff: {handoff}")
+        refs = _card_handoff_refs(tid, c, batch_ids) if named is not None else []
+        if refs:
+            live = named or {}
+            lines.append("  cards this handoff names, live now (re-read this turn; the handoff text is as of its "
+                         "completion): " + "; ".join(_live_ref_text(r, live.get(r)) for r in refs))
         receipt_lines = _receipt_lines(c)
         cost = sum(len(line) for line in receipt_lines)
         if cost <= receipt_budget:
@@ -1756,7 +1802,11 @@ def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: 
         # Preserve legacy closeout behavior, without inferring artifact acceptance
         # or treating a handoff as permission to expand the approved scope.
         legacy_ids = [tid for tid in row.get("batch") or [] if "completion_receipt" not in (cards.get(tid) or {})]
-        lines.append("For legacy cards without receipts (" + ", ".join(legacy_ids) + "), check any claim you can cheaply verify. "
+        lines.append("For legacy cards without receipts (" + ", ".join(legacy_ids) + "), each handoff is as of its "
+                     "completion: an item it calls open or waiting on the user may have finished since. Where a "
+                     "'live now' line names that item's card, its status there wins; never relist as open or as an "
+                     "ask a card shown done, and re-read any other open item before you call it open. "
+                     "Check any claim you can cheaply verify. "
                      "Within existing authorization, for each fixable problem the handoffs leave open, "
                      "fix it now if it's small and reversible; otherwise create a linked card with acceptance "
                      "criteria and name it. List as still open only items that are the user's own call, or that "

@@ -1275,6 +1275,20 @@ def post_llm_call(session_id: str = "", platform: str = "", conversation_history
         logger.debug("chat-closeout post_llm_call failed", exc_info=True)
 
 
+def _named_cards(read: Callable[[list[str]], dict], row: dict, cards: dict) -> Optional[dict]:
+    """Live rows of the cards receipt-less handoffs name (``core.handoff_refs``), read now for the close-out prompt
+    (self-heal agent-f82d813de9). None when the read fails: the prompt then prints no live lines rather than
+    calling an unread card open or missing."""
+    refs = core.handoff_refs(row, cards)
+    if not refs:
+        return {}
+    try:
+        return dict(core.canonical_view(read(refs)))
+    except Exception:
+        logger.debug("chat-closeout: handoff-named card read failed", exc_info=True)
+        return None
+
+
 def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = None, **_: Any) -> Optional[dict]:
     """Conditional: only when this chat's whole batch has settled and no close-out turn has run for it (the live
     path: a kanban notice turn in an open chat). No tokens otherwise."""
@@ -1305,7 +1319,7 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
         if not key or row.get("closing") is not None:
             return None  # nothing new to report, or the waker already briefed this turn
         _state["observed"][session_id] = key
-        prompt = core.closeout_prompt(row, cards, now=time.time())
+        prompt = core.closeout_prompt(row, cards, now=time.time(), named=_named_cards(read_cards, row, cards))
         # the brief names each unlinked entry; this turn is its one mention
         ledger().write(session_id, closing=sorted(row["batch"]), unlinked=core.briefed(row.get("unlinked"), time.time()))
         return {"context": prompt}
@@ -1710,7 +1724,8 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
         # Mark the batch covered and the turn as a close-out BEFORE it starts: the turn's own end (or a card it
         # creates) must never read as a fresh settled batch.
         wakes = [t for t in row.get("wakes") or [] if 0 <= now - float(t) < 3600] + [now]
-        prompt = core.closeout_prompt(row, cards, now=now)  # names each unlinked entry: this turn is its mention
+        prompt = core.closeout_prompt(row, cards, now=now,  # names each unlinked entry: this turn is its mention
+                                      named=_named_cards(read, row, cards))
         led.write(sid, covered=set(row.get("covered") or []) | set(new_ids), closing=sorted(row["batch"]),
                   wakes=wakes, wake_count=int(row.get("wake_count") or 0) + 1,
                   unlinked=core.briefed(row.get("unlinked"), now))

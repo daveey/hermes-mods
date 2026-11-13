@@ -64,6 +64,15 @@ including legacy absence, all dispositions, malformed/oversized provenance and p
 bounds. `tests/test_remote_completion_receipt_closeout.py` exercises real remote
 projection through brief/wake delivery. Live Desktop delivery is not proved here.
 
+**Legacy handoffs name live cards.** A receipt-less handoff is prose frozen at completion
+("still open: David must approve X (t_...)"). Every card id such a handoff names outside
+the batch (`core.handoff_refs`, at most 8 per card / 24 per prompt) is re-read at prompt
+time on both close-out paths (`pre_llm_call` and the waker) and printed under the handoff
+as `cards this handoff names, live now`, with its current status (and result once settled).
+The legacy instruction says that status wins over the handoff, so a finished ask is not
+relisted as open (self-heal agent-f82d813de9). A failed read prints no live lines.
+`tests/test_handoff_live_refs.py`.
+
 ## Ownership and evidence
 
 New batches use local `board/task` keys and remote `gateway/profile/board/task` keys (the local gateway/profile is implicit in the ledger's runtime scope). Remote reads use core's origin-ledger projection, including released rows omitted from `session_tasks`, plus core's unsuperseded historical associations. There is no second ownership ledger or replica-only completion rule.
