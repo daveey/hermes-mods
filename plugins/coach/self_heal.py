@@ -4588,22 +4588,50 @@ def _this_gateway_names() -> set:
     return names
 
 
-def lane_kanban_argv(board: Optional[str]) -> tuple:
-    """`hermes kanban [--board <slug>]` for a lane's board, for a comment on (or a show of) its card.
-    -> (argv, None), or (None, why) when the card is on another gateway, whose board this host's CLI cannot reach.
-    A digest-sourced lane holds '<gateway>:<board>' (hermes-hub:default), which the CLI refuses as a slug (exit 2):
-    this host's own gateway uses the board part; another gateway's card is skipped with the reason logged, never
-    commented on locally (the local board does not hold it). Reads that can use the hub replica go via card_lookup."""
+def _show_task(argv: list, card: str, runner=None) -> tuple:
+    """`<argv> show <card> --json` -> (task dict | None, "found" | "no_such_task" | "unreadable")."""
+    try:
+        rc, out, err = _run(argv + ["show", card, "--json"], runner)
+    except Exception:  # health: allow BLE001 -- an unreadable board is reported, never inferred from
+        return None, "unreadable"
+    if rc != 0:
+        return None, ("no_such_task" if "no such task" in (err + out).lower() else "unreadable")
+    try:
+        task = json.loads(out).get("task")
+    except (ValueError, AttributeError):
+        return None, "unreadable"
+    return (task, "found") if isinstance(task, dict) else (None, "unreadable")
+
+
+def lane_owner(card: str, board: Optional[str], runner=None) -> dict:
+    """Where this host reads and writes a lane's owner card: the one helper for every `hermes kanban` call on a lane
+    card (owner text, inbox-step note, occurrence/incident comments, card_lookup's first read).
+    -> {"argv": `hermes kanban [--board <slug>]` | None, "task": the shown task | None, "shown": bool,
+        "how": the local show's outcome (found | no_such_task | unreadable) | None, "why": skip reason when no argv}.
+    A plain slug or no board is this host's own board: argv as given, nothing shown here (the caller shows or
+    writes). A digest-sourced lane holds '<gateway>:<board>' (hermes-hub:default, macbook:default): the CLI refuses
+    that as a slug (exit 2), and the gateway is the session's origin host, not where the card lives (11-13: 5 of 17
+    cards in the hub's macbook:/mini: lanes were on the hub board). So the board part is shown locally first; a card
+    found there is read and written locally. Not found: this host's own gateway still uses the local board (the write
+    reports its own failure); another gateway's card gets argv None and `why` (callers log it and skip; reads can
+    fall back to the hub replica via card_lookup). Card ids are global, so a local hit is the card."""
     base = ["hermes", "kanban"]
     if not board:
-        return base, None
+        return {"argv": base, "task": None, "shown": False, "how": None, "why": None}
     board = str(board)
     if ":" not in board:
-        return base + ["--board", board], None
+        return {"argv": base + ["--board", board], "task": None, "shown": False, "how": None, "why": None}
     gw, _, slug = board.partition(":")
-    if gw.lower() not in _this_gateway_names():
-        return None, f"card is on gateway {gw}, which this host's kanban CLI cannot reach"
-    return base + (["--board", slug] if slug else []), None
+    argv = base + (["--board", slug] if slug else [])
+    task, how = _show_task(argv, card, runner)
+    if task is not None:
+        return {"argv": argv, "task": task, "shown": True, "how": how, "why": None}
+    if gw.lower() in _this_gateway_names():
+        return {"argv": argv, "task": None, "shown": True, "how": how, "why": None}
+    where = f"this host's {slug or 'default'} board"
+    return {"argv": None, "task": None, "shown": True, "how": how,
+            "why": (f"card {card} is not on {where} ({how.replace('_', ' ')}) and its lane names gateway {gw}, "
+                    "which this host's kanban CLI cannot reach")}
 
 
 def _comment_skipped(event: str, d: dict, st: dict, card: str, why: str, store) -> None:
@@ -4616,10 +4644,11 @@ def _corruption_comment(d: dict, st: dict, store, runner=None) -> dict:
     card = card or st.get("fix_card") or st.get("card")
     if not card:
         return {"action": "skip", "why": "incident suppressed"}
-    argv, remote = lane_kanban_argv(st.get("board"))
+    own = lane_owner(card, st.get("board"), runner)
+    argv = own["argv"]
     if argv is None:
-        _comment_skipped("selfheal_incident_comment", d, st, card, remote, store)
-        return {"action": "skip", "card": card, "why": f"incident comment skipped: {remote}"}
+        _comment_skipped("selfheal_incident_comment", d, st, card, own["why"], store)
+        return {"action": "skip", "card": card, "why": f"incident comment skipped: {own['why']}"}
     body = (f"SQLite corruption occurrence ({d['incident']['db']}, host {d['incident']['host']}): "
             f"{d.get('symptom') or ''}\n{str(d.get('details') or '')[-1500:]}")
     rc, out, err = _run(argv + ["comment", card, body], runner)
@@ -4636,10 +4665,11 @@ def _open_card_comment(d: dict, st: dict, store, runner=None) -> dict:
     card = (st.get("card") if st.get("status") in ("filed", "proposed") else st.get("fix_card")) or st.get("card")
     if not card:
         return {"action": "skip", "why": "no open card"}
-    argv, remote = lane_kanban_argv(st.get("board"))
+    own = lane_owner(card, st.get("board"), runner)
+    argv = own["argv"]
     if argv is None:
-        _comment_skipped("selfheal_occurrence_comment", d, st, card, remote, store)
-        return {"action": "skip", "card": card, "why": f"occurrence comment skipped: {remote}"}
+        _comment_skipped("selfheal_occurrence_comment", d, st, card, own["why"], store)
+        return {"action": "skip", "card": card, "why": f"occurrence comment skipped: {own['why']}"}
     body = (f"Occurrence on {d.get('host') or '?'}: {d.get('symptom') or ''}\n"
             f"{str(d.get('details') or '')[-1500:]}")
     rc, out, err = _run(argv + ["comment", card, body], runner)
@@ -5659,11 +5689,21 @@ def card_lookup(card: str, board: Optional[str] = None, runner=None, home: Optio
     """Where a card is and what state it is in, with the authority behind the answer.
     -> {status, authority, board?, gateway?, why?, last_seen?}. status is the Kanban status, "missing" (every
     readable source agrees it is not there) or None (unknown: `why` says which source could not vouch).
-    `board` = the lane's board ('<gateway>:<board>' when a digest named another host's card); `gateway` = a known
+    `board` = the lane's board ('<gateway>:<board>' when a digest named another host's card: shown on this host's
+    board part first via lane_owner, since the label is the session's origin host; a local hit is the answer, a miss
+    reads that gateway's replica); `gateway` = a known
     remote owner; `since` = when the lane learned of the card (absence must be vouched for after it).
     Reads only: one `hermes kanban show`, mode=ro SQLite opens."""
     now = time.time() if now is None else now
     if board and ":" in str(board):  # digest_owner_cards' '<host>:<board>': not a slug this host's CLI accepts
+        if not gateway:  # the label is the session's origin host: the card may be on this host's own board
+            own = lane_owner(card, board, runner)
+            task = own["task"]
+            if task is not None:
+                if task.get("status"):
+                    return {"status": task["status"], "authority": "board",
+                            "board": str(board).partition(":")[2] or None}
+                return {"status": None, "authority": None, "why": "board read returned no task status"}
         gw, _, rboard = str(board).partition(":")
         gateway, board = gateway or gw, rboard or None
         remote_board = board
@@ -5848,16 +5888,13 @@ ADOPT_RECHECK_S = 3600  # an owner whose text could not be read is re-judged at 
 
 def _owner_card_text(card: str, board: Optional[str], runner=None) -> Optional[dict]:
     """The owner card's title/body/key/created/completed via `hermes kanban show --json`; None when unreadable or
-    when the board's answer carries no title (a reply that cannot be judged is not a refusal). A digest-sourced lane
-    holds '<gateway>:<board>' (hermes-hub:default), which the CLI refuses as a slug (exit 2): read the board part, as
-    card_lookup does. Card ids are global, so a card that is not on this host's board still reads as unreadable."""
-    board = (str(board).partition(":")[2] or None) if board and ":" in str(board) else board
-    argv = ["hermes", "kanban"] + (["--board", board] if board else []) + ["show", card, "--json"]
-    try:
-        rc, out, _ = _run(argv, runner)
-        task = json.loads(out).get("task") if rc == 0 else None
-    except Exception:  # health: allow BLE001 -- unreadable means unknown, judged on a later pass
+    when the board's answer carries no title (a reply that cannot be judged is not a refusal). The board is resolved
+    by lane_owner: a digest lane's '<gateway>:<board>' is shown on this host's board part first; another gateway's
+    card that is not there reads as unreadable (kept, re-judged later), never as a refusal."""
+    own = lane_owner(card, board, runner)
+    if own["argv"] is None:
         return None
+    task = own["task"] if own["shown"] else _show_task(own["argv"], card, runner)[0]
     if not isinstance(task, dict) or "title" not in task:
         return None
     return {"id": card, **{k: task.get(k) for k in ("title", "body", "idempotency_key", "status", "created_at",
@@ -5987,18 +6024,15 @@ def sweep_inbox_steps(store=None, runner=None) -> list:
         card = st.get("card") if status == "filed" else st.get("fix_card") if status == "approved" else None
         if not card or st.get("inbox_step_noted") == card:
             continue
-        argv, remote = lane_kanban_argv(st.get("board"))
+        own = lane_owner(card, st.get("board"), runner)
+        argv = own["argv"]
         if argv is None:
             if st.get("inbox_step_skipped") != card:  # logged once per card, not on every sync
                 lane.update(fp, inbox_step_skipped=card)
                 store.log({"event": "selfheal_inbox_step_noted", "fingerprint": fp, "card": card, "ok": None,
-                           "skipped": remote, "board": st.get("board")})
+                           "skipped": own["why"], "board": st.get("board")})
             continue
-        try:
-            rc, out, _ = _run(argv + ["show", card, "--json"], runner)
-            task = json.loads(out)["task"] if rc == 0 else None
-        except Exception:
-            task = None
+        task = own["task"] if own["shown"] else _show_task(argv, card, runner)[0]
         if not task or task.get("status") in ENDED or not OLD_INBOX_STEP.search(task.get("body") or ""):
             continue
         try:

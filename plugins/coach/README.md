@@ -1082,9 +1082,12 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
     done or archived files a fresh generation the same UTC day (also after `declined`/`reverted`). A `fixed` shape
     keeps the rollout hold (2 held, `selfheal_recurrence_held`, the 3rd files). A comment in the `proposed` window
     lands on the finished investigation card. Lane writes (this comment, the SQLite incident comment, the inbox-step
-    note) build `hermes kanban [--board]` with `lane_kanban_argv`: a digest lane's `<gateway>:<board>` uses the
-    board part when the gateway is this host (host name or Board gateway name), else the write is skipped and
-    logged `ok: null, skipped: <why>` (`tests/test_self_heal_lane_board_argv.py`). Nothing goes to the Inbox.
+    note) and the owner reads (`_owner_card_text`, `card_lookup`) resolve the card with one helper, `lane_owner`: a
+    digest lane's `<gateway>:<board>` names the session's origin host, not where the card lives, so the board part is
+    shown locally first and a local card is read and written locally; this host's own gateway (host name or Board
+    gateway name) always uses the local board; another gateway's card that is not here is skipped and logged
+    `ok: null, skipped: <why>` (`card_lookup` reads that gateway's replica instead)
+    (`tests/test_self_heal_lane_owner.py`). Nothing goes to the Inbox.
     `[selfheal-probe]` sessions (also on the
     first turn, from the turn's ask) log `selfheal_detect probe:true` + `selfheal_skip why=probe` and file nothing.
   - Tests: `tests/test_self_heal_guard_refusal.py` (core-backed cases skip without core).
