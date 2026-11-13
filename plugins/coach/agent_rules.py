@@ -93,6 +93,9 @@ HINTS = {
     "cleanup_sweeper": ("You scheduled a recurring cleanup ({what}). That hides a leak. Load five-whys, find the "
                         "producer that failed to clean up (read its session or card if there is no file), fix it "
                         "there and remove this job, unless your reply says why the producer can't be fixed."),
+    "metric_split": ("{where} reports {hits} with no split. Name the split and metric with every score (\"1.787 val "
+                     "BPB\", \"test acc 91.3%\"), reading it from the source table or README, so the next reader "
+                     "doesn't assume one and table a val score beside test baselines. {fix}"),
 }
 
 # plan_first: a new build ask (a build verb plus a real spec), not a fix/bug report and not already a go.
@@ -1440,6 +1443,50 @@ def cleanup_sweeper(tool: str, args: Any, result: Any = None, status: Optional[s
         if hit:
             return hit
     return None
+
+
+# ---- metric_split (agent-05bb25439d) --------------------------------------------------------------------------------
+# A handoff ("reaches 1.787±0.009 BPB") with no split let the reader assume test and table a val score beside test
+# baselines. A metric number (BPB, perplexity, accuracy, loss) whose clause names no split gets a hint, never a refusal.
+# a score is a decimal or a percentage ("0 rows", "3 seeds", "$2.572" are not)
+_MS_NUM = r"(?<![\w$€£.])(?:\d+\.\d+%?|\d+%)(?:\s*(?:±|\+/-|\+-)\s*\d+(?:\.\d+)?%?)?(?![\w.]*\d)"
+_MS_METRIC = r"(?:bpb|bits[- ]per[- ]byte|perplexity|ppl|accuracy|acc|loss)"
+METRIC_AFTER_RE = re.compile(rf"({_MS_NUM})\s*{_MS_METRIC}\b", re.I)
+METRIC_BEFORE_RE = re.compile(rf"\b{_MS_METRIC}\s*(?:=|:|of|is|at|\s)\s*({_MS_NUM})", re.I)
+METRIC_SPLIT_RE = re.compile(r"\b(?:val|valid|validation|dev|test|testing|train|training|held[- ]?out|eval)\b", re.I)
+# a clause ends at a sentence stop (not a decimal point), a semicolon, a newline or a table cell
+METRIC_CLAUSE_RE = re.compile(r"(?<!\d)\.(?!\d)|[;!?\n|]")
+METRIC_SPLIT_TOOLS = {"kanban_complete": ("summary", "result"), "kanban_comment": ("body",),
+                      "kanban_create": ("title", "body")}
+
+
+def bare_metrics(text: Any) -> list[str]:
+    """Metric numbers in `text` whose clause names no split (val/test/train...), as written ("1.787±0.009 BPB")."""
+    if not isinstance(text, str) or not text:
+        return []
+    out: list[str] = []
+    for clause in METRIC_CLAUSE_RE.split(text):
+        if METRIC_SPLIT_RE.search(clause):
+            continue
+        for rx in (METRIC_AFTER_RE, METRIC_BEFORE_RE):
+            for m in rx.finditer(clause):
+                shown = " ".join(m.group(0).split())
+                if shown not in out:
+                    out.append(shown)
+    return out
+
+
+def metric_split_texts(tool: str, args: Any) -> list[str]:
+    """The human-readable handoff text of a kanban_complete/comment/create call (direct or via tool_call)."""
+    calls = [((tool or "").rsplit("__", 1)[-1], args)]
+    if calls[0][0] == "tool_call" and isinstance(args, dict):
+        calls = [(str(c.get("name") or "").rsplit("__", 1)[-1], c.get("arguments"))
+                 for c in args.get("calls") or [] if isinstance(c, dict)]
+    out = []
+    for name, a in calls:
+        if isinstance(a, dict):
+            out += [a[k] for k in METRIC_SPLIT_TOOLS.get(name, ()) if isinstance(a.get(k), str)]
+    return out
 
 
 # ---- hub_ssh_heavy (agent-24dac018a6) --------------------------------------------------------------------------------
@@ -3596,6 +3643,10 @@ class AgentCoach:
         if isinstance(reply, str) and reply.strip():
             s["replied"] = True
             s["plan_due"] = False
+            hits = bare_metrics(reply)
+            if hits:  # metric_split on the final reply: delivered with the next turn's context
+                self._fire_metric_split(sid, "Your last reply", hits,
+                                        "If the user saw it, correct it in your next message.")
         s["loop"]["last_reply"] = reply[-4000:]
         s["loop"]["last_log"] = list(s["turn_log"])[-25:]
         # the reply check of a no-tool follow-up turn reads these (prev_turn; self-heal agent-1f34642d7f)
@@ -3733,6 +3784,33 @@ class AgentCoach:
         if hit:
             self._fire(s, sid, "cleanup_sweeper", "session", what=hit.replace("{", "(").replace("}", ")"))
 
+    def check_metric_split(self, sid: str, tool: str, args: Any) -> None:
+        """metric_split rule (once per number per session): a kanban_complete/comment/create text with a metric score
+        and no val/test split. Also run from transform_tool_result so the hint lands on the handoff call itself."""
+        if not sid:
+            return
+        hits = [h for t in metric_split_texts(tool, args) for h in bare_metrics(t)]
+        if not hits:
+            return
+        names = [(tool or "").rsplit("__", 1)[-1]]
+        if names[0] == "tool_call" and isinstance(args, dict):
+            names = [str(c.get("name") or "") for c in args.get("calls") or [] if isinstance(c, dict)]
+        closed = any(n.endswith("kanban_complete") for n in names)
+        self._fire_metric_split(sid, "This handoff", hits,
+                                "The card is closed: post a kanban_comment with the labelled numbers." if closed
+                                else "Post a corrected comment or edit before the next step.")
+
+    def _fire_metric_split(self, sid: str, where: str, hits: list, fix: str) -> None:
+        """One hint per new bare number: numbers already hinted this session stay quiet."""
+        s = self._s(sid)
+        new = [h for h in dict.fromkeys(hits) if f"metric_split:{h}" not in s["fired"]]
+        if not new:
+            return
+        for h in new[1:]:
+            s["fired"].add(f"metric_split:{h}")
+        shown = ", ".join(f"\"{h}\"" for h in new[:4]).replace("{", "(").replace("}", ")")
+        self._fire(s, sid, "metric_split", new[0], where=where, hits=shown, fix=fix)
+
     def check_plan_first(self, sid: str, tool: str, args: Any) -> None:
         """plan_first rule for one call (also run from transform_tool_result, so the hint lands on this call)."""
         if not sid:
@@ -3829,6 +3907,7 @@ class AgentCoach:
         self.check_widget_send(sid, tool, args)
         self.check_empty_wait(sid, tool, args, result)
         self.check_cleanup_sweeper(sid, tool, args, result, status)
+        self.check_metric_split(sid, tool, args)
         # plan_first (once per session). A clarify the user answered showed them the plan: that counts as a reply.
         if tool == "clarify":
             d = _as_dict(result) or {}
