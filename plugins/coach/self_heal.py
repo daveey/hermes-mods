@@ -2382,7 +2382,20 @@ class LaneState:
     def get(self, fp: str) -> dict:
         return dict(self.read().get(fp) or {})
 
-    def update(self, fp: str, **kw) -> dict:
+    @contextlib.contextmanager
+    def _locked(self):
+        """Serialize read-modify-write of the lane file across processes (lane cron, signals cron, every card's
+        `event ...` CLI): an unlocked rewrite of the whole file drops a concurrent writer's change."""
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.with_suffix(".lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def _apply(self, fp: str, kw: dict) -> dict:
         d = self.read()
         e = d.get(fp) or {}
         hist = e.get("history") or []
@@ -2390,11 +2403,24 @@ class LaneState:
             hist = (hist + [[round(time.time()), kw["status"]]])[-30:]
         e.update(kw, history=hist)
         d[fp] = e
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(d, indent=1))
         os.replace(tmp, self.path)
         return e
+
+    def update(self, fp: str, **kw) -> dict:
+        with self._locked():
+            return self._apply(fp, kw)
+
+    def transition(self, fp: str, expect: dict, **kw) -> Optional[dict]:
+        """update() only while the entry still holds every `expect` field; None (nothing written) otherwise.
+        For a writer that decided from an earlier read: reconcile walks a snapshot for minutes, and a receipt
+        (`event fixed` / `not_defect`) recorded meanwhile must not be overwritten by its `stale`."""
+        with self._locked():
+            cur = self.read().get(fp) or {}
+            if any(cur.get(k) != v for k, v in expect.items()):
+                return None
+            return self._apply(fp, kw)
 
 
 def _utc_day(ts: float) -> str:
@@ -5624,6 +5650,9 @@ def _reconcile_fp(lane, store, fp: str, st: dict, runner, now: float, via: str =
         ks = card_status(card, st.get("board"), runner)
     if ks not in ENDED:
         return None
+    # What this decision was read from: the write below applies only while the lane still holds it.
+    held = {"status": status, "card": st.get("card"), "fix_card": st.get("fix_card"),
+            "verify_card": st.get("verify_card"), "gen": st.get("gen")}
     proposal = Path(store.root) / "selfheal" / fp / "proposal.md"
     try:
         p_mtime = proposal.stat().st_mtime if status == "filed" and ks == "done" else 0.0
@@ -5633,11 +5662,16 @@ def _reconcile_fp(lane, store, fp: str, st: dict, runner, now: float, via: str =
         # The investigation finished and wrote this generation's proposal, but its `event proposed` never reached
         # this lane (plugin-129c2f2518: an exported scratch HERMES_HOME sent it to a temp lane that reported
         # success). The proposal is the evidence: record it as proposed so sync() files the fix card.
-        lane.update(fp, status="proposed", proposed_at=p_mtime)
+        if not lane.transition(fp, held, status="proposed", proposed_at=p_mtime):
+            return None
         store.log({"event": "selfheal_proposed", "fingerprint": fp, "card": card, "via": "reconcile",
                    "note": f"card {ks} without reporting; proposal.md found", "component": st.get("component")})
         return f"proposed (card {card} {ks}, proposal.md found)"
-    lane.update(fp, status="stale", closed_at=now)
+    if not lane.transition(fp, held, status="stale", closed_at=now):
+        # The lane moved while this pass looked the card up (a receipt, a re-approval): that newer state stands.
+        store.log({"event": "selfheal_stale_skipped", "fingerprint": fp, "card": card, "was": status, "kanban": ks,
+                   "now": lane.get(fp).get("status")})
+        return None
     store.log({"event": "selfheal_stale", "fingerprint": fp, "card": card, "was": status, "kanban": ks,
                "component": st.get("component"), **({"via": via} if via else {})})
     return f"stale ({status}, card {card} {ks})"

@@ -1205,6 +1205,9 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
 - **Where it decides.** On the hub (`coach/selfheal-config.json`: `hub_host`, `hub_ssh`, `board`, `bb_board`; no hub
   configured = this host) it decides locally; on any other host, live mode pipes `d` to `self_heal.py file --mode live`
   on the hub over ssh, so dedupe, recurrence, suppression and budget live in one place (`coach/selfheal_lane.json`).
+  Every lane write takes `coach/selfheal_lane.lock`, and reconcile's `stale`/`proposed` writes are compare-and-set
+  against the state the pass read: a receipt (`event fixed`/`not_defect`) recorded while the pass looked cards up
+  stands (`selfheal_stale_skipped`), it is not overwritten by `stale`.
 - **Shadow** (`COACH_SELFHEAL=shadow`, else `mode` in `coach/selfheal-config.json`, default shadow) logs `selfheal_would_file` with the full card args and creates
   nothing. **Live** creates the investigation card.
 - **Complaint turns:** filing stores `complaint_at` (explicit turn timestamp, else detector `at`) and a short

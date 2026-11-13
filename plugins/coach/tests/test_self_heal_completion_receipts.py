@@ -129,3 +129,55 @@ def test_fix_deferred_once_per_utc_day_fingerprint_reason(store):
     assert not board.creates()
     assert sh.LaneState(store.root).get(FP)["status"] == "proposed"
     assert sh.file_fix(FP, store=store, runner=board, now=midnight + 2, budget_fn=OPEN)["action"] == "filed"
+
+
+class _ReceiptDuringLookup:
+    """Board whose `show` of the verify card is when the verifier's receipt lands (the production race: reconcile
+    iterates a lane snapshot read at pass start, and card lookups for ~1,000 lanes take minutes)."""
+
+    def __init__(self, board, store, kind, at):
+        self.board, self.store, self.kind, self.at, self.done = board, store, kind, at, False
+
+    def __call__(self, argv, **kw):
+        if "show" in argv and "t_verify01" in argv and not self.done:
+            self.done = True
+            sh.record_event(self.kind, FP, card="t_abcdef01", note="abcdef1234", store=self.store, now=self.at)
+        return self.board(argv, **kw)
+
+
+@pytest.mark.parametrize("kind", ["fixed", "not_defect"])
+def test_receipt_recorded_during_a_reconcile_pass_is_not_overwritten_by_stale(store, monkeypatch, kind):
+    monkeypatch.setattr(sh, "budget", OPEN)
+    lane = sh.LaneState(store.root)
+    lane.update(FP, status="approved", fix_card="t_abcdef01", verify_card="t_verify01")
+    board = _ReceiptDuringLookup(Board(status={"t_abcdef01": "done", "t_verify01": "done"}), store, kind, NOW + 5)
+    sh.reconcile(store, runner=board, now=NOW)
+    assert board.done
+    assert lane.get(FP)["status"] == kind
+    assert not events(store, "selfheal_stale")
+
+
+def test_done_verifier_without_any_receipt_still_goes_stale(store, monkeypatch):
+    monkeypatch.setattr(sh, "budget", OPEN)
+    lane = sh.LaneState(store.root)
+    lane.update(FP, status="approved", fix_card="t_abcdef01", verify_card="t_verify01")
+    sh.reconcile(store, runner=Board(status={"t_abcdef01": "done", "t_verify01": "done"}), now=NOW)
+    assert lane.get(FP)["status"] == "stale"
+
+
+def test_lane_transition_is_compare_and_set(store):
+    lane = sh.LaneState(store.root)
+    lane.update(FP, status="fixed", fixed_at=NOW)
+    assert lane.transition(FP, {"status": "approved"}, status="stale", closed_at=NOW) is None
+    assert lane.get(FP)["status"] == "fixed" and "closed_at" not in lane.get(FP)
+    assert lane.transition(FP, {"status": "fixed"}, status="reverted")["status"] == "reverted"
+
+
+def test_concurrent_lane_writers_do_not_drop_each_others_updates(store):
+    code = ("import sys; sys.path.insert(0, sys.argv[1]); import self_heal as sh; from pathlib import Path\n"
+            "lane = sh.LaneState(Path(sys.argv[2]))\n"
+            "for i in range(25): lane.update(f'fp-{sys.argv[3]}-{i}', status='filed')\n")
+    procs = [subprocess.Popen([sys.executable, "-c", code, str(Path(sh.__file__).parent), str(store.root), str(n)])
+             for n in range(6)]
+    assert [p.wait(timeout=120) for p in procs] == [0] * 6
+    assert sum(k.startswith('fp-') for k in sh.LaneState(store.root).read()) == 150
