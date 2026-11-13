@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -97,6 +98,40 @@ def _split_response(raw: bytes):
     return int(m.group(1)), headers, body
 
 
+KILL_GRACE = 1.0   # seconds a timed-out gh group gets after SIGTERM, then after SIGKILL, before the hook moves on
+
+
+def _signal_group(proc, sig) -> None:
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+    except OSError:
+        try:
+            proc.send_signal(sig)
+        except OSError:
+            pass
+
+
+def _stop_group(proc) -> None:
+    """Stop a timed-out gh and everything it started, bounded: SIGTERM the group (a quota supervisor stops its own
+    child group), then SIGKILL it. A descendant that left the group and still holds the pipes must not keep the hook
+    past its deadline, so after the second grace the pipes are closed and the process is not waited on further."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        _signal_group(proc, sig)
+        try:
+            proc.communicate(timeout=KILL_GRACE)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    for pipe in (proc.stdout, proc.stderr):
+        try:
+            if pipe:
+                pipe.close()
+        except OSError:
+            pass
+
+
 def gh_fetch(url: str, token: str, timeout: float):
     """Metered transport: one ``gh api --include`` GET per request. (decoded JSON, next-page URL or None).
 
@@ -111,19 +146,15 @@ def gh_fetch(url: str, token: str, timeout: float):
     cmd = [gh, "api", "--include", "-H", "Accept: application/vnd.github+json",
            "-H", "X-GitHub-Api-Version: 2022-11-28", path]
     try:
+        # Own session: on timeout the whole gh chain (broker -> quota supervisor -> gh) is signalled as one group.
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                env=env)
+                                env=env, start_new_session=True)
     except OSError as exc:
         raise Unknown(f"gh could not start ({type(exc).__name__})") from None
     try:
         out, _err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.terminate()   # SIGTERM lets a quota supervisor stop its own child group
-        try:
-            proc.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
+        _stop_group(proc)
         raise Unknown("GitHub lookup failed (timeout)") from None
     status, headers, body = _split_response(out)
     where = path.split("?")[0]
