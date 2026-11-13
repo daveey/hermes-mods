@@ -1543,6 +1543,29 @@ desktop.log slice: `saturated_conns == []`, one 61 s episode with reason `read E
 filed; bursts with no gate line, after the gate reopened, or under another conn's gate stay saturation; episode
 edges; gate-line parsing; the fail-fast line's quoted age).
 
+Backend stall (2026-11-13 12:03-12:13 PST: a blocking `py-spy record` stopped the hub's always-on serve for 17 min,
+and the detector filed "link saturation on conn=hermes-hub" for 265 timeouts while /api/health took 0.12-0.33 s
+through the tunnels and Send-Q was about 0). A fourth kind, judged after client_stall. `backend_stall`: a
+`[ssh] teardown conn:<c>`, then an `ssh dial +N ms` for that conn with N < 5000, then (each line within 120 s of the
+last) `always-on dashboard unavailable (pid P not answering on port X)` (it names no conn: it goes to the conn of the
+latest dial) or `[remote-down] conn:<c>::... trial exceeded`. A saturated link would slow the re-dial too; a fast
+re-dial with the backend still silent on the fresh tunnel means the far-end process is stopped or its loop blocked. An
+episode with a `marked down (<reason>)` naming a closed or refused connection (ECONNRESET, ECONNREFUSED, EPIPE,
+`socket hang up`, `connect failed`) within 120 s of its teardown is a restart, reported as backend_down only (the
+12:31 PST mini restart logs the same re-dial lines). Timeouts on the conn within +/-60 s of an episode's lines are
+backend_stall; a conn whose shared-burst timeouts (all of its timeouts when it has no bursts) are more than half
+backend_stall is in `backend_stall.conns` and never in `saturated_conns`. The report's `backend_stall` has `count`,
+`by_conn`, `conns`, `burst_share` and `episodes` (conn, teardown, dials with ms, confirms with kind and pid/port). Such
+a conn, when significant (>= 20% of the awake count or >= the threshold), gets ONE card, key
+`backend-timeouts:<host>:backend-stall:<conn>`, titled "Desktop hung backend on conn=<conn>: ...". It asks for the
+backend host's `event loop stalled` / `loop-watch: event loop stalled` lines in `~/.hermes/logs/agent.log*`,
+`sudo journalctl` `COMMAND=.*py-spy` or other ptrace/observer commands, and the loop-watch.jsonl `loop_stacks` for the
+pid, not byte attribution. Its leftover timeouts (outside the +/-60 s) are the same hang: they make no path card, and
+the generic incident card is filed only when the rest is over the threshold without them. Tests:
+`tests/test_backend_timeout_backend_stall.py` (the real 12:00-12:20 PST desktop.log slice: `saturated_conns == []`,
+242 backend_stall in two episodes, one hung-backend card reused then :2; a slow re-dial, a re-dial that answers, a
+`read ECONNRESET` restart, another conn's hang and a minority hang stay what they were; line parsing).
+
 #### Timestamp contract and rollout
 
 Production scans use UTC instants and read the producer's immutable numeric offset:
