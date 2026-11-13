@@ -926,9 +926,14 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             raw = rc.aux_confirm(rc.confirm_system(), rc.confirm_prompt(ask, coach.turn_rich(session_id), reply,
                                                                         prev_turn=prev, board=board))
             res = rc.parse_confirm(raw)
+            later = rc.closeout_later_lines(ask) if hasattr(rc, "closeout_later_lines") else []
             store.log({"event": "report_only_confirm", "session_id": session_id, "ok": res is not None,
                        "p": res[0] if res else None, "evidence": res[1] if res else "", **tag,
                        **({"board": [b.strip()[:200] for b in board]} if board else {}),
+                       # agent-93112d1e96: the judge saw the close-out's post-handoff card comments; a low verdict
+                       # on such a turn is recorded as resting on that board re-read.
+                       **({"closeout_later": len(later)} if later else {}),
+                       **({"decision_src": "closeout"} if later and res and res[0] < 0.5 else {}),
                        **((ref() if callable(ref) else ref) or {})})
             return res
         return confirm
