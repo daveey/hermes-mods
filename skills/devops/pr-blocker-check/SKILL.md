@@ -28,7 +28,7 @@ Run the checker once per wake; schedule the next look with `kanban_continue(resu
 | review_required / changes_requested | request or await a real review; address comments |
 | blocked_unknown | diagnose (rulesets, required checks, queue); do not guess or ask |
 | closed_unknown | CLOSED, mergedAt null, and the base-branch commit lookup failed: retry it, never read it as closed |
-| ready | attempt the normal merge (never `--admin`, never self-approve, never add bypass labels) |
+| ready | attempt the normal merge (never `--admin`, never self-approve, never add bypass labels). A state-branch merge must run as the bare command with nothing after it: `gh pr merge N -R O/R --rebase --match-head-commit <FULL_SHA>`. ship-only-guard reads a trailing `2>&1` or `; next-cmd` as an extra arg and returns its generic "Land only through hermes-core-wt ship" deny. |
 
 Graphite merge queue (e.g. softmax-universe/softmax) pushes a squash `… (#N)` to the base branch and closes the PR: state CLOSED, mergedAt null. The checker reports merged with the landed sha; by hand, look for the `(#N)` commit on the base branch near closedAt.
 
