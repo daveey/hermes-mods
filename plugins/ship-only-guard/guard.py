@@ -282,15 +282,28 @@ def _approval_refusal(number, data):
             "changes, then rerun the same merge command. A review of an earlier head does not count.")
 
 
-# Base drift under the PR's CI (t_01a1d6201140c966). `pull_request` runs test the merge ref against the PR's
-# recorded baseRefOid; a state commit landing on the same paths after that is never tested with the PR. #2491
-# (CI on base 3a55357793) was rebase-merged onto 5f0478a3dc, which carried #2487's adc4b89b37 changing
+# Base drift under the PR's CI (t_01a1d6201140c966). The PR's recorded baseRefOid is at or before the base its
+# `pull_request` CI merge ref was built on: live #2507's checkout was "Merge 3ac709e8e8 into f5f7030b43" while
+# its baseRefOid c67ac3f18d sat 15 commits behind, and #2491 shows GitHub does not refresh it on a later
+# mergeability recompute. So baseRefOid...state is a superset of the untested window (it can over-refuse, never
+# miss). A retarget without a CI rerun could make baseRefOid newer than the tested base (fail open): never
+# retarget during landing. A state commit landing on the PR's paths inside that window is never tested with the
+# PR. #2491 (CI on base 3a55357793) was rebase-merged onto 5f0478a3dc, which carried #2487's adc4b89b37 changing
 # hosts/mini-1/bb-tuner/bb_tuner_feed.py, and state went red at 21c2ccf5a8.
 _COMPARE_COMMITS_CAP = 250   # GitHub's compare lists at most 250 commits per page
 _COMPARE_FILES_CAP = 300     # ... and at most 300 files
 _PR_FILES_CAP = 100          # gh pr view --json files reads one page of 100
+_ATTRIBUTE_HITS = 3          # per-hit culprit lookups (one bounded gh api call each) on a refusal
 _WORKFLOWS = ".github/workflows/"
 _CHURN_SUBJECT = re.compile(r"^(?:sync: |Merge |skills: edits from )")
+# CI harness files at the root or in a flat top-level dir (state: tests/run_ci.py, tests/requirements-ci*.txt)
+# change how every test runs, so like workflows they hold any PR (t_01a1d62f8c197f3d).
+_GLOBAL_FILE = re.compile(r"(?:[^/]+/)?(?:requirements[^/]*|run_ci\.py)")
+_TEST_MODULE = re.compile(r"test_(.+)\.py")
+_CODE_SUFFIXES = {"", ".py", ".sh", ".js", ".mjs", ".cjs", ".ts", ".swift"}
+# Stems too generic to tie a test module to one code file.
+_GENERIC_STEMS = {"__init__", "__main__", "main", "conftest", "setup", "util", "utils", "common", "helpers",
+                  "config", "test", "tests"}
 
 
 def _path_area(path):
@@ -300,12 +313,66 @@ def _path_area(path):
     return "/".join(parts[:-1][:3]) if len(parts) > 2 else "/".join(parts)
 
 
+def _flat_shared(path):
+    """A non-test file directly in a top-level dir (tests/sync_test_support.py, tests/__init__.py,
+    tests/placement_support.py): shared support for that dir's modules. Markdown is prose, never support."""
+    parts = path.split("/")
+    return len(parts) == 2 and not parts[1].startswith("test_") and not parts[1].endswith(".md")
+
+
+def _norm(name):
+    return name.replace("-", "_").lower()
+
+
+def _test_key(path):
+    """`<stem>` of a `test_<stem>[_suffix].py` module anywhere (tests/test_bb_tuner_feed.py -> bb_tuner_feed)."""
+    m = _TEST_MODULE.fullmatch(path.rsplit("/", 1)[-1])
+    return _norm(m[1]) if m else ""
+
+
+def _code_stem(path):
+    """Normalized basename stem of a code file (home/scripts/hub-read.py, home/bin/hermes-core-wt), or ''."""
+    name = path.rsplit("/", 1)[-1]
+    if name.startswith("."):
+        return ""
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    elif not stem or ("." + ext) not in _CODE_SUFFIXES:
+        return ""
+    stem = _norm(stem)
+    return "" if len(stem) < 4 or stem in _GENERIC_STEMS else stem
+
+
+def _coupled(key, stem):
+    """A test key and a code stem name the same module: equal, or one extends the other by `_<suffix>`
+    (test_hub_read_examples.py ~ hub-read.py; test_foo.py ~ foo_cli.py)."""
+    return bool(key and stem) and (key == stem or key.startswith(stem + "_") or stem.startswith(key + "_"))
+
+
+def _overlap(pr, base):
+    """Why the base-delta file `base` can change what the PR file `pr` was tested against, or ''."""
+    if base.startswith(_WORKFLOWS) or _GLOBAL_FILE.fullmatch(base):
+        return "ci"
+    if _path_area(pr) == _path_area(base):
+        return "area"
+    if (pr.count("/") == base.count("/") == 1 and pr.split("/")[0] == base.split("/")[0]
+            and (_flat_shared(pr) or _flat_shared(base))):
+        return "shared"
+    if _coupled(_test_key(pr), _code_stem(base)) or _coupled(_test_key(base), _code_stem(pr)):
+        return "test-code"
+    return ""
+
+
 def _base_drift_refusal(number, repo, data, cwd, env):
     """Refusal text when state moved, since the base the PR's CI tested, on the PR's own areas; else None.
 
-    Overlap: a base-delta file and a PR file in the same top-3-segment directory, or any base-delta file
-    under .github/workflows/. Churn elsewhere (hermes-sync `sync:` commits under other hosts/<host>/ or
-    home/skills/...) never refuses. An unreadable, truncated or non-linear compare fails closed."""
+    Overlap (`_overlap`): a base-delta file and a PR file in the same top-3-segment directory; any base-delta
+    .github/workflows/ file or root/flat-dir requirements*/run_ci.py; a non-test, non-markdown file directly in
+    a top-level dir (tests/sync_test_support.py) on either side with any file directly in that dir on the other;
+    or a test_<stem>*.py module on one side and a code file whose stem matches it on the other (tests/test_foo.py
+    ~ home/scripts/foo.py, either direction). Churn elsewhere (hermes-sync `sync:` commits under other
+    hosts/<host>/ or home/skills/...) never refuses. An unreadable, truncated or non-linear compare fails closed."""
     head = str(data.get("headRefOid") or "")
     base = data.get("baseRefOid")
 
@@ -345,19 +412,26 @@ def _base_drift_refusal(number, repo, data, cwd, env):
         return closed("the compare lists a file or commit without a name")
     if not total:
         return None
-    pr_areas = {_path_area(f["path"]) for f in files}
-    hits = []
+    hits = {}
     for f in changed:
         for name in (f["filename"], f.get("previous_filename")):
-            if isinstance(name, str) and name and (name.startswith(_WORKFLOWS) or _path_area(name) in pr_areas):
-                hits.append(name)
+            if not isinstance(name, str) or not name or name in hits:
+                continue
+            for pf in files:
+                why = _overlap(pf["path"], name)
+                if why:
+                    hits[name] = (why, pf["path"])
+                    break
     if not hits:
         return None
-    hits = sorted(set(hits))
 
     def subject(c):
         msg = c.get("commit", {}).get("message") if isinstance(c.get("commit"), dict) else ""
         return (str(msg or "").splitlines() or [""])[0]
+
+    def shown_hit(name):
+        why, pf = hits[name]
+        return name if why in ("area", "ci") or pf == name else f"{name} ({why} ~ {pf})"
 
     # The compare aggregates files, so a per-commit attribution needs more requests: list the content commits
     # (not hermes-sync/skills churn or merges) first, the churn count after.
@@ -368,14 +442,41 @@ def _base_drift_refusal(number, repo, data, cwd, env):
         named += f"; +{len(work) - 8} more"
     if churn:
         named += f" (+{churn} sync/merge commit(s))"
-    shown = ", ".join(hits[:6]) + (f", +{len(hits) - 6} more" if len(hits) > 6 else "")
-    return (f"[ship-only-guard] Refused state merge of PR #{number}: its CI tested base {base[:10]}, and "
-            f"{total} state commit(s) landed since then; together they change this PR's areas ({shown}). No check ran "
-            f"on that combination (#2491 turned state red this way). Base commits since {base[:10]}: {named}. "
+    order = sorted(hits)
+    shown = ", ".join(shown_hit(h) for h in order[:6]) + (f", +{len(order) - 6} more" if len(order) > 6 else "")
+    culprits = _attribute_hits(repo, order[:_ATTRIBUTE_HITS], {c["sha"]: c for c in commits}, subject, cwd, env)
+    return (f"[ship-only-guard] Refused state merge of PR #{number}: its CI tested base {base[:10]} (or later), "
+            f"and {total} state commit(s) landed since then; together they change this PR's areas ({shown}). No "
+            f"check ran on that combination (#2491 turned state red this way). "
+            + (f"Last base change per file: {culprits}. " if culprits else "")
+            + f"Base commits since {base[:10]}: {named}. "
             f"Run `gh api -X PUT repos/{repo}/pulls/{number}/update-branch -f expected_head_sha={head}`, wait "
             "for green CI on the new head, then rerun the merge with --match-head-commit <new head>. The guard "
             "re-checks exact-head approval on the new head: confirm `git patch-id --stable` of the PR diff is "
             "unchanged and get the review confirmed for that sha.")
+
+
+def _attribute_hits(repo, names, window, subject, cwd, env):
+    """'path: sha subject; ...' naming, per overlapping file, the newest commit in the drift window that touched
+    it (one `gh api repos/R/commits?sha=state&path=<file>&per_page=5` each, at most _ATTRIBUTE_HITS). Best
+    effort: an unreadable answer or a culprit older than the newest 5 only drops that file's attribution."""
+    from urllib.parse import quote
+    probe_env = dict(env)
+    probe_env["GH_PROMPT_DISABLED"] = "1"
+    out = []
+    for name in names:
+        try:
+            p = subprocess.run(["gh", "api", f"repos/{repo}/commits?sha=state&path={quote(name, safe='/')}&per_page=5"],
+                               cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=8)
+            listed = json.loads(p.stdout) if p.returncode == 0 else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+        if not isinstance(listed, list):
+            continue
+        hit = next((window[c["sha"]] for c in listed if isinstance(c, dict) and c.get("sha") in window), None)
+        if hit:
+            out.append(f"{name}: {hit['sha'][:10]} {subject(hit)[:60]}")
+    return "; ".join(out)
 
 
 def _state_merge(words, repo, cwd, env):

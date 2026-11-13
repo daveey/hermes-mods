@@ -35,11 +35,16 @@ def check(argv=CMD):
     return g.check_argv(argv, repos={"example/protected"}, env={"GH_REPO": "example/protected"})
 
 
-def probe(monkeypatch, data, compare=IDENTICAL):
-    """gh pr view answers `data`; gh api compare answers `compare` (a dict, or a (returncode, stdout) pair)."""
+def probe(monkeypatch, data, compare=IDENTICAL, commits=None):
+    """gh pr view answers `data`; gh api compare answers `compare` (a dict, or a (returncode, stdout) pair);
+    a per-file commits lookup answers `commits[path]` (a list), else exit 1."""
     calls = []
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
+        if argv[:2] == ["gh", "api"] and "/commits?" in argv[2]:
+            path = argv[2].split("&path=", 1)[1].split("&", 1)[0]
+            listed = (commits or {}).get(path)
+            return SimpleNamespace(returncode=0 if listed is not None else 1, stdout=json.dumps(listed))
         if argv[:2] == ["gh", "api"]:
             rc, out = compare if isinstance(compare, tuple) else (0, json.dumps(compare))
             return SimpleNamespace(returncode=rc, stdout=out)
@@ -136,6 +141,96 @@ def test_renamed_from_pr_area_refused(monkeypatch):
     moved["files"][0]["previous_filename"] = "hosts/mini-1/bb-tuner/z.py"
     probe(monkeypatch, payload(), moved)
     assert check()
+
+
+# t_01a1d62f8c197f3d: gaps found reviewing ce5447f7. Each rule has a refusing case and a non-refusing control.
+def drift(monkeypatch, pr_files, base_files, commits=None):
+    calls = probe(monkeypatch, payload(files=[{"path": p} for p in pr_files]),
+                  delta(base_files, [commit("c" * 40, "base change")]), commits)
+    return check(), calls
+
+
+@pytest.mark.parametrize("support", ["tests/sync_test_support.py", "tests/placement_support.py",
+                                     "tests/gateway_control_fixture.py", "tests/__init__.py"])
+def test_flat_dir_shared_support_file_refused(monkeypatch, support):
+    # A base change to a shared non-test file in tests/ holds a PR on any tests/test_*.py module ...
+    why, _ = drift(monkeypatch, ["tests/test_a.py"], [support])
+    assert why and f"{support} (shared ~ tests/test_a.py)" in why
+    # ... and a PR changing that support file is held by a base change to any module beside it.
+    why, _ = drift(monkeypatch, [support], ["tests/test_b.py"])
+    assert why and "tests/test_b.py (shared ~ " in why
+
+
+def test_flat_dir_shared_rule_controls_allowed(monkeypatch):
+    # Other test modules, markdown beside them, other top-level dirs and nested dirs stay independent.
+    assert drift(monkeypatch, ["tests/test_a.py"], ["tests/test_b.py", "tests/ci_durations.md"])[0] is None
+    assert drift(monkeypatch, ["docs/a.md"], ["docs/b.md"])[0] is None
+    assert drift(monkeypatch, ["tests/test_a.py"], ["scripts/check", "tests/fixtures/x/support.py"])[0] is None
+
+
+@pytest.mark.parametrize("harness", ["tests/run_ci.py", "tests/requirements-ci.txt", "tests/requirements-ci-py39.txt",
+                                     "requirements.txt"])
+def test_ci_harness_file_holds_any_pr(monkeypatch, harness):
+    why, _ = drift(monkeypatch, ["hosts/mini-1/bb-tuner/x.py"], [harness])
+    assert why and harness in why
+
+
+def test_nested_requirements_is_not_global(monkeypatch):
+    assert drift(monkeypatch, ["hosts/mini-1/bb-tuner/x.py"], ["tests/fixtures/askeve/requirements.txt"])[0] is None
+
+
+@pytest.mark.parametrize("pr_file,base_file", [
+    ("tests/test_bb_tuner_feed.py", "home/scripts/bb_tuner_feed.py"),       # #2491's shape, dominant layout
+    ("tests/test_hub_read_examples.py", "home/scripts/hub-read.py"),        # suffix, `-` normalized
+    ("tests/test_hermes_sync_trash.py", "hermes-sync"),                     # root script, no extension
+    ("tests/test_x_reply.py", "home/bin/x-reply-gate"),                     # code stem extends the key
+    ("home/scripts/tests/test_mail_gate.py", "home/scripts/mail_gate.py"),  # nested tests dir
+    ("home/bin/hermes-core-wt", "tests/test_hermes_core_wt_ship.py"),       # reverse: code PR, test on base
+])
+def test_test_code_coupling_refused(monkeypatch, pr_file, base_file):
+    why, _ = drift(monkeypatch, [pr_file], [base_file])
+    assert why and f"{base_file} (test-code ~ {pr_file})" in why
+
+
+@pytest.mark.parametrize("pr_file,base_file", [
+    ("tests/test_foo.py", "home/scripts/bar.py"),          # different module
+    ("tests/test_foo.py", "home/scripts/foobar.py"),       # prefix without a `_` boundary
+    ("tests/test_jobs_cron.py", "hosts/laptop-1/cron/jobs.json"),  # sync churn data, not code
+    ("tests/test_utils_x.py", "home/scripts/utils.py"),    # generic stem
+    ("tests/test_abc_x.py", "home/scripts/abc.py"),        # stem under 4 characters
+    ("tests/test_foo.py", "home/scripts/tests/test_foo_data.py"),  # two test modules are not test<->code
+])
+def test_test_code_coupling_controls_allowed(monkeypatch, pr_file, base_file):
+    assert drift(monkeypatch, [pr_file], [base_file])[0] is None
+
+
+def test_refusal_attributes_each_hit_to_its_base_commit(monkeypatch):
+    # The culprit is past the first 8 content commits; the per-file lookup still names it.
+    work = [commit(f"{i:x}" * 40, f"unrelated {i}") for i in range(1, 11)]
+    culprit = commit("f" * 40, "bb-tuner feed: change the push token")
+    compare = delta(["hosts/mini-1/bb-tuner/bb_tuner_feed.py"], work + [culprit])
+    outside = {"sha": "e" * 40}   # older than the window: never named
+    calls = probe(monkeypatch, payload(), compare,
+                  {"hosts/mini-1/bb-tuner/bb_tuner_feed.py": [{"sha": culprit["sha"]}, outside]})
+    why = check()
+    assert "Last base change per file: hosts/mini-1/bb-tuner/bb_tuner_feed.py: ffffffffff bb-tuner feed" in why
+    assert "+3 more" in why   # the oldest-first list still caps at 8, and the culprit is past it
+    argv, kw = calls[2]
+    assert argv == ["gh", "api", "repos/example/protected/commits?sha=state&path=hosts/mini-1/bb-tuner/"
+                    "bb_tuner_feed.py&per_page=5"]
+    assert kw["timeout"] <= 10 and not kw.get("shell")
+    # A listing with no commit in the drift window attributes nothing (and never names an older commit).
+    probe(monkeypatch, payload(), compare, {"hosts/mini-1/bb-tuner/bb_tuner_feed.py": [outside]})
+    why = check()
+    assert why and "Last base change per file" not in why and "eeeeeeeeee" not in why
+
+
+def test_attribution_is_bounded_and_best_effort(monkeypatch):
+    files = [f"hosts/mini-1/bb-tuner/f{i}.py" for i in range(5)]
+    calls = probe(monkeypatch, payload(), delta(files, [commit("c" * 40, "x")]))   # every lookup exits 1
+    why = check()
+    assert why and "Last base change per file" not in why and "cccccccccc x" in why
+    assert len(calls) == 2 + 3
 
 
 @pytest.mark.parametrize("compare", [

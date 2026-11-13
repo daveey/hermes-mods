@@ -258,6 +258,8 @@ def state_check(monkeypatch, data, argv=STATE_CMD):
     monkeypatch.setattr(g.subprocess, "run", run)
     why = g.check_argv(argv, repos={"example/protected"}, env={"GH_REPO": "example/protected"})
     assert 1 <= len(calls) <= 2 and "reviews" in calls[0][-1].split(",") and "comments" in calls[0][-1].split(",")
+    # A second call is only ever the base-drift compare of the PR's baseRefOid against state.
+    assert calls[1:] in ([], [["gh", "api", f"repos/example/protected/compare/{data['baseRefOid']}...state"]])
     return why
 
 

@@ -3,7 +3,8 @@
 A public, stdlib-only command guard that routes landing through a repository's
 trusted ship workflow for core main, with a narrow state-branch preflight below.
 It does not merge or push. State preflight makes two bounded read-only GitHub
-requests (the PR view and one base compare).
+requests (the PR view and one base compare), plus at most three bounded
+per-file commit lookups when it refuses for base drift.
 
 ## Configuration
 
@@ -100,18 +101,48 @@ main/other base, changed head, pending/failed/skipped/neutral checks, a possibly
 truncated rollup, unreadable reviews/comments, an unanswered review point and a
 missing exact-head approval fail closed. This is not a blanket non-main exemption.
 
-**Base drift under CI.** A `pull_request` run tests the merge ref against the
-PR's recorded `baseRefOid`, not the `state` tip at merge time. After the checks
+**Base drift under CI.** A `pull_request` run tests a merge ref built on some
+`state` commit, not the `state` tip at merge time. The PR's recorded
+`baseRefOid` is at or before the base CI tested: live #2507's checkout was
+`Merge 3ac709e8e8 into f5f7030b43` while its `baseRefOid` c67ac3f18d sat 15
+commits behind, and #2491 shows GitHub does not refresh it on a later
+mergeability recompute. Comparing from `baseRefOid` therefore covers a superset
+of the untested window (it can over-refuse, not miss). A retarget without a CI
+rerun could make `baseRefOid` newer than the tested base (fail open), so never
+retarget during landing. After the checks
 above pass, the guard reads `gh api repos/OWNER/REPO/compare/<baseRefOid>...state`
 (fixed argv, 15-second timeout) and refuses when a file changed on `state` since
-that base shares an area with a PR file: the same directory cut to its top three
-segments (`hosts/<host>/bb-tuner/`, `home/bin/`), the same file for a repo-root
-file or one directly in a top-level dir (`tests/test_x.py`, `docs/x.md`, whose
-dozens of unrelated modules would otherwise hold every PR), or any
-`.github/workflows/` file. Renames count both paths. Churn elsewhere (`sync:`
-commits under other `hosts/<host>/`, `home/skills/…`) does not refuse. The
-refusal names the overlapping files and the base commits (content commits first;
-the compare does not attribute files per commit) and asks for
+that base overlaps a PR file:
+
+- the same directory cut to its top three segments (`hosts/<host>/bb-tuner/`,
+  `home/bin/`);
+- the same file for a repo-root file or one directly in a top-level dir
+  (`tests/test_x.py`, `docs/x.md`, whose dozens of unrelated modules would
+  otherwise hold every PR);
+- a shared support file directly in a top-level dir: a name not starting with
+  `test_` and not markdown (`tests/sync_test_support.py`, `tests/__init__.py`)
+  on either side overlaps any file directly in that dir on the other side;
+- test and code: a `test_<stem>[_suffix].py` module anywhere on one side and a
+  code file (`.py`, `.sh`, `.js`/`.mjs`/`.cjs`/`.ts`, `.swift` or no extension)
+  on the other whose basename stem, with `-` read as `_`, equals the key or
+  extends it by `_<suffix>` either way (`tests/test_hub_read_examples.py` ~
+  `home/scripts/hub-read.py`, `tests/test_foo.py` ~ `home/bin/foo-cli`). Stems
+  under 4 characters and generic ones (`__init__`, `main`, `utils`, `config`...)
+  never match;
+- any `.github/workflows/` file, or a CI harness file at the root or directly
+  in a top-level dir (`requirements*`, `run_ci.py`: `tests/run_ci.py`,
+  `tests/requirements-ci.txt`) on the base side, which holds every PR.
+
+Renames count both paths. Churn elsewhere (`sync:`
+commits under other `hosts/<host>/`, `home/skills/…`) does not refuse. Nested
+areas (`home/scripts/` vs `home/scripts/tests/`) are not a prefix match: the
+test-and-code rule covers the module pairs that matter there, and a prefix rule
+measured on live PRs held sync churn (see the commit message). The
+refusal names the overlapping files (with the rule and the PR file for the two
+cross-file rules), the newest drift-window commit that touched each of the first
+3 files (one bounded `gh api repos/OWNER/REPO/commits?sha=state&path=<file>&per_page=5`
+each, 8-second timeout; a failed lookup only drops that attribution), and the
+base commits (content commits first, the first 8) and asks for
 `gh api -X PUT repos/OWNER/REPO/pulls/N/update-branch -f expected_head_sha=<head>`,
 green CI on the new head and a rerun; the exact-head approval check then applies
 to the new head. A missing/malformed `baseRefOid`, a missing, empty or 100-entry
@@ -139,7 +170,8 @@ and verify postmerge CI and deployment separately.
 
 `tests_state.py` covers allowed and refused preflights, malformed/unreadable
 responses, transport failures, head/base changes, CI states, bounded rollups,
-base drift under CI (the #2491 replay, sync churn, workflows, truncated compares),
+base drift under CI (the #2491 replay, sync churn, workflows, CI harness files,
+shared support files, test<->code coupling, per-file attribution, truncated compares),
 strict flags, `cd $VAR;` prefixes, named failure steps and terminal/Python/tool
 entry points. No test merges a live PR.
 
