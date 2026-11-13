@@ -126,6 +126,51 @@ export function sessionPath(item) {
   return `/api/sessions/${encodeURIComponent(item.session_id)}${p}`
 }
 
+/** A v4 UUID (crypto.randomUUID exists only in secure contexts). */
+export function uuid() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  const b = new Uint8Array(16)
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') crypto.getRandomValues(b)
+  else for (let i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256)
+  b[6] = (b[6] & 0x0f) | 0x40
+  b[8] = (b[8] & 0x3f) | 0x80
+  const h = Array.from(b, x => x.toString(16).padStart(2, '0')).join('')
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
+// Core's isUnroutedRestPath: the gateway has no such route (pre-fence runtime).
+const unroutedRest = e => /no such api endpoint|endpoint is likely missing/i.test(str(e && e.message ? e.message : e))
+
+/** One fenced session write, core's protocol (web_server_sessions.py::_mutate_session_request,
+ *  desktop sdk setPersistedSessionHidden): read the session's mutation snapshot on the same
+ *  connection, then PATCH with request_id + expected_revision (+ expected_generation). A write
+ *  without that identity is refused with 409 client_upgrade_required. Only a gateway with no
+ *  snapshot route at all (pre-fence runtime) gets the bare write. */
+export async function patchSessionFenced(api, item, via, payload) {
+  const profile = item.profile && item.profile !== 'default' ? item.profile : ''
+  const q = profile ? `?profile=${encodeURIComponent(profile)}` : ''
+  const path = `/api/sessions/${encodeURIComponent(item.session_id)}`
+  let snap
+  try {
+    snap = await api({ ...via, path: `${path}/mutation-snapshot${q}` })
+  } catch (e) {
+    if (unroutedRest(e)) return api({ ...via, path: `${path}${q}`, method: 'PATCH', body: payload })
+    throw e
+  }
+  const ok = n => Number.isSafeInteger(n) && n >= 0
+  if (!snap || snap.exists !== true || !ok(snap.runtime_revision) || !ok(snap.runtime_generation)) {
+    throw new Error('Session mutation snapshot unavailable')
+  }
+  const body = {
+    ...payload,
+    request_id: uuid(),
+    expected_revision: snap.runtime_revision,
+    expected_generation: snap.runtime_generation,
+    ...(profile ? { profile } : {})
+  }
+  return api({ ...via, path: `${path}${q}`, method: 'PATCH', body })
+}
+
 export function itemFor(items, sessionId) {
   if (!sessionId) return null
   return items.find(i => i.session_id === sessionId) || null
@@ -478,7 +523,7 @@ export function createStore(ctx) {
           extra = hubInboxItems(hub.items, liveNames, connForHub).filter(i => !seen.has(`${i.hub.gateway}:${i.session_id}`))
         }
         $items.set(extra.length ? [...live, ...extra] : live)
-        markRead(itemFor($items.get(), host.state.focusedStoredSessionId?.get?.()))
+        markRead(itemFor($items.get(), host.state.focusedStoredSessionId?.get?.()), { poll: true })
       })
       .finally(() => {
         inflight = null
@@ -491,17 +536,23 @@ export function createStore(ctx) {
   }
 
   // Desktop's own read state is client-side only, so the inbox keeps the
-  // server watermark itself (any door that focuses the chat counts).
-  const markRead = item => {
+  // server watermark itself (any door that focuses the chat counts). Inbox
+  // sessions are hidden from Recents (and may live on another gateway), so
+  // core's clearUnreadOnOpen, which only acts on $sessions rows, never sees them.
+  // The 30 s poll re-marks the focused chat only once per activity stamp: a
+  // write that failed must not re-fire every poll (it did, as 409s in desktop.log).
+  const polledRead = new Set()
+  const markRead = (item, { poll = false } = {}) => {
     if (!item || !item.unread || item.hub) return
+    const key = `${item.gateway}:${item.profile || 'default'}:${item.session_id}:${item.updated_at ?? ''}`
+    if (poll && polledRead.has(key)) return
+    polledRead.add(key)
     $items.set($items.get().map(i => (i === item ? { ...i, unread: false } : i)))
-    // Core's session PATCH (`unread: false` → SessionDB.set_session_read) on the owning gateway.
+    // Core's fenced session PATCH (`unread: false` → SessionDB.set_session_read) on the owning gateway.
     const api = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
     if (!api) return
     const via = item.gateway && item.gateway !== routedGateway() ? { connectionId: item.gateway } : {}
-    void Promise.resolve(
-      api({ ...via, path: sessionPath(item), method: 'PATCH', body: { unread: false } })
-    ).catch(() => {})
+    void patchSessionFenced(api, item, via, { unread: false }).catch(e => log('mark read failed', item.session_id, str(e && e.message ? e.message : e)))
   }
 
   const open = item => {

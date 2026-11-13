@@ -127,19 +127,117 @@ test('archive removes optimistically and posts to the owning gateway', async () 
   assert.deepEqual(ctx.calls[0], ['/items/s3/archive', { method: 'POST' }])
 })
 
-test('markRead clears unread once and posts to the owning gateway', async () => {
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const SNAP = { session_id: 's5', exists: true, runtime_revision: 7, runtime_generation: 2 }
+const flush = () => new Promise(r => setTimeout(r, 0))
+
+// A fake bridge: the snapshot GET answers `snap` (or throws it), every PATCH acks.
+function fakeApi(snap = SNAP) {
+  const calls = []
+  const api = async req => {
+    calls.push(req)
+    if (!req.method && /\/mutation-snapshot/.test(req.path)) {
+      if (snap instanceof Error) throw snap
+      return snap
+    }
+    return { ok: true }
+  }
+  return { calls, api }
+}
+
+test('markRead clears unread once and sends a FENCED PATCH to the owning gateway (no bare {unread:false})', async () => {
   host.activeConnectionId = () => 'local'
   host.state.gateways = { get: () => [] }
-  const apiCalls = []
-  globalThis.window = { hermesDesktop: { api: async req => (apiCalls.push(req), { ok: true }) } }
+  const { calls, api } = fakeApi()
+  globalThis.window = { hermesDesktop: { api } }
   const store = m.createStore(fakeCtx(() => ({ ok: true })))
   const item = { session_id: 's5', gateway: 'mini', unread: true }
   store.$items.set([item])
   store.markRead(item)
   assert.equal(store.$items.get()[0].unread, false)
   store.markRead(store.$items.get()[0])
-  assert.deepEqual(apiCalls, [{ connectionId: 'mini', path: '/api/sessions/s5', method: 'PATCH', body: { unread: false } }])
+  await flush()
+  assert.equal(calls.length, 2)
+  assert.deepEqual(calls[0], { connectionId: 'mini', path: '/api/sessions/s5/mutation-snapshot' })
+  const { body, ...rest } = calls[1]
+  assert.deepEqual(rest, { connectionId: 'mini', path: '/api/sessions/s5', method: 'PATCH' })
+  assert.match(body.request_id, UUID_RE)
+  assert.deepEqual({ ...body, request_id: 'x' }, { unread: false, request_id: 'x', expected_revision: 7, expected_generation: 2 })
+  // The backend's client_upgrade_required condition: no PATCH may go out without the identity.
+  for (const c of calls.filter(c => c.method === 'PATCH')) {
+    assert.ok(c.body.request_id && Number.isInteger(c.body.expected_revision) && Number.isInteger(c.body.expected_generation))
+  }
   delete globalThis.window
+})
+
+test('markRead on a profile item: snapshot and PATCH scoped to that profile, profile in the body', async () => {
+  host.activeConnectionId = () => 'local'
+  const { calls, api } = fakeApi()
+  globalThis.window = { hermesDesktop: { api } }
+  const store = m.createStore(fakeCtx(() => ({ ok: true })))
+  const item = { session_id: 's5', gateway: 'local', profile: 'work', unread: true }
+  store.$items.set([item])
+  store.markRead(item)
+  await flush()
+  assert.deepEqual(calls[0], { path: '/api/sessions/s5/mutation-snapshot?profile=work' })
+  assert.equal(calls[1].path, '/api/sessions/s5?profile=work')
+  assert.equal(calls[1].body.profile, 'work')
+  assert.equal(calls[1].body.expected_revision, 7)
+  delete globalThis.window
+})
+
+test('markRead: a failed or unusable snapshot sends no PATCH; only a pre-fence gateway (no route) gets the bare write', async () => {
+  host.activeConnectionId = () => 'local'
+  for (const snap of [new Error('503: owner_unavailable'), { exists: false, runtime_revision: 0, runtime_generation: null }, { exists: true }]) {
+    const { calls, api } = fakeApi(snap)
+    globalThis.window = { hermesDesktop: { api } }
+    const store = m.createStore(fakeCtx(() => ({ ok: true })))
+    const item = { session_id: 's5', gateway: 'local', unread: true }
+    store.$items.set([item])
+    store.markRead(item)
+    await flush()
+    assert.deepEqual(calls.map(c => c.method || 'GET'), ['GET'], String(snap))
+  }
+  const { calls, api } = fakeApi(new Error('404: No such API endpoint: /api/sessions/s5/mutation-snapshot'))
+  globalThis.window = { hermesDesktop: { api } }
+  const store = m.createStore(fakeCtx(() => ({ ok: true })))
+  const item = { session_id: 's5', gateway: 'local', unread: true }
+  store.$items.set([item])
+  store.markRead(item)
+  await flush()
+  assert.deepEqual(calls[1], { path: '/api/sessions/s5', method: 'PATCH', body: { unread: false } })
+  delete globalThis.window
+})
+
+test('the 30 s poll marks the focused chat read once per activity stamp, not every poll (failed writes do not loop)', async () => {
+  host.activeConnectionId = () => 'local'
+  host.state.gateways = { get: () => [] }
+  host.state.focusedStoredSessionId = { get: () => 's5' }
+  // The write fails (as the 409 did), so the server keeps answering unread: true.
+  const calls = []
+  globalThis.window = { hermesDesktop: { api: async req => { calls.push(req); throw new Error('409: session_busy') } } }
+  let stamp = 100
+  const ctx = fakeCtx(() => ({ items: [{ session_id: 's5', unread: true, updated_at: stamp }] }))
+  ctx.hubRest = async () => null
+  const store = m.createStore(ctx)
+  await store.refresh()
+  await store.refresh()
+  await store.refresh()
+  await flush()
+  assert.equal(calls.length, 1, 'one snapshot read for three polls of the same unread state')
+  stamp = 200 // new activity in the chat: the poll marks it read again
+  await store.refresh()
+  await flush()
+  assert.equal(calls.length, 2)
+  // An explicit open still retries (the next poll brought the server's unread flag back).
+  await store.refresh()
+  await flush()
+  assert.equal(calls.length, 2)
+  store.markRead(store.$items.get()[0])
+  await flush()
+  assert.equal(calls.length, 3)
+  delete globalThis.window
+  delete host.state.focusedStoredSessionId
 })
 
 test('nextItemAfter: the one below, else the top of what is left, null on the last', () => {
