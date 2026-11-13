@@ -70,7 +70,8 @@ def build(home: Path, rng: random.Random, sessions: int, messages: int, tasks: i
     with sqlite3.connect(hub) as conn:
         conn.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, seq INTEGER, data TEXT, "
                      "PRIMARY KEY (gw, coll, key))")
-        conn.execute("CREATE INDEX replica_seq ON replica (gw, coll, seq)")
+        conn.execute("CREATE INDEX replica_coll ON replica (coll)")  # the hub's own indexes (hermes-hub hub.db)
+        conn.execute("CREATE INDEX replica_poll_metadata ON replica (coll, gw, seq)")
         conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
         seq = 0
         rrows = []

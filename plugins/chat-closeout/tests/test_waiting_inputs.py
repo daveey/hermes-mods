@@ -212,3 +212,131 @@ def test_the_source_is_registered_with_its_inputs(monkeypatch):
     monkeypatch.setattr(hermes_cli, 'kanban_session_activity', fake, raising=False)
     plugin._register_waiting_source()
     assert seen == {'name': 'chat-closeout', 'fn': plugin.waiting_source, 'inputs': plugin.waiting_inputs}
+
+
+# ---- review t_01a1d6d33d3cb0d4: inputs settlement reads that the keys must also cover ---------------------------
+def _notice(state, sid, ts):
+    with sqlite3.connect(state) as conn:
+        for role, text, at, finish in (('user', '✔ [default] @default Kanban t_1 done — local', ts, None),
+                                       ('assistant', 'Result checked.', ts + 1, 'stop')):
+            conn.execute('INSERT INTO messages (session_id, role, content, timestamp, finish_reason, active) '
+                         'VALUES (?,?,?,?,?,1)', (sid, role, text, at, finish))
+
+
+def test_a_timestamp_repair_that_proves_an_ack_clears_the_waiting_row(world):
+    """No trigger covers ``messages.timestamp``: the watermark carries the active rows' timestamp sum, as core
+    ``transcript_key`` does, so a repair that moves the notice past ``completed_at`` re-proves the chat."""
+    _notice(world['state'], 'c1', 50)  # before completed_at=100: no proof yet
+    assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+    key = plugin.waiting_inputs()
+    reset(world['work'])
+    with sqlite3.connect(world['state']) as conn:
+        conn.execute("UPDATE messages SET timestamp = timestamp + 100 WHERE session_id = 'c1'")
+    assert plugin.waiting_inputs() != key
+    assert poll() == {'c2': ['t_2']}
+    assert world['work']['reconcile_done'] == ['c1']
+
+
+def test_an_active_flip_below_the_max_moves_the_key(world):
+    _notice(world['state'], 'c1', 50)
+    with sqlite3.connect(world['state']) as conn:
+        conn.execute("INSERT INTO messages (session_id, role, content, timestamp, active) "
+                     "VALUES ('c1', 'user', 'later', 60, 1)")
+    key = plugin.waiting_inputs()
+    with sqlite3.connect(world['state']) as conn:
+        first = conn.execute("SELECT MIN(id) FROM messages WHERE session_id = 'c1'").fetchone()[0]
+        conn.execute('UPDATE messages SET active = 0 WHERE id = ?', (first,))
+    assert plugin.waiting_inputs() != key
+
+
+def test_a_state_db_that_cannot_vouch_for_rewrites_gives_no_key(world):
+    """Without core's transcript-revision triggers an in-place rewrite moves nothing: no key (no adoption, no
+    per-row reuse), like ``transcript_key`` returning None."""
+    with sqlite3.connect(world['state']) as conn:
+        conn.execute('DROP TRIGGER messages_transcript_revision_update')
+    with pytest.raises(Exception):
+        plugin.waiting_inputs()
+    assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+    reset(world['work'])
+    assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+    assert sorted(world['work']['reconcile_done']) == ['c1', 'c2', 'c3']  # a full pass every time
+
+
+def test_a_floor_rollover_re_reconciles_every_row(world, monkeypatch):
+    """The 10-minute floor reaches the per-row answers, not only the whole-pass memo."""
+    assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+    reset(world['work'])
+    assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+    assert world['work']['reconcile_done'] == []
+    monkeypatch.setattr(plugin.wi, 'FLOOR_S', 1e-9)  # every call a new floor bucket
+    assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+    assert sorted(world['work']['reconcile_done']) == ['c1', 'c2', 'c3']
+
+
+def test_a_floor_rollover_re_judges_quiet_host_rows(world, monkeypatch):
+    world['led'].write('c1', batch=[], open=[])
+    world['led'].write('c2', batch=[], open=[])
+    wake = lambda sid, *a, **k: 'busy'  # noqa: E731
+    monkeypatch.setattr(plugin, '_unseen_counts', lambda: {})
+    plugin.wake_tick(wake=wake, last_user=lambda _: 0)
+    plugin._state.pop('host_memo', None)  # past the whole-pass skip: the per-row quiet cache alone
+    reset(world['work'])
+    plugin.wake_tick(wake=wake, last_user=lambda _: 0)
+    assert world['work']['reconcile_done'] == []
+    plugin._state.pop('host_memo', None)
+    monkeypatch.setattr(plugin.wi, 'FLOOR_S', 1e-9)
+    plugin.wake_tick(wake=wake, last_user=lambda _: 0)
+    assert world['work']['reconcile_done'] == ['c3']
+
+
+def test_replica_batch_row_rewritten_at_its_old_seq_moves_the_key(world, tmp_path, monkeypatch):
+    hub = tmp_path / 'hub.db'
+    _replica(hub, [('default/default/t_1', {'id': 't_1', 'status': 'done'}),
+                   ('default/default/t_9', {'id': 't_9', 'status': 'running'})])
+    monkeypatch.setattr(plugin, 'hub_db_path', lambda: hub)
+    key = plugin.waiting_inputs()
+    with sqlite3.connect(hub) as conn:  # a resync rewrites t_1 in place, keeping its seq
+        conn.execute("UPDATE replica SET data = ? WHERE key = 'default/default/t_1'",
+                     (json.dumps({'id': 't_1', 'status': 'running'}),))
+    assert plugin.waiting_inputs() != key
+
+
+def test_replica_batch_row_with_a_null_seq_moves_the_key(world, tmp_path, monkeypatch):
+    hub = tmp_path / 'hub.db'
+    _replica(hub, [('default/default/t_9', {'id': 't_9', 'status': 'running'})])
+    monkeypatch.setattr(plugin, 'hub_db_path', lambda: hub)
+    key = plugin.waiting_inputs()
+    with sqlite3.connect(hub) as conn:
+        conn.execute("INSERT INTO replica VALUES ('worker-1', 'tasks', 'default/default/t_1', NULL, ?)",
+                     (json.dumps({'id': 't_1', 'status': 'done'}),))
+    assert plugin.waiting_inputs() != key
+
+
+def test_replica_batch_row_of_a_gateway_without_info_moves_the_key(world, tmp_path, monkeypatch):
+    hub = tmp_path / 'hub.db'
+    _replica(hub, [('default/default/t_9', {'id': 't_9', 'status': 'running'})])
+    monkeypatch.setattr(plugin, 'hub_db_path', lambda: hub)
+    key = plugin.waiting_inputs()
+    with sqlite3.connect(hub) as conn:  # a new gateway, no gateway/info row, writes a batch card at an old seq
+        conn.execute("INSERT INTO replica VALUES ('worker-9', 'tasks', 'default/default/t_1', 0, ?)",
+                     (json.dumps({'id': 't_1', 'status': 'done'}),))
+    assert plugin.waiting_inputs() != key
+
+
+def test_a_fresh_fingerprint_is_never_answered_from_the_older_cache(world):
+    """Core takes a fingerprint, then runs the source on the same thread: inputs that moved since the 3 s answer
+    cache was filled are answered now, not under the newer key with the older answer."""
+    assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+    _notice(world['state'], 'c1', 101)
+    plugin.waiting_inputs()
+    assert plugin.waiting_source() == {'c2': ['t_2']}  # no waiting_cache pop: within the 3 s window
+
+
+def test_another_threads_inputs_are_not_reused(world):
+    import threading
+    assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+    t = threading.Thread(target=plugin.waiting_inputs)
+    t.start()
+    t.join()
+    _notice(world['state'], 'c1', 101)
+    assert poll() == {'c2': ['t_2']}  # not the other thread's (older) reads

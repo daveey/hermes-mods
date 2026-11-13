@@ -1735,10 +1735,27 @@ def _origin_digest() -> Any:
     return _revision_digest("origin", _origin_ledger_path(), read)
 
 
+def _transcript_vouched(conn: sqlite3.Connection) -> bool:
+    """core ``transcript_key``'s trigger check: the db's triggers bump ``transcript_revision`` on every in-place
+    rewrite an ``AckIndex`` can read (else a watermark could miss one: no reuse)."""
+    names = tuple(core.TRANSCRIPT_TRIGGERS)
+    sql = dict(conn.execute(f"SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN "
+                            f"({','.join('?' for _ in names)})", names).fetchall())
+    return all(core._trigger_vouches(sql.get(name), needs) for name, needs in core.TRANSCRIPT_TRIGGERS.items())
+
+
+_lineage_lock = threading.Lock()  # the tips memo is shared by the waiting and host threads
+
+
 def _lineages(sids: list[str]) -> Optional[dict[str, list]]:
     """``{sid: lineage watermark}`` (``wi.lineage_key`` of the chat and its compression tip) for every chat, None
     when a state.db can't be read. The tip is looked up again only when the chain's end markers moved."""
-    watch = _wi_get("lineage", wi.LineageWatch)
+    with _lineage_lock:
+        return _lineages_locked(sids)
+
+
+def _lineages_locked(sids: list[str]) -> Optional[dict[str, list]]:
+    watch = _wi_get("lineage", lambda: wi.LineageWatch(vouch=_transcript_vouched))
     with _wi_lock:
         tips: dict[str, tuple] = _wi.setdefault("tips", {})
     paths = state_dbs()
@@ -1837,14 +1854,28 @@ def waiting_inputs() -> Any:
         # Parts built here from plain JSON data are digested as they are; only core's values go through portable.
         key = [wi.portable(parts[k]) if k == "scope" else wi.strict_digest(parts[k]) for k in sorted(parts)]
     # Core runs ``waiting_source`` right after a fingerprint it could not adopt: that pass reuses these reads. They
-    # were taken before its own reads, so a change in between only re-runs the next pass, never hides one.
-    _state["inputs_hit"] = (time.monotonic(), rows, parts)
+    # were taken before its own reads, so a change in between only re-runs the next pass, never hides one. Per
+    # thread: the fingerprint and the pass that follows it run on one thread, and another thread's (older) reads
+    # must never label this thread's answer.
+    _state["inputs_hit"] = (threading.get_ident(), time.monotonic(), rows, parts)
     return key
 
 
-def _waiting_row_key(lineages: Optional[dict[str, list]]) -> Callable[[dict, Any], Optional[str]]:
+def _own_inputs_hit(pop: bool) -> Optional[tuple]:
+    """This thread's fresh ``inputs_hit`` (``(rows, parts)``), else None; ``pop`` consumes it."""
+    hit = _state.get("inputs_hit")
+    if hit is None or hit[0] != threading.get_ident():
+        return None
+    if pop:
+        _state.pop("inputs_hit", None)
+    return (hit[2], hit[3]) if time.monotonic() - hit[1] <= INPUTS_REUSE_S else None
+
+
+def _waiting_row_key(lineages: Optional[dict[str, list]], floor: Any) -> Callable[[dict, Any], Optional[str]]:
+    """A row's key carries the floor bucket too: a missed input is recomputed within ``FLOOR_S`` per row, not only
+    per pass."""
     def key(row: dict, cards: Any) -> Optional[str]:
-        return wi.row_key(row, cards, (lineages or {}).get(row["session_id"]))
+        return wi.row_key(row, cards, (lineages or {}).get(row["session_id"]), extra=floor)
     return key
 
 
@@ -1860,15 +1891,20 @@ def waiting_source() -> dict[str, list[str]]:
         return {}
     with _waiting_lock:
         hit = _state.get("waiting_cache")
-        if hit and time.monotonic() - hit[0] < 3.0:
+        fresh = _own_inputs_hit(pop=False)
+        memo = _state.get("waiting_memo")
+        # The fingerprint core just took on this thread saw inputs the cached answer was not computed from: answer
+        # them now rather than hand the older answer to core under the newer key.
+        moved = fresh is not None and (memo is None or memo[0] != fresh[1])
+        if hit and time.monotonic() - hit[0] < 3.0 and not moved:
             return hit[1]
         with wi.accounting_pass("chat-closeout.waiting") as acct, _proof_pass():
             # One proof pass for the inputs and the reconcile: the watermark seeks and the proofs share connections.
             now = time.time()
-            reuse = _state.pop("inputs_hit", None)
+            reuse = _own_inputs_hit(pop=True)
             try:
-                if reuse is not None and time.monotonic() - reuse[0] <= INPUTS_REUSE_S:
-                    rows, parts = [dict(r) for r in reuse[1]], reuse[2]
+                if reuse is not None:
+                    rows, parts = [dict(r) for r in reuse[0]], reuse[1]
                 else:
                     rows = _pending_rows()
                     parts = _input_parts(rows, now)
@@ -1891,7 +1927,7 @@ def waiting_source() -> dict[str, list[str]]:
                 else:
                     lineages = dict(parts["lineage"])
                     out = core.pending_closeouts(ledger(), reader, proof=session_proof, rows=rows,
-                                                 row_key=_waiting_row_key(lineages),
+                                                 row_key=_waiting_row_key(lineages, parts["floor"]),
                                                  cache=_wi_get("waiting_rows", wi.RowCache), stats=stats,
                                                  fields=core.SETTLE_ROW_FIELDS)
             except Exception:
@@ -2011,11 +2047,12 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
         return done
 
 
-def _host_row_key(row: dict, cards: Any, lineages: Optional[dict[str, list]]) -> Optional[str]:
-    """A host-pass row's inputs: the whole ledger row, its cards as read (full read) and its lineage watermark."""
+def _host_row_key(row: dict, cards: Any, lineages: Optional[dict[str, list]], now: float) -> Optional[str]:
+    """A host-pass row's inputs: the whole ledger row, its cards as read (full read), its lineage watermark and
+    the floor bucket (a missed input is re-judged within ``FLOOR_S``)."""
     if lineages is None:
         return None
-    return wi.row_key(row, cards, lineages.get(row["session_id"]))
+    return wi.row_key(row, cards, lineages.get(row["session_id"]), extra=int(now // wi.FLOOR_S))
 
 
 def _row_quiet(row: dict, cards: Any) -> bool:
@@ -2056,7 +2093,7 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
     for row in pending:
         sid = row["session_id"]
         cards = core.canonical_view(read(row["batch"]))
-        hkey = _host_row_key(row, cards, lineages)
+        hkey = _host_row_key(row, cards, lineages, now)
         if quiet_rows.get(sid, hkey) is not None:
             continue  # quiet under exactly these inputs last pass: the same reads decide the same nothing
         quiet_rows.put(sid, None, None)

@@ -42,6 +42,10 @@ class Unportable(Exception):
     """A key part only this process can compare (a stat fallback holding a connection): no cross-process key."""
 
 
+class Unvouched(Exception):
+    """A state.db whose triggers cannot vouch for in-place message rewrites: no transcript watermark."""
+
+
 def digest(value: Any) -> str:
     return hashlib.sha1(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
@@ -154,12 +158,37 @@ def _tail(key: Any) -> str:
     return str(key).rsplit("/", 1)[-1]
 
 
+_MISSING = object()
+_REPLICA_PROBE = ("SELECT gw, count(*), count(seq), max(seq), total(seq) FROM replica WHERE coll = 'tasks' "
+                  "GROUP BY gw")  # index-only on replica_poll_metadata (coll, gw, seq): ~1 ms on a 18k-row hub
+
+
+def file_ident(path: Optional[Path]) -> Optional[tuple]:
+    """(st_dev, st_ino) of ``path``: a replaced or restored file is another file (core ``kanban_replica_rows``)."""
+    if path is None:
+        return None
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
 class ReplicaWatch:
     """The hub replica rows the batch cards' remote reads depend on, read incrementally.
 
-    ``refresh`` re-reads only when ``token`` (the replica's committed revision in this process) moved: the rows
-    written since the cursor (per gateway, an index range of ``replica_poll_metadata``) and a primary-key check that
-    every tracked row still exists. New batch tails, a replaced file or a failed read rebuild."""
+    ``refresh`` re-reads only when ``token`` (the replica's committed revision in this process) moved. Then, in one
+    read transaction (core ``kanban_replica_rows._delta``'s checks, on what this key needs):
+
+    * a per-gateway probe aggregate (``count``, ``count(seq)``, ``max(seq)``, ``total(seq)``; index-only);
+    * the rows written since each gateway's cursor (an index range), merged into the ``(gw, key) -> seq`` map of
+      every task row; the merged map must reproduce the probe, else the cause (a delete, a row rewritten at an older
+      seq, a gateway whose seqs went back) is unknown and the rows are rebuilt;
+    * every tracked batch row re-read by primary key, its raw text compared: a batch row rewritten in place at the
+      same seq (a resync) still moves its digest.
+
+    A NULL ``seq`` (no cursor can cover it), a replaced file (``file_ident``), new batch tails or a failed read
+    rebuild."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -167,10 +196,14 @@ class ReplicaWatch:
 
     def clear(self) -> None:
         self.path: Optional[str] = None
+        self.ident: Optional[tuple] = None
         self.token: Any = None
         self.cursor: dict[str, int] = {}
+        self.seqs: dict[tuple[str, str], Optional[int]] = {}  # every task row: (gw, key) -> seq
+        self.aggs: dict[str, list] = {}  # gw -> [rows, rows with a seq, total seq]: ``self.seqs`` summed
         self.tails: frozenset = frozenset()
-        self.rows: dict[tuple[str, str], tuple[str, str, Any]] = {}   # (gw, key) -> (tail, digest, observed_at)
+        # (gw, key) -> (tail, digest, observed_at, raw text hash)
+        self.rows: dict[tuple[str, str], tuple[str, str, Any, str]] = {}
         self.gateways: dict[str, list[tuple[str, Any, float]]] = {}  # gw -> [(scope digest, observed_at, window)]
         self.meta: Optional[dict] = None
         self.ok = False
@@ -178,7 +211,11 @@ class ReplicaWatch:
         self.increments = 0
 
     @staticmethod
-    def _entry(key: Any, raw: Any) -> tuple[str, str, Any]:
+    def _raw_hash(raw: Any) -> str:
+        return hashlib.sha1(raw.encode() if isinstance(raw, str) else repr(raw).encode()).hexdigest()
+
+    @classmethod
+    def _entry(cls, key: Any, raw: Any) -> tuple[str, str, Any, str]:
         try:
             data = json.loads(raw)
         except (TypeError, ValueError):
@@ -186,7 +223,30 @@ class ReplicaWatch:
         observed = None
         if isinstance(data, dict) and isinstance(data.get("origin_observation"), dict):
             observed = data["origin_observation"].get("observed_at")
-        return _tail(key), digest(substantive(data)), observed
+        return _tail(key), digest(substantive(data)), observed, cls._raw_hash(raw)
+
+    @staticmethod
+    def _probe(conn: sqlite3.Connection) -> dict[str, tuple]:
+        return {str(gw): (int(n), int(ns), int(top or 0), float(tot or 0))
+                for gw, n, ns, top, tot in conn.execute(_REPLICA_PROBE)}
+
+    def _agrees(self, probe: dict[str, tuple]) -> bool:
+        """The ``(gw, key) -> seq`` map (kept as per-gateway sums) reproduces the probe aggregate of every gateway."""
+        mine = {gw: (a[0], a[1], self.cursor.get(gw, 0), float(a[2])) for gw, a in self.aggs.items() if a[0]}
+        return mine == probe
+
+    def _put_seq(self, gw: str, key: str, seq: Optional[int]) -> None:
+        agg = self.aggs.setdefault(gw, [0, 0, 0])
+        old = self.seqs.get((gw, key), _MISSING)
+        if old is _MISSING:
+            agg[0] += 1
+        elif old is not None:
+            agg[1] -= 1
+            agg[2] -= old
+        if seq is not None:
+            agg[1] += 1
+            agg[2] += seq
+        self.seqs[(gw, key)] = seq
 
     @staticmethod
     def _scopes(raw: Any) -> list[tuple[str, Any, float]]:
@@ -207,43 +267,54 @@ class ReplicaWatch:
                 out.append((digest(s), None, window))
         return sorted(out, key=lambda t: (t[0], str(t[1])))
 
-    def _rebuild(self, conn: sqlite3.Connection, tails: frozenset) -> None:
-        rows: dict[tuple[str, str], tuple[str, str, Any]] = {}
-        cursor: dict[str, int] = {}
-        want = []
-        for gw, key, seq in conn.execute("SELECT gw, key, seq FROM replica WHERE coll = 'tasks'"):
-            cursor[str(gw)] = max(cursor.get(str(gw), 0), int(seq or 0))
-            if _tail(key) in tails:
-                want.append((gw, key))
-        for gw, key in want:
-            r = conn.execute("SELECT data FROM replica WHERE gw = ? AND coll = 'tasks' AND key = ?",
-                             (gw, key)).fetchone()
-            if r is not None:
-                rows[(str(gw), str(key))] = self._entry(key, r[0])
-        gateways = {}
-        for gw, seq, data in conn.execute("SELECT gw, seq, data FROM replica WHERE coll = 'gateway' AND key = 'info'"):
-            gateways[str(gw)] = self._scopes(data)
-        self.rows, self.cursor, self.gateways = rows, cursor, gateways
-        self.rebuilds += 1
+    _ROW_SQL = "SELECT seq, data FROM replica WHERE gw = ? AND coll = 'tasks' AND key = ?"
 
-    def _increment(self, conn: sqlite3.Connection) -> None:
-        cursor = dict(self.cursor)
-        gws = {str(r[0]) for r in conn.execute("SELECT gw FROM replica WHERE coll = 'gateway' AND key = 'info'")}
-        for gw in sorted(gws | set(cursor)):
-            for key, seq, data in conn.execute(
-                    "SELECT key, seq, data FROM replica WHERE coll = 'tasks' AND gw = ? AND seq > ?",
-                    (gw, cursor.get(gw, 0))):
-                cursor[gw] = max(cursor.get(gw, 0), int(seq or 0))
-                if _tail(key) in self.tails:
-                    self.rows[(gw, str(key))] = self._entry(key, data)
-        for gw, key in list(self.rows):
-            if conn.execute("SELECT 1 FROM replica WHERE gw = ? AND coll = 'tasks' AND key = ?",
-                            (gw, key)).fetchone() is None:
-                self.rows.pop((gw, key))
+    def _read_gateways(self, conn: sqlite3.Connection) -> None:
         self.gateways = {str(gw): self._scopes(data) for gw, data in conn.execute(
             "SELECT gw, data FROM replica WHERE coll = 'gateway' AND key = 'info'")}
-        self.cursor = cursor
+
+    def _rebuild(self, conn: sqlite3.Connection, tails: frozenset) -> None:
+        self.seqs, self.aggs, self.cursor = {}, {}, {}
+        want = []
+        for gw, key, seq in conn.execute("SELECT gw, key, seq FROM replica WHERE coll = 'tasks'"):
+            gw, key = str(gw), str(key)
+            self._put_seq(gw, key, None if seq is None else int(seq))
+            self.cursor[gw] = max(self.cursor.get(gw, 0), int(seq or 0))
+            if _tail(key) in tails:
+                want.append((gw, key))
+        rows: dict[tuple[str, str], tuple[str, str, Any, str]] = {}
+        for gw, key in want:
+            r = conn.execute(self._ROW_SQL, (gw, key)).fetchone()
+            if r is not None:
+                rows[(gw, key)] = self._entry(key, r[1])
+        self.rows = rows
+        self._read_gateways(conn)
+        self.rebuilds += 1
+
+    def _increment(self, conn: sqlite3.Connection) -> bool:
+        """Advance to ``conn``'s snapshot; False when only a rebuild can tell what changed."""
+        probe = self._probe(conn)
+        if any(n != ns for n, ns, _top, _tot in probe.values()):
+            return False  # a NULL seq: no cursor covers that row (core refuses to memoize it too)
+        for gw in sorted(set(probe) | set(self.cursor)):
+            for key, seq in conn.execute("SELECT key, seq FROM replica WHERE coll = 'tasks' AND gw = ? AND seq > ?",
+                                         (gw, self.cursor.get(gw, 0))):
+                key, seq = str(key), int(seq)
+                self._put_seq(gw, key, seq)
+                self.cursor[gw] = max(self.cursor.get(gw, 0), seq)
+                if _tail(key) in self.tails and (gw, key) not in self.rows:
+                    self.rows[(gw, key)] = ("", "", None, "")  # a new batch row: read below
+        if not self._agrees(probe):
+            return False  # a delete, a rewrite at an older seq, a seq that went back: unknown which rows
+        for (gw, key), old in list(self.rows.items()):
+            r = conn.execute(self._ROW_SQL, (gw, key)).fetchone()
+            if r is None:
+                self.rows.pop((gw, key))
+            elif self._raw_hash(r[1]) != old[3]:
+                self.rows[(gw, key)] = self._entry(key, r[1])  # includes a rewrite in place at the same seq
+        self._read_gateways(conn)
         self.increments += 1
+        return True
 
     def refresh(self, path: Optional[Path], tails: Iterable[str], connect: Callable[[Path], Any],
                 token: Any) -> None:
@@ -254,7 +325,9 @@ class ReplicaWatch:
                     self.clear()
                     self.ok = True
                 return
-            same = self.ok and self.path == str(path) and token is not None and self.token is not None
+            ident = file_ident(path)
+            same = (self.ok and self.path == str(path) and token is not None and self.token is not None
+                    and ident is not None and ident == self.ident)
             if same and token == self.token and tails <= self.tails:
                 if tails != self.tails:
                     self.tails = tails
@@ -270,9 +343,7 @@ class ReplicaWatch:
             try:
                 conn.execute("BEGIN")  # one snapshot: rows, gateways and meta agree
                 try:
-                    if same and tails <= self.tails:
-                        self._increment(conn)
-                    else:
+                    if not (same and tails <= self.tails and self._increment(conn)):
                         self._rebuild(conn, tails)
                     self.meta = {str(k): v for k, v in conn.execute(
                         "SELECT k, v FROM meta WHERE k IN ('last_ok', 'offline_since')").fetchall()}
@@ -280,7 +351,7 @@ class ReplicaWatch:
                     conn.rollback()
                 self.tails = tails
                 self.rows = {k: v for k, v in self.rows.items() if v[0] in tails}
-                self.path, self.token, self.ok = str(path), token, True
+                self.path, self.ident, self.token, self.ok = str(path), ident, token, True
             except Exception:
                 logger.debug("chat-closeout: replica read for waiting inputs failed", exc_info=True)
                 self.clear()
@@ -294,9 +365,9 @@ class ReplicaWatch:
                 raise LookupError("replica unreadable")
             if self.path is None:
                 return ["no-replica"]
-            rows = sorted([gw, key, d] for (gw, key), (_t, d, _o) in self.rows.items())
+            rows = sorted([gw, key, d] for (gw, key), (_t, d, _o, _r) in self.rows.items())
             owners = sorted([gw, key, _fresh(o, now, REPLICA_FRESH_S)]
-                            for (gw, key), (_t, _d, o) in self.rows.items() if o is not None)
+                            for (gw, key), (_t, _d, o, _r) in self.rows.items() if o is not None)
             scopes = sorted([gw, s, _fresh(at, now, w)] for gw, lst in self.gateways.items() for s, at, w in lst)
             meta = dict(self.meta or {})
         raw = meta.get("last_ok")
@@ -313,10 +384,15 @@ class ReplicaWatch:
 # ---- state.db transcripts ---------------------------------------------------------------------------------------
 class LineageWatch:
     """Per-session transcript watermarks per state.db. A db is re-queried only when its stat moved (a process-local
-    gate) or new ids are asked for, on one short-lived connection (never retained, IDLE-READS.md)."""
+    gate) or new ids are asked for, on one short-lived connection (never retained, IDLE-READS.md).
 
-    def __init__(self) -> None:
+    ``vouch(conn)`` (the plugin passes core's ``TRANSCRIPT_TRIGGERS`` check): False when the db's triggers cannot
+    vouch that ``transcript_revision`` moves on an in-place rewrite; then, like core ``transcript_key``, there is
+    no watermark (no reuse)."""
+
+    def __init__(self, vouch: Optional[Callable[[sqlite3.Connection], bool]] = None) -> None:
         self.lock = threading.Lock()
+        self.vouch = vouch
         self.dbs: dict[str, tuple[Optional[tuple], frozenset, dict[str, tuple]]] = {}  # path -> (stat, ids, rows)
         self.queries = 0
 
@@ -341,8 +417,14 @@ class LineageWatch:
                 if "parent_session_id" in scols else "NULL")
         if "session_id" in mcols:
             top = "(SELECT MAX(m.id) FROM messages m WHERE m.session_id = s.id)"
-            act = ("(SELECT MAX(m.id) FROM messages m WHERE m.session_id = s.id AND m.active = 1)"
-                   if "active" in mcols else "NULL")
+            if "active" in mcols:
+                # Core ``transcript_key``'s terms per session, index-only (idx_messages_session_active): an active
+                # flip or delete below the max moves the count and id sum, a timestamp repair (no trigger covers
+                # ``timestamp``) the timestamp sum.
+                act = ("(SELECT json_array(MAX(m.id), COUNT(*), TOTAL(m.id), TOTAL(m.timestamp)) FROM messages m "
+                       "WHERE m.session_id = s.id AND m.active = 1)")
+            else:
+                act = "NULL"
         else:
             top = act = "NULL"
         out: dict[str, tuple] = {}
@@ -350,6 +432,8 @@ class LineageWatch:
         if began:
             conn.execute("BEGIN")  # one snapshot for every id
         try:
+            if self.vouch is not None and ("transcript_revision" not in scols or not self.vouch(conn)):
+                raise Unvouched("state.db cannot vouch for in-place message rewrites")
             for i in range(0, len(ids), 300):
                 chunk = ids[i:i + 300]
                 for r in conn.execute(f"SELECT s.id, {top}, {act}, {rev}, {end}, {kids} FROM sessions s "
@@ -377,7 +461,7 @@ class LineageWatch:
                 else:
                     try:
                         rows = self._query(path, sorted(want), connect) if want else {}
-                    except (sqlite3.Error, OSError):
+                    except (sqlite3.Error, OSError, Unvouched):
                         logger.debug("chat-closeout: lineage watermark of %s unavailable", path, exc_info=True)
                         self.dbs.pop(key, None)
                         return None
