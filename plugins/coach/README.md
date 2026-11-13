@@ -1604,7 +1604,9 @@ Missing audits, marker refusals and prior-run scratch remain untouched. Core's m
 pins reserve capacity, CLI errors/timeouts stop the batch, and a nonblocking file lock prevents overlapping cron ticks.
 A successful spill files no diagnostic card that tick. If unresolved waiting work remains on a later tick, it
 files at most one diagnostic per day, pinned to a pool worker with capacity after pending reservations, with
-`terminal,file,git` requirements (cloneable repo work, not `host_repo`). Both CLI writes are bound to the sampled
+`terminal,file,git` requirements (cloneable repo work, not `host_repo`). It files nothing (JSON `skipped`) when
+every waiting card is a legacy row (no `portable_reason` in its `created` event, so no producer is left to fix)
+whose replay names a real host need; one audited card, a portable replay or a failed check still files. Both CLI writes are bound to the sampled
 home/DB and preserve worker authority fences. Tests: `tests/test_worker_share_spill.py` and
 `tests/test_worker_share_watch.py` (scratch DB, supported CLI boundary, not a live claim-throughput proof).
 Every `created` event also carries `portable_reason` (core), so the marked share is a query. Self-heal splits a

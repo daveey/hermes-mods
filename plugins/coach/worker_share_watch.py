@@ -8,7 +8,8 @@ nothing noticed: the rollout check only tested fake probe cards. This watch samp
 cron, every 10 min): the hub at cap, draining, or refusing admission; a pool worker with room and cards waiting. Three samples in
 a row move at most three never-started, explicitly audited portable cards through core's move CLI. Pending
 pins reserve capacity. Missing audits and host-bound reasons never move. If no move succeeds, one diagnostic
-card per day is pinned to a pool worker with room, listing core's refusal reasons.
+card per day is pinned to a pool worker with room, listing core's refusal reasons, unless every waiting card is an
+unaudited legacy row replaying to a real host need (nothing left to fix).
 
     worker_share_watch.py [--dry-run] [--json] [--home PATH] [--streak 3]
 
@@ -123,6 +124,21 @@ def waiting_unmarked(db: Path) -> list:
 def card_reason(card: dict, reason_fn: Callable[[dict], Optional[str]]) -> str:
     value = card["creation_reason"] if "creation_reason" in card else reason_fn(card)
     return value or "portable (not re-enrolled)"
+
+
+def fixable(waiting: list, reason_fn: Callable[[dict], Optional[str]]) -> bool:
+    """Whether a diagnostic card has anything to fix. Every ``created`` event carries ``portable_reason`` now, so
+    a legacy row (no creation audit) has no producer left to fix; when each one replays to a real host need, the
+    card would only restate it every day. An audited card, a portable replay or a failed check still files."""
+    for card in waiting:
+        if card.get("reason_source") == "created event":
+            return True
+        try:
+            if reason_fn(card) is None:
+                return True
+        except Exception:
+            return True
+    return False
 
 
 def hub_pressure(home: Path, now_ms: int) -> list[str]:
@@ -370,7 +386,7 @@ def run(home: Path, *, registry_fn: Callable[[], object], reason_fn: Callable[[d
     s = sample(dict(registry_fn() or {}), waiting, now_ms, reason_fn, hub_pressure(home, now_ms))
     st = load_state(home)
     streak = (int(st.get("streak") or 0) + 1) if s["starved"] else 0
-    out = {"sample": s, "streak": streak, "filed": None, "moved": [], "move_errors": []}
+    out = {"sample": s, "streak": streak, "filed": None, "skipped": None, "moved": [], "move_errors": []}
     if dry_run:
         return out
     if streak >= streak_needed:
@@ -380,8 +396,11 @@ def run(home: Path, *, registry_fn: Callable[[], object], reason_fn: Callable[[d
     day = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
     pending = pending_pins(home / 'kanban.db')
     s['room'] = {m: n - pending[m] for m, n in s['room'].items() if n > pending[m]}
-    if (s["starved"] and s['room'] and not out['moved'] and not out['move_errors']
-            and streak >= streak_needed and st.get("filed_day") != day):
+    want = (s["starved"] and s['room'] and not out['moved'] and not out['move_errors']
+            and streak >= streak_needed and st.get("filed_day") != day)
+    if want and not fixable(waiting, reason_fn):
+        out["skipped"] = "legacy rows replay to host needs"
+    elif want:
         examples = []
         for c in waiting:
             try:
