@@ -159,6 +159,48 @@ def test_hop_host_uses_proxycommand_through_the_jump_host(env):
     argv = env.ssh_log()[0]["argv"]
     pc = [x for x in argv if x.startswith("ProxyCommand=")]
     assert pc and "daveey@100.1.1.1" in pc[0] and "-W %h:%p" in pc[0] and "daveey@roses-iMac.local" in argv
+    # `--` ends option parsing before every user@addr, the jump host's included.
+    assert argv[argv.index("daveey@roses-iMac.local") - 1] == "--" and "-W %h:%p -- daveey@100.1.1.1" in pc[0]
+
+
+def _runner_job(env, **target):
+    return {"target": dict({"addr": "100.1.1.1", "user": "daveey"}, **target), "timeout": 30, "cap": 8000,
+            "known_hosts": str(env.home / "tailnet" / "known_hosts"), "mode": "exec", "command": "hostname"}
+
+
+def test_runner_puts_double_dash_before_user_at_addr(env):
+    res = tn.run_via_broker("user/tailnet-ssh-key", "t", _runner_job(env), timeout=30)
+    assert res["rc"] == 0 and res["ran"] and "failure" not in res
+    argv = env.ssh_log()[0]["argv"]
+    assert argv[-3:] == ["--", "daveey@100.1.1.1", "hostname"]
+
+
+@pytest.mark.parametrize("target", [{"addr": "-oProxyCommand=touch /tmp/pwn"}, {"user": "-oProxyCommand=x"},
+                                    {"addr": "two words"}, {"user": "a;b"}])
+def test_runner_refuses_an_option_like_target_before_ssh_and_says_it_never_ran(env, target):
+    res = tn.run_via_broker("user/tailnet-ssh-key", "t", _runner_job(env, **target), timeout=30)
+    # rc stays 255 for older callers; "failure" tells it apart from an ssh that could not connect.
+    assert res["rc"] == 255 and res["failure"] == "local"
+    assert "not a plain ssh user and address" in res["stderr"]
+    assert env.ssh_log() == []
+
+
+def test_runner_without_a_vended_key_says_no_key_not_unreachable(env):
+    (env.state / "key").write_text("")
+    res = tn.run_via_broker("user/tailnet-ssh-key", "t", _runner_job(env), timeout=30)
+    assert res["rc"] == 255 and res["failure"] == "no-key"
+    assert env.ssh_log() == []
+
+
+def test_runner_reports_a_missing_ssh_as_a_local_failure(env, monkeypatch):
+    pyonly = env.state.parent / "pyonly"  # python3 for the fake broker's shebang, and no ssh anywhere on PATH
+    pyonly.mkdir()
+    (pyonly / "python3").symlink_to(sys.executable)
+    monkeypatch.setenv("PATH", str(Path(tn.broker_bin()).parent) + ":" + str(pyonly))
+    (Path(tn.broker_bin()).parent / "ssh").unlink()
+    res = tn.run_via_broker("user/tailnet-ssh-key", "t", _runner_job(env), timeout=30)
+    assert res["rc"] == 255 and res["failure"] == "local"
+    assert res["stderr"].startswith("FileNotFoundError: ")
 
 
 def test_mac_ops_profile_owner_turn(env, monkeypatch):

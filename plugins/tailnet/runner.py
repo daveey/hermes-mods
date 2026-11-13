@@ -38,21 +38,33 @@ def base_opts(keyfile, known_hosts, isolated=False):
     return (["-F", "/dev/null"] if isolated else []) + opts
 
 
+USER_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}")
+ADDR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:-]{0,252}")
+
+
+def destination(t):
+    """user@addr, refusing anything ssh could read as an option or a shell word (a leading '-', spaces)."""
+    user, addr = str(t.get("user") or ""), str(t.get("addr") or "")
+    if not USER_RE.fullmatch(user) or not ADDR_RE.fullmatch(addr):
+        raise ValueError("target user/addr is not a plain ssh user and address")
+    return f"{user}@{addr}"
+
+
 def build(job, keyfile, isolated=False):
-    t = job["target"]
-    dest = f"{t['user']}@{t['addr']}"
+    dest = destination(job["target"])
     opts = base_opts(keyfile, job["known_hosts"], isolated)
     if job.get("via"):
-        v = job["via"]
-        hop = " ".join(["ssh"] + base_opts(keyfile, job["known_hosts"], isolated) + ["-W", "%h:%p", f"{v['user']}@{v['addr']}"])
+        hop = " ".join(["ssh"] + base_opts(keyfile, job["known_hosts"], isolated)
+                       + ["-W", "%h:%p", "--", destination(job["via"])])
         opts += ["-o", "ProxyCommand=" + hop]
     mode = job["mode"]
+    # `--` ends ssh/scp option parsing, so user@addr (and the paths) can never be taken as an option.
     if mode == "exec":
-        return ["ssh"] + opts + [dest, job["command"]]
+        return ["ssh"] + opts + ["--", dest, job["command"]]
     if mode == "put":
-        return ["scp", "-q", "-p"] + opts + [job["local"], f"{dest}:{job['remote']}"]
+        return ["scp", "-q", "-p"] + opts + ["--", job["local"], f"{dest}:{job['remote']}"]
     if mode == "get":
-        return ["scp", "-q", "-p"] + opts + [f"{dest}:{job['remote']}", job["local"]]
+        return ["scp", "-q", "-p"] + opts + ["--", f"{dest}:{job['remote']}", job["local"]]
     raise ValueError("bad mode")
 
 
@@ -269,7 +281,10 @@ def main():
                           "error": msg, "seconds": 0}))
         return
     if not key.strip():
-        print(json.dumps({"rc": 255, "stdout": "", "stderr": "no key vended by the broker", "seconds": 0}))
+        # rc 255 like an ssh that could not connect (older callers); "failure" says ssh never ran. ("ran" stays
+        # unset: to the plugin it means the runner was reached, i.e. the request was approved.)
+        print(json.dumps({"rc": 255, "failure": "no-key",
+                          "stdout": "", "stderr": "no key vended by the broker", "seconds": 0}))
         return
     if not key.endswith("\n"):
         key += "\n"
@@ -288,6 +303,7 @@ def main():
         if job["mode"] == "put" and os.path.getsize(job["local"]) > int(job.get("max_bytes") or 0):
             raise ValueError("file too large")
         copy_started = False
+        local_failure = False
         try:
             if job.get("_bounded_get"):
                 preflight_get(job, kf, env)
@@ -305,7 +321,9 @@ def main():
         except subprocess.TimeoutExpired as exc:
             rc, out, err = 124, (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or ""), "timed out"
         except Exception as exc:
+            # A local failure (ssh/scp missing, a refused target, a changed staged file): the job never ran.
             rc, out, err = 255, "", f"{type(exc).__name__}: {exc}"
+            local_failure = True
         if job.get("_bounded_get") and copy_started and rc != 0:
             Path(job["local"]).unlink(missing_ok=True)
         if job["mode"] == "get" and rc == 0 and os.path.exists(job["local"]) \
@@ -316,8 +334,11 @@ def main():
             out = out or f"copied ({os.path.getsize(job['local'])} bytes locally)"
     finally:
         shutil.rmtree(d, ignore_errors=True)
-    print(json.dumps({"rc": rc, "stdout": clean(out, key, cap), "stderr": clean(err, key, cap),
-                      "seconds": round(time.time() - t0, 1)}))
+    result = {"rc": rc, "stdout": clean(out, key, cap), "stderr": clean(err, key, cap),
+              "seconds": round(time.time() - t0, 1)}
+    if local_failure:
+        result["failure"] = "local"
+    print(json.dumps(result))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ A profile's local turns (CLI, cron, Kanban workers; never a chat user) skip the 
 
 The runner checks workload syntax **before creating a key directory/file or starting SSH/SCP**. This covers both plugin tools (including approved requests) and direct `token-broker exec -- python runner.py` calls with jobs on stdin. These refusals return JSON with `rc: 126`, `ran: false`, `blocked: true`, and an explanation. Protected downloads additionally perform authenticated metadata preflight before SCP; failed metadata returns a nonzero rc without transferring the file. Approval does not override workload placement.
 
+The runner always passes `--` before `user@addr` to ssh/scp (and to the jump host's ssh) and refuses a target whose user or address is not a plain value (a leading `-`, spaces or shell metacharacters) before SSH starts. When the job failed before SSH/SCP ran, the reply keeps `rc: 255` for older callers but adds `failure`: `"no-key"` (the broker vended no key) or `"local"` (ssh missing, a refused target, a local exception). A reply with `rc: 255` and no `failure` is SSH's own exit: it could not connect or authenticate.
+
 An administrator may install this private JSON file at **`Path.home() / ".hermes/tailnet/workload-policy.json"`**. It is intentionally not relative to `HERMES_HOME`, a profile, or a job-supplied path. Keep real machine identities out of this public repository.
 
 ```json
