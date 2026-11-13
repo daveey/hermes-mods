@@ -1150,6 +1150,7 @@ def collect_cron(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                         "details": home_tilde(f"job {job.get('id')} ({name}, profile {prof}) failure_streak="
                                               f"{job.get('failure_streak')} last_status={job.get('last_status')} "
                                               f"filed: {why}\nscript={job.get('script')}\n{detail}")[:1500],
+                        "recheck": cron_recheck(detail, lf.get("kind")),
                         "fp": fp("cron", host, prof, name)})
         for k in [k for k in cuts if k.startswith(f"{prof}:") and k not in present]:
             cuts.pop(k, None)  # the job was removed: nothing left to rerun
@@ -1943,11 +1944,26 @@ def template_recheck(rule: str, head: str) -> dict:
     return {"kind": "template_hold", "rule": rule, "head": head}
 
 
+def cron_recheck(detail: str, failure_kind: Optional[str] = None) -> dict:
+    """The input collect_cron judged a counted cron failure on (its last_failure detail and kind)."""
+    return {"kind": "cron_failure", "detail": str(detail or "")[:500], "failure_kind": failure_kind or None}
+
+
+def _cron_failure_exempt(r: dict) -> Optional[str]:
+    """Why collect_cron would not count this failure now: the same cron_lifecycle_interrupt test it applies, on the same
+    record (a typed kind decides alone). cron-4fc984eb0b: rows queued before 3d196a72 counted restart cuts."""
+    lf = {"kind": r.get("failure_kind")} if r.get("failure_kind") else {}
+    if cron_lifecycle_interrupt(lf, str(r.get("detail") or "")):
+        return "cron lifecycle interrupt (current classifier)"
+    return None
+
+
 # Detector re-checks for deferred signals (t_01a1d5815b28b08b): a signal carries {"kind": <key>, ...} as "recheck";
 # self_heal.retry_deferred calls recheck_exempts before filing and withdraws the row when the detector, on the code
 # running now, would not fire. A new detector kind adds its collector's own skip predicate here.
 RECHECKS: Dict[str, Callable[[dict], Optional[str]]] = {
     "template_hold": lambda r: _template_hold_exempt(str(r.get("rule") or ""), str(r.get("head") or "")),
+    "cron_failure": _cron_failure_exempt,
 }
 
 
@@ -1961,14 +1977,26 @@ _TEMPLATE_SYMPTOM_RE = re.compile(r'^coach (\S+) held \d+ replies whose user tur
                                   r'chats: ')
 
 
+# collect_cron's counted-failure details: "job <id> (<name>, profile <prof>) failure_streak=... filed: ...\n
+# script=...\n<detail>", optionally behind to_defect's "(seen Nx this pass)\n". The restart-cut-unrecovered alarm
+# has another shape (and fingerprint), so it is never rebuilt.
+_CRON_DETAILS_RE = re.compile(r"^(?:\(seen \d+x this pass\)\n)?job \S+ \(([^\n]*), profile (\S+)\) failure_streak=[^\n]*"
+                              r" filed: [^\n]*\nscript=[^\n]*\n")
+
+
 def defect_recheck(d: dict) -> Optional[dict]:
     """The recheck of a self-heal defect: its own field, else (rows deferred before the field existed) one rebuilt from a
-    template-hold symptom, trusted only when it reproduces the row's fingerprint."""
+    template-hold symptom or cron failure details, trusted only when it reproduces the row's fingerprint."""
     if isinstance(d.get("recheck"), dict):
         return d["recheck"]
     m = _TEMPLATE_SYMPTOM_RE.match(str(d.get("symptom") or ""))
     if m and fp("agent", "template-hold", m.group(1), m.group(2).lower()) == d.get("fingerprint"):
         return template_recheck(m.group(1), m.group(2))
+    if d.get("component") == "cron" and d.get("kind") == "cron":
+        details = str(d.get("details") or "")
+        m = _CRON_DETAILS_RE.match(details)
+        if m and fp("cron", d.get("host"), m.group(2), m.group(1)) == d.get("fingerprint"):
+            return cron_recheck(details[m.end():])  # legacy rows carry no last_failure kind: prose fallback
     return None
 
 

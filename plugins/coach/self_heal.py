@@ -2380,7 +2380,11 @@ NATURAL_EVENT_RULE = """   `live_check` needs a natural event (the real failing 
    timeouts, a scratch HERMES_HOME, never a live session or registry)? Then run an A/B repro instead of waiting,
    within this card's budget: the installed tree must pass, and the pre-fix tree must reproduce the original
    symptom (build it as `<first fix sha>^` in a temporary worktree, remove it afterwards). Record fixed only when
-   both hold; a repro whose pre-fix run also passes proves nothing."""
+   both hold; a repro whose pre-fix run also passes proves nothing.
+   A detector or classifier fix also covers detections queued under the old rule: run
+   `self_heal._detector_exempts_now(row)` on every row of that family still in `coach/selfheal_pending.sqlite` (and
+   on the fixed defect's own stored payload). One the fix should drop but the recheck keeps is not fixed: it files
+   the next morning (cron-4fc984eb0b)."""
 
 
 # selfheal lesson [verify-retry-receipt-first] (x5): a retried VERIFY whose quota-killed run had already logged

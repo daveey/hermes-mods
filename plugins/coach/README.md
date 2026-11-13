@@ -1378,7 +1378,11 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   Overlapping ranges within two hours are dropped as `selfheal_skip` / `resolved under <fp>` only with a
   deployed fix explicitly named in the disposition. Post-disposition crashes, remote hosts and missing or
   ambiguous evidence still go through admission. Detection/disposition timestamps never substitute for crash
-  ranges. Regression coverage: `tests/test_resolved_crash_pending.py`. Fixes remain proposed so Inbox
+  ranges. Regression coverage: `tests/test_resolved_crash_pending.py`. A queued signal is also re-asked of its own
+  detector on the code deployed now (`signals.RECHECKS`: `template_hold`, `cron_failure`; a signal's `recheck` field,
+  else rebuilt from a legacy row only when that reproduces its fingerprint) and dropped as `selfheal_skip` /
+  `detector_exempts_now: <why>`: a queued cron failure the current classifier calls a restart cut is never filed
+  (cron-4fc984eb0b, `tests/test_cron_recheck_pending.py`). Fixes remain proposed so Inbox
   sync retries the existing Do-it outcome. Unavailable or invalid accounting refuses admission. Each card body
   carries a `Budget for this card` line ($8 investigation, $15 fix) for the engine watchdog.
   This is not a strict monetary reservation system: queued/concurrent admissions, cross-board accounting,
