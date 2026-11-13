@@ -253,6 +253,41 @@ def test_open_owner_by_body_fingerprint_line_takes_a_comment(env):
     assert events(env.store, "selfheal_dedup_commented")[0]["via"] == "body"
 
 
+@pytest.mark.parametrize("via", ["key", "body"])
+def test_open_owner_excludes_self_refile_and_finds_next_owner(env, via):
+    fp = defect()["fingerprint"]
+    for tid, age in (("t_self", 120), ("t_other", 60)):
+        env.board.add(tid, key=f"selfheal:{fp}:{tid}" if via == "key" else tid,
+                      body=sh.with_fp_line("hand-filed owner", fp) if via == "body" else "",
+                      created_at=NOW - age)
+
+    # Control: the re-filing card really is the oldest matching open owner.
+    assert sh.open_owner(fp, None)["id"] == "t_self"
+    owner = sh.open_owner(fp, None, exclude=["t_self"])
+    assert owner["id"] == "t_other"
+    assert owner["via"] == via
+    assert sh.open_owner(fp, None, exclude=["t_self", "t_other"]) is None
+
+
+@pytest.mark.parametrize("via", ["key", "body"])
+def test_self_refile_comments_other_owner_not_itself(env, via):
+    d = defect(filed_by="t_self")
+    fp = d["fingerprint"]
+    for tid, age in (("t_self", 120), ("t_other", 60)):
+        env.board.add(tid, key=f"selfheal:{fp}:{tid}" if via == "key" else tid,
+                      body=sh.with_fp_line("hand-filed owner", fp) if via == "body" else "",
+                      created_at=NOW - age)
+
+    out = file(env, d)
+    assert out["action"] == "skip" and out["dedup"] is True
+    assert out["card"] == "t_other"
+    assert env.board.creates() == []
+    ((card, body),) = env.board.comments
+    assert card == "t_other" and fp in body
+    (event,) = events(env.store, "selfheal_dedup_commented")
+    assert event["card"] == "t_other" and event["via"] == via
+
+
 def test_fingerprint_mentioned_inline_is_not_an_owner(env):
     d = defect()
     fp = d["fingerprint"]
