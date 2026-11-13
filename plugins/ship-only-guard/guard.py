@@ -78,8 +78,22 @@ def _deny(repo, operation, repos):
     return None
 
 
-def _path(value, cwd):
+_VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _path(value, cwd, env=None):
+    """Resolve a cd/-C target. `$VAR`/`${VAR}` expand from the command's env snapshot when set there;
+    an unset one stays literal (gh probes then fall back, `_probe_cwd`)."""
+    if env is not None and "$" in value:
+        value = _VAR.sub(lambda m: env.get(m[1] or m[2], m[0]), value)
     return os.path.abspath(os.path.join(cwd, os.path.expanduser(value)))
+
+
+def _probe_cwd(cwd):
+    """cwd for a gh probe whose repo is explicit. A derived cwd that does not exist (an unexpanded
+    `cd $VAR;` target) would raise OSError in subprocess and fail the preflight for no real reason,
+    so the probe runs in the guard's own cwd instead."""
+    return cwd if cwd and os.path.isdir(cwd) else None
 
 
 REVIEW_REPLY_MARKER = "<!-- hermes-review-reply -->"
@@ -311,7 +325,7 @@ def _base_drift_refusal(number, repo, data, cwd, env):
     probe_env["GH_PROMPT_DISABLED"] = "1"
     try:
         p = subprocess.run(["gh", "api", f"repos/{repo}/compare/{base}...state"],
-                           cwd=cwd, env=probe_env, capture_output=True, text=True, timeout=15)
+                           cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
         if p.returncode != 0:
             return closed(f"the compare {base[:10]}...state failed (exit {p.returncode})")
         cmp = json.loads(p.stdout)
@@ -367,8 +381,9 @@ def _base_drift_refusal(number, repo, data, cwd, env):
 def _state_merge(words, repo, cwd, env):
     """Narrow state-only exception, never a general non-main merge allowance.
 
-    Returns True to allow, False when the command is not this route or any preflight
-    fails, or a refusal string naming unanswered review points or a missing exact-head
+    Returns True to allow, False when the command is not this route, or a refusal
+    string: a named failed preflight step (gh view error, state/base/head/url mismatch,
+    non-green check names), unanswered review points or a missing exact-head
     approval. Independence of the reviewer and required-CI coverage remain caller
     duties; this preflight refuses missing/non-green visible checks, refuses while any
     review whose body raises a non-blocking point ("nit", "non-blocking", un-negated)
@@ -410,35 +425,70 @@ def _state_merge(words, repo, cwd, env):
     fields = "number,url,state,baseRefName,baseRefOid,headRefOid,statusCheckRollup,reviews,comments,files"
     probe_env = dict(env)
     probe_env["GH_PROMPT_DISABLED"] = "1"
+    number, sha = args[0], options["--match-head-commit"]
+
+    def failed(step):
+        # The command has the state-merge form, so name the failing preflight step instead of the
+        # generic deny (a `cd $VAR;` cwd once failed it silently, t_01a1d625bbebeaa8).
+        return (f"[ship-only-guard] Refused state merge of PR #{number} ({repo}): the exact-head state "
+                f"preflight failed: {step}. Fix that and rerun the same command; a PR into main lands "
+                "only through `hermes-core-wt ship <slug>`.")
+
     try:
-        p = subprocess.run(["gh", "pr", "view", args[0], "--repo", repo, "--json", fields],
-                           cwd=cwd, env=probe_env, capture_output=True, text=True, timeout=15)
-        if p.returncode != 0:
-            return False
+        p = subprocess.run(["gh", "pr", "view", number, "--repo", repo, "--json", fields],
+                           cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        return failed(f"`gh pr view {number} --repo {repo}` could not run ({type(e).__name__}: {str(e)[:120]})")
+    if p.returncode != 0:
+        err = " ".join(str(getattr(p, "stderr", "") or "").split())[:160]
+        return failed(f"`gh pr view {number} --repo {repo}` exited {p.returncode}" + (f" ({err})" if err else ""))
+    try:
         data = json.loads(p.stdout)
-        if not isinstance(data, dict):
-            return False
-        if (data.get("number") != int(args[0]) or data.get("state") != "OPEN"
-                or data.get("baseRefName") != "state"
-                or data.get("headRefOid") != options["--match-head-commit"]
-                or not isinstance(data.get("url"), str)
-                or data["url"].lower() != f"https://github.com/{repo}/pull/{args[0]}"):
-            return False
+    except (ValueError, TypeError):
+        return failed(f"`gh pr view {number}` returned unreadable JSON")
+    if not isinstance(data, dict):
+        return failed(f"`gh pr view {number}` returned no JSON object")
+    try:
+        mismatch = []
+        if data.get("number") != int(number):
+            mismatch.append(f"number is {data.get('number')!r}")
+        if data.get("state") != "OPEN":
+            mismatch.append(f"state is {data.get('state')!r}, not OPEN")
+        if data.get("baseRefName") != "state":
+            mismatch.append(f"base is {data.get('baseRefName')!r}, not 'state'")
+        if data.get("headRefOid") != sha:
+            mismatch.append(f"head is {str(data.get('headRefOid'))[:12]!r}, not --match-head-commit {sha[:12]}")
+        if not isinstance(data.get("url"), str) or data["url"].lower() != f"https://github.com/{repo}/pull/{number}":
+            mismatch.append(f"url is {data.get('url')!r}")
+        if mismatch:
+            return failed("; ".join(mismatch))
         checks = data.get("statusCheckRollup")
         # gh's connection is bounded; never infer success from a possibly capped
         # rollup. Skipped/neutral/unknown checks conservatively require the ship path.
         if not isinstance(checks, list) or not 0 < len(checks) < 100:
-            return False
-        if not all(isinstance(c, dict) and (
-            c.get("__typename") == "CheckRun" and c.get("status") == "COMPLETED"
-            and c.get("conclusion") == "SUCCESS" or
-            c.get("__typename") == "StatusContext" and c.get("state") == "SUCCESS"
-        ) for c in checks):
-            return False
-        return (_review_reply_refusal(args[0], data) or _approval_refusal(args[0], data)
-                or _base_drift_refusal(args[0], repo, data, cwd, env) or True)
-    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
-        return False
+            n = len(checks) if isinstance(checks, list) else "no"
+            return failed(f"statusCheckRollup has {n} entries (needs 1-99 readable checks)")
+
+        def green(c):
+            return isinstance(c, dict) and (
+                c.get("__typename") == "CheckRun" and c.get("status") == "COMPLETED"
+                and c.get("conclusion") == "SUCCESS" or
+                c.get("__typename") == "StatusContext" and c.get("state") == "SUCCESS")
+
+        def label(c):
+            if not isinstance(c, dict):
+                return "?"
+            name = c.get("name") or c.get("context") or "?"
+            return f"{name}={c.get('conclusion') or c.get('state') or c.get('status') or '?'}"
+
+        bad = [label(c) for c in checks if not green(c)]
+        if bad:
+            return failed(f"{len(bad)} of {len(checks)} checks not green: " + ", ".join(bad[:8])
+                          + (f", +{len(bad) - 8} more" if len(bad) > 8 else ""))
+        return (_review_reply_refusal(number, data) or _approval_refusal(number, data)
+                or _base_drift_refusal(number, repo, data, cwd, env) or True)
+    except (ValueError, TypeError) as e:
+        return failed(f"`gh pr view {number}` returned an unexpected shape ({type(e).__name__})")
 
 
 SYNC_REQUIRED_CHECK = "All required checks pass (v2)"
@@ -486,7 +536,7 @@ def _upstream_sync_merge(words, repo, cwd, env):
     probe_env["GH_PROMPT_DISABLED"] = "1"
     try:
         p = subprocess.run(["gh", "pr", "view", args[0], "--repo", repo, "--json", fields],
-                           cwd=cwd, env=probe_env, capture_output=True, text=True, timeout=15)
+                           cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
         if p.returncode != 0:
             return False
         data = json.loads(p.stdout)
@@ -625,7 +675,7 @@ def check_argv(argv, cwd=None, repos=None, env=None, _depth=0):
             elif words[0] in {"-i", "--ignore-environment", "-"}:
                 env = {}; words.pop(0)
             elif words[0] in {"-C", "--chdir"} and len(words) > 1:
-                cwd = _path(words[1], cwd); words = words[2:]
+                cwd = _path(words[1], cwd, env); words = words[2:]
             elif words[0] == "--":
                 words.pop(0); break
             else:
@@ -654,11 +704,11 @@ def check_argv(argv, cwd=None, repos=None, env=None, _depth=0):
             if w in {"-C", "-c", "--work-tree", "--git-dir"} and words:
                 value = words.pop(0)
                 if w in {"-C", "--work-tree"}:
-                    cwd = _path(value, cwd)
+                    cwd = _path(value, cwd, env)
                 elif w == "-c" and "=" in value:
                     k, v = value.split("=", 1); config[k] = v
             elif w.startswith("-C"):
-                cwd = _path(w[2:], cwd)
+                cwd = _path(w[2:], cwd, env)
         if words and words[0] == "push":
             return _push(words[1:], cwd, repos, config)
     return None
@@ -700,7 +750,7 @@ def check_shell(command, cwd=None, repos=None, env=None, _depth=0):
         # Only cwd is propagated. Command-prefix assignments, especially the land
         # marker, never leak to later commands in a compound expression.
         if words and words[0] in {"cd", "pushd"} and len(words) == 2:
-            cwd = _path(words[1], cwd)
+            cwd = _path(words[1], cwd, env)
         why = check_argv(words, cwd, repos, env, _depth + 1)
         if why:
             return why

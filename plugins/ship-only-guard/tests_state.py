@@ -246,3 +246,75 @@ def test_merge_api_stays_refused(monkeypatch):
     calls = probe(monkeypatch, payload())
     assert check(["gh", "api", "repos/example/protected/pulls/12/merge"])
     assert not calls
+
+
+# t_01a1d625bbebeaa8: `cd $HERMES_KANBAN_WORKSPACE; gh pr merge ...` for green, approved state PR #2511 was
+# refused with the generic text: the literal `<cwd>/$VAR` became the gh probe's cwd, subprocess raised
+# OSError and the preflight returned False.
+def strict_probe(monkeypatch, data):
+    """Like probe(), but a nonexistent cwd raises as real subprocess.run does."""
+    calls = []
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if kwargs.get("cwd") is not None and not g.os.path.isdir(kwargs["cwd"]):
+            raise FileNotFoundError(2, "No such file or directory", kwargs["cwd"])
+        out = IDENTICAL if argv[:2] == ["gh", "api"] else data
+        return SimpleNamespace(returncode=0, stdout=json.dumps(out))
+    monkeypatch.setattr(g.subprocess, "run", run)
+    return calls
+
+
+def test_cd_unset_var_prefix_still_probes(monkeypatch, tmp_path):
+    import shlex
+    calls = strict_probe(monkeypatch, payload())
+    command = "cd $HERMES_KANBAN_WORKSPACE; " + shlex.join(CMD)
+    assert g.check_shell(command, cwd=str(tmp_path), repos={"example/protected"}, env={}) is None
+    assert len(calls) == 2 and all(kw["cwd"] is None for _, kw in calls)
+    assert g.check_tool("terminal", {"command": command, "workdir": str(tmp_path)},
+                        repos={"example/protected"}, env={}) is None
+
+
+def test_cd_set_var_prefix_expands(monkeypatch, tmp_path):
+    import shlex
+    calls = strict_probe(monkeypatch, payload())
+    for target in ("$WS", "${WS}", '"$WS"'):
+        calls.clear()
+        command = f"cd {target} && " + shlex.join(CMD)
+        assert g.check_shell(command, cwd="/", repos={"example/protected"}, env={"WS": str(tmp_path)}) is None
+        assert calls[0][1]["cwd"] == str(tmp_path)
+
+
+@pytest.mark.parametrize("updates,named", [
+    ({"baseRefName": "main"}, "base is 'main', not 'state'"),
+    ({"state": "MERGED"}, "state is 'MERGED', not OPEN"),
+    ({"headRefOid": "b" * 40}, "not --match-head-commit aaaaaaaaaaaa"),
+    ({"statusCheckRollup": []}, "statusCheckRollup has 0 entries"),
+    ({"statusCheckRollup": [{"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                            {"__typename": "CheckRun", "name": "tests", "status": "COMPLETED", "conclusion": "FAILURE"},
+                            {"__typename": "CheckRun", "name": "e2e", "status": "IN_PROGRESS", "conclusion": None}]},
+     "2 of 3 checks not green: tests=FAILURE, e2e=IN_PROGRESS"),
+])
+def test_failed_preflight_names_the_step(monkeypatch, updates, named):
+    probe(monkeypatch, payload(**updates))
+    why = check()
+    assert why and "state preflight failed" in why and named in why
+    assert "Refused direct gh pr merge" not in why
+
+
+def test_gh_view_failure_named(monkeypatch):
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        returncode=1, stdout="", stderr="HTTP 401: Bad credentials"))
+    why = check()
+    assert "gh pr view 12 --repo example/protected` exited 1 (HTTP 401: Bad credentials)" in why
+    def boom(*a, **k):
+        raise OSError("offline")
+    monkeypatch.setattr(g.subprocess, "run", boom)
+    assert "could not run (OSError: offline)" in check()
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="not json"))
+    assert "unreadable JSON" in check()
+
+
+def test_non_state_form_keeps_generic_deny(monkeypatch):
+    calls = probe(monkeypatch, payload())
+    assert "Refused direct gh pr merge" in check(CMD + ["--auto"])
+    assert not calls

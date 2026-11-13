@@ -140,7 +140,15 @@ and verify postmerge CI and deployment separately.
 `tests_state.py` covers allowed and refused preflights, malformed/unreadable
 responses, transport failures, head/base changes, CI states, bounded rollups,
 base drift under CI (the #2491 replay, sync churn, workflows, truncated compares),
-strict flags and terminal/Python/tool entry points. No test merges a live PR.
+strict flags, `cd $VAR;` prefixes, named failure steps and terminal/Python/tool
+entry points. No test merges a live PR.
+
+A command in the state-merge form that fails the preflight names the failing step
+(`gh pr view` exit/stderr or transport error, state/base/head/url mismatch, the
+non-green check names and conclusions) instead of the generic deny. The `gh`
+probes take the repo from the explicit `--repo`, so a derived cwd that does not
+exist (e.g. an unset `cd $VAR;` target) is dropped and the probe runs in the
+guard's own cwd; `cd $VAR`/`${VAR}` targets expand from the command's env when set.
 
 ## Upstream-sync landing (main, merge commit)
 
@@ -196,7 +204,8 @@ remain necessary. This plugin does not install or change that workflow.
 
 This bounded analyzer is not a shell/Python interpreter. Computed argv, arbitrary
 wrapper scripts, dynamic imports, HTTP clients other than `gh api`, Git aliases,
-complex shell expansion/substitutions, variable-based cwd, conditional shell state,
+complex shell expansion/substitutions, variable-based cwd beyond a plain
+`$VAR`/`${VAR}` cd target set in the env snapshot, conditional shell state,
 and complete Python control-flow/scope analysis are not covered. Literal child
 shells and inline Python are inspected to a bounded depth. Shell cwd tracking is
 linear; use explicit tool `workdir`/subprocess `cwd` for unambiguous context. A
