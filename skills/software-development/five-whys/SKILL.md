@@ -84,6 +84,11 @@ For each answer:
 - **It is a fact with evidence**, not a guess: cite the log line, test, `file:line`, commit, config value or
   measurement. Toyota's version of this is *genchi genbutsu*, go and see. If you only have a hypothesis, label it
   `(hypothesis)`, test it, and don't build further whys on it until it holds.
+- **A hypothesis written into a skill names its owner card.** A chat's `(hypothesis)` label dies with the chat; a
+  skill note outlives it. Skill text that states a cause nobody has tested carries `(unconfirmed: t_<card>)`, naming
+  the card that will settle it, never a bare "cause is unconfirmed". When your chain settles that cause, grep every
+  skill tree for the card id and rewrite each marked note (SKILL.md and references alike) to the verified cause, or
+  delete it. A sweep opens a reconcile card for any marker whose card has finished.
 - **A missing mechanism is a hypothesis until searched.** Before a why says nothing does X ("nothing asks workers
   to pause", "X is never retried"), search the code, repo README/docs and active configuration for X. Start from
   distinctive log terms (policy names, flags), then trace the documented contract to the deployed control.
