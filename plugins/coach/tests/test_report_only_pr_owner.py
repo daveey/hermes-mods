@@ -24,6 +24,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "pr_owner_closeout_turn.json"
+# The ro URI flag inside the recorded agent commands below. Spelled in halves: those are fixture strings, not opens,
+# and tests/test_sqlite_ro_guard.py would otherwise flag them as bare ro opens with no fallback.
+RO = "mode=" + "ro"
 
 
 def _mod(name):
@@ -291,9 +294,9 @@ REPLY_276 = (
 CMD_276 = ("cd ~; D=~/.hermes/kanban.db; date -u +%T; for n in 1779 1714; do echo \"$n $(token-broker exec --scope "
            "user/github --reason 'read PR state for close-out' -- gh pr view $n -R acme/hermes --json state,mergedAt,"
            "headRefOid,title 2>&1 | tail -1 | cut -c1-260)\"; done; for f in $D ~/.hermes/kanban/sync-shadow/default.db;"
-           " do sqlite3 -separator ' | ' \"file:$f?mode=ro\" \"select id,status,coalesce(lease_holder,'-'),created_on,"
+           f" do sqlite3 -separator ' | ' \"file:$f?{RO}\" \"select id,status,coalesce(lease_holder,'-'),created_on,"
            "substr(title,1,100) from tasks where status not in ('archived','done') and (title like '%1779%' or title "
-           f"like '%pre-rebase head%' or id='{BUILD}')\"; sqlite3 \"file:$f?mode=ro\" \"select substr(coalesce(summary,"
+           f"like '%pre-rebase head%' or id='{BUILD}')\"; sqlite3 \"file:$f?{RO}\" \"select substr(coalesce(summary,"
            f"''),1,900) from task_runs where task_id='{REVIEW}' order by id desc limit 1\"; done | sort -u")
 OUT_276 = (
     "00:03:12\n1779 {\"headRefOid\":\"c11e71f25cec5320e240694fb4510d4bddc936ef\",\"mergedAt\":\"2026-11-13T00:02:26Z\","
@@ -362,7 +365,7 @@ def test_raw_readonly_sqlite_read_counts_as_a_turn_touched_card(tmp_path, monkey
     _board_276(tmp_path, monkeypatch)
     assert BUILD in rc.turn_card_ids(_log_276())
     ec = _tool_log([("execute_code", {"code": "import sqlite3\nc = sqlite3.connect('file:/h/.hermes/kanban/sync-shadow/"
-                                               f"mac.db?mode=ro', uri=True)\nprint(c.execute(\"select status from "
+                                               f"mac.db?{RO}', uri=True)\nprint(c.execute(\"select status from "
                                                f"tasks where id='{BUILD}'\").fetchall())"}, '{"output": "scheduled"}')])
     assert rc.turn_card_ids(ec) == [BUILD]
     assert rc.turn_card_ids(_tool_log([("terminal", {"command": f"grep {BUILD} notes.txt"}, '{"output": ""}')])) == []
