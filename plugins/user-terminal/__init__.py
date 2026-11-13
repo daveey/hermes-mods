@@ -2073,6 +2073,30 @@ def _sweep_register_hook() -> None:
     _SWEEP_GENERATION_HOOK = True
 
 
+def _is_board_busy(exc) -> bool:
+    """True for a board that is only busy (core ``BoardLifecycleBusy``, native SQLITE_BUSY/LOCKED, or a
+    reader waiting out a dead WAL generation): "retry next pass", not a broken board. Core re-raises
+    these on purpose so callers can retry; logging them as ERROR files false self-heal defects."""
+    try:
+        from hermes_cli.kanban_generation import DeletedWalGenerationError
+    except ImportError:
+        DeletedWalGenerationError = None
+    if DeletedWalGenerationError is not None and isinstance(exc, DeletedWalGenerationError):
+        return True
+    try:
+        from hermes_cli.kanban_generation import is_busy
+    except ImportError:
+        is_busy = None
+    if is_busy is not None:
+        return bool(is_busy(exc))
+    import sqlite3
+    return (getattr(exc, 'sqlite_errorcode', 0) or 0) & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
+
+class _SweepBoardBusy(Exception):
+    """This pass already found the board busy: skip the job quietly, no second open."""
+
+
 def _sweep_db_stamp(path: str):
     """Stat catches replacement/WAL changes; data_version catches WAL commit publication.
 
@@ -2207,11 +2231,22 @@ def sweep_jobs(skip: Path | None = None) -> None:
         # All jobs on one board share a pre-inspection observation for this pass.
         # Commits during the pass invalidate it on the next pass, never get relabelled.
         db_stamps = {}
+        busy_dbs = set()  # boards found busy this pass: later jobs on them skip without reopening
+
         def db_stamp(db):
             if not db:
                 return None
+            if db in busy_dbs:
+                raise _SweepBoardBusy(db)
             if db not in db_stamps:
-                db_stamps[db] = _sweep_db_stamp(db)
+                try:
+                    db_stamps[db] = _sweep_db_stamp(db)
+                except Exception as exc:
+                    if _is_board_busy(exc):
+                        busy_dbs.add(db)
+                        log.debug("user_terminal: board %s busy (%s); retry next pass", db, exc)
+                        raise _SweepBoardBusy(db) from exc
+                    raise
             return db_stamps[db]
 
         for job in jobs:
@@ -2267,9 +2302,14 @@ def sweep_jobs(skip: Path | None = None) -> None:
                     log.debug("user_terminal: %s has a malformed state file; not memoized", job)
                     continue
                 _sweep_remember(job, stamp, db)
-            except Exception:
+            except _SweepBoardBusy:
+                _SWEEP_FINAL.pop(job, None)  # logged once per board above; never memoized
+            except Exception as exc:
                 _SWEEP_FINAL.pop(job, None)
-                log.exception("user_terminal: reconciling %s failed", job)
+                if _is_board_busy(exc):  # a board read inside watch_once: normal, retried next pass
+                    log.debug("user_terminal: reconciling %s: board busy (%s); retry next pass", job, exc)
+                else:
+                    log.exception("user_terminal: reconciling %s failed", job)
     finally:
         _SWEEP_LOCK.release()
 
@@ -2430,8 +2470,11 @@ def _open_or_fail(job: Path, prefix: str) -> tuple[str | None, dict | None]:
 def _reconcile(job: Path) -> None:
     try:
         watch_once(job, {})
-    except Exception:
-        log.exception("user_terminal: reconciling %s failed", job)
+    except Exception as exc:
+        if _is_board_busy(exc):
+            log.debug("user_terminal: reconciling %s: board busy (%s); retry next pass", job, exc)
+        else:
+            log.exception("user_terminal: reconciling %s failed", job)
 
 
 def _card_note(job: Path) -> str:
