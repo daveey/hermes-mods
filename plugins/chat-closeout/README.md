@@ -74,6 +74,16 @@ The legacy instruction says that status wins over the handoff, so a finished ask
 relisted as open (self-heal agent-f82d813de9). A failed read prints no live lines.
 `tests/test_handoff_live_refs.py`.
 
+**Comments posted after the handoff.** A decision often lands later as a comment on the
+same card, with no new run (David choosing "Close scoped" on an archived card). The full
+board read carries up to 2 comments per card created after its handoff (the end of the run
+whose summary is the handoff, else `completed_at`), decisions ranked before chatter, 300
+chars each, 4 KB per prompt. They print under the handoff as `later on this card (after its
+handoff): <UTC> <author>: <text>`, and every prompt logs `closeout_later_comments n=<k>`.
+The coach's report_only judges show these lines in their own section and count them as a
+card read recording the decision (self-heal agent-93112d1e96).
+`tests/test_handoff_later_comments.py`, coach `tests/test_report_only_closeout_later.py`.
+
 ## Ownership and evidence
 
 New batches use local `board/task` keys and remote `gateway/profile/board/task` keys (the local gateway/profile is implicit in the ledger's runtime scope). Remote reads use core's origin-ledger projection, including released rows omitted from `session_tasks`, plus core's unsuperseded historical associations. There is no second ownership ledger or replica-only completion rule.
