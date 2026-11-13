@@ -119,6 +119,43 @@ main/other base, changed head, pending/failed/skipped/neutral checks, a possibly
 truncated rollup, unreadable reviews/comments, an unanswered review point and a
 missing exact-head approval fail closed. This is not a blanket non-main exemption.
 
+**Why a carry needs no confirm review on the new head.** A carry does not ask
+for an `Exact-head confirmation` review on H, by design (decided in
+t_01a1d6c53d57c331, option B). A confirm review of a clean update-branch head
+only re-checks that H is the approved patch on a newer base. The guard computes
+that mechanically from GitHub's own data:
+
+- (a) shows the head only merged `state` in. H0 is an ancestor of H. Every
+  first-parent commit after H0 is a merge whose second parent is on `state`.
+- (b) shows the PR's own diff against its base is the reviewed one, byte for
+  byte and whitespace included. An edit hidden in a merge commit (an "evil
+  merge") changes that diff, and so does a conflict resolution, which alters
+  the `-` lines or the context. Either one refuses.
+- (c) means no later objection is overridden.
+
+What a reviewer could add beyond identity is how the PR behaves on the new
+base. The guard already requires an all-success check rollup on the exact head
+H, and the base-drift check below covers state moving after that; confirm
+reviewers were never asked to redo that judgment. The guard cannot verify who
+wrote a review either, because every agent posts as the same account (gate
+boundary below). A confirm comment therefore adds only a hand-copied version of
+(b).
+
+Measured on the state repo, 250 merged PRs from 2026-11-12 07:47Z to
+2026-11-13 21:07Z: 35 (14%) landed on an update-branch merge head, and 29 of
+those heads have a review or verdict comment on them. None of the 29 found a
+changed patch. The only one with findings (#1210) was a full post-merge review
+that flagged untested behaviour, not identity. Pre-merge confirms arrived a
+median of about 10 minutes after the update, time in which `state` can move
+again. Before the carry existed, #1812, #1837 and #2438 were refused for lack of
+one.
+
+One residual gap remains. Patch-id hashes hunks without their line numbers, so
+a merge that moved an identical hunk, context included, to another place in
+the same file would keep the id. The stronger check is that H's tree equals
+`git merge-tree --write-tree H0 <second parent>`. That needs a local fetch,
+which the gh-only reads above cannot do; follow-up t_01a1d6de4e9ec063 owns it.
+
 **Base drift under CI.** A `pull_request` run tests a merge ref built on some
 `state` commit, not the `state` tip at merge time. The PR's recorded
 `baseRefOid` is at or before the base CI tested: live #2507's checkout was
