@@ -1503,6 +1503,22 @@ path card; it keeps one only when its timeouts outside those bursts are signific
 slow path gives one path card; a path standing apart keeps its card; two conns; an active card naming the conn owns
 it).
 
+Client-side stall and reconnect cascade (2026-11-13 09:28-09:46 PST: hub (direct) and mini (DERP) went slow within
+seconds of each other, the detector filed "link saturation on conn=hermes-hub", and no path flooded the link). Before
+saturation is judged, two kinds of timeout are set aside. `reconnect_cascade`: timeouts on a conn within 30 s after
+`[ssh] teardown conn:<c>` or `[slow-link] ... treating it as down` for it. `client_stall`: every timeout in a
+5-minute bucket where >= 2 distinct remote conns (not `local`/`primary`) each show a stall signal within 60 s of each
+other: a `[slow-link] http://127.0.0.1:<port> is slow` line (port mapped to its conn by a `[ssh] forwarding` line that
+names it, else by the same-instant `[remote-timing] conn:<c>::... dispatch probe slow` line; unmappable lines are
+counted in `unmapped_slow_links`), a probe-slow line, or a shared burst of its own timeouts. When client_stall
+timeouts are most of an over-threshold window, ONE card per host per incident, key
+`backend-timeouts:<host>:uplink-stall`, titled "Desktop uplink stall on <host>", asks for the host's network and
+Tailscale path (`tailscale status`/`netcheck`, DERP vs direct), not per-path byte attribution; the generic incident
+card is filed only when the unexplained rest is over the threshold by itself. Tests:
+`tests/test_backend_timeout_client_stall.py` (the real 09:25-09:50 PST desktop.log slice as a fixture: client_stall
+hub+mini, `saturated_conns == []`, cascade ~120, one uplink card reused then :2; a single-conn kanban/board storm
+stays saturation; port mapping; teardown cascade).
+
 #### Timestamp contract and rollout
 
 Production scans use UTC instants and read the producer's immutable numeric offset:

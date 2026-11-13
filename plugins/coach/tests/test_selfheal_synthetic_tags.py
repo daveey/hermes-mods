@@ -128,6 +128,8 @@ NOT_NOTICES = {
     "older": "coach/reply_check.py: '[older tool calls omitted]' placeholder inside a tool log",
     "redacted": "tailnet/runner.py: redaction placeholder in command output",
     "hermes": "coach/backend_timeouts.py: parses a '[hermes] ' log prefix",
+    "slow-link": "coach/backend_timeouts.py: parses the Desktop's '[slow-link] ...' desktop.log lines",
+    "ssh": "coach/backend_timeouts.py: parses the Desktop's '[ssh] forwarding/teardown ...' desktop.log lines",
     "unparseable-query-dropped": "loop-watch/reqtrace.py: placeholder in a request trace",
     "selfheal-probe": "PROBE_RE: probes must reach the probe path (selfheal_skip why=probe), not be dropped",
     "message": "coach/signals.py: lowercased match key for the cross-session relay header (CROSS_SESSION_RE)",

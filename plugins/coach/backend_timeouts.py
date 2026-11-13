@@ -28,6 +28,15 @@ out together in shared 2-second buckets (>= 2 such buckets, >= half of the conn'
 tunnel makes every path on it time out at once, so such a conn gets ONE card, key `backend-timeouts:<host>:conn:<conn>`,
 naming the top paths as candidates and asking for per-path byte/request attribution. Its burst timeouts no longer make
 paths significant; a path keeps its own card only when its timeouts outside those bursts are significant by themselves.
+Saturation is judged only on timeouts the link's own traffic can explain. Two kinds are set aside first:
+- client_stall: in a 5-minute bucket, >= 2 distinct remote conns (not `local`/`primary`) each show a stall signal
+  (a `[slow-link] ... is slow` line, mapped to its conn by port, a `[remote-timing] conn:<c>::... dispatch probe slow`
+  line, or a shared burst of their own timeouts) within 60 s of each other. Independent links stalling together point
+  at the Desktop host's uplink, not at one link's traffic (2026-11-13 09:28-09:46 PST: hub direct + mini via DERP).
+  When such timeouts are most of an over-threshold window, ONE card per host per incident, key
+  `backend-timeouts:<host>:uplink-stall`, asks for the host's network/Tailscale path, not per-path byte attribution.
+- reconnect_cascade: timeouts on a conn within 30 s after `[ssh] teardown conn:<c>` or `[slow-link] ... treating it
+  as down` for it: in-flight requests and the new tunnel's backlog failing together, not traffic.
 --dry-run prints the report and files nothing. --hours prints a per-hour histogram of every timeout still in the
 logs (for checking past bursts). No Inbox items. Exit 2 with count:null when
 clock/coverage evidence is unresolved; this is not a healthy raw-zero receipt.
@@ -65,6 +74,12 @@ CONN_RE = re.compile(r"\bconn=([\w.-]+)")
 AFTER_RE = re.compile(r"Timed out connecting to Hermes backend after (\d+)ms(?:, (\d+)s ago)?")
 TAG_RE = re.compile(r"\[([a-z][\w:.-]*)\]")
 ID_SEG_RE = re.compile(r"^(?=.*\d)[\w.-]{8,}$|^\d+$|^t_[0-9a-f]+$")
+SLOW_LINK_RE = re.compile(r"\[slow-link\] https?://127\.0\.0\.1:(\d+)(?: is slow| timed out .*treating it as down)")
+FORWARD_RE = re.compile(r"\[ssh\] forwarding 127\.0\.0\.1:(\d+) ->")
+CANCEL_RE = re.compile(r"\[ssh\] cancelled forward 127\.0\.0\.1:(\d+)")
+TEARDOWN_RE = re.compile(r"\[ssh\] teardown conn:([\w.-]+?)(?:::|[\s(]|$)")
+PROBE_SLOW_RE = re.compile(r"\[remote-timing\] conn:([\w.-]+?)::\S* dispatch probe slow")
+LINE_CONN_RE = re.compile(r"\bconn[:=]([\w.-]+?)(?:::|[\s)\],]|$)")
 ROTATED = 3
 DEFAULT_THRESHOLD = 30
 DEFAULT_WINDOW_MIN = 30
@@ -79,6 +94,12 @@ BURST_MIN_PATHS = 2     # a bucket where >= this many paths of one conn time out
 SAT_MIN_PATHS = 3       # the bursts span at least this many distinct paths
 SAT_MIN_BURSTS = 2      # ... and recur: at least this many burst buckets
 SAT_SHARE = 0.5         # ... and hold at least this share of the conn's awake timeouts
+# Client-side stall: several independent remote links stalling together = the Desktop host's own uplink.
+STALL_BUCKET_S = 300    # judged per 5-minute bucket
+STALL_PAIR_S = 60       # two remote conns' stall signals start within this many seconds of each other
+LOCAL_CONNS = {"local", "primary", "?"}
+CASCADE_S = 30          # timeouts within this long after a teardown / treated-as-down are a reconnect cascade
+PROBE_PORT_S = 2        # a `[slow-link]` line and its conn's `dispatch probe slow` line are logged together
 CLOSED = {"done", "archived"}
 ACTIVE = {"triage", "ready", "running", "review", "blocked"}  # works the card's own text (blocked: David acts)
 
@@ -113,9 +134,75 @@ def route_of(line: str) -> str:
     return "(no path)"
 
 
-def iter_timeouts(files: list, *, strict=False, evidence=None):
+def link_event(line: str, ts: datetime) -> Optional[tuple]:
+    """(ts, kind, conn, port) for a Desktop link-state line, else None. kind: slow | down | probe_slow | teardown |
+    forward | cancel. `conn` is None when the line names only a local port."""
+    if "[slow-link]" in line:
+        m = SLOW_LINK_RE.search(line)
+        if m:
+            return (ts, "down" if "treating it as down" in line else "slow", None, m.group(1))
+    elif "[ssh] " in line:
+        m = TEARDOWN_RE.search(line)
+        if m:
+            return (ts, "teardown", m.group(1), None)
+        m = FORWARD_RE.search(line)
+        if m:
+            c = LINE_CONN_RE.search(line)
+            return (ts, "forward", c.group(1) if c else None, m.group(1))
+        m = CANCEL_RE.search(line)
+        if m:
+            return (ts, "cancel", None, m.group(1))
+    elif "dispatch probe slow" in line:
+        m = PROBE_SLOW_RE.search(line)
+        if m:
+            return (ts, "probe_slow", m.group(1), None)
+    return None
+
+
+def resolve_link_events(events: list, since: Optional[datetime] = None) -> tuple:
+    """Map each `[slow-link]` port to its conn and return ([(ts, kind, conn)], unmapped_count).
+
+    `[ssh] forwarding 127.0.0.1:<port>` maps a port to the conn it names; today's Desktop names none, so a port is
+    mapped by the `dispatch probe slow` line its conn logs in the same instant (within PROBE_PORT_S), else by the
+    most recent mapping learned for that port since it was last forwarded, else by `[ssh] cancelled forward <port>`
+    right after a `teardown conn:<c>`. An unmappable slow-link line is counted, never guessed."""
+    events = sorted(events, key=lambda e: e[0])
+    probes = [(ts, conn) for ts, kind, conn, _ in events if kind == "probe_slow"]
+    port_conn: dict = {}
+    last_teardown = None
+    out, unmapped = [], 0
+    for ts, kind, conn, port in events:
+        if kind == "forward":
+            port_conn.pop(port, None)  # a fresh forward: whatever this port meant before is stale
+            if conn:
+                port_conn[port] = conn
+            continue
+        if kind == "teardown":
+            last_teardown = (ts, conn)
+            out.append((ts, kind, conn))
+            continue
+        if kind == "cancel":
+            if last_teardown and (ts - last_teardown[0]).total_seconds() <= CASCADE_S:
+                port_conn.setdefault(port, last_teardown[1])
+            continue
+        if kind == "probe_slow":
+            out.append((ts, kind, conn))
+            continue
+        near = {c for t, c in probes if abs((t - ts).total_seconds()) <= PROBE_PORT_S}
+        if len(near) == 1:
+            port_conn[port] = next(iter(near))
+        c = port_conn.get(port)
+        if c is None:
+            unmapped += 1 if since is None or ts >= since else 0
+            continue
+        out.append((ts, kind, c))
+    return out, unmapped
+
+
+def iter_timeouts(files: list, *, strict=False, evidence=None, events=None):
     """Yield (datetime, route, conn, lookback_s) per log entry naming the timeout. Stack/continuation lines without a stamp count only
-    if their entry's stamped line did not already (one entry = one timeout)."""
+    if their entry's stamped line did not already (one entry = one timeout). With `events` (a list), link-state
+    lines (:func:`link_event`) are appended to it from the same pass."""
     for path in files:
         last_ts, counted = None, False
         try:
@@ -138,6 +225,10 @@ def iter_timeouts(files: list, *, strict=False, evidence=None):
                     if evidence is not None and last_ts is not None and last_ts.tzinfo:
                         evidence['coverage_start'] = min(evidence.get('coverage_start', last_ts), last_ts)
                     counted = False
+                    if events is not None and last_ts is not None:
+                        ev = link_event(line, last_ts)
+                        if ev is not None:
+                            events.append(ev)
                 if strict and NEEDLE in line and last_ts is None:
                     raise ValueError('timeout has missing or invalid timestamp')
                 if NEEDLE not in line or last_ts is None or counted:
@@ -225,7 +316,8 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
     awake_by_path: Counter = Counter()
     awake_by_conn: Counter = Counter()
     awake_since_wake: Counter = Counter()
-    conn_buckets: dict = {}  # conn -> time bucket -> Counter(route): which paths timed out together
+    awake: list = []  # (ts, route, conn) of awake timeouts, classified after the pass
+    link_events: list = []
     wake_ends = sorted(hi for _, hi in intervals)
     sleep_count = 0
     spanning_count = 0
@@ -235,7 +327,8 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
     if now.tzinfo and not files:
         raise ValueError('no Desktop logs found; bounded count unproven')
     evidence = {}
-    for ts, route, conn, lookback in iter_timeouts(files, strict=bool(now.tzinfo), evidence=evidence):
+    for ts, route, conn, lookback in iter_timeouts(files, strict=bool(now.tzinfo), evidence=evidence,
+                                                   events=link_events):
         if now.tzinfo and ts.tzinfo is None:
             # Any legal datetime UTC offset is strictly within +/-24 hours.
             # Exclude only when ALL possible instants are outside this window;
@@ -256,11 +349,11 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
                 awake_by_path[route] += 1
                 awake_by_conn[conn] += 1
                 awake_since_wake[wake_bucket(ts, wake_ends)] += 1
-                bucket = int(ts.timestamp()) // BURST_BUCKET_S
-                conn_buckets.setdefault(conn, {}).setdefault(bucket, Counter())[route] += 1
+                awake.append((ts, route, conn))
             first = ts if first is None or ts < first else first
             last = ts if last is None or ts > last else last
     coverage_start = evidence.get('coverage_start')
+    cls = classify(awake, [e for e in link_events if (e[0].tzinfo is None) == (now.tzinfo is None)], start, now)
     if now.tzinfo and not by_path and (coverage_start is None or coverage_start > start):
         raise ValueError('raw zero unproven: retained offset-stamped logs do not cover window start')
     return {"window_start": start.isoformat(sep=" "), "window_end": now.isoformat(sep=" "),
@@ -272,8 +365,86 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
             "awake_by_path": dict(awake_by_path.most_common()),
             "awake_by_conn": dict(awake_by_conn.most_common()),
             "awake_since_wake": dict(awake_since_wake.most_common()),
-            "awake_conn_bursts": conn_bursts(conn_buckets),
+            "awake_conn_bursts": cls["awake_conn_bursts"],
+            "client_stall": cls["client_stall"], "reconnect_cascade": cls["reconnect_cascade"],
+            "awake_explained_by_path": cls["explained_by_path"],
             "first": first.isoformat(sep=" ") if first else None, "last": last.isoformat(sep=" ") if last else None}
+
+
+def _burst_buckets(timeouts: list) -> dict:
+    """conn -> 2-second bucket -> Counter(route): which paths of a conn timed out together."""
+    out: dict = {}
+    for ts, route, conn in timeouts:
+        out.setdefault(conn, {}).setdefault(int(ts.timestamp()) // BURST_BUCKET_S, Counter())[route] += 1
+    return out
+
+
+def classify(awake: list, link_events: list, start: datetime, now: datetime) -> dict:
+    """Split awake timeouts into reconnect_cascade, client_stall and the rest; only the rest feeds
+    awake_conn_bursts (and so :func:`saturated_conns`). A timeout can be both cascade and stall: it is reported in
+    both and set aside once."""
+    lo = start - timedelta(seconds=STALL_BUCKET_S)
+    # Ports are mapped over every retained line (a mapping learned before the window still holds until the port is
+    # forwarded again); only the window's events count.
+    resolved, unmapped = resolve_link_events([e for e in link_events if e[0] <= now], since=lo)
+    downs: dict = {}    # conn -> [ts] of teardown / treated-as-down
+    signals: dict = {}  # conn -> [epoch s] stall signals
+    for ts, kind, conn in resolved:
+        if ts < lo:
+            continue
+        if kind in ("teardown", "down"):
+            downs.setdefault(conn, []).append(ts)
+        if kind in ("slow", "probe_slow"):
+            signals.setdefault(conn, []).append(ts.timestamp())
+
+    def in_cascade(ts, conn):
+        return any(0 <= (ts - d).total_seconds() <= CASCADE_S for d in downs.get(conn, ()))
+
+    cascade_ids = {id(t) for t in awake if in_cascade(t[0], t[2])}
+    rest = [t for t in awake if id(t) not in cascade_ids]
+    for conn, buckets in _burst_buckets(rest).items():
+        for b, c in buckets.items():
+            if len(c) >= BURST_MIN_PATHS:
+                signals.setdefault(conn, []).append(float(b * BURST_BUCKET_S))
+    remote = sorted(c for c in signals if c not in LOCAL_CONNS)
+    stall_buckets: dict = {}  # 5-min bucket -> set(conns)
+    for i, a in enumerate(remote):
+        for b in remote[i + 1:]:
+            for ta in signals[a]:
+                for tb in signals[b]:
+                    if abs(ta - tb) <= STALL_PAIR_S:
+                        for t in (ta, tb):
+                            stall_buckets.setdefault(int(t) // STALL_BUCKET_S, set()).update((a, b))
+    stalled_ids = {id(t) for t in awake if int(t[0].timestamp()) // STALL_BUCKET_S in stall_buckets}
+    kept = [t for t in rest if id(t) not in stalled_ids]
+    explained = Counter(t[1] for t in awake if id(t) in cascade_ids or id(t) in stalled_ids)
+    tz = now.tzinfo
+
+    def bucket_iso(b):
+        return datetime.fromtimestamp(b * STALL_BUCKET_S, tz).isoformat(sep=" ")
+
+    return {
+        "awake_conn_bursts": conn_bursts(_burst_buckets(kept)),
+        "client_stall": {"count": len(stalled_ids), "buckets": [bucket_iso(b) for b in sorted(stall_buckets)],
+                         "conns": sorted(set().union(*stall_buckets.values())) if stall_buckets else [],
+                         "by_conn": dict(Counter(t[2] for t in awake if id(t) in stalled_ids).most_common()),
+                         "unmapped_slow_links": unmapped},
+        "reconnect_cascade": {"count": len(cascade_ids),
+                              "by_conn": dict(Counter(t[2] for t in awake if id(t) in cascade_ids).most_common()),
+                              "teardowns": sum(len(v) for v in downs.values())},
+        "explained_by_path": dict(explained.most_common()),
+    }
+
+
+def stall_dominant(rep: dict) -> bool:
+    """Client-stall timeouts are most (> half) of the awake count."""
+    total = rep.get("awake_count") or 0
+    return bool(total) and ((rep.get("client_stall") or {}).get("count") or 0) * 2 > total
+
+
+def unexplained_count(rep: dict) -> int:
+    """Awake timeouts that are neither client_stall nor reconnect_cascade."""
+    return (rep.get("awake_count") or 0) - sum((rep.get("awake_explained_by_path") or {}).values())
 
 
 def conn_bursts(conn_buckets: dict) -> dict:
@@ -399,7 +570,7 @@ def _saturation_step(rep: dict, threshold: int) -> str:
 
 
 def _evidence(host: str, rep: dict, probe: dict, threshold: int, window_min: int) -> str:
-    sat = _saturation_md(rep, threshold)
+    sat = "\n".join(x for x in (_saturation_md(rep, threshold), _stall_md(rep)) if x)
     return fence_evidence(f"""Detected by hermes-mods plugins/coach/backend_timeouts.py (cron, every 10 min) on {host}.
 
 The Desktop app on {host} logged {rep['count']} "{NEEDLE}" lines in the last {window_min} min
@@ -590,7 +761,7 @@ def significant_paths(rep: dict, threshold: int) -> list:
     counting only timeouts that stand apart from their conn: a saturated conn's shared-burst timeouts belong to its
     conn card (:func:`saturated_conns`), so a victim path gets no card of its own."""
     total = rep.get("awake_count") or 0
-    absorbed: Counter = Counter()
+    absorbed: Counter = Counter(rep.get("awake_explained_by_path") or {})  # client stall / reconnect cascade
     for conn in saturated_conns(rep, threshold):
         absorbed.update(rep["awake_conn_bursts"][conn].get("burst_by_path") or {})
     out = []
@@ -696,6 +867,76 @@ and that may not be the one with the most timeouts.
   `awake_by_conn`, with `window_start` later than the fix. A restart alone does not satisfy this.
 - Paste that output and the per-path byte/request attribution in a comment before completing.
 """
+
+
+def uplink_card_title(host: str) -> str:
+    return f"Desktop uplink stall on {host}"
+
+
+def _stall_md(rep: dict) -> str:
+    cs = rep.get("client_stall") or {}
+    rc = rep.get("reconnect_cascade") or {}
+    if not cs.get("count") and not rc.get("count"):
+        return ""
+    return (f"Client-side stall: {cs.get('count', 0)} awake timeouts fell in 5-minute buckets where several remote "
+            f"conns ({', '.join(cs.get('conns') or []) or 'none'}) stalled within {STALL_PAIR_S} s of each other "
+            f"(buckets starting {', '.join(cs.get('buckets') or []) or 'none'}; by conn {cs.get('by_conn') or {}}).\n"
+            f"Reconnect cascade: {rc.get('count', 0)} timeouts within {CASCADE_S} s after a teardown / treated-as-down "
+            f"of their conn ({rc.get('teardowns', 0)} teardowns; by conn {rc.get('by_conn') or {}}).")
+
+
+def uplink_card_body(host: str, rep: dict, probe: dict, threshold: int, window_min: int, previous: str) -> str:
+    cs = rep.get("client_stall") or {}
+    conns = ", ".join(f"conn={c}" for c in cs.get("conns") or []) or "several remote conns"
+    return f"""Several independent remote links from the Desktop on {host} stalled at the same time ({conns}), so the
+shared segment is most likely {host}'s own network uplink, not any one link's traffic. {cs.get('count', 0)} of
+{rep.get('awake_count')} awake timeouts fell in those stall buckets. Per-path byte attribution on a backend will not
+find a flooding path here: each far end sees a healthy link.
+{previous}
+{home_pin_note("the network and Tailscale path to check are the Desktop host's own")}
+
+## Evidence
+{_evidence(host, rep, probe, threshold, window_min)}
+
+## Do this
+1. On {host}, read its network path while (or soon after) it stalls: `tailscale status` (each stalled peer: direct
+   or relayed through DERP, and which relay), `tailscale netcheck` (UDP, NAT type, nearest DERP latency), and
+   `tailscale ping <peer>` for each stalled conn's host. Note the Wi-Fi/Ethernet network, captive or hard-NAT
+   networks, VPNs and any large upload running on {host} at that time.
+2. Compare the timestamps in `[slow-link]` and `[remote-timing] ... dispatch probe slow` lines of
+   `~/.hermes/logs/desktop.log` across conns. Stalls that start together on links with different routes (direct vs
+   DERP) point to the shared uplink. If only one conn stalls in a later window, that is a different incident.
+3. Fix or work around the uplink cause where the agent can (e.g. a stuck Tailscale path: `tailscale down/up`, or a
+   process saturating the uplink). For a network only the user controls, report the evidence. Use the five-whys
+   skill for the chain.
+
+## Acceptance
+- A fresh 30-minute window on {host} shows no client stall:
+  `python3 ~/code/hermes-mods/plugins/coach/backend_timeouts.py --dry-run` prints `"client_stall": {{"count": 0`,
+  with `window_start` later than the fix. If the cause is a network outside the agents' control, paste the
+  `tailscale netcheck` output and the stall timestamps instead.
+- Paste that output in a comment before completing.
+"""
+
+
+def file_uplink_card(home: Path, host: str, now: datetime, rep: dict, probe: dict, threshold: int,
+                     window_min: int, runner: Callable) -> dict:
+    """At most one open card per host per uplink-stall incident: reuse it (comment hourly) while open, else
+    `backend-timeouts:<host>:uplink-stall` (:2, :3, ... once the earlier one closed)."""
+    st = load_state(home)
+    cs = rep.get("client_stall") or {}
+    still = (f"Still firing at {now.isoformat()} on {host}: client stall, {cs.get('count', 0)} of "
+             f"{rep.get('awake_count')} awake timeouts in {window_min} min, conns {', '.join(cs.get('conns') or [])}, "
+             f"buckets {', '.join(cs.get('buckets') or [])}; reconnect cascade "
+             f"{(rep.get('reconnect_cascade') or {}).get('count', 0)}.")
+    out = _ensure_owner(home, st, f"{host}:uplink-stall", f"backend-timeouts:{host}:uplink-stall", now, runner,
+                        "uplink stall", lambda: None,
+                        lambda previous: uplink_card_body(host, rep, probe, threshold, window_min, previous),
+                        uplink_card_title(host), still)
+    if out.get("owner"):
+        out["task_id"] = out["owner"]
+    out["kind"] = "uplink_stall"
+    return out
 
 
 def _ensure_owner(home: Path, st: dict, skey: str, base: str, now: datetime, runner: Callable, what: str,
@@ -843,15 +1084,24 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] =
            "power": power_report, "clock": clock,
            "over_threshold": rep["awake_count"] >= threshold, "saturated_conns": saturated_conns(rep, threshold),
            "cards": []}
+    # Most of the window is a client-side stall: one uplink card; the generic incident (and its conn/path owners)
+    # only when what remains unexplained is over the threshold by itself.
+    res["uplink_stall"] = res["over_threshold"] and stall_dominant(rep)
+    generic = res["over_threshold"] and (not res["uplink_stall"] or unexplained_count(rep) >= threshold)
     if res["over_threshold"]:
         res["host_probe"] = (probe or probe_host)()
         if not a.dry_run:
             runner = runner or subprocess.run
-            host_card = file_card(home, host, now, rep, res["host_probe"], threshold, window, runner)
-            owners = file_path_cards(home, host, now, rep, res["host_probe"], threshold, window, runner, host_card)
-            if owners:
-                host_card["path_owners"] = owners
-            res["cards"].append(host_card)
+            if res["uplink_stall"]:
+                res["cards"].append(file_uplink_card(home, host, now, rep, res["host_probe"], threshold, window,
+                                                     runner))
+            if generic:
+                host_card = file_card(home, host, now, rep, res["host_probe"], threshold, window, runner)
+                owners = file_path_cards(home, host, now, rep, res["host_probe"], threshold, window, runner,
+                                         host_card)
+                if owners:
+                    host_card["path_owners"] = owners
+                res["cards"].append(host_card)
     if a.json or a.dry_run:
         print(json.dumps(res))
     elif res["over_threshold"]:  # cron no-agent: stdout is delivered, so stay silent when healthy
