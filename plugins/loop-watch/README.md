@@ -167,3 +167,31 @@ independent timer flushing, lifespan/late-drain shutdown, bounded outage memory,
 and actual sink fsync failure. Existing tests cover counts beyond slow-report
 caps and unchanged slow-request tracing. Production acceptance additionally needs
 real records on both sides of a safe service restart.
+
+## Opt-in tracemalloc heap census
+
+Also **off by default**, and meant for one diagnostic process lifetime only: tracing adds memory
+(roughly 50-100 bytes per live block) and CPU to every allocation. Give the ordinary launcher
+`HERMES_LOOP_WATCH_HEAP_CENSUS=<frames>` (an integer 1-32; anything else is off) before its next
+natural start. When loop-watch registers, it calls `tracemalloc.start(<frames>)` (unless tracing is
+already on) and arms the same private one-shot trigger as the cache census, under
+`<HERMES_HOME>/loop-watch-heap/<pid>-<random-generation>/`, with the command `heap-census-v1\n`
+(15 bytes). The request rules (fresh regular 0600 file, atomic consume, one attempt per process) are
+identical to the cache census above.
+
+`result.json` (0600, at most 64 KiB) holds `schema: 1`, `kind: heap_census`, `status: ok|unknown`,
+`traced_bytes`, `peak_bytes`, `tracemalloc_overhead_bytes`, `traces`, `frames`, `gc_counts`,
+`gc_collections`, `seconds`, and three top-40 lists of `[location, bytes, blocks]`:
+
+- `by_line`: innermost frame of each live block.
+- `by_app_line`: innermost frame outside the stdlib/site-packages (the code that asked for it).
+- `by_app_entry`: outermost such frame within the captured `<frames>` (the entry point, if the stack fits).
+
+Locations are `file:line` only (home shortened to `~`); no values, keys or reprs are serialized.
+Allocations made before loop-watch registered (most imports) are not traced. The snapshot runs on the
+census thread, holds the GIL for roughly a second per million live blocks, and briefly needs about
+150 bytes of extra memory per live block (a 5M-block heap: ~750 MB). After the one report the census
+stops tracing (if it started it), releasing the per-block overhead. A failing snapshot writes
+`status: unknown` with the exception type. Remove the env var after the diagnostic run. `tests_heap.py` covers env parsing, default-off, attribution of a held allocation
+to its line, value privacy, the one-shot trigger and output cap, and that the cache census defaults
+are unchanged.

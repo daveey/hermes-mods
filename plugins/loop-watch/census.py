@@ -149,8 +149,9 @@ def private_dir(path):
 
 class Probe:
     """A random process-generation directory grants exactly one request, ever."""
-    def __init__(self, home, *, runner=runner_reference):
-        root = Path(home) / "loop-watch-census"
+    def __init__(self, home, *, runner=runner_reference, command=COMMAND, scanner=None, max_output=MAX_OUTPUT,
+                 subdir="loop-watch-census"):
+        root = Path(home) / subdir
         root.mkdir(mode=0o700, exist_ok=True)
         parent = private_dir(root)
         try:
@@ -161,15 +162,18 @@ class Probe:
             os.close(parent)
         self.path = root / name
         self.runner = runner
+        self.command = command
+        self.scanner = scanner
+        self.max_output = max_output
         self.used = False
         self.guard = threading.Lock()
         self.created_ns = time.time_ns()
-        self.write("ready.json", {"schema": 1, "pid": os.getpid(), "command": "cache-census-v1",
+        self.write("ready.json", {"schema": 1, "pid": os.getpid(), "command": command.decode("ascii").strip(),
                                   "request": "request", "output": "result.json"})
 
     def write(self, name, report):
         payload = json.dumps(report, separators=(",", ":")).encode("ascii")
-        if len(payload) > MAX_OUTPUT:
+        if len(payload) > self.max_output:
             payload = b'{"schema":1,"status":"unknown","truncated":true,"output_truncated":true}'
         fd = os.open(name + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o600, dir_fd=self.fd)
@@ -200,13 +204,13 @@ class Probe:
                 st = os.fstat(fd)
                 if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
                         or stat.S_IMODE(st.st_mode) != 0o600 or st.st_nlink != 1
-                        or st.st_mtime_ns < self.created_ns or st.st_size != len(COMMAND)):
+                        or st.st_mtime_ns < self.created_ns or st.st_size != len(self.command)):
                     return
-                if os.read(fd, len(COMMAND) + 1) != COMMAND:
+                if os.read(fd, len(self.command) + 1) != self.command:
                     return
             finally:
                 os.close(fd)
-            self.write("result.json", scan(self.runner()))
+            self.write("result.json", self.scanner() if self.scanner else scan(self.runner()))
         except OSError:
             pass  # never log private request data or paths
         finally:

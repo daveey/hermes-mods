@@ -87,3 +87,16 @@ def register(ctx) -> None:
             census = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(census)
         census.start(home)
+    # Default-off tracemalloc heap census (HERMES_LOOP_WATCH_HEAP_CENSUS=<frames>): diagnostic runs only.
+    if os.environ.get("HERMES_LOOP_WATCH_HEAP_CENSUS"):
+        try:
+            try:
+                from . import heap
+            except ImportError:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("loop_watch_heap", Path(__file__).with_name("heap.py"))
+                heap = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(heap)
+            heap.start(home)
+        except Exception:  # noqa: BLE001 - a diagnostic must never break plugin registration
+            pass
