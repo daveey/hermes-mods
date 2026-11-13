@@ -804,6 +804,57 @@ def card_names_defect(card: dict, d: dict, fp: Optional[str] = None) -> bool:
     return len(want & head) >= max(2, -(-len(want) // 3))
 
 
+_SESSION_ID = re.compile(r"\b\d{8}_\d{6}_[0-9a-f]{6}\b")
+
+
+def _complaint_anchors(d: dict) -> set:
+    """Session ids the complaint's own text names, other than the complaining session itself: the thing it is about
+    (desktop-40fef7fbb1: "@session:default/20261110_183233_4a0c3f archiving this session keeps failing"). A fix card
+    written in root-cause words still names that session as its evidence."""
+    text = " ".join(str(d.get(k) or "") for k in ("quote", "evidence", "symptom", "details"))
+    return set(_SESSION_ID.findall(text)) - {str(d.get("session_id") or "")}
+
+
+def card_answers_complaint(card: dict, d: dict) -> bool:
+    """Subject evidence for a card written in root-cause words (its title names the mechanism, not the symptom):
+    its body names a session the complaint is about (_complaint_anchors) AND shares a distinctive symptom word.
+    desktop-40fef7fbb1's owner, "state.db: unconfirmed read SQLITE_CORRUPT must not latch the process", shares no
+    title word with "archiving a session repeatedly fails" but its body reads "David's sidebar archive of
+    20261110_183233_4a0c3f failed". The complaining session's own id names nothing: every card it files carries it."""
+    anchors = _complaint_anchors(d)
+    body = str(card.get("body") or "")
+    if not anchors or not any(a in body for a in anchors):
+        return False
+    want = _subject_words(d.get("error") if d.get("kind") == "repeat_failure" else d.get("symptom"))
+    return bool(want & _subject_words(" ".join(str(card.get(k) or "") for k in ("title", "body"))))
+
+
+def owner_relevance(card: dict, d: dict, fp: Optional[str] = None) -> tuple:
+    """Sort key (higher = better owner) among session cards that already passed the subject gate: relevance to the
+    symptom first, recency never. desktop-40fef7fbb1 adopted the session's NEWEST card, an unrelated
+    "Activate instant hub core updates" filed 4 h after the complaint, over the state.db latch fix that answered it.
+    Order: names the fingerprint > names the symptom phrase > distinctive symptom words in title/key > names a
+    session the complaint is about > symptom words in the body > carries fix metadata (landed commit/PR) > filed
+    after the complaint; ties go to the EARLIEST such card (the response to the complaint, not later work)."""
+    fp = fp or d.get("fingerprint")
+    text = _norm_text(" ".join(str(card.get(k) or "") for k in ("title", "body", "idempotency_key")))
+    names_fp = bool(fp) and fp.lower() in text
+    needle = _norm_text(d.get("symptom"))[:SUBJECT_SYMPTOM_CHARS].strip()
+    names_symptom = len(needle) >= 12 and needle in text
+    want = _subject_words(d.get("error") if d.get("kind") == "repeat_failure" else d.get("symptom"))
+    head = len(want & _subject_words(" ".join(str(card.get(k) or "") for k in ("title", "idempotency_key"))))
+    body = str(card.get("body") or "")
+    anchors = sum(1 for a in _complaint_anchors(d) if a in body)
+    body_words = len(want & _subject_words(body))
+    since = d.get("complaint_at") or d.get("at")
+    try:
+        created = float(card.get("created_at") or 0)
+        after = since is not None and created >= float(since)
+    except (TypeError, ValueError):
+        created, after = 0.0, False
+    return (names_fp, names_symptom, head, anchors, body_words, bool(card.get("fix_meta")), after, -created)
+
+
 def is_resume_note(user_text) -> bool:
     """Core's resume note (crash recovery or update pause): a machine-written turn, never a user complaint."""
     return clean_user(user_text).lstrip().startswith(RESUME_NOTE_PREFIX)
@@ -3474,13 +3525,20 @@ def session_owned_cards(session_id: Optional[str], since: float, home: Optional[
             cols = {c[1] for c in db.execute("PRAGMA table_info(tasks)")}
             body = "substr(body, 1, 4000)" if "body" in cols else "NULL"
             ikey = "idempotency_key" if "idempotency_key" in cols else "NULL"
+            # Fix metadata (a landed commit or published PR on the card's result or any run): ranks owners
+            runs = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone()
+            fixes = ["result LIKE '%landed_sha%'", "result LIKE '%published_pr%'"] if "result" in cols else []
+            if runs:
+                fixes.append("EXISTS(SELECT 1 FROM task_runs r WHERE r.task_id = tasks.id AND "
+                             "(r.metadata LIKE '%landed_sha%' OR r.metadata LIKE '%published_pr%'))")
+            fix = "(" + " OR ".join(fixes) + ")" if fixes else "0"
             for r in db.execute(
-                    f"SELECT id, title, status, created_at, {body}, {ikey} FROM tasks WHERE status IN ({marks}) "
+                    f"SELECT id, title, status, created_at, {body}, {ikey}, {fix} FROM tasks WHERE status IN ({marks}) "
                     "AND created_at >= ? "
                     "AND (session_id = ? OR id IN (SELECT task_id FROM kanban_notify_subs WHERE chat_id = ?))",
                     (*ADOPT_STATUSES, int(since), session_id, session_id)):
                 rows.append({"id": r[0], "title": r[1], "status": r[2], "created_at": r[3], "board": board,
-                             "body": r[4], "idempotency_key": r[5]})
+                             "body": r[4], "idempotency_key": r[5], "fix_meta": bool(r[6])})
         except sqlite3.Error:
             pass
         finally:
@@ -3860,8 +3918,9 @@ def _card_names_fingerprint(card: dict, fp: str) -> bool:
 
 def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[Callable] = None) -> Optional[dict]:
     """If the defect's origin session created/subscribed an active card after the complaint that names the defect
-    (card_names_defect; never the card the complaint is about, never another lane's investigation/VERIFY card),
-    record the newest such card as the lane's fix_card (approved) and log `selfheal_adopted_owner`.
+    (card_names_defect or card_answers_complaint; never the card the complaint is about, never another lane's
+    investigation/VERIFY card), record the most relevant such card (owner_relevance, not recency) as the lane's
+    fix_card (approved) and log `selfheal_adopted_owner`.
     -> result dict, or None to go on and file."""
     sid = d.get("session_id")
     if owner_fn is None and os.environ.get("COACH_SELFHEAL_NO_EXEC") == "1":
@@ -3903,8 +3962,10 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
     # that lane's fix and implements nothing: desktop-727bbca8b8).
     subject = _defect_subject_cards(d) | _filer_cards(d)
     process = _lane_process_cards(store, fp)
+    # A fix card often names the root cause, not the symptom ("state.db ... latch" for "archiving a session
+    # repeatedly fails"): its body naming the session the complaint is about counts as subject evidence too.
     named = [x for x in cards
-             if x["id"] not in subject and card_names_defect(x, d, fp)
+             if x["id"] not in subject and (card_names_defect(x, d, fp) or card_answers_complaint(x, d))
              and (x["id"] not in process or _card_names_fingerprint(x, fp))]
     if not named:
         store.log({"event": "selfheal_adopt_skipped", "why": "no session card names the defect",
@@ -3914,7 +3975,9 @@ def _adopt_session_card(d: dict, fp: str, store, now: float, owner_fn: Optional[
                    "subject_cards": [x["id"] for x in cards if x["id"] in subject],
                    "process_cards": [x["id"] for x in cards if x["id"] in process]})
         return None
-    cards = named
+    # Most relevant first, never simply the newest: the origin session keeps filing unrelated work after the complaint
+    # (desktop-40fef7fbb1 took an instant-update activation card filed 4 h later over the state.db latch fix).
+    cards = sorted(named, key=lambda x: owner_relevance(x, d, fp), reverse=True)
     c = cards[0]
     lane = LaneState(store.root)
     st = lane.get(fp)

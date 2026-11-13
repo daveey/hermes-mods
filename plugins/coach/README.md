@@ -1095,7 +1095,15 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   adoption, for every source (complaints included), takes a session card only with subject evidence
   (`card_names_defect`): its title, body or idempotency key names the fingerprint, the symptom's first 80 characters
   or the repeated error, or the non-generic tool; or its title shares max(2, a third) of the symptom's distinctive
-  words. Two cards are never the owner even when their words match: a card the complaint itself names (the stalled
+  words; or (`card_answers_complaint`) its body names a session the complaint is about (a session id in the quote or
+  evidence other than the complaining session's own) and shares a distinctive symptom word, which catches a fix
+  card titled by its root cause. Among the cards that pass, the owner is the most relevant (`owner_relevance`):
+  fingerprint > symptom phrase > title/key symptom words > named complaint session > body symptom words > fix
+  metadata (a run or result with `landed_sha`/`published_pr`) > filed after the complaint, ties to the earliest
+  card. Never the newest: desktop-40fef7fbb1 ("archiving a session repeatedly fails") took the session's newest
+  card, an instant-update activation filed 4 h later, over the state.db latch fix that answered it, and a second
+  fingerprint of that complaint turn inherited the wrong owner (`tests/test_self_heal_adopt_relevance.py`).
+  Two cards are never the owner even when their words match: a card the complaint itself names (the stalled
   card of a wait notice is the subject, not the scheduler's repair), and another fingerprint's investigation or
   VERIFY card unless it names this fingerprint. A card another host's digest names is judged on its text from the
   hermes-hub replica; with no readable text it is not adopted. Otherwise it files (`selfheal_adopt_skipped`, with
