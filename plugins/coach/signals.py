@@ -1477,8 +1477,8 @@ NUDGE_OUTCOME = ("reply_nudge_outcome", "nudge_outcome_lost", "nudge_outcome_sub
 STRONG_REPORT_ONLY_SRC = ("confirm", "closed_owner", "unverified_owner")
 # reply_check rules whose nudges get a reply_nudge_outcome (same as reply_check.RULES; a test pins the match).
 OUTCOME_RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask",
-                 "credit_ask", "laptop_job", "skipped_live", "merge_forecast", "future_clock", "claimed_mutation",
-                 "restart_scope_claim")
+                 "credit_ask", "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock",
+                 "claimed_mutation", "restart_scope_claim")
 # The backend identity core.Store.log stamps on each reply_nudge (agent-a8d0c8c1ed); see backend_gone.
 BACKEND_KEYS = ("pid", "host", "proc_start")
 NUDGE_WHAT = {"handoff": "agent handed the user a step it could do itself"}

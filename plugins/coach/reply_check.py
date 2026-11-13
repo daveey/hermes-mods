@@ -1542,6 +1542,63 @@ def merge_forecast(reply: str, tool_log: Optional[list] = None) -> Optional[str]
     return s.strip(" -*\t")
 
 
+# ---- pr_state_claim: the reply states a PR's present state, but this turn never read that PR ---------------------------
+# (self-heal agent-36ec41dc12: at 16:45 PST a chat told David "PR #1750 ... isn't merged yet". It had merged at 16:35
+# and was live on the hub at 16:37. The claim came from a `gh pr view` taken at 16:24, before two Hermes-update pauses,
+# the second of which was this PR landing; the chat corrected itself 13 minutes later.) merge_forecast covers only
+# forecasts. Deterministic, before the judge: a sentence (outside code and quotes, not a question, not a condition or
+# reported speech) naming a PR (or "it", in a reply that names one) and claiming it is not merged / still open /
+# awaiting merge, while the turn's tool log has no PR-state read. Opening, merging or landing a PR this turn also
+# counts as a read (the result is in the log); `--help` output does not.
+_APOS = "[\u2019']"
+_PSC_CLAIM_RE = re.compile(
+    r"\b(?:is|has|have)\s*n" + _APOS + r"t\s+(?:yet\s+|been\s+|yet\s+been\s+)?(?:merged|landed)\b"
+    r"|\b(?:is|has|have)\s+not\s+(?:yet\s+|been\s+|yet\s+been\s+)?(?:merged|landed)\b"
+    r"|\b(?:it|PR|PRs|request|that|this|which)" + _APOS + r"?s?\s+not\s+(?:yet\s+)?(?:merged|landed)\b"
+    r"|\bstill\s+(?:open|unmerged|un-merged|pending\s+merge|in\s+review|waiting\s+(?:on|for)\s+(?:review|checks|CI|merge))\b"
+    r"|\b(?:is|are)\s+(?:still\s+)?unmerged\b"
+    r"|\b(?:awaiting|waiting\s+to)\s+(?:merge|be\s+merged|land)\b",
+    re.I)
+_PSC_IT_RE = re.compile(r"^\W*(?:it|it" + _APOS + r"s|that|this)\b", re.I)
+# The claim sits inside a condition or reported speech: "if PR 42 isn't merged yet", "the log said it isn't merged".
+_PSC_HEDGE_RE = re.compile(r"\b(?:if|whether|unless|until|once|when|in\s+case|said|says|told|showed|shows|reported|"
+                           r"claimed|thought|assumed|wrote|was\s+going\s+off)\b[^.;:!?]{0,60}$", re.I)
+_PSC_READ_RE = re.compile(
+    _MF_CHECK_RE.pattern + r"|\bgh\s+pr\s+(?:list|merge|create|ready)\b|\bhermes-core-wt\s+(?:ship|land|lane)\b",
+    re.I)
+_PSC_HELP_RE = re.compile(r"(?:^|\s)(?:--help|-h)(?:\s|\)|$)")
+_PSC_META_RE = re.compile(r"\bpr_state_claim\b", re.I)
+PR_STATE_CLAIM_NUDGE = (
+    "[coach] pr_state_claim: your reply states a PR's current state (\"{evidence}\"), but this turn never read that PR. "
+    "A read from earlier in the chat (before an update pause, a wait or a resumed run) may be stale: the PR may have "
+    "merged since, and the update itself may be that PR landing. Read it now (`gh pr view <n> --json state,mergedAt`) "
+    "and report what that read shows, with its time.")
+
+
+def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """The sentence claiming a PR's present (unmerged/open) state when this turn read no PR state, else None (code
+    spans, quotes, `>` lines, questions, conditions, reported speech and replies naming pr_state_claim are ignored)."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    text = _QUOTED_RE.sub(" ", text)
+    if _PSC_META_RE.search(text) or not _MF_PR_RE.search(text):
+        return None
+    hit = None
+    for s in _SENTENCE_END.split(text):
+        if s.rstrip(" *_").endswith("?"):
+            continue
+        m = _PSC_CLAIM_RE.search(s)
+        if not m or _PSC_HEDGE_RE.search(s[:m.start()]):
+            continue
+        if _MF_PR_RE.search(s) or _PSC_IT_RE.search(s):
+            hit = s
+            break
+    if not hit:
+        return None
+    if any(_PSC_READ_RE.search(l or "") and not _PSC_HELP_RE.search(l or "") for l in (tool_log or [])):
+        return None
+    return hit.strip(" -*\t")
+
+
 # ---- future_clock: a past-tense Pacific time stamp that has not happened yet -------------------------------------------
 # (self-heal agent-748d257889: at 20:59 PST a red-sweep report said "(Checked 21:05–21:40 PT.)" and card comments said
 # "Red sweep ~21:15 PST". The model subtracted 7 h from UTC tool stamps after DST had ended (UTC-8) and never read the
@@ -1934,9 +1991,10 @@ def restart_scope_claim_nudge(evidence: str, skew: Optional[tuple]) -> str:
 
 
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
-         "laptop_job", "skipped_live", "merge_forecast", "future_clock", "claimed_mutation", "restart_scope_claim")
+         "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock", "claimed_mutation",
+         "restart_scope_claim")
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
-                 "laptop_job", "skipped_live", "merge_forecast", "future_clock", "claimed_mutation",
+                 "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock", "claimed_mutation",
                  "restart_scope_claim")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
@@ -3610,6 +3668,12 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "merge_forecast", "p": 1.0, "evidence": phrase, "reason": "merge_forecast",
                     "verdict": {"merge_forecast": 1.0, "evidence": phrase},
                     "nudge": MERGE_FORECAST_NUDGE.format(evidence=phrase[:160])}
+    if not only or "pr_state_claim" in only:
+        phrase = pr_state_claim(reply, tool_log)
+        if phrase:  # deterministic: a present-state PR claim ("isn't merged yet") with no PR read this turn
+            return {"rule": "pr_state_claim", "p": 1.0, "evidence": phrase, "reason": "pr_state_claim",
+                    "verdict": {"pr_state_claim": 1.0, "evidence": phrase},
+                    "nudge": PR_STATE_CLAIM_NUDGE.format(evidence=phrase[:160])}
     if not only or "future_clock" in only:
         phrase = future_clock(reply, now=now)
         if phrase:  # deterministic: a past-tense Pacific stamp later than the real clock (agent-748d257889)
@@ -3895,6 +3959,7 @@ def block_handoff(text: str, user_ask: str, tool_log: list[str], llm: Callable[[
 BACKTEST_RULES: dict = {"credit_ask": lambda r: credit_ask(r, []), "laptop_job": laptop_job,
                         "skipped_live": lambda r: skipped_live(r, []),
                         "merge_forecast": lambda r: merge_forecast(r, []),
+                        "pr_state_claim": lambda r: pr_state_claim(r, []),
                         "future_clock": lambda r, at=None: future_clock(r, now=at),
                         "claimed_mutation": lambda r: (claimed_mutation(r, []) or {}).get("evidence"),
                         # wording only (an upper bound): a backtest can't know each reply's backend skew
