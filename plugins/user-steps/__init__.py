@@ -373,7 +373,7 @@ PUBLISH_NUDGE = ('Complete the missing agent work now: publish action_request wi
 
 # One decision, one tile, decided by the agent: identity is provenance only (core.same_open_ask). A reply that
 # raises an ask while this chat has an open request is held ONCE so the agent, which knows whether it meant a new
-# decision, either drops a restatement or re-sends unchanged. Never merges anything; the re-send always publishes.
+# decision, either drops a restatement or re-sends unchanged. Never merges; publication policies still apply.
 OPEN_ASK_NUDGE_HEAD = '[user-steps: open request check]'
 
 
@@ -386,7 +386,8 @@ def open_ask_nudge(open_asks: list, new_steps: list) -> str:
             '(for example "... still needs you"), delete it: the open tile already shows that ask, and the '
             'restatement would sit beside it as a duplicate tile. To change an open request, revise it with '
             'action_request (its requestId and expectedRevision). If an ask is a genuinely different decision, '
-            'keep it as written: send the reply again and it gets its own tile (this check runs once per turn). '
+            'keep it as written: send the reply again and it can get its own tile, subject to publication '
+            'policies and rate limits (this check runs once per turn). '
             'Do not mention this check to the user.')
 
 
@@ -402,17 +403,27 @@ def _publish_nudges(turn_messages: Any) -> int:
 
 
 def open_ask_hold(session_id, final_response, open_asks, unmapped, relay, store, owner, attempt, hold_budget,
-                  turn_messages):
-    """Hold once when an ask that maps to no open request by provenance would mint a tile beside an open one."""
+                  turn_messages, candidates=None):
+    """Hold once only for asks publication would currently allow to mint new tiles."""
     if not open_asks or not unmapped or attempt >= hold_budget or _open_ask_nudges(turn_messages):
         return None
-    # The same filters process_reply applies before minting: an identical open ledger step is reused, and in a
-    # relay turn an other-session title is suppressed. Those publish nothing, so they are not new tiles.
-    ledger_open = {core.action_identity(s) for s in _ledger().read(session_id).get('steps', [])
-                   if s.get('status') == 'open'}
+    # Read-only projection of process_reply's canonical retirement, before testing exact reuse/suppression.
+    now = core.time.time()
+    ledger_steps = [core.publication_step(s, store.get(owner, s['requestId'])
+                    if s.get('requestId') and s.get('session') == session_id else None, now)
+                    for s in _ledger().read(session_id).get('steps', [])]
+    if any(core.retired_action([old for old in ledger_steps if core.action_identity(old) == core.action_identity(s)])
+           for s in (candidates if candidates is not None else unmapped)):
+        return None  # one retired action holds the ENTIRE delivered reply, even its otherwise-new asks
+    budget = core.publication_budget(ledger_steps, now)
+    ledger_open = {core.action_identity(s) for s in ledger_steps if s.get('status') == 'open'}
     other = core.elsewhere_open_keys(store, owner) if relay else set()
     new = []
     for s in unmapped:
+        if len(new) >= budget:
+            break
+        if core.reply_draft_holds(session_id, s.get('kind'), s.get('text'), s.get('verbatim_span')) is not None:
+            continue
         key, span = core.ask_key(s.get('text')), core.ask_key(s.get('verbatim_span'))
         if core.locate(final_response, s.get('verbatim_span') or '') is None or core.action_identity(s) in ledger_open \
                 or (len(key) >= core._ASK_KEY_MIN and key in other) \
@@ -469,6 +480,9 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
         card = core.card_ask_for(step, card_asks, res.get('repeats') or (), final_response)
         if card is not None:
             return 'card', card
+        draft = core.reply_draft_holds(session_id, step.get('kind'), step.get('text'), step.get('verbatim_span'))
+        if draft is not None:
+            return 'card', draft
         same = core.same_open_ask(step, open_asks, res.get('repeats') or (), mapped,
                                   _TURN_PUBLISHED.get(session_id, ()), reply=final_response)
         if same is not None:
@@ -478,7 +492,8 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
 
     hits = [(s, maps(s)) for s in steps]  # in reply order, like process_reply (mapped accumulates)
     held = open_ask_hold(session_id, final_response, open_asks, [s for s, hit in hits if hit is None], relay,
-                         store, owner, attempt, hold_budget, turn_messages)
+                         store, owner, attempt, hold_budget, turn_messages,
+                         candidates=[s for s, hit in hits if hit is None or hit[0] != 'card'])
 
     def covered(hit):
         return hit is not None and (hit[0] == 'card' or hit[1]['id'] in ready)

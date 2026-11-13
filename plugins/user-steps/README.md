@@ -452,8 +452,6 @@ open, undecided request of the same session only with exact provenance:
 - the extractor listed that exact sentence under `repeats` for the open id (request id
   or extracted step id; the prompt lists producer-published requests as open steps),
   and the reply corroborates it (below);
-- the evidence sentence (30+ characters, 5+ words) is the sentence an open ask was
-  extracted from in an EARLIER reply;
 - the request was published or revised by the `action_request` tool in this very turn
   (server-recorded `turn_requests`; reset when the next turn starts), and the ask
   restates its title or is the approve/change/decline menu of the only such approval;
@@ -479,13 +477,16 @@ onto the open tile, which silently loses a decision. Instead the pre-send gate
 (`publication_buffer`, `open_ask_hold`) holds a final reply ONCE per turn when the
 session has an open request and the reply yields an ask that nothing above maps and
 that the transform would mint (its span is in a prose block; no identical open ledger
-step; not an other-session title in a relay turn). The nudge, headed
+step; not an other-session title in a relay turn; not held by a reply-draft card;
+no retired exact action holding the entire reply; and room in the per-reply/hourly
+publication budget). Canonical retirement is projected read-only as in `process_reply`.
+The nudge, headed
 `[user-steps: open request check]`, names each open request (requestId and title)
 and quotes the new asks. It tells the agent to delete a sentence that only restates or
 points at an open request, to revise an open request through `action_request`, or to
 send the reply again if it is a different decision. The re-sent reply is never held
-again and publishes as usual, so a real second ask costs one retry and is never lost.
-The gate only judges; nothing is published from a held draft. A publish hold (an
+again by this check; it publishes subject to the usual publication policies and rate
+limits. The gate only judges; nothing is published from a held draft. A publish hold (an
 approval with no plan) takes precedence. With an open ledger step the gate extracts
 even when the reply has no ask-like wording, as `process_reply` does. A text inside an
 agent-written `::user-step` marker is an attribute, not prose: it mints nothing and is

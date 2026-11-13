@@ -107,7 +107,7 @@ def test_extractor_reworded_ask_naming_the_same_card_is_a_separate_ask(tmp_path)
     assert all(store.get(OWNER, rid) == r for rid, r in before.items())  # earlier requests untouched
 
 
-def test_extractor_same_evidence_sentence_reworded_reuses_the_open_tile(tmp_path):
+def test_extractor_same_evidence_sentence_without_explicit_repeat_is_a_new_tile(tmp_path):
     # MacBook chat ..6212f7: the same "**Ask:** ..." sentence came back 75 min later as kind choose, new text.
     store, ledger = env(tmp_path)
     ask = '**Ask:** which model ID should the study use, or which model should it use instead?'
@@ -116,7 +116,7 @@ def test_extractor_same_evidence_sentence_reworded_reuses_the_open_tile(tmp_path
     reply(store, ledger, 'Still blocked on one thing.\n\n' + ask, [{
         'text': 'Pick the model ID for the study (or name a different model)', 'kind': 'choose',
         'verbatim_span': ask, 'options': ['Provide the model ID', 'Name a different model']}])
-    assert len(live(store)) == 1
+    assert len(live(store)) == 2
 
 
 def test_extractor_restating_this_turns_published_title_does_not_mint_a_second_tile(tmp_path):
@@ -784,12 +784,13 @@ def test_the_check_never_holds_without_an_open_request_or_at_the_budget(plugin, 
 
 
 def test_the_check_does_not_hold_an_ask_provenance_maps_onto_the_open_tile(plugin, monkeypatch):
-    # The extractor's corroborated repeat, and the same evidence sentence, already land on the open tile.
+    # Only an explicit, corroborated repeat maps a later reply onto the open tile.
     store, req = _gate_open(plugin)
     step_id = plugin._ledger().read('session-a')['steps'][0]['id']
     span = "**If you pick C, or don't answer,** nothing changes."
-    assert _gate(plugin, monkeypatch, 'Still open from earlier:\n\n' + span,
-                 [dict(STEP_852F, text='Pick the macOS CI option')]) is None  # same evidence sentence
+    held = _gate(plugin, monkeypatch, 'Still open from earlier:\n\n' + span,
+                 [dict(STEP_852F, text='Pick the macOS CI option')])
+    assert held and held.get('hold') is True  # same evidence alone is not provenance
     quote = 'Pick macOS CI option A, B, or C (B recommended): that one still needs you.'
     assert _gate(plugin, monkeypatch, quote, [], repeats=[{'id': step_id, 'verbatim_span': quote}]) is None
     assert _open_titles(store) == [req['title']]
@@ -1178,6 +1179,88 @@ def test_the_1317_headline_beside_a_new_unlettered_menu_is_its_own_tile(tmp_path
                             '- sub-minute jobs only (~$4/day)\n- no spend')
     reply(store, ledger, text, [dict(STEP_A9DE)])
     assert len(live(store)) == 2
+
+
+@pytest.mark.parametrize('generic_title', [False, True], ids=['specific-titles', 'identical-generic-titles'])
+def test_identical_question_for_different_subjects_holds_once_and_publishes_two_tiles(plugin, monkeypatch, generic_title):
+    span = 'Which option would you like me to use for this project?'
+    first = 'For the cache backend: Redis or SQLite.\n\n' + span
+    second = 'For the logo colour: Blue or Green.\n\n' + span
+    title = 'Choose an option for this project'
+    cache = {'text': title if generic_title else 'Choose the cache backend', 'kind': 'choose',
+             'verbatim_span': span, 'options': ['Redis', 'SQLite']}
+    logo = {'text': title if generic_title else 'Choose the logo colour', 'kind': 'choose',
+            'verbatim_span': span, 'options': ['Blue', 'Green']}
+    store, req = _gate_open(plugin, first, cache)
+    held = _gate(plugin, monkeypatch, second, [logo])
+    assert held and held.get('hold') is True and req['requestId'] in held['nudge']
+    assert _gate(plugin, monkeypatch, second, [logo], **_after_nudge(held)) is None
+    out = _send(plugin, second, [logo])
+    assert len(live(store)) == 2
+    assert out['steps'][0]['requestId'] != req['requestId']
+    assert store.get(OWNER, req['requestId']) == req
+
+
+@pytest.mark.parametrize('kind', ['approve', 'do'])
+def test_open_ask_check_ignores_a_reply_draft_card_ask(plugin, monkeypatch, kind):
+    store, req = _gate_open(plugin)
+    text = 'Please press Post on the reply draft to send it.'
+    step = {'text': 'Post this reply', 'kind': kind, 'verbatim_span': text, 'options': []}
+    monkeypatch.setattr(plugin.core, 'owned_reply_card', lambda *a: {'session_id': 'draft-a', 'type': 'reply'})
+    assert _gate(plugin, monkeypatch, text, [step]) is None
+    out = _send(plugin, text, [step])
+    assert out['steps'] == [] and _open_titles(store) == [req['title']]
+
+
+@pytest.mark.parametrize('state', ['ledger-resolved', 'cancelled', 'resolved', 'superseded'])
+def test_open_ask_check_ignores_the_whole_reply_when_an_action_is_retired(plugin, monkeypatch, state):
+    store, _ = _gate_open(plugin)
+    text = 'Which cache backend: Redis or SQLite?'
+    old = {'text': 'Choose the cache backend', 'kind': 'choose', 'verbatim_span': text,
+           'options': ['Redis', 'SQLite']}
+    tile = _send(plugin, text, [old])['steps'][0]
+    if state == 'ledger-resolved':
+        ledger = plugin._ledger()
+        with ledger.edit(ledger.root('session-a')) as data:
+            next(s for s in data['steps'] if s['id'] == tile['id'])['status'] = 'resolved'
+    else:
+        # Canonical retirement can arrive before its ledger mirror is reconciled.
+        with store._tx() as conn:
+            conn.execute('UPDATE requests SET state=? WHERE id=?', (state, tile['requestId']))
+    fresh = 'Which logo colour: blue or green?'
+    step = {'text': 'Choose the logo colour', 'kind': 'choose', 'verbatim_span': fresh,
+            'options': ['Blue', 'Green']}
+    before = store.requests(OWNER)
+    final = text + '\n\n' + fresh
+    assert _gate(plugin, monkeypatch, final, [step, old]) is None
+    assert store.requests(OWNER) == before  # judging must not reconcile/write the canonical or ledger state
+    out = _send(plugin, final, [step, old])
+    assert out['text'] == plugin.core.HELD_REPLY and out['steps'] == []
+    assert store.requests(OWNER) == before
+
+
+@pytest.mark.parametrize('at_cap', [True, False], ids=['capped', 'one-slot-left'])
+def test_open_ask_check_obeys_the_hourly_publication_budget(plugin, monkeypatch, at_cap):
+    store, req = _gate_open(plugin)
+    ledger = plugin._ledger()
+    now = plugin.core.time.time()
+    count = plugin.core.MAX_NEW_PER_HOUR - (1 if at_cap else 2)
+    with ledger.edit(ledger.root('session-a')) as data:
+        data['steps'].extend({'id': f'us_budget{i:06}', 'text': f'Old ask {i}', 'kind': 'input',
+                              'verbatim_span': f'Old question {i}?', 'options': [], 'created': now,
+                              'status': 'resolved', 'session': 'session-a'} for i in range(count))
+    text = 'Which logo colour: blue or green?'
+    step = {'text': 'Choose the logo colour', 'kind': 'choose', 'verbatim_span': text,
+            'options': ['Blue', 'Green']}
+    held = _gate(plugin, monkeypatch, text, [step])
+    if at_cap:
+        assert held is None
+    else:
+        assert held and held.get('hold') is True
+    out = _send(plugin, text, [step])
+    assert len(out['steps']) == (0 if at_cap else 1)
+    assert len(live(store)) == (1 if at_cap else 2)
+    assert store.get(OWNER, req['requestId']) == req
 
 
 def test_directly_asks_still_blanks_short_quotes():
