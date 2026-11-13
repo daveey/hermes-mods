@@ -25,9 +25,9 @@ raises, so no fingerprint is produced and core reads locally. It is made of:
 | `origin` | digest of the origin ledger's obligations and receipts | re-read only when its committed revision moves |
 | `boards` | each local board's content key (`ksa._board_content_key`: bookkeeping writes excluded) | core's cached key |
 | `shadows` | each sync shadow's content key plus its freshness judged at now | core's cached key, `core.shadow_rows` cache |
-| `replica` | substantive digests of the hub replica `tasks` rows for the batch cards, the owners' scope heartbeats and the sync meta; every clock verdict is judged at now | `ReplicaWatch`: incremental by `seq`, only when the replica's revision moved |
-| `lineage` | per-lineage transcript watermark for each pending chat and its compression tip: max `messages.id` (any row and active rows), `transcript_revision`, `end_reason`, compression-child count | `LineageWatch`: index seeks, re-run only when that state.db's stat moved |
-| `floor` | a 10-minute bucket | a missed input is recomputed within 10 minutes |
+| `replica` | substantive digests of the hub replica `tasks` rows for the batch cards, the owners' scope heartbeats and the sync meta; every clock verdict is judged at now | `ReplicaWatch`, only when the replica's revision moved: a per-gateway index-only probe (`count`, `count(seq)`, `max(seq)`, `total(seq)`), the rows past each gateway's cursor, and every tracked batch row re-read by primary key (raw text compared, so a rewrite in place at its old seq moves it). A NULL `seq`, a probe the merged rows don't reproduce (a delete, a rewrite at an older seq, a new gateway without an info row), a replaced file (dev, ino) or new batch tails rebuild |
+| `lineage` | per-lineage transcript watermark for each pending chat and its compression tip: max `messages.id` (any row), the active rows' max id, count, id sum and timestamp sum (core `transcript_key`'s terms: an active flip or delete below the max, a timestamp repair), `transcript_revision`, `end_reason`, compression-child count | `LineageWatch`: index-only seeks (`idx_messages_session_active`, `idx_messages_session_id`), re-run only when that state.db's stat moved. A db whose triggers can't vouch that `transcript_revision` moves on an in-place rewrite (core `TRANSCRIPT_TRIGGERS`) has no watermark: no key, a full pass every time, like `transcript_key` returning None |
+| `floor` | a 10-minute bucket, in the whole key and in every per-row key | a missed input is recomputed within 10 minutes, per row too |
 
 R11: the global state.db stat is never part of a key value, because it moves in about 47% of 2 s windows. It only
 gates re-running the per-lineage seeks in-process. A message written in a chat with no ledger row leaves the key
@@ -40,8 +40,8 @@ observation still verifies (`_owner_evidence`) is kept, so a real attestation ch
 ## Per-row reuse
 
 `pending_closeouts(..., row_key=, cache=)` keeps one cached answer per row, keyed by
-`row_key(row, cards as read, lineage watermark)`. A pass after an input moved re-reconciles only the rows whose own
-key moved:
+`row_key(row, cards as read, lineage watermark, floor bucket)`. A pass after an input moved re-reconciles only the rows
+whose own key moved:
 - a batch card changing re-reconciles that row;
 - an ack landing in a transcript re-proves that chat;
 - a ledger write re-reconciles that row.
@@ -49,8 +49,9 @@ key moved:
 The batch read itself (one union query per pass) still runs, because a row's key includes its cards as read.
 
 `waiting_inputs()` leaves its reads for the waiting pass core runs right after a fingerprint it could not adopt
-(`INPUTS_REUSE_S` = 1 s). Those reads were taken before the pass's own, so a change in between only re-runs the next
-pass.
+(`INPUTS_REUSE_S` = 1 s), on the same thread only. Those reads were taken before the pass's own, so a change in
+between only re-runs the next pass. When those reads differ from the inputs of the 3 s answer cache, the pass skips
+that cache: core never publishes an older answer under the newer key.
 
 ## Host pass
 
