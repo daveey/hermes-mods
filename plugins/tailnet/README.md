@@ -12,6 +12,8 @@ The runner checks workload syntax **before creating a key directory/file or star
 
 The runner always passes `--` before `user@addr` to ssh/scp (and to the jump host's ssh) and refuses a target whose user or address is not a plain value (a leading `-`, spaces or shell metacharacters) before SSH starts. When the job failed before SSH/SCP ran, the reply keeps `rc: 255` for older callers but adds `failure`: `"no-key"` (the broker vended no key) or `"local"` (ssh missing, a refused target, a local exception). A reply with `rc: 255` and no `failure` is SSH's own exit: it could not connect or authenticate.
 
+Every `tailnet_exec` ssh carries `-o SetEnv=LC_HERMES_AGENT=<requesting session id, else tailnet_exec>`, so a `hermes kanban comment` run on the target records `writer_kind: agent` instead of `human`. `SetEnv` is sent even under `-F /dev/null`, and stock macOS/Ubuntu sshd already accept `LC_*`, so targets need no change. Copies (scp, and a protected get's size probe) carry no marker. A session id that is not a plain token (spaces, quotes, a leading `-`) falls back to `tailnet_exec`.
+
 An administrator may install this private JSON file at **`Path.home() / ".hermes/tailnet/workload-policy.json"`**. It is intentionally not relative to `HERMES_HOME`, a profile, or a job-supplied path. Keep real machine identities out of this public repository.
 
 ```json

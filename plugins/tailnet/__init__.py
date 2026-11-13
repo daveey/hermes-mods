@@ -585,6 +585,9 @@ def tool_exec(args: dict, **_: Any) -> str:
             return _jerr("reason is required (at least 5 characters): why this is being run")
     timeout = _timeout(args)
     payload = dict(_job_base(inv, host, timeout), mode="exec", command=command)
+    sid = _session("ID")
+    if sid:  # runner.py sends it as LC_HERMES_AGENT, attributing the remote command to this agent session
+        payload["agent_session"] = sid
     return _gate(inv, req, "exec", host, command, why, payload, args, timeout)
 
 

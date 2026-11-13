@@ -50,7 +50,23 @@ def destination(t):
     return f"{user}@{addr}"
 
 
-def build(job, keyfile, isolated=False):
+# Agent marker for the remote shell: `hermes kanban comment` run through tailnet_exec must record
+# writer_kind=agent on the target. Stock sshd (macOS, Ubuntu) accepts only `AcceptEnv LANG LC_*`, and the isolated
+# mode reads no ssh_config (no SendEnv), so SetEnv sends it regardless of this process's env. Every exec job comes
+# from an agent tool, and a marker can only lower a note's authority. Value: the requesting session id, else this.
+AGENT_MARKER = "LC_HERMES_AGENT"
+AGENT_MARKER_DEFAULT = "tailnet_exec"
+SAFE_MARKER_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}")
+
+
+def agent_marker_value(job):
+    value = job.get("agent_session")
+    if isinstance(value, str) and SAFE_MARKER_VALUE.fullmatch(value.strip()):
+        return value.strip()
+    return AGENT_MARKER_DEFAULT
+
+
+def build(job, keyfile, isolated=False, marker=True):
     dest = destination(job["target"])
     opts = base_opts(keyfile, job["known_hosts"], isolated)
     if job.get("via"):
@@ -60,6 +76,8 @@ def build(job, keyfile, isolated=False):
     mode = job["mode"]
     # `--` ends ssh/scp option parsing, so user@addr (and the paths) can never be taken as an option.
     if mode == "exec":
+        if marker:
+            opts += ["-o", f"SetEnv={AGENT_MARKER}={agent_marker_value(job)}"]
         return ["ssh"] + opts + ["--", dest, job["command"]]
     if mode == "put":
         return ["scp", "-q", "-p"] + opts + ["--", job["local"], f"{dest}:{job['remote']}"]
@@ -270,7 +288,8 @@ class PreflightRefused(Exception):
 
 def preflight_get(job, keyfile, env):
     probe = dict(job, mode="exec", command=get_stat_command(job["remote"]))
-    p = subprocess.run(build(probe, keyfile, True), capture_output=True, text=True,
+    # The size probe belongs to a get (scp carries no comment): no agent marker, like the copy itself.
+    p = subprocess.run(build(probe, keyfile, True, marker=False), capture_output=True, text=True,
                        timeout=min(int(job.get("timeout") or 120), 30), env=env,
                        stdin=subprocess.DEVNULL)
     value = p.stdout.strip()

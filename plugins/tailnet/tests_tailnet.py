@@ -1009,3 +1009,110 @@ def test_register_exposes_three_tools(env):
             seen.append(kw["name"])
     tn.register(Ctx())
     assert sorted(seen) == ["tailnet_copy", "tailnet_exec", "tailnet_hosts"]
+
+
+# ---------------------------------------------------------------- agent marker over ssh
+# A `hermes kanban comment` run through tailnet_exec must record writer_kind=agent on the target. Stock sshd
+# accepts only LANG LC_*, and the isolated mode runs `-F /dev/null` (no SendEnv), so the runner sets the marker
+# itself with SetEnv. scp carries no comment: put/get stay unchanged.
+
+_rspec = importlib.util.spec_from_file_location("tailnet_runner_t", HERE / "runner.py")
+runner_mod = importlib.util.module_from_spec(_rspec)
+_rspec.loader.exec_module(runner_mod)
+
+SID = "20260101_000000_abc123"
+
+
+def _build_job(mode, **extra):
+    job = {"target": {"addr": "100.1.1.1", "user": "daveey"}, "known_hosts": "/tmp/kh", "mode": mode}
+    job.update({"exec": {"command": "hostname"}, "put": {"local": "/tmp/a", "remote": "/tmp/b"},
+                "get": {"local": "/tmp/a", "remote": "/tmp/b"}}[mode])
+    job.update(extra)
+    return job
+
+
+def _setenv_values(argv):
+    return [argv[i + 1] for i, x in enumerate(argv[:-1]) if x == "-o" and argv[i + 1].startswith("SetEnv=")]
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+def test_exec_sends_the_agent_marker_with_setenv(isolated):
+    argv = runner_mod.build(_build_job("exec"), "/k", isolated)
+    assert _setenv_values(argv) == ["SetEnv=LC_HERMES_AGENT=tailnet_exec"]
+    # an ssh option: before `--` and the destination, so the remote command is unchanged
+    assert argv.index("SetEnv=LC_HERMES_AGENT=tailnet_exec") < argv.index("--")
+    assert argv[-3:] == ["--", "daveey@100.1.1.1", "hostname"]
+    assert (argv[1:3] == ["-F", "/dev/null"]) is isolated
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+def test_exec_marker_carries_the_requesting_session_id(isolated):
+    argv = runner_mod.build(_build_job("exec", agent_session=SID), "/k", isolated)
+    assert _setenv_values(argv) == ["SetEnv=LC_HERMES_AGENT=" + SID]
+
+
+@pytest.mark.parametrize("bad", ["", "  ", "a b", "x\ny", "-oProxyCommand=x", "a=b\"c", "é", "x" * 201, None, 7])
+def test_exec_marker_falls_back_for_an_unsafe_session_value(bad):
+    argv = runner_mod.build(_build_job("exec", agent_session=bad), "/k", True)
+    assert _setenv_values(argv) == ["SetEnv=LC_HERMES_AGENT=tailnet_exec"]
+
+
+@pytest.mark.parametrize("mode", ["put", "get"])
+@pytest.mark.parametrize("isolated", [False, True])
+def test_put_and_get_are_unchanged(mode, isolated):
+    argv = runner_mod.build(_build_job(mode, agent_session=SID), "/k", isolated)
+    assert _setenv_values(argv) == [] and not any("LC_HERMES_AGENT" in x for x in argv)
+    assert argv[:3] == ["scp", "-q", "-p"]
+    expected = ["-F", "/dev/null"] if isolated else []
+    assert argv[3:3 + len(expected)] == expected
+    tail = ["--", "/tmp/a", "daveey@100.1.1.1:/tmp/b"] if mode == "put" else ["--", "daveey@100.1.1.1:/tmp/b", "/tmp/a"]
+    assert argv[-3:] == tail
+
+
+def test_jump_host_proxycommand_carries_no_marker():
+    argv = runner_mod.build(_build_job("exec", via={"addr": "100.1.1.2", "user": "daveey"}), "/k", True)
+    pc = [x for x in argv if x.startswith("ProxyCommand=")]
+    assert pc and "LC_HERMES_AGENT" not in pc[0]  # the hop runs no shell, only -W
+    assert _setenv_values(argv) == ["SetEnv=LC_HERMES_AGENT=tailnet_exec"]
+
+
+def test_tool_exec_job_carries_the_session_id_end_to_end(env):
+    env.session()
+    env.monkeypatch.setenv("HERMES_SESSION_ID", SID)
+    r = call(tn.tool_exec, host="mini", command="hostname", reason="check mini")
+    assert r["ran"]
+    assert _setenv_values(env.ssh_log()[0]["argv"]) == ["SetEnv=LC_HERMES_AGENT=" + SID]
+
+
+def test_tool_exec_without_a_session_id_still_marks_the_agent(env):
+    env.session()
+    env.monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    r = call(tn.tool_exec, host="mini", command="hostname", reason="check mini")
+    assert r["ran"]
+    assert _setenv_values(env.ssh_log()[0]["argv"]) == ["SetEnv=LC_HERMES_AGENT=tailnet_exec"]
+
+
+def test_tool_copy_job_has_no_marker(env):
+    env.session()
+    env.monkeypatch.setenv("HERMES_SESSION_ID", SID)
+    assert call(tn.tool_copy, host="mini", direction="put", remote_path="/tmp/a.txt", local_name="a.txt",
+                content="hello", reason="push a file")["ran"]
+    assert call(tn.tool_copy, host="mini", direction="get", remote_path="/tmp/b.txt", local_name="b.txt",
+                reason="fetch a file")["ran"]
+    logs = env.ssh_log()
+    assert [e["prog"] for e in logs] == ["scp", "scp"]
+    assert all(not any("LC_HERMES_AGENT" in x for x in e["argv"]) for e in logs)
+
+
+def test_protected_get_size_probe_has_no_marker(workload):
+    # The get's ssh size probe is part of the copy, not an agent command: unchanged, no marker.
+    workload.policy.write_text(json.dumps(dict(POLICY, protected_addresses=["100.1.1.1"])))
+    workload.session()
+    workload.monkeypatch.setenv("HERMES_SESSION_ID", SID)
+    get_job(workload)
+    result = call(tn.tool_copy, host="mini", direction="get", remote_path="/tmp/data", local_name="data",
+                  reason="test bounded get")
+    assert result["ok"] and result["ran"], result
+    logs = workload.ssh_log()
+    assert [x["prog"] for x in logs] == ["ssh", "scp"]
+    assert all(not any("LC_HERMES_AGENT" in a for a in x["argv"]) for x in logs)
