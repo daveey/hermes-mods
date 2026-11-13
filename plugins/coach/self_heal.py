@@ -2365,6 +2365,14 @@ NATURAL_EVENT_RULE = """   `live_check` needs a natural event (the real failing 
    both hold; a repro whose pre-fix run also passes proves nothing."""
 
 
+# selfheal lesson [verify-retry-receipt-first] (x5): a retried VERIFY whose quota-killed run had already logged
+# `event fixed` redid the check and re-recorded. Both VERIFY variants open with this receipt check.
+def retry_receipt_rule(fp: str, coach: str, how: str = "") -> str:
+    return f"""0. Is this a retry (prior attempts or comments on this card)? Then before any work, check whether an earlier
+   run already recorded the receipt: grep {coach}/log.jsonl for `selfheal_fixed` with `{fp}` and read `{fp}` in
+   {coach}/selfheal_lane.json{how}. Already recorded? Read it back and add evidence; never re-record."""
+
+
 def verify_brief(fp: str, st: dict, fix_card: str, remote: bool = False) -> str:
     """The VERIFY child: host steps, live check, and the lane event, from the fix's handoff. ``remote`` (the hub's
     lane): a pool worker does every gateway step through `hub-admin '<command>'`; else it is machine-pinned here."""
@@ -2383,6 +2391,7 @@ You run
 on the host that filed it, because the live check and the lane record need this host's coach store and logs.
 Post nothing to the Inbox. Budget for this card <= ${INVESTIGATION_BUDGET}.
 
+{retry_receipt_rule(fp, '<coach>')}
 1. Read the fix card's handoff: `kanban_show(task_id="{fix_card}")` (summary, metadata `fix_shas`, `core_change`,
    `red`, `green`, `live_check`, `host_steps`, `undo`, or `not_defect`).
 2. `core_change` set? File one core card with `kanban_create`, assignee="default",
@@ -2416,6 +2425,8 @@ def remote_verify_brief(fp: str, st: dict, fix_card: str) -> str:
     work text names no local state path or host word: the runs_on attestations are the declared need."""
     stage = f"{VERIFY_REMOTE_DIR}/{fp}.md"
     coach = '"$HOME/.hermes/coach"'  # expanded by the gateway's shell inside hub-admin's single quotes
+    receipt_cmd = (f":\n   `hub-admin 'grep selfheal_fixed {coach}/log.jsonl | grep {fp} | tail -n 1; "
+                   f"grep -o {fp} {coach}/selfheal_lane.json'`")
     return f"""Self-heal VERIFY for defect `{fp}`: owner/fix card {fix_card} (its parent here).
 This card runs on a pool worker. The lane it records into lives on the gateway that filed it, so EVERY step that
 reads or changes that gateway runs there through `hub-admin '<command>'` (single-quoted, so `$HOME` and `~` expand
@@ -2430,6 +2441,7 @@ recording fixed (do not call a real unresolved defect not_defect). Clear any mis
 A false detection requires evidence before `event not_defect`.
 Post nothing to the Inbox. Budget for this card <= ${INVESTIGATION_BUDGET}.
 
+{retry_receipt_rule(fp, '<coach>', receipt_cmd)}
 1. Read the fix card's handoff: `kanban_show(task_id="{fix_card}")` (summary, metadata `fix_shas`, `core_change`,
    `red`, `green`, `live_check`, `host_steps`, `undo`, or `not_defect`).
 2. `core_change` set? File one core card with `kanban_create`, assignee="default",
