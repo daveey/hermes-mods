@@ -157,16 +157,22 @@ def test_ttl_env(value, expected):
 
 
 class FakeClock:
-    """Monotonic clock that only moves when the census thread sleeps; no real waiting."""
-    def __init__(self, on_tick=None):
+    """Monotonic clock that only moves when the census thread sleeps; no real waiting.
+
+    With `hold`, the first sleep waits until the test sets it: the thread can otherwise run the
+    whole fake TTL (and stop tracing) before the test observes the armed state under load."""
+    def __init__(self, on_tick=None, hold=None):
         self.now = 1000.0
         self.on_tick = on_tick
         self.sleeps = 0
+        self.hold = hold
 
     def __call__(self):
         return self.now
 
     def sleep(self, seconds):
+        if self.hold is not None:
+            assert self.hold.wait(15), 'test never released the census thread'
         self.now += seconds
         self.sleeps += 1
         if self.on_tick:
@@ -180,10 +186,11 @@ def _request(d):
 
 
 def test_tracing_stops_at_ttl_without_request(tmp_path, clean, caplog):
-    clock = FakeClock()
+    clock = FakeClock(hold=threading.Event())
     with caplog.at_level('WARNING', logger='loop-watch'):
         thread = arm(tmp_path, env={h.ENV: '2', h.TTL_ENV: '60'}, clock=clock, sleep=clock.sleep)
         assert thread is not None and tracemalloc.is_tracing()
+        clock.hold.set()
         thread.join(15)
     assert not thread.is_alive()
     assert not tracemalloc.is_tracing()  # loop-watch started it, so the TTL stopped it
