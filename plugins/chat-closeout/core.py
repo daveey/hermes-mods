@@ -1248,6 +1248,23 @@ class Ledger:
                 c.close()
         return [_row(r) for r in rows]
 
+    def pending_for(self, sids: Iterable[str]) -> list[dict[str, Any]]:
+        """``pending()`` restricted to these chat ids, read by primary key (a residual pass's cheap read)."""
+        ids = sorted({str(s) for s in sids if s})
+        out: list[dict[str, Any]] = []
+        if not ids:
+            return out
+        with self._lock:
+            c = self._conn()
+            try:
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    out += c.execute(f"SELECT * FROM waiting WHERE session_id IN ({','.join('?' for _ in chunk)}) "
+                                     "AND (batch != '[]' OR unlinked LIKE '%\"removed\"%')", chunk).fetchall()
+            finally:
+                c.close()
+        return [_row(r) for r in sorted(out, key=lambda r: r["session_id"])]
+
     def write(self, sid: str, **fields: Any) -> None:
         enc = {k: (json.dumps(sorted(v)) if k in _JSON_SETS else
                    json.dumps(list(v)) if k in ("closing", "wakes") and v is not None else
@@ -1263,15 +1280,19 @@ class Ledger:
             finally:
                 c.close()
 
-    def claim(self, sid: str, sig: str, now: float) -> bool:
-        """CAS: exactly one process wins the wake for (chat, settled state)."""
+    def claim(self, sid: str, sig: str, now: float, *, over_foreign_refusal: bool = False) -> bool:
+        """CAS: exactly one process wins the wake for (chat, settled state). ``over_foreign_refusal``: a refusal
+        another process recorded does not hold this caller off its retry backoff (``refused`` means the chat was
+        not live there; a residual pass claims only chats live in its own process). Its own refusal still does."""
         with self._lock:
             c = self._conn()
             try:
                 cur = c.execute("UPDATE waiting SET claim_sig=?, claim_at=?, claim_pid=?, wake_result='claimed' "
                                 "WHERE session_id=? AND COALESCE(claim_sig,'') != ? AND COALESCE(done_sig,'') != ? "
-                                "AND COALESCE(retry_after,0) <= ?",
-                                (sig, now, os.getpid(), sid, sig, sig, now))
+                                "AND (COALESCE(retry_after,0) <= ? OR (? AND wake_result='refused' "
+                                "AND COALESCE(claim_pid,0) != ?))",
+                                (sig, now, os.getpid(), sid, sig, sig, now, int(bool(over_foreign_refusal)),
+                                 os.getpid()))
                 return cur.rowcount == 1
             finally:
                 c.close()

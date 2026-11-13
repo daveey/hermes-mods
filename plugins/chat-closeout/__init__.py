@@ -9,6 +9,9 @@ they finish. Logic lives in core.py; this file wires Hermes hooks and the backen
   thread (serve)    close-out waker: wake an idle chat whose cards all settled, once per batch state (in-process
                     resume via server._wake_session_turn), at most MAX_WAKES_PER_HOUR per chat; watchdog every 15 min: Kanban card + WARNING for a chat
                     with unseen kanban results > 30 min or a settled batch with no close-out > 30 min
+  host lease        (``run_pass``) one process per Hermes home (core ``host_loop_lease`` ``chat-closeout``, gateway first)
+                    runs the scans above; every other backend wakes only the chats live in it (their ledger rows by
+                    key, plus owner wakes the holder relayed because it was refused there). Older core: every process.
 Every hook fails open. [daveey]
 """
 from __future__ import annotations
@@ -985,10 +988,12 @@ def read_cards(ids: list[str], remote_inventory: Optional[Callable[[], list[dict
     return out
 
 
-def _pass_reader(light: bool = False) -> Callable[[list[str]], dict]:
+def _pass_reader(light: bool = False, rows: Optional[list[dict]] = None) -> Callable[[list[str]], dict]:
     """``read_cards`` for one pass over the ledger: the remote inventory (a full hub-replica projection) and the
     local boards are read once and reused for every row, not once per pending row. A failed read fails every row
-    the same way. ``light`` for a pass that only decides settlement (the sidebar's waiting source).
+    the same way. ``light`` for a pass that only decides settlement (the sidebar's waiting source). ``rows``: the
+    pass covers only these ledger rows (a residual pass), so the shared board read is their ids, not every pending
+    row's.
 
     ``read.healthy()``: the inventory was read, no replica row is stale, and the hub replica is fresh: only such a
     pass counts as observing that an entry is missing (``core.track_unlinked``)."""
@@ -1013,7 +1018,7 @@ def _pass_reader(light: bool = False) -> Callable[[list[str]], dict]:
     def read(ids: list[str]) -> dict:
         if "ids" not in union:
             try:
-                union["ids"] = {i for row in ledger().pending() for i in row["batch"]}
+                union["ids"] = {i for row in (ledger().pending() if rows is None else rows) for i in row["batch"]}
             except Exception:
                 union["ids"] = set()
         want = set(ids)
@@ -1649,17 +1654,29 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
               unseen: Optional[dict[str, int]] = None, last_user: Optional[Callable[[list[str]], float]] = None,
               read: Optional[Callable[[list[str]], dict]] = None,
               proof: Optional[Callable[[str, str, dict], bool]] = None, mono: Optional[float] = None,
-              healthy: Optional[Callable[[], bool]] = None) -> list[dict]:
+              healthy: Optional[Callable[[], bool]] = None, only: Optional[set[str]] = None) -> list[dict]:
     """One close-out pass over the ledger. Returns what it did (for logs/tests). One remote-inventory read per
     tick, shared by every pending row, and one ``_proof_pass`` (state.db connections, compression tips and
     transcript proofs shared by every row, as the sidebar's waiting pass does). ``healthy`` (default: the pass
-    reader's ``healthy``) says whether this pass observes missing entries (``core.track_unlinked``)."""
+    reader's ``healthy``) says whether this pass observes missing entries (``core.track_unlinked``).
+
+    ``only``: a residual pass (this process does not hold the host lease, see ``run_pass``): just the ledger rows
+    of these chat ids (the ones live in this process), read by primary key, and nothing at all when none is
+    pending. Such a pass may retry a chat another process's wake was refused for: that refusal said "not live
+    there", and the chat is live here."""
+    rows = None
+    if only is not None:
+        rows = ledger().pending_for(only)
+        if not rows:
+            return []
+        if read is None:
+            read = _pass_reader(rows=rows)
     with _proof_pass():
         return _wake_tick(now=now, wake=wake, unseen=unseen, last_user=last_user, read=read, proof=proof,
-                          mono=mono, healthy=healthy)
+                          mono=mono, healthy=healthy, rows=rows)
 
 
-def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=None) -> list[dict]:
+def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=None, rows=None) -> list[dict]:
     now = time.time() if now is None else now
     mono = time.monotonic() if mono is None else mono
     read = read or _pass_reader()
@@ -1676,8 +1693,9 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
         logger.debug("chat-closeout: shepherd upgrade incomplete (inventory unreadable or stale); retrying")
     last_user = last_user or (lambda ids: core.last_user_at(state_dbs(), ids, pool=_pass_pool()))
     led = ledger()
+    residual = rows is not None
     done: list[dict] = []
-    for row in led.pending():
+    for row in (led.pending() if rows is None else rows):
         sid = row["session_id"]
         if _session_source(sid).lower() in SKIP_PLATFORMS:
             # A worker/cron transcript is not a chat: it cannot be resumed (resume is refused), so a ledger row for
@@ -1715,10 +1733,10 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
         due = core.closeout_due(row, cards, unseen=n_unseen, last_user_at=user_at, now=now)
         if not due:
             relay = core.ask_relay_due(row, cards, unseen=n_unseen, last_user_at=user_at, now=now)
-            if relay and led.claim(sid, relay, now):
+            if relay and led.claim(sid, relay, now, over_foreign_refusal=residual):
                 done.append(_relay(led, sid, row, cards, relay, now, wake))
             continue
-        if not led.claim(sid, due, now):
+        if not led.claim(sid, due, now, over_foreign_refusal=residual):
             continue
         new_ids = core.uncovered(row, cards)
         # Mark the batch covered and the turn as a close-out BEFORE it starts: the turn's own end (or a card it
@@ -1982,9 +2000,11 @@ def owner_wake_tick(*, now: Optional[float] = None, cards: Optional[list[dict]] 
                     chat_info: Optional[Callable[[str], Optional[dict]]] = None,
                     supervise: Optional[Callable[[list[dict], str, str], str]] = None,
                     last_user: Optional[Callable[[str], float]] = None,
-                    dependents: Optional[Callable[[dict], list[str]]] = None) -> list[dict]:
+                    dependents: Optional[Callable[[dict], list[str]]] = None,
+                    relay_refused: bool = False) -> list[dict]:
     """Owner wake (owner_wake.py): a card parked for an agent-owned reason starts ONE supervise turn in the chat that
-    owns it (archived/reaped/gone chat -> a board-supervisor card). Needs core ``parked_waits``; older cores: no-op."""
+    owns it (archived/reaped/gone chat -> a board-supervisor card). Needs core ``parked_waits``; older cores: no-op.
+    ``relay_refused``: the lease holder's host pass posts a refused wake for the process the chat is live in."""
     try:
         from hermes_cli import kanban_session_activity as ksa
     except ImportError:
@@ -2013,7 +2033,16 @@ def owner_wake_tick(*, now: Optional[float] = None, cards: Optional[list[dict]] 
         chat_info=chat_info or owner_wake.chat_info_from(state_dbs, _compression_tip),
         supervise=supervise or owner_wake.supervise_on_board,
         last_user=last_user or (lambda sid: core.last_user_at(state_dbs(), _lineage(sid))), now=now,
-        canonical=_canonical_session)
+        canonical=_canonical_session, relay_refused=relay_refused)
+
+
+def owner_relay_tick(live: set[str], *, now: Optional[float] = None,
+                     wake: Optional[Callable[..., str]] = None) -> list[dict]:
+    """Residual owner wake: take the host pass's relays for chats live in this process (``owner_wake.take_relays``)."""
+    if wake is None:
+        srv = _server()
+        wake = srv._wake_session_turn if srv is not None else None
+    return owner_wake.take_relays(live=live, wake=wake, log=wake_log(), now=now)
 
 
 def _canonical_session(sid: str) -> str:
@@ -2414,15 +2443,105 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
     return raised
 
 
+LEASE_NAME = "chat-closeout"
+
+
+def _lease_role() -> str:
+    """This process's host-loop lease role (core ``host_loop_lease.ROLE_PRIORITY``): its ``hermes`` subcommand."""
+    for tok in [a for a in sys.argv[1:] if not a.startswith("-")][:3]:
+        if tok in ("gateway", "serve", "dashboard"):
+            return tok
+    return "serve"
+
+
+def _host_lease():
+    """Core's ``HostLoopLease`` for this loop (one per process), or None on a core without
+    ``hermes_cli.host_loop_lease``: then every process runs the host pass, as before the lease (safe duplication:
+    ledger claims are CAS, the watchdog's postings keep their own ``Ledger.lease``)."""
+    if "lease" not in _state:
+        lease = None
+        try:
+            from hermes_cli import host_loop_lease as hll
+            cls = getattr(hll, "HostLoopLease", None)
+            if cls is not None:
+                lease = cls(LEASE_NAME, _lease_role(), interval=max(TICK_S, 1.0))
+        except Exception:
+            logger.debug("chat-closeout: host loop lease unavailable; this process runs the host pass",
+                         exc_info=True)
+            lease = None
+        _state["lease"] = lease
+    return _state["lease"]
+
+
+def _lease_relays() -> bool:
+    """A refused host-pass wake is posted for the chat's own process only while the lease really elects one holder
+    (not under core's kill switch ``HERMES_HOST_LOOP_LEASE=0``, where every process runs the host pass)."""
+    try:
+        from hermes_cli import host_loop_lease as hll
+        return bool(getattr(hll, "enabled", lambda: True)())
+    except Exception:
+        return False
+
+
+def _live_ids() -> Optional[set[str]]:
+    """Ids of the chats live in this process (core ``kanban_unloaded.live_session_ids``), None when unreadable."""
+    try:
+        from tui_gateway import kanban_unloaded as ku
+        fn = getattr(ku, "live_session_ids", None)
+        return None if fn is None else set(fn())
+    except Exception:
+        logger.debug("chat-closeout: live session ids unavailable", exc_info=True)
+        return None
+
+
+def _host_pass(relays: bool) -> None:
+    for name, call in (("wake_tick", lambda: wake_tick()),
+                       ("owner_wake_tick", lambda: owner_wake_tick(relay_refused=relays)),
+                       ("watchdog_tick", lambda: watchdog_tick())):
+        try:
+            call()
+        except Exception:
+            logger.warning("chat-closeout %s failed", name, exc_info=True)
+
+
+def run_pass() -> str:
+    """One background pass (design t_01a1d45d75851804 §2b). The lease holder (core ``host_loop_lease``, gateway >
+    Desktop serve > dashboard) runs the host pass: the full ledger scan with reconcile and wakes, owner wake, the
+    watchdog's candidate scan. Every other process runs only a residual pass for the chats live in it (only it can
+    start their turns): their ledger rows by primary key, and the owner-wake relays the host pass posted for them.
+    An older core (no lease) or unreadable live ids: the full pass, as before. Returns which pass ran."""
+    lease = _host_lease()
+    if lease is None:
+        _host_pass(False)
+        return "full"
+    if lease.held():
+        try:
+            _host_pass(_lease_relays())
+        finally:
+            lease.beat()
+        return "host"
+    live = _live_ids()
+    if live is None:
+        _host_pass(False)
+        return "full"
+    if live:
+        for name, call in (("wake_tick", lambda: wake_tick(only=live)),
+                           ("owner_relay_tick", lambda: owner_relay_tick(live))):
+            try:
+                call()
+            except Exception:
+                logger.warning("chat-closeout %s (residual) failed", name, exc_info=True)
+    return "residual"
+
+
 def _loop(stop: threading.Event) -> None:
     stop.wait(float(os.environ.get("CHAT_CLOSEOUT_FIRST_S", "20")))
     while not stop.is_set():
         if _server() is not None and not _off():
-            for fn in (wake_tick, owner_wake_tick, watchdog_tick):
-                try:
-                    fn()
-                except Exception:
-                    logger.warning("chat-closeout %s failed", fn.__name__, exc_info=True)
+            try:
+                run_pass()
+            except Exception:
+                logger.warning("chat-closeout pass failed", exc_info=True)
         stop.wait(TICK_S)
 
 
