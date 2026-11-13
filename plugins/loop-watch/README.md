@@ -237,6 +237,114 @@ processes), the TTL (expiry calls `tracemalloc.stop` exactly once at the TTL wit
 wall-clock UNTIL stops tracing when the monotonic clock stands still, a request before the TTL still
 reports, pre-existing tracing is never stopped), and that the cache census defaults are unchanged.
 
+## Opt-in owner census (no tracemalloc)
+
+`roots.py` answers "which module global, frame or class holds the heap" for a process that is already
+running, without tracing. Also **off by default**. An armed process pays one 1 s file check until the
+request; nothing is traced or sampled.
+
+**Arm** with a private file, not an env key (a `.env` key is relayed to other gateways and only read at
+process start):
+
+```sh
+d="${HERMES_HOME:-$HOME/.hermes}/loop-watch-roots"; mkdir -p -m 700 "$d"
+(umask 077; printf '{"until": %d, "kinds": ["gateway"]}' $(($(date +%s) + 86400)) > "$d/arm.new" \
+  && mv "$d/arm.new" "$d/arm")
+```
+
+- `until`: epoch seconds, in the future and at most 72 h away. Otherwise the file is inert.
+- `kinds` (optional): process kinds that may arm, from `gateway` (`hermes gateway run`), `serve`,
+  `dashboard`, `other`. Default `gateway` only.
+- The file must be a regular 0600 file of the same user with one link, at most 512 bytes, not a symlink.
+
+loop-watch reads it whenever it registers: at process start and whenever the host reloads the plugin,
+so a process that is already running arms at its next reload.
+loop-watch registers only in `hermes gateway run` and `hermes serve` unless `HERMES_LOOP_WATCH=all`, so
+the `dashboard` and `other` kinds need that too. An armed process logs one WARNING `roots census armed
+in pid …` to agent.log; an arm file it ignores logs `roots census not armed in pid …: <reason>`.
+
+**Disarm** by deleting the arm file: an armed process re-reads it every 30 s and stops waiting
+(`roots census disarmed in pid …`) when it is gone, invalid or no longer names its kind, or at `until`.
+Rewriting the file (atomically, as above) moves the window of a waiting process. A process consumes at
+most one request in its lifetime: after a request, valid or not, it never arms again; one that disarmed
+without a request arms again on a later registration with a valid arm file. Registrations racing on
+several threads arm one probe. Request directories of past probes are left in place.
+
+**Request** once per process, the same way as the cache census, under
+`<HERMES_HOME>/loop-watch-roots/<pid>-<random-generation>/` with the command `roots-census-v1\n`
+(16 bytes):
+
+```sh
+D=$(ls -d ~/.hermes/loop-watch-roots/<pid>-*/)
+(umask 077; printf 'roots-census-v1\n' > "$D/request.new" && mv "$D/request.new" "$D/request")
+```
+
+The request rules (fresh regular 0600 file, atomic consume, one attempt per process) are those of the
+cache census. Once disarmed, a later request in that directory is never consumed.
+
+`result.json` (0600, at most 64 KiB) holds `schema: 1`, `kind: roots_census`, `status: ok|unknown`,
+`truncated`, `bytes`, `objects`, `gc_objects`, `roots`, `owners`, `bitmap_bytes` (the scan's visited
+bitmap), `seconds`, the phase totals
+`module_bytes`, `frame_bytes`, `code_bytes`, `instance_bytes`, `unowned_bytes`, and `top`: the 100
+largest owners as `[owner, bytes, objects]`. The walk is breadth-first from all owners at once, so a
+shared object is counted once, for the nearest owner. Owners, in the order they claim:
+
+| Owner | Holds |
+|---|---|
+| `module.name`, `module.name.attr`, `module.Class.attr` | a module global or class attribute and what only it reaches. A plain instance gets a row per attribute, two levels deep |
+| `<frame file.py:qualname>` | locals of another thread's running frame, or of a suspended generator/coroutine |
+| `<code module>` | what the module's classes and functions hold: class dicts, constants, docstrings, defaults, closures |
+| `<inst module.Class>`, `<inst module.Class>.attr` | objects nothing above reached, by class. A class with at most 8 such instances gets a row per attribute |
+| `<unowned type>` | the rest, by type |
+
+**What the numbers are.** Sizes are `sys.getsizeof` (shallow) sums: Python object bytes, not the
+process footprint. Allocator slack, C-extension buffers and freed-but-kept arenas are not in it, so
+`bytes` is usually well under `footprint`. ints, floats and None are not counted. Values on a running
+frame's evaluation stack are not visible, nor is a container the garbage collector does not track unless
+an owner reaches it.
+
+**Privacy.** The report holds names as they appear in code (module, global, class, attribute and
+function names, source file basenames) with sizes and counts. No values, dict keys or reprs are read
+into it. Every label part must be a short ASCII identifier (module parts may contain `-`, file names
+also `.` and `+`); anything else is shown as `?`, and an instance attribute with such a name gets no row
+of its own. A program that uses
+data as identifiers (a module global or instance attribute named after a user or a session) would show
+those names: the file is 0600 in the process's own home, treat it like a log.
+
+**Code it runs.** Of the inspected objects: `__sizeof__` (as `sys.getsizeof` calls it; one that raises
+counts 0 bytes, one that blocks would block the scan), finalizers of objects whose last reference the
+scan happened to hold, and a data descriptor that a metaclass or a module subclass defines under the
+name `__dict__`, `__module__` or `__qualname__`. Otherwise types are compared by identity and attributes
+are read through the base `type`/`object` slots, so no `__eq__`, `__hash__`, `__getattr__`, instance
+property or lazy import runs. One object that raises is skipped; it never ends the scan.
+
+**Cost.** The one scan touches every live object once (on a host that is swapping, that faults the
+compressed heap in, with the GIL held for that object). Measured: 2.1M gc-tracked objects (4.2M
+counted, 470 MB) in 4.3 s on a quiet CPU; 1.5M gc-tracked objects in 3.8 s at load 16. While it runs it
+needs about 1% of the heap for its bitmap plus 16 bytes per live container; the allocator may keep that
+afterwards (a 537 MB test process ended at 593 MB, a 249 MB one at 295 MB). It runs on its own thread
+and shares the GIL in the normal 5 ms slices, so the event loop keeps running, slower (longest gap seen
+by a 1 ms ticker: 53-89 ms, against 21 ms idle); `gc.get_objects()` itself is one uninterrupted call
+(23 ms at 1.5M objects). A 60 s deadline is checked every 16k objects and before each container of more
+than 100k items (one such container is finished once begun: a 20M-item list took 2.4 s); past it the
+scan skips what is left and reports `truncated: true`. Reading `__dict__` to name attribute rows materializes that instance's dict, so it
+is done only for module-level instances and for classes with at most 8 unreached instances.
+
+`tests_roots.py` covers: ownership by module global, class attribute, running-thread frame, suspended
+generator and coroutine, closure, unreached class and unowned container; nearest-owner counting of a
+shared object; attribute rows and their instance cap; that the report has no values or keys and masks
+names that are not identifiers; that the census does not count itself or leave anything behind; a lazy
+module is not imported; a raising `__class__` property, a metaclass with raising `__eq__`/
+`__getattribute__` and no `__hash__`, and a raising `__sizeof__` do not end the scan (and the metaclass
+code never runs); the deadline (every pass over the heap goes through the one deadline-checked
+iterator, a passed deadline leaves nothing counted, a big container is not begun after it); the
+owner-table and top-list caps; the arm file rules (absent, stale, too far, overflowing, not private,
+hard-linked, symlink, oversized, process kinds); disarming by removal and arming again; a rewritten arm
+file moving the window or excluding the kind; eight racing registrations arming one probe; a thread
+that cannot start releasing the claim; the one-shot request and its cap; and `register()` in real child
+processes. Not tested: a `__sizeof__` that blocks, descriptors on a metaclass, the worst-case report
+size (computed: 20 KB of the 64 KiB cap), and behaviour on a swapping host.
+
 ## Bounded stall-time cost
 
 The stall sampler runs while the backend is already stalled, so its own cost is capped
