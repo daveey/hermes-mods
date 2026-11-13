@@ -841,5 +841,111 @@ class TestAll(unittest.TestCase):
             self.assertNotIn('SKIP', r.stdout)
 
 
+class TestRunDirSweep(unittest.TestCase):
+    """A killed run's synthetic HOME/TMPDIR is swept by the next run; a live concurrent run's is kept."""
+
+    SLEEPER = '''
+        import os, time
+        from pathlib import Path
+        def test_hold():
+            Path(os.environ['SWEEP_MARK']).write_text(os.environ['HOME'])
+            time.sleep(300)
+    '''
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.base = self.tmp / 'hm'
+        self.root = self.tmp / 'repo'
+        make_tree(self.root, {'sleeper': self.SLEEPER, 'quick': 'def test_ok():\n    pass\n'})
+        self.env = {k: v for k, v in os.environ.items() if k != 'HERMES_CORE_CHECKOUT'}
+        self.env.update(HERMES_MODS_PYTHON=sys.executable, HERMES_TEST_ALL_HOME_BASE=str(self.base))
+
+    def start_sleeper(self, name: str) -> tuple[subprocess.Popen, str]:
+        """Start a whole test-all run that stays inside its suite; return it and its run stem."""
+        import signal, time
+        mark = self.tmp / f'{name}.home'
+        p = subprocess.Popen([sys.executable, str(RUNNER), '--root', str(self.root), '--no-core', '--exact',
+                              '-k', 'plugins/sleeper'], env=dict(self.env, SWEEP_MARK=str(mark)),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(lambda: (p.poll() is None and os.killpg(p.pid, signal.SIGKILL), p.wait()))
+        deadline = time.time() + 120
+        while not (mark.exists() and mark.read_text()) and time.time() < deadline:
+            self.assertIsNone(p.poll(), 'sleeper run exited early')
+            time.sleep(0.2)
+        home = Path(mark.read_text())
+        self.assertEqual(home.parent, self.base)
+        # As short as the bare TemporaryDirectory names it replaced: suites bind AF_UNIX sockets below it.
+        self.assertEqual(len(home.name), 8, home)
+        stem = home.name[:-1]
+        self.assertEqual(self.names(stem), [stem + '.lock', stem + 'h', stem + 't'])
+        return p, stem
+
+    def names(self, stem: str) -> list[str]:
+        return sorted(p.name for p in self.base.iterdir() if p.name.startswith(stem))
+
+    def age(self, path: Path, secs: int) -> None:
+        old = __import__('time').time() - secs
+        for dirpath, dirnames, filenames in os.walk(path):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (old, old), follow_symlinks=False)
+        os.utime(path, (old, old))
+
+    def age_run(self, stem: str, secs: int) -> None:
+        for name in self.names(stem):
+            self.age(self.base / name, secs)
+
+    def run_quick(self):
+        return subprocess.run([sys.executable, str(RUNNER), '--root', str(self.root), '--no-core', '--exact',
+                               '-k', 'plugins/quick'], env=self.env, capture_output=True, text=True, timeout=180)
+
+    def test_killed_run_is_swept_and_live_concurrent_run_is_kept(self):
+        import signal
+        killed, killed_stem = self.start_sleeper('killed')
+        live, live_stem = self.start_sleeper('live')
+        self.assertTrue((self.base / (killed_stem + 'h') / 'venv').is_dir())  # the --no-core venv is in HOME
+        os.killpg(killed.pid, signal.SIGKILL)  # no finalizer runs: the dirs leak, as on an OOM/card cap
+        killed.wait()
+        self.assertEqual(len(self.names(killed_stem)), 3)
+        # Both look old; only the lock tells the live one apart.
+        self.age_run(killed_stem, 4 * 3600)
+        self.age_run(live_stem, 4 * 3600)
+        r = self.run_quick()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('removed 3 stale run entries', r.stdout)
+        self.assertEqual(self.names(killed_stem), [])
+        self.assertTrue((self.base / (live_stem + 'h') / 'venv').is_dir())
+        self.assertIsNone(live.poll())
+        # The quick run removed its own dirs and lock on a normal exit.
+        self.assertEqual(sorted(p.name for p in self.base.iterdir()), self.names(live_stem))
+
+    def test_sweep_rules_for_fresh_and_pre_lock_dirs(self):
+        runner = runpy.run_path(str(RUNNER))
+        home, temp, lock, fd = runner['claim_run_dir'](self.base)
+        os.close(fd)  # lock free, but younger than the create->flock grace: kept
+        legacy_idle = self.base / 'ab12cd34'
+        (legacy_idle / 'pytest-of-me/ro').mkdir(parents=True)
+        (legacy_idle / 'pytest-of-me/ro/f').write_text('x')
+        os.chmod(legacy_idle / 'pytest-of-me/ro', 0o500)  # read-only dirs as pytest leaves them
+        self.age(legacy_idle, 4 * 3600)
+        legacy_busy = self.base / 'ef56gh78'
+        (legacy_busy / 'deep').mkdir(parents=True)
+        self.age(legacy_busy, 4 * 3600)
+        (legacy_busy / 'deep/new').write_text('x')  # one fresh file inside keeps a pre-lock dir
+        (self.base / 'stray-file').write_text('x')
+        removed = runner['sweep_stale_runs'](self.base)
+        self.assertEqual(removed, ['ab12cd34'])
+        self.assertTrue(home.is_dir() and temp.is_dir() and lock.is_file())
+        self.assertTrue(legacy_busy.is_dir() and (self.base / 'stray-file').exists())
+        # A run's own dirs are judged by its lock, never by the pre-lock idle rule.
+        self.age(home, 4 * 3600)
+        self.age(temp, 4 * 3600)
+        self.assertEqual(runner['sweep_stale_runs'](self.base), [])
+        self.age(lock, 700)
+        self.assertEqual(sorted(runner['sweep_stale_runs'](self.base)), sorted([home.name, temp.name, lock.name]))
+        self.assertEqual(sorted(p.name for p in self.base.iterdir()), ['ef56gh78', 'stray-file'])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -35,16 +35,20 @@ resolved with core's [tool.uv] overrides, so suites import core there as they do
 Suites are discovered from the tree (plugins/*, tools/*, tests/, and one per skill dir holding
 SKILL.md under skills/ with test_*.py, e.g. `-k hermes-coach`); SUITE_OVERRIDES below holds the few that need a
 different command or are skipped with a reason.
+Each run keeps its synthetic HOME/TMPDIR in ~/.cache/hm/<stem>{h,t} (override: $HERMES_TEST_ALL_HOME_BASE),
+flock'ed via <stem>.lock while it runs; every run first removes the dirs of killed runs (see sweep_stale_runs).
 """
 from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import contextlib
 from importlib.metadata import distributions
 import json
 import os
 import shlex
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -81,6 +85,11 @@ os.environ.pop("HERMES_TEST_ALL_REEXEC", None)
 
 import tomllib
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # not POSIX: no run locks, so the sweep below removes nothing
+    fcntl = None
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -557,6 +566,127 @@ def run_suite(s: dict, py: str, core: Path | None, timeout: int, root: Path = RO
     return res
 
 
+# Each run's synthetic HOME and TMPDIR are <home base>/<stem>h and <stem>t, flock'ed through <stem>.lock for
+# the run's lifetime. They are siblings with 8-char names, as short as the bare TemporaryDirectory names
+# before, because suites bind AF_UNIX sockets under TMPDIR and HOME (paths capped near 104 bytes). A killed
+# run (OOM, SIGTERM at a card cap, SIGKILL) never reaches its cleanup, so every run first sweeps the runs
+# whose lock it can take: the kernel drops a flock when its holder dies, so a free lock means no live run.
+# RUN_LOCK_GRACE covers the instant between creating and flocking a lock. Pre-lock dirs (bare random names
+# from older runners) have no lock to ask, so they go only once nothing inside changed for LEGACY_IDLE s.
+RUN_LOCK_SUFFIX = '.lock'
+RUN_PARTS = ('h', 't')
+RUN_LOCK_GRACE = 600
+LEGACY_IDLE = 3 * 3600
+
+
+def home_base_dir() -> Path:
+    return Path(os.environ.get('HERMES_TEST_ALL_HOME_BASE') or Path.home() / '.cache' / 'hm')
+
+
+def _rmtree(path: Path) -> None:
+    def fix(func, p, *_):  # pytest-of-<user> trees hold read-only dirs
+        try:
+            os.chmod(os.path.dirname(p), 0o700)
+            if os.path.isdir(p) and not os.path.islink(p):
+                os.chmod(p, 0o700)
+            func(p)
+        except OSError:
+            pass
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=fix)
+    else:
+        shutil.rmtree(path, onerror=fix)
+
+
+def _newest_mtime(path: Path, since: float) -> float:
+    """Newest mtime under path (symlinks not followed); returns early at the first one newer than `since`."""
+    newest = path.lstat().st_mtime
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames + filenames:
+            try:
+                m = os.lstat(os.path.join(dirpath, name)).st_mtime
+            except OSError:
+                continue
+            if m > newest:
+                newest = m
+                if newest > since:
+                    return newest
+    return newest
+
+
+def sweep_stale_runs(base: Path, now: float | None = None) -> list[str]:
+    """Remove the entries in base that hold no live run; return their names."""
+    if fcntl is None or not base.is_dir():
+        return []
+    now = time.time() if now is None else now
+    removed = []
+    entries = sorted(base.iterdir())
+    locks = {e.name[:-len(RUN_LOCK_SUFFIX)] for e in entries
+             if e.name.endswith(RUN_LOCK_SUFFIX) and e.is_file() and not e.is_symlink()}
+    for entry in entries:
+        try:
+            if entry.name.endswith(RUN_LOCK_SUFFIX) and entry.name[:-len(RUN_LOCK_SUFFIX)] in locks:
+                if now - entry.lstat().st_mtime < RUN_LOCK_GRACE:
+                    continue
+                fd = os.open(entry, os.O_RDWR)
+                try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except OSError:
+                        continue  # a live run holds it
+                    stem = entry.name[:-len(RUN_LOCK_SUFFIX)]
+                    for part in RUN_PARTS:
+                        d = base / (stem + part)
+                        if d.is_dir() and not d.is_symlink():
+                            _rmtree(d)
+                            removed.append(d.name)
+                    entry.unlink()  # last and still locked: an interrupted sweep leaves the lock to retry from
+                    removed.append(entry.name)
+                finally:
+                    os.close(fd)
+                continue
+            if entry.is_symlink() or not entry.is_dir() or entry.name[:-1] in locks:
+                continue
+            if now - _newest_mtime(entry, now - LEGACY_IDLE) >= LEGACY_IDLE:
+                _rmtree(entry)
+                if not entry.exists():
+                    removed.append(entry.name)
+        except OSError as e:
+            print(f"test-all: could not sweep {entry}: {e}", file=sys.stderr, flush=True)
+    return removed
+
+
+def claim_run_dir(base: Path) -> tuple[Path, Path, Path, int]:
+    """Lock base/<stem>.lock, then make base/<stem>h and <stem>t; returns (home, temp, lock, lock fd)."""
+    base.mkdir(parents=True, exist_ok=True)
+    while True:
+        stem = ''.join(secrets.choice('abcdefghijklmnopqrstuvwxyz0123456789_') for _ in range(7))
+        if any((base / (stem + part)).exists() for part in RUN_PARTS):
+            continue
+        lock = base / (stem + RUN_LOCK_SUFFIX)
+        try:
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        break
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    home, temp = (base / (stem + part) for part in RUN_PARTS)
+    home.mkdir(mode=0o700)
+    temp.mkdir(mode=0o700)
+    return home, temp, lock, fd
+
+
+def release_run_dir(home: Path, temp: Path, lock: Path, fd: int) -> None:
+    try:
+        for d in (home, temp):
+            if d.exists():
+                _rmtree(d)
+        lock.unlink(missing_ok=True)
+    finally:
+        os.close(fd)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-k", dest="match", action="append", default=[], help="only suites whose name contains this")
@@ -615,9 +745,15 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     # Keep the synthetic home outside the real Hermes home and outside TMPDIR;
     # tests of canonical HOME must not mistake it for a temporary export.
-    home_base = Path.home() / '.cache' / 'hm'
-    home_base.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='', dir=home_base) as home, tempfile.TemporaryDirectory(prefix='', dir=home_base) as temp, cf.ThreadPoolExecutor(max_workers=max(1, a.jobs)) as ex:
+    home_base = home_base_dir()
+    swept = sweep_stale_runs(home_base)
+    if swept:
+        print(f"test-all: removed {len(swept)} stale run entries from {home_base}", flush=True)
+    home_dir, temp_dir, run_lock, run_fd = claim_run_dir(home_base)
+    home, temp = str(home_dir), str(temp_dir)
+    with contextlib.ExitStack() as stack:
+        stack.callback(release_run_dir, home_dir, temp_dir, run_lock, run_fd)
+        ex = stack.enter_context(cf.ThreadPoolExecutor(max_workers=max(1, a.jobs)))
         if a.no_core:
             # A fresh, pip-free venv excludes the invoking interpreter's editable
             # core install even in grandchildren that don't inherit Python flags.
