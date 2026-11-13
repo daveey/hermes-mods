@@ -63,6 +63,10 @@ REPEAT_RE = re.compile(
     r"aren'?t|arent|haven'?t|havent) (?:you |we |it |this |that )?(?:just )?(?:fix|fixed|done|work|working|solve|"
     r"resolved?|unblock|move|moving|happen)"
     r"|\bwhat'?s (?:going on|happening|the (?:hold ?up|status|delay))\b|\bwhat is going on\b"
+    # agent-02be078e8a: "what going on here, why are we blocked and nothing running"
+    r"|\bwhat (?:going on|happening)\b|\bwhy (?:are|is) (?:we|it|this|that|everything|things) (?:still )?"
+    r"(?:blocked|stuck|stalled|waiting)\b|\bwhy (?:is )?(?:nothing|no ?one|nobody) (?:is )?(?:running|moving|working|"
+    r"happening)\b|\bnothing (?:is )?(?:running|moving|happening)\b"
     r"|\blook again\b|\bcheck again\b|\bany (?:update|progress|news)\b|\bis it (?:fixed|done|working|unblocked) (?:yet|now)\b"
     r"|\bstill (?:red|blocked|broken|stuck|failing|waiting|down|not)\b|\bwhere are we\b"
     # agent-48e909978c: "how goes?", "what's the deal, can we unblock ...?" (same phrasings as status_only's ask)
@@ -76,13 +80,17 @@ UNFINISHED_RE = re.compile(
     r"|\bunderway\b|\bin progress\b|\bunfinished\b|\bstill (?:being )?(?:tested|testing|running|working|debugging|"
     r"blocked|waiting|queued|pending|in review)\b|\bwaits? (?:for|on) (?:capacity|a worker|the worker|a slot)\b"
     r"|\bqueued (?:behind|for|on)\b|\bholding up (?:deploy(?:ment)?|the fix|recovery)\b"
-    r"|\b(?:before|pending) (?:deploy(?:ment)?|the deploy|recovery)\b",
+    r"|\b(?:before|pending) (?:deploy(?:ment)?|the deploy|recovery)\b"
+    # agent-02be078e8a: "a cloud worker is tidying the follow-ups ... now"
+    r"|\b(?:is|are) (?:tidying|working on|cleaning up|fixing|finishing|wrapping up|handling|picking up)\b"
+    r"[^.!?\n]{0,80}\bnow\b",
     re.I)
 # ... and names someone else doing it
 OWNER_NOUN_RE = re.compile(
     r"\bt_[0-9a-f]{6,}\b"
     r"|\b(?:its|the|that|active|repair|fix|recovery|deploy(?:ment)?|other|another|background|existing|owning)\s+"
     r"(?:repair |fix |recovery )?(?:worker|card|agent|subagent|session|chat|lane|owner)s?\b"
+    r"|\ba (?:cloud|pool|remote|background|kanban) (?:worker|agent|session)\b"
     r"|\bthe (?:existing |active |current )?(?:repair|fix|recovery)\b",
     re.I)
 CARD_RE = re.compile(r"\bt_[0-9a-f]{6,}\b")

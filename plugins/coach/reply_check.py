@@ -1382,7 +1382,63 @@ PROBE_TAG_RE = re.compile(r"^\s*\[selfheal-probe\]\s*", re.I)
 STATUS_PLAIN_HINT = (
     "[coach] status_plain: the user asked about progress (\"{ask}\"). Open with the state of their original ask in "
     "plain words: what works, what's still broken (a number), the one thing stopping it, who acts next. No card ids "
-    "or subagent/owner/coordinator/detector words in the first paragraph.")
+    "or subagent/owner/coordinator/detector words in the first paragraph. Before the first sentence, read the live "
+    "state of every item you will report (card, PR, run, worker) with a tool call this turn: earlier turns are stale. "
+    "Never write \"never started\" or \"not running\" from memory.")
+
+
+# status_fresh (agent-02be078e8a): on a status_plain turn, a draft written with zero tool calls that states work status
+# is held once, unshown (pre_final_gate), so the agent reads live state first. Deterministic, no LLM call.
+# Off switch: env COACH_STATUS_FRESH=off, or config plugins.entries.coach.settings.status_fresh: false.
+STATUS_FRESH_CLAIM_RE = re.compile(
+    r"\b(?:never|not|hasn'?t|haven'?t|didn'?t|wasn'?t|isn'?t|aren'?t)\s+(?:yet\s+)?(?:been\s+)?"
+    r"(?:start(?:ed)?|run(?:ning)?|picked up|claimed|merged|landed|deployed|moving)\b"
+    r"|\b(?:is|are|was|were|still|now|been)\s+(?:still\s+)?(?:running|blocked|stuck|queued|merged|landed|deployed|"
+    r"started|pending|in review|in progress|idle|done|green|red|failing)\b"
+    r"|\b(?:started|merged|landed|deployed|queued|blocked)\b(?:\s+(?:on|behind|by|at|yesterday|earlier))"
+    r"|\bnothing (?:is )?(?:running|moving|started)\b|\bno (?:worker|run|PR|card)s? (?:is |are )?(?:running|exists?|open)\b"
+    r"|\bt_[0-9a-f]{6,}\b|\bPR\s*#\d+|\bpull request\s*#?\d+",
+    re.I)
+STATUS_FRESH_NUDGE = (
+    "[coach] status_fresh: the user asked about progress (\"{ask}\") and this draft states work status (\"{claim}\") "
+    "with no tool call this turn. Status from earlier turns is stale. Read the live state of each item you report "
+    "(kanban_show / cross_task read, gh pr view, the run log) now, then answer from what the reads return.")
+
+
+def status_fresh_enabled() -> bool:
+    """Env COACH_STATUS_FRESH, then config plugins.entries.coach.settings.status_fresh; default on."""
+    raw = os.environ.get("COACH_STATUS_FRESH")
+    if raw is None:
+        try:
+            raw = _cache.load_sibling(_HERE, "second_opinion")._config_settings().get("status_fresh")
+        except Exception:
+            raw = None
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ("0", "off", "false", "no")
+
+
+def status_fresh_claim(draft: str) -> Optional[str]:
+    """The first work-status claim in a draft (started/running/blocked/merged, a card or PR id), else None."""
+    if not isinstance(draft, str) or not draft.strip():
+        return None
+    m = next((m for m in STATUS_FRESH_CLAIM_RE.finditer(draft[:6000]) if not _quoted(draft, m.start(), m.end())), None)
+    return m.group(0).strip()[:120] if m else None
+
+
+def turn_tool_calls(turn_messages: Any) -> int:
+    """Tool calls made this turn (assistant tool_calls entries, else tool result rows)."""
+    calls = results = 0
+    for m in turn_messages or []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list):
+            calls += len(m["tool_calls"])
+        elif m.get("role") == "tool":
+            results += 1
+    return max(calls, results)
 
 
 def status_plain_enabled() -> bool:

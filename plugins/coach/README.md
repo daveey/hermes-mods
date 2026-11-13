@@ -953,6 +953,32 @@ subagent/hub handoff matched no owner pattern, so status_only and relay_repeat c
 Off switch: `COACH_STATUS_PLAIN=off`, or `plugins.entries.coach.settings.status_plain: false`. Tests:
 `tests/test_status_plain.py` (the chat's real asks, turns 3/10/15/18, and the reply before turn 18).
 
+### Fresh status reads (`pre_final_gate:status_fresh`)
+
+Defect agent-02be078e8a (2026-11-13): the user asked "what going on here, why are we blocked and nothing running". The
+first reply, written with zero tool calls, said the follow-ups "were assigned to a cloud worker but never started"; the
+PR was written, green and in review. status_plain fired but only asked for a plain opening, relay_repeat matched
+neither the ask nor the previous "a cloud worker is tidying ... now", and the only catch was an LLM judge after the
+draft had been on screen ~37 s.
+
+- `STATUS_PLAIN_HINT` now says: read the live state of every item you will report with a tool call this turn before
+  the first sentence; earlier turns are stale; never write "never started" / "not running" from memory.
+- New `pre_final_gate` callback `status_fresh`, armed only on a turn where status_plain fired. It holds the draft once,
+  unshown, when the turn made zero tool calls and the draft states work status (`reply_check.status_fresh_claim`:
+  started / running / blocked / merged / never started, a `t_…` card or `PR #N`). No LLM call. Its `needs_buffer` is
+  true only while a session has an armed status turn (disarmed at `post_llm_call`). Logged as `event=status_fresh`
+  with `action=hold` (tools 0) or `action=pass` (a status draft after a read).
+- relay_repeat also reads "what going on", "why are we blocked", "why is nothing running"/"nothing running" as a
+  repeat ask, and "is tidying / working on ... now" by "a cloud/pool/remote worker" as an unfinished owner relay.
+
+Off switch: `COACH_STATUS_FRESH=off`, or `plugins.entries.coach.settings.status_fresh: false`. Tests:
+`tests/test_status_fresh.py`. Known limit: core decides the turn's stream buffer before `pre_llm_call` arms the gate,
+so no pre-stream protection is claimed on the first status turn unless another eligible gate already buffers.
+Core must re-evaluate buffering after `pre_llm_call` and prefer the optional
+`needs_buffer_for_session(session_id=...)` predicate over the legacy boolean. The predicate isolates concurrent
+ordinary turns; on older core the conservative boolean can also buffer another session while a status turn is armed.
+The plugin tests prove hold decisions, not actual stream suppression; end-to-end suppression needs the core change.
+
 ### Checkout-local sibling cache
 
 The sibling loader keys modules by canonical source directory as well as module name. Discovering an installed
