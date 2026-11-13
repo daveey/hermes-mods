@@ -281,3 +281,41 @@ def test_self_verify_hook_end_to_end(tmp_path, monkeypatch):
     logged = [json.loads(l) for l in (tmp_path / "coach" / "log.jsonl").read_text().splitlines()]
     hints = [e for e in logged if e.get("event") == "agent_hint" and e.get("rule") == "relay_repeat"]
     assert [e.get("kind") for e in hints] == ["self_verify"]
+
+
+# --- capability correction (self-heal agent-01e0b4b066): the real 2026-11-11 turns, card id and runtime scrubbed ---
+R_QUEUED = (
+    "The owner-terminal flow now works: I ran the read-only preflight successfully. The old MacBook connectivity "
+    "blocker is resolved.\n\nI also raised priority to **300** and verified **zero cards ahead**. It remains queued "
+    "behind seven running workers.\n\nThe live runtime has changed since the handoff; I recorded its current version "
+    "for the worker to avoid using stale deployment instructions. Cancellation has **not** run\u2014the workflow and "
+    "its three cards remain nonterminal.")
+CAP_ASK = "i dont understand. you can do things on my macnine via ssh"
+
+
+def test_capability_correction_paraphrases():
+    for t in (CAP_ASK, "you can ssh into it", "You have ssh access to the mini", "you could just run it over ssh",
+              "you can reach the hub from here", "you can do it from here", "you already have shell access"):
+        assert rr.capability_correction(t), t
+    for t in ("thanks", "resume", "can you ssh into the mini and check the log?", "you can do better",
+              "great, now add a dark mode toggle", "\u23f3 [default] @default Kanban t_01a1cafe1234: you can do it here",
+              "[coach] you can do things on my machine via ssh"):
+        assert not rr.capability_correction(t), t
+
+
+def test_capability_correction_after_queued_relay_fires_with_act_hint():
+    st = {"last_reply": R_QUEUED}
+    hit = rr.assess(st, 5, CAP_ASK, card_status=lambda c: "ready")
+    assert hit and hit["kind"] == "relay" and hit["capability"]
+    h = hit["hint"]
+    assert "already have the access" in h and "yourself this turn" in h and "priority" in h
+    assert st["relay_repeat_turn"] == 5  # forces the report_only second opinion on this turn's reply
+    assert rr.assess(st, 5, CAP_ASK, card_status=lambda c: "ready") is None  # once per turn
+
+
+def test_capability_correction_needs_an_unfinished_relay():
+    for prev in ("", R_755338, "Fixed: the sidebar scrolls now; I reloaded it and checked."):
+        assert rr.assess({"last_reply": prev}, 2, CAP_ASK, card_status=lambda c: "ready") is None, prev[:40]
+    # the owner delivered since the relay
+    st = {"last_reply": R_751318}
+    assert rr.assess(st, 3, "you can ssh into it", card_status=lambda c: "done") is None

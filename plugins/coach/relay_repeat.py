@@ -10,6 +10,7 @@ and later did.
 Rule: in a live chat, a repeat ask about the same unresolved state ends the owner's budget unless that owner delivered
 since the last reply. Fires (once per turn, pre_llm_call) when
   (a) the user's message is a repeat ask (fix_loop's prefilter, or "why can't you fix / what's going on / look again"),
+      or a capability correction ("you can do things on my machine via ssh", "you have ssh access": agent-01e0b4b066),
       typed by a person (never a notice or worker prompt);
   (b) the previous final reply relayed an unfinished owner: OWNER_HANDOFF_RE / OWNER_CARD_RE, or an unfinished marker
       ("underway", "not deployed", "still being tested", "waits for capacity") with an owner noun (a card id, a
@@ -89,15 +90,43 @@ CARD_RE = re.compile(r"\bt_[0-9a-f]{6,}\b")
 DONE_NOTICE_RE = re.compile(r"\bKanban (t_[0-9a-f]{6,}) (?:done|completed)\b")
 CLOSED = ("done", "archived")
 # Hermes-written user rows reply_check.notice_turn does not class as notices (blocked/failed Kanban notices, the todo
-# list and system notes re-injected after compaction, coach nudges): never a person asking again. A backtest of the
-# rule on 10 days of hub chats fired on all of these before this exclusion.
-_SYNTHETIC_RE = re.compile(r"^\s*(?:[\u2714\u2713\u2716\u2717\u23f8\u26a0\u2757]|\[(?!image|screenshot)[^\]\n]{1,80}[\]:])", re.I)
+# list and system notes re-injected after compaction, coach nudges, ready-wait notices): never a person asking again.
+# A backtest of the rule on 10 days of hub chats fired on all of these before this exclusion.
+_SYNTHETIC_RE = re.compile(r"^\s*(?:[\u2714\u2713\u2716\u2717\u23f3\u23f8\u26a0\u2757]|\[(?!image|screenshot)[^\]\n]{1,80}[\]:])", re.I)
 
 HINT = ("[coach] The user has asked again ({n} time{s}) while your replies relayed {owner}'s unfinished progress "
         "(\"{phrase}\"). A repeat ask in a live chat ends that owner's budget: take the next step yourself this turn "
         "(reproduce, fix, deploy, verify on the user's path), or delegate_task with fix authority, instead of another "
         "status relay. If that card is not linked to this chat, link it this turn (kanban_origin_adopt, or "
         "session_outcome wait) so the user can see the work.")
+
+# --- capability correction (agent-01e0b4b066) ----------------------------------------------------------------------
+# A chat answered two "parent ready with no worker" notices by raising a queued card's priority ("It remains queued
+# behind seven running workers"); David wrote "i dont understand. you can do things on my macnine via ssh". That is
+# neither a repeat status ask nor a do-it-yourself verification ask, so nothing fired. A person telling the agent it
+# already has the access (ssh, the machine, the host) after a relay of a queued/unfinished owner ends that owner's
+# budget the same way a repeat ask does.
+CAPABILITY_RE = re.compile(
+    r"\byou (?:can|could|are able to|'re able to)\s+(?:just\s+)?(?:do|run|reach|access|use|fix|ssh|get (?:in|on)to)\b"
+    r"[^.?!\n]{0,60}?\b(?:via|over|through|with|using|from|on|into|onto)\s+(?:ssh|my (?:mac|machine|macbook|mini|laptop|"
+    r"host|box|computer)|the (?:hub|host|machine|mac|mini|gateway)|here|this chat)"
+    r"|\byou can ssh\b|\byou (?:already )?(?:have|got) (?:ssh|shell|terminal|root|sudo|the) ?access\b"
+    r"|\byou (?:can|could) (?:just )?do (?:it|this|that|things) (?:your ?self|from here|here|in this chat)\b",
+    re.I)
+
+CAPABILITY_HINT = (
+    "[coach] The user says you already have the access to do this (\"{ask}\") while your last reply relayed {owner}'s "
+    "queued or unfinished work (\"{phrase}\"). That ends the owner's budget: take the next step yourself this turn "
+    "with that access (ssh, the host terminal), or delegate_task with fix authority, instead of another priority "
+    "bump or queue report. If one exact limit stops you (a permission you lack, an unsafe action), name it.")
+
+
+def capability_correction(user_text: str) -> Optional[str]:
+    """The matched phrase when a person tells the agent it already has the access to act, else None."""
+    if not isinstance(user_text, str) or not user_text.strip() or _automated(user_text):
+        return None
+    m = CAPABILITY_RE.search(user_text[:1500])
+    return m.group(0).strip()[:120] if m else None
 
 
 # --- self-verify (agent-954fae4dfc) ---------------------------------------------------------------------------------
@@ -270,7 +299,9 @@ def _assess_relay(state: dict, turn: int, user_text: str,
                 return None
     elif state.get("relay_done_after") == _sig(prev):
         return None
-    if not repeat_ask(user_text):
+    rep = repeat_ask(user_text)
+    cap = None if rep else capability_correction(user_text)
+    if not (rep or cap):
         return None
     if state.get("relay_repeat_turn") == turn:
         return None
@@ -281,5 +312,8 @@ def _assess_relay(state: dict, turn: int, user_text: str,
     state["relay_repeat_turn"] = turn
     n = len(asks)
     owner = ", ".join(cards[:3]) if cards else "another owner"
+    if cap:
+        return {"n": n, "kind": "relay", "owner": owner, "cards": cards, "phrase": own["phrase"], "capability": cap,
+                "hint": CAPABILITY_HINT.format(ask=cap, owner=owner, phrase=own["phrase"][:120])}
     return {"n": n, "kind": "relay", "owner": owner, "cards": cards, "phrase": own["phrase"],
             "hint": HINT.format(n=n, s="" if n == 1 else "s", owner=owner, phrase=own["phrase"][:120])}
