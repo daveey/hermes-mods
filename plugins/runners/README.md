@@ -370,6 +370,10 @@ agent. Mutation safety is then only as strong as that session's tool boundary.
   GitHub is called. `request_id` and `source_sha` are workflow inputs and the run-name carries
   `[request_id]`. A timeout/reset/5xx after sending is `unknown_outcome`: reconcile by request
   ID, never resubmit. Several runs for one request bind to the broker's claim holder.
+- Every api.github.com call (branch/compare checks, the dispatch POST, run/job/artifact reads)
+  runs inside a `token-broker exec` vend with reason `Dispatch runner jobs` (`BrokerVendGitHub.api`,
+  method and path allowlisted on both sides), so each is a `github_quota` ledger row. Only the
+  credential-free artifact download from the redirect's storage host runs in-process.
 - `GET /jobs/{id}` is cached and schedules one background reconcile: exact run id, attempt,
   job id and assigned runner, workflow-ref SHA (`head_sha`) kept distinct from the checked-out
   source SHA. Explicit retry (`JobDomain.retry`) is a new request; GitHub re-runs cannot claim.

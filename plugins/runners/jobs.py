@@ -895,31 +895,38 @@ class _Closing:
 # ------------------------------------------------------------------ production GitHub port
 
 class GitHubDispatchPort:
-    """Direct HTTPS to api.github.com with a broker-vended token; no proxies.
+    """api.github.com requests run inside a token-broker vend; no proxies.
 
-    Artifact downloads follow exactly one redirect to an allowlisted HTTPS storage
-    host, without the GitHub Authorization header.
+    `github` is a BrokerVendGitHub: the token never leaves its vend, which
+    performs each allowlisted request (the GitHub quota supervisor records them
+    in its ledger). Artifact downloads follow exactly one redirect to an
+    allowlisted HTTPS storage host, from this process, without any credential.
     """
     API = 'api.github.com'
     STORAGE_SUFFIXES = ('.actions.githubusercontent.com', '.blob.core.windows.net')
 
-    def __init__(self, credential_resolver, *, timeout=20):
-        self.resolve, self.timeout = credential_resolver, timeout
+    def __init__(self, github, *, timeout=20):
+        self.github, self.timeout = github, timeout
+
+    def resolve(self, ref):
+        return self.github(ref)
 
     def _request(self, ref, method, path, body=None, *, host=API, auth=True, max_bytes=4 * 1024 * 1024):
         import http.client
         import ssl
-        headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'hermes-runners-jobs',
-                   'X-GitHub-Api-Version': '2022-11-28'}
         if auth:
-            headers['Authorization'] = 'Bearer ' + self.resolve(ref).token
-        data = None
-        if body is not None:
-            data = json.dumps(body).encode()
-            headers['Content-Type'] = 'application/json'
+            if host != self.API:
+                raise ArtifactError('artifact_redirect_refused')
+            try:
+                return self.github.api(self.resolve(ref), method, path, body=body,
+                                       timeout=self.timeout, max_bytes=max_bytes)
+            except Exception:
+                # Vend refusal, transport failure, unknown route: nothing usable came back.
+                raise OSError('github_vend_failed') from None
+        headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'hermes-runners-jobs'}
         conn = http.client.HTTPSConnection(host, timeout=self.timeout, context=ssl.create_default_context())
         try:
-            conn.request(method, path, body=data, headers=headers)
+            conn.request(method, path, headers=headers)
             response = conn.getresponse()
             raw = response.read(max_bytes + 1)
             if len(raw) > max_bytes:
@@ -1052,9 +1059,13 @@ def domain_for(service, home):
         cached = _DOMAINS.get(key)
         if cached and cached[0] == signature:
             return cached[1]
-        from .providers.runtime import BrokerCredential, BrokerCredentialResolver
+        from .providers.runtime import BrokerCredential, BrokerVendGitHub
         references = {ref: BrokerCredential(**spec) for ref, spec in raw.get('credentials', {}).items()}
-        resolver = BrokerCredentialResolver(references, broker_command=tuple(raw.get('broker_executable') and [raw['broker_executable']] or ['token-broker']))
+        # Every GitHub request runs inside the vend, recorded in the quota ledger.
+        github = BrokerVendGitHub(references, reason='Dispatch runner jobs',
+                                  broker_command=tuple(raw.get('broker_executable') and [raw['broker_executable']] or ['token-broker']))
+        if cached:
+            cached[2].close()
 
         def inventory():
             snapshot = service.inventory()
@@ -1062,8 +1073,8 @@ def domain_for(service, home):
             return dict(freshness=snapshot['meta']['freshness'], runners=runners)
 
         domain = JobDomain(db_path=service.path, config=service.config, runtime=runtime,
-                           github=GitHubDispatchPort(resolver), claims=ClaimsClient(runtime['claims_socket'], runtime['claims_health_url']),
+                           github=GitHubDispatchPort(github), claims=ClaimsClient(runtime['claims_socket'], runtime['claims_health_url']),
                            inventory=inventory, artifact_root=Path(home) / 'runners' / 'artifacts',
                            meta=lambda: deepcopy(service.inventory()['meta']))
-        _DOMAINS[key] = (signature, domain)
+        _DOMAINS[key] = (signature, domain, github)
         return domain

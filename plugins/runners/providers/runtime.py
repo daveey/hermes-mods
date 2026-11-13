@@ -1,18 +1,17 @@
-"""Production read-only boundaries; no ambient GitHub credentials or proxies.
+"""Production GitHub boundaries; no ambient GitHub credentials or proxies.
 
 Credential mappings are private runtime configuration, not inventory YAML. Each
 reference maps to a broker scope/env name and an explicit stable budget key;
-aliases MUST use the same key. Tokens exist only in process memory and the
-anonymous child pipe. No broker stdout/stderr is retained. Call invalidate(ref)
-or invalidate(key=credential.key) after rejected authorization; TTL is a cache
-ceiling, not a claim about the issuer's actual credential lifetime. A failed vend
-(a broker denial such as the GitHub quota brake, a timeout, a bad pipe value) is
-remembered per budget key for failure_ttl seconds: every alias sharing that key
-fails fast without spawning the broker until the cool-down ends.
-
-BrokerVendGitHub (collector, reconcile) is the metered variant: its token stays
-inside the open broker vend, which performs and records every GET.
+aliases MUST use the same key. BrokerVendGitHub (collector, reconcile and job
+dispatch) keeps the token inside an open `token-broker exec` vend that performs
+every request, so the GitHub quota supervisor records each one in its ledger.
+No broker stdout/stderr is retained. Call invalidate(ref) or
+invalidate(key=credential.key) after rejected authorization. A vend that cannot
+start (a broker denial such as the GitHub quota brake, a timeout) is remembered
+per budget key for failure_ttl seconds: every alias sharing that key fails fast
+without spawning the broker until the cool-down ends.
 """
+import base64
 from dataclasses import dataclass
 import hashlib
 import http.client
@@ -254,117 +253,13 @@ def _validated_command(broker_command):
     return tuple(broker_command)
 
 
-# Values are not arguments: only env name and anonymous descriptor are passed.
-# 4096 bytes fits PIPE_BUF on supported Linux/macOS runtimes, avoiding a blocked
-# writer while the parent waits for the bounded broker process to finish.
-_PIPE_CHILD = '''import os, sys
-try:
-    value = os.environ[sys.argv[1]].encode('ascii')
-    if not value or len(value) > 4096 or any(c < 33 or c > 126 for c in value):
-        raise ValueError()
-    if os.write(int(sys.argv[2]), value) != len(value):
-        raise ValueError()
-except BaseException:
-    os._exit(1)
-'''
-
-
-class BrokerCredentialResolver:
-    """Callable CredentialResolver with per-reference bounded in-memory cache.
-
-    The runner has subprocess.run's signature and is injectable for offline
-    tests. Never use a shell or capture broker logs. No auto-approval or fallback
-    to credentials in the parent environment is implemented.
-    """
-    def __init__(self, references, *, runner=subprocess.run, clock=time.monotonic,
-                 ttl=300, timeout=30, broker_command=('token-broker',), failure_ttl=60):
-        if (not _bounded_number(ttl, 3600) or not _bounded_number(timeout, 300)
-                or not _bounded_number(failure_ttl, 3600)):
-            raise ValueError('invalid_broker_options')
-        self._references = _validated_references(references)
-        self._command = _validated_command(broker_command)
-        self.runner, self.clock, self.ttl, self.timeout = runner, clock, ttl, timeout
-        self.failure_ttl = failure_ttl
-        self._cache = {}
-        # Budget key -> monotonic time before which a failed vend is not retried.
-        # Keyed by key, not ref, so hundreds of scopes sharing one credential
-        # cost one broker exec per cool-down instead of one each.
-        self._failures = {}
-        self._lock = RLock()
-
-    def invalidate(self, ref=None, *, key=None):
-        """Drop all aliases for ref/key; without either argument clear all."""
-        with self._lock:
-            if ref is None and key is None:
-                self._cache.clear()
-                self._failures.clear()
-                return
-            if ref in self._references:
-                key = self._references[ref].key
-            self._failures.pop(key, None)
-            self._cache = {r: item for r, item in self._cache.items()
-                           if self._references[r].key != key}
-
-    def __call__(self, ref):
-        with self._lock:
-            read_fd = write_fd = None
-            spec = None
-            try:
-                spec = self._references[ref]
-                now = self.clock()
-                cached = self._cache.get(ref)
-                if cached is not None and now < cached[0]:
-                    return cached[1]
-                self._cache.pop(ref, None)
-                retry_at = self._failures.get(spec.key)
-                if retry_at is not None:
-                    if now < retry_at:
-                        spec = None  # Already recorded; do not extend the cool-down.
-                        raise ValueError()
-                    del self._failures[spec.key]
-                read_fd, write_fd = os.pipe()
-                os.set_blocking(read_fd, False)
-                argv = [*self._command, 'exec', '--scope', spec.scope,
-                        '--reason', 'Read runner inventory', '--', sys.executable,
-                        '-I', '-c', _PIPE_CHILD, spec.env_var, str(write_fd)]
-                # Broker authentication may need its normal environment, but the
-                # requested credential must be supplied by exec, never inherited.
-                environment = dict(os.environ)
-                for configured in self._references.values():
-                    environment.pop(configured.env_var, None)
-                result = self.runner(argv, stdin=subprocess.DEVNULL, env=environment,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     pass_fds=(write_fd,), timeout=self.timeout, check=False,
-                                     shell=False, close_fds=True)
-                os.close(write_fd)
-                write_fd = None
-                if result.returncode != 0:
-                    raise ValueError()
-                raw = os.read(read_fd, 4097)
-                if not raw or len(raw) > 4096 or any(c < 33 or c > 126 for c in raw):
-                    raise ValueError()
-                credential = Credential(spec.key, raw.decode('ascii'))
-                self._cache[ref] = (self.clock() + self.ttl, credential)
-                return credential
-            except Exception:
-                if spec is not None:
-                    self._failures[spec.key] = self.clock() + self.failure_ttl
-                raise RuntimeBoundaryError('credential_unavailable') from None
-            finally:
-                for fd in (read_fd, write_fd):
-                    if fd is not None:
-                        os.close(fd)
-
-
-
 # ------------------------------------------------------------------ metered vends
 #
-# BrokerCredentialResolver returns the token to this process. The vend the GitHub
-# quota supervisor (token-broker's user-scope wrapper, github_quota.py) records
-# for it ends before any request, with zero requests, while the collector and the
-# 6-hourly reconcile spend the shared per-user core bucket with nothing in the
-# quota ledger (2026-11-12: ~520 unledgered calls per reconcile run, 2-5/min
-# from the collector). BrokerVendGitHub keeps the token inside the vend instead.
+# A resolver that handed the token to this process got a vend that the GitHub
+# quota supervisor (token-broker's user-scope wrapper, github_quota.py) recorded
+# with zero requests: it ended before any request, so the collector, the 6-hourly
+# reconcile and job dispatch spent the shared per-user core bucket with nothing
+# in the quota ledger. BrokerVendGitHub keeps the token inside the vend instead.
 
 _FRAME = struct.Struct('>I')
 _REQUEST_LIMIT = 64 * 1024
@@ -399,6 +294,86 @@ def _recv_frame(channel, limit, deadline):
     if not 0 < size <= limit:
         raise ValueError()
     return json.loads(exact(size, False))
+
+
+# Job dispatch (plugins/runners/jobs.py GitHubDispatchPort): the only non-GET
+# requests a vend performs, each (method, path) matched whole. Patterns mirror
+# load_dispatch_runtime's repository/workflow/ref validation.
+_REPO = r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.\.?/)[A-Za-z0-9_.-]{1,100}'
+_WORKFLOW = r'[A-Za-z0-9_.-]{1,100}\.ya?ml'
+_ID = r'[1-9][0-9]{0,19}'
+_SHA = r'[0-9a-f]{40}'
+_API_ROUTES = tuple((method, re.compile(pattern)) for method, pattern in (
+    ('GET', r'/repos/%s/branches/(?!(?:.*/)?\.\.?(?:/|$))[A-Za-z0-9_./-]{1,200}' % _REPO),
+    ('GET', r'/repos/%s/compare/%s\.\.\.%s' % (_REPO, _SHA, _SHA)),
+    ('POST', r'/repos/%s/actions/workflows/%s/dispatches' % (_REPO, _WORKFLOW)),
+    ('GET', r'/repos/%s/actions/workflows/%s/runs\?event=workflow_dispatch&per_page=50' % (_REPO, _WORKFLOW)),
+    ('GET', r'/repos/%s/actions/runs/%s' % (_REPO, _ID)),
+    ('GET', r'/repos/%s/actions/runs/%s/attempts/%s' % (_REPO, _ID, _ID)),
+    ('GET', r'/repos/%s/actions/runs/%s/attempts/%s/jobs' % (_REPO, _ID, _ID)),
+    ('GET', r'/repos/%s/actions/runs/%s/artifacts\?per_page=100' % (_REPO, _ID)),
+    ('GET', r'/repos/%s/actions/artifacts/%s/zip' % (_REPO, _ID)),
+))
+_API_BODY_LIMIT = 16 * 1024
+
+
+def _validated_api_request(method, path, body, timeout, max_bytes):
+    """Encoded JSON body (or None) of an allowlisted dispatch request, else ValueError."""
+    if (type(method) is not str or type(path) is not str
+            or not any(m == method and p.fullmatch(path) for m, p in _API_ROUTES)
+            or not _bounded_number(timeout, 60)
+            or type(max_bytes) is not int or not 0 < max_bytes <= 16 * 1024 * 1024):
+        raise ValueError()
+    if method == 'GET':
+        if body is not None:
+            raise ValueError()
+        return None
+    if type(body) is not dict:
+        raise ValueError()
+    data = json.dumps(body, ensure_ascii=True, separators=(',', ':'))
+    if len(data) > _API_BODY_LIMIT:
+        raise ValueError()
+    return data
+
+
+def _api_request(token, method, path, body, timeout, max_bytes):
+    """One allowlisted request to api.github.com from inside the vend.
+
+    Raw bytes cross back base64-encoded; error bodies are dropped (they can
+    echo request details), headers are kept (retry-after, location)."""
+    data = _validated_api_request(method, path, body, timeout, max_bytes)
+    headers = {'accept': 'application/vnd.github+json', 'user-agent': 'hermes-runners-jobs',
+               'x-github-api-version': '2022-11-28', 'accept-encoding': 'identity',
+               'authorization': 'Bearer ' + token}
+    if data is not None:
+        headers['content-type'] = 'application/json'
+    deadline = time.monotonic() + timeout
+    conn = http.client.HTTPSConnection('api.github.com', timeout=timeout, context=ssl.create_default_context())
+    try:
+        conn.request(method, path, body=None if data is None else data.encode('ascii'), headers=headers)
+        response = conn.getresponse()
+        response_headers = {k.lower(): v for k, v in response.getheaders()}
+        raw = bytearray()
+        if 200 <= response.status < 300:
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError()
+                if conn.sock is not None:
+                    conn.sock.settimeout(left)
+                chunk = response.read1(min(65536, max_bytes + 1 - len(raw)))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+                if len(raw) > max_bytes:
+                    return {'error': 'response_too_large'}
+        return {'status': response.status, 'headers': response_headers,
+                'body': base64.b64encode(bytes(raw)).decode('ascii')}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # Not -I: the quota supervisor loads its request instrumentation through
@@ -438,6 +413,18 @@ def _serve_vend(fd, env_var, idle):
             request = _recv_frame(channel, _REQUEST_LIMIT, time.monotonic() + idle)
             if request is None:
                 return
+            if type(request) is dict and set(request) == {'method', 'path', 'body', 'timeout', 'max_bytes'}:
+                # Job dispatch: allowlisted method and path, re-checked on this side.
+                _validated_api_request(request['method'], request['path'], request['body'],
+                                       request['timeout'], request['max_bytes'])
+                try:
+                    reply = _api_request(token, request['method'], request['path'], request['body'],
+                                         request['timeout'], request['max_bytes'])
+                except Exception:
+                    # Includes the supervisor refusing the request (reserve, budget, brake).
+                    reply = {'error': 'http_transport_failed'}
+                _send_frame(channel, reply)
+                continue
             if type(request) is not dict or set(request) != {'url', 'headers', 'timeout', 'max_body_bytes', 'max_timeout'}:
                 raise ValueError()
             headers = request['headers']
@@ -500,18 +487,23 @@ class BrokerVendGitHub:
     supervisor's per-vend budget and own-burst brake (250 each).
 
     Usage: client = BrokerVendGitHub(refs); GitHubActions(transport=client.transport,
-    credential_resolver=client); client.close() when done.
+    credential_resolver=client); client.close() when done. Job dispatch uses
+    client.api(credential, method, path, ...) for its allowlisted routes
+    (_API_ROUTES, including the workflow-dispatch POST) under its own `reason`.
     """
     def __init__(self, references, *, broker_command=('token-broker',), ttl=240, idle=60,
                  max_requests=200, start_timeout=60, failure_ttl=60,
                  max_body_bytes=4 * 1024 * 1024, max_timeout=30,
-                 popen=subprocess.Popen, clock=time.monotonic, executable=None):
+                 popen=subprocess.Popen, clock=time.monotonic, executable=None,
+                 reason='Read runner inventory'):
         if (not _bounded_number(ttl, 3600) or not _bounded_number(idle, 3600)
                 or not _bounded_number(start_timeout, 300) or not _bounded_number(failure_ttl, 3600)
                 or type(max_requests) is not int or not 0 < max_requests < 250
                 or type(max_body_bytes) is not int or not 0 < max_body_bytes <= 16 * 1024 * 1024
-                or not _bounded_number(max_timeout, 60)):
+                or not _bounded_number(max_timeout, 60)
+                or type(reason) is not str or not re.fullmatch(r'[A-Za-z][A-Za-z0-9 ,.()-]{0,99}', reason)):
             raise ValueError('invalid_broker_options')
+        self.reason = reason
         self._references = _validated_references(references)
         self._command = _validated_command(broker_command)
         self.ttl, self.idle, self.max_requests = ttl, idle, max_requests
@@ -538,7 +530,7 @@ class BrokerVendGitHub:
         parent, child = socket.socketpair()
         process = None
         try:
-            argv = [*self._command, 'exec', '--scope', scope, '--reason', 'Read runner inventory', '--',
+            argv = [*self._command, 'exec', '--scope', scope, '--reason', self.reason, '--',
                     self.executable, '-s', '-P', '-B', '-c', _VEND_CHILD,
                     os.path.dirname(os.path.abspath(__file__)), str(child.fileno()), env_var,
                     str(self.ttl + 60)]
@@ -634,6 +626,50 @@ class BrokerVendGitHub:
                     # request in a fresh vend instead of failing it.
                     self._close(identity)
                 return HTTPResponse(reply['status'], reply['headers'], reply['body'])
+            except Exception:
+                if identity is not None:
+                    try:
+                        self._close(identity, graceful)
+                    except Exception:
+                        pass  # Cleanup must not expose a process/transport exception.
+                raise RuntimeBoundaryError('http_transport_failed') from None
+
+    def api(self, credential, method, path, *, body=None, timeout=20, max_bytes=4 * 1024 * 1024):
+        """(status, lower-cased headers, raw bytes) of one allowlisted job-dispatch request.
+
+        `credential` comes from this client's resolver. Only 2xx bodies are
+        returned. Raises RuntimeBoundaryError before anything is sent for an
+        unknown credential or a route outside _API_ROUTES."""
+        with self._lock:
+            identity = None
+            graceful = False
+            try:
+                duration = min(timeout, self.max_timeout) if _bounded_number(timeout, 300) else 0
+                _validated_api_request(method, path, body, duration, max_bytes)
+                handle = getattr(credential, 'token', None)
+                if handle not in self._identities or self._keys[self._identities[handle]] != credential.key:
+                    raise ValueError()
+                identity = self._identities[handle]
+                session = self._live(identity)
+                session.used += 1
+                session.last = self.clock()
+                _send_frame(session.channel, dict(method=method, path=path, body=body,
+                                                  timeout=duration, max_bytes=max_bytes))
+                reply = _recv_frame(session.channel, 2 * max_bytes + 8 * 1024 * 1024,
+                                    time.monotonic() + duration + 5)
+                if type(reply) is dict and set(reply) == {'error'}:
+                    graceful = True
+                    raise ValueError()
+                if (type(reply) is not dict or set(reply) != {'status', 'headers', 'body'}
+                        or type(reply['status']) is not int or type(reply['headers']) is not dict
+                        or type(reply['body']) is not str):
+                    raise ValueError()
+                raw = base64.b64decode(reply['body'], validate=True)
+                if len(raw) > max_bytes:
+                    raise ValueError()
+                if reply['status'] in (401, 403, 429):
+                    self._close(identity)  # Latched blocked by the quota supervisor.
+                return reply['status'], reply['headers'], raw
             except Exception:
                 if identity is not None:
                     try:

@@ -36,7 +36,7 @@ from plugins.runners.config import ConfigFile
 from plugins.runners.store import Store
 from plugins.runners.probes.ssh import SSHProbe, SSHTarget, ProbeSpec
 from plugins.runners.providers.github_actions import GitHubActions
-from plugins.runners.providers.runtime import BrokerCredential, BrokerCredentialResolver, BrokerVendGitHub
+from plugins.runners.providers.runtime import BrokerCredential, BrokerVendGitHub
 
 # The collector reads with GitHub *user* tokens (PAT/OAuth) whose 5000/h core bucket is
 # shared by every token of that user (gh on every host, CI helpers, agents).
@@ -74,7 +74,7 @@ def load_runtime(path):
         if executable is not None and (type(executable) is not str or not Path(executable).is_absolute() or any(ord(c) < 32 for c in executable)):
             raise ValueError()
         credentials = {k: BrokerCredential(**v) for k, v in data['credentials'].items()}
-        BrokerCredentialResolver(credentials)  # Validate without vending anything.
+        BrokerVendGitHub(credentials)  # Validate without vending anything.
         jobs = data.get('job_repositories', {})
         if type(jobs) is not dict or any(type(v) is not list or len(v) > 10 or
                 any(not GitHubActions._name(repo, 2) for repo in v) for v in jobs.values()):

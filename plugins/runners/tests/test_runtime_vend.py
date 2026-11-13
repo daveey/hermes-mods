@@ -23,9 +23,10 @@ import http.client, json, os, time
 class Reply:
     def __init__(self, path, status):
         self.status = status
-        self.body = json.dumps({'path': path}).encode()
+        self.body = b'' if status in (204, 302) else json.dumps({'path': path}).encode()
+        self.extra = [('Location', 'https://pipelines.actions.githubusercontent.com/z')] if status == 302 else []
     def getheaders(self):
-        return [('X-RateLimit-Remaining', '4321'), ('X-RateLimit-Reset', '1')]
+        return [('X-RateLimit-Remaining', '4321'), ('X-RateLimit-Reset', '1')] + self.extra
     def read1(self, size):
         body, self.body = self.body, b''
         return body
@@ -33,18 +34,19 @@ class Connection:
     sock = None
     def __init__(self, host, **kwargs):
         self.host = host
-    def request(self, method, path, headers=None, **kwargs):
+    def request(self, method, path, body=None, headers=None, **kwargs):
         with open(os.environ['FAKE_MODE']) as f:
             mode = f.read().strip()
         with open(os.environ['FAKE_LOG'], 'a') as f:
-            f.write(json.dumps(dict(pid=os.getpid(), method=method, path=path,
+            f.write(json.dumps(dict(pid=os.getpid(), method=method, path=path, host=self.host,
+                                    body=body.decode() if body else None,
                                     auth=headers.get('authorization'))) + '\\n')
         if mode == 'fail':
             raise OSError('fictional refusal')
         if mode == 'slow':
             time.sleep(30)
         self.path = path
-        self.status = 403 if mode == 'forbidden' else 200
+        self.status = {'forbidden': 403, 'nocontent': 204, 'redirect': 302}.get(mode, 200)
     def getresponse(self):
         return Reply(self.path, self.status)
     def close(self):
@@ -299,3 +301,112 @@ def test_github_actions_adapter_contract(fake):
 def test_options_are_bounded(options):
     with pytest.raises(ValueError):
         BrokerVendGitHub(specs(), **options)
+
+
+# ---------------------------------------------------------------- job dispatch (api)
+
+REPO = 'example/widgets'
+DISPATCH = '/repos/example/widgets/actions/workflows/build.yml/dispatches'
+
+
+def test_dispatch_post_and_reads_run_inside_a_dispatch_vend(fake):
+    client = fake.client(reason='Dispatch runner jobs')
+    credential = client('first')
+    body = dict(ref='refs/heads/main', inputs={'request_id': 'request_' + '0' * 32}, return_run_details=True)
+    status, headers, raw = client.api(credential, 'POST', DISPATCH, body=body)
+    assert status == 200 and json.loads(raw) == {'path': DISPATCH}
+    assert headers['x-ratelimit-remaining'] == '4321'
+    status, _, raw = client.api(credential, 'GET', '/repos/example/widgets/branches/release/v2')
+    assert status == 200 and json.loads(raw) == {'path': '/repos/example/widgets/branches/release/v2'}
+    rows = fake.requests()
+    assert [(r['method'], r['host'], r['auth']) for r in rows] == [
+        ('POST', 'api.github.com', 'Bearer ' + TOKEN), ('GET', 'api.github.com', 'Bearer ' + TOKEN)]
+    assert json.loads(rows[0]['body']) == body and rows[1]['body'] is None
+    assert len({r['pid'] for r in rows}) == 1 and rows[0]['pid'] != os.getpid()
+    assert fake.execs() == ['exec --scope user/fictional-github --reason Dispatch runner jobs']
+    assert next(iter(client._sessions.values())).used == 2
+
+
+def test_dispatch_statuses_cross_the_vend(fake):
+    client = fake.client()
+    credential = client('first')
+    fake.mode('nocontent')
+    assert client.api(credential, 'POST', DISPATCH, body={'ref': 'refs/heads/main'})[::2] == (204, b'')
+    fake.mode('redirect')
+    status, headers, raw = client.api(credential, 'GET', '/repos/example/widgets/actions/artifacts/7/zip')
+    assert (status, raw) == (302, b'') and headers['location'].startswith('https://pipelines.')
+    fake.mode('forbidden')
+    assert client.api(credential, 'GET', '/repos/example/widgets/actions/runs/5')[::2] == (403, b'')
+    assert not client._sessions  # Latched blocked: the next request starts a fresh vend.
+    fake.mode('fail')
+    with pytest.raises(RuntimeBoundaryError, match='^http_transport_failed$'):
+        client.api(credential, 'GET', '/repos/example/widgets/actions/runs/5')
+    assert not client._sessions
+
+
+@pytest.mark.parametrize('method,path,body', [
+    ('POST', '/repos/example/widgets/actions/runs/5/rerun', {}),
+    ('DELETE', '/repos/example/widgets/actions/runs/5', None),
+    ('PUT', DISPATCH, {}),
+    ('GET', '/user', None),
+    ('GET', '/repos/example/widgets/branches/../../orgs/x', None),
+    ('GET', '/repos/example/../branches/main', None),
+    ('GET', '/repos/example/widgets/actions/runs/5?per_page=100', None),
+    ('GET', '/repos/example/widgets/actions/runs/5', {}),
+    ('POST', DISPATCH, None),
+    ('POST', DISPATCH, {'inputs': 'x' * 20000}),
+])
+def test_api_refuses_unlisted_requests_before_sending(fake, method, path, body):
+    client = fake.client()
+    credential = client('first')
+    with pytest.raises(RuntimeBoundaryError, match='^http_transport_failed$'):
+        client.api(credential, method, path, body=body)
+    assert not fake.requests()
+
+
+def test_api_refuses_unknown_credentials_before_any_vend(fake):
+    client = fake.client()
+    for credential in (Credential('shared-user', TOKEN), Credential('other-key', client._handles[('user/fictional-github', 'GH_TOKEN')]), None):
+        with pytest.raises(RuntimeBoundaryError):
+            client.api(credential, 'GET', '/repos/example/widgets/actions/runs/5')
+    assert not fake.execs()
+
+
+def test_vend_side_rechecks_the_dispatch_allowlist(fake):
+    client = fake.client()
+    client('first')
+    session = next(iter(client._sessions.values()))
+    runtime._send_frame(session.channel, dict(method='DELETE', path='/repos/example/widgets', body=None,
+                                              timeout=5, max_bytes=1024))
+    assert runtime._recv_frame(session.channel, 4096, time.monotonic() + 10) is None
+    assert session.process.wait(timeout=10) is not None and not fake.requests()
+
+
+def test_dispatch_port_runs_every_github_call_in_the_vend(fake):
+    from plugins.runners import jobs as J
+    client = fake.client(reason='Dispatch runner jobs')
+    port = J.GitHubDispatchPort(client)
+    assert port.run('first', REPO, 5) == {'path': '/repos/example/widgets/actions/runs/5'}
+    assert port.dispatch('first', REPO, '.github/workflows/build.yml', 'refs/heads/main', {}) == dict(run_id=None)
+    fake.mode('fail')
+    with pytest.raises(J.DispatchUnknown):
+        port.run('first', REPO, 5)
+    assert [r['method'] for r in fake.requests()] == ['GET', 'POST', 'GET']
+    assert {r['auth'] for r in fake.requests()} == {'Bearer ' + TOKEN}
+    fake.deny()
+    client.invalidate()
+    with pytest.raises(J.DispatchRejected, match='credential_unavailable'):
+        port.dispatch('first', REPO, '.github/workflows/build.yml', 'refs/heads/main', {})
+
+
+def test_aliases_cannot_split_same_broker_identity_budget():
+    references = specs()
+    references['alias'] = BrokerCredential('user/fictional-github', 'GH_TOKEN', 'different-budget')
+    with pytest.raises(ValueError, match='invalid_broker_reference'):
+        BrokerVendGitHub(references)
+
+
+@pytest.mark.parametrize('reason', ['', 'bad\nreason', 'x' * 101, None, '-starts-with-dash'])
+def test_reason_is_bounded(reason):
+    with pytest.raises(ValueError):
+        BrokerVendGitHub(specs(), reason=reason)
