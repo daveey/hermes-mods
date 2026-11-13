@@ -127,6 +127,21 @@ def test_shell_python_and_tool_route(monkeypatch):
     assert g.check_tool("terminal", {"command": command}, repos=repos, env={})
 
 
+def test_cd_unset_var_prefix_still_probes(monkeypatch, tmp_path):
+    # Like the state route (t_01a1d625bbebeaa8): an unexpanded `cd $VAR;` target must not become the probe's
+    # cwd, where real subprocess.run raises and the green sync PR would be refused for no reason.
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("cwd") is not None and not g.os.path.isdir(kwargs["cwd"]):
+            raise FileNotFoundError(2, "No such file or directory", kwargs["cwd"])
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload()))
+    monkeypatch.setattr(g.subprocess, "run", run)
+    command = "cd $HERMES_KANBAN_WORKSPACE; " + shlex.join(GATE)
+    assert g.check_shell(command, cwd=str(tmp_path), repos={"example/protected"}, env={}) is None
+    assert len(calls) == 1 and calls[0]["cwd"] is None
+
+
 def test_state_route_unchanged_and_merge_api_refused(monkeypatch):
     # A sync-shaped PR cannot be landed by rebase, and --merge never admits a state PR.
     calls = probe(monkeypatch, payload())

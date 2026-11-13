@@ -111,6 +111,17 @@ def test_context(repo, tmp_path, monkeypatch):
     assert g.check_shell("env -u HERMES_CORE_WT_LAND gh pr merge 12")
 
 
+@pytest.mark.parametrize("command", [
+    "git -C $WS push origin main", "git -C ${WS} push origin main", "git -C$WS push origin main",
+    "env -C $WS git push origin main", "env --chdir ${WS} git push origin main",
+])
+def test_context_var_target_expands(repo, tmp_path, command):
+    # A -C/--chdir $VAR target resolves from the command's env like `cd $VAR`; unset, it names no repository.
+    repos = {"example/protected"}
+    assert g.check_shell(command, str(tmp_path), repos=repos, env={"WS": str(repo)}), command
+    assert g.check_shell(command, str(tmp_path), repos=repos, env={}) is None, command
+
+
 def test_configured_push_default(repo):
     subprocess.run(["git", "-C", str(repo), "config", "remote.origin.push", "HEAD:main"], check=True)
     assert g.check_shell("git push", str(repo))

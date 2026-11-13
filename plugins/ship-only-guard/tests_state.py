@@ -37,14 +37,15 @@ def check(argv=CMD):
 
 def probe(monkeypatch, data, compare=IDENTICAL, commits=None):
     """gh pr view answers `data`; gh api compare answers `compare` (a dict, or a (returncode, stdout) pair);
-    a per-file commits lookup answers `commits[path]` (a list), else exit 1."""
+    a per-file commits lookup answers `commits[path]` (a list, or a (returncode, list) pair), else exit 1."""
     calls = []
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
         if argv[:2] == ["gh", "api"] and "/commits?" in argv[2]:
             path = argv[2].split("&path=", 1)[1].split("&", 1)[0]
             listed = (commits or {}).get(path)
-            return SimpleNamespace(returncode=0 if listed is not None else 1, stdout=json.dumps(listed))
+            rc, listed = listed if isinstance(listed, tuple) else (0 if listed is not None else 1, listed)
+            return SimpleNamespace(returncode=rc, stdout=json.dumps(listed))
         if argv[:2] == ["gh", "api"]:
             rc, out = compare if isinstance(compare, tuple) else (0, json.dumps(compare))
             return SimpleNamespace(returncode=rc, stdout=out)
@@ -199,6 +200,8 @@ def test_test_code_coupling_refused(monkeypatch, pr_file, base_file):
     ("tests/test_utils_x.py", "home/scripts/utils.py"),    # generic stem
     ("tests/test_abc_x.py", "home/scripts/abc.py"),        # stem under 4 characters
     ("tests/test_foo.py", "home/scripts/tests/test_foo_data.py"),  # two test modules are not test<->code
+    ("tests/test_feedback.py", "home/scripts/feed.py"),   # key extends the stem without a `_` boundary
+    ("home/scripts/feed.py", "tests/test_feedback.py"),   # ... and the reverse direction
 ])
 def test_test_code_coupling_controls_allowed(monkeypatch, pr_file, base_file):
     assert drift(monkeypatch, [pr_file], [base_file])[0] is None
@@ -223,6 +226,10 @@ def test_refusal_attributes_each_hit_to_its_base_commit(monkeypatch):
     probe(monkeypatch, payload(), compare, {"hosts/mini-1/bb-tuner/bb_tuner_feed.py": [outside]})
     why = check()
     assert why and "Last base change per file" not in why and "eeeeeeeeee" not in why
+    # A failed lookup is never trusted, even when it printed a listing naming a window commit.
+    probe(monkeypatch, payload(), compare, {"hosts/mini-1/bb-tuner/bb_tuner_feed.py": (1, [{"sha": culprit["sha"]}])})
+    why = check()
+    assert why and "Last base change per file" not in why and "+3 more" in why
 
 
 def test_attribution_is_bounded_and_best_effort(monkeypatch):
@@ -235,13 +242,16 @@ def test_attribution_is_bounded_and_best_effort(monkeypatch):
 
 @pytest.mark.parametrize("compare", [
     (1, ""), (0, "not json"), (0, "[]"),
+    (1, json.dumps(IDENTICAL)),   # a failed compare is never trusted, even when it printed a clean answer
     {k: v for k, v in delta([], []).items() if k != "files"},
     {k: v for k, v in delta([], []).items() if k != "commits"},
     {k: v for k, v in delta([], []).items() if k != "total_commits"},
     dict(delta([], []), total_commits=250),
+    delta([], [commit(f"{i:040x}", "x") for i in range(250)]),   # 250 listed: the page cap, possibly more
     dict(delta([], [commit("e" * 40, "x")]), total_commits=2),
     dict(delta(["home/x/y/%d.md" % i for i in range(300)], [commit("e" * 40, "x")])),
     dict(delta([], []), status="diverged", behind_by=3),
+    dict(delta([], []), behind_by=2), dict(IDENTICAL, behind_by=1),   # behind_by alone marks a non-ancestor base
 ])
 def test_unreadable_or_truncated_compare_refused(monkeypatch, compare):
     probe(monkeypatch, payload(), compare)
