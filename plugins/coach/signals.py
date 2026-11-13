@@ -18,7 +18,9 @@ It turns raw machine signals into `self_heal.file_defect` calls with stable fing
               pass time), filed once per fingerprint per 30 min;
 - cron        a cron job whose sticky `last_failure.at` is newer than the cursor (cron/jobs.json), filed only while
               failure_streak >= cron.failure_nudge_threshold (default 3) or after that many recovered failures in
-              24 h (cursor `cron_fails`); a one-off failure the next run recovered from is only counted;
+              24 h (cursor `cron_fails`); a one-off failure the next run recovered from is only counted; a gateway
+              restart cut never counts, but one with no later run outcome after 6 h (24 h while a run is claimed)
+              files once as "restart cut not recovered" (cursor `cron_cuts`);
 - kanban      a card with >= 2 runs that crashed / timed out / failed to spawn (every board db); and the dispatcher's
               systemic breaker holding cards in triage (`gave_up` events with `sticky: true`, event-id cursor),
               one signal per board + normalized error head per 30 min;
@@ -1023,6 +1025,56 @@ def cron_lifecycle_interrupt(last_failure, detail: Optional[str] = None) -> bool
     return bool(_CRON_LIFECYCLE_RE.match(str(detail or "")))
 
 
+# A restart cut is not a job failure, but the cut run's work is lost unless it is redone (cron-01cfd2fd26). Core
+# books the cut with last_run_at == last_failure.at and reruns the job once; a rerun cut again is not rerun, and a
+# refused/failed reschedule only logs a WARNING with no traceback (cron/restart_cut.py settle_restart_cut). So each
+# cut stays pending in cur["cron_cuts"] until a later run reaches a real outcome (last_run_at past the cut: a
+# success, or a real failure the ordinary counter then counts). Unrecovered after the grace, it files once under
+# its own fingerprint; a claimed (running) rerun is waited on up to CRON_CUT_MAX_S so a stale claim can't hide it.
+CRON_CUT_GRACE_S = 6 * 3600
+CRON_CUT_MAX_S = 24 * 3600
+
+
+def _cron_cut_settled(job: dict, cut: dict) -> bool:
+    """A pending cut is settled once a later run reached an outcome, or the job was disabled/paused by its operator."""
+    if job.get("enabled") is False or job.get("state") == "paused" or job.get("paused_at"):
+        return True
+    return _iso_ts(job.get("last_run_at")) > float(cut.get("at") or 0)
+
+
+def _cron_cut_lost(job: dict, cut: dict, now: float, host: str, prof: str) -> Optional[dict]:
+    """The defect for an unsettled cut ({"at", "detail"}) past its grace, else None (still waiting)."""
+    cut_at = float(cut.get("at") or now)
+    age = now - cut_at
+    claimed = bool(job.get("run_claim") or job.get("fire_claim"))
+    held = _iso_ts(job.get("quota_hold_until")) > now  # parked behind a closed provider window: the rerun waits
+    if age < CRON_CUT_GRACE_S or ((claimed or held) and age < CRON_CUT_MAX_S):
+        return None
+    name = job.get("name") or job.get("id")
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(cut_at))
+    return {"kind": "cron", "component": "cron", "at": now, "profile": prof,
+            "symptom": f"cron job '{name}' restart cut not recovered on {host}: no completed run since {since} "
+                       f"({age / 3600:.1f} h)",
+            "details": home_tilde(f"job {job.get('id')} ({name}, profile {prof}) was cut by its gateway's restart at "
+                                  f"{since} and no later run reached an outcome (last_run_at={job.get('last_run_at')} "
+                                  f"last_status={job.get('last_status')} claimed={claimed} "
+                                  f"next_run_at={job.get('next_run_at')}): the cut run's work was never redone.\n"
+                                  f"{cut.get('detail') or ''}")[:1500],
+            "fp": fp("cron", host, prof, name, "restart-cut-unrecovered")}
+
+
+def _cron_cut_check(cuts: dict, k: str, job: dict, now: float, host: str, prof: str) -> List[dict]:
+    """Settle, wait on, or file (once) the pending cut cuts[k]; drops it when settled or filed."""
+    if _cron_cut_settled(job, cuts[k]):
+        cuts.pop(k, None)
+        return []
+    lost = _cron_cut_lost(job, cuts[k], now, host, prof)
+    if lost is None:
+        return []
+    cuts.pop(k, None)  # one card per cut; the fp dedupes a later cut that is lost again
+    return [lost]
+
+
 def _cron_threshold(h: Path) -> int:
     """cron.failure_nudge_threshold from <home>/config.yaml (core's own streak warning); default 3, 0/bad -> 3."""
     try:
@@ -1051,20 +1103,25 @@ def collect_cron(home: Path, cur: dict, now: float, host: str) -> List[dict]:
     out = []
     seen = cur.setdefault("cron", {})
     fails = cur.setdefault("cron_fails", {})
+    cuts = cur.setdefault("cron_cuts", {})
     first = not seen
     for prof, h in homes(home):
         try:
             j = json.loads((h / "cron" / "jobs.json").read_text())
         except Exception:
-            continue
+            continue  # unreadable this pass: its pending cuts are kept, not judged
         threshold = _cron_threshold(h)
+        present = set()
         for job in (j.get("jobs") if isinstance(j, dict) else j) or []:
             lf = job.get("last_failure") or {}
             at = _iso_ts(lf.get("at"))
             k = f"{prof}:{job.get('id')}"
+            present.add(k)
             prev = float(seen.get(k) or 0)
             if not at or at <= prev or (first and at < now - BACKFILL_S):
                 seen[k] = max(prev, at)
+                if k in cuts:
+                    out.extend(_cron_cut_check(cuts, k, job, now, host, prof))
                 continue
             seen[k] = at
             if _iso_ts(job.get("quota_hold_until")) > at:
@@ -1072,7 +1129,13 @@ def collect_cron(home: Path, cur: dict, now: float, host: str) -> List[dict]:
             name = job.get("name") or job.get("id")
             detail = str(lf.get("detail") or job.get("last_error") or "run failed")
             if cron_lifecycle_interrupt(lf, detail):
-                continue  # owner's restart/shutdown cut is never a job defect, even with an old inflated streak
+                # owner's restart/shutdown cut is never a job defect, even with an old inflated streak; it stays
+                # pending until a later run settles it. A newer cut restarts the clock: the collector may have
+                # missed a success between the two (jobs.json keeps only the latest last_run_at).
+                cuts[k] = {"at": at, "detail": detail[:500]}
+                out.extend(_cron_cut_check(cuts, k, job, now, host, prof))
+                continue
+            cuts.pop(k, None)  # a real outcome after the cut: the ordinary counter below owns it
             streak = int(job.get("failure_streak") or 0)
             recent = [t for t in fails.get(k, []) if t > at - CRON_WINDOW_S]
             recent.append(at)
@@ -1088,6 +1151,8 @@ def collect_cron(home: Path, cur: dict, now: float, host: str) -> List[dict]:
                                               f"{job.get('failure_streak')} last_status={job.get('last_status')} "
                                               f"filed: {why}\nscript={job.get('script')}\n{detail}")[:1500],
                         "fp": fp("cron", host, prof, name)})
+        for k in [k for k in cuts if k.startswith(f"{prof}:") and k not in present]:
+            cuts.pop(k, None)  # the job was removed: nothing left to rerun
     for k in [k for k, v in fails.items() if not v or max(v) < now - CRON_WINDOW_S]:
         fails.pop(k, None)  # keep the cursor small
     return out

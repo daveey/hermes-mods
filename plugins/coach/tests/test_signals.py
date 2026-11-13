@@ -826,6 +826,138 @@ def test_cron_collect_uses_kind(home, lf, counted):
     assert cur["cron"][k] == pytest.approx(NOW - 600)
 
 
+# Lost restart-cut reruns (cron-01cfd2fd26): a cut never counts as a job failure, but the cut run's work must be
+# redone. Core books the cut with last_run_at == last_failure.at and reruns the job once (cron/restart_cut.py);
+# a rerun cut again, a refused reschedule or a lost rerun leaves no later run. Recovery evidence is a real outcome
+# after the cut: last_run_at > the cut's at (a success, or a real failure the ordinary counter then counts).
+RECOVERED_RUN_S = 300
+
+
+def _cut_job(i, cut_at, last_run_at=None, **kw):
+    """The record cron/jobs.py _record_run_outcome(shutdown_interrupted=True) leaves; last_run_at moves past the cut
+    once a later run reaches a real outcome."""
+    job = {"id": i, "name": f"job {i}", "last_status": kw.pop("status", "error"), "failure_streak": 0,
+           "last_run_at": _iso(last_run_at if last_run_at is not None else cut_at),
+           "last_failure": {"at": _iso(cut_at), "detail": kw.pop("detail", RESTART_CUT)}}
+    job.update(kw)
+    return job
+
+
+def test_cron_three_recovered_cuts_in_a_day_file_nothing(home):
+    cur = {}
+    for t in (NOW - 9000, NOW - 5400, NOW - 1800):
+        _write_jobs(home, _cut_job("r", t))
+        assert sg.collect_cron(home, cur, t + 60, "hubhost") == []
+        _write_jobs(home, _cut_job("r", t, last_run_at=t + RECOVERED_RUN_S, status="ok"))  # the rerun completed
+        assert sg.collect_cron(home, cur, t + RECOVERED_RUN_S + 60, "hubhost") == []
+    assert sg.collect_cron(home, cur, NOW + sg.CRON_CUT_GRACE_S * 2, "hubhost") == []
+    assert "default:r" not in cur.get("cron_fails", {}) and not cur.get("cron_cuts")
+
+
+def test_cron_unrecovered_cut_files_once_after_grace(home):
+    cur, cut = {}, NOW - 600
+    _write_jobs(home, _cut_job("u", cut))
+    assert sg.collect_cron(home, cur, NOW, "hubhost") == []  # rerun still has time
+    assert sg.collect_cron(home, cur, cut + sg.CRON_CUT_GRACE_S - 1, "hubhost") == []
+    got = sg.collect_cron(home, cur, cut + sg.CRON_CUT_GRACE_S + 1, "hubhost")
+    assert len(got) == 1 and got[0]["kind"] == "cron"
+    assert "restart cut not recovered" in got[0]["symptom"] and "job u" in got[0]["symptom"]
+    assert got[0]["fp"] != sg.fp("cron", "hubhost", "default", "job u")  # never merged with the job-failure lane
+    assert "default:u" not in cur.get("cron_fails", {})  # still not counted as a job failure
+    assert sg.collect_cron(home, cur, cut + sg.CRON_CUT_GRACE_S + 120, "hubhost") == []  # one card per cut
+
+
+def test_cron_typed_cut_with_new_wording_is_tracked_too(home):
+    cur, cut = {}, NOW - 600
+    job = _cut_job("t", cut, detail="Stopped while the owner gateway went down (new core wording)")
+    job["last_failure"]["kind"] = "lifecycle_interrupt"
+    _write_jobs(home, job)
+    assert sg.collect_cron(home, cur, NOW, "hubhost") == [] and "default:t" in cur["cron_cuts"]
+    assert len(sg.collect_cron(home, cur, cut + sg.CRON_CUT_GRACE_S + 1, "hubhost")) == 1
+
+
+def test_cron_rerun_cut_again_files_from_latest_cut(home):
+    cur, first = {}, NOW - 3600
+    _write_jobs(home, _cut_job("a", first))
+    assert sg.collect_cron(home, cur, first + 60, "hubhost") == []
+    second = first + 900  # the one rerun was cut too: core does not rerun it a second time
+    _write_jobs(home, _cut_job("a", second))
+    assert sg.collect_cron(home, cur, second + 60, "hubhost") == []
+    # jobs.json keeps only the latest last_run_at, so a success between the cuts may be unseen: age from the latest
+    assert sg.collect_cron(home, cur, first + sg.CRON_CUT_GRACE_S + 1, "hubhost") == []
+    got = sg.collect_cron(home, cur, second + sg.CRON_CUT_GRACE_S + 1, "hubhost")
+    assert len(got) == 1 and "restart cut not recovered" in got[0]["symptom"]
+
+
+def test_cron_cut_followed_by_real_failure_counts_failure_not_lost_cut(home):
+    cur, cut = {"cron_fails": {"default:f": [NOW - 7000, NOW - 6000]}}, NOW - 5000
+    _write_jobs(home, _cut_job("f", cut))
+    assert sg.collect_cron(home, cur, cut + 60, "hubhost") == []
+    # the rerun reached a real outcome: a genuine failure, which the ordinary counter must still count
+    _write_jobs(home, _cron_job("f", 1, "error", _iso(cut + 400)) | {"last_run_at": _iso(cut + 400)})
+    got = sg.collect_cron(home, cur, cut + 500, "hubhost")
+    assert len(got) == 1 and "3 failures in 24h" in got[0]["details"]
+    assert sg.collect_cron(home, cur, cut + sg.CRON_CUT_GRACE_S * 2, "hubhost") == []  # cut was recovered
+
+
+@pytest.mark.parametrize("change", ["removed", "disabled", "paused"])
+def test_cron_cut_of_removed_or_disabled_job_is_dropped(home, change):
+    cur, cut = {}, NOW - 600
+    _write_jobs(home, _cut_job("d", cut))
+    assert sg.collect_cron(home, cur, NOW, "hubhost") == []
+    if change == "removed":
+        _write_jobs(home, _cron_job("other", 0, "ok", _iso(NOW - 99999)))
+    elif change == "disabled":
+        _write_jobs(home, _cut_job("d", cut, enabled=False))
+    else:
+        _write_jobs(home, _cut_job("d", cut, state="paused", paused_at=_iso(NOW)))
+    assert sg.collect_cron(home, cur, cut + sg.CRON_CUT_GRACE_S + 1, "hubhost") == []
+    assert not cur.get("cron_cuts")
+
+
+def test_cron_cut_waits_while_a_run_is_claimed_then_files_at_hard_cap(home):
+    cur, cut = {}, NOW - 600
+    _write_jobs(home, _cut_job("c", cut, run_claim={"owner": "gw", "at": _iso(cut + 30)}))
+    assert sg.collect_cron(home, cur, NOW, "hubhost") == []
+    assert sg.collect_cron(home, cur, cut + sg.CRON_CUT_GRACE_S + 1, "hubhost") == []  # rerun in flight
+    got = sg.collect_cron(home, cur, cut + sg.CRON_CUT_MAX_S + 1, "hubhost")  # a stale claim never hides it forever
+    assert len(got) == 1 and "restart cut not recovered" in got[0]["symptom"]
+
+
+def test_cron_old_cursor_without_cut_entries(home):
+    k = "default:o"
+    cur = {"cron": {k: NOW - 7200}, "cron_fails": {k: [NOW - 7200]}}  # pre-change cursor shape
+    _write_jobs(home, _cut_job("o", NOW - 600))
+    assert sg.collect_cron(home, cur, NOW, "hubhost") == []
+    assert cur["cron_fails"][k] == [NOW - 7200] and k in cur["cron_cuts"]
+
+
+def test_cron_cut_record_from_real_core_writer(home):
+    # Detection guard: build the cut and the recovering run with core's own writer, so a change to what
+    # _record_run_outcome stamps (last_run_at, last_failure) breaks this test instead of hiding lost reruns.
+    import os
+    try:  # scripts/test-all puts core on PYTHONPATH (HERMES_CORE_CHECKOUT); the public CI has no core
+        from cron.jobs import _record_run_outcome
+    except ImportError:
+        if os.environ.get("HERMES_CORE_CHECKOUT"):
+            raise
+        pytest.skip("needs Hermes core (HERMES_CORE_CHECKOUT unset)")
+    job = {"id": "w", "name": "job w", "failure_streak": 0, "last_status": "ok"}
+    _record_run_outcome(job, False, RESTART_CUT, None, None, _iso(NOW - 600), shutdown_interrupted=True)
+    assert job["failure_streak"] == 0 and job["last_run_at"] == job["last_failure"]["at"]
+    lost = json.loads(json.dumps(job))
+    cur = {}
+    _write_jobs(home, job)
+    assert sg.collect_cron(home, cur, NOW, "hubhost") == [] and "default:w" in cur["cron_cuts"]
+    _record_run_outcome(job, True, None, None, None, _iso(NOW - 300))  # the rerun succeeded
+    _write_jobs(home, job)
+    assert sg.collect_cron(home, cur, NOW + sg.CRON_CUT_GRACE_S, "hubhost") == []
+    cur2 = {}
+    _write_jobs(home, lost)
+    assert sg.collect_cron(home, cur2, NOW, "hubhost") == []
+    assert len(sg.collect_cron(home, cur2, NOW + sg.CRON_CUT_GRACE_S, "hubhost")) == 1
+
+
 def test_kanban_cards_failed_twice(home):
     ks = kinds(sg.collect(home, {}, "hubhost", NOW), "kanban")
     assert [s["symptom"].split()[2] for s in ks] == ["t_crash2"]  # once is not enough; self-heal's own cards skip
