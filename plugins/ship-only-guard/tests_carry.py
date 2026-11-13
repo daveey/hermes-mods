@@ -553,6 +553,29 @@ def test_path_changed_on_both_sides_merges_cleanly_and_carries(monkeypatch):
         f"repos/{R}/git/blobs/{blob_sha(SHARED[k])}" for k in ("base", "ours", "theirs"))
 
 
+def test_large_path_changed_on_both_sides_merges_cleanly_and_carries(monkeypatch):
+    # A large text file must take the content-merge path, not the unchanged-blob shortcut.
+    base = b"start\n" + b"unchanged line\n" * 90000 + b"end\n"
+    ours = base.replace(b"start\n", b"pr change\n", 1)
+    theirs = base.replace(b"end\n", b"base change\n")
+    merged = ours.replace(b"end\n", b"base change\n")
+    assert all(1_200_000 < len(d) < 8 << 20 for d in (base, ours, theirs, merged))
+    calls = shared(monkeypatch, base=base, ours=ours, theirs=theirs, merged=merged)
+    assert check() is None
+    assert sorted(c[-1] for c in calls if "/git/blobs/" in c[-1]) == sorted(
+        f"repos/{R}/git/blobs/{blob_sha(d)}" for d in (base, ours, theirs))
+
+
+@pytest.mark.parametrize("size", [8 * 1024 * 1024 + 1, None])
+def test_over_eight_mib_or_missing_size_refuses_before_blob_read(monkeypatch, size):
+    sha = blob_sha(SHARED["ours"])
+    calls = shared(monkeypatch, ours=("100644", sha, size))
+    why = check()
+    assert f"blob {sha[:10]} is over {g._MERGE_BLOB_BYTES} bytes or has no size" in why
+    assert "a clean merge cannot be shown" in why
+    assert not any(f"/git/blobs/{sha}" in c[-1] for c in calls)
+
+
 def test_merge_result_other_than_the_clean_content_merge_refused(monkeypatch):
     shared(monkeypatch, merged=SHARED["merged"] + b"extra\n")
     assert "its tree differs from the clean merge" in check() and "at home/shared.txt" in check()
