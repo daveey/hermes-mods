@@ -124,3 +124,56 @@ def test_no_watch_predicate_means_no_watches(gate, tmp_path, monkeypatch):
     cards, _ = gate.core.linked_state(CHAT, db_paths=[db])
     assert [x["id"] for x in cards] == ["t_01a1d0a6b9097a68"]
     assert cards[0]["watch"] is False and gate.core._is_open(cards[0])
+
+
+def _old_board(tmp_path):
+    db = tmp_path / "fake.db"
+    c = sqlite3.connect(db)
+    c.executescript("""create table tasks(id text, title text, status text, assignee text, created_at real,
+        completed_at real, result text, session_id text, block_kind text, human_request text);
+        create table kanban_notify_subs(task_id text, platform text, chat_id text);""")
+    for i, title in enumerate(("w", "plain")):
+        c.execute("insert into tasks values (?,?,?,?,?,?,?,?,?,?)",
+                  (f"t_{i}", title, "scheduled", "default", float(i), None, "", CHAT, None, None))
+    c.commit()
+    c.close()
+    return db
+
+
+def _fake_core(monkeypatch, **attrs):
+    import types
+    mod = types.ModuleType("hermes_cli.kanban_watch")
+    mod.__dict__.update(attrs)
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_watch", mod)
+
+
+@pytest.mark.parametrize("fallback", ["1", " 1 ", "(1)", "TRUE", "1 = 1", "NOT 0"])
+def test_any_constant_no_watch_answer_means_no_watches(gate, tmp_path, monkeypatch, fallback):
+    """Core's "no watches" answer is not matched by its exact spelling: any always-true predicate negates to 0."""
+    _fake_core(monkeypatch, not_watch_sql=lambda conn, alias="t": fallback)
+    cards, _ = gate.core.linked_state(CHAT, db_paths=[_old_board(tmp_path)])
+    assert sorted(x["id"] for x in cards) == ["t_0", "t_1"]
+    assert all(x["watch"] is False and gate.core._is_open(x) for x in cards)
+
+
+@pytest.mark.parametrize("attrs", [{}, {"not_watch_sql": None}, {"not_watch_sql": lambda conn, alias="t": None},
+                                   {"not_watch_sql": lambda conn, alias="t": "  "},
+                                   {"not_watch_sql": lambda conn, alias="t": "t.no_such_col = 1"}])
+def test_degraded_predicate_means_no_watches(gate, tmp_path, monkeypatch, attrs):
+    """A core module without the function, a non-string or blank result, or SQL this board can't run: no watches."""
+    _fake_core(monkeypatch, **attrs)
+    db = _old_board(tmp_path)
+    c = sqlite3.connect(db)
+    assert gate.core._watch_sql(c) == "0"
+    c.close()
+    cards, _ = gate.core.linked_state(CHAT, db_paths=[db])
+    assert len(cards) == 2 and all(x["watch"] is False and gate.core._is_open(x) for x in cards)
+
+
+def test_core_predicate_is_used_as_is(gate, tmp_path, monkeypatch):
+    """Whatever predicate core returns is applied (negated), not reinterpreted: here card 'w' is the watch."""
+    _fake_core(monkeypatch, not_watch_sql=lambda conn, alias="t": f"{alias}.title <> 'w'")
+    cards, _ = gate.core.linked_state(CHAT, db_paths=[_old_board(tmp_path)])
+    by = {x["id"]: x for x in cards}
+    assert by["t_0"]["watch"] is True and not gate.core._is_open(by["t_0"])
+    assert by["t_1"]["watch"] is False and gate.core._is_open(by["t_1"])

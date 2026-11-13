@@ -348,12 +348,14 @@ def _core_projection():
 def _watch_sql(c: sqlite3.Connection) -> str:
     """SQL (alias ``t``) that is 1 for a watch park: a card parked ``scheduled`` with ``kanban_schedule(watch=true)``.
     Core's own predicate (``hermes_cli.kanban_watch``), which ``session_tasks`` / ``hermes kanban chat-tasks`` and
-    the chat counts use to leave a watch out of the chat's open work. An older core, a failed import or a board the
-    predicate cannot run on: ``0`` (no watches), as ``_core_projection`` degrades to local-only."""
+    the chat counts use to leave a watch out of the chat's open work. An older core (no module or no
+    ``not_watch_sql``), a non-string result or a predicate that does not run on this board: ``0`` (no watches), as
+    ``_core_projection`` degrades to local-only. Core's own "no watches" answer for a board without park payloads
+    (a constant true predicate, however it is spelled) negates to false here, so it needs no special case."""
     try:
         from hermes_cli.kanban_watch import not_watch_sql
         expr = not_watch_sql(c, "t")
-        if expr.strip() == "1":  # board without park payloads: no watches
+        if not isinstance(expr, str) or not expr.strip():
             return "0"
         expr = f"(not ({expr}))"
         c.execute(f"select {expr} from tasks t limit 0").fetchall()
@@ -480,8 +482,9 @@ def linked_state(session_id: str, limit: int = 15, db_paths: list[Path] | None =
 
     The ``limit`` newest cards, plus every open card that needs a person (blocked, in review, or carrying a
     human_request) however old: in a long chat the oldest cards drop out of a recency list first, and those are
-    the ones blocked on David (self-heal agent-d9399023fc). Total capped at LINKED_CAP by dropping the oldest
-    non-pinned cards; a pinned card is never cut."""
+    the ones blocked on David (self-heal agent-d9399023fc). Pinned cards plus the chat's open cards are capped at
+    LINKED_CAP by dropping the oldest non-pinned ones (a pinned card is never cut). Local watch parks
+    (``_watch_sql``) are listed outside that cap and never cut, so the list can exceed LINKED_CAP by their number."""
     out: list[dict] = []
     if not session_id:
         return out, True
