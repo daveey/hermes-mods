@@ -1779,6 +1779,27 @@ def _live_ref_text(ref: str, card: Optional[dict[str, Any]]) -> str:
     return f"{ref} [{state}] {title}" + (f": {result}" if result and is_settled(card) else "")
 
 
+LATEST_COMMENT_HEAD = 300
+
+
+def _latest_comment_text(card: dict[str, Any]) -> str:
+    """A remote card with no handoff: ``latest comment [<when> <author>]: <head>`` from the ``last_comment`` the
+    plugin read off the hub replica (self-heal agent-a679e846ca: an archived card whose latest comment recorded the
+    user's decision rendered as "(no handoff)", leaving the close-out turn nothing to cite). "" without one."""
+    c = card.get("last_comment")
+    if not isinstance(c, dict):
+        return ""
+    body = " ".join(str(c.get("body") or "").split())[:LATEST_COMMENT_HEAD]
+    if not body:
+        return ""
+    try:
+        when = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(float(c.get("at"))))
+    except (TypeError, ValueError, OverflowError, OSError):
+        when = "?"
+    who = " ".join(str(c.get("author") or "?").split())[:40]
+    return f"latest comment [{when} {who}]: {body}"
+
+
 def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: Optional[float] = None,
                     named: Optional[dict[str, dict[str, Any]]] = None) -> str:
     """``named``: the cards :func:`handoff_refs` lists, read for this prompt (None = not read: no live lines)."""
@@ -1795,7 +1816,7 @@ def closeout_prompt(row: dict[str, Any], cards: dict[str, dict[str, Any]], now: 
         state = c.get("status") or "?"
         if state == "blocked":
             state = f"blocked ({c.get('block_kind') or 'needs a human'})"
-        handoff = " ".join(str(c.get("summary") or "").split())[:700] or "(no handoff)"
+        handoff = " ".join(str(c.get("summary") or "").split())[:700] or _latest_comment_text(c) or "(no handoff)"
         lines.append(f"- {tid} [{state}] {c.get('title') or ''}{_ask_line(c, now)}\n  handoff: {handoff}")
         refs = _card_handoff_refs(tid, c, batch_ids) if named is not None else []
         if refs:

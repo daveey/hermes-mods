@@ -628,6 +628,56 @@ def _hub_fresh() -> bool:
         return False
 
 
+def _replica_last_comments(cards: list[dict]) -> dict[int, dict]:
+    """``{id(card): newest comment}`` from the hub replica's task records (``last_comments``, newest last, written by
+    hermes-hub's collector) for remote rows, keyed like :func:`_replica_completed_at`. Read-only; fails open ({})."""
+    path = hub_db_path()
+    if path is None or not cards:
+        return {}
+    out: dict[int, dict] = {}
+    try:
+        conn = core.ro_connect(Path(path))
+    except Exception:
+        return {}
+    try:
+        for card in cards:
+            rk = "/".join(str(card[k]) for k in ("profile", "board", "id") if card.get(k))
+            r = conn.execute("SELECT data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
+                             (card.get("gateway"), rk)).fetchone()
+            if r is None:
+                continue
+            data = json.loads(r[0])
+            comments = [c for c in data.get("last_comments") or [] if isinstance(c, dict)
+                        and str(c.get("body") or "").strip()]
+            if str(data.get("id")) == str(card["id"]) and comments:
+                out[id(card)] = {k: comments[-1].get(k) for k in ("author", "at", "body")}
+    except Exception:
+        logger.debug("chat-closeout: replica comments unavailable", exc_info=True)
+    finally:
+        conn.close()
+    return out
+
+
+def _with_latest_comments(row: dict, cards: dict) -> dict:
+    """``cards`` for the close-out prompt, with ``last_comment`` on each batch remote card that has no handoff
+    (self-heal agent-a679e846ca: such a card rendered as "(no handoff)" though its latest comment recorded the user's
+    decision). Copies, never mutates: inventory rows are core's cache. Fails open: the cards as read."""
+    try:
+        want = [(tid, c) for tid in row.get("batch") or [] for c in [cards.get(tid)]
+                if c and c.get("remote") and not str(c.get("summary") or "").strip() and "last_comment" not in c]
+        got = _replica_last_comments([c for _, c in want]) if want else {}
+        if not got:
+            return cards
+        out = dict(cards)
+        for tid, c in want:
+            if id(c) in got:
+                out[tid] = {**c, "last_comment": got[id(c)]}
+        return out
+    except Exception:
+        logger.debug("chat-closeout: latest comments fill failed", exc_info=True)
+        return cards
+
+
 def _replica_completed_at(cards: list[dict], failed_out: Optional[list] = None) -> dict[int, float]:
     """``{id(card): completed_at}`` from the hub replica's task records (``[profile/]board/id`` under the owner
     gateway) for finished shepherd rows that carry no completion time. Read-only; an unreadable replica gives {}
@@ -1324,7 +1374,8 @@ def pre_llm_call(session_id: str = "", platform: str = "", user_message: Any = N
         if not key or row.get("closing") is not None:
             return None  # nothing new to report, or the waker already briefed this turn
         _state["observed"][session_id] = key
-        prompt = core.closeout_prompt(row, cards, now=time.time(), named=_named_cards(read_cards, row, cards))
+        prompt = core.closeout_prompt(row, _with_latest_comments(row, cards), now=time.time(),
+                                      named=_named_cards(read_cards, row, cards))
         # the brief names each unlinked entry; this turn is its one mention
         ledger().write(session_id, closing=sorted(row["batch"]), unlinked=core.briefed(row.get("unlinked"), time.time()))
         return {"context": prompt}
@@ -1746,7 +1797,7 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
         # Mark the batch covered and the turn as a close-out BEFORE it starts: the turn's own end (or a card it
         # creates) must never read as a fresh settled batch.
         wakes = [t for t in row.get("wakes") or [] if 0 <= now - float(t) < 3600] + [now]
-        prompt = core.closeout_prompt(row, cards, now=now,  # names each unlinked entry: this turn is its mention
+        prompt = core.closeout_prompt(row, _with_latest_comments(row, cards), now=now,  # names each unlinked entry
                                       named=_named_cards(read, row, cards))
         led.write(sid, covered=set(row.get("covered") or []) | set(new_ids), closing=sorted(row["batch"]),
                   wakes=wakes, wake_count=int(row.get("wake_count") or 0) + 1,
