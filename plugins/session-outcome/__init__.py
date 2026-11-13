@@ -482,6 +482,15 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
                     failures = [n for n in not_linked if "(origin-bound to this chat)" not in n]
                     if failures:
                         result["not_linked"] = failures
+                # agent-1b6c276b0a: `declared: true` alone read as "a watch is armed", so a chat promised "I'll watch
+                # it until it's done" on a card nothing linked. Say plainly whether this wait can wake the chat.
+                result["wakes_chat"] = bool(linked)
+                unlinked = [c for c in dict.fromkeys(cards) if c not in linked]
+                if unlinked:
+                    result["warning"] = (
+                        f"Nothing will wake this chat for {', '.join(unlinked)}. Don't promise to watch it. Link it, "
+                        "start terminal(background=true, notify=true) with a status loop, or tell the user you are "
+                        "not watching.")
         return json.dumps(result)
     except Exception as exc:  # never crash the agent loop
         log.exception("session_outcome failed")

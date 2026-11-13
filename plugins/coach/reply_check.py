@@ -119,6 +119,9 @@ WAIT_RE = re.compile(
     r"(\b(?:once|when|after|as soon as)\b[^.\n]{0,90}\b" + _FINISH + r"\b[^\n]{0,160}?\b(?:I'll|I will|I'm going to)\b"
     r"|\b(?:I'll|I will)\b[^.\n]{0,160}\b(?:once|when|after|as soon as)\b[^.\n]{0,90}\b" + _FINISH + r"\b"
     r"|\bI'll (?:check back|check in again|follow up|report back|pick (?:this|it) (?:back )?up)\b"
+    # agent-1b6c276b0a: "I'll watch it directly until it's done"
+    r"|\b(?:I'll|I will|we'll|we will)\s+(?:keep\s+)?(?:watch(?:ing)?|monitor(?:ing)?|track(?:ing)?|"
+    r"keep(?:ing)? an eye on)\b[^.\n]{0,80}?\b(?:until|till|til)\b"
     r"|\b(?:waiting|wait) (?:on|for) (?:the |its |their |those |these )?(?:\w+ ){0,3}(?:runs?|jobs?|training|"
     r"experiments?|evals?|builds?|CI|sweeps?|deploys?|tests?|soaks?|workers?)\b)", re.I)
 DONE_RE = re.compile(
@@ -2558,6 +2561,13 @@ STALLED_OWNER = ("A card that can't start (failed attempts, quota, no eligible r
                  "doesn't start it: do it in this chat if your model can, raise its priority (`hermes kanban edit "
                  "<id> --priority N`), or re-place it (`placement`) on a gateway with capacity, and say which.")
 
+# agent-1b6c276b0a: a session_outcome wait returned ok/declared on a card it could not link, and the judge resolved
+# "I'll watch it until it's done" because "a session_outcome wait [was] registered". The `<- OK wait` line
+# (agent_rules.wait_result_line) carries what the wait armed; the judges read it with this clause.
+UNLINKED_WAIT = ("A session_outcome wait is a wake source only when its `<- OK wait` line shows wakes_chat=true: one "
+                 "showing wakes_chat=false (the card did not link to this chat) wakes nothing, so it is neither a "
+                 "watch, a started fix nor a checked owner, and a promise to watch that card is unbacked.")
+
 # agent-9ac78980e2 / agent-61f2644a68: one clause for both report_only judges on the coach's own board read and on
 # dependency-gated owners.
 BOARD_OWNER = ("A `<- BOARD task=...` line (in COACH'S OWN BOARD READ) is the coach's own read of a card the message "
@@ -2637,7 +2647,7 @@ probabilities (0-1):
   already confirmed nothing is armed to wake this session afterwards (no background watcher, kanban card, goal or
   subagent). Score high when the agent's own follow-up depends on that outside work. Score low when the next step is
   the USER's (they will test, decide, or reply), when the agent says plainly that it is stopping and the user should
-  ping it, or when the outside work's result needs no further action from the agent.
+  ping it, or when the outside work's result needs no further action from the agent. """ + UNLINKED_WAIT + """
 - report_only: the message describes or diagnoses a problem (broken, stale, failing, stalled, unfinished, unmerged,
   undeployed, "not fixed", "remains open", "owned by the existing card", "relayed to the owner", "no action needed
   from you") that the agent could fix or start fixing itself, and ends WITHOUT fixing it, starting a fix (a kanban
@@ -2702,6 +2712,7 @@ probabilities (0-1):
     by itself" after a reset scores HIGH (0.7+) even when the tool log checked that card, unless the tool log shows
     the agent did the work this turn or re-placed the card on a gateway that can run it, and the message says which.
     A Kanban worker's own kanban_block(kind=dependency) behind such a card is not a started fix either.
+    """ + UNLINKED_WAIT + """
   * Small or optional leftovers still count. A closing "one limit / one gap / one small thing", "I left that alone",
     "optional tidy-up", "I didn't touch it", "haven't checked X", "needs a restart / the next sync to take effect", "not
     posted" about something the agent could do or check with its access scores 0.7+, even when the main work is done
@@ -2775,7 +2786,7 @@ Return ONLY one JSON object:
 - agent_fixable: when problem is true: could an agent with the access above plausibly fix it or start fixing it itself (true), or does it genuinely need the user (password, physical action, a decision only he can make, money) or an outside party (false)? null when problem is false. An item the user chose to defer, rescope or skip is false when the reply names that decision and a tool log shown (this turn or the previous turn) records it (a card read or comment carrying the decision); acting on it would override the user. Only the user's own recorded decision counts: an agent's own choice to wait, a schedule, or a bare claim that the user deferred it (nothing in either tool log) does not, and the latest request asking the agent to finish it overrides an earlier deferral.
 - outcome (pick the best fit for the unresolved problem the reply is mainly about):
   "fixed": the agent itself fixed or changed the thing during this turn (edited code/config, ran the command that resolves it), even if final verification is pending.
-  "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR). A Kanban worker that checkpointed its own card with kanban_continue this turn has started the leftovers that checkpoint carries to the card's next run. """ + STALLED_OWNER + """ Such a card (failed start attempts, parked on quota or "No eligible deep routes", "starts by itself" after a reset) is "report_only", not "started", unless the agent did the work this turn or re-placed it on a gateway that can run it. A Kanban worker's own kanban_block(kind=dependency) behind such a card is not a started fix either.
+  "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR). A Kanban worker that checkpointed its own card with kanban_continue this turn has started the leftovers that checkpoint carries to the card's next run. """ + STALLED_OWNER + """ Such a card (failed start attempts, parked on quota or "No eligible deep routes", "starts by itself" after a reset) is "report_only", not "started", unless the agent did the work this turn or re-placed it on a gateway that can run it. A Kanban worker's own kanban_block(kind=dependency) behind such a card is not a started fix either. """ + UNLINKED_WAIT + """
   "proposed": no fix yet, but the reply proposes a concrete solution or plan (what would change and how), possibly asking for a go-ahead.
   "offered": only a vague offer ("want me to fix it?", "I can look into it") with no concrete solution.
   "report_only": the reply describes or diagnoses the problem, or says it is not fixed / can be ignored / is owned by an existing task / was relayed to someone, WITHOUT fixing it, starting a new fix, or proposing a concrete solution.

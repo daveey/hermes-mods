@@ -37,5 +37,11 @@ def test_wait_binding(real, tmp_path, monkeypatch, origin_session, profile, gate
     if expected:
         assert "not_linked" not in result
         assert result["link_notes"] == ["t_remote: linked on remote (origin-bound to this chat)"]
+        assert result["wakes_chat"] is True and "warning" not in result, result
     else:
         assert "link it with:" in result["not_linked"][0]
+        # agent-1b6c276b0a: a wait that linked nothing must not read as a watch: ok/declared alone let the chat
+        # promise "I'll watch it until it's done" with nothing armed to wake it.
+        assert result["wakes_chat"] is False, result
+        assert "Nothing will wake this chat for t_remote" in result["warning"], result
+        assert "Don't promise to watch it" in result["warning"], result

@@ -3212,6 +3212,31 @@ def session_result_line(tool: str, args: Any, result: Any, now: Optional[float] 
 
 
 
+# agent-1b6c276b0a: a session_outcome wait that could not link its card returned ok/declared, and the judges read the
+# bare `-> session_outcome(...)` call as an armed watch. One `<- OK wait` line carries whether it wakes the chat.
+_WAIT_UNLINKED_RE = re.compile(r"\bNothing will wake this chat for ([^.]+)\.")
+
+
+def wait_result_line(tool: str, args: Any, result: Any) -> Optional[str]:
+    """`   <- OK wait wakes_chat=<bool> ...` for a session_outcome wait whose result reports wakes_chat, else None.
+    Callers skip failed calls."""
+    if (tool or "").rsplit("__", 1)[-1] != "session_outcome":
+        return None
+    if not isinstance(args, dict) or str(args.get("kind") or "") != "wait":
+        return None
+    d = _as_dict(result)
+    if not isinstance(d, dict) or not isinstance(d.get("wakes_chat"), bool):
+        return None
+    body = f"wait wakes_chat={'true' if d['wakes_chat'] else 'false'}"
+    linked = [str(c) for c in d.get("linked") or []]
+    if linked:
+        body += " linked=" + ",".join(linked[:4])
+    m = _WAIT_UNLINKED_RE.search(str(d.get("warning") or ""))
+    if m:
+        body += " unlinked=" + m.group(1).replace(" ", "")
+    return f"   <- OK {body}"[:OK_LINE_MAX]
+
+
 def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = None,
                       saved: Any = ()) -> Optional[str]:
     """The `   <- OK ...` line for a successful owner read, else None. Callers skip failed calls. `saved`: files an
@@ -3708,6 +3733,13 @@ class AgentCoach:
             if park:  # this turn parked its run: reply_check.lifecycle_park (agent-9f966b0682)
                 s["turn_log"].append(park)
                 s.setdefault("turn_rich", deque(maxlen=60)).append(park)
+            try:  # whether a session_outcome wait armed anything (agent-1b6c276b0a)
+                waited = wait_result_line(tool, args, result)
+            except Exception:
+                waited = None
+            if waited:
+                s["turn_log"].append(waited)
+                s.setdefault("turn_rich", deque(maxlen=60)).append(waited)
         try:  # which named cards a board write changed or was refused (reply_check.claimed_mutation)
             mut = mutation_result_line(tool, args, result, status)
         except Exception:

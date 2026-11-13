@@ -19,6 +19,16 @@ def test_promise_detection_ignores_code_and_quotes():
     assert core.find_promise("> I'll report back\n`running now`") is None
 
 
+def test_promise_detection_catches_watch_until():
+    # agent-1b6c276b0a: the reply that ended the turn with nothing armed to wake the chat.
+    said = "The MacBook fix card t_01a1d139db545db9 is stalled. I'll watch it directly until it's done."
+    assert core.find_promise(said) == "I'll watch it directly until"
+    assert core.find_promise("I'll keep an eye on the build till it lands.")
+    assert core.find_promise("We'll keep monitoring the deploy until it goes green.")
+    assert core.find_promise("I watched it until it finished; it is merged.") is None
+    assert core.find_promise("Watch it until it finishes, then run the tests.") is None
+
+
 def test_midturn_completion_needs_closeout(tmp_path):
     led = core.Ledger(tmp_path / 'ledger.db')
     core.record_turn_end(led, 'chat', ['t_one'], lambda _: {'t_one': {'status': 'running'}}, now=1)

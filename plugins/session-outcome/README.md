@@ -64,6 +64,9 @@ not claimed by this plugin section.
     also count as `linked`; `link_notes` identifies the owner gateway. Another chat/profile/gateway's binding
     never counts, and an unreadable ledger reports unknown linkage rather than suggesting a new adoption.
     An owning (create/shepherd/origin) sub the chat already has is left as is.
+    A card wait also returns `wakes_chat` (true when at least one card linked) and, for each card that did not
+    link, a plain `warning` ("Nothing will wake this chat for <card>. Don't promise to watch it. ..."): `ok` and
+    `declared` alone never mean a watch is armed. The coach logs it as `<- OK wait wakes_chat=...` for its judges.
 - **Provider** `user-steps`: user-steps `open_steps(sid)` → `{"decision_items": [...], "waiting_on": []}`, or None
   when the chat has no open steps.
 - **Judge**: is the last assistant message a closing summary? Every chat is judged, including a kind never seen

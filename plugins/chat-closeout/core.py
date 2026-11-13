@@ -1977,6 +1977,9 @@ def shadow_rows(path: Path, ids: Iterable[str]) -> tuple[tuple[tuple[Any, Any], 
 _PROMISE = re.compile(
     r"\b(?:I'?ll|I will|I’ll|we'?ll|will)\s+(?:report back|let you know|ping you|update you|follow up|get back to you|"
     r"check back|circle back|tell you (?:when|once|if)|post (?:an? |the )?update|report (?:when|once|the result))"
+    # agent-1b6c276b0a: "I'll watch it directly until it's done" with nothing armed to wake the chat
+    r"|\b(?:I'?ll|I will|I’ll|we'?ll|we will)\s+(?:keep\s+)?(?:watch(?:ing)?|monitor(?:ing)?|track(?:ing)?|"
+    r"keep(?:ing)? an eye on)\b[^.\n]{0,80}?\b(?:until|till|til)\b"
     r"|\b(?:when|once) (?:it|they|that|this|the (?:card|cards|job|build|run|worker|task)s?) "
     r"(?:finish(?:es)?|complete[sd]?|land[s]?|(?:is|are) done)\b"
     r"|\brunning (?:now|in the background)\b",
