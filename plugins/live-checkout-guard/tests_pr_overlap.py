@@ -254,7 +254,15 @@ import json, os, sys
 from urllib.parse import urlparse, parse_qs
 spec = json.load(open(os.environ["FAKE_GH_SPEC"]))
 with open(os.environ["FAKE_GH_LOG"], "a") as log:
-    log.write(json.dumps({{"argv": sys.argv[1:], "token": bool(os.environ.get("GH_TOKEN"))}}) + "\n")
+    log.write(json.dumps({{"argv": sys.argv[1:], "token": os.environ.get("GH_TOKEN", "")}}) + "\n")
+if sys.argv[1:3] == ["auth", "token"]:   # a raw-token resolution would hand this sentinel to the next gh call
+    print("raw-sentinel")
+    sys.exit(0)
+if spec.get("hang"):   # a gh chain that ignores SIGTERM, with a grandchild that left the group holding stdout
+    import signal, subprocess, time
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
+    time.sleep(10)
 if spec.get("exit"):
     sys.stderr.write("GitHub quota guard: refused.\n")
     sys.exit(spec["exit"])
@@ -295,6 +303,7 @@ def fake_gh(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_GH_SPEC", str(spec))
     monkeypatch.setenv("FAKE_GH_LOG", str(log))
     monkeypatch.setenv("PR_OVERLAP_GH", str(gh))
+    monkeypatch.setenv("PATH", str(gh.parent) + os.pathsep + os.environ.get("PATH", ""))   # a bare `gh` is the fake too
     monkeypatch.setenv("PR_OVERLAP_CACHE", str(tmp_path / "gh-cache"))
     for var in ("GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)
@@ -328,7 +337,7 @@ def test_hook_lookup_goes_through_metered_gh(env, fake_gh, monkeypatch):
                      "repos/acme/private-state/pulls?state=open&base=state&per_page=100",
                      "repositories/1/pulls?state=open&base=state&per_page=100&page=2"]
     assert all(c["argv"][:2] == ["api", "--include"] for c in calls)   # never `gh auth token`
-    assert not any(c["token"] for c in calls)                          # no raw token handed to gh
+    assert all(c["token"] == "" for c in calls)                       # no raw token resolved and handed to gh
     assert env.gh.calls == 0                                           # the injected fake was not used
 
 
@@ -362,3 +371,16 @@ def test_first_failure_stops_further_file_reads(env):
     res = c.check("acme/private-state", "state", [GUIDE])
     assert res["status"] == "unknown" and "502" in res["reason"]
     assert env.gh.calls <= 1 + 4   # the list read, then at most one in-flight read per worker
+
+
+def test_gh_timeout_is_bounded_and_unknown(env, fake_gh, monkeypatch):
+    """A timed-out gh chain (SIGTERM ignored, a descendant outside its group still holding stdout) is stopped
+    group-wide and abandoned after the grace: the read is unknown within timeout + 2 graces, not when gh exits."""
+    import time
+    mod = plugin_overlap()
+    monkeypatch.setattr(mod, "KILL_GRACE", 0.3)
+    fake_gh.set([{"number": 41, "sha": "a", "files": [GUIDE]}], hang=True)
+    t0 = time.monotonic()
+    with pytest.raises(mod.Unknown, match="timeout"):
+        mod.gh_fetch(mod.API + "/repos/acme/private-state/pulls?state=open&base=state&per_page=100", "", 0.5)
+    assert time.monotonic() - t0 < 0.5 + 2 * 0.3 + 1.0
