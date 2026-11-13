@@ -249,3 +249,12 @@ wall time sampling (each pass's duration sets the wait before the next), takes a
 per 10 min; later stalls are timed only. Each stall report carries `sampling`
 (`full`/`capped`/`rate_limited`) and `watcher_cost_s`. `stall_s` ends when the loop ran
 the probe, excluding the watcher's report work. Tests: `tests_stall_cost.py`.
+
+## Journal lock never blocks the event loop
+
+The sidecar lock is shared by every loop-watch process on a host. `journal.append` waits at
+most `DIAG_LOCK_TIMEOUT_S` (0.5 s) for diagnostics and `DURABLE_LOCK_TIMEOUT_S` (5 s) for
+stats (which retry the same record), then raises `ETIMEDOUT`. Slow-request reports, which
+`ReqTrace._finish` produces on the event loop, go through `offloop_sink` to a writer
+thread with a bounded queue (64, dropped when full). Tests: `tests_journal_lock.py` hold
+the lock from another process.

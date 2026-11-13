@@ -387,7 +387,7 @@ def _install_reqtrace(home: Path, slow_s: Optional[float]):
         return None
     try:
         rt = _reqtrace_mod()
-        trace = rt.ReqTrace(sink=rt.default_sink(home / "logs" / "loop-watch.jsonl"), slow_s=slow_s)
+        trace = rt.ReqTrace(sink=rt.offloop_sink(rt.default_sink(home / "logs" / "loop-watch.jsonl")), slow_s=slow_s)
         if rt.install_on_app(app, trace):
             trace.start_stats()
             setattr(trace, "_loop_watch_app", app)
