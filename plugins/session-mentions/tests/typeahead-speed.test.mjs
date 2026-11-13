@@ -53,8 +53,14 @@ test('sessionItems on 30k rows stays well inside a keystroke budget once warm', 
   const big = Array.from({ length: 30_000 }, (_, i) => ({ ...rows[i % rows.length], id: `big_${i}` }))
   const conns = [{ id: 'c0' }, { id: 'c1' }, { id: 'c2' }]
   m.sessionItems(big, 'zz', { active: 'c0', conns }) // warm the per-row cache
-  const t = performance.now()
-  for (const q of ['ty', 'typ', 'typea', 'typeahead']) m.sessionItems(big, q, { active: 'c0', conns })
-  const perKey = (performance.now() - t) / 4
-  assert.ok(perKey < 60, `${perKey.toFixed(1)} ms per keystroke`)
+  // Best of 5 rounds: CI runs this suite beside 3 others (-j4), and one starved round read 63.7 ms
+  // while this path takes ~10-18 ms unloaded. A real regression is slow in every round.
+  const rounds = []
+  for (let r = 0; r < 5; r++) {
+    const t = performance.now()
+    for (const q of ['ty', 'typ', 'typea', 'typeahead']) m.sessionItems(big, q, { active: 'c0', conns })
+    rounds.push((performance.now() - t) / 4)
+  }
+  const perKey = Math.min(...rounds)
+  assert.ok(perKey < 60, `${perKey.toFixed(1)} ms per keystroke (rounds: ${rounds.map(x => x.toFixed(1)).join(', ')})`)
 })
