@@ -438,8 +438,9 @@ def take_relays(*, live: Iterable[str], wake: Optional[Callable[..., str]], log:
                 now: Optional[float] = None) -> list[dict[str, Any]]:
     """A residual pass's owner wakes: the relays the host pass posted (``tick(relay_refused=True)``) for chats live
     in THIS process, by primary key. Each is taken by one process (CAS), then woken here with the host pass's
-    prompt; the cards' claims are finished as the host pass would have. ``busy`` re-posts it for the next pass;
-    refused/error leaves the claims to expire (CLAIM_TTL_S), as in ``tick``."""
+    prompt; the cards' claims are finished as the host pass would have. ``busy`` drops it and releases the claims,
+    so the next host pass re-decides (the card may have unparked); refused/error leaves the claims to expire
+    (CLAIM_TTL_S), as in ``tick``."""
     now = time.time() if now is None else now
     if wake is None:
         return []
@@ -463,8 +464,11 @@ def take_relays(*, live: Iterable[str], wake: Optional[Callable[..., str]], log:
                 _bookkeep(lambda k=key, p=premise: log.finish(k, p, "started", "chat"), sid)
             logger.info("owner-wake: woke %s for %s (relayed from the host pass)", sid, keys)
         elif result == "busy":
-            _bookkeep(lambda: log.post_relay(sid, cards, relay["prompt"], relay["display_text"],
-                                             relay["posted_at"]), sid)
+            # Mid-turn: drop the relay and release its claims (as ``tick``'s busy path does), so the next host
+            # pass re-checks ``due(card)`` instead of this pass replaying a possibly stale premise until the TTL.
+            for key, premise in cards:
+                _bookkeep(lambda k=key, p=premise: log.release(k, p), sid)
+            logger.info("owner-wake: relayed wake of %s busy; released for the next host pass", sid)
         else:
             logger.info("owner-wake: relayed wake of %s deferred (%s)", sid, result)
         done.append({"session_id": sid, "route": "relay", "result": result, "cards": keys})
