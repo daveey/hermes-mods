@@ -16,7 +16,8 @@ name none of the limits only David can change: real money (a $ amount, budget/ca
 an acceptance threshold or required gate, credentials or a write/admin permission (a read-only grant is not one),
 other people, safety/consent/hard-to-reverse effects, a step only a human can do, or a rule David stated (quoted).
 Evidence is not read: it cites tool output ("read-only installation token") that must not release the hold.
-An unchanged ask is held at most MAX_HOLDS times, then passes (logged owner_recommendation_released).
+Holds are counted per (session, tool, blocked card), not per ask text, so rewording does not restart the bound: at
+most MAX_HOLDS holds, then the ask passes (logged owner_recommendation_released).
 """
 from __future__ import annotations
 
@@ -41,13 +42,22 @@ _LIMITS = (
         r"|runners?|service|account|minutes))\b"
         r"|\b(?:spend(?:ing)?|cost)\s+(?:cap|limit|envelope|ceiling)\b|\bstanding\s+(?:cap|envelope)\b"
         r"|\b(?:aws|gcp|azure|cloud|gpu|vast|runpod|blacksmith|api)\s+(?:spend|costs?|bill\w*|charges?)\b"
-        r"|\brecurring\s+(?:\w+\s+)?(?:spend|costs?|charges?|fees?)\b|\bbilling\s+(?:change|plan|account)\b", re.I)),
+        r"|\brecurring\s+(?:\w+\s+)?(?:spend|costs?|charges?|fees?)\b|\bbilling\s+(?:change|plan|account)\b"
+        # An upgrade, renewal or new subscription costs money even without a $ sign. Bare "subscription" does not:
+        # spending existing subscription quota is inside the limits (the Fable route incident).
+        r"|\bupgrad\w*\s+(?:\w+\s+){0,4}?(?:plan|tier|subscription|seats?|account)\b|\bnew\s+subscription\b"
+        r"|\bsubscription\s+(?:fees?|upgrade|price|tier\s+change)\b|\brenew\w*\b|\blet\s+(?:it|the\s+\w+)\s+lapse\b",
+        re.I)),
+    ("legal", re.compile(
+        r"\blicen[cs]e\s+(?:terms|agreement|fees?)\b|\blegal\b|\bcontracts?\b|\bterms\s+of\s+(?:service|use)\b"
+        r"|\bsign(?:s|ing)?\s+(?:the|an?)\s+(?:agreement|nda|contract)\b", re.I)),
     ("threshold", re.compile(
         r"\bacceptance(?:\s+criteri(?:a|on))?\b"
         r"|\b(?:lower|relax|waiv|weaken|drop|reduc|loosen|chang|amend|revis)\w*\s+(?:the\s+|its\s+|a\s+|our\s+)?"
         r"(?:\w+\s+){0,2}(?:target|threshold|bar|floor|criteri(?:a|on)|slo|required\s+checks?)\b"
         r"|\b(?:below|short\s+of)\s+(?:the\s+)?(?:target|threshold|bar)\b"
-        r"|\b(?:bypass\w*|skip\w*|disabl\w*)\s+(?:the\s+)?(?:review|required\s+(?:ci|checks?)|gate|ship\s+gate)\b", re.I)),
+        r"|\b(?:bypass\w*|skip\w*|disabl\w*)\s+(?:the\s+)?(?:review|required\s+(?:ci|checks?)|gate|ship\s+gate)\b"
+        r"|\bbranch\s+protection\b|\brulesets?\b", re.I)),
     ("credential", re.compile(
         r"\b(?:passwords?|passcodes?|2fa|mfa|otp|api\s+keys?|secrets?|private\s+keys?|credentials?|tokens?"
         r"|sign(?:s|ing)?\s+in|log(?:s|ging)?\s?in|keychain)\b", re.I)),
@@ -58,7 +68,11 @@ _LIMITS = (
     ("safety", re.compile(
         r"\b(?:irreversible|hard\s+to\s+(?:reverse|undo)|cannot\s+be\s+undone|one-way|permanent\w*|destructive"
         r"|data\s+loss|delet(?:e|es|ing)|wip(?:e|es|ing)|purg\w+|force-?push\w*|security|safety|outage|downtime"
-        r"|consent|production\s+data)\b", re.I)),
+        r"|consent|production|prod|offline|take\s+(?:it\s+)?down|personal\s+(?:data|information|email|gmail|account)"
+        r"|private\s+data)\b", re.I)),
+    ("admin", re.compile(
+        r"\b(?:repo|org|organi[sz]ation|site|workspace|server)\s+admin\b|\badministrator\b"
+        r"|\badmin\w*\s+(?:on|of|to|for|rights|role|access)\b", re.I)),
     ("human_only", re.compile(
         r"\b(?:physical(?:ly)?|in\s+person|by\s+hand|on\s+(?:your|his)\s+(?:phone|watch|device)|captcha)\b", re.I)),
     ("david_rule", re.compile(
@@ -68,11 +82,12 @@ _LIMITS = (
 
 # A permission change releases only when it is not read-only.
 # ("scope" is not a permission word here: asks say "widens the scope" of the work itself.)
-_PERMISSION = re.compile(r"\b(?:permissions?|access|roles?|entitlements?|grant(?:s|ed|ing)?)\b", re.I)
+_PERMISSION = re.compile(r"\b(?:permissions?|access|roles?|rights|entitlements?|grant(?:s|ed|ing)?)\b", re.I)
 _READ_ONLY = re.compile(r"\bread-?only\b|:\s*read\b|\bread\s+(?:perms?|permissions?|access|scopes?)\b", re.I)
 _ELEVATED = re.compile(
     r"\b(?:write|read[/-]write|admin\w*|owner|maintain\w*|elevated|full|org-wide|root)\s+"
-    r"(?:access|permissions?|roles?|rights|scopes?)\b|:\s*(?:write|admin)\b|\bsudo\b", re.I)
+    r"(?:access|permissions?|roles?|rights|scopes?)\b|:\s*(?:write|admin)\b|\bsudo\b"
+    r"|\b(?:also|plus|and)\s+write\b", re.I)
 
 HOLD_MESSAGE = (
     "ask-gate: owner_recommendation_hold. This ask hands David a pick between options that stays inside the card's "

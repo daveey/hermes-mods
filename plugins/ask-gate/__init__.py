@@ -937,21 +937,21 @@ def _agent_condition_hold(session_id: str, tool_name: str, request: dict) -> dic
         return None
 
 
-# Process-local hold counts per (session, tool, ask hash), like _REPLAN_HELD.
+# Process-local hold counts per (session, tool, blocked card), not per ask text: an agent rewords a held ask, and a
+# text key would restart the bound on every rewording, holding a real ask whose limit the regex misses forever.
 _OWNER_RECOMMENDATION_HELD: dict[tuple[str, str, str], int] = {}
 
 
-def _owner_recommendation_hold(session_id: str, tool_name: str, request: dict) -> dict | None:
+def _owner_recommendation_hold(session_id: str, tool_name: str, request: dict, card: str = "") -> dict | None:
     """Hold a human_request that asks David to pick between options inside the card's limits, naming no money,
     credential/write permission, other people, safety, threshold, human-only step or David rule (red-sweep slug
-    owner-recommendation-not-applied). Deterministic, bounded to owner_recommendation.MAX_HOLDS per unchanged ask;
-    fails open."""
+    owner-recommendation-not-applied). Deterministic, bounded to owner_recommendation.MAX_HOLDS per (session, tool,
+    card) however the ask is reworded (blocked kanban_create: per session and tool); fails open."""
     try:
         hit = owner_recommendation.hit(request)
         if hit is None:
             return None
-        ask = json.dumps({k: request.get(k) for k in ("action", "why_human")}, sort_keys=True)
-        key = (session_id, tool_name, core.text_hash(ask))
+        key = (session_id, tool_name, card or "")
         n = _OWNER_RECOMMENDATION_HELD.get(key, 0)
         if n >= owner_recommendation.MAX_HOLDS:
             core.log_event("owner_recommendation_released", tool=tool_name, session=session_id, holds=n,
@@ -1013,7 +1013,8 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
             return conditioned
         raw = args["human_request"]
         recommended = _owner_recommendation_hold(session_id, tool_name, dict(
-            request, choices=raw.get("choices") if isinstance(raw, dict) else None))
+            request, choices=raw.get("choices") if isinstance(raw, dict) else None),
+            card=next(iter(_block_card(tool_name, args)), ""))
         if recommended is not None:
             return recommended
         filing = _pr_filing_hold(session_id, tool_name, args, request)

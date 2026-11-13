@@ -266,3 +266,49 @@ def test_gate_error_fails_open(gate, tmp_path, monkeypatch):
 
 def test_judge_rule_covers_prose_the_regex_misses(gate):
     assert "apply your recommendation and comment how to" in gate.judge_mod.STRUCTURED_SYSTEM
+
+
+def test_rewording_does_not_restart_the_bound(gate, tmp_path, monkeypatch):
+    # The count is per blocked card, not per ask text: an agent that rewords a held ask must not be held forever.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_01a1cf6f00320b7e")
+    for i in range(2):
+        hr = dict(ROOM_IPHONE, action=ROOM_IPHONE["action"] + " (rewording %d)" % i)
+        assert "owner_recommendation_hold" in _block(gate, hr)["message"]
+    r = _block(gate, dict(ROOM_IPHONE, action=ROOM_IPHONE["action"] + " (rewording 2)"))
+    assert r is None or "owner_recommendation_hold" not in r.get("message", "")
+    assert _events(tmp_path, "owner_recommendation_released")
+
+
+def test_another_card_has_its_own_bound(gate, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_01a1cf6f00320b7e")
+    for _ in range(2):
+        _block(gate, ROOM_IPHONE)
+    gate.LOG.add("s1", "terminal", "evidence check", MACOS_LANE["evidence"])
+    gate.LLM = llm_returning([("ok", "fine")])
+    r = gate.pre_tool_call(tool_name="kanban_block", session_id="s1", args={
+        "task_id": "t_01a1d5b9382b24ad", "kind": "needs_input", "reason": "x", "human_request": MACOS_LANE})
+    assert r and "owner_recommendation_hold" in r["message"]
+
+
+# Review findings on PR #98: David-only limits the first regexes missed. Each must pass (not be held).
+@pytest.mark.parametrize("action,why", [
+    ("Reply yes or no: give the release bot repo admin so it can edit settings?", "It changes who controls the repo."),
+    ("Reply yes or no: should the App get admin rights on the org?", "It changes the App."),
+    ("Reply yes or no: grant the App read-only access and also write on Contents?", "It changes the App."),
+    ("Pick one: A) upgrade to the Claude Max plan, B) stay on Pro. Reply with the letter.", "It is a plan choice."),
+    ("Reply yes or no: renew the hermes.dev domain for another year?", "It expires next week."),
+    ("Reply A or B: A) accept the new license terms for the SDK, B) pin the old version.", "Terms changed."),
+    ("Reply A or B: A) read the personal Gmail account for receipts, B) the work inbox only.", "Mail access."),
+    ("Reply A or B: A) restart the production hub now, B) wait for the nightly window.", "A interrupts chats."),
+    ("Reply A or B: A) take BB offline for 5 min to migrate, B) migrate live.", "A is a short gap."),
+    ("Reply yes or no: change branch protection on main to drop the review requirement?", "Repo policy."),
+])
+def test_review_found_limits_pass(gate, action, why):
+    hr = dict(MACOS_LANE, action=action, why_human=why, scope="see action")
+    assert gate.owner_recommendation.hit(hr) is None, gate.owner_recommendation.limit_named(hr)
+
+
+def test_subscription_quota_alone_is_not_money(gate):
+    # Spending existing subscription quota (the Fable incident) stays inside the limits; an upgrade does not.
+    assert "subscription quota" in FABLE_ROUTE["why_human"]
+    assert gate.owner_recommendation.limit_named(FABLE_ROUTE) is None
