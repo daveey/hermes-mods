@@ -61,12 +61,14 @@ def env(tmp_path, monkeypatch):
     return store, data
 
 
-def seed(store, fp, source="admission", at=NOW):
-    """A fingerprint the lane filed from a detector `source` (as file_defect logs it)."""
+def seed(store, fp, source="admission", at=NOW, rule=None):
+    """A fingerprint the lane filed from a detector `source` (as file_defect logs it), judged under `rule`
+    (default: the current AUDIT_RULE)."""
     sh.LaneState(store.root).update(fp, status="filed", card="t_aaaaaaaa", component="agent",
                                     symptom=f"symptom {fp}", session_id=f"sess-{fp}", filed_at=at)
     store.log({"event": "selfheal_detect", "fingerprint": fp, "source": source, "p": 0.95,
-               "session_id": f"sess-{fp}", "symptom": f"symptom {fp}", "evidence": f"Not reviewed: X ({fp})"})
+               "session_id": f"sess-{fp}", "symptom": f"symptom {fp}", "evidence": f"Not reviewed: X ({fp})",
+               **({"audit_rule": rule or sh.AUDIT_RULE} if rule != "" else {})})
 
 
 def negatives(data):

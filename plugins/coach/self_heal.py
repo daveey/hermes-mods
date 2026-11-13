@@ -1471,7 +1471,8 @@ def detect_admission(final_reply: str, llm: Optional[Callable[[str, str], str]] 
         v = audit_verdict(final_reply, llm or aux_judge, tool_log, ask, confirm)
         th = confirm_threshold(v, threshold)
         hit = _verdict(v, "admission", th)
-        return {**hit, "threshold": th, "audit_input": audit_input(final_reply, tool_log, ask)} if hit else None
+        return ({**hit, "threshold": th, "audit_rule": AUDIT_RULE,
+                 "audit_input": audit_input(final_reply, tool_log, ask)} if hit else None)
     except Exception:
         return None
 
@@ -1497,12 +1498,79 @@ def _save_audit_input(store, d: dict) -> None:
         p = Path(store.root) / "selfheal" / d["fingerprint"] / AUDIT_INPUT_FILE
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({**inp, "session_id": d.get("session_id"), "host": d.get("host"),
-                                 "p": d.get("p_defect"), "stages": d.get("stages"), "stage1_p": d.get("stage1_p")}))
+                                 "p": d.get("p_defect"), "stages": d.get("stages"), "stage1_p": d.get("stage1_p"),
+                                 "audit_rule": d.get("audit_rule")}))
     except Exception:
         pass
 
 
+def _saved_audit_input(store, fp: str) -> dict:
+    try:
+        inp = json.loads((Path(store.root) / "selfheal" / fp / AUDIT_INPUT_FILE).read_text())
+        return inp if isinstance(inp, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _rejudge_admission(inp: dict) -> Optional[dict]:
+    """The current turn-end audit (judge, then the confirm model) on a saved audited turn. None = no opinion."""
+    return audit_verdict(inp.get("text") or "", aux_judge, inp.get("tool_log"), inp.get("ask") or "", confirm_judge())
+
+
+def _stale_admission(d: dict, store, fp: str) -> Optional[dict]:
+    """A turn-end audit finding judged under an older AUDIT_RULE (deferred across a prompt/threshold change, or
+    from a host on older code) is judged again by the current rule right before it would open a card. Returns a
+    skip result when the current rule no longer files it; None = file it (same rule, a re-judge that still hits,
+    or nothing to re-judge: legacy detections saved no audited turn, and a judge error fails open).
+    agent-b07b407fde was detected 2026-11-11 18:45 under the rule 5720fd3e changed a day later, waited 2 days on
+    the lane's spend cap and concurrency, filed, and closed not_defect."""
+    if d.get("source") != "admission":
+        return None
+    inp = _saved_audit_input(store, fp)
+    rule = d.get("audit_rule") or inp.get("audit_rule")
+    if rule == AUDIT_RULE or not inp.get("text"):
+        return None
+    try:
+        v = _rejudge_admission(inp)
+    except Exception as exc:  # health: allow BLE001 -- advisory re-judge; the detection files as before
+        store.log({"event": "selfheal_rejudge_error", "fingerprint": fp, "error": str(exc)[:200]})
+        return None
+    if not v:
+        store.log({"event": "selfheal_rejudge_error", "fingerprint": fp, "error": "no verdict"})
+        return None
+    th = confirm_threshold(v)
+    hit = _verdict(v, "admission", th) if v.get("kind") in AUDIT_KINDS else None
+    store.log({"event": "selfheal_rejudged", "fingerprint": fp, "old_rule": rule, "rule": AUDIT_RULE,
+               "p": v.get("p_defect"), "kind": v.get("kind"), "threshold": th, "files": bool(hit),
+               **{k: v[k] for k in ("stages", "judge_model", "confirm_model") if k in v}})
+    if hit:
+        try:  # its negative row (if it closes not_defect) is evidence against the current rule now
+            p = Path(store.root) / "selfheal" / fp / AUDIT_INPUT_FILE
+            p.write_text(json.dumps({**inp, "audit_rule": AUDIT_RULE, "p": v.get("p_defect")}))
+        except OSError:
+            pass
+        return None
+    store.log({"event": "selfheal_withdrawn", "mode": "live", "fingerprint": fp, "why": "audit_rule_changed",
+               "source": "admission", "session_id": d.get("session_id"), "old_rule": rule, "rule": AUDIT_RULE,
+               "p": v.get("p_defect"), "kind": v.get("kind")})
+    return {"action": "skip", "why": "audit_rule_changed"}
+
+
 AUDIT_KINDS = ("admission",)
+
+
+def _audit_rule() -> str:
+    """Identity of the rule a turn-end audit filed under: the prompt, the kinds that file and every threshold. A
+    detector card's prompt or threshold fix changes it, so false alarms made under the old rule stop counting
+    against the new one (admission_negative) and a detection deferred across the change is re-judged before it
+    files (_stale_admission). t_01a1d3759039b97a: 5 of the 6 rows that opened it had been analysed (and 3 fixed) by
+    earlier detector cards; the 6th was detected under the pre-5720fd3e rule and filed 2 days later from the
+    deferred queue, then closed not_defect. The current rule kept all 7 gate negatives below threshold."""
+    blob = json.dumps([AUDIT_SYS, AUDIT_KINDS, AUDIT_THRESHOLD, GATE, sorted(CONFIRM_THRESHOLDS.items())])
+    return hashlib.sha1(blob.encode()).hexdigest()[:12]
+
+
+AUDIT_RULE = _audit_rule()
 
 
 def confirm_judge() -> Optional[Callable[[str, str], str]]:
@@ -1651,7 +1719,8 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
         evidence = f"{hit_ev[:300]} | reply: {str(evidence or '')[-180:]}"
     stop = {k: hit[k] for k in ("stop_cause", "stop_evidence", "stop_host") if k in hit}
     stop.update({k: hit[k] for k in ("stages", "stage1_p", "stage1_kind", "judge_model", "confirm_model",
-                                     "threshold", "prompt_sha") if k in hit})  # which stage filed it, on which model
+                                     "threshold", "prompt_sha", "audit_rule")
+                 if k in hit})  # which stage filed it, on which model, under which audit rule
     if hit.get("source") in ("complaint", "admission") and agent_session(session_id):
         # A backend still on an older coach __init__ judges agent-driven chats; nothing is recorded or filed for them
         # (agent-d925f95adc). Guard refusals and machine signals are defects whoever hit them: not gated here.
@@ -4867,6 +4936,9 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     denied = _admission_denied(b, now, store, runner) or _fix_first_denied(b, store, now)
     if denied:
         return _defer_investigation(d, denied, store)
+    stale = _stale_admission(d, store, fp)  # after the caps: a deferred row is re-judged once, when it would file
+    if stale:
+        return stale
     known, gen = known_cards(st), dec["gen"]
     tid, out, err = None, "", ""
     for _ in range(5):  # an idempotency key that hands back an earlier card (any non-archived status) -> next gen
@@ -5484,9 +5556,12 @@ def admission_negative(fp: str, st: dict, note: str = "", store=None, now: Optio
                "at": now, "host": host_name()}
         try:  # the audited turn, saved at filing: makes the row replayable (selfheal_replay.py --mode admission)
             inp = json.loads((Path(store.root) / "selfheal" / fp / AUDIT_INPUT_FILE).read_text())
-            row.update({k: inp[k] for k in ("text", "ask", "tool_log", "stages", "stage1_p") if inp.get(k)})
+            row.update({k: inp[k] for k in ("text", "ask", "tool_log", "stages", "stage1_p", "audit_rule")
+                        if inp.get(k)})
         except (OSError, ValueError, TypeError):
             pass
+        if not row.get("audit_rule") and rec.get("audit_rule"):
+            row["audit_rule"] = rec["audit_rule"]
         path = _coach_data() / ADMISSION_NEG_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
         rows = []
@@ -5501,9 +5576,13 @@ def admission_negative(fp: str, st: dict, note: str = "", store=None, now: Optio
                 f.write(json.dumps(row) + "\n")
             rows.append(row)
         since = now - ADMISSION_NEG_DAYS * 86400
-        recent = [r for r in rows if float(r.get("at") or 0) >= since]
+        window = [r for r in rows if float(r.get("at") or 0) >= since]
+        # Only false alarms of the CURRENT audit rule count: a row from an older rule (or one recorded before rows
+        # carried it) is evidence against a prompt a detector card already changed. Counting them re-opened a
+        # card on rows earlier cards had fixed (t_01a1d3759039b97a: 6 rows, 5 already analysed, all pre-5720fd3e).
+        recent = [r for r in window if r.get("audit_rule") == AUDIT_RULE]
         out: dict = {"event": "selfheal_admission_negative", "fingerprint": fp, "recent": len(recent),
-                     "file": str(path)}
+                     "file": str(path), "rule": AUDIT_RULE, "older_rule": len(window) - len(recent)}
         if len(recent) >= ADMISSION_NEG_CARD_AT:
             spath = Path(store.root) / ADMISSION_NEG_STATE
             card = _open_card(spath, runner)

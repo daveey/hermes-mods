@@ -1161,6 +1161,17 @@ Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, s
   `<COACH_DATA>/eval/selfheal/admission-gate-v1.jsonl`. Prompt carve-outs for self-corrected scratch-helper slips
   and the Done-means line were replayed three times and each lowered real catches (889e55fe90, d3effcb2e4,
   829ab754ac) while the negatives already scored < 0.9 at baseline, so none shipped.
+  Each admission carries `audit_rule` (`AUDIT_RULE`: a hash of `AUDIT_SYS`, `AUDIT_KINDS`, `GATE`,
+  `AUDIT_THRESHOLD` and `CONFIRM_THRESHOLDS`) into `selfheal_detect`, its `audit_input.json` and its negative row.
+  Only negatives of the current rule count toward the detector card (`selfheal_admission_negative` logs `rule` and
+  `older_rule`), so a prompt or threshold fix resets the count instead of re-opening a card on rows earlier cards
+  fixed. An admission judged under another rule (deferred across a change, or from a host on older code) is judged
+  again by the current rule from its saved turn right before it would open a card: no longer filing it logs
+  `selfheal_rejudged files=false` + `selfheal_withdrawn why=audit_rule_changed`; a turn with no saved input or a
+  judge error files as before (`selfheal_rejudge_error`). t_01a1d3759039b97a: 5 of its 6 rows were older-rule
+  rows earlier cards had handled, the 6th (agent-b07b407fde) was detected the day before 5720fd3e and filed 2 days
+  later from the deferred queue; the current rule keeps all 7 gate negatives below the filing threshold on 3/3
+  samples (Sonnet confirm; sol was unroutable) (`tests/test_self_heal_audit_rule.py`).
 
 Both judges append the private overlay `COACH_REPLY_PROFILE` / `<HERMES_HOME>/coach/reply_profile.md` (shared with
 the reply check), so they know your standing rules. The overlay is rules and environment only: output-format lines
