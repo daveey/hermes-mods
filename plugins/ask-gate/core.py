@@ -345,6 +345,43 @@ def _core_projection():
     return fn, tuple(dict.fromkeys(tuple(listed) + ("done", "archived")))  # what `chat-tasks` lists
 
 
+class _NoProjection(Exception):
+    """No core, a broken core, or a core without ``session_tasks``: local-only, not worth a log line."""
+
+
+def _read_projection(ids: list[str]) -> Any:
+    """Import core's projection and read ``ids``' rows. Runs on a reader thread with ``_remote_busy`` held, so the
+    cold import is bounded by the turn's budget too (it can take a large part of a cold process's first read)."""
+    probe = _core_projection()
+    if probe is None:
+        raise _NoProjection()
+    fn, statuses = probe
+    try:
+        return fn(ids, statuses, stale_ok=True)
+    except TypeError:  # a core whose session_tasks predates stale_ok
+        return fn(ids, statuses)
+
+
+WARM_SESSION = "ask-gate-projection-warmup"  # no chat has this id: the read returns nothing, but walks every path
+
+
+def warm_projection() -> bool:
+    """Pay a fresh process's cold projection read (2.5 s live: imports, board/replica path and reader caches) once,
+    off-turn: called from a daemon thread at plugin register. Holds ``_remote_busy`` like a turn's read, so a turn
+    arriving meanwhile waits for it within its own budget instead of starting a second cold read. True on a read."""
+    with _remote_busy:
+        t0 = time.monotonic()
+        try:
+            _read_projection([WARM_SESSION])
+        except _NoProjection:
+            return False
+        except BaseException as exc:  # noqa: BLE001 -- a warm-up never raises into a daemon thread's stderr
+            log_event("linked_remote_warm", ok=False, error=f"{type(exc).__name__}: {exc}"[:300])
+            return False
+        log_event("linked_remote_warm", ok=True, seconds=round(time.monotonic() - t0, 3))
+        return True
+
+
 def _hr_dict(value: Any) -> dict | None:
     if isinstance(value, (bytes, str)) and value:
         try:
@@ -363,30 +400,30 @@ def _board_path(board: Any) -> Path | None:
 def projected_cards(session_id: str, timeout: float | None = None) -> list[dict] | None:
     """This chat's cards (its compression lineage) from core's projection, shaped like ``linked_cards`` rows;
     None when it cannot be read (no/older core, an error, or no answer within ``REMOTE_TIMEOUT_S``)."""
-    probe = _core_projection()
-    if probe is None:
-        return None
-    fn, statuses = probe
-    if not _remote_busy.acquire(blocking=False):
+    deadline = time.monotonic() + (REMOTE_TIMEOUT_S if timeout is None else timeout)
+    ids = answer_lineage(session_id)
+    # One read at a time: a read already in flight (the register-time warm-up, or an earlier turn's timed-out read)
+    # is waited out for what is left of this turn's budget, then this turn reads warm caches; never a second read.
+    if not _remote_busy.acquire(timeout=max(0.0, deadline - time.monotonic())):
         log_event("linked_remote_unavailable", session=session_id, reason="previous read still running")
         return None
     box: dict[str, Any] = {}
-    ids = answer_lineage(session_id)
 
     def run() -> None:
         try:
-            try:
-                box["rows"] = fn(ids, statuses, stale_ok=True)
-            except TypeError:  # a core whose session_tasks predates stale_ok
-                box["rows"] = fn(ids, statuses)
+            box["rows"] = _read_projection(ids)
+        except _NoProjection:
+            box["nocore"] = True
         except BaseException as exc:  # noqa: BLE001 -- any failure means local-only, never a broken turn
             box["err"] = f"{type(exc).__name__}: {exc}"
         finally:
             _remote_busy.release()
     t = threading.Thread(target=run, name="ask-gate-linked-remote", daemon=True)
     t.start()
-    t.join(REMOTE_TIMEOUT_S if timeout is None else timeout)
+    t.join(max(0.0, deadline - time.monotonic()))
     rows = box.get("rows")
+    if box.get("nocore"):
+        return None
     if t.is_alive() or not isinstance(rows, list):
         log_event("linked_remote_unavailable", session=session_id,
                   reason="timeout" if t.is_alive() else box.get("err") or "no rows")
@@ -441,11 +478,17 @@ def linked_state(session_id: str, limit: int = 15, db_paths: list[Path] | None =
                      + (" or t.human_request is not null" if "human_request" in cols else "") + ")")
             rows = c.execute(base + "where t.session_id=? order by t.created_at desc limit ?",
                              (session_id, limit)).fetchall()
+            # Every open card counts, however old: it is the chat's live work (the recency window above is for
+            # finished ones). Bounded only as a runaway guard; the cap below says how many it cut.
+            rows += c.execute(base + "where t.session_id=? and t.status not in ('done','archived','cancelled') "
+                              "order by t.created_at desc limit ?", (session_id, _OPEN_READ_MAX)).fetchall()
             pinned = c.execute(base + f"where t.session_id=? and {needs}", (session_id,)).fetchall()
             try:  # cards created elsewhere but notifying this chat count too (matches the sidebar count)
                 sub = "t.id in (select task_id from kanban_notify_subs where chat_id=?)"
                 rows += c.execute(base + f"where {sub} order by t.created_at desc limit ?",
                                   (session_id, limit)).fetchall()
+                rows += c.execute(base + f"where {sub} and t.status not in ('done','archived','cancelled') "
+                                  "order by t.created_at desc limit ?", (session_id, _OPEN_READ_MAX)).fetchall()
                 pinned += c.execute(base + f"where {sub} and {needs}", (session_id,)).fetchall()
             except sqlite3.Error:
                 pass
@@ -491,9 +534,32 @@ def linked_state(session_id: str, limit: int = 15, db_paths: list[Path] | None =
     seen: set[str] = set()
     out = [x for x in sorted(out, key=lambda x: (not x["pinned"], -(x.get("created") or 0)))
            if not (x["id"] in seen or seen.add(x["id"]))]
+    # Pinned (needs a person) cards are never cut. Then the chat's open cards, newest first, up to LINKED_CAP: they
+    # are its live work, so they rank ahead of every done/archived row. Finished rows (and another chat's card that
+    # only notifies this one) fill what is left of the ``limit`` recency window. Open cards past the cap are counted
+    # in ``more_open``, which the block prints, so nothing is cut silently.
     pins = [x for x in out if x["pinned"]]
-    rest = [x for x in out if not x["pinned"]][:max(0, min(limit, LINKED_CAP - len(pins)))]
-    return sorted(pins + rest, key=lambda x: x.get("created") or 0, reverse=True), complete
+    room = max(0, LINKED_CAP - len(pins))
+    live = [x for x in out if not x["pinned"] and _is_open(x)]
+    rest = [x for x in out if not x["pinned"] and not _is_open(x)]
+    keep_live = live[:room]
+    keep_rest = rest[:max(0, min(limit, room) - len(keep_live))]
+    cards = CardList(sorted(pins + keep_live + keep_rest, key=lambda x: x.get("created") or 0, reverse=True))
+    cards.more_open = len(live) - len(keep_live)
+    return cards, complete
+
+
+_OPEN_READ_MAX = 500  # per board query: a runaway guard, far above any chat's open cards
+
+
+class CardList(list):
+    """``linked_state``'s cards; ``more_open`` = open cards cut by LINKED_CAP (listed by ``hermes kanban chat-tasks``)."""
+    more_open = 0
+
+
+def _is_open(card: dict) -> bool:
+    """The chat's own unfinished work (local or remote); a notice-only card is another chat's work."""
+    return card.get("status") not in _FINAL and not card.get("notice_only")
 
 
 def waiting_on_david(cards: list[dict]) -> list[dict]:
@@ -700,7 +766,9 @@ def l1_block(session_id: str, ledger: "Ledger | None", db_paths: list[Path] | No
         head = "Cards linked to this chat" + ("" if complete else (
             " (local cards only: the cards this chat placed on other gateways could not be read just now, so this "
             "list and the waiting list below may be incomplete; `hermes kanban chat-tasks <chat>` lists them all)"))
-        parts.append(head + ":\n" + render_cards(cards))
+        more = getattr(cards, "more_open", 0)
+        tail = f"\n{more} more open cards: run `hermes kanban chat-tasks {session_id}`" if more else ""
+        parts.append(head + ":\n" + render_cards(cards) + tail)
     waiting = waiting_on_david(cards)
     if waiting:
         parts.append("Waiting on David now:\n" + "\n".join(

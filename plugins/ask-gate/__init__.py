@@ -1409,6 +1409,18 @@ def _prewarm() -> None:
     threading.Thread(target=ctx.run, args=(go,), name="ask-gate-prewarm", daemon=True).start()
 
 
+def _warm_projection() -> None:
+    """Start core's chat-projection warm-up off-turn (core.warm_projection): a fresh process's first read took 2.5 s,
+    over the turn's 2 s bound, so the first turn after every gateway restart listed local cards only."""
+    if _off() or _is_worker() or os.environ.get("ASK_GATE_NO_PREWARM"):
+        return
+    import contextvars
+    import threading
+    ctx = contextvars.copy_context()  # profile-scoped home resolution is context-bound, as in _prewarm
+    threading.Thread(target=ctx.run, args=(core.warm_projection,), name="ask-gate-projection-warm",
+                     daemon=True).start()
+
+
 def register(ctx) -> None:
     runtime_contract.require_runtime_contract()
     approval_adapter_loading.install(ctx, approval_reconciliation)
@@ -1416,3 +1428,4 @@ def register(ctx) -> None:
     ctx.register_hook("post_tool_call", post_tool_call)
     ctx.register_hook("pre_tool_call", pre_tool_call)
     ctx.register_hook("pre_final_gate", pre_final_gate)
+    _warm_projection()
