@@ -209,7 +209,10 @@ For recurrence evidence, inspect the private red-sweep log for slug `owner-recom
 
 - One line per red card, every sweep, whatever you did with it:
   `python3 $R log --card <id> --gateway <owner> --board <b> --title "<short>" --cls <class> --action <cleared|guessed|asked|left-to-owner|left-blocked> --avoidable <yes|partly|no> --slug <prevention-slug> --prevention "<what would have kept it from blocking>" --blocked-event <id from list> --run <chat or cron id>`.
-  `--blocked-event` dedupes a card seen again in the same blocked state.
+  `--blocked-event` dedupes a card seen again in the same blocked state. `--cls` takes the script's fixed names,
+  not the table's wording: `already-satisfied`, `false-premise`, `silent-default`, `standing-approval`,
+  `headless-refusal`, `missing-credential`, `conflicting-instructions`, `scope-permission`, `moving-target`,
+  `review-reserved`, `real-decision`, `physical-or-signin`, `other`.
 - `avoidable=yes` means the worker or the card's author could have resolved it without the user (a standing
   rule covered it, the premise was checkable, the default was stated, an interactive session had the access).
   Name the fix as a rule on the source (worker skill, card template, guard, reporter script), not on this card.
