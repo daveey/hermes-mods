@@ -13,9 +13,14 @@ SHA = "a" * 40
 CMD = ["gh", "pr", "merge", "12", "--repo", "example/protected", "--rebase", "--match-head-commit", SHA]
 
 
+APPROVAL = {"id": "PRR_x", "author": {"login": "you"}, "authorAssociation": "MEMBER", "state": "COMMENTED",
+            "submittedAt": "2026-11-13T15:00:00Z", "commit": {"oid": SHA},
+            "body": f"Independent exact-head review @ {SHA}: approve"}
+
+
 def payload(**updates):
     return {"number": 12, "state": "OPEN", "baseRefName": "state", "headRefOid": SHA,
-            "url": "https://github.com/example/protected/pull/12", "reviews": [], "comments": [],
+            "url": "https://github.com/example/protected/pull/12", "reviews": [APPROVAL], "comments": [],
             "statusCheckRollup": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}], **updates}
 
 
@@ -39,6 +44,14 @@ def test_state_exact_head_allowed(monkeypatch):
     argv, kw = calls[0]
     assert argv[:6] == ["gh", "pr", "view", "12", "--repo", "example/protected"]
     assert kw["timeout"] <= 20 and not kw.get("shell")
+
+
+def test_state_without_exact_head_approval_refused(monkeypatch):
+    # #2413: green rollup, right base and head, zero reviews and comments. The preflight used to admit it.
+    probe(monkeypatch, payload(reviews=[]))
+    assert "no approval of its exact head" in check()
+    probe(monkeypatch, payload(reviews=[dict(APPROVAL, commit={"oid": "b" * 40})]))
+    assert "no approval of its exact head" in check()
 
 
 @pytest.mark.parametrize("updates", [

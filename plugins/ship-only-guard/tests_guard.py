@@ -232,9 +232,12 @@ def state_pr(reviews=(), comments=(), **updates):
     return data
 
 
-def review(body, at="2026-11-13T15:21:04Z", node=NIT_ID):
-    return {"id": node, "author": {"login": "you"}, "authorAssociation": "MEMBER", "state": "COMMENTED",
-            "submittedAt": at, "body": body}
+def review(body, at="2026-11-13T15:21:04Z", node=NIT_ID, commit=STATE_SHA, state="COMMENTED", **author):
+    return {"id": node, "author": {"login": "you", **author}, "authorAssociation": "MEMBER", "state": state,
+            "submittedAt": at, "body": body, "commit": {"oid": commit}}
+
+
+APPROVAL = review("**Independent exact-head review @ " + STATE_SHA + ": approve**", node="PRR_approval")
 
 
 def comment(body, at="2026-11-13T15:22:00Z", login="you", association="MEMBER", **author):
@@ -295,7 +298,7 @@ def test_reply_must_follow_each_nit_review(monkeypatch):
     "Nit (non-blocking): none",
 ])
 def test_state_merge_allows_negated_or_absent_nits(monkeypatch, body):
-    assert state_check(monkeypatch, state_pr([review(body)])) is None
+    assert state_check(monkeypatch, state_pr([APPROVAL, review(body)])) is None
 
 
 @pytest.mark.parametrize("body", [
@@ -366,3 +369,88 @@ def test_refusal_quotes_identifiers_intact(monkeypatch):
     # Live #1613 quoted "testhubreadexamples.py": markdown stripping must not eat underscores.
     why = state_check(monkeypatch, state_pr([review("Nit (non-blocking). In `test_hub_read_examples.py` line 99.")]))
     assert why and "test_hub_read_examples.py" in why
+
+
+# --- state merge exact-head approval gate (t_01a1d5e5c3a82d64) ------------------------------------------------
+# #2413 merged with zero reviews and zero comments: the preflight checked review *replies* but never that an
+# approval of the exact head existed. 19 state PRs merged 2026-11-13 had no exact-head approval record.
+OLD_SHA = "b" * 40
+
+
+def test_replay_pr2413_at_merge_refused(monkeypatch):
+    why = _replay(monkeypatch, _fixture("pr2413-at-merge.json"))
+    assert why and "PR #2413" in why and "no approval of its exact head" in why
+    assert "0775f3761df95fd34d44e400d977489fffda4c24" in why and "rerun the same merge command" in why
+
+
+@pytest.mark.parametrize("reviews,comments", [
+    ([], []),                                                                     # the #2413 shape
+    ([review("**Verdict: approve**", commit=OLD_SHA)], []),                       # an earlier head
+    ([review("**Verdict: approve**", commit=None)], []),                          # commit unreadable
+    ([{k: v for k, v in review("Approve.").items() if k != "commit"}], []),
+    ([review("Looks good overall.")], []),                                        # no verdict at all
+    ([review("Approve.", login="ci-review[bot]")], []),                           # a bot is no reviewer
+    ([review("Approve.", is_bot=True)], []),
+    ([], [comment(f"VERDICT: APPROVE at {OLD_SHA}")]),                           # comment names another head
+    ([], [comment(f"Reviewed {STATE_SHA}: looks good, approve.")]),              # comment without a VERDICT line
+    ([], [comment(f"VERDICT: APPROVE at {STATE_SHA}", login="github-actions", association="NONE")]),
+    ([], [comment(f"VERDICT: APPROVE at e{STATE_SHA[:10]}")]),                   # not the sha's start
+])
+def test_state_merge_refuses_without_exact_head_approval(monkeypatch, reviews, comments):
+    why = state_check(monkeypatch, state_pr(reviews, comments))
+    assert why and "no approval of its exact head" in why and STATE_SHA in why
+
+
+@pytest.mark.parametrize("body", [
+    "**Request changes** at exact head: the retry loop never terminates.",
+    "Independent exact-head review: I cannot approve this yet; the test is missing.",
+    "**VERDICT: REQUEST_CHANGES**", "Approve the idea.\n\nVERDICT: REQUEST CHANGES (blocking: B1)",
+    "Rejected: wrong base.",
+])
+def test_state_merge_refuses_a_blocking_exact_head_verdict(monkeypatch, body):
+    why = state_check(monkeypatch, state_pr([review(body)]))
+    assert why and "latest exact-head verdict requests changes" in why
+
+
+@pytest.mark.parametrize("body", [
+    "**Independent exact-head review @ " + STATE_SHA + ": approve** (posted as COMMENT because the author's "
+    "account cannot approve its own PR)",
+    "**Verdict: APPROVE.** Nothing blocks.", "APPROVE @aaaaaaaaaa", "Approve at " + STATE_SHA,
+    "## Independent exact-head review — verdict: APPROVE (posted as COMMENT; own-PR)",
+    "Round 1 requested changes; all fixed.\n\nVERDICT: APPROVE",
+])
+def test_state_merge_allows_an_exact_head_approval_review(monkeypatch, body):
+    assert state_check(monkeypatch, state_pr([review(body)])) is None
+
+
+def test_state_merge_approval_forms(monkeypatch):
+    assert state_check(monkeypatch, state_pr([review("", state="APPROVED")])) is None
+    assert state_check(monkeypatch, state_pr([review("lgtm", state="CHANGES_REQUESTED")]))
+    # A VERDICT issue comment that names the head (full sha or its first 10+ hex) counts.
+    for text in (f"Independent review at exact head {STATE_SHA}: VERDICT: APPROVE",
+                 f"**VERDICT: APPROVE** @ {STATE_SHA[:10]}"):
+        assert state_check(monkeypatch, state_pr([], [comment(text)])) is None
+
+
+def test_latest_exact_head_verdict_wins(monkeypatch):
+    block = review("Request changes: B1.", at="2026-11-13T15:00:00Z", node="PRR_a")
+    approve = review("Re-review: approve.", at="2026-11-13T15:30:00Z", node="PRR_b")
+    assert state_check(monkeypatch, state_pr([block, approve])) is None
+    late_block = review("Request changes: B2.", at="2026-11-13T15:40:00Z", node="PRR_c")
+    assert "requests changes" in state_check(monkeypatch, state_pr([block, approve, late_block]))
+    late_comment = comment(f"VERDICT: REQUEST_CHANGES at {STATE_SHA}", at="2026-11-13T15:45:00Z")
+    assert "requests changes" in state_check(monkeypatch, state_pr([approve], [late_comment]))
+
+
+def test_unreadable_verdict_time_refuses(monkeypatch):
+    why = state_check(monkeypatch, state_pr([review("Approve.", at=None)]))
+    assert why and "no readable time" in why
+
+
+def test_approval_gate_surfaces_through_shell_and_cli(monkeypatch):
+    import shlex
+    data = state_pr([])
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(data)))
+    assert "no approval of its exact head" in g.check_shell(shlex.join(STATE_CMD), repos={"example/protected"}, env={})
+    monkeypatch.setenv("SHIP_ONLY_GUARD_REPOS", '["example/protected"]')
+    assert g.main(["--gh-args", *STATE_CMD[1:]]) == 1

@@ -82,14 +82,24 @@ implicit PR/repo, URL selector, extra flags, duplicate flags, or other merge mod
 A fixed-argv `gh pr view` (15-second timeout, no shell) must confirm the same PR
 URL/number, OPEN state, base exactly `state`, matching head, and a nonempty
 all-success check rollup smaller than 100 entries. The same single read fetches
-`reviews,comments` for the review-reply check above. Missing/malformed/offline,
+`reviews,comments` for the review-reply check above and for the **exact-head
+approval check**: the latest non-bot verdict on the head must approve. A verdict
+is a review on that exact commit (state APPROVED/CHANGES_REQUESTED, a
+`VERDICT: <x>` line, or a first line that approves; whichever of "approve" or a
+blocking phrase comes first decides, so "approve (posted as COMMENT because the
+account can't approve)" approves), or a PR comment that names the head (full
+sha or its first 10+ hex) and carries a `VERDICT:` line. No verdict, a review
+of an earlier head only, or a later request-changes refuses. A state PR with no
+review at all (#2413) is refused. Missing/malformed/offline,
 main/other base, changed head, pending/failed/skipped/neutral checks, a possibly
-truncated rollup, unreadable reviews/comments and an unanswered review point fail
-closed. This is not a blanket non-main exemption.
+truncated rollup, unreadable reviews/comments, an unanswered review point and a
+missing exact-head approval fail closed. This is not a blanket non-main exemption.
 
-**Gate boundary:** this guard does not authenticate independent review receipts
-or prove coverage of required-but-absent CI. Those remain the landing owner's
-mandatory gates, just as for existing state pushes. Passing this preflight alone
+**Gate boundary:** this guard checks that an exact-head approval record exists;
+it does not authenticate that its author was independent (every agent posts as
+the same GitHub account), and it does not prove coverage of required-but-absent
+CI. Those remain the landing owner's mandatory gates, just as for existing state
+pushes. Passing this preflight alone
 is NOT approval to land. Main still requires `hermes-core-wt ship`; merge API
 endpoints remain blocked. Do not set a trusted marker for state landing.
 The head fence is atomic at GitHub; the base read is only a preflight, not an

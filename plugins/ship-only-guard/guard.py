@@ -177,17 +177,93 @@ def _review_reply_refusal(number, data):
             "rerun the same merge command.")
 
 
+# Exact-head approval record (t_01a1d5e5c3a82d64). Reviewers here post COMMENT reviews (the PR author's account
+# cannot approve its own PR), so the verdict is read from the body: a `VERDICT: <x>` line, else the first
+# non-empty line, where whichever of "approve" / a blocking phrase comes first decides ("approve (posted as
+# COMMENT because the account can't approve)" is an approval).
+_VERDICT = re.compile(r"\bVERDICT\s*[:=]\s*(APPROVE[DS]?|PASS|REQUEST[ _-]CHANGES|CHANGES[ _-]REQUESTED|FAIL|REJECT)\b",
+                      re.IGNORECASE)
+_APPROVE_WORD = re.compile(r"\bapprov(?:e|ed|es|al)\b", re.IGNORECASE)
+_BLOCK_WORD = re.compile(r"\brequest(?:s|ed)?[ _-]changes\b|\bchanges[ _-]requested\b|\bnot\s+approv|"
+                         r"\b(?:can(?:no|')t|won't|do(?:es)?n't|do(?:es)? not)\s+approv|\breject", re.IGNORECASE)
+
+
+def _flat(text):
+    return " ".join(re.sub(r"[*`#>]", "", str(text)).split())  # keep _: REQUEST_CHANGES stays one token
+
+
+def _body_verdict(body, first_line_ok=True):
+    """'approve', 'block' or None for a review/comment body: the last VERDICT line wins, else the first line."""
+    lines = [_flat(line) for line in str(body or "").splitlines()]
+    marked = [m.group(1).upper() for line in lines for m in _VERDICT.finditer(line)]
+    if marked:
+        return "approve" if marked[-1].startswith(("APPROVE", "PASS")) else "block"
+    if not first_line_ok:
+        return None
+    first = next((line for line in lines if line), "")
+    ok, bad = _APPROVE_WORD.search(first), _BLOCK_WORD.search(first)
+    if ok and (not bad or ok.start() < bad.start()):
+        return "approve"
+    return "block" if bad else None
+
+
+def _approval_refusal(number, data):
+    """Refusal text unless the latest non-bot verdict on the exact head approves; else None.
+
+    Evidence is a review whose commit is the head (state APPROVED/CHANGES_REQUESTED, a VERDICT line, or a
+    first line that approves), or a PR comment naming the head (its first 10+ hex) with a VERDICT line.
+    It proves an approval record exists, not that its author was independent (every agent posts as one
+    account): independence stays the landing owner's duty.
+    Why: #2413 merged 16 min after its head was pushed with no review or verdict at all; 19 state PRs merged
+    2026-11-13 had no exact-head approval record and this preflight admitted every one."""
+    head = str(data.get("headRefOid") or "")
+    verdicts = []
+    for r in data.get("reviews") or []:
+        if _is_bot(r.get("author"), r.get("authorAssociation")):
+            continue
+        if not isinstance(r.get("commit"), dict) or r["commit"].get("oid") != head:
+            continue
+        state = r.get("state")
+        verdict = ("approve" if state == "APPROVED" else "block" if state == "CHANGES_REQUESTED"
+                   else _body_verdict(r.get("body")))
+        if verdict:
+            verdicts.append((_when(r.get("submittedAt")), verdict))
+    for c in data.get("comments") or []:
+        body = str(c.get("body") or "")
+        if _is_bot(c.get("author"), c.get("authorAssociation")) or not re.search(
+                rf"(?<![0-9a-f]){head[:10]}", body):
+            continue
+        verdict = _body_verdict(body, first_line_ok=False)
+        if verdict:
+            verdicts.append((_when(c.get("createdAt")), verdict))
+    if any(t is None for t, _ in verdicts):
+        return (f"[ship-only-guard] Refused state merge of PR #{number}: a review/verdict on head {head[:10]} has "
+                "no readable time, so the latest exact-head verdict cannot be read. Rerun the same merge "
+                "command once `gh pr view --json reviews,comments` works.")
+    verdicts.sort()
+    if verdicts and verdicts[-1][1] == "approve":
+        return None
+    why = ("its latest exact-head verdict requests changes" if verdicts
+           else "it has no approval of its exact head (no review on that commit and no comment naming it "
+                "with a VERDICT line)")
+    return (f"[ship-only-guard] Refused state merge of PR #{number}: {why}. A state PR lands only after an "
+            f"independent exact-head review of {head}: file a review card for that sha (its reviewer posts a "
+            "review on that commit whose first line says approve, or `VERDICT: APPROVE`), fix any requested "
+            "changes, then rerun the same merge command. A review of an earlier head does not count.")
+
+
 def _state_merge(words, repo, cwd, env):
     """Narrow state-only exception, never a general non-main merge allowance.
 
     Returns True to allow, False when the command is not this route or any preflight
-    fails, or a refusal string naming unanswered review points. Independent exact-head
-    review and required-CI coverage remain caller duties; this preflight refuses
-    missing/non-green visible checks, and refuses while any review whose body raises a
-    non-blocking point ("nit", "non-blocking", un-negated) has no later non-bot PR
-    comment marked <!-- hermes-review-reply -->: reply before you merge. Unreadable
-    reviews/comments refuse. It is not an atomic base lock (gh only offers an atomic
-    head fence).
+    fails, or a refusal string naming unanswered review points or a missing exact-head
+    approval. Independence of the reviewer and required-CI coverage remain caller
+    duties; this preflight refuses missing/non-green visible checks, refuses while any
+    review whose body raises a non-blocking point ("nit", "non-blocking", un-negated)
+    has no later non-bot PR comment marked <!-- hermes-review-reply -->: reply before
+    you merge, and refuses unless the latest non-bot verdict on the exact head approves
+    (`_approval_refusal`). Unreadable reviews/comments refuse. It is not an atomic base
+    lock (gh only offers an atomic head fence).
     """
     # Accept explicit numeric PR and repo only; avoid gh's implicit current PR,
     # URL/repo precedence, aliases, unknown options, auto-merge or admin override.
@@ -244,7 +320,7 @@ def _state_merge(words, repo, cwd, env):
             c.get("__typename") == "StatusContext" and c.get("state") == "SUCCESS"
         ) for c in checks):
             return False
-        return _review_reply_refusal(args[0], data) or True
+        return _review_reply_refusal(args[0], data) or _approval_refusal(args[0], data) or True
     except (OSError, ValueError, TypeError, subprocess.SubprocessError):
         return False
 
