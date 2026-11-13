@@ -38,6 +38,8 @@ class Board:
 
     def __call__(self, argv, capture_output=True, text=True, input=None, timeout=None):
         self.calls.append(list(argv))
+        if "--board" in argv and ":" in argv[argv.index("--board") + 1]:  # the real CLI's slug check (exit 2)
+            return SimpleNamespace(returncode=2, stdout="", stderr="kanban: invalid board slug")
         if "create" in argv:
             self.n += 1
             return SimpleNamespace(returncode=0, stdout=json.dumps({"id": f"t_new{self.n:05d}"}), stderr="")
@@ -58,7 +60,7 @@ def events(store, kind):
     return [r for r in rows if r.get("event") == kind]
 
 
-def legacy_adoption(store, fp, case):
+def legacy_adoption(store, fp, case, board=None):
     """The lane as the hub held it on 11-12: approved on a session card, no adopt_* fields (adopted before the rule
     was recorded), plus its detect and adoption rows in the coach log."""
     det, owner = case["detect"], case["wrong_owner"]
@@ -68,7 +70,8 @@ def legacy_adoption(store, fp, case):
     sh.LaneState(store.root).update(fp, status="approved", fix_card=owner["id"], approved_at=case["adopted_at"],
                                     component=det["component"], symptom=det["symptom"],
                                     session_id=det["session_id"], filed_day="2026-11-12",
-                                    cards=[owner["id"]], complaint_at=det["ts"])
+                                    cards=[owner["id"]], complaint_at=det["ts"],
+                                    **({"board": board} if board else {}))
 
 
 def pending(store):
@@ -195,3 +198,27 @@ def test_filed_lane_is_not_revalidated(store, monkeypatch):
     st = sh.LaneState(store.root).get(fp)
     assert st["adopt_via"] == "unknown" and st["fix_card"] == "t_filed0001"
     assert not events(store, "selfheal_adoption_rejected")
+
+
+@pytest.mark.parametrize("fp", ["cron-c6a6e6bc09", "agent-6a8134f494", "agent-4f525369e7"])
+def test_digest_board_owner_is_read_and_rejected_not_kept_unreadable(store, monkeypatch, fp):
+    """Live 11-13 04:09Z: 46 of 48 legacy session lanes carry the digest's '<gateway>:<board>' (hermes-hub:default).
+    `hermes kanban --board hermes-hub:default` exits 2 (invalid slug), so every such owner read as unreadable and was
+    kept; none was rejected. The owner text is read with the board part only."""
+    monkeypatch.setattr(sh, "budget", OPEN)
+    case = CASES[fp]
+    legacy_adoption(store, fp, case, board="hermes-hub:default")
+    board = Board([case["wrong_owner"]])
+    sh.reconcile(store, runner=board, now=case["detect"]["ts"] + 86400)
+    shows = [a for a in board.calls if "show" in a and case["wrong_owner"]["id"] in a]
+    assert shows and all(":" not in a[a.index("--board") + 1] for a in shows if "--board" in a)
+    assert [r["card"] for r in events(store, "selfheal_adoption_rejected")] == [case["wrong_owner"]["id"]]
+    assert not [r for r in events(store, "selfheal_adoption_revalidated") if r.get("ok") is None]
+
+
+def test_owner_card_text_board_slug():
+    board = Board([{"id": "t_x", "title": "T", "body": "B"}])
+    assert sh._owner_card_text("t_x", "hermes-hub:default", board)["title"] == "T"
+    assert board.calls[-1][:4] == ["hermes", "kanban", "--board", "default"]
+    assert sh._owner_card_text("t_x", "other-gw:", board)["title"] == "T"
+    assert "--board" not in board.calls[-1]
