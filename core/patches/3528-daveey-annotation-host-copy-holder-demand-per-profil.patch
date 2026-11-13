@@ -1,0 +1,234 @@
+From 8848208d5490053b0fab87695dc3b27a5c7f70db Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:09:37 +0000
+Subject: [PATCH] [daveey] annotation host copy: holder demand per profile,
+ renew before expiry, disk copy v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-ups from independent review 5891094785 (card t_01a1d4e06d3fd78b) of PR #2200
+(annotation host copy, design t_01a1d45d75851804 §2c). Card t_01a1d4e905dd65c1.
+
+1. `_holder_pass` read `_disk.demand_age(scope)` outside `ctx.run`, so `_path()`
+   (`get_hermes_home()`) looked for a non-launch profile's demand file under the
+   launch home: in a serve hosting several profiles the holder never refreshed
+   those scopes. The demand check now runs in `_holder_refresh`, inside the
+   scope's own context.
+2. The holder's re-read at HOLDER_REFRESH_AGE_S (20 s) was a counts-cache hit
+   while the inputs stayed revalidatable, so publish rewrote the same `read_at`
+   every 2 s and the copy only renewed when the cache expired at 30 s, leaving a
+   window where adopters missed. When the copy has aged past the renew threshold
+   the holder sets `_revalidate.force_read.scope`, which makes `counts_fresh`
+   refuse the cache for that scope on that thread, so a real read publishes a
+   fresh `read_at` before adopters drop the copy.
+3. `kanban_annotation_disk._VERSION` 1 -> 2: the restart/host copy encoding now
+   wraps lists/dicts as {l}/{d}; an older core would have seeded those wrappers
+   as data for one cold start. v1 copies are now ignored (one cold start).
+
+Tests (RED before, GREEN after):
+- test_holder_refreshes_a_scope_demanded_on_another_profile (0 == 1 before)
+- test_holder_renews_the_copy_before_adopters_would_miss (max copy age 30.0
+  before; <= 22 s after, and an adopter adopts at the end)
+- test_a_version_1_copy_is_ignored
+11 annotation/session-activity test files: 167 passed. scripts/check ok.
+---
+ hermes_cli/kanban_annotation_disk.py          |  6 ++-
+ hermes_cli/kanban_annotation_host.py          | 21 +++++---
+ .../kanban_session_activity_revalidate.py     |  5 ++
+ .../hermes_cli/test_kanban_annotation_disk.py | 14 +++++
+ .../hermes_cli/test_kanban_annotation_host.py | 52 +++++++++++++++++++
+ 5 files changed, 89 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_annotation_disk.py b/hermes_cli/kanban_annotation_disk.py
+index 84897fe640..d694d7af7f 100644
+--- a/hermes_cli/kanban_annotation_disk.py
++++ b/hermes_cli/kanban_annotation_disk.py
+@@ -28,7 +28,9 @@ log = logging.getLogger(__name__)
+ # A restart gap is seconds; a copy older than this describes a backend that has been down, not one restarting.
+ MAX_AGE_S = 300.0
+ _PARTS = 11
+-_VERSION = 1
++# [daveey] 2: lists and dicts are wrapped as ``{"l"}``/``{"d"}`` (PR #2200). A version 1 copy is ignored (one cold
++# start), and an older core ignores a version 2 copy instead of seeding the wrappers as data.
++_VERSION = 2
+ 
+ 
+ # Off under the test harness, where many tests share one scope and a copy would leak between them; the copy's own
+@@ -90,7 +92,7 @@ def _path(scope: tuple[str, ...]) -> Path:
+ 
+ def _encode(value: Any) -> Any:
+     # [daveey] Lists, tuples and nested dicts keep their own type, so a decoded copy equals the read exactly (the
+-    # execution part's evidence dicts hold lists); a copy written before kept lists as "t" and still decodes.
++    # execution part's evidence dicts hold lists).
+     if isinstance(value, (set, frozenset, tuple, list)):
+         items = [_encode(v) for v in value]
+         if isinstance(value, (set, frozenset)):
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+index eecff2ee80..87f4529616 100644
+--- a/hermes_cli/kanban_annotation_host.py
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -20,7 +20,10 @@ for the same scope: ``kanban_session_activity._refresh_annotation_locked`` was 1
+   so a source the fingerprint cannot see is never served from another process.
+ * **Holder** (lease ``kanban-annotation``, ``host_loop_lease``): one process per home runs a demand-driven refresher
+   for every scope it can reproduce that any process polled (``<scope>.demand`` touched) in the last
+-  ``DEMAND_WINDOW_S``, so the copy is current when the others poll. A miss anywhere still refreshes locally as before:
++  ``DEMAND_WINDOW_S``, so the copy is current when the others poll. It reads each scope's demand inside that scope's
++  own context (a serve hosting several profiles keeps each profile's demand under its own home), and renews a copy
++  past ``HOLDER_REFRESH_AGE_S`` with a real read (bypassing the counts cache), so a fresh ``read_at`` is published
++  before adopters drop the copy at ``_COUNTS_MAX_AGE_S``. A miss anywhere still refreshes locally as before:
+   no added latency, and ``HERMES_ANNOTATION_HOST_COPY=0`` turns publishing and adopting off.
+ """
+ 
+@@ -330,9 +333,6 @@ def _holder_pass() -> int:
+     another input's, or aging. Returns how many it refreshed."""
+     refreshed = 0
+     for scope, ctx in list(_known.items()):
+-        age = _disk.demand_age(scope)
+-        if age is None or age > DEMAND_WINDOW_S:
+-            continue
+         try:
+             refreshed += bool(ctx.run(_holder_refresh, scope))
+         except Exception:  # health: allow BLE001 -- one scope's failed read must not stop the others
+@@ -341,20 +341,27 @@ def _holder_pass() -> int:
+ 
+ 
+ def _holder_refresh(scope: tuple[str, ...]) -> bool:
++    """Runs inside ``scope``'s own context: its demand file and copy live under that profile's home."""
+     from hermes_cli import kanban_session_activity as _ksa
+ 
+-    if _ksa._origin_scope() != scope:
+-        return False  # this context no longer reproduces the scope
++    age = _disk.demand_age(scope)
++    if age is None or age > DEMAND_WINDOW_S or _ksa._origin_scope() != scope:
++        return False  # nobody polled it lately, or this context no longer reproduces the scope
+     copy = _disk.load_host(scope)
+-    if copy is not None and time.time() - copy[1] < HOLDER_REFRESH_AGE_S:
++    renew = copy is not None and time.time() - copy[1] >= HOLDER_REFRESH_AGE_S
++    if copy is not None and not renew:
+         _local, _full, _wall, fp = _inputs_now(scope)
+         if fp is not None and fp[0] == copy[0]:
+             return False
+     if not _ksa._annotate_refresh_lock.acquire(blocking=False):
+         return False  # a poll here is already reading (it publishes)
++    # [daveey] An aging copy is renewed by a real read: the counts cache would answer the unchanged inputs with the
++    # old read, republishing its ``read_at`` until the copy expires for every adopter at ``_COUNTS_MAX_AGE_S``.
++    _ksa._revalidate.force_read.scope = scope if renew else None
+     try:
+         _ksa._refresh_annotation_locked(scope)
+     finally:
++        _ksa._revalidate.force_read.scope = None
+         _ksa._annotate_refresh_lock.release()
+     return True
+ 
+diff --git a/hermes_cli/kanban_session_activity_revalidate.py b/hermes_cli/kanban_session_activity_revalidate.py
+index a39f815680..5dcb0bde57 100644
+--- a/hermes_cli/kanban_session_activity_revalidate.py
++++ b/hermes_cli/kanban_session_activity_revalidate.py
+@@ -25,6 +25,9 @@ STAT_SETTLED_S = 2.0
+ # Set by ``refresh_if_unchanged`` while it re-reads a scope whose inputs it just found unchanged:
+ # ``(without shadows or None, with shadows)``, so the readers do not read every board's revision again (per thread).
+ inputs_pin = threading.local()
++# [daveey] ``force_read.scope``: this thread's next counts read of that scope really reads (the annotation holder
++# renewing an aging host copy, ``kanban_annotation_host._holder_refresh``).
++force_read = threading.local()
+ 
+ 
+ def revalidatable(fingerprint: tuple, wall: float) -> bool:
+@@ -79,6 +82,8 @@ def counts_fresh(scope: tuple[str, ...], fingerprint: tuple, now: float) -> bool
+     cache = _ksa._cache
+     if cache is None or _ksa._cache_scope != scope or fingerprint != _ksa._cache_fingerprint:
+         return False
++    if getattr(force_read, "scope", None) == scope:
++        return False
+     if now < cache[0]:
+         return True
+     return _ksa._cache_revalidatable and now < _ksa._cache_read_at + _ksa._COUNTS_MAX_AGE_S
+diff --git a/tests/hermes_cli/test_kanban_annotation_disk.py b/tests/hermes_cli/test_kanban_annotation_disk.py
+index c4e1615aab..93706e5d34 100644
+--- a/tests/hermes_cli/test_kanban_annotation_disk.py
++++ b/tests/hermes_cli/test_kanban_annotation_disk.py
+@@ -58,6 +58,20 @@ def test_old_other_scope_or_corrupt_copy_is_no_copy(copy_on):
+     assert disk.load(SCOPE) is None
+ 
+ 
++def test_a_version_1_copy_is_ignored(copy_on):
++    """A version 1 copy may hold lists and dicts bare (before PR #2200) or wrapped as ``{"l"}``/``{"d"}``: the
++    bumped version makes each core ignore the other's encoding instead of seeding wrappers as data (review nit 3)."""
++    parts = _parts()
++    assert disk.save(SCOPE, parts) and disk.save_host(SCOPE, "f" * 64, time.time(), parts)
++    for path in (disk._path(SCOPE), disk._path(SCOPE).with_suffix(".host.json")):
++        body = json.loads(path.read_text(encoding="utf-8"))
++        assert body["version"] == disk._VERSION != 1
++        body["version"] = 1
++        path.write_text(json.dumps(body), encoding="utf-8")
++    assert disk.load(SCOPE) is None
++    assert disk.load_host(SCOPE) is None
++
++
+ def test_off_under_the_test_harness_by_default(monkeypatch, copy_on):
+     monkeypatch.setattr(disk, "FORCE", False)
+     assert not disk.save(SCOPE, _parts())
+diff --git a/tests/hermes_cli/test_kanban_annotation_host.py b/tests/hermes_cli/test_kanban_annotation_host.py
+index 225e253412..8d1f9b4acb 100644
+--- a/tests/hermes_cli/test_kanban_annotation_host.py
++++ b/tests/hermes_cli/test_kanban_annotation_host.py
+@@ -210,3 +210,55 @@ def test_holder_refreshes_a_demanded_scope_once_per_change(world):
+     _other_process()
+     after, _ = _poll()
+     assert after[0]["kanban_active"] == 3 and world["calls"]["recompute"] == 2  # adopted the holder's read
++
++
++def test_holder_refreshes_a_scope_demanded_on_another_profile(world, tmp_path, monkeypatch):
++    """One serve hosts several profiles: a non-launch profile's demand file lives under that profile's home, so the
++    holder reads its age inside the scope's own context (PR #2200 review nit 1)."""
++    import contextvars
++
++    import hermes_scope
++    from hermes_constants import get_hermes_home_override
++
++    other_home = tmp_path / "profiles" / "other"
++    other_home.mkdir(parents=True)
++    other = ("annotation-host-test", "other")
++    monkeypatch.setattr(ksa, "_origin_scope",
++                        lambda: other if get_hermes_home_override() == str(other_home) else SCOPE)
++    token = hermes_scope.push_state(home=str(other_home))
++    try:
++        host._known[other] = contextvars.copy_context()
++        disk.touch_demand(other)
++        assert disk.demand_age(other) is not None
++    finally:
++        hermes_scope.pop_state(token)
++    assert disk.demand_age(other) is None  # the launch home holds no demand for it
++    assert host._holder_pass() == 1
++    token = hermes_scope.push_state(home=str(other_home))
++    try:
++        assert disk.load_host(other) is not None  # published under the other profile's home
++    finally:
++        hermes_scope.pop_state(token)
++
++
++def test_holder_renews_the_copy_before_adopters_would_miss(world):
++    """Under steady demand the holder publishes a fresh ``read_at`` before the copy reaches ``_COUNTS_MAX_AGE_S``:
++    its re-read at ``HOLDER_REFRESH_AGE_S`` really reads instead of taking the still-revalidatable counts cache and
++    republishing the old ``read_at`` (PR #2200 review nit 2)."""
++    import contextvars
++
++    host._known[SCOPE] = contextvars.copy_context()
++    disk.touch_demand(SCOPE)
++    assert host._holder_pass() == 1
++    ages = []
++    for _ in range(int(3 * ksa._COUNTS_MAX_AGE_S / host.HOLDER_INTERVAL_S)):
++        _advance(world, host.HOLDER_INTERVAL_S)
++        copy = disk.load_host(SCOPE)
++        assert copy is not None
++        ages.append(world["wall"] - copy[1])  # what an adopter polling now finds
++        host._holder_pass()
++    assert max(ages) <= host.HOLDER_REFRESH_AGE_S + host.HOLDER_INTERVAL_S < ksa._COUNTS_MAX_AGE_S, ages
++    reads = world["calls"]["recompute"]
++    _other_process()
++    _poll()
++    assert world["calls"]["recompute"] == reads  # an adopter at any moment finds a current copy
+-- 
+2.43.0
+

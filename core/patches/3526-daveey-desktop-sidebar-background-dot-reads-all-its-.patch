@@ -1,0 +1,695 @@
+From cc80f2b34070de28a52ae1a0810aed088607fadc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:50:20 +0000
+Subject: [PATCH] [daveey] desktop: sidebar background dot reads all its
+ stores, falls back to the listed row, says "waiting"
+
+Follow-ups from the PR #2154 review (review 5890296461):
+
+1. Tick lag. `useBackgroundDotUnknown` and `useSessionDotState` subscribed only to
+   `$kanbanObservationTick` (plus the id stores), while `rowExecution` also reads
+   `$liveWorkRoster`, `$backgroundStatusBySession`, `$subagentsBySession`,
+   `$sessionStates` and `$sessions`. A roster or event change that flipped `exec.live`
+   repainted the label/state only on the next 15 s tick. Both hooks now use
+   `useStoresSelector` over every read store (`ROW_EXECUTION_STORES`). `$sessionStates`
+   is reduced to a computed runtime->stored-id key so per-token republishes do not
+   re-run the selector.
+2. Null row. A dot with no caller row (contrib tab lead, unresolved `tileStoredRow`)
+   evaluated `{}` and said "status unknown" for a store-claimed `background_active` /
+   `goal_active`. It now falls back to the listed `$sessions` / `$messagingSessions`
+   row by id.
+3. Waiting label. `backgroundDotUnknown` becomes `backgroundDotLabel` ->
+   `running | unknown | waiting`. A fresh row held only by known waiting work (all
+   cards parked/held or current waiting observations; no unparked, blocked, needs-you
+   or outstanding ask) reads "Open work, waiting" (new `sidebar.row.backgroundWaiting`
+   in all 8 locales + _keys.desktop.json).
+
+Tests: session-status-dot.test.tsx (new, component-level RED on base for all three
+points) and session-dot-state.test.ts backgroundDotLabel cases.
+---
+ .../src/app/chat/session-status-dot.test.tsx  | 165 ++++++++++++++++++
+ .../src/app/chat/session-status-dot.tsx       |  21 ++-
+ apps/desktop/src/i18n/ar_chrome.ts            |   1 +
+ apps/desktop/src/i18n/de.ts                   |   1 +
+ .../desktop/src/i18n/en_session_row_status.ts |   1 +
+ apps/desktop/src/i18n/es.ts                   |   1 +
+ apps/desktop/src/i18n/fr.ts                   |   1 +
+ apps/desktop/src/i18n/ja.ts                   |   1 +
+ apps/desktop/src/i18n/ru.ts                   |   1 +
+ .../src/i18n/types_session_row_status.ts      |   2 +
+ apps/desktop/src/i18n/zh-hant_chrome.ts       |   1 +
+ apps/desktop/src/i18n/zh.ts                   |   1 +
+ apps/desktop/src/lib/use-session-dot-state.ts |  43 +++--
+ .../src/store/execution-observation-row.ts    |  18 ++
+ .../src/store/session-dot-state.test.ts       |  61 +++++--
+ apps/desktop/src/store/session-dot-state.ts   |  58 ++++--
+ locales/_keys.desktop.json                    |   1 +
+ 17 files changed, 329 insertions(+), 49 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/session-status-dot.test.tsx
+
+diff --git a/apps/desktop/src/app/chat/session-status-dot.test.tsx b/apps/desktop/src/app/chat/session-status-dot.test.tsx
+new file mode 100644
+index 0000000000..4d1e64c814
+--- /dev/null
++++ b/apps/desktop/src/app/chat/session-status-dot.test.tsx
+@@ -0,0 +1,165 @@
++import { act, cleanup, render } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { rowExecution } from '@/store/execution-observation-row'
++import { activeGatewayProfileKey, gatewayRouteState, isActivePrimary } from '@/store/gateway'
++import { $kanbanObservationTick } from '@/store/kanban-observation'
++import { $liveWorkRoster, setLiveWorkRosterSource } from '@/store/live-work-roster'
++import { $sessions } from '@/store/session'
++import type { SessionInfo } from '@/types/hermes'
++
++import fixture from '../../../../../schemas/fixtures/execution-observations-v1.json'
++
++import { SessionStatusDot } from './session-status-dot'
++
++vi.mock('@/i18n', async () => {
++  const { enSessionRowStatus } = await import('@/i18n/en_session_row_status')
++
++  return {
++    useI18n: () => ({
++      t: {
++        sidebar: {
++          row: {
++            ...enSessionRowStatus,
++            backgroundRunning: 'Running in background',
++            draftSession: 'Draft',
++            finishedUnread: 'Finished',
++            needsInput: 'Needs input',
++            sessionRunning: 'Running',
++            waitingForAnswer: 'Waiting for answer'
++          }
++        }
++      }
++    })
++  }
++})
++
++const RUNNING = '[role="status"][aria-label="Running in background"]'
++const UNKNOWN = '[role="status"][aria-label="Open work, current status unknown"]'
++const WAITING = '[role="status"][aria-label="Open work, waiting"]'
++
++// The render clock sits inside the fixture's validity window (observed 1000, valid until 1600).
++const NOW = 1001
++const unknownObs = { source: 'unavailable.work' }
++
++const waitingObs = {
++  ...fixture.base,
++  ...fixture.cases.find(c => c.id === 'dependency')!.set,
++  identity: { ...fixture.base.identity, work_id: 'task-waiting' }
++}
++
++/** The roster source `rowExecution` reads for a row with no known owner. */
++const ownSource = () => (isActivePrimary() ? gatewayRouteState(null, activeGatewayProfileKey()).key : 'ambient')
++
++/** A remote roster read reporting a running card (no process/subagent count, so no other store claims the row). */
++const rosterRunningCard = (sessionId: string) =>
++  setLiveWorkRosterSource(ownSource(), [{ background: 0, execution_observations: [fixture.base], session_id: sessionId, subagents: 0 }])
++
++const dot = (session: null | Partial<SessionInfo>, id = session?.id ?? null) =>
++  render(<SessionStatusDot session={session as null | SessionInfo} storedSessionId={id} />).container
++
++beforeEach(() => {
++  vi.useFakeTimers()
++  vi.setSystemTime(NOW * 1000)
++})
++
++afterEach(() => {
++  cleanup()
++  vi.useRealTimers()
++  $liveWorkRoster.set({})
++  $sessions.set([])
++})
++
++// [daveey] PR #2154 review follow-ups: the dot evaluates every store its row verdict reads, falls back to the
++// listed row, and names known waiting work.
++describe('SessionStatusDot live inputs (no tick lag)', () => {
++  it('relabels unknown -> running as soon as the roster reports a running card, without the 15 s tick', () => {
++    const tick = $kanbanObservationTick.get()
++
++    const c = dot({
++      execution_observations: [unknownObs],
++      id: 'lag-label',
++      kanban_active: 1,
++      kanban_observed_at: NOW,
++      kanban_parked: 1,
++      message_count: 4
++    })
++
++    expect(c.querySelector(UNKNOWN)).not.toBeNull()
++
++    act(() => rosterRunningCard('lag-label'))
++
++    expect(rowExecution({ id: 'lag-label' } as SessionInfo)?.live).toBe(1)
++    expect($kanbanObservationTick.get()).toBe(tick)
++    expect(c.querySelector(RUNNING)).not.toBeNull()
++    expect(c.querySelector(UNKNOWN)).toBeNull()
++  })
++
++  it('repaints an idle tree row as background as soon as the roster reports its running card', () => {
++    const c = dot({ id: 'lag-state', kanban_observed_at: NOW, message_count: 4 })
++
++    expect(c.querySelector('[role="status"]')).toBeNull()
++
++    act(() => rosterRunningCard('lag-state'))
++
++    expect(c.querySelector(RUNNING)).not.toBeNull()
++  })
++})
++
++describe('SessionStatusDot with no session row', () => {
++  for (const stamp of [{ background_active: 1 }, { goal_active: true }]) {
++    it(`reads the listed row for a store-claimed ${Object.keys(stamp)[0]} instead of saying unknown`, () => {
++      $sessions.set([{ id: 'listed', kanban_observed_at: NOW, message_count: 4, ...stamp } as SessionInfo])
++
++      const c = dot(null, 'listed')
++
++      expect(c.querySelector(RUNNING)).not.toBeNull()
++      expect(c.querySelector(UNKNOWN)).toBeNull()
++    })
++  }
++})
++
++describe('SessionStatusDot waiting label', () => {
++  it('says waiting for a row held only by a fresh waiting card', () => {
++    const c = dot({
++      execution_observations: [waitingObs],
++      id: 'waiting-tree',
++      kanban_active: 1,
++      kanban_observed_at: NOW,
++      kanban_parked: 1,
++      message_count: 4
++    })
++
++    expect(c.querySelector(WAITING)?.getAttribute('title')).toBe('Open work, waiting')
++    expect(c.querySelector(RUNNING)).toBeNull()
++  })
++
++  it('says waiting for a listed row whose open cards are all parked', () => {
++    const row = {
++      execution_observations: [],
++      id: 'all-parked',
++      kanban_active: 2,
++      kanban_observed_at: NOW,
++      kanban_parked: 2,
++      message_count: 4
++    } as Partial<SessionInfo>
++
++    $sessions.set([row as SessionInfo])
++
++    expect(dot(row).querySelector(WAITING)).not.toBeNull()
++  })
++
++  it('keeps running when a running card sits beside the waiting one', () => {
++    const c = dot({
++      execution_observations: [waitingObs, fixture.base],
++      id: 'mixed',
++      kanban_active: 2,
++      kanban_observed_at: NOW,
++      kanban_parked: 1,
++      message_count: 4
++    })
++
++    expect(c.querySelector(RUNNING)).not.toBeNull()
++    expect(c.querySelector(WAITING)).toBeNull()
++  })
++})
+diff --git a/apps/desktop/src/app/chat/session-status-dot.tsx b/apps/desktop/src/app/chat/session-status-dot.tsx
+index 2097de0fa2..50cea883b0 100644
+--- a/apps/desktop/src/app/chat/session-status-dot.tsx
++++ b/apps/desktop/src/app/chat/session-status-dot.tsx
+@@ -3,10 +3,10 @@ import { useStore } from '@nanostores/react'
+ import { type Translations, useI18n } from '@/i18n'
+ import { unreadDotOutcomeLabel, unreadDotOutcomeStripe } from '@/lib/session-outcome'
+ import { sessionStatusStripeColor } from '@/lib/session-status-stripe'
+-import { useBackgroundDotUnknown, useSessionDotState } from '@/lib/use-session-dot-state'
++import { useBackgroundDotLabel, useSessionDotState } from '@/lib/use-session-dot-state'
+ import { cn } from '@/lib/utils'
+ import { $sessionColorById, sessionColorFor } from '@/store/session-color'
+-import type { SessionDotState } from '@/store/session-dot-state'
++import type { BackgroundDotLabel, SessionDotState } from '@/store/session-dot-state'
+ import type { SessionInfo } from '@/types/hermes'
+ import type { SessionOutcome } from '@/types/session-outcome'
+ 
+@@ -99,15 +99,18 @@ export const sessionDotClassName = (state: SessionDotState): string => DOT_VARIA
+  *  outcome that is waiting / running / unresolved / decision / muted repaints the unread dot in that outcome's stripe
+  *  colour (still filled, so it still reads as new), because users read emerald as done. Every other state ignores
+  *  the outcome: the live-turn states already outrank it, and idle keeps the project colour.
+- *  [daveey] `backgroundUnknown`: the `background` claim rests only on unknown or unfresh work evidence, so the same
+- *  hollow dot says the status is unknown rather than asserting "running". */
++ *  [daveey] `backgroundLabel`: what the `background` claim rests on. `unknown` (only unknown or unfresh work evidence)
++ *  and `waiting` (only known waiting work) keep the same hollow dot but say so rather than asserting "running". */
+ export const sessionDotVariant = (
+   state: SessionDotState,
+   outcome?: null | SessionOutcome,
+-  backgroundUnknown = false
++  backgroundLabel: BackgroundDotLabel = 'running'
+ ): DotVariant => {
+-  if (state === 'background' && backgroundUnknown) {
+-    return { ...DOT_VARIANTS.background, ariaLabel: r => r.backgroundUnknown, title: r => r.backgroundUnknown }
++  if (state === 'background' && backgroundLabel !== 'running') {
++    const label = (r: Translations['sidebar']['row']) =>
++      backgroundLabel === 'unknown' ? r.backgroundUnknown : r.backgroundWaiting
++
++    return { ...DOT_VARIANTS.background, ariaLabel: label, title: label }
+   }
+ 
+   const stripe = state === 'unread' ? unreadDotOutcomeStripe(outcome) : null
+@@ -166,9 +169,9 @@ export function SessionStatusDot({ storedSessionId, session, branchStem, classNa
+   // Selector, not a plain useStore: the map is rebuilt whenever any session's
+   // status changes, but a given dot only repaints when ITS OWN state flips.
+   const dotState = useSessionDotState(storedSessionId, session)
+-  const backgroundUnknown = useBackgroundDotUnknown(storedSessionId, session, dotState)
++  const backgroundLabel = useBackgroundDotLabel(storedSessionId, session, dotState)
+ 
+-  const variant = sessionDotVariant(dotState, session?.outcome, backgroundUnknown)
++  const variant = sessionDotVariant(dotState, session?.outcome, backgroundLabel)
+ 
+   return (
+     <span className={cn('flex items-center gap-0.5', className)}>
+diff --git a/apps/desktop/src/i18n/ar_chrome.ts b/apps/desktop/src/i18n/ar_chrome.ts
+index ddf3b41bea..24e8410b23 100644
+--- a/apps/desktop/src/i18n/ar_chrome.ts
++++ b/apps/desktop/src/i18n/ar_chrome.ts
+@@ -315,6 +315,7 @@ export const arChrome = {
+     loadCount: step => `تحميل ${step} أخرى`,
+     row: {
+       backgroundUnknown: 'عمل مفتوح، حالته الحالية غير معروفة',
++      backgroundWaiting: 'عمل مفتوح، قيد الانتظار',
+       kanbanUnknown: count => `${count} من عناصر العمل حالتها الحالية غير معروفة: الأدلة مفقودة أو منتهية الصلاحية أو غير متحقق منها. هذا لا يعني الاكتمال؛ لم يُطلب فحص جديد.`,
+       pausedQueue: 'قد لا تكون رسالة وُضعت في قائمة الانتظار قبل إعادة التشغيل قد أُرسلت: أرسلها مجددًا أو تجاهلها',
+       pin: 'تثبيت',
+diff --git a/apps/desktop/src/i18n/de.ts b/apps/desktop/src/i18n/de.ts
+index e2458d3d65..1201f2db77 100644
+--- a/apps/desktop/src/i18n/de.ts
++++ b/apps/desktop/src/i18n/de.ts
+@@ -3717,6 +3717,7 @@ export const deOverrides = {
+     toolCallCount: count => `${count} ${count === 1 ? 'Tool-Aufruf' : 'Tool-Aufrufe'}`,
+     row: {
+       backgroundUnknown: 'Offene Arbeit, aktueller Status unbekannt',
++      backgroundWaiting: 'Offene Arbeit, wartet',
+       kanbanUnknown: count => `${count} Arbeitseinträge mit unbekanntem aktuellem Status: Nachweise fehlen, sind abgelaufen oder nicht verifiziert. Das bedeutet nicht erledigt; es wurde keine neue Prüfung angefordert.`,
+       pausedQueue: 'Eine vor einem Neustart eingereihte Nachricht wurde womöglich nicht ausgeführt: erneut senden oder verwerfen',
+       pin: 'Anpinnen',
+diff --git a/apps/desktop/src/i18n/en_session_row_status.ts b/apps/desktop/src/i18n/en_session_row_status.ts
+index f7de9247d2..91cfb98c8b 100644
+--- a/apps/desktop/src/i18n/en_session_row_status.ts
++++ b/apps/desktop/src/i18n/en_session_row_status.ts
+@@ -48,6 +48,7 @@ export const enSessionRowStatus = {
+   muteFailed: 'Could not update the parked state',
+   backgroundProcesses: count => `${count} background ${count === 1 ? 'process' : 'processes'} running`,
+   backgroundUnknown: 'Open work, current status unknown',
++  backgroundWaiting: 'Open work, waiting',
+   backgroundProcessUnnamed: 'background process',
+   stopProcess: 'Stop',
+   stoppingProcess: 'Stopping…'
+diff --git a/apps/desktop/src/i18n/es.ts b/apps/desktop/src/i18n/es.ts
+index 387ac9212a..164b3150bb 100644
+--- a/apps/desktop/src/i18n/es.ts
++++ b/apps/desktop/src/i18n/es.ts
+@@ -3705,6 +3705,7 @@ export const esOverrides = {
+     toolCallCount: (count: number) => `${count} ${count === 1 ? 'llamada a herramienta' : 'llamadas a herramientas'}`,
+     row: {
+       backgroundUnknown: 'Trabajo abierto, estado actual desconocido',
++      backgroundWaiting: 'Trabajo abierto, en espera',
+       kanbanUnknown: count => `${count} elementos de trabajo con estado actual desconocido: faltan pruebas, han caducado o no están verificadas. Esto no significa terminado; no se solicitó una nueva comprobación.`,
+       pausedQueue: 'Puede que un mensaje en cola antes de un reinicio no se haya ejecutado: envíalo de nuevo o descártalo',
+       pin: 'Fijar',
+diff --git a/apps/desktop/src/i18n/fr.ts b/apps/desktop/src/i18n/fr.ts
+index aef4a4009d..0628bc2d9e 100644
+--- a/apps/desktop/src/i18n/fr.ts
++++ b/apps/desktop/src/i18n/fr.ts
+@@ -3724,6 +3724,7 @@ export const frOverrides = {
+     toolCallCount: count => `${count} ${count === 1 ? "appel d'outil" : "appels d'outil"}`,
+     row: {
+       backgroundUnknown: 'Travail non terminé, statut actuel inconnu',
++      backgroundWaiting: 'Travail non terminé, en attente',
+       kanbanUnknown: count => `${count} éléments de travail au statut actuel inconnu : preuves manquantes, expirées ou non vérifiées. Cela ne signifie pas terminé ; aucune nouvelle vérification demandée.`,
+       pausedQueue: 'Un message mis en file avant un redémarrage n’a peut-être pas été exécuté : renvoyez-le ou supprimez-le',
+       pin: 'Épingler',
+diff --git a/apps/desktop/src/i18n/ja.ts b/apps/desktop/src/i18n/ja.ts
+index 3ddab81b91..9953a84a85 100644
+--- a/apps/desktop/src/i18n/ja.ts
++++ b/apps/desktop/src/i18n/ja.ts
+@@ -2247,6 +2247,7 @@ export const jaOverrides = {
+     toolCallCount: count => `${count} 件のツール呼び出し`,
+     row: {
+       backgroundUnknown: '未完了の作業あり、現在の状態は不明',
++      backgroundWaiting: '未完了の作業あり、待機中',
+       kanbanUnknown: count => `${count} 件の作業の現在の状態が不明です。証拠がない、期限切れ、または未検証です。完了を意味しません。新しい確認は要求されていません。`,
+       pausedQueue: '再起動前にキューに入れたメッセージが実行されていない可能性があります：再送信するか破棄してください',
+       pin: 'ピン留め',
+diff --git a/apps/desktop/src/i18n/ru.ts b/apps/desktop/src/i18n/ru.ts
+index 3f0ff0ba30..7c6f7a0ff7 100644
+--- a/apps/desktop/src/i18n/ru.ts
++++ b/apps/desktop/src/i18n/ru.ts
+@@ -2510,6 +2510,7 @@ export const ruOverrides = {
+       `${count} ${RU_PLURAL(count, 'вызов инструмента', 'вызова инструмента', 'вызовов инструмента')}`,
+     row: {
+       backgroundUnknown: 'Есть незавершённая работа, текущий статус неизвестен',
++      backgroundWaiting: 'Есть незавершённая работа, ожидает',
+       kanbanUnknown: count => `${count} рабочих элементов с неизвестным текущим статусом: данные отсутствуют, устарели или не проверены. Это не означает завершение; новая проверка не запрашивалась.`,
+       pausedQueue: 'Сообщение, поставленное в очередь до перезапуска, возможно, не выполнено: отправьте снова или отмените',
+       pin: 'Закрепить',
+diff --git a/apps/desktop/src/i18n/types_session_row_status.ts b/apps/desktop/src/i18n/types_session_row_status.ts
+index ff29a3da31..fba9b7dcc2 100644
+--- a/apps/desktop/src/i18n/types_session_row_status.ts
++++ b/apps/desktop/src/i18n/types_session_row_status.ts
+@@ -22,6 +22,8 @@ export interface SessionRowStatusCopy {
+   backgroundProcesses: (count: number) => string
+   /** [daveey] The hollow background dot when its only open work has unknown or unfresh status (never "running"). */
+   backgroundUnknown: string
++  /** [daveey] The hollow background dot when its only open work is known waiting (parked, held or a fresh wait). */
++  backgroundWaiting: string
+   backgroundProcessUnnamed: string
+   stopProcess: string
+   stoppingProcess: string
+diff --git a/apps/desktop/src/i18n/zh-hant_chrome.ts b/apps/desktop/src/i18n/zh-hant_chrome.ts
+index b2cae2faa3..84ddefb9b4 100644
+--- a/apps/desktop/src/i18n/zh-hant_chrome.ts
++++ b/apps/desktop/src/i18n/zh-hant_chrome.ts
+@@ -197,6 +197,7 @@ export const zhHantChrome = {
+     toolCallCount: count => `${count} 次工具調用`,
+     row: {
+       backgroundUnknown: '有未完成的工作，目前狀態未知',
++      backgroundWaiting: '有未完成的工作，等待中',
+       kanbanUnknown: count => `${count} 項工作的目前狀態未知：證據缺失、已過期或未經驗證。這不表示已完成；未要求新的檢查。`,
+       pausedQueue: '重新啟動前排入佇列的訊息可能未執行：請重新傳送或捨棄',
+       pin: '釘選',
+diff --git a/apps/desktop/src/i18n/zh.ts b/apps/desktop/src/i18n/zh.ts
+index 72b909909f..58f0317947 100644
+--- a/apps/desktop/src/i18n/zh.ts
++++ b/apps/desktop/src/i18n/zh.ts
+@@ -3115,6 +3115,7 @@ export const zhOverrides = {
+     toolCallCount: count => `${count} 次工具调用`,
+     row: {
+       backgroundUnknown: '有未完成的工作，当前状态未知',
++      backgroundWaiting: '有未完成的工作，等待中',
+       kanbanUnknown: count => `${count} 项工作的当前状态未知：证据缺失、已过期或未经验证。这不表示已完成；未请求新的检查。`,
+       pausedQueue: '重启前排队的消息可能未运行：请重新发送或丢弃',
+       pin: '置顶',
+diff --git a/apps/desktop/src/lib/use-session-dot-state.ts b/apps/desktop/src/lib/use-session-dot-state.ts
+index f80ec9eeb9..13725ef335 100644
+--- a/apps/desktop/src/lib/use-session-dot-state.ts
++++ b/apps/desktop/src/lib/use-session-dot-state.ts
+@@ -1,40 +1,57 @@
+-import { useStoreSelector } from '@/lib/use-session-slice'
++import { useStoreSelector, useStoresSelector } from '@/lib/use-session-slice'
+ import { $backgroundRunningSessionIds } from '@/store/composer-status'
+-import { $kanbanObservationTick, hasFreshKanbanObservation } from '@/store/kanban-observation'
+-import { $sessions, lineageAliases } from '@/store/session'
++import { ROW_EXECUTION_STORES } from '@/store/execution-observation-row'
++import { $kanbanObservationTick } from '@/store/kanban-observation'
++import { $messagingSessions, $sessions, lineageAliases, sessionMatchesStoredId } from '@/store/session'
+ import {
+   $delegatingSessionIds,
+   $sessionDotStateById,
+-  backgroundDotUnknown,
++  type BackgroundDotLabel,
++  backgroundDotLabel,
+   type SessionDotState,
+   withRowActivity
+ } from '@/store/session-dot-state'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+-/** Fold tree-only row evidence too, and repaint when its observation expires. */
++/** [daveey] Every store a dot's row verdict reads: the observation tick (time-only expiry), the listed rows a missing
++ *  caller row falls back to, and `rowExecution`'s own inputs. Subscribing to fewer left the dot up to one 15 s tick
++ *  behind a roster or event change. */
++const DOT_ROW_STORES = [$kanbanObservationTick, $messagingSessions, ...ROW_EXECUTION_STORES] as const
++
++const NO_ROW: Partial<SessionInfo> = {}
++
++/** [daveey] The row a dot evaluates: the caller's, else the listed `$sessions` / `$messagingSessions` row the dot store
++ *  claimed from (a contrib tab lead or an unresolved `tileStoredRow` passes none). Evaluating `{}` instead read a
++ *  store-claimed process or goal as unknown work. */
++const dotRow = (id: string, row: null | SessionInfo | undefined): Partial<SessionInfo> =>
++  row ??
++  $sessions.get().find(s => sessionMatchesStoredId(s, id)) ??
++  $messagingSessions.get().find(s => sessionMatchesStoredId(s, id)) ??
++  NO_ROW
++
++/** Fold tree-only row evidence too, and repaint when its observation expires or its execution evidence changes. */
+ export function useSessionDotState(id: null | string, row?: null | SessionInfo) {
+   const state = useStoreSelector($sessionDotStateById, states => id ? (states[id] ?? 'idle') : 'draft')
+-  useStoreSelector($kanbanObservationTick, () => hasFreshKanbanObservation(row ?? undefined))
+ 
+-  return id ? withRowActivity(state, row ?? {}) : state
++  return useStoresSelector(DOT_ROW_STORES, () => id ? withRowActivity(state, dotRow(id, row)) : state)
+ }
+ 
+ /** Whether any lineage alias of `id` is in `ids` (the store claims every alias the same way). */
+ const litFor = (ids: readonly string[], id: null | string): boolean =>
+   id !== null && ids.length > 0 && lineageAliases(id, $sessions.get()).some(alias => ids.includes(alias))
+ 
+-/** [daveey] Whether a `background` dot's label must say its status is unknown (see `backgroundDotUnknown`). Reads
+- *  only stores the dot state already derives from; the existing observation tick re-evaluates time-only expiry. */
+-export function useBackgroundDotUnknown(
++/** [daveey] What a `background` dot's label says (see `backgroundDotLabel`); `running` for every other state, where
++ *  the variant ignores it. */
++export function useBackgroundDotLabel(
+   id: null | string,
+   row: null | SessionInfo | undefined,
+   state: SessionDotState
+-): boolean {
++): BackgroundDotLabel {
+   const background = state === 'background' && id !== null
+   const processLive = useStoreSelector($backgroundRunningSessionIds, ids => background && litFor(ids, id))
+   const delegating = useStoreSelector($delegatingSessionIds, ids => background && litFor(ids, id))
+ 
+-  return useStoreSelector($kanbanObservationTick, () =>
+-    background ? backgroundDotUnknown(row ?? {}, processLive || delegating) : false
++  return useStoresSelector(DOT_ROW_STORES, () =>
++    background && id !== null ? backgroundDotLabel(dotRow(id, row), processLive || delegating) : 'running'
+   )
+ }
+diff --git a/apps/desktop/src/store/execution-observation-row.ts b/apps/desktop/src/store/execution-observation-row.ts
+index d78b4be95e..47e8c89b50 100644
+--- a/apps/desktop/src/store/execution-observation-row.ts
++++ b/apps/desktop/src/store/execution-observation-row.ts
+@@ -1,3 +1,5 @@
++import { computed } from 'nanostores'
++
+ import { summarizeExecutionObservations } from '@/lib/execution-observations'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+@@ -110,6 +112,22 @@ export function rowExecution(row: Partial<Stamped> | undefined, nowSeconds: numb
+   }
+ }
+ 
++/** [daveey] `rowExecution`'s only read of `$sessionStates` is each runtime's stored id. That store is republished per
++ *  streaming token; this key changes only when a runtime binds to (or leaves) a stored session. */
++const $runtimeBindings = computed($sessionStates, states =>
++  Object.entries(states).map(([runtime, state]) => `${runtime}=${state?.storedSessionId ?? ''}`).join('\n')
++)
++
++/** [daveey] Every store `rowExecution` reads. A hook that evaluates it for a render must subscribe to all of them
++ *  (`useStoresSelector`), or its verdict lags until some unrelated store happens to notify. */
++export const ROW_EXECUTION_STORES = [
++  $liveWorkRoster,
++  $backgroundStatusBySession,
++  $subagentsBySession,
++  $runtimeBindings,
++  $sessions
++] as const
++
+ /** Evidence that keeps a row off done: live/waiting/needs-you work, an outstanding ask, or unresolved uncertainty. */
+ export const executionHoldsRow = (e: null | RowExecution): boolean =>
+   e !== null && e.live + e.waiting + e.needsUser + e.unknown + e.outstanding > 0
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index c306e0742f..0d1ab0f744 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -27,7 +27,7 @@ import {
+   $kanbanUnseenSessionIds,
+   $sessionDotStateById,
+   $unreadSessionCount,
+-  backgroundDotUnknown,
++  backgroundDotLabel,
+   hasLiveTurn,
+   kanbanStripeCounts,
+   markSessionListRefreshReason,
+@@ -701,10 +701,23 @@ describe('withRowActivity', () => {
+ })
+ 
+ // [daveey] The background dot keeps its claim on unknown work, but its label must not assert "running".
+-describe('backgroundDotUnknown', () => {
++describe('backgroundDotLabel', () => {
+   const fresh = () => ({ kanban_observed_at: Date.now() / 1000 })
+   const unknownObs = { source: 'unavailable.work' }
+ 
++  const live = () => {
++    const now = Date.now() / 1000
++
++    return { ...fixture.base, observed_at: now, valid_until: now + 120 }
++  }
++
++  // [daveey] A fresh dependency wait (the fixture's `dependency` case) under its own card identity.
++  const waitingObs = () => ({
++    ...live(),
++    ...fixture.cases.find(c => c.id === 'dependency')!.set,
++    identity: { ...fixture.base.identity, work_id: 'task-waiting' }
++  })
++
+   it('is unknown when the claim rests only on unknown or unfresh evidence', () => {
+     const rows = [
+       { ...fresh(), kanban_unknown: true },
+@@ -712,29 +725,49 @@ describe('backgroundDotUnknown', () => {
+       { kanban_observed_at: undefined },
+       { ...fresh(), execution_observations: [unknownObs], kanban_active: 1, kanban_parked: 1 },
+       // An older backend's unparked cards are discovered as unknown, never as certain running.
+-      { ...fresh(), kanban_active: 1 }
++      { ...fresh(), kanban_active: 1 },
++      // A known wait beside unknown work does not vouch for the rest.
++      { ...fresh(), execution_observations: [waitingObs(), unknownObs], kanban_active: 2, kanban_parked: 2 }
+     ]
+ 
+     for (const row of rows) {
+       expect(withRowActivity('idle', row as never)).toBe('background')
+-      expect(backgroundDotUnknown(row as never)).toBe(true)
++      expect(backgroundDotLabel(row as never)).toBe('unknown')
+     }
+   })
+ 
+   it('says running when a process, subagent, goal or running card exists', () => {
+-    const now = Date.now() / 1000
+-    const running = { ...fixture.base, observed_at: now, valid_until: now + 120 }
+-
+-    expect(backgroundDotUnknown({ kanban_unknown: true, background_active: 1 })).toBe(false)
+-    expect(backgroundDotUnknown({ kanban_unknown: true, goal_active: true })).toBe(false)
+-    expect(backgroundDotUnknown({ kanban_unknown: true }, true)).toBe(false)
++    expect(backgroundDotLabel({ kanban_unknown: true, background_active: 1 })).toBe('running')
++    expect(backgroundDotLabel({ kanban_unknown: true, goal_active: true })).toBe('running')
++    expect(backgroundDotLabel({ kanban_unknown: true }, true)).toBe('running')
++    expect(
++      backgroundDotLabel({ ...fresh(), execution_observations: [live(), unknownObs], kanban_active: 2 } as never)
++    ).toBe('running')
+     expect(
+-      backgroundDotUnknown({ ...fresh(), execution_observations: [running, unknownObs], kanban_active: 2 } as never)
+-    ).toBe(false)
++      backgroundDotLabel({ ...fresh(), execution_observations: [live(), waitingObs()], kanban_active: 2, kanban_parked: 1 } as never)
++    ).toBe('running')
+   })
+ 
+-  it('keeps the existing label for known waiting or blocked work', () => {
+-    expect(backgroundDotUnknown({ ...fresh(), kanban_active: 0, kanban_blocked: 1 })).toBe(false)
++  it('says waiting when the only open work is known waiting (fresh, all parked)', () => {
++    const rows = [
++      { ...fresh(), execution_observations: [waitingObs()], kanban_active: 1, kanban_parked: 1 },
++      { ...fresh(), execution_observations: [], kanban_active: 2, kanban_parked: 2 },
++      { ...fresh(), execution_observations: [], kanban_active: 2, kanban_held: 1, kanban_parked: 1 }
++    ]
++
++    for (const row of rows) {
++      expect(backgroundDotLabel(row as never)).toBe('waiting')
++    }
++  })
++
++  it('keeps the running label for blocked or unparked work (not a known wait)', () => {
++    expect(backgroundDotLabel({ ...fresh(), kanban_active: 0, kanban_blocked: 1 })).toBe('running')
++    expect(
++      backgroundDotLabel({ ...fresh(), execution_observations: [], kanban_active: 2, kanban_blocked: 1, kanban_parked: 2 } as never)
++    ).toBe('running')
++    expect(
++      backgroundDotLabel({ ...fresh(), execution_observations: [waitingObs()], kanban_active: 2, kanban_parked: 1 } as never)
++    ).toBe('running')
+   })
+ })
+ 
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 500000d5e1..2f3156d3ec 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -456,28 +456,60 @@ const rowHasBackgroundWork = (row: RowActivity): boolean =>
+   (row.kanban_blocked ?? 0) > 0 ||
+   (row.background_active ?? 0) > 0
+ 
+-/** [daveey] Whether a `background` dot must say its work's status is unknown instead of "running". The claim itself
+- *  stays (unknown must never read as done); only the words change. True when nothing positively runs (no process,
+- *  subagent, goal or current running/queued execution) and the claim rests on unknown or unfresh evidence: a failed or
+- *  stale kanban read, an expired/absent observation, or work whose execution evidence is unknown. `liveElsewhere` is
+- *  the store's own running evidence for the row (a renderer-polled process, async subagents). Rows held only by known
+- *  waiting or blocked work keep the existing label. */
+-export const backgroundDotUnknown = (row: RowActivity, liveElsewhere = false, nowSeconds: number = Date.now() / 1000): boolean => {
++/** [daveey] What a `background` dot's label may claim about its work. */
++export type BackgroundDotLabel = 'running' | 'unknown' | 'waiting'
++
++/** [daveey] The words on a `background` dot. The claim itself stays (unknown or parked work must never read as done);
++ *  only the label follows the evidence:
++ *  - `running` when something positively runs: a process (renderer-polled or backend `background_active`), async
++ *    subagents, a goal, or current running/queued execution. `liveElsewhere` is the store's own running evidence for
++ *    the row (a renderer-polled process, async subagents).
++ *  - `unknown` when nothing runs and the claim rests on unknown or unfresh evidence: a failed or stale kanban read, an
++ *    expired/absent observation, or work whose execution evidence is unknown.
++ *  - `waiting` when the only open work is known waiting on a fresh read: parked or held cards, or current waiting
++ *    observations, with no unparked card, blocked card, needs-you entry or outstanding ask.
++ *  Anything else (blocked or needs-you work) keeps the existing `running` label. */
++export const backgroundDotLabel = (
++  row: RowActivity,
++  liveElsewhere = false,
++  nowSeconds: number = Date.now() / 1000
++): BackgroundDotLabel => {
+   if (liveElsewhere || row.goal_active === true || (row.background_active ?? 0) > 0) {
+-    return false
++    return 'running'
+   }
+ 
+   const exec = rowExecution(row, nowSeconds)
+ 
+   if ((exec?.live ?? 0) > 0) {
+-    return false
++    return 'running'
++  }
++
++  if (rowEvidenceUnknown(row, exec)) {
++    return 'unknown'
+   }
+ 
++  return rowOnlyWaiting(row, exec) ? 'waiting' : 'running'
++}
++
++/** [daveey] The claim rests on unknown or unfresh evidence: a failed or stale kanban read, an expired/absent
++ *  observation, or work whose execution evidence is unknown. */
++const rowEvidenceUnknown = (row: RowActivity, exec: ReturnType<typeof rowExecution>): boolean =>
++  row.kanban_unknown === true ||
++  (row.kanban_remote_stale ?? 0) > 0 ||
++  !hasFreshKanbanObservation(row) ||
++  (exec?.unknown ?? 0) > 0
++
++/** [daveey] The only open work is known waiting: parked/held cards or current waiting observations, and no unparked
++ *  card, blocked card, needs-you entry or outstanding ask. */
++const rowOnlyWaiting = (row: RowActivity, exec: ReturnType<typeof rowExecution>): boolean => {
++  const parked = row.kanban_parked === undefined ? 0 : row.kanban_parked + (row.kanban_held ?? 0)
++
+   return (
+-    row.kanban_unknown === true ||
+-    (row.kanban_remote_stale ?? 0) > 0 ||
+-    !hasFreshKanbanObservation(row) ||
+-    (exec?.unknown ?? 0) > 0
++    parked + (exec?.waiting ?? 0) > 0 &&
++    liveKanbanCount(row) === 0 &&
++    (row.kanban_blocked ?? 0) === 0 &&
++    (exec?.needsUser ?? 0) === 0 &&
++    (exec?.outstanding ?? 0) === 0
+   )
+ }
+ 
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index 29a40b6886..2a8bf7e23b 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -4913,6 +4913,7 @@
+     "sidebar.row.backgroundProcesses",
+     "sidebar.row.backgroundRunning",
+     "sidebar.row.backgroundUnknown",
++    "sidebar.row.backgroundWaiting",
+     "sidebar.row.branchFrom",
+     "sidebar.row.copyId",
+     "sidebar.row.copyIdFailed",
+-- 
+2.43.0
+

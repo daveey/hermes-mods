@@ -1,0 +1,112 @@
+From 8e58e5d76e83446e43c82e64f183580b44d247ab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:18:56 +0000
+Subject: [PATCH] [daveey] test: pin the per-mode at-par reference cache and
+ the CLI init_db refusal clause
+
+Two exact-anchor revert mutants of #2207 survived tests/hermes_cli/test_kanban_schema_owner.py
+(post-merge check t_01a1d4f93186f195; card t_01a1d509cb5adc68). Tests only, no code change.
+
+- M4 (`_reference_schema` reads `next(iter(_REFERENCE.values()))`, one cache for both modes):
+  every sync test reset `_REFERENCE`, so no test built both modes in one process.
+  test_unsynced_reference_built_first_does_not_stand_in_for_the_synced_one: unsynced reference
+  first, then a synced board missing a sync column this core declares must refuse with
+  BoardSchemaNotOwned naming the column. test_synced_reference_built_first_is_not_applied_to_an_unsynced_board:
+  the reverse order, an unsynced board at par still opens read-write.
+- M12 (CLI `except BoardSchemaNotOwned` around `kb.init_db()` removed): the existing CLI test used an
+  existing board, so the refusal came from the handler clause. test_cli_on_a_missing_board_prints_the_refusal_line_and_creates_nothing:
+  missing board, `kanban list` from a non-installed checkout -> rc 1, exactly one `kanban: ` line
+  (not "could not initialize database: kanban: ..."), no kanban.db or sidecars.
+
+Proof (mutant harness from t_01a1d4f93186f195, on this tree): 22/22 green; M4 -> 2 failed (the two
+new reference tests), M12 -> 1 failed (the new CLI test); M1-M3, M5, M7, M9, M10, M13 still red.
+
+Equivalent survivors, no test: M8 (re-inlining the sync DDL in install_or_remove, a pure refactor
+revert) and M11 (dropping refuse_missing_board from init_db: connect() re-checks before it creates
+the file). M6 is a non-revert probe.
+---
+ tests/hermes_cli/test_kanban_schema_owner.py | 68 ++++++++++++++++++++
+ 1 file changed, 68 insertions(+)
+
+diff --git a/tests/hermes_cli/test_kanban_schema_owner.py b/tests/hermes_cli/test_kanban_schema_owner.py
+index efb2eb3424..45f4a68cb8 100644
+--- a/tests/hermes_cli/test_kanban_schema_owner.py
++++ b/tests/hermes_cli/test_kanban_schema_owner.py
+@@ -401,6 +401,74 @@ def test_cli_prints_the_refusal_line_not_a_traceback(home, capsys):
+     assert DROPPED[1] not in _columns(db)
+ 
+ 
++# --- mutant survivors of #2207 (card t_01a1d509cb5adc68) ---------------------------------------------------
++
++def _fake_sync_column(monkeypatch) -> None:
++    from hermes_cli import kanban_db_sync as sync
++    monkeypatch.setattr(owner, "_REFERENCE", {})
++    monkeypatch.setattr(sync, "_SYNC_COLUMN_DDL", (*sync._SYNC_COLUMN_DDL, ("tasks", "fake_sync_col", "fake_sync_col TEXT")))
++
++
++def test_unsynced_reference_built_first_does_not_stand_in_for_the_synced_one(home, monkeypatch):
++    """One process judges both modes: the unsynced reference, built first, must not be reused for a synced
++    board, or a sync column this core declares and the board lacks would pass as "at par"."""
++    db = _synced_board(home)
++    before = _triggers(db), _columns(db)
++    _fake_sync_column(monkeypatch)
++    unsynced = owner._reference_schema(sync=False)
++    assert "kanban_sync_state" not in unsynced
++    synced = owner._reference_schema(sync=True)
++    assert "kanban_sync_state" in synced and "fake_sync_col" in synced["tasks"]
++    _foreign_install(home)
++    conn = kbc.connect(db)
++    try:
++        with pytest.raises(owner.BoardSchemaNotOwned) as err:
++            kb.create_task(conn, title="from a worktree", assignee="default")
++    finally:
++        conn.close()
++    assert "fake_sync_col" in str(err.value)
++    assert (_triggers(db), _columns(db)) == before
++
++
++def test_synced_reference_built_first_is_not_applied_to_an_unsynced_board(home, monkeypatch):
++    """The reverse order: the synced reference, built first, must not judge an unsynced board (it has no sync
++    tables and needs none), which would turn a board at par into a read-only refusal."""
++    db = home / "kanban.db"
++    kbc.connect(db).close()
++    kbc._INITIALIZED_PATHS.discard(str(db.resolve()))
++    _fake_sync_column(monkeypatch)
++    assert "kanban_sync_state" in owner._reference_schema(sync=True)
++    _foreign_install(home)
++    conn = kbc.connect(db)
++    try:
++        tid = kb.create_task(conn, title="sync off, at par", assignee="default")
++        assert conn.execute("SELECT id FROM tasks WHERE id = ?", (tid,)).fetchone()
++    finally:
++        conn.close()
++
++
++def test_cli_on_a_missing_board_prints_the_refusal_line_and_creates_nothing(home, capsys):
++    """The refusal comes from the CLI's own ``init_db`` (no board yet), not a handler: still one ``kanban:``
++    line, not "could not initialize database: kanban: ...", and no empty kanban.db left behind."""
++    import argparse
++    from hermes_cli import kanban as kcli
++    from hermes_cli.kanban_parser import build_parser
++    db = home / "kanban.db"
++    assert not db.exists()
++    _foreign_install(home)
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers())
++    rc = kcli.kanban_command(parser.parse_args(["kanban", "list"]))
++    err = capsys.readouterr().err
++    assert rc == 1
++    assert "Traceback" not in err
++    lines = [line for line in err.splitlines() if line.strip()]
++    assert len(lines) == 1 and lines[0].startswith("kanban: ") and "only this home's installed core" in lines[0]
++    assert "could not initialize database" not in lines[0] and not lines[0].startswith("kanban: kanban:")
++    assert not db.exists()
++    assert not any(p.name.startswith("kanban.db") for p in home.iterdir()), sorted(p.name for p in home.iterdir())
++
++
+ def test_run_forever_give_up_opens_the_hub_card(home, monkeypatch):
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_placement as kp
+-- 
+2.43.0
+

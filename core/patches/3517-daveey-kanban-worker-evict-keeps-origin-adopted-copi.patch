@@ -1,0 +1,292 @@
+From f0cbec1c68efbe606e2063e8b2e0b09dd73123db Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:05:26 +0000
+Subject: [PATCH] [daveey] kanban: worker evict keeps origin-adopted copies;
+ one stuck copy never aborts the pickup
+
+worker-4 failed every worker-node pickup from 2026-11-13 11:09Z (`kanban: worker-node pickup
+failed`, ~every 15 s): `evict()` picked an archived foreign copy (t_01a1d48abbb62104, created on
+the macbook) that had been adopted on worker-4 with `kanban_origin_adopt`. Its
+`origin_creation_intents` row (`task_id REFERENCES tasks(id)`, no ON DELETE) made
+`DELETE FROM tasks` raise `FOREIGN KEY constraint failed`; the whole eviction transaction rolled
+back and `pickup()` raised before importing anything, so cards pinned `machine:worker-4`
+(t_01a1c7a649c59bec) were never imported.
+
+Five whys:
+1. Pinned cards not imported -> `pickup()` raised in `evict(conn)` before the import step.
+2. evict raised -> DELETE FROM tasks hit an FK child (origin_creation_intents) it does not clear.
+3. It reached that copy -> the evictable-copy query only exempts claimed/running/wake-probe copies,
+   not a copy this gateway owns as an origin owner (an adoption writes a machine-local intent row
+   onto an existing foreign copy).
+4. One copy stopped every eviction and the pickup -> all copies are deleted in one write txn and
+   pickup has no failure boundary around evict.
+
+Intent semantics (decision): the intent row is the owner's origin-binding custody. It is
+machine-local and never synced; its `binding_id` is a random secret. The hub collector publishes a
+card's `origin_bindings` only from this table, and `kanban_origin_ledger.observe_owner_task`
+checks the published bindings against it and advances/releases the origin chat's obligation only
+from an owner record that still carries the marker plus the card's completion events and runs
+(`kanban_terminal_carry._owner_proof` reads the same rows). Nothing in core ever deletes an intent
+row. Evicting a terminal copy (deleting the intent too) would therefore strand the origin's
+obligation exactly when the owner is about to publish the release. So the copy stays in every
+unclaimed state, terminal included, the same way `kanban_placement_recovery` already exempts
+intent-bearing cards. The carry module restores intent rows only when the binding owner is this
+gateway, so an intent row here always means "this gateway owns the binding".
+
+Fix:
+- `evict()` excludes copies that have an `origin_creation_intents` row.
+- Each copy is deleted in its own savepoint (`write_txn(allow_nested=True)`); a copy that still
+  cannot go (any FK child the list does not know) is kept and logged by task id, and the other
+  evictions commit.
+- `pickup()` logs and continues when `evict()` raises, so imports always run.
+
+Proof:
+- RED on main's source: all 6 new tests fail; 5 with the production error
+  `sqlite3.IntegrityError: FOREIGN KEY constraint failed` at kanban_worker_node.py:364, the
+  sixth with `kanban: worker-node pickup failed`.
+- GREEN: tests/hermes_cli/test_kanban_evict_origin_intent.py 6/6; 100 related files (every test
+  importing kanban_worker_node or calling evict) 2420 passed; the one failure,
+  test_eviction_receipt_and_rollback_are_local_only, asserted the old raise and now asserts the
+  refused copy is kept with its receipt rolled back.
+- Mutants (sdlc-review mutants.py), 4/4 killed: keep clause dropped; per-copy catch dropped;
+  savepoint removed with catch kept; pickup try around evict dropped.
+
+Card: t_01a1d4f144e2f2a0
+---
+ hermes_cli/kanban_worker_node.py              |  49 +++++--
+ .../test_kanban_evict_origin_intent.py        | 128 ++++++++++++++++++
+ .../hermes_cli/test_kanban_scratch_custody.py |   4 +-
+ 3 files changed, 166 insertions(+), 15 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_evict_origin_intent.py
+
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index a1e1dffa88..e322db903d 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -321,6 +321,15 @@ def evict(conn: sqlite3.Connection) -> list[str]:
+     keep = (" AND NOT EXISTS (SELECT 1 FROM task_wake_checks w WHERE w.task_id = tasks.id AND "
+             "((tasks.status = 'scheduled' AND w.purpose IS NOT 'ask_resolved') "
+             "OR (tasks.status = 'blocked' AND w.purpose = 'ask_resolved')))" if probes else "")
++    # [daveey] A copy adopted here as an origin owner (``kanban_origin_adopt``) holds an ``origin_creation_intents``
++    # row: machine-local, never synced, and the only copy of the binding secret. The collector publishes a card's
++    # ``origin_bindings`` only from that table, and the origin ledger advances (or releases, once terminal) its
++    # obligation only from an owner record that still carries the marker and the card's completion events/runs.
++    # So the copy stays, terminal ones included: evicting it would strand the origin chat's obligation, and its
++    # FK row made the DELETE raise and roll back every eviction and the whole pickup (worker-4, 11-13,
++    # t_01a1d4f144e2f2a0).
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='origin_creation_intents'").fetchone():
++        keep += " AND NOT EXISTS (SELECT 1 FROM origin_creation_intents i WHERE i.task_id = tasks.id)"
+     rows = conn.execute(
+         "SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ? AND claim_lock IS NULL "
+         "AND status != 'running'" + keep, (own,)).fetchall()
+@@ -350,23 +359,34 @@ def evict(conn: sqlite3.Connection) -> list[str]:
+                     "SELECT 1 FROM task_attachments WHERE task_id=? AND stored_path!='' "
+                     "AND coalesce(blob_key,'')='' LIMIT 1", (tid,)).fetchone():
+                 continue  # retain the only byte custodian until private storage acknowledges it
+-            from hermes_cli.kanban_run_tombstones import retain_ended_runs
+-            from hermes_cli.kanban_scratch_custody import retain
+-            retain(conn, tid)
+-            retain_ended_runs(conn, tid)
+-            for table in present:
+-                conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (tid,))
+-            # The copy's own edges go with it; an edge from it to a card still in this file belongs to that child
+-            # (own_partition keeps it, the Board still holds it). Dropping it un-gated a hub child of a copy evicted
+-            # between review hand-off and re-pickup: 51 promoted / 97 claim_rejected parents_not_done (2026-10-29).
+-            conn.execute("DELETE FROM task_links WHERE child_id = ? OR (parent_id = ? AND child_id NOT IN "
+-                         "(SELECT id FROM tasks WHERE id != ?))", (tid, tid, tid))
+-            conn.execute("DELETE FROM tasks WHERE id = ?", (tid,))
++            # [daveey] Each copy in its own savepoint: one row that cannot go (an FK child this list does not know)
++            # is kept and logged, and never rolls back the other evictions or stops the pickup after it.
++            try:
++                with write_txn(conn, allow_nested=True):
++                    _evict_one(conn, tid, present)
++            except sqlite3.Error:
++                _log.warning("kanban worker node: could not evict copy %s; kept", tid, exc_info=True)
++                continue
+             gone.append(tid)
+         conn.execute("UPDATE kanban_sync_state SET applying = 0")
+     return gone
+ 
+ 
++def _evict_one(conn: sqlite3.Connection, tid: str, present: set[str]) -> None:
++    from hermes_cli.kanban_run_tombstones import retain_ended_runs
++    from hermes_cli.kanban_scratch_custody import retain
++    retain(conn, tid)
++    retain_ended_runs(conn, tid)
++    for table in present:
++        conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (tid,))
++    # The copy's own edges go with it; an edge from it to a card still in this file belongs to that child
++    # (own_partition keeps it, the Board still holds it). Dropping it un-gated a hub child of a copy evicted
++    # between review hand-off and re-pickup: 51 promoted / 97 claim_rejected parents_not_done (2026-10-29).
++    conn.execute("DELETE FROM task_links WHERE child_id = ? OR (parent_id = ? AND child_id NOT IN "
++                 "(SELECT id FROM tasks WHERE id != ?))", (tid, tid, tid))
++    conn.execute("DELETE FROM tasks WHERE id = ?", (tid,))
++
++
+ def _guard_held(conn: sqlite3.Connection, ids: list[str]) -> set[str]:
+     """[daveey] Copies the local dispatcher holds in its ready/review lane (respawn guard: ``active_pr``, cooldowns,
+     ...): a recorded ``respawn_guarded`` hold that the guard still confirms. Eviction keeps them. Dropping one
+@@ -640,7 +660,10 @@ def pickup(conn: sqlite3.Connection, *, budget: Any,
+     mode = pickup_mode()
+     if sync.board_mode(conn) != "primary" or mode is None:
+         return []
+-    evict(conn)
++    try:
++        evict(conn)
++    except Exception:  # health: allow BLE001 -- [daveey] a failed eviction must never stop the pickup that follows
++        _log.warning("kanban worker node: evicting finished copies failed; picking up anyway", exc_info=True)
+     _refill_copies(conn)
+     limit = DEFAULT_PICKUP_BATCH if budget is None else budget
+     if getattr(limit, "total", limit) <= 0:
+diff --git a/tests/hermes_cli/test_kanban_evict_origin_intent.py b/tests/hermes_cli/test_kanban_evict_origin_intent.py
+new file mode 100644
+index 0000000000..45b1752011
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_evict_origin_intent.py
+@@ -0,0 +1,128 @@
++"""A foreign copy adopted here as an origin owner stays, and one copy that cannot go never stops the pickup.
++
++worker-4 2026-11-13 (t_01a1d4f144e2f2a0): a card created on the macbook was adopted on worker-4
++(``kanban_origin_adopt``) and later archived. ``evict`` picked the archived foreign copy, its
++``origin_creation_intents`` row (``task_id REFERENCES tasks(id)``) made ``DELETE FROM tasks`` raise
++``FOREIGN KEY constraint failed``, the whole eviction rolled back and ``pickup`` raised before importing
++anything, every tick for hours; cards pinned to worker-4 were never imported."""
++import logging
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_origin_creation as creation
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_worker_node as support
++
++svc = support.svc
++gws = support.gws
++PIN = [f"machine:{support.WORKER}"]
++
++
++def _status(conn, tid):
++    t = kb.get_task(conn, tid)
++    return t.status if t else None
++
++
++def _copy(hub, worker, **kw):
++    """A hub card copied into the worker's file (not claimed, not running)."""
++    tid = support._hub_card(hub, runs_on=PIN, **kw)
++    worker.round()
++    worker.enter()
++    replica = wn.open_replica(worker.conn)
++    try:
++        assert wn.import_cards(worker.conn, replica, [tid]) == [tid]
++    finally:
++        replica.close()
++    return tid
++
++
++def _adopt(worker, tid):
++    worker.enter()
++    creation.adopt_with_origin(worker.conn, {
++        "request_id": f"adopt:{tid}:local-origin",
++        "owner": {"gateway": support.WORKER, "profile": "default", "board": support.BOARD, "task_id": tid},
++        "origin": {"gateway": "macbook", "profile": "default", "session": "local-origin"}}, board=support.BOARD)
++    worker.round()  # push the adoption's synced event so only the intent row could keep the copy
++
++
++def _archive_on_hub(hub, worker, tid):
++    hub.enter()
++    assert kb.archive_task(hub.conn, tid)
++    hub.round()
++    worker.round()
++    worker.enter()
++    assert _status(worker.conn, tid) == "archived"
++
++
++def _intents(conn, tid):
++    return conn.execute("SELECT COUNT(*) FROM origin_creation_intents WHERE task_id = ?", (tid,)).fetchone()[0]
++
++
++def _no_failed_evictions(caplog):
++    # Kept by the query, never attempted: a failed DELETE would be caught by the per-copy savepoint and logged.
++    assert not [r for r in caplog.records if "could not evict" in r.getMessage()]
++
++
++def test_an_adopted_archived_copy_stays_and_pickup_still_imports(gws, caplog):
++    hub, worker = gws
++    adopted = _copy(hub, worker, title="adopted here, then archived")
++    _adopt(worker, adopted)
++    _archive_on_hub(hub, worker, adopted)
++    plain = _copy(hub, worker, title="plain foreign copy")
++    _archive_on_hub(hub, worker, plain)
++    with caplog.at_level(logging.WARNING, logger=wn._log.name):
++        assert wn.evict(worker.conn) == [plain]  # the intent row's card stays; the rest still goes
++    _no_failed_evictions(caplog)
++    assert _status(worker.conn, adopted) == "archived" and _intents(worker.conn, adopted) == 1
++    pinned = support._hub_card(hub, title="pinned to the worker", runs_on=PIN)
++    worker.round()
++    worker.tick()
++    assert _status(worker.conn, pinned) == "running"
++    assert _status(worker.conn, adopted) == "archived" and _intents(worker.conn, adopted) == 1
++
++
++@pytest.mark.parametrize("status", ["ready", "blocked", "done"])
++def test_an_adopted_copy_is_kept_in_every_unclaimed_state(gws, status, caplog):
++    hub, worker = gws
++    tid = _copy(hub, worker)
++    _adopt(worker, tid)
++    worker.conn.execute("UPDATE kanban_sync_state SET applying = 1")
++    worker.conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
++    worker.conn.execute("UPDATE kanban_sync_state SET applying = 0")
++    worker.conn.commit()
++    with caplog.at_level(logging.WARNING, logger=wn._log.name):
++        assert wn.evict(worker.conn) == [] and _status(worker.conn, tid) == status
++    _no_failed_evictions(caplog)
++
++
++def test_a_copy_that_cannot_be_deleted_is_kept_and_the_others_go(gws, caplog):
++    """Any FK child evict does not know (here a stand-in table) keeps that one copy, logged by id."""
++    hub, worker = gws
++    stuck = _copy(hub, worker, title="has an unknown FK child")
++    other = _copy(hub, worker, title="evictable")
++    worker.conn.execute("CREATE TABLE fixture_fk_child (task_id TEXT NOT NULL REFERENCES tasks(id))")
++    worker.conn.execute("INSERT INTO fixture_fk_child VALUES (?)", (stuck,))
++    worker.conn.commit()
++    with caplog.at_level(logging.WARNING, logger=wn._log.name):
++        assert wn.evict(worker.conn) == [other]
++    assert _status(worker.conn, stuck) == "ready"
++    assert kb.get_task(worker.conn, other) is None
++    assert any(stuck in r.getMessage() for r in caplog.records)
++    # The kept copy's own rows are intact (its savepoint rolled back, not the outer eviction).
++    assert worker.conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (stuck,)).fetchone()[0] > 0
++    assert worker.conn.execute("SELECT applying FROM kanban_sync_state").fetchone()[0] == 0
++
++
++def test_pickup_goes_on_when_eviction_raises(gws, monkeypatch, caplog):
++    hub, worker = gws
++    pinned = support._hub_card(hub, title="pinned", runs_on=PIN)
++
++    def boom(conn):
++        raise RuntimeError("evict failed")
++    monkeypatch.setattr(wn, "evict", boom)
++    worker.round()
++    with caplog.at_level(logging.WARNING, logger=wn._log.name):
++        worker.tick()
++    assert _status(worker.conn, pinned) == "running"
++    assert any("evicting finished copies failed" in r.getMessage() for r in caplog.records)
+diff --git a/tests/hermes_cli/test_kanban_scratch_custody.py b/tests/hermes_cli/test_kanban_scratch_custody.py
+index e1c37920d1..ea9d685fc6 100644
+--- a/tests/hermes_cli/test_kanban_scratch_custody.py
++++ b/tests/hermes_cli/test_kanban_scratch_custody.py
+@@ -138,8 +138,8 @@ def test_eviction_receipt_and_rollback_are_local_only(env):
+     tid, path, run = task(env)
+     env.conn.execute("CREATE TEMP TRIGGER refuse_eviction BEFORE DELETE ON tasks "
+                      "BEGIN SELECT RAISE(ABORT, 'rollback'); END")
+-    with pytest.raises(sqlite3.IntegrityError, match="rollback"):
+-        worker.evict(env.conn)
++    # The refused copy is kept (its own savepoint rolls back, receipt included); evict never raises.
++    assert worker.evict(env.conn) == []
+     assert kb.get_task(env.conn, tid) is not None
+     assert custody.receipts(env.conn) == []
+     env.conn.execute("DROP TRIGGER refuse_eviction")
+-- 
+2.43.0
+

@@ -1,0 +1,499 @@
+From 61dba01c2032dd8807b12eaea9014423d3c59377 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:53:41 +0000
+Subject: [PATCH] [daveey] Respawn guard: a captured PR approved before the
+ park by a historical parent, still at that head, resumes once
+
+Five whys (t_01a1d4635554fa12, worker disk reclaim, held `active_pr` > 60 min):
+1. Why held? `resumes_review` returned False for the only holding PR, core #2097.
+2. Why? Its exact-head approval came from R1 (t_01a1d47d3344937c), which finished
+   BEFORE the owner parked, so `_awaited_parents` drops it as historical and it covers
+   nothing.
+3. Why did the awaited parent not cover it? R2 (t_01a1d48585bd6f9e) approved state
+   #2108 at its exact head, a PR the checkpoint never captured (cited by number only),
+   so `_named_prs` returned set() and R2 counted as no evidence at all.
+4. Why no other path? `_dependency_handoff_after` defers R1's review result to
+   `resumes_review` (`is_review_result`), and `resumes_awaited_review` covers timed
+   parks only.
+5. Why is that wrong? The owner parked orderly after R1's approval, #2097 is still OPEN
+   at exactly R1's reviewed_sha, and the only awaited parent finished with an explicit
+   exact-head verdict. Nothing is left to duplicate; the next run lands #2097.
+
+Fix (new hermes_cli/kanban_dependency_review_historical.py, called only after the
+existing rule refuses): one continuation when
+- every awaited parent is one the checkpoint named as awaited (or an accepted late
+  re-review) and completed (claimed, after the park) with an explicit approve or
+  change-request verdict at a full exact head; a PR it names that the checkpoint did not
+  capture is ordering proof only, never coverage;
+- every holding PR the awaited parents do not cover is approved BY NAME (pr/reviewed_pr)
+  by a checkpointed historical parent (`_historical_parent`, local claimed completion)
+  at a full reviewed_sha equal to the PR's current GitHub head, confirmed by a fresh read
+  (`kanban_awaited_review._at_head`; a cached head can only refuse, a gh failure holds).
+Every existing refusal stays: run_uid binding, one continuation consumed by the next
+claim, crash/reclaim, legacy checkpoints without an awaited list, and "a named unrelated
+PR approves nothing" when there is nothing historical to cover.
+
+Proof:
+- tests/hermes_cli/test_kanban_dependency_review_historical_cover.py, 30 tests. RED on
+  main e17f4285f2: the incident (a), its no-prerequisite and change-request variants
+  fail; GREEN on head. Holds: head moved after R1 (b, plus a stale cached match), R2
+  with no/short head or no explicit verdict (c), gh read failure (d), uncovered second
+  captured PR (no gh read), legacy checkpoint, reopened/unclaimed/not-completed
+  historical run, historical approval of another PR, one approval's sha never covers
+  another PR, crash after review.
+- Mutants (sdlc-review mutants.py, every added condition): 18/18 killed.
+- 47 test files importing kanban_dependency_review / kanban_db_dispatch_pr_state /
+  kanban_awaited_review: 987 passed, 0 failed, 1 skipped.
+- Replay old vs new over every real checkpointed owner on worker-3 (kanban.db, boards/*,
+  sync-shadow/*; read-only, head reads stubbed to "match"): 889 owners, 2 changes, both
+  False -> True and both held owners of exactly this shape whose PRs are OPEN at the
+  approved heads (gh read): t_01a1d4635554fa12 (#2097 @ e826c065ce) and
+  t_01a1cf7175102c70 (#1536 @ 84e3ffb172 approved pre-park, awaited #1613 re-review).
+---
+ hermes_cli/kanban_dependency_review.py        |  19 +-
+ .../kanban_dependency_review_historical.py    |  98 ++++++
+ ...nban_dependency_review_historical_cover.py | 291 ++++++++++++++++++
+ 3 files changed, 403 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_dependency_review_historical.py
+ create mode 100644 tests/hermes_cli/test_kanban_dependency_review_historical_cover.py
+
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index 9f55569590..6d7d2dc6b4 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -9,6 +9,9 @@ continuation when it records an exact-head approval. The next claim consumes it.
+ A review parent linked after the park by someone else (an orchestrator's
+ ``kanban_link``) counts as awaited only as an exact-current-head re-review of a
+ captured PR (:mod:`kanban_dependency_review_relink`).
++A captured PR a historical parent approved before the park, still at that exact head,
++is covered when every awaited parent finished with an exact-head verdict, even on a PR the
++checkpoint never captured (:mod:`kanban_dependency_review_historical`).
+ A later comment that repeats a captured PR does not re-arm the hold; a new PR,
+ a review naming a different PR, or a crash/reclaim does.
+ """
+@@ -408,10 +411,16 @@ def resumes_review(conn, task_id, pr_urls, *, discharged=()):
+     # the other) also resume: each named parent left exact-head evidence for a checkpointed
+     # PR and together they cover every holding PR. Still no merge approval, one continuation.
+     approvals = {p: _approval_prs(conn, p, parked_at, row["id"], captured_set) for p in parents}
+-    if not all(approvals[p] or repairs[p] for p in parents):
+-        return False
+     named_awaited = evidence.get("awaited")
+     named = [*(named_awaited if isinstance(named_awaited, list) else ()), *late]
+-    if not all(urls.issubset(a) for p, a in approvals.items() if p not in named):
+-        return False
+-    return urls.issubset(reviewed.union(*approvals.values()))
++    covered = reviewed.union(*approvals.values())
++    if (all(approvals[p] or repairs[p] for p in parents)
++            and all(urls.issubset(a) for p, a in approvals.items() if p not in named)
++            and urls.issubset(covered)):
++        return True
++    # A captured PR a historical parent approved before the park, still at that head, while the
++    # awaited parents reviewed (exact head, explicit verdict) a sibling PR the checkpoint never
++    # captured (:mod:`kanban_dependency_review_historical`; 2026-11-13 t_01a1d4635554fa12).
++    from hermes_cli.kanban_dependency_review_historical import covers
++    return covers(conn, parents=parents, checkpointed=checkpointed, named_awaited=named, urls=urls,
++                  covered=covered, parked_at=parked_at, owner_run_id=row["id"], captured=captured_set)
+diff --git a/hermes_cli/kanban_dependency_review_historical.py b/hermes_cli/kanban_dependency_review_historical.py
+new file mode 100644
+index 0000000000..caabf9eb51
+--- /dev/null
++++ b/hermes_cli/kanban_dependency_review_historical.py
+@@ -0,0 +1,98 @@
++"""A pre-park exact-head approval of a captured PR still at that head covers it. [daveey]
++
++Production shape (2026-11-13, t_01a1d4635554fa12): the owner published core PR #2097 and
++state PR #2108 and filed one review card per PR. Review R1 approved #2097 at its exact head
++BEFORE the owner parked; the owner then parked on ``dependency_wait`` with R2 (the #2108
++review) still awaited, and captured only #2097. R2 approved #2108 at its exact head. The
++owner stayed ``active_pr``-held: R1 is historical (finished before the park), so it covers
++nothing, and R2 names a PR the checkpoint never captured, so it covers nothing either.
++
++:func:`covers` grants that one continuation only when all of these hold (the caller,
++:func:`kanban_dependency_review.resumes_review`, has already applied every checkpoint,
++run-binding, parent-set and crash/reclaim check):
++
++* every awaited parent is one the checkpoint itself named as awaited (or an accepted late
++  re-review); a parent awaited only because its history could not be proven finished
++  before the park keeps the old per-parent rule;
++* every awaited parent completed (claimed, after the park) with an explicit verdict
++  (approve or a change request) at a full exact head. A PR it names that the checkpoint
++  did not capture is ordering proof only, never coverage for a captured PR;
++* every holding PR that no awaited parent covers is covered by a checkpointed parent that
++  is historical (``_historical_parent``: finished before the park, unchanged since, on
++  this board) whose latest claimed completion approves THAT PR by name (``pr`` /
++  ``reviewed_pr``; an absent name binds nothing here) at a full ``reviewed_sha`` equal to
++  the PR's current GitHub head, confirmed by a fresh read (:func:`kanban_awaited_review._at_head`).
++
++A moved head, a gh failure, a change request or a missing/short head keeps the hold. It
++never authorizes a merge; the next claim consumes the continuation.
++"""
++from __future__ import annotations
++
++
++def _explicit_verdict_at_head(conn, parent_id, parked_at, owner_run_id) -> bool:
++    """True when the parent completed after the park with approve/changes at a full head."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_dependency_review as review
++
++    row = review._completed_review_run(conn, parent_id, parked_at, owner_run_id)
++    if row is None:
++        return False
++    data = kb._json_dict(row["metadata"])
++    verdict = data.get("verdict")
++    approve = isinstance(verdict, str) and verdict.strip().lower() in review._APPROVALS
++    if not (approve or review._requests_changes(row, data)):
++        return False
++    return review._exact_head(data)
++
++
++def _historical_approval(conn, parent_id, parked_at, captured: set[str]):
++    """(named PRs, reviewed_sha) of a historical parent's approval, or None."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_dependency_review as review
++
++    if not review._historical_parent(conn, parent_id, parked_at):
++        return None
++    row = conn.execute(
++        "SELECT r.*, EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
++        "AND e.run_id = r.id AND e.kind = 'claimed') AS was_claimed "
++        "FROM task_runs r WHERE r.task_id = ? ORDER BY r.id DESC LIMIT 1", (parent_id,),
++    ).fetchone()
++    if row is None or not row["was_claimed"] or row["outcome"] != "completed":
++        return None  # replica-only history has no local run row: fail closed
++    data = kb._json_dict(row["metadata"])
++    verdict = data.get("verdict")
++    sha = data.get("reviewed_sha")
++    if (not isinstance(verdict, str) or verdict.strip().lower() not in review._APPROVALS
++            or data.get("approved") is False
++            or not isinstance(sha, str) or not review._SHA.fullmatch(sha)):
++        return None
++    named = review._named_prs(data, captured)
++    if not named:
++        return None  # the checkpoint was taken after this review: it binds no scope here
++    return named, sha.lower()
++
++
++def covers(conn, *, parents, checkpointed, named_awaited, urls, covered,
++           parked_at, owner_run_id, captured: set[str]) -> bool:
++    """One continuation when awaited parents gave ordering proof and history covers the rest.
++
++    ``parents`` are the awaited parents; ``covered`` the holding PRs their own exact-head
++    evidence already covers (repair or approval of a captured PR).
++    """
++    if not parents or not all(p in named_awaited for p in parents):
++        return False
++    if not all(_explicit_verdict_at_head(conn, p, parked_at, owner_run_id) for p in parents):
++        return False
++    missing = set(urls) - set(covered)
++    if not missing:
++        return False  # nothing for history to cover: the caller's rule already decided
++    approvals = []
++    for parent in checkpointed:  # an awaited parent finished after the park: never historical
++        found = _historical_approval(conn, parent, parked_at, captured)
++        if found is not None:
++            approvals.append(found)
++    if not all(any(url in named for named, _ in approvals) for url in missing):
++        return False  # cheap refusal before any gh read
++    from hermes_cli.kanban_awaited_review import _at_head
++    return all(any(url in named and _at_head(url, sha) for named, sha in approvals)
++               for url in sorted(missing))
+diff --git a/tests/hermes_cli/test_kanban_dependency_review_historical_cover.py b/tests/hermes_cli/test_kanban_dependency_review_historical_cover.py
+new file mode 100644
+index 0000000000..d4d1a026de
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dependency_review_historical_cover.py
+@@ -0,0 +1,291 @@
++"""A captured PR approved before the park by a now-historical parent, still at that head, resumes once.
++
++Production shape (2026-11-13, t_01a1d4635554fa12): the owner published core PR #2097 and
++state PR #2108 (cited only by number) and filed review R1 for #2097 and R2 for #2108. R1
++approved #2097 at its exact head BEFORE the owner parked; the park awaited only R2 and
++captured only #2097. R2 then approved #2108 at its exact head. The owner stayed
++``active_pr``-held for over an hour: R1 was historical and R2 named an uncaptured PR.
++"""
++import json
++import subprocess
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from hermes_cli import kanban_dependency_review_historical as hist
++from hermes_cli.kanban_dependency_review import resumes_review
++from tests.hermes_cli import test_kanban_dependency_review as helpers
++from tests.hermes_cli.kanban_guard_helpers import worker_comment
++
++board = helpers.board
++CORE = "https://github.com/example-org/hermes/pull/2097"
++STATE = "https://github.com/example-org/hermes/pull/2108"
++HEAD = "e826c065ce30b3f82370123a382e40c413d16b50"
++STATE_HEAD = "3a4f5f1de7" + "0" * 30
++MOVED = "b" * 40
++OTHER = "https://github.com/example-org/hermes/pull/2099"
++OTHER_HEAD = "c" * 40
++_REAL_GH_PR_STATE = prs._gh_pr_state
++
++
++@pytest.fixture(autouse=True)
++def gh(monkeypatch):
++    """Fake ``gh pr view``: ``gh.heads[url]`` is the PR's head; ``gh.fail`` fails every read."""
++    class Gh:
++        heads = {CORE: HEAD, STATE: STATE_HEAD}
++        fail = False
++        calls: list = []
++
++    Gh.calls = []
++
++    def run(argv, **kwargs):
++        Gh.calls.append(list(argv))
++        if Gh.fail:
++            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="HTTP 502")
++        url = next(a for a in argv if a.startswith("https://"))
++        out = {"state": "OPEN", "headRefOid": Gh.heads.get(url), "comments": []}
++        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(out), stderr="")
++
++    monkeypatch.setattr(prs, "_gh_pr_state", _REAL_GH_PR_STATE)
++    monkeypatch.setattr(prs, "_gh_argv", lambda: ["gh"])
++    monkeypatch.setattr(subprocess, "run", run)
++    prs.clear_cache()
++    yield Gh
++    prs.clear_cache()
++
++
++def finish(conn, review, metadata, *, claim=True):
++    run = None
++    if claim:
++        kb.claim_task(conn, review)
++        run = kb.get_task(conn, review).current_run_id
++    assert kb.complete_task(conn, review, summary="Review complete", expected_run_id=run, metadata=metadata)
++    kb.recompute_ready(conn)
++
++
++def approve(pr, sha):
++    return {"verdict": "approve", "reviewed_sha": sha, "reviewed_pr": pr}
++
++
++def incident(conn, *, r1=None, r2=None, prerequisite=True, r1_claim=True, r2_claim=True, before_park=None,
++             extra_pr=None):
++    """Replay the sequence: R1 approves CORE pre-park, owner parks awaiting R2, R2 finishes."""
++    now = int(time.time())
++    with pytest.MonkeyPatch.context() as clock:
++        clock.setattr(time, "time", lambda: now - 30)
++        task = kb.create_task(conn, title="worker disk reclaim", assignee="dev")
++        parents = []
++        if prerequisite:
++            parents.append(kb.create_task(conn, title="design ruling", assignee="dev"))
++            finish(conn, parents[0], {} if prerequisite is True else prerequisite)
++        kb.claim_task(conn, task)
++        run = kb.get_task(conn, task).current_run_id
++        worker_comment(conn, task, "dev", "Published core PR " + CORE)
++        if extra_pr:
++            worker_comment(conn, task, "dev", "Follow-up PR " + extra_pr)
++        worker_comment(conn, task, "dev", "State PR #2108 filed too")
++        review_1 = kb.create_task(conn, title="review #2097", assignee="reviewer")
++        review_2 = kb.create_task(conn, title="review #2108", assignee="reviewer")
++        for parent in [*parents, review_1, review_2]:
++            kb.link_tasks(conn, parent, task, expected_child_run_id=run)
++        clock.setattr(time, "time", lambda: now - 20)
++        finish(conn, review_1, approve(CORE, HEAD) if r1 is None else r1, claim=r1_claim)
++        if before_park is not None:
++            before_park(conn, review_1)
++        clock.setattr(time, "time", lambda: now - 10)
++        assert kb.block_task(conn, task, kind="dependency", reason="review #2108", expected_run_id=run)
++    checkpoint = json.loads(conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'dependency_wait'", (task,),
++    ).fetchone()["payload"])["review_checkpoint"]
++    assert checkpoint["awaited"] == [review_2] and checkpoint["prs"] == sorted({CORE, extra_pr or CORE})
++    finish(conn, review_2, approve(STATE, STATE_HEAD) if r2 is None else r2, claim=r2_claim)
++    assert kb.get_task(conn, task).status == "ready"
++    return task
++
++
++def test_incident_resumes_exactly_once(board, gh):
++    task = incident(board)
++    assert resumes_review(board, task, [CORE]) is True
++    assert dispatch.check_respawn_guard(board, task) is None
++    assert kb.claim_task(board, task) is not None
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++    assert kb.reclaim_task(board, task, reason="Worker died", signal_fn=lambda *_: None)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_incident_without_prerequisite_parent_resumes(board):
++    task = incident(board, prerequisite=False)
++    assert dispatch.check_respawn_guard(board, task) is None
++
++
++def test_head_moved_after_historical_approval_stays_held(board, gh):
++    gh.heads = {CORE: MOVED, STATE: STATE_HEAD}
++    task = incident(board)
++    assert resumes_review(board, task, [CORE]) is False
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_head_moved_after_a_cached_match_stays_held(board, gh, monkeypatch):
++    task = incident(board)
++    assert prs.pr_head(CORE) == HEAD  # a match cached by an earlier tick, a minute ago
++    prs._heads.update({k: (v[0], v[1] - 60) for k, v in prs._heads.items()})
++    gh.heads = {CORE: MOVED, STATE: STATE_HEAD}
++    assert resumes_review(board, task, [CORE]) is False
++
++
++def test_gh_failure_stays_held(board, gh):
++    gh.fail = True
++    task = incident(board)
++    assert resumes_review(board, task, [CORE]) is False
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++@pytest.mark.parametrize("r2", [
++    {"verdict": "approve", "reviewed_pr": STATE},  # no head at all
++    {"verdict": "approve", "reviewed_pr": STATE, "reviewed_sha": "3a4f5f1de7"},  # short head
++    {"reviewed_pr": STATE, "reviewed_sha": STATE_HEAD},  # no verdict: not explicit evidence
++    {"verdict": "looks fine", "reviewed_pr": STATE, "reviewed_sha": STATE_HEAD},
++])
++def test_awaited_parent_without_explicit_exact_head_verdict_stays_held(board, r2):
++    task = incident(board, r2=r2)
++    assert resumes_review(board, task, [CORE]) is False
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++def test_awaited_change_request_on_sibling_is_ordering_proof(board):
++    r2 = {"verdict": "request_changes", "reviewed_pr": STATE, "reviewed_sha": STATE_HEAD}
++    task = incident(board, r2=r2)
++    assert dispatch.check_respawn_guard(board, task) is None
++
++
++@pytest.mark.parametrize("r1", [
++    {"verdict": "request_changes", "reviewed_pr": CORE, "reviewed_sha": HEAD},
++    {"verdict": "approve", "reviewed_pr": STATE, "reviewed_sha": HEAD},  # names another PR
++    {"verdict": "approve", "reviewed_sha": HEAD},  # names no PR: the checkpoint post-dates it
++    {"verdict": "approve", "reviewed_pr": CORE, "head": HEAD},  # no reviewed_sha to compare
++    {"verdict": "approve", "reviewed_pr": CORE, "reviewed_sha": HEAD[:10]},
++    {"verdict": "approve", "reviewed_pr": CORE, "reviewed_sha": HEAD, "approved": False},
++])
++def test_historical_parent_must_approve_that_pr_at_a_full_head(board, r1):
++    task = incident(board, r1=r1)
++    assert resumes_review(board, task, [CORE]) is False
++
++
++def test_historical_parent_reopened_after_park_does_not_cover(board):
++    task = incident(board)
++    review_1 = _review_1(board, task)
++    kb._append_event(board, review_1, "reopened", {})
++    assert resumes_review(board, task, [CORE]) is False
++
++
++def test_uncovered_second_captured_pr_stays_held(board, gh):
++    # The awaited parent's sibling approval never covers a captured PR history doesn't cover.
++    task = incident(board, extra_pr=OTHER)
++    prs.clear_cache()
++    gh.calls.clear()
++    assert resumes_review(board, task, [CORE, OTHER]) is False
++    assert gh.calls == []  # refused before any GitHub read
++    assert resumes_review(board, task, [CORE]) is True  # the covered PR alone would resume
++
++
++@pytest.mark.parametrize("r1", [
++    {"reviewed_pr": CORE, "reviewed_sha": HEAD},  # no verdict
++    {"verdict": "approve", "reviewed_pr": CORE},  # no reviewed_sha
++])
++def test_historical_parent_needs_verdict_and_head(board, r1):
++    task = incident(board, r1=r1)
++    assert resumes_review(board, task, [CORE]) is False
++
++
++def test_unclaimed_historical_completion_does_not_cover(board):
++    task = incident(board, r1_claim=False)
++    assert resumes_review(board, task, [CORE]) is False
++
++
++def test_historical_run_that_did_not_complete_does_not_cover(board):
++    def timed_out(conn, review):
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET outcome = 'timed_out' WHERE task_id = ?", (review,))
++    task = incident(board, before_park=timed_out)
++    assert resumes_review(board, task, [CORE]) is False
++
++
++def test_unclaimed_awaited_completion_is_not_ordering_proof(board):
++    task = incident(board, r2_claim=False)
++    assert resumes_review(board, task, [CORE]) is False
++
++
++def test_legacy_checkpoint_without_awaited_list_stays_held(board):
++    task = incident(board)
++    row = board.execute("SELECT id, payload FROM task_events WHERE task_id = ? "
++                        "AND kind = 'dependency_wait'", (task,)).fetchone()
++    payload = json.loads(row["payload"])
++    payload["review_checkpoint"].pop("awaited")
++    with kb.write_txn(board):
++        board.execute("UPDATE task_events SET payload = ? WHERE id = ?", (json.dumps(payload), row["id"]))
++    assert resumes_review(board, task, [CORE]) is False
++
++
++def test_sibling_approval_of_unrelated_pr_still_approves_nothing(board):
++    # An awaited parent approves the holding PR; its awaited sibling approved a PR the
++    # checkpoint never captured. History has nothing to cover, so the caller's rule ("a named
++    # unrelated PR approves nothing") stands.
++    from tests.hermes_cli import test_kanban_dependency_review_mixed as mixed
++    from tests.hermes_cli import test_kanban_dependency_review_split as split
++    task, reviews = split.parked_two_prs(board)
++    mixed.finish(board, reviews, [mixed.approve(split.CORE), mixed.approve(split.MODS + "1")])
++    assert resumes_review(board, task, [split.CORE]) is False
++
++
++def test_unparked_crash_after_review_is_not_a_handoff(board, gh):
++    task = incident(board)
++    assert kb.claim_task(board, task) is not None
++    assert kb.reclaim_task(board, task, reason="Worker died", signal_fn=lambda *_: None)
++    assert resumes_review(board, task, [CORE]) is False
++
++
++def test_each_approval_covers_only_the_pr_it_names(board, gh):
++    # The prerequisite approved OTHER at OTHER_HEAD before the park; CORE then moved to a head
++    # equal to that sha. Its approval of OTHER never covers CORE.
++    gh.heads = {CORE: OTHER_HEAD, OTHER: OTHER_HEAD, STATE: STATE_HEAD}
++    task = incident(board, prerequisite=approve(OTHER, OTHER_HEAD), extra_pr=OTHER)
++    assert resumes_review(board, task, [CORE]) is False
++    assert resumes_review(board, task, [OTHER]) is True
++
++
++def _park(board, task):
++    """(parked_at, owner run id, review_checkpoint) of the owner's dependency park."""
++    row = board.execute("SELECT run_id, created_at, payload FROM task_events WHERE task_id = ? "
++                        "AND kind = 'dependency_wait'", (task,)).fetchone()
++    return kb._to_epoch(row["created_at"]), row["run_id"], json.loads(row["payload"])["review_checkpoint"]
++
++
++def _review_1(board, task):
++    return next(p for p in kb.parent_ids(board, task) if kb.get_task(board, p).title == "review #2097")
++
++
++def test_historical_approval_requires_unchanged_history(board):
++    task = incident(board)
++    parked_at, _, _ = _park(board, task)
++    review_1 = _review_1(board, task)
++    assert hist._historical_approval(board, review_1, parked_at, {CORE}) == ({CORE}, HEAD)
++    kb._append_event(board, review_1, "reopened", {})
++    assert hist._historical_approval(board, review_1, parked_at, {CORE}) is None
++
++
++def test_historical_approval_requires_a_full_sha(board):
++    task = incident(board, r1={"verdict": "approve", "reviewed_pr": CORE, "reviewed_sha": HEAD[:10]})
++    parked_at, _, _ = _park(board, task)
++    assert hist._historical_approval(board, _review_1(board, task), parked_at, {CORE}) is None
++
++
++def test_covers_needs_an_awaited_parent(board, gh):
++    task = incident(board)
++    parked_at, run_id, checkpoint = _park(board, task)
++    kwargs = dict(checkpointed=checkpoint["parents"], named_awaited=checkpoint["awaited"], urls={CORE},
++                  covered=set(), parked_at=parked_at, owner_run_id=run_id, captured={CORE})
++    assert hist.covers(board, parents=checkpoint["awaited"], **kwargs) is True
++    assert hist.covers(board, parents=[], **kwargs) is False
+-- 
+2.43.0
+

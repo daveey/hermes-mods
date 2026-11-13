@@ -1,0 +1,379 @@
+From 12cca5b4557bc42a5730929a3ee7da85e9a85e9a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:29:15 +0000
+Subject: [PATCH] [daveey] lifecycle guard: scan scripts run behind shell
+ reserved words (time, !, if/then, {, coproc)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Inside the supervised gateway `./x.sh` (x.sh = `hermes gateway restart`) was refused, but
+`time ./x.sh`, `! ./x.sh`, `if true; then ./x.sh; fi`, `{ ./x.sh; }` and
+`while false; do ./x.sh; done` ran. Reproduced on main 8ecf7ef242 through
+gateway_lifecycle_block().
+
+Why: the referenced-script walk read each segment at its first non-assignment token and at the
+wrapper-peeled one. A leading reserved word is neither, so the walk took `time`/`!`/`then`/`{`/`do`
+for the command and never opened the script. The interpreter walk (`time python3 x.py`), the
+`sh -c` / `env -S` / `su -c` payload walk (`then bash -c './x.sh'`), the over-budget fail-closed
+path (it only applies to discovered scripts) and `launchctl submit` detection had the same gap.
+time(1) as a program (`/usr/bin/time ./x.sh`, `command time ./x.sh`) was not a wrapper either.
+
+Fix (additive; no reference is ever removed):
+- `_command_segment_views()` yields each segment as written and, when it starts with reserved
+  words, without them (`_peel_command_keywords`, from executes_command_named). The shell-script,
+  interpreter and payload walks and contains_launchctl_submit_command read every view, then
+  peel env assignments and wrappers as before.
+- `_COMMAND_PREFIX_KEYWORDS` gains `coproc` (and `coproc NAME { … }` skips NAME).
+- `time` joins the transparent wrappers, with `-f/--format/-o/--output` taking a value.
+
+Tests: tests/cron/test_lifecycle_guard_reserved_words.py — 51 killing cases (shell scripts,
+sourced scripts, interpreter runs, sh -c payloads, launchctl submit, over-budget fail-closed)
+plus mention/additivity guards; test_hint_survives_reserved_words now goes through the full
+_refuse path, and executes_command_named covers coproc and time(1).
+RED on f56d54960f (base): 62 failed. GREEN: 96 passed; tests/cron + approval/terminal/code
+execution suites 2903 passed, 4 skipped; scripts/check ok.
+
+Card: t_01a1d4cd34067afe
+---
+ cron/lifecycle_guard.py                       |  55 +++++--
+ .../test_lifecycle_guard_reserved_words.py    | 154 ++++++++++++++++++
+ .../test_lifecycle_guard_hermes_sync_hint.py  |  14 +-
+ 3 files changed, 202 insertions(+), 21 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_reserved_words.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 25b8b50222..28b6a1d2b2 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -313,6 +313,8 @@ _ReadRemoteScriptFn = Callable[[str], Optional[str]]
+ _TRANSPARENT_COMMAND_PREFIXES = frozenset({
+     "sudo", "doas", "env", "nohup", "setsid", "nice", "ionice", "stdbuf",
+     "timeout", "exec", "command", "builtin", "eatmydata",
++    # time(1) (`/usr/bin/time x`, `command time x`); the `time` keyword is peeled separately.
++    "time",
+     # Privilege and namespace wrappers: options, then the command they run.
+     "pkexec", "su", "runuser", "setpriv", "systemd-run", "nsenter", "unshare",
+ })
+@@ -326,6 +328,7 @@ _TRANSPARENT_PREFIX_VALUE_OPTIONS = {
+     "ionice": {"-c", "-n", "-p", "--class", "--classdata"},
+     "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+     "timeout": {"-s", "-k", "--signal", "--kill-after"},
++    "time": {"-f", "--format", "-o", "--output"},
+     "pkexec": {"--user"},
+     "su": {"-s", "--shell", "-g", "--group", "-G", "--supp-group"},
+     "runuser": {"-u", "--user", "-s", "--shell", "-g", "--group", "-G", "--supp-group"},
+@@ -882,7 +885,7 @@ def contains_launchctl_submit_command(command: str) -> bool:
+ 
+     See #62891.
+     """
+-    for segment in _iter_command_segments(command):
++    for segment in _iter_command_segment_views(command):
+         index = _executed_command_index(segment)
+         if index is not None and _executable_name(segment[index]) == "launchctl":
+             arguments = segment[index + 1 :]
+@@ -892,15 +895,17 @@ def contains_launchctl_submit_command(command: str) -> bool:
+ 
+ 
+ # Reserved words that may precede a simple command in the same segment (`if hermes-sync`,
+-# `then x`, `! x`, `time -p x`, `{ x; }`); `fi`/`done`/`}` close a list and run nothing.
++# `then x`, `! x`, `time -p x`, `{ x; }`, `coproc x`); `fi`/`done`/`}` close a list and run nothing.
+ _COMMAND_PREFIX_KEYWORDS = frozenset({
+-    "if", "then", "elif", "else", "while", "until", "do", "!", "time", "{",
++    "if", "then", "elif", "else", "while", "until", "do", "!", "time", "{", "coproc",
+ })
+ _MAX_EXECUTES_NAMED_DEPTH = 4
++_SHELL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ 
+ 
+ def _peel_command_keywords(segment: list[str]) -> list[str]:
+-    """*segment* without its leading reserved words (and ``time``'s ``-p``/``--``)."""
++    """*segment* without its leading reserved words (and ``time``'s ``-p``/``--``, and the NAME of
++    ``coproc NAME { … }``)."""
+     index = 0
+     while index < len(segment) and segment[index] in _COMMAND_PREFIX_KEYWORDS:
+         word = segment[index]
+@@ -908,9 +913,27 @@ def _peel_command_keywords(segment: list[str]) -> list[str]:
+         if word == "time":
+             while index < len(segment) and segment[index] in ("-p", "--"):
+                 index += 1
++        elif (word == "coproc" and index + 1 < len(segment) and segment[index + 1] == "{"
++              and _SHELL_NAME.fullmatch(segment[index])):
++            index += 1
+     return segment[index:]
+ 
+ 
++def _command_segment_views(segment: list[str]) -> list[list[str]]:
++    """*segment* as written, then without its leading reserved words when it has any. Callers
++    read every view, so peeling only ever ADDS a reference. Without the peeled view `time ./x.sh`,
++    `if true; then ./x.sh; fi` and `{ ./x.sh; }` read the keyword as the command and never open
++    ``./x.sh``."""
++    peeled = _peel_command_keywords(segment)
++    return [segment, peeled] if peeled and len(peeled) != len(segment) else [segment]
++
++
++def _iter_command_segment_views(command: str) -> Iterator[list[str]]:
++    """Every ``_command_segment_views`` view of every segment of *command*."""
++    for segment in _iter_command_segments(command):
++        yield from _command_segment_views(segment)
++
++
+ def _shell_script_operand(arguments: list[str]) -> Optional[str]:
+     """The script a POSIX shell runs from *arguments*, skipping options and the values of
+     ``-o``/``-O``/``+o``/``+O``; ``None`` for ``-c`` (inline source) or no operand."""
+@@ -1168,20 +1191,22 @@ def _iter_referenced_shell_scripts(
+     command: str, *, cwd: Optional[str] = None, call_arguments: bool = False,
+ ) -> Iterator[Path]:
+     """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
+-    original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
++    original token AND at the peeled wrapper target, both with and without leading reserved words
++    (`time`, `!`, `then`, `{`, …) — additive on purpose: peeling must never REMOVE
+     a reference (a local ``./timeout`` is a script, not the coreutils wrapper). With
+     *call_arguments* the same discovery runs over call-argument segments instead
+     (``expanduser("~/x")``): paths there are interpreter string literals, i.e. mentions."""
+     for segment, is_call_argument in _iter_positioned_command_segments(command):
+         if is_call_argument != call_arguments:
+             continue
+-        index = _command_token_index(segment)
+-        if index is None:
+-            continue
+-        yield from _references_at(segment, index, cwd)
+-        peeled = _peel_transparent_prefixes(segment, index)
+-        if peeled != index:
+-            yield from _references_at(segment, peeled, cwd)
++        for view in _command_segment_views(segment):
++            index = _command_token_index(view)
++            if index is None:
++                continue
++            yield from _references_at(view, index, cwd)
++            peeled = _peel_transparent_prefixes(view, index)
++            if peeled != index:
++                yield from _references_at(view, peeled, cwd)
+ 
+ 
+ # CPython short options that take a value (glued `-Wignore` or the next token), and the ones after
+@@ -1222,7 +1247,7 @@ def _iter_python_interpreter_scripts(command: str, *, cwd: Optional[str] = None)
+     """Yield files a segment runs as ``python3 [options] <file>`` (also behind wrappers:
+     ``/usr/bin/env python3 <file>``). An interpreter is never itself a wrapper, so only the
+     executed command is read."""
+-    for segment in _iter_command_segments(command):
++    for segment in _iter_command_segment_views(command):
+         index = _executed_command_index(segment)
+         if index is None or not _INTERPRETER_IMAGE_RE.match(_executable_name(segment[index]).lower()):
+             continue
+@@ -1241,8 +1266,8 @@ def _python_source_is_unsafe(text: str, budget: _LifecycleScanBudget) -> bool:
+ 
+ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
+     """Yield code passed through ``sh|bash|... -c`` (and ``su -c`` / ``env -S``) for recursive
+-    scanning."""
+-    for segment in _iter_command_segments(command):
++    scanning; reserved words before the shell (`time bash -c …`) are peeled."""
++    for segment in _iter_command_segment_views(command):
+         index = _command_token_index(segment)
+         if index is None:
+             continue
+diff --git a/tests/cron/test_lifecycle_guard_reserved_words.py b/tests/cron/test_lifecycle_guard_reserved_words.py
+new file mode 100644
+index 0000000000..3217864337
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_reserved_words.py
+@@ -0,0 +1,154 @@
++"""Shell reserved words before a command do not hide what it runs.
++
++The referenced-script walk read each segment at its first token and at the wrapper-peeled one, so
++inside the gateway `./x.sh` (x.sh restarting the gateway) was refused while `time ./x.sh`,
++`! ./x.sh`, `if true; then ./x.sh; fi`, `{ ./x.sh; }` and `while false; do ./x.sh; done` ran:
++the walk saw `time`/`!`/`then`/`{`/`do` as the command and never opened the script. The same gap
++let interpreter runs (`time python3 x.py`), `sh -c` payloads (`then bash -c './x.sh'`) and
++`launchctl submit` behind a keyword through.
++"""
++
++from __future__ import annotations
++
++import shlex
++from pathlib import Path
++
++import pytest
++
++from cron import lifecycle_guard
++from cron.lifecycle_guard import contains_launchctl_submit_command, scan_gateway_lifecycle
++
++# Assembled so this file's own text never carries the literal command.
++LIFECYCLE = " ".join(["hermes", "gateway", "re" + "start"])
++
++
++def _executable(path: Path, text: str) -> str:
++    path.write_text(text, encoding="utf-8")
++    path.chmod(0o755)
++    return shlex.quote(str(path))
++
++
++@pytest.fixture
++def script(tmp_path) -> str:
++    return _executable(tmp_path / "x.sh", f"#!/bin/sh\n{LIFECYCLE}\n")
++
++
++@pytest.fixture
++def runner(tmp_path) -> str:
++    return _executable(tmp_path / "runner.py", f"import os\nos.system({LIFECYCLE!r})\n")
++
++
++_KEYWORD_TEMPLATES = [
++    "time {p}",
++    "time -p {p}",
++    "time -p -- {p}",
++    "! {p}",
++    "! time {p}",
++    "if true; then {p}; fi",
++    "if {p}; then :; fi",
++    "if false; then :; elif {p}; then :; fi",
++    "if false; then :; else {p}; fi",
++    "while false; do {p}; done",
++    "while {p}; do :; done",
++    "until {p}; do :; done",
++    "for i in 1; do {p}; done",
++    "{{ {p}; }}",
++    "{{ {p} arg; }} > /dev/null",
++    "if true; then {{ ! {p}; }}; fi",
++    # A keyword, then the env assignments and wrappers the walk already peels.
++    "time FOO=1 {p}",
++    "time nohup {p}",
++    "! sudo -u root {p}",
++    # A keyword before a shell or a sourced script.
++    "time bash {p}",
++    "then sh -o pipefail {p}",
++    "time . {p}",
++    "if true; then source {p}; fi",
++    # coproc runs its command in the background.
++    "coproc {p}",
++    "coproc {{ {p}; }}",
++    "coproc NAME {{ {p}; }}",
++    # The external time(1), also reached through `command`.
++    "/usr/bin/time {p}",
++    "/usr/bin/time -f %e -o /dev/null {p}",
++    "command time -p {p}",
++]
++
++
++@pytest.mark.parametrize("template", _KEYWORD_TEMPLATES)
++def test_script_behind_a_reserved_word_is_scanned(script, template):
++    assert scan_gateway_lifecycle(template.format(p=script)) == (True, None)
++
++
++@pytest.mark.parametrize("template", [
++    "time python3 {p}",
++    "if true; then python3 -u {p}; fi",
++    "! /usr/bin/env python3 {p}",
++    "while false; do timeout 5 python3 {p}; done",
++    "{{ python3 {p}; }}",
++    "/usr/bin/time python3 {p}",
++])
++def test_interpreter_run_behind_a_reserved_word_is_scanned(runner, template):
++    assert scan_gateway_lifecycle(template.format(p=runner)) == (True, None)
++
++
++@pytest.mark.parametrize("template", [
++    "time bash -c {q}",
++    "if true; then sh -c {q}; fi",
++    "! nohup bash -c {q}",
++    "time env -S {q}",
++    "then su -c {q}",
++    "/usr/bin/time bash -c {q}",
++])
++def test_shell_payload_behind_a_reserved_word_is_scanned(script, template):
++    assert scan_gateway_lifecycle(template.format(q=shlex.quote(script))) == (True, None)
++
++
++@pytest.mark.parametrize("command", [
++    "time launchctl submit -l x -- /bin/true",
++    "if true; then launchctl submit -l x -- /bin/true; fi",
++    "! launchctl bootstrap gui/501 /tmp/x.plist",
++    "{ launchctl submit -l x -- /bin/true; }",
++    "/usr/bin/time launchctl submit -l x -- /bin/true",
++])
++def test_launchctl_submit_behind_a_reserved_word_is_detected(command):
++    assert contains_launchctl_submit_command(command)
++    assert scan_gateway_lifecycle(command)[0] is True
++
++
++@pytest.mark.parametrize("template", [
++    "time {p}",
++    "! {p}",
++    "if true; then {p}; fi",
++    "{{ {p}; }}",
++    "while false; do {p}; done",
++])
++def test_unscannable_script_behind_a_reserved_word_fails_closed(tmp_path, monkeypatch, template):
++    monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINES", 50)
++    big = _executable(tmp_path / "big.sh", "#!/bin/sh\n" + "echo ok\n" * 100)
++
++    unsafe, refusal = scan_gateway_lifecycle(template.format(p=big))
++
++    assert unsafe is True
++    assert refusal is not None
++    assert "big.sh" in refusal
++
++
++@pytest.mark.parametrize("template", [
++    # Mentions stay mentions: a keyword spelled as an argument is not a command prefix.
++    "echo time {p}",
++    "echo if {p}",
++    "printf '%s\\n' '!' {p}",
++    "time echo {p}",
++    "if true; then echo {p}; fi",
++    "{{ cat {p}; }}",
++])
++def test_reserved_word_does_not_turn_a_mention_into_a_run(script, template):
++    assert scan_gateway_lifecycle(template.format(p=script)) == (False, None)
++
++
++def test_keyword_peel_is_additive(tmp_path):
++    """A script literally named like a keyword is still read at the original token."""
++    local = _executable(tmp_path / "time", f"#!/bin/sh\n{LIFECYCLE}\n")
++
++    assert scan_gateway_lifecycle(f"{local} arg") == (True, None)
+diff --git a/tests/tools/test_lifecycle_guard_hermes_sync_hint.py b/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
+index d8cdf388e2..86ed3dae88 100644
+--- a/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
++++ b/tests/tools/test_lifecycle_guard_hermes_sync_hint.py
+@@ -122,8 +122,6 @@ def test_hint_survives_shell_options_with_values(tmp_path, monkeypatch, template
+     assert _ROUTE in error
+ 
+ 
+-# The referenced-script walk does not yet peel reserved words, so these are not refused today
+-# (follow-up card); the hint itself must already name the route once they are.
+ @pytest.mark.parametrize("template", [
+     "time {script} mods-pull",
+     "time -p {script} mods-pull",
+@@ -132,13 +130,14 @@ def test_hint_survives_shell_options_with_values(tmp_path, monkeypatch, template
+     "if {script} mods-pull; then echo ok; fi",
+     "while false; do {script} mods-pull; done",
+     "{{ {script} mods-pull; }}",
++    "coproc {script} mods-pull",
+ ])
+-def test_hint_survives_reserved_words(tmp_path, template):
+-    from tools.terminal_tool_guards import _refusal_hint
+-
++def test_hint_survives_reserved_words(tmp_path, monkeypatch, template):
+     script = _script(tmp_path, "hermes-sync", _RESTART)
+ 
+-    assert _ROUTE in _refusal_hint(template.format(script=script))
++    error = _refuse(tmp_path, monkeypatch, template.format(script=script))
++
++    assert _ROUTE in error
+ 
+ 
+ def test_a_shell_option_value_is_not_the_script(tmp_path, monkeypatch):
+@@ -158,6 +157,9 @@ def test_a_shell_option_value_is_not_the_script(tmp_path, monkeypatch):
+     ("then sudo -u ubuntu hermes-sync", True),
+     ("bash -c 'if true; then hermes-sync; fi'", True),
+     ("python3 /x/hermes-sync", True),
++    ("coproc hermes-sync", True),
++    ("coproc SYNC { hermes-sync; }", True),
++    ("/usr/bin/time -f %e hermes-sync", True),
+     ("bash -c 'echo hermes-sync'", False),
+     ("grep hermes-sync log", False),
+     ("echo time hermes-sync", False),
+-- 
+2.43.0
+

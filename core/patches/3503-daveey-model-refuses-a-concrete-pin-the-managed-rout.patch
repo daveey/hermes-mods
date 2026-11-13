@@ -1,0 +1,190 @@
+From 2e57d4ceef2b260f3f2f0738855337474fa33074 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:42:17 +0000
+Subject: [PATCH] [daveey] /model refuses a concrete pin the managed routing
+ registry rejects, and the rejection names it
+
+Under model_routing.enforce_subscription_only a /model or Desktop-picker switch to a model the host's
+registry lacks was saved (on the current provider the credential step swallowed the resolver's
+ManagedPinRejectedError), then every later turn failed with 'Managed subscription policy rejects
+unregistered or ambiguous concrete pin', naming neither the model nor the allowed pins.
+
+- ManagedPinRejectedError's text now names the model, provider and allowed pins, and the way out
+  (/model, or this host's model_routing.routes). Class, .allowed and .registry_empty unchanged.
+- switch_model runs pin_policy on the name it would persist before credentials (new sibling
+  hermes_cli/model_switch_managed.py). Class selectors and hosts without the policy are unchanged.
+
+Self-heal defect agent-27ae0dbd84 (card t_01a1d4e458172558); repeat of t_01a1c68c9c1c515e.
+---
+ agent/model_routing_managed.py                |  7 +-
+ hermes_cli/model_switch.py                    | 12 ++--
+ hermes_cli/model_switch_managed.py            | 31 ++++++++
+ .../test_model_switch_managed_pin.py          | 70 +++++++++++++++++++
+ 4 files changed, 113 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/model_switch_managed.py
+ create mode 100644 tests/hermes_cli/test_model_switch_managed_pin.py
+
+diff --git a/agent/model_routing_managed.py b/agent/model_routing_managed.py
+index f7bafb46c2..2717d4bfb3 100644
+--- a/agent/model_routing_managed.py
++++ b/agent/model_routing_managed.py
+@@ -58,7 +58,12 @@ class ManagedPinRejectedError(ModelRoutingError):
+     def __init__(self, model, provider, allowed):
+         self.model, self.provider, self.allowed = model, provider, list(allowed)
+         self.registry_empty = not self.allowed
+-        super().__init__("Managed subscription policy rejects unregistered or ambiguous concrete pin")
++        # Every chat, gateway.log and alert shows only str(exc): name the pin and the way out.
++        on = f" on provider {provider!r}" if provider else ""
++        allowed_text = ", ".join(self.allowed) or "none (the registry serves no subscription pin)"
++        super().__init__(
++            f"Managed subscription policy rejects unregistered or ambiguous concrete pin {model!r}{on}. "
++            f"Allowed: {allowed_text}. Pick one with /model, or register it in this host's model_routing.routes.")
+ 
+ 
+ def allowed_pins(config):
+diff --git a/hermes_cli/model_switch.py b/hermes_cli/model_switch.py
+index ce15804bb5..6b1b7339ba 100644
+--- a/hermes_cli/model_switch.py
++++ b/hermes_cli/model_switch.py
+@@ -1802,11 +1802,11 @@ def switch_model(
+     *, allow_network: bool = True) -> ModelSwitchResult:
+     """Core model-switching pipeline shared between CLI and gateway.
+ 
+-    Route (PATH A with ``--provider``, else PATH B) -> credentials -> validation -> result; each
+-    step returns a failure :class:`ModelSwitchResult` to stop the chain, or ``None`` to continue.
+-    ``user_providers`` / ``custom_providers`` are the config.yaml ``providers:`` dict and
+-    ``custom_providers:`` list. ``allow_network=False`` makes every models.dev lookup (provider and
+-    alias resolution included) cache-only; provider endpoint validation is unchanged."""
++    Route (PATH A with ``--provider``, else B) -> managed-pin verdict -> credentials -> validation -> result;
++    a step's failure :class:`ModelSwitchResult` stops the chain. ``user_providers`` / ``custom_providers``
++    are config.yaml's ``providers:`` / ``custom_providers:``; ``allow_network=False`` makes models.dev
++    lookups (provider and alias resolution included) cache-only; endpoint validation is unchanged."""
++    from hermes_cli.model_switch_managed import refuse_unregistered_pin
+     st = _Switch(
+         raw_input=raw_input, current_provider=current_provider, current_model=current_model,
+         current_base_url=current_base_url, current_api_key=current_api_key, is_global=is_global,
+@@ -1814,7 +1814,7 @@ def switch_model(
+         new_model=raw_input.strip(), target_provider=current_provider)
+     route = _route_explicit_provider if explicit_provider else _route_from_model_input
+     with models_dev_network_scope(allow_network=allow_network):
+-        for step in (route, _resolve_switch_credentials, _validate_switch):
++        for step in (route, refuse_unregistered_pin, _resolve_switch_credentials, _validate_switch):
+             fail = step(st)
+             if fail is not None:
+                 return fail
+diff --git a/hermes_cli/model_switch_managed.py b/hermes_cli/model_switch_managed.py
+new file mode 100644
+index 0000000000..ee307e6e47
+--- /dev/null
++++ b/hermes_cli/model_switch_managed.py
+@@ -0,0 +1,31 @@
++"""The managed subscription policy's verdict on a ``/model`` switch, before anything is saved. [daveey]
++
++Under ``model_routing.enforce_subscription_only`` every turn resolves a concrete model through
++``pin_policy``. A switch that saved a model this host's registry lacks left a chat that failed every
++later turn, and on the current provider the switch even reported success (the credential step swallows
++the resolver's refusal). This step runs the same check first, on the name the switch would persist.
++Class selectors and hosts without the policy pass unchanged.
++"""
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Optional
++
++if TYPE_CHECKING:
++    from hermes_cli.model_switch import ModelSwitchResult, _Switch
++
++
++def refuse_unregistered_pin(st: _Switch) -> Optional[ModelSwitchResult]:
++    from agent.model_routing import ModelRoutingError, is_class_selector
++    from agent.model_routing_managed import managed_config, pin_policy
++    from hermes_cli.model_normalize import normalize_model_for_provider
++    model = normalize_model_for_provider(st.new_model, st.target_provider) if st.new_model else ""
++    if not model or is_class_selector(model):
++        return None
++    try:
++        managed = managed_config()
++        if managed is not None:
++            pin_policy(model, st.target_provider or None, managed)
++    except ModelRoutingError as exc:
++        return st.fail(str(exc), new_model=model, target_provider=st.target_provider,
++                       provider_label=st.provider_label)
++    return None
+diff --git a/tests/hermes_cli/test_model_switch_managed_pin.py b/tests/hermes_cli/test_model_switch_managed_pin.py
+new file mode 100644
+index 0000000000..9fe2db1863
+--- /dev/null
++++ b/tests/hermes_cli/test_model_switch_managed_pin.py
+@@ -0,0 +1,70 @@
++"""``/model`` refuses a concrete pin the managed routing registry would refuse at every turn. [daveey]
++
++A Desktop chat switched to a model this host's ``model_routing.routes`` lacks: the switch saved it, then
++every turn died before the model with "Managed subscription policy rejects unregistered or ambiguous
++concrete pin", naming neither the model nor what the host allows. The switch now runs the same
++``pin_policy`` check before anything is saved, and the error names the model and the allowed pins.
++"""
++import pytest
++
++from agent.model_routing_managed import ManagedPinRejectedError, allowed_pins, managed_config, pin_policy
++from hermes_cli import model_switch
++from tests.agent import test_managed_subscription as fixtures
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++
++@pytest.fixture
++def offline_validation(monkeypatch):
++    """The catalog check accepts anything: these tests are about the routing registry, not the catalog."""
++    import hermes_cli.models_validate as validate
++    monkeypatch.setattr(validate, "validate_requested_model",
++                        lambda *a, **k: {"accepted": True, "persist": True, "recognized": True, "message": ""})
++
++
++def test_rejection_names_the_model_provider_and_every_allowed_pin(managed):
++    with pytest.raises(ManagedPinRejectedError) as info:
++        pin_policy("claude-fable-5-2", "anthropic", managed_config())
++    text = str(info.value)
++    assert "claude-fable-5-2" in text and "anthropic" in text
++    assert all(model in text for model in info.value.allowed)
++    assert "/model" in text and "model_routing.routes" in text
++    # Class and attributes the Kanban/cron readers rely on are unchanged.
++    assert info.value.model == "claude-fable-5-2" and info.value.provider == "anthropic"
++    assert info.value.allowed and info.value.registry_empty is False
++
++
++@pytest.mark.parametrize("explicit", ["", "anthropic"])
++def test_switch_to_unregistered_model_is_refused_naming_allowed_pins(managed, offline_validation, explicit):
++    result = model_switch.switch_model(
++        "claude-fable-5-2", current_provider="anthropic", current_model="anthropic-deep",
++        explicit_provider=explicit, allow_network=False)
++    assert result.success is False
++    assert "claude-fable-5-2" in result.error_message
++    allowed = allowed_pins(managed_config())
++    assert len(allowed) > 1 and all(model in result.error_message for model in allowed)
++    assert "not connected" not in result.error_message  # a routing verdict, not a missing credential
++
++
++def test_switch_to_registered_model_still_switches(managed, offline_validation):
++    result = model_switch.switch_model(
++        "anthropic-standard", current_provider="anthropic", current_model="anthropic-deep", allow_network=False)
++    assert result.success is True, result.error_message
++    assert result.new_model == "anthropic-standard"
++
++
++def test_policy_off_accepts_any_model(routing_home, offline_validation):
++    result = model_switch.switch_model(
++        "claude-fable-5-2", current_provider="anthropic", current_model="anthropic-deep", allow_network=False)
++    assert result.success is True, result.error_message
++
++
++def test_class_selector_passes_the_pin_verdict(managed):
++    from hermes_cli.model_switch_managed import refuse_unregistered_pin
++    st = model_switch._Switch(
++        raw_input="class:deep", current_provider="anthropic", current_model="anthropic-deep", current_base_url="",
++        current_api_key="", is_global=False, explicit_provider="", user_providers=None, custom_providers=None,
++        new_model="class:deep", target_provider="auto")
++    assert refuse_unregistered_pin(st) is None
+-- 
+2.43.0
+

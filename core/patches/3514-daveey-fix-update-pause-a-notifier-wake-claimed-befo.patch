@@ -1,0 +1,686 @@
+From ea4f9dc74e54a0b85241c529f446f17b49b774aa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:35:37 +0000
+Subject: [PATCH] [daveey] fix(update-pause): a notifier wake claimed before
+ the hold re-queues instead of starting inside it
+
+laptop-1 incident 31763 (hermes-sync 31763-1794567981543, 2026-11-13 PST, core fedc433cef): the restart-safe
+drain lost its 180 s claim lease to the Desktop chat 20261026_235722_bef6c6.
+
+Timeline (agent.log/gateway.log/gui.log, state.db session_admissions, read-only):
+- 02:24:06 the legacy Desktop backend (tui_gateway, pid 63130) starts a turn on bef6c6 that holds the
+  cross-process session turn lease for 2586 s.
+- 02:54:34 the canonical gateway (pid 63148) claims the next FIFO row of the same chat, admission
+  fba3e1457ef2441db0a6e03080e204c4 (seq 4233): the folded Kanban-wake batch ("28 Kanban task updates ...",
+  identity ["kanban-wake", route, ...] = request_id, so session_notifier_drain.notifier_wake is True).
+  No hold exists yet, so the claim's notifier-hold check passes. Its agent turn then blocks in
+  turn_facade.admit_durable_turn_lease behind the Desktop turn.
+- 03:06:22 the drain takes its claim hold; 03:07:04 it asks the 4 live turns to pause.
+- 03:07:12.09 the Desktop turn parks (paused_for_update) and releases the lease. 12.278 the legacy backend's own
+  queued-prompt drain is correctly refused (HOLD_MESSAGE). 12.353 the gateway turn that had been waiting on
+  the lease acquires it and STARTS (platform=desktop, history=105) inside the window.
+- 03:07:21 that turn's turn-start preflight compression runs (deep aux model): no step boundary for ~2 min.
+- 03:09:04 reclaim preflight refuses ("unmatched gateway work"); 03:09:07 the wake parks; 03:09:22 lease lost.
+
+Five whys:
+1. Why did a new turn start in the window? A wake admission claimed at 02:54 began executing at 03:07:12.
+2. Why did it begin then? Its turn waited on the session turn lease, and the lease freed the moment the
+   Desktop turn parked for the update.
+3. Why was the hold not checked? The claim checks the hold class (session_notifier_drain.eligible) once, at
+   claim time; nothing re-checked it when the claimed turn actually began.
+4. Why could the turn not just pause? A turn pauses only at a completed-tool step boundary (gateway checkpoints
+   need a persisted tool suffix); a turn that has not started has none, and its turn-start compression cannot
+   yield (compression_can_yield excludes turn-start preflight: there is no boundary to land on).
+5. Root cause: claim admission and turn start are separated by an unbounded wait, and the hold contract
+   ("new turns wait in their backend's queue") was enforced only at the first.
+It was NOT session_auto_continue._drain_queued_prompt (that drain was refused at 12.278) and not a queued claim
+during the hold (_claim_next skips held notifier wakes).
+
+Fix:
+- agent/update_pause_cancel.py: pause_before_turn (already run after the lease is acquired and before the turn
+  body, i.e. before the turn-start compression) also asks a per-run gate, vars(agent)["update_yield_before_turn"].
+  A truthy reason ends the turn unstarted (no request, nothing persisted, transcript unchanged) and the result
+  carries update_pause_unstarted=True.
+- gateway/session_update_pause_ingress.py + session_update_pause_hook.py: for a fresh claim of the claim-held
+  class (a notifier wake, not a resumed checkpoint) the bound scope carries the claim's own hold test
+  (session_notifier_drain.held_noted); the installed hook sets the gate for that run and removes it after. A
+  user Stop or steer pending wins. Humans and checkpoint resumes are untouched (they keep their admission
+  semantics under the hold).
+- gateway/run_turn_runner.py: project_paused_result passes the unstarted marker through.
+- hermes_state_update_pause.requeue_unstarted_input: guarded started -> queued for the exact owner epoch and
+  generation; refused once any transcript row of the conversation's chain postdates the claim's transcript_mark,
+  or a worker, steering transfer or checkpoint exists. seq is untouched (the row is the FIFO head again) and the
+  old generation is fenced (its settle/checkpoint refuse).
+- gateway/session_update_pause.park_or_interrupt: an unstarted pause re-queues (waiters and media stay with the
+  row, execution stamp cleared, pending accounting republished); the drain then sees notifier_held and waits
+  until the hold lifts. A refused re-queue falls back to the existing checkpoint path.
+
+Compression decision: compression stays NOT a pause point. Turn-start/idle/engine preflight compressions have no
+step boundary to park on (a gateway checkpoint needs a completed tool suffix; the Desktop side refuses them in
+compression_can_yield for the same reason, review 5878929471 on #1617), and mid-turn post-tool/pre-API
+compressions are already cancellable through the update cancel. The bug was entering a turn whose pause predated
+it; the turn-start gate now runs before that compression, so such a turn never reaches it.
+
+Tests:
+- tests/gateway/test_update_hold_claimed_wake.py: composed GatewayRunner + SessionAuthority + real
+  admit_route_wake: a wake claimed before the hold, whose turn begins after it, goes back to queued (unsettled,
+  unrun, not parked, execution cleared), stays queued across claim polls while held, then runs once as the same
+  admission and completes after the lift. RED on origin/main ("the wake began its turn inside the update hold").
+  Plus: a human row gets no turn-start gate.
+- tests/agent/test_update_yield_before_turn.py: real AIAgent: the gate yields before any model request,
+  persistence or turn-start compression (_compress_context never called); open and failing gates run normally.
+- tests/hermes_state/test_requeue_unstarted_input.py: FIFO head again, old generation fenced, re-claim bumps the
+  generation; refused after a transcript write, for another generation/epoch, and after settlement.
+---
+ agent/update_pause_cancel.py                  |  39 ++++-
+ gateway/run_turn_runner.py                    |   5 +-
+ gateway/session_update_pause.py               |  39 +++++
+ gateway/session_update_pause_hook.py          |  23 ++-
+ gateway/session_update_pause_ingress.py       |  14 +-
+ hermes_state_update_pause.py                  |  40 +++++
+ tests/agent/test_update_yield_before_turn.py  |  84 +++++++++++
+ .../gateway/test_update_hold_claimed_wake.py  | 142 ++++++++++++++++++
+ .../test_requeue_unstarted_input.py           |  78 ++++++++++
+ 9 files changed, 452 insertions(+), 12 deletions(-)
+ create mode 100644 tests/agent/test_update_yield_before_turn.py
+ create mode 100644 tests/gateway/test_update_hold_claimed_wake.py
+ create mode 100644 tests/hermes_state/test_requeue_unstarted_input.py
+
+diff --git a/agent/update_pause_cancel.py b/agent/update_pause_cancel.py
+index 332cc84d04..a4b775ddfc 100644
+--- a/agent/update_pause_cancel.py
++++ b/agent/update_pause_cancel.py
+@@ -205,21 +205,44 @@ def first_request_can_pause(agent: Any) -> bool:
+     return getattr(agent, FIRST_REQUEST_ATTR, False) is True
+ 
+ 
+-def pause_before_turn(agent: Any, conversation_history: Any) -> dict | None:
+-    """The result of a continuation that yields to an already-pending pause before its turn starts: no request,
+-    nothing persisted, the transcript unchanged (the next continuation sends the same note). None otherwise."""
+-    hook = getattr(agent, "step_boundary_pause", None)
+-    if not first_request_can_pause(agent) or not callable(hook):
+-        return None
++# [daveey] t_01a1d49d50e4c656: a per-run gate the gateway installs (``vars(agent)``, never a class attribute) for a
++# fresh claim whose admission class the claim itself would now hold (a notifier wake under a core-update claim hold).
++# The claim checked the hold once, but its turn may begin much later: it waits on the cross-process session turn
++# lease first (laptop-1 incident 31763: claimed 02:54, started 03:07:12 inside the drain window, right after the
++# Desktop backend's turn holding the lease parked). Asked once the lease is held and before anything of the turn
++# runs; a truthy reason ends it unstarted and the result carries ``UNSTARTED_KEY`` so the gateway re-queues the
++# admission in its FIFO place instead of checkpointing a boundary that does not exist.
++BEFORE_TURN_ATTR = "update_yield_before_turn"
++UNSTARTED_KEY = "update_pause_unstarted"
++
++
++def _ask(hook: Any) -> Any:
+     try:
+-        reason = hook() or None
++        return hook() or None
+     except Exception:  # health: allow BLE001 -- a failing pause hook never pauses (as _step_boundary_pause)
+         return None
++
++
++def pause_before_turn(agent: Any, conversation_history: Any) -> dict | None:
++    """The result of a turn that yields to an already-pending pause before it starts: no request, nothing persisted,
++    the transcript unchanged (the next continuation sends the same note; a re-queued admission runs as it was).
++    None otherwise. Runs before the turn-start compression preflight: that compression has no step boundary to
++    land on (``compression_can_yield``), so a turn whose pause predates it must never enter it."""
++    hook = getattr(agent, "step_boundary_pause", None)
++    reason = _ask(hook) if first_request_can_pause(agent) and callable(hook) else None
++    unstarted = False
++    if not reason:
++        try:
++            gate = vars(agent).get(BEFORE_TURN_ATTR)
++        except TypeError:
++            gate = None
++        reason = _ask(gate) if callable(gate) else None
++        unstarted = bool(reason)
+     if not reason:
+         return None
+     return {"final_response": "", "messages": list(conversation_history or []), "api_calls": 0,
+             "completed": False, "interrupted": True, "paused_for_update": reason,
+-            "turn_exit_reason": f"paused_for_update({reason})"}
++            "turn_exit_reason": f"paused_for_update({reason})", **({UNSTARTED_KEY: True} if unstarted else {})}
+ 
+ 
+ def model_yield_requested(agent: Any) -> bool:
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index b4ed4650fe..2bce94fd52 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -93,7 +93,10 @@ def project_paused_result(result, common: dict) -> dict | None:
+     empty-response error, no media tags) so the authority can branch before terminal settlement."""
+     if not paused_update_result(result):
+         return None
+-    return {"final_response": "", "paused_for_update": True, **common}
++    from agent.update_pause_cancel import UNSTARTED_KEY
++    # [daveey] t_01a1d49d50e4c656: an unstarted yield has no boundary to checkpoint; the authority re-queues it.
++    unstarted = {UNSTARTED_KEY: True} if result.get(UNSTARTED_KEY) is True else {}
++    return {"final_response": "", "paused_for_update": True, **common, **unstarted}
+ 
+ 
+ def _persisted_turn(agent, agent_history, result, compressions) -> dict | None:
+diff --git a/gateway/session_update_pause.py b/gateway/session_update_pause.py
+index 79579868a3..c74d995d64 100644
+--- a/gateway/session_update_pause.py
++++ b/gateway/session_update_pause.py
+@@ -127,6 +127,10 @@ async def park_or_interrupt(authority, live, ref, row):
+         remember_claim(authority, ref.session_id, row)
+         if stopped(authority, row):
+             return await settle_interrupted(authority, live, ref, row)
++        if unstarted_result(authority, row):
++            requeued = await requeue_unstarted(authority, live, ref, row)
++            if requeued is not None:
++                return requeued
+         try:
+             receipt = await tracked_write(authority, partial(checkpoint_session_input, authority.db,
+                 epoch=authority.epoch, admission_id=row['admission_id'], generation=row['generation'],
+@@ -148,6 +152,41 @@ async def park_or_interrupt(authority, live, ref, row):
+         return True
+ 
+ 
++def unstarted_result(authority, row):
++    """[daveey] t_01a1d49d50e4c656: the paused result of a turn that yielded before it started (no boundary)."""
++    from agent.update_pause_cancel import UNSTARTED_KEY
++    result = (authority.pending_results.get(row['admission_id']) or {}).get('result')
++    return isinstance(result, dict) and result.get(UNSTARTED_KEY) is True
++
++
++async def requeue_unstarted(authority, live, ref, row):
++    """Hand an unstarted claim back to its FIFO place (caller holds the claim gate and mutation lock); the
++    waiter and media stay with the queued row. None when the store refuses: the caller's checkpoint path
++    then decides (and settles it interrupted, as any unparkable pause)."""
++    from gateway.session_runtime_workers import tracked_write, persist_work_count
++    from hermes_state_runtime import RuntimeStoreError
++    from hermes_state_update_pause import requeue_unstarted_input
++    try:
++        await tracked_write(authority, partial(requeue_unstarted_input, authority.db, epoch=authority.epoch,
++            admission_id=row['admission_id'], generation=row['generation'], transcript_mark=row['transcript_mark']))
++    except RuntimeStoreError as exc:
++        logging.getLogger(__name__).warning('Unstarted gateway turn could not be re-queued for update: session=%s '
++                                            'admission=%s (%s)', ref.session_id, row['admission_id'], exc)
++        return None
++    authority.pending_results.pop(row['admission_id'], None)
++    previous = authority.update_claims.pop(ref.session_id, None)
++    if previous is not None:
++        authority.update_stops.discard(previous[0])
++    with live.event_stream.lock:
++        live.event_stream.execution = {}
++        authority.adopted.pop(ref.session_id, None)
++    logging.getLogger(__name__).info('Re-queued unstarted gateway turn for update hold: session=%s admission=%s '
++                                     'generation=%s', ref.session_id, row['admission_id'], row['generation'])
++    authority._publish_pending(ref)
++    persist_work_count(authority)
++    return True
++
++
+ def stopped(authority, row):
+     return (row['admission_id'] in authority.update_stops
+             or authority.pending_stops.get(row['target_session_id']) == row['generation']
+diff --git a/gateway/session_update_pause_hook.py b/gateway/session_update_pause_hook.py
+index a6188fd39c..716388c3d9 100644
+--- a/gateway/session_update_pause_hook.py
++++ b/gateway/session_update_pause_hook.py
+@@ -41,6 +41,9 @@ class UpdatePauseScope:
+     resuming: bool = False
+     # Omitted only by deliberate direct unit usage; production always supplies an event id.
+     message_id: Any = _MISSING
++    # [daveey] t_01a1d49d50e4c656: True while the claim would now hold this admission (``claim_hold_gate``);
++    # None for a row the claim never holds (a human, a resumed checkpoint).
++    claim_held: Callable[[], bool] | None = None
+ 
+ 
+ _scope: contextvars.ContextVar[UpdatePauseScope | None] = contextvars.ContextVar(
+@@ -57,8 +60,9 @@ def current_scope(message_id: Any = _MISSING) -> UpdatePauseScope | None:
+ 
+ @contextmanager
+ def bind_scope(home: str | Path, *, eligible: bool, resuming: bool = False,
+-               message_id: Any = _MISSING) -> Iterator[UpdatePauseScope]:
+-    scope = UpdatePauseScope(Path(home), bool(eligible), bool(resuming), message_id)
++               message_id: Any = _MISSING, claim_held: Callable[[], bool] | None = None) -> Iterator[UpdatePauseScope]:
++    scope = UpdatePauseScope(Path(home), bool(eligible), bool(resuming), message_id,
++                             None if resuming else claim_held)
+     token = _scope.set(scope)
+     try:
+         yield scope
+@@ -90,6 +94,17 @@ def boundary_hook(agent: Any, root: Path) -> Callable[[], str | None]:
+     return hook
+ 
+ 
++def before_turn_gate(agent: Any, claim_held: Callable[[], bool]) -> Callable[[], str | None]:
++    """[daveey] t_01a1d49d50e4c656: the turn-start gate (``agent.update_pause_cancel.BEFORE_TURN_ATTR``) of a fresh
++    claim the claim would now hold. A user Stop or steer pending wins, as at a boundary."""
++    def gate() -> str | None:
++        from tui_gateway.update_pause import PAUSE_REASON
++        if not claim_held() or stop_or_steer_pending(agent):
++            return None
++        return PAUSE_REASON
++    return gate
++
++
+ def mid_tool_cancel_step(agent: Any, root: Path, state: dict) -> list[str] | None:
+     """One poll of ``start_mid_tool_cancel``: the cancelled call ids once a requested pause has waited
+     ``MID_TOOL_GRACE_S`` on a running call (from the later of the request's first sighting and the
+@@ -148,15 +163,19 @@ def installed(agent: Any, scope: UpdatePauseScope | None = None, *,
+     if scope is None or not scope.eligible:
+         yield False
+         return
++    from agent.update_pause_cancel import BEFORE_TURN_ATTR
+     prior = vars(agent).get(_HOOK_ATTR, _MISSING)
+     root = fence_root(scope.home)
+     setattr(agent, _HOOK_ATTR, boundary_hook(agent, root))
+     vars(agent)[_PAUSABLE_ATTR] = True
++    if scope.claim_held is not None:
++        vars(agent)[BEFORE_TURN_ATTR] = before_turn_gate(agent, scope.claim_held)
+     stop_watcher = start_mid_tool_cancel(agent, root)
+     try:
+         yield True
+     finally:
+         stop_watcher()
++        vars(agent).pop(BEFORE_TURN_ATTR, None)
+         vars(agent).pop(_PAUSABLE_ATTR, None)
+         if prior is _MISSING:
+             vars(agent).pop(_HOOK_ATTR, None)
+diff --git a/gateway/session_update_pause_ingress.py b/gateway/session_update_pause_ingress.py
+index cc08fe83f5..4692902823 100644
+--- a/gateway/session_update_pause_ingress.py
++++ b/gateway/session_update_pause_ingress.py
+@@ -50,10 +50,22 @@ def pause_scope(authority, row, event, live, *, is_api):
+                  if key != 'api_text'}
+     cli = cli_turn_scope(event.message_id, committed) if row.get('update_resume') else nullcontext()
+     with display, cli, bind_scope(_profile_home(authority), eligible=supported(authority, row, event, live, is_api=is_api),
+-                             resuming=bool(row.get('update_resume')), message_id=event.message_id):
++                             resuming=bool(row.get('update_resume')), message_id=event.message_id,
++                             claim_held=claim_hold_gate(row)):
+         yield
+ 
+ 
++def claim_hold_gate(row):
++    """[daveey] t_01a1d49d50e4c656: the claim's own hold test for this row's class, re-asked at turn start (None:
++    the claim never holds the row). A notifier wake waits queued under a core-update claim hold
++    (``session_notifier_drain.eligible``); one claimed before the hold may start long after it (a session turn
++    lease wait), so its turn re-asks and, held, the admission goes back to its FIFO place (``requeue_unstarted``)."""
++    from gateway import session_notifier_drain
++    if row.get('update_resume') or not session_notifier_drain.notifier_wake(row):
++        return None
++    return lambda: session_notifier_drain.held_noted()
++
++
+ def retain_pause(authority, row, result, captured, *, native):
+     """Keep nonterminal state until the fully unwound handler can be checkpointed."""
+     from gateway.session_update_pause_hook import is_paused
+diff --git a/hermes_state_update_pause.py b/hermes_state_update_pause.py
+index 914e4c007a..4317dc42dd 100644
+--- a/hermes_state_update_pause.py
++++ b/hermes_state_update_pause.py
+@@ -178,6 +178,46 @@ def resume_session_checkpoint(db, *, epoch, admission_id, _guard=None):
+     return db._execute_write(write)
+ 
+ 
++def requeue_unstarted_input(db, *, epoch, admission_id, generation, transcript_mark):
++    """[daveey] t_01a1d49d50e4c656: hand an exact started generation that never began its turn back to its FIFO place.
++
++    The claim held no proof of a boundary because the turn wrote nothing: refused (``invalid_checkpoint``) once any
++    transcript row of the conversation's chain postdates the claim's ``transcript_mark``, or once a worker, a
++    steering transfer or a checkpoint exists for it. ``seq`` is untouched, so the row is the FIFO head again and
++    the next claim re-validates it (a held notifier wake then waits queued). The old generation is fenced: its
++    status is no longer started, so its settlement and checkpoint writes refuse."""
++    _text(admission_id)
++    def write(conn):
++        _epoch(conn, epoch)
++        row = _admission(conn, admission_id)
++        logical = row['target_session_id']
++        if (row['status'] != 'started' or row['owner_epoch'] != epoch or type(generation) is not int
++                or row['generation'] != generation or _session(conn, logical)['runtime_generation'] != generation):
++            raise RuntimeStoreError('stale_generation')
++        if type(transcript_mark) is not int or transcript_mark < 0:
++            _refuse('invalid transcript mark')
++        from hermes_state_runtime_workers import worker_states
++        if worker_states(conn, logical):
++            _refuse('worker execution is live or uncertain')
++        if conn.execute("SELECT 1 FROM session_admissions WHERE target_session_id=? AND status='terminal' "
++                        "AND outcome='steering' AND owner_epoch=? AND generation=? LIMIT 1",
++                        (logical, epoch, generation)).fetchone():
++            _refuse('steering transfer exists')
++        if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (CHECKPOINT_PREFIX + admission_id,)).fetchone():
++            _refuse('checkpoint exists')
++        from hermes_state_local_lineage import local_physical_target
++        chain = sorted({logical, *_canonical_chain(conn, local_physical_target(conn, logical))})
++        marks = ','.join('?' * len(chain))
++        if conn.execute(f'SELECT 1 FROM messages WHERE session_id IN ({marks}) AND id>? LIMIT 1',
++                        (*chain, transcript_mark)).fetchone():
++            _refuse('turn wrote its transcript')
++        conn.execute("UPDATE session_admissions SET status='queued',generation=NULL WHERE admission_id=? "
++                     "AND status='started'", (admission_id,))
++        conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (logical,))
++        return _row(_admission(conn, admission_id))
++    return db._execute_write(write)
++
++
+ def recover_checkpointed_inputs(conn, epoch):
+     """Old started attempts without exact proof become unknown; return their count."""
+     changed = 0
+diff --git a/tests/agent/test_update_yield_before_turn.py b/tests/agent/test_update_yield_before_turn.py
+new file mode 100644
+index 0000000000..23ac1985a9
+--- /dev/null
++++ b/tests/agent/test_update_yield_before_turn.py
+@@ -0,0 +1,84 @@
++"""[daveey] t_01a1d49d50e4c656: a turn whose admission the claim would now hold yields before it starts.
++
++laptop-1 incident 31763 (2026-11-13 PST): the canonical gateway claimed a folded Kanban-wake batch on the
++Desktop chat 20261026_235722_bef6c6 at 02:54, BEFORE the core-update hold; its agent turn then waited on the
++session turn lease held by the legacy Desktop backend's own 43-minute turn. That turn parked for the update at
++03:07:12.09 and released the lease; within ~100 ms the waiting gateway turn acquired it and started (03:07:12.353,
++history=105) INSIDE the drain window, ran a turn-start preflight compression (deep aux model, no step boundary)
++and parked only at 03:09:07, 3 s after the reclaim preflight refused "unmatched gateway work".
++
++The claim's hold check (``session_notifier_drain.eligible``) ran once, at 02:54. The gateway now installs an
++``update_yield_before_turn`` gate for a fresh claim of a claim-held class (a notifier wake): the agent asks it
++after the lease is acquired and before anything of the turn runs (no request, no persistence, no turn-start
++compression), and the gateway hands the admission back to its FIFO place.
++"""
++
++from __future__ import annotations
++
++from unittest.mock import patch
++
++from agent.update_pause_cancel import BEFORE_TURN_ATTR, UNSTARTED_KEY
++from tests.agent.test_step_boundary_pause import _final_response, _make_agent
++
++HISTORY = [{"role": "user", "content": "earlier"}, {"role": "assistant", "content": "ok"}]
++
++
++def _run(agent, events, message="[IMPORTANT: 28 Kanban task updates arrived while this session was busy]"):
++    agent.client.chat.completions.create.side_effect = [_final_response()]
++
++    def _persist(messages, *_a, **_k):
++        events.append(("persist", [m.get("role") for m in messages]))
++
++    with (
++        patch.object(agent, "_flush_messages_to_session_db", return_value=True),
++        patch.object(agent, "_persist_session", side_effect=_persist),
++        patch.object(agent, "_save_trajectory"),
++        patch.object(agent, "_cleanup_task_resources"),
++    ):
++        return agent.run_conversation(message, conversation_history=[dict(m) for m in HISTORY])
++
++
++def test_held_claim_yields_before_the_turn_starts_without_compressing():
++    events: list = []
++    agent = _make_agent(events)
++    # The turn-start preflight would compress (the 03:07:21 deep-aux compression): it must never be entered.
++    agent.compression_enabled = True
++    agent.context_compressor.should_compress_preflight.return_value = True
++    asked: list = []
++    vars(agent)[BEFORE_TURN_ATTR] = lambda: asked.append(1) or "core_update_pause"
++
++    with patch.object(agent, "_compress_context") as compress:
++        result = _run(agent, events)
++
++    assert asked == [1]
++    assert agent.client.chat.completions.create.call_count == 0
++    assert compress.call_count == 0
++    assert result["paused_for_update"] == "core_update_pause"
++    assert result[UNSTARTED_KEY] is True
++    assert result["interrupted"] is True and result["completed"] is False and result["api_calls"] == 0
++    assert result["messages"] == HISTORY  # the wake text was never added
++    assert not [e for e in events if e[0] == "persist"]
++
++
++def test_open_gate_runs_the_turn_normally():
++    events: list = []
++    agent = _make_agent(events)
++    asked: list = []
++    vars(agent)[BEFORE_TURN_ATTR] = lambda: asked.append(1) or None
++
++    result = _run(agent, events)
++
++    assert asked == [1]
++    assert result["final_response"] == "done"
++    assert not result.get("paused_for_update") and UNSTARTED_KEY not in result
++
++
++def test_failing_gate_never_pauses():
++    events: list = []
++    agent = _make_agent(events)
++
++    def _boom():
++        raise RuntimeError("fence unreadable")
++    vars(agent)[BEFORE_TURN_ATTR] = _boom
++
++    assert _run(agent, events)["final_response"] == "done"
+diff --git a/tests/gateway/test_update_hold_claimed_wake.py b/tests/gateway/test_update_hold_claimed_wake.py
+new file mode 100644
+index 0000000000..b6234f1424
+--- /dev/null
++++ b/tests/gateway/test_update_hold_claimed_wake.py
+@@ -0,0 +1,142 @@
++"""[daveey] t_01a1d49d50e4c656: a notifier wake claimed before a core-update hold never starts inside it.
++
++laptop-1 incident 31763 (2026-11-13 PST): the gateway claimed a folded Kanban-wake batch for the Desktop chat
++20261026_235722_bef6c6 at 02:54, before the hold. Its turn then waited on the session turn lease (a Desktop
++backend turn held it) until 03:07:12, when that turn parked for the update; the waiting wake started at once,
++inside the drain window, and kept the reclaim from finding the chat idle. A claim is checked against the hold
++once; the turn it hands off may begin much later.
++
++Contract: a queued notifier wake waits in its FIFO while the hold is on (``session_notifier_drain``). A claimed
++one whose turn has not begun when the hold comes on yields before its turn starts and goes back to its FIFO
++place, queued, unsettled and unrun; it runs once the hold lifts. A human or a resumed checkpoint is untouched.
++"""
++import asyncio
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.session_results import execution_result
++
++
++def _turn_start(agent_history, event):
++    """What TurnRunner does for the agent run: install the hook for the bound scope, then the agent's own
++    turn-start check (``conversation_loop`` runs it after acquiring the session turn lease)."""
++    from agent.update_pause_cancel import pause_before_turn
++    from gateway.run_turn_runner import project_paused_result
++    from gateway.session_update_pause_hook import installed
++    agent = SimpleNamespace()
++    with installed(agent, message_id=event.message_id):
++        paused = pause_before_turn(agent, agent_history)
++    return None if paused is None else project_paused_result(paused, {})
++
++
++@pytest.mark.asyncio
++async def test_wake_claimed_before_the_hold_goes_back_to_its_fifo_until_the_hold_lifts(tmp_path, monkeypatch):
++    from gateway import session_notifier_drain, session_update_pause
++    from gateway.config import GatewayConfig
++    from gateway.run import GatewayRunner
++    from gateway.session_authority import initialize_session_authority
++    from gateway.session_automation import admit_route_wake
++    from gateway.session_contract import SessionActor
++    from gateway.session_local import create_local_session
++    from hermes_cli import admission_fence
++    from hermes_state import SessionDB
++    from hermes_state_runtime import list_session_admissions
++    from tests.waiting import async_wait_until
++
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
++    db = SessionDB(tmp_path / 'state.db')
++    runner.session_store._db = runner._session_db = db
++    authority = await initialize_session_authority(runner, profile_id='default', instance_id='wake-hold', db=db)
++    held, asked = [False], []
++    monkeypatch.setattr(session_notifier_drain, 'held', lambda: asked.append(1) or held[0])
++    monkeypatch.setattr(session_update_pause, 'update_held', lambda authority: held[0])
++    monkeypatch.setattr(admission_fence, 'pause_requested', lambda root: held[0])
++    started, ran = [], []
++
++    async def turn(event, source, quick_key, run_generation):
++        started.append(event.text)
++        # The turn waited on the session turn lease (another backend's turn held it) across the start
++        # of the hold: the hold is on by the time this turn would begin.
++        held[0] = True
++        projected = _turn_start([], event)
++        if projected is not None:
++            execution_result.get()['result'] = projected
++            return None
++        ran.append(event.text)
++        execution_result.get()['result'] = {'final_response': 'done', 'messages': []}
++        return 'done'
++
++    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
++    try:
++        viewer = SessionActor('test-owner', 'default', frozenset(
++            {'session:create', 'session:submit', 'session:read'}), 'viewer')
++        ref = create_local_session(authority, viewer, dict(request_id='cli', source='tui', model='fixture',
++                                                          cwd=str(tmp_path), toolsets=[]))
++        await authority.attach(viewer, ref, history=False)
++        live = authority.sessions[ref.session_id]
++        adapter = runner._adapter_for_source(live.source)
++        wake = '[IMPORTANT: 28 Kanban task updates arrived while this session was busy]'
++        assert await admit_route_wake(runner, adapter, live.source, wake, 'kanban-wake') is True
++        await async_wait_until(lambda: len(started) == 1, timeout=10, what='the wake was claimed')
++
++        def requeued():
++            rows = list_session_admissions(db, session_id=ref.session_id)
++            return [(r['status'], r['outcome']) for r in rows] == [('queued', None)] \
++                and not authority.pending_results and authority.sessions[ref.session_id].event_stream.execution == {}
++        await async_wait_until(lambda: requeued() or bool(ran), timeout=10, what='the wake settled its first claim')
++        assert ran == [], 'the wake began its turn inside the update hold'
++        assert requeued() and not authority.update_parked
++        assert not authority.executing
++
++        # The drain keeps it queued behind the held claim (several claim polls), never re-claiming it.
++        polls = len(asked)
++        authority._schedule(ref)
++        await async_wait_until(lambda: len(asked) >= polls + 3, timeout=10, what='the drain re-read the hold')
++        assert len(started) == 1 and requeued()
++        first_id = list_session_admissions(db, session_id=ref.session_id)[0]['admission_id']
++
++        async def later(event, source, quick_key, run_generation):
++            started.append(event.text)
++            assert _turn_start([], event) is None
++            ran.append(event.text)
++            execution_result.get()['result'] = {'final_response': 'done', 'messages': []}
++            return 'done'
++        monkeypatch.setattr(runner, '_handle_message_with_agent', later)
++        held[0] = False  # the hold lifts
++        authority._schedule(ref)
++        await async_wait_until(lambda: ran == [wake], timeout=10, what='the wake ran after the hold lifted')
++        await asyncio.wait_for(authority.sessions[ref.session_id].task, 10)
++        rows = list_session_admissions(db, session_id=ref.session_id, pending_only=False)
++        assert [(r['admission_id'], r['status'], r['outcome']) for r in rows] == [
++            (first_id, 'terminal', 'completed')]  # the same admission, run once
++    finally:
++        held[0] = False
++        tasks = [live.task for live in authority.sessions.values() if live.task]
++        for task in tasks:
++            if not task.done():
++                task.cancel()
++        await asyncio.gather(*tasks, return_exceptions=True)
++        db.close()
++
++
++@pytest.mark.asyncio
++async def test_human_turn_claimed_before_the_hold_still_runs(tmp_path, monkeypatch):
++    """Humans keep their admission semantics under the claim hold: only the held class yields."""
++    from gateway import session_notifier_drain, session_update_pause
++    from gateway.session_update_pause_ingress import pause_scope
++    from gateway.session_update_pause_hook import installed
++    from agent.update_pause_cancel import BEFORE_TURN_ATTR
++    monkeypatch.setattr(session_notifier_drain, 'held', lambda: True)
++    monkeypatch.setattr(session_update_pause, 'update_held', lambda authority: True)
++    authority = SimpleNamespace(profile_id=str(tmp_path))
++    monkeypatch.setattr('gateway.session_tui_ops._profile_home', lambda authority: tmp_path)
++    live = SimpleNamespace(source=SimpleNamespace(platform=SimpleNamespace(value='local')))
++    event = SimpleNamespace(message_id='m1')
++    human = {'payload': {'text': 'hi'}, 'request_id': 'r', 'principal_id': 'uid:501'}
++    with pause_scope(authority, human, event, live, is_api=False):
++        agent = SimpleNamespace()
++        with installed(agent, message_id='m1') as hooked:
++            assert hooked
++            assert BEFORE_TURN_ATTR not in vars(agent)
+diff --git a/tests/hermes_state/test_requeue_unstarted_input.py b/tests/hermes_state/test_requeue_unstarted_input.py
+new file mode 100644
+index 0000000000..694989fc27
+--- /dev/null
++++ b/tests/hermes_state/test_requeue_unstarted_input.py
+@@ -0,0 +1,78 @@
++"""[daveey] t_01a1d49d50e4c656: ``requeue_unstarted_input`` hands a claim that never began its turn back to its FIFO place.
++
++Only an exact, unstarted generation: nothing of the conversation's transcript may postdate the claim, and the old
++generation is fenced (its settlement refuses) once the row is queued again.
++"""
++import json
++
++import pytest
++
++import hermes_state_runtime as rt
++from hermes_state import SessionDB
++from hermes_state_update_pause import requeue_unstarted_input
++from tests.hermes_state.test_notifier_claim_eligibility import wake_payload
++
++
++@pytest.fixture
++def claimed(tmp_path):
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    db.create_session('s', source='test')
++    epoch = rt.begin_runtime_epoch(db, instance_id='owner')
++    identity = json.dumps(['kanban-wake', 'route', 'one'])
++    wake = rt.admit_session_input(db, epoch=epoch, session_id='s', principal_id='automation:route',
++                                  request_id=identity, payload=wake_payload(identity, local=True))
++    rt.admit_session_input(db, epoch=epoch, session_id='s', principal_id='human', request_id='later',
++                           payload={'text': 'later'})
++    row = rt.claim_session_input(db, epoch=epoch, session_id='s')
++    assert row['admission_id'] == wake['admission_id']
++    try:
++        yield db, epoch, row
++    finally:
++        db.close()
++
++
++def _requeue(db, owner_epoch, row, **overrides):
++    return requeue_unstarted_input(db, **{'epoch': owner_epoch, 'admission_id': row['admission_id'],
++                                          'generation': row['generation'],
++                                          'transcript_mark': row['transcript_mark'], **overrides})
++
++
++def test_requeued_row_is_the_fifo_head_again_and_its_old_generation_is_fenced(claimed):
++    db, epoch, row = claimed
++    queued = _requeue(db, epoch, row)
++    assert (queued['status'], queued['outcome'], queued['generation']) == ('queued', None, None)
++    pending = rt.list_session_admissions(db, session_id='s')
++    assert [r['admission_id'] for r in pending] == [row['admission_id'], pending[1]['admission_id']]
++    assert [r['status'] for r in pending] == ['queued', 'queued']
++    with pytest.raises(rt.RuntimeStoreError) as exc:
++        rt.settle_session_input(db, epoch=epoch, admission_id=row['admission_id'], generation=row['generation'],
++                                outcome='completed')
++    assert exc.value.reason == 'stale_generation'
++    again = rt.claim_session_input(db, epoch=epoch, session_id='s')
++    assert again['admission_id'] == row['admission_id'] and again['generation'] == row['generation'] + 1
++
++
++def test_refused_once_the_turn_wrote_its_transcript(claimed):
++    db, epoch, row = claimed
++    db.append_messages_batch('s', [{'role': 'user', 'content': 'the wake'}])
++    with pytest.raises(rt.RuntimeStoreError) as exc:
++        _requeue(db, epoch, row)
++    assert exc.value.reason == 'invalid_checkpoint'
++    assert rt.get_session_admission(db, admission_id=row['admission_id'])['status'] == 'started'
++
++
++@pytest.mark.parametrize('field,value', [('generation', 99), ('epoch', 0)])
++def test_refused_for_another_generation_or_owner(claimed, field, value):
++    db, epoch, row = claimed
++    with pytest.raises(rt.RuntimeStoreError):
++        _requeue(db, epoch, row, **{field: value})
++    assert rt.get_session_admission(db, admission_id=row['admission_id'])['status'] == 'started'
++
++
++def test_refused_after_settlement(claimed):
++    db, epoch, row = claimed
++    rt.settle_session_input(db, epoch=epoch, admission_id=row['admission_id'], generation=row['generation'],
++                            outcome='completed')
++    with pytest.raises(rt.RuntimeStoreError) as exc:
++        _requeue(db, epoch, row)
++    assert exc.value.reason == 'stale_generation'
+-- 
+2.43.0
+

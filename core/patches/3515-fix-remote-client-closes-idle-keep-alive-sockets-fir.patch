@@ -1,0 +1,346 @@
+From 4fbd41fa2d50cceb6291a1c7f951a43dd9fcce7e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:53:35 -0800
+Subject: [PATCH] fix(remote): client closes idle keep-alive sockets first;
+ backend idle close 5 s -> 120 s
+
+Desktop <-> hermes-hub flapped all night (53 "marked down (socket hang up)" in 03:00-04:23 PST, ~200
+fail-fast lines per 10 min) on build fedc433cef. tcpdump of the hub proxy :9147: 197 requests in 7 min
+were written into connections the backend had already closed, each closed after exactly 5.0 s idle
+(uvicorn's default timeout_keep_alive). The FIN crosses the SSH tunnel only after Desktop has picked that
+pooled socket for its next poll; Desktop's agents kept idle sockets forever. One such hang up marks the
+whole remote down in remote-down-gate.
+
+- hermes_cli: every uvicorn listener (web_server._build_uvicorn_server, build_listener_server) uses
+  KEEP_ALIVE_IDLE_S = 120.
+- Desktop: all pooled agents (json, probe, download) come from keepAliveAgent(), which closes a free
+  socket after CLIENT_KEEPALIVE_IDLE_MS = 30 s, so the client always closes first.
+
+Tests: keepalive-race.test.ts reproduces the race live (uvicorn-like server + FIN-delaying relay): the old
+agent hangs up, keepAliveAgent never does; pins every pool to the idle timeout and its margin under the
+server constant. test_web_server_ws_ping.py pins timeout_keep_alive on both listeners (fail on base).
+
+Card: t_01a1d48ad4870953
+---
+ apps/desktop/electron/api-transport.ts       |  30 +++-
+ apps/desktop/electron/keepalive-race.test.ts | 159 +++++++++++++++++++
+ hermes_cli/web_server.py                     |   3 +-
+ hermes_cli/web_server_lifecycle.py           |   3 +-
+ hermes_cli/web_server_transport.py           |   8 +
+ tests/hermes_cli/test_web_server_ws_ping.py  |  24 +++
+ 6 files changed, 219 insertions(+), 8 deletions(-)
+ create mode 100644 apps/desktop/electron/keepalive-race.test.ts
+
+diff --git a/apps/desktop/electron/api-transport.ts b/apps/desktop/electron/api-transport.ts
+index 02f47f12e8..4991a2fc28 100644
+--- a/apps/desktop/electron/api-transport.ts
++++ b/apps/desktop/electron/api-transport.ts
+@@ -37,14 +37,32 @@ import crypto from 'node:crypto'
+ import http from 'node:http'
+ import https from 'node:https'
+ 
++// [daveey] A pooled socket idle this long is closed by us, never reused. The backend closes idle
++// keep-alive connections after KEEP_ALIVE_IDLE_S (hermes_cli/web_server_transport.py, 120 s); if the
++// server closes first, its FIN crosses the SSH tunnel after we have already written the next request
++// into that socket: `socket hang up`, and one of those marks the whole remote down (hermes-hub
++// 2026-11-13, uvicorn's 5 s default: 197 such races in 7 min). Closing well before the server keeps
++// that race from ever starting. Node destroys a free socket at the agent `timeout`; an in-flight
++// request has its own deadline (startRequestDeadline) and is not cut by it.
++export const CLIENT_KEEPALIVE_IDLE_MS = 30_000
++
++/** A keep-alive agent whose free sockets close after *idleMs* idle (the client closes, not the server). */
++export function keepAliveAgent<T extends typeof http | typeof https>(
++  mod: T,
++  maxSockets: number,
++  idleMs: number = CLIENT_KEEPALIVE_IDLE_MS
++): T extends typeof https ? https.Agent : http.Agent {
++  return new mod.Agent({ keepAlive: true, maxSockets, timeout: idleMs }) as any
++}
++
+ // JSON pool: many small concurrent calls (session lists, config, prompts).
+-const HTTP_JSON_AGENT = new http.Agent({ keepAlive: true, maxSockets: 50 })
+-const HTTPS_JSON_AGENT = new https.Agent({ keepAlive: true, maxSockets: 50 })
++const HTTP_JSON_AGENT = keepAliveAgent(http, 50)
++const HTTPS_JSON_AGENT = keepAliveAgent(https, 50)
+ 
+ // Download pool: few long-lived streaming bodies. Isolated from the JSON pool
+ // so saturating it with large file downloads can't block interactive calls.
+-const HTTP_DOWNLOAD_AGENT = new http.Agent({ keepAlive: true, maxSockets: 8 })
+-const HTTPS_DOWNLOAD_AGENT = new https.Agent({ keepAlive: true, maxSockets: 8 })
++const HTTP_DOWNLOAD_AGENT = keepAliveAgent(http, 8)
++const HTTPS_DOWNLOAD_AGENT = keepAliveAgent(https, 8)
+ 
+ // [daveey] Probe pool: the dispatch-time /api/health probe of a pooled remote
+ // (ensureHealthyPooledRemoteBackendForDispatch). On a slow link the JSON pool
+@@ -53,8 +71,8 @@ const HTTPS_DOWNLOAD_AGENT = new https.Agent({ keepAlive: true, maxSockets: 8 })
+ // Its own tiny pool keeps the health verdict about the remote, not about our
+ // local socket queue.
+ export const PROBE_POOL_MAX_SOCKETS = 2
+-const HTTP_PROBE_AGENT = new http.Agent({ keepAlive: true, maxSockets: PROBE_POOL_MAX_SOCKETS })
+-const HTTPS_PROBE_AGENT = new https.Agent({ keepAlive: true, maxSockets: PROBE_POOL_MAX_SOCKETS })
++const HTTP_PROBE_AGENT = keepAliveAgent(http, PROBE_POOL_MAX_SOCKETS)
++const HTTPS_PROBE_AGENT = keepAliveAgent(https, PROBE_POOL_MAX_SOCKETS)
+ 
+ export type JsonRequestPool = 'json' | 'probe'
+ 
+diff --git a/apps/desktop/electron/keepalive-race.test.ts b/apps/desktop/electron/keepalive-race.test.ts
+new file mode 100644
+index 0000000000..1abdb83d2d
+--- /dev/null
++++ b/apps/desktop/electron/keepalive-race.test.ts
+@@ -0,0 +1,159 @@
++/**
++ * [daveey] The keep-alive close race behind the hermes-hub flapping (2026-11-13), reproduced live.
++ *
++ * A backend that closes an idle keep-alive connection sends a FIN that reaches Desktop only after the SSH tunnel
++ * carries it across. A request written into the pooled socket in that window dies with `socket hang up`, and the
++ * remote-down gate then marks the whole remote down. On the hub, uvicorn's 5 s idle close produced 197 such races
++ * in 7 minutes (tcpdump of :9147). The fix makes the client side close first: every pooled agent closes a free
++ * socket after CLIENT_KEEPALIVE_IDLE_MS, well under the backend's KEEP_ALIVE_IDLE_S.
++ *
++ * The harness puts a TCP relay that delays the server's close by FIN_DELAY_MS (the tunnel) between a uvicorn-like
++ * server with a short idle close and the client. Bare GETs, no retries, so each race surfaces.
++ */
++import { readFileSync } from 'node:fs'
++import http from 'node:http'
++import net from 'node:net'
++import type { AddressInfo } from 'node:net'
++import { join } from 'node:path'
++
++import { describe, expect, it } from 'vitest'
++
++import { CLIENT_KEEPALIVE_IDLE_MS, downloadAgentFor, jsonAgentFor, keepAliveAgent } from './api-transport'
++
++const SERVER_IDLE_MS = 200
++const FIN_DELAY_MS = 300
++// The next request goes out after the server closed but before its FIN crossed the relay.
++const GAP_MS = 320
++
++const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
++
++/**
++ * Like uvicorn: answers each request with no `Keep-Alive: timeout=` hint (Node's own http server sends one, and
++ * the client would honour it) and closes the connection after SERVER_IDLE_MS idle.
++ */
++function uvicornLikeServer(): net.Server {
++  return net.createServer((socket: net.Socket) => {
++    let idle: NodeJS.Timeout | undefined
++    let buf = ''
++
++    const arm = () => {
++      clearTimeout(idle)
++      idle = setTimeout(() => socket.destroy(), SERVER_IDLE_MS)
++    }
++
++    arm()
++    socket.on('data', (chunk: Buffer) => {
++      buf += chunk.toString('latin1')
++
++      while (buf.includes('\r\n\r\n')) {
++        buf = buf.slice(buf.indexOf('\r\n\r\n') + 4)
++        socket.write('HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{"ok":true}')
++      }
++
++      arm()
++    })
++    socket.on('error', () => {})
++    socket.on('close', () => clearTimeout(idle))
++  })
++}
++
++async function tunnelledServer() {
++  const server = uvicornLikeServer()
++  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
++  const upstreamPort = (server.address() as AddressInfo).port
++
++  const relay = net.createServer((client: net.Socket) => {
++    const upstream = net.connect(upstreamPort, '127.0.0.1')
++    client.on('data', (chunk: Buffer) => upstream.writable && upstream.write(chunk))
++    upstream.on('data', (chunk: Buffer) => client.write(chunk))
++    upstream.on('close', () => setTimeout(() => client.end(), FIN_DELAY_MS))
++    client.on('close', () => upstream.destroy())
++    client.on('error', () => upstream.destroy())
++    upstream.on('error', () => {})
++  })
++
++  await new Promise<void>(resolve => relay.listen(0, '127.0.0.1', resolve))
++  const base = `http://127.0.0.1:${(relay.address() as AddressInfo).port}`
++
++  return {
++    base,
++    close: async () => {
++      await new Promise<void>(resolve => server.close(() => resolve()))
++      await new Promise<void>(resolve => relay.close(() => resolve()))
++    }
++  }
++}
++
++function get(url: string, agent: http.Agent): Promise<string> {
++  return new Promise((resolve, reject) => {
++    const req = http.get(url, { agent }, (res: http.IncomingMessage) => {
++      const chunks: Buffer[] = []
++      res.on('data', (c: Buffer) => chunks.push(c))
++      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
++    })
++
++    req.on('error', reject)
++  })
++}
++
++async function pollWithGaps(base: string, agent: http.Agent, rounds = 3) {
++  let failures = 0
++
++  for (let i = 0; i < rounds; i++) {
++    try {
++      await get(`${base}/api/status`, agent)
++    } catch {
++      failures += 1
++    }
++
++    await sleep(GAP_MS)
++  }
++
++  return failures
++}
++
++describe('live: keep-alive close race through a tunnel', () => {
++  it('an agent that keeps idle sockets forever writes into server-closed sockets (socket hang up)', async () => {
++    const srv = await tunnelledServer()
++    const agent = new http.Agent({ keepAlive: true, maxSockets: 4 })
++
++    try {
++      expect(await pollWithGaps(srv.base, agent)).toBeGreaterThan(0)
++    } finally {
++      agent.destroy()
++      await srv.close()
++    }
++  }, 15_000)
++
++  it('keepAliveAgent closes its idle socket first, so the same polling never races the server close', async () => {
++    const srv = await tunnelledServer()
++    const agent = keepAliveAgent(http, 4, SERVER_IDLE_MS / 2)
++
++    try {
++      expect(await pollWithGaps(srv.base, agent, 5)).toBe(0)
++    } finally {
++      agent.destroy()
++      await srv.close()
++    }
++  }, 15_000)
++})
++
++describe('pooled agents close idle sockets before the backend does', () => {
++  it('every pool uses the client idle timeout', () => {
++    const agents = ['http:', 'https:'].flatMap(p => [jsonAgentFor(p), jsonAgentFor(p, 'probe'), downloadAgentFor(p)])
++
++    for (const agent of agents) {
++      expect((agent as any).options.timeout).toBe(CLIENT_KEEPALIVE_IDLE_MS)
++      expect((agent as any).keepAlive).toBe(true)
++    }
++  })
++
++  it("stays well under the backend's KEEP_ALIVE_IDLE_S (hermes_cli/web_server_transport.py)", () => {
++    const py = readFileSync(join(__dirname, '../../../hermes_cli/web_server_transport.py'), 'utf8')
++    const serverIdleS = Number(/^KEEP_ALIVE_IDLE_S = (\d+)/m.exec(py)?.[1])
++
++    expect(serverIdleS).toBeGreaterThan(0)
++    // Room for a slow tunnel: the client closes at least a minute before the server would.
++    expect(serverIdleS * 1000 - CLIENT_KEEPALIVE_IDLE_MS).toBeGreaterThanOrEqual(60_000)
++  })
++})
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index f98c797eda..943f69717d 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -1303,7 +1303,7 @@ def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
+ 
+     _uvicorn_console_logging()  # log_config=None: uvicorn's dictConfig would close every live handler
+     from hermes_cli.web_server_skew_exit import wrap_asgi_close_when_draining
+-    from hermes_cli.web_server_transport import transport_observed_app
++    from hermes_cli.web_server_transport import KEEP_ALIVE_IDLE_S, transport_observed_app
+ 
+     # [daveey] A superseded always-on backend closes keep-alive sockets after each response (drain).
+     served_app = wrap_asgi_close_when_draining(served_app)
+@@ -1328,6 +1328,7 @@ def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
+         # mid-turn request orphans the backend past that budget (#76244). 3s
+         # leaves room for lifespan shutdown + cron_stop before the kill.
+         timeout_graceful_shutdown=3,
++        timeout_keep_alive=KEEP_ALIVE_IDLE_S,
+     )
+     return config, uvicorn.Server(config)
+ 
+diff --git a/hermes_cli/web_server_lifecycle.py b/hermes_cli/web_server_lifecycle.py
+index 2bf96d5191..680b17c2ed 100644
+--- a/hermes_cli/web_server_lifecycle.py
++++ b/hermes_cli/web_server_lifecycle.py
+@@ -623,7 +623,7 @@ def build_listener_server(served_app, host: str, port: int, *, auth_required: bo
+         ws_ping = (None, None) if host in _LOOPBACK_HOST_VALUES else (
+             _ws_ping_setting("ws_ping_interval"), _ws_ping_setting("ws_ping_timeout"))
+     _uvicorn_console_logging()
+-    from hermes_cli.web_server_transport import transport_observed_app
++    from hermes_cli.web_server_transport import KEEP_ALIVE_IDLE_S, transport_observed_app
+ 
+     forwarded_allow_ips = _dashboard_forwarded_allow_ips(dash_cfg)
+     served_app = transport_observed_app(
+@@ -644,6 +644,7 @@ def build_listener_server(served_app, host: str, port: int, *, auth_required: bo
+         # mid-turn request orphans the backend past that budget (#76244). 3s
+         # leaves room for lifespan shutdown + cron_stop before the kill.
+         timeout_graceful_shutdown=timeout_graceful_shutdown,
++        timeout_keep_alive=KEEP_ALIVE_IDLE_S,
+         lifespan=lifespan,
+     )
+     return config, uvicorn.Server(config)
+diff --git a/hermes_cli/web_server_transport.py b/hermes_cli/web_server_transport.py
+index 356134b027..8df2bebeb0 100644
+--- a/hermes_cli/web_server_transport.py
++++ b/hermes_cli/web_server_transport.py
+@@ -3,6 +3,14 @@ from __future__ import annotations
+ 
+ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+ 
++# [daveey] Idle keep-alive lifetime of an HTTP connection on every Hermes listener. uvicorn's default (5 s)
++# is shorter than the gap between a remote Desktop's polls, and the server's FIN crosses the SSH tunnel
++# only after Desktop has already picked that pooled socket for its next request: on hermes-hub
++# (2026-11-13) 197 requests in 7 min were written into server-closed sockets, each a `socket hang up`
++# that marked the whole remote down. The side that closes an idle connection must be the client, so this
++# stays well above Desktop's pooled-socket idle timeout (CLIENT_KEEPALIVE_IDLE_MS in api-transport.ts).
++KEEP_ALIVE_IDLE_S = 120
++
+ 
+ def transport_observed_app(app, *, proxy_headers: bool, forwarded_allow_ips):
+     """Compose raw observation outside Uvicorn's unchanged proxy middleware.
+diff --git a/tests/hermes_cli/test_web_server_ws_ping.py b/tests/hermes_cli/test_web_server_ws_ping.py
+index 832a36f9ac..ad94232a7f 100644
+--- a/tests/hermes_cli/test_web_server_ws_ping.py
++++ b/tests/hermes_cli/test_web_server_ws_ping.py
+@@ -399,3 +399,27 @@ def test_gateway_listener_compresses_only_for_remote_peers(host, auth_required,
+     config, _server = build_listener_server(lambda scope, receive, send: None, host, 0,
+                                             auth_required=auth_required)
+     assert config.ws_per_message_deflate is deflate
++
++
++def test_start_server_keeps_idle_http_connections_open_longer_than_desktop_does(monkeypatch):
++    """uvicorn's 5 s default idle close raced remote Desktop's pooled sockets across the SSH tunnel: the
++    server's FIN arrived after Desktop had written its next request, a `socket hang up` that marked the
++    whole remote down (hermes-hub 2026-11-13). The backend keeps an idle keep-alive connection open long
++    enough that the client (30 s, api-transport.ts CLIENT_KEEPALIVE_IDLE_MS) always closes first."""
++    from hermes_cli.web_server_transport import KEEP_ALIVE_IDLE_S
++
++    captured = _stub_uvicorn(monkeypatch)
++
++    web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
++
++    assert captured["timeout_keep_alive"] == KEEP_ALIVE_IDLE_S
++    assert KEEP_ALIVE_IDLE_S >= 90
++
++
++def test_gateway_listener_keeps_idle_http_connections_open_longer_than_desktop_does():
++    """The gateway session listener (``build_listener_server``) uses the same idle keep-alive lifetime."""
++    from hermes_cli.web_server_lifecycle import build_listener_server
++    from hermes_cli.web_server_transport import KEEP_ALIVE_IDLE_S
++
++    config, _server = build_listener_server(lambda scope, receive, send: None, "127.0.0.1", 0, auth_required=True)
++    assert config.timeout_keep_alive == KEEP_ALIVE_IDLE_S
+-- 
+2.43.0
+

@@ -1,0 +1,173 @@
+From 827c3f4f931758ac343203a6945eaf5e6bb33a77 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:48:03 +0000
+Subject: [PATCH] [daveey] kanban: one OWNER_WRITTEN source; origin_link_fields
+ means enabled and not recorded stopped; pin the done-row carry
+
+Follow-up to PR #2157 (review 5890952298 at d5a7122d12, card t_01a1d4e0d644b672).
+
+1. OWNER_WRITTEN was defined in both hermes_cli/kanban_origin_creation.py and
+   tools/kanban_tools_board_delivery.py. The origin side now imports the owner's
+   constant. RED: test_owner_written_wire_value_has_one_source failed on main
+   ('OWNER_WRITTEN' assigned in kanban_tools_board_delivery); GREEN after.
+
+2. origin_link_fields said "sync runs" but checks sync_enabled() and not
+   runstate.down(). No positive running marker exists (a completed round deletes
+   the record), so an enabled sync that has not started yet still answers
+   owner_written. That direction is fine: the link row waits in the owner's own
+   outbox and goes out with its first round, and a refusal to start or a crash
+   records a stop. The docstring (and the board_delivery comment) now say
+   "enabled and not recorded stopped"; test_owner_answer_means_enabled_and_not_recorded_stopped
+   pins both sides with a real runstate file (no record -> answer; record_down -> {}).
+
+3. Done-row carry, checked against the real hub: the owner's hermes-hub
+   advance_origin_create finishes with {**creation, ok, code: origin_bound,
+   handoff_complete: True, origin_receipt}, where creation is the courier create's
+   own result; the origin's fetch_outcomes stores the result verbatim in sent.result.
+   Hub req_ledger row placement:macbook:24a806162e8729d0b6f2bf21 (11-13 11:32, before
+   #2157 deployed) keeps every creation key that way (origin_creation, placement,
+   gated, ...), and origin_chat_link sits in the same dict as origin_creation, so it
+   survives. test_owner_answer_survives_the_hubs_done_row_to_the_origin drives the
+   real courier create output through that merge into await_task_id/owner_chat_link
+   (replacing reliance on a hand-built row). Pin, green on main.
+
+Tests: 9 affected files, 195 passed (hermes-core-wt test).
+---
+ hermes_cli/kanban_origin_creation.py          | 15 ++++++--
+ tests/hermes_cli/test_kanban_origin_notify.py | 37 +++++++++++++++++++
+ tests/tools/test_kanban_board_delivery.py     | 16 ++++++++
+ tools/kanban_tools_board_delivery.py          | 10 +++--
+ 4 files changed, 70 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index c4f4337c06..4339144228 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -86,10 +86,17 @@ OWNER_WRITTEN = "owner_written"
+ 
+ def origin_link_fields(conn, task_id: str, origin: dict) -> dict:
+     """``{"origin_chat_link": "owner_written"}`` for the courier result when this owner holds the origin chat's
+-    unreleased ``created`` link and its Board sync runs, so the link reaches the Board without the origin; ``{}``
+-    otherwise. [daveey] The origin reads this answer instead of guessing from the chat id's shape: an owner on older
+-    core (no ``_link_origin``) or with its sync off or stopped writes nothing that reaches the Board, and a
+-    ``local-<sha256>`` chat an ancestor already proves does get a link. Never raises."""
++    unreleased ``created`` link and its Board sync is enabled and not recorded stopped, so the link reaches the
++    Board without the origin; ``{}`` otherwise. [daveey] The origin reads this answer instead of guessing from the
++    chat id's shape: an owner on older core (no ``_link_origin``) or with its sync off or stopped writes nothing that
++    reaches the Board, and a ``local-<sha256>`` chat an ancestor already proves does get a link.
++
++    "Not recorded stopped" is ``kanban_sync_runstate.down()`` being None. There is no positive running marker (a
++    completed round deletes the record), so an enabled sync that has not started yet also answers; its link row
++    waits in this owner's own outbox and goes out with the first round, while a refusal to start or a crash records
++    a stop and withholds the answer. The origin reads the field from its replica's ``done`` row, which the owner's
++    hermes-hub builds as ``{**creation, ...}`` over this result, so the field survives the binding accept. Never
++    raises."""
+     try:
+         from hermes_cli import kanban_db_sync as sync
+         from hermes_cli import kanban_sync_runstate as runstate
+diff --git a/tests/hermes_cli/test_kanban_origin_notify.py b/tests/hermes_cli/test_kanban_origin_notify.py
+index 714dcc5d53..df49a75536 100644
+--- a/tests/hermes_cli/test_kanban_origin_notify.py
++++ b/tests/hermes_cli/test_kanban_origin_notify.py
+@@ -400,3 +400,40 @@ def test_session_poller_delivers_remote_notice_through_collect(tmp_path, monkeyp
+     srv._kb_rewind_refused(session, texts)  # a refused turn hands the notice back
+     again = srv._collect_kanban_notifications({"session_key": CHAT}, [])
+     assert [str(t) for t in again if "t_done" in t]
++
++
++def test_owner_answer_means_enabled_and_not_recorded_stopped(synced_owner):
++    """[daveey] PR #2157 review 5890952298: ``origin_link_fields`` reads "sync runs" as enabled and not recorded
++    stopped. No positive "running" marker exists (a completed round deletes the record), so an enabled sync with no
++    record still answers ``owner_written``: the link row sits in this owner's own outbox and goes out with its first
++    round. A recorded stop (refusal to start, crash, graceful stop) withholds the answer."""
++    from hermes_cli import kanban_origin_creation as oc
++    from hermes_cli import kanban_sync_runstate as runstate
++    res = json.loads(str(registry.dispatch("kanban_create", {"title": "Build", "assignee": "default"},
++                                           origin_intent=synced_owner)))
++    assert not runstate.path().exists()  # never started: no record either way
++    with kbc.connect_closing() as conn:
++        assert oc.origin_link_fields(conn, res["task_id"], synced_owner["origin"]) == {
++            "origin_chat_link": "owner_written"}
++        runstate.record_down("not starting: board default: test")
++        assert oc.origin_link_fields(conn, res["task_id"], synced_owner["origin"]) == {}
++
++
++def test_owner_answer_survives_the_hubs_done_row_to_the_origin(synced_owner, monkeypatch):
++    """[daveey] PR #2157 review 5890952298: the origin reads ``origin_chat_link`` from its replica's ``done`` row. The
++    owner's hermes-hub (``advance_origin_create``) finishes the request with ``{**creation, "ok": True, "code":
++    "origin_bound", "handoff_complete": True, "origin_receipt": receipt}``, where ``creation`` is this courier
++    create's own result, and the origin's ``fetch_outcomes`` stores that result verbatim in ``sent.result``. Real hub
++    row placement:macbook:24a806162e8729d0b6f2bf21 (11-13) keeps every creation key that way (``origin_creation``,
++    ``placement``, ``gated`` ...), so the field rides through; this drives the real create output through that
++    merge."""
++    from hermes_cli import kanban_placement as kp
++    creation = json.loads(str(registry.dispatch("kanban_create", {"title": "Build", "assignee": "default"},
++                                                origin_intent=synced_owner)))
++    receipt = {"status": "accepted", "request_id": creation["origin_creation"]["child_request_id"]}
++    done = {**creation, "ok": True, "code": "origin_bound", "handoff_complete": True, "origin_receipt": receipt}
++    monkeypatch.setattr(kp, "_sent_row", lambda rid: ("done", json.dumps(done)))
++    seen: dict = {}
++    tid, _ = kp.await_task_id(synced_owner["request_id"], hub_cli="hermes-hub", budget=0, result_out=seen)
++    assert tid == creation["task_id"]
++    assert kp.owner_chat_link(seen["result"]) == {"chat_link": "owner_written"}
+diff --git a/tests/tools/test_kanban_board_delivery.py b/tests/tools/test_kanban_board_delivery.py
+index 5484a99925..aa30b6607a 100644
+--- a/tests/tools/test_kanban_board_delivery.py
++++ b/tests/tools/test_kanban_board_delivery.py
+@@ -541,3 +541,19 @@ def test_when_this_gateways_sync_recovers_its_reconcile_keeps_the_one_link(home,
+     ksc._pull_replica(BOARD, board.hub(ME), ME)
+     assert [t["id"] for t in ksa.session_tasks([CHAT])] == [tid]
+     assert links.reconcile(conn, BOARD, ME) == {"added": 0, "changed": 0, "released": 0, "retired": 0}
++
++
++def test_owner_written_wire_value_has_one_source():
++    """PR #2157 review 5890952298: ``OWNER_WRITTEN`` was spelled out in this module and in
++    ``kanban_origin_creation``, so a reworded wire value would split the owner's answer from the origin's reading of
++    it. The origin side now imports the owner's constant. [daveey]"""
++    import ast
++    import inspect
++
++    from hermes_cli import kanban_origin_creation
++    from tools import kanban_tools_board_delivery as kbd
++    tree = ast.parse(inspect.getsource(kbd))
++    assigned = {t.id for n in ast.walk(tree) if isinstance(n, (ast.Assign, ast.AnnAssign))
++                for t in (n.targets if isinstance(n, ast.Assign) else [n.target]) if isinstance(t, ast.Name)}
++    assert "OWNER_WRITTEN" not in assigned
++    assert kbd.OWNER_WRITTEN is kanban_origin_creation.OWNER_WRITTEN
+diff --git a/tools/kanban_tools_board_delivery.py b/tools/kanban_tools_board_delivery.py
+index 6cf27d2435..cfa1556294 100644
+--- a/tools/kanban_tools_board_delivery.py
++++ b/tools/kanban_tools_board_delivery.py
+@@ -5,6 +5,9 @@ import json
+ import logging
+ from typing import Any, Callable
+ 
++# The owner's answer is defined once, where the owner writes it (PR #2157 review). [daveey]
++from hermes_cli.kanban_origin_creation import OWNER_WRITTEN
++
+ logger = logging.getLogger(__name__)
+ 
+ # Tools whose success writes a row other hosts must see (pushed through this gateway's Board sync outbox).
+@@ -18,16 +21,15 @@ BOARD_WRITE_TOOLS = frozenset({
+ # (``placed.chat_link: owner_written``, from ``kanban_origin_creation.origin_link_fields``), the link no longer waits
+ # in this gateway's outbox; what still depends on this gateway is its replica of the Board, which this chat's task
+ # list reads and the stopped sync no longer pulls. Only an owner on this core or newer whose Board sync is on (it has
+-# a task_chat_links table) and running gives that answer. Without it the link waits here: no answer yet (a queued
+-# request, whose owner_written would only be the expected outcome, not a fact, so it is never claimed), an owner on
+-# older core (it writes no link), an owner with its sync off, or a ``local-<sha256>`` chat it does not link.
++# a task_chat_links table) and not recorded stopped gives that answer. Without it the link waits here: no answer yet
++# (a queued request, whose owner_written would only be the expected outcome, not a fact, so it is never claimed), an
++# owner on older core (it writes no link), an owner with its sync off, or a ``local-<sha256>`` chat it does not link.
+ # kanban_tools builds its placed-create notes from these fragments, so the rewrites below always find them. The
+ # queued note is CHAT_TASKS_HEAD + CHAT_TASKS_SEP; the rewrites insert after the exact head, whatever the separator.
+ CHAT_TASKS_SHOWS = " and shows in this chat's tasks"
+ CHAT_TASKS_HEAD = "(this chat's tasks"
+ CHAT_TASKS_SEP = ", "
+ _LATER = " once this gateway's copy of the Board refreshes"
+-OWNER_WRITTEN = "owner_written"
+ _QUEUED_LATER = " once this gateway's Board sync recovers"
+ 
+ 
+-- 
+2.43.0
+

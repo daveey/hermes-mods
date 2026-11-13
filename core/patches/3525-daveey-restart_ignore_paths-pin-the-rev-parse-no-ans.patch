@@ -1,0 +1,112 @@
+From e7de91ea3608e2541932ecfb34c50c854d9d679f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:07:56 +0000
+Subject: [PATCH] [daveey] restart_ignore_paths: pin the rev-parse no-answer
+ branch; soften "never comes back"
+
+Follow-up to PR #2193 review 5891065227 (non-blocking nits), card t_01a1d4e73941ac2c.
+
+1. `_names_no_commit`'s `found is None` branch (rev-parse timeout/OSError after
+   merge-base exit 128) had no test. New pinning test
+   `test_a_rev_parse_that_gives_no_answer_after_merge_base_128_stays_uncached`:
+   patches `_git` to return None for rev-parse only; the verdict is None, and
+   code_skew reads skew without caching the pair. Once rev-parse answers, the
+   same pair gets the definite cached False.
+   RED proof: mutating the branch to `if found is None: return True` (treat no
+   answer as a missing commit, so the False would be cached) fails the test
+   with `assert False is None`; the other 45 tests stay green.
+2. Comments (restart_ignore_paths, code_skew, the missing-commit test docstring)
+   no longer claim a missing sha "never comes back": a disk sha can appear
+   later (shallow checkout deepened by fetch, ref written before objects). The
+   cached False keeps that pair skewed until the cache clears or the process
+   restarts: fail closed, at worst one extra restart.
+
+Tests: tests/hermes_cli/test_restart_ignore_paths.py + test_code_skew.py, 56 passed.
+---
+ gateway/code_skew.py                          |  4 ++-
+ hermes_cli/restart_ignore_paths.py            |  4 ++-
+ tests/hermes_cli/test_restart_ignore_paths.py | 31 +++++++++++++++++--
+ 3 files changed, 35 insertions(+), 4 deletions(-)
+
+diff --git a/gateway/code_skew.py b/gateway/code_skew.py
+index 792459b9fc..29daf43253 100644
+--- a/gateway/code_skew.py
++++ b/gateway/code_skew.py
+@@ -115,7 +115,9 @@ def detect_code_skew() -> tuple[str, str] | None:
+ # watchdogs poll every few seconds and would otherwise run two git commands per poll for the same pair. A transient
+ # git failure (None: timeout, OSError, git not found) is not cached: it reads as skew now and is asked again on the
+ # next poll, so it never pins the pair as skewed for the life of the process (t_01a1d49d2f2a8ae2). A sha git says
+-# is no commit (boot commit gc'd after a force-push) is a definite False and is cached (PR #2151 review).
++# is no commit (boot commit gc'd after a force-push) is a definite False and is cached (PR #2151 review). A disk
++# sha may still appear later (shallow checkout deepened, ref written before its objects): the cached False then
++# keeps that pair skewed until the cache clears or the process restarts, failing closed (at worst one restart).
+ _restart_free_verdicts: dict[tuple[str, str], bool] = {}
+ 
+ 
+diff --git a/hermes_cli/restart_ignore_paths.py b/hermes_cli/restart_ignore_paths.py
+index 69c77b7891..2fd25cf197 100644
+--- a/hermes_cli/restart_ignore_paths.py
++++ b/hermes_cli/restart_ignore_paths.py
+@@ -89,7 +89,9 @@ def range_restart_verdict(root: str, base: str, head: str,
+     """``range_restart_free`` with the transient case kept apart: True/False are final for the pair (a commit
+     range never changes), None means git did not answer (not found, timeout, OSError, an unexpected exit) and
+     the same question may get a definite answer later, so callers must not cache it. A sha that names no commit
+-    in the repo (a boot commit gc'd after a force-push) is a definite False: it never comes back."""
++    in the repo (a boot commit gc'd after a force-push) is a definite False. A disk sha can still appear later
++    (a shallow checkout deepened by fetch, a ref written before its objects), but a cached False only keeps the
++    pair reading as skew until the cache clears or the process restarts: fail closed, at worst one extra restart."""
+     if not (_is_sha(base) and _is_sha(head)) or base == head:
+         return False
+     globs = tuple(globs)
+diff --git a/tests/hermes_cli/test_restart_ignore_paths.py b/tests/hermes_cli/test_restart_ignore_paths.py
+index b0bf4be262..681ed96673 100644
+--- a/tests/hermes_cli/test_restart_ignore_paths.py
++++ b/tests/hermes_cli/test_restart_ignore_paths.py
+@@ -224,8 +224,9 @@ def _counting_git(monkeypatch):
+ 
+ @pytest.mark.parametrize("missing", ["boot", "disk"])
+ def test_a_missing_commit_is_a_definite_verdict_cached_as_skew(repo, monkeypatch, missing):
+-    """A boot sha gc'd after a force-push (or an absent disk sha) never comes back: merge-base exits 128 for it,
+-    which is a definite False, cached so the watchdog polls stop running git for that pair (PR #2151 review)."""
++    """A boot sha gc'd after a force-push (or an absent disk sha): merge-base exits 128 for it, which is a definite
++    False, cached so the watchdog polls stop running git for that pair (PR #2151 review). A disk sha that appears
++    later stays skew until the cache clears or the process restarts: fail closed, at worst one extra restart."""
+     root, base = repo
+     head = _commit(root, {"tests/test_a.py": "x\n"}, "t1")
+     gone = "f" * 40
+@@ -245,6 +246,32 @@ def test_a_missing_commit_is_a_definite_verdict_cached_as_skew(repo, monkeypatch
+     assert len(calls) == first  # cached: the next poll runs no git
+ 
+ 
++def test_a_rev_parse_that_gives_no_answer_after_merge_base_128_stays_uncached(repo, monkeypatch):
++    """merge-base exits 128 for a missing sha, then rev-parse times out (``_git`` None): no verdict, not cached."""
++    root, base = repo
++    gone = "f" * 40
++    real_git = rip._git
++    rev_parse_ok = {"on": False}
++
++    def flaky(root_, *args):
++        if args[0] == "rev-parse" and not rev_parse_ok["on"]:
++            return None  # timed out / OSError
++        return real_git(root_, *args)
++
++    monkeypatch.setattr(rip, "_git", flaky)
++    assert rip.range_restart_verdict(str(root), base, gone) is None
++
++    monkeypatch.setattr(code_skew, "_PROJECT_ROOT", root)
++    monkeypatch.setattr(code_skew, "_restart_free_verdicts", {})
++    monkeypatch.setattr(code_skew, "_boot_fingerprint", f"git:refs/heads/main:{base}")
++    monkeypatch.setattr(code_skew, "_fingerprint", lambda: f"git:refs/heads/main:{gone}")
++    assert code_skew.detect_code_skew() == (base[:10], gone[:10])  # fail closed meanwhile
++    assert code_skew._restart_free_verdicts == {}  # not pinned: asked again next poll
++    rev_parse_ok["on"] = True
++    assert code_skew.detect_code_skew() == (base[:10], gone[:10])
++    assert code_skew._restart_free_verdicts == {(base, gone): False}  # now a definite answer, cached
++
++
+ def test_a_non_commit_object_is_a_definite_verdict(repo):
+     root, _base = repo
+     head = _commit(root, {"tests/test_a.py": "x\n"}, "t1")
+-- 
+2.43.0
+

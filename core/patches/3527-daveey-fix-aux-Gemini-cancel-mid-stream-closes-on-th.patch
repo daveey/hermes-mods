@@ -1,0 +1,193 @@
+From eabb3501baec3a5bf87942e53ea1a3c3202cda4f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:58:12 +0000
+Subject: [PATCH] [daveey] fix(aux): Gemini cancel-mid-stream closes on the
+ reading worker once, and its sockets get shut down
+
+Follow-ups from the exact-head review of PR #2148 (card t_01a1d4b61dcb2670).
+
+1. Test: AsyncGeminiNativeClient runs the create and every _async_stream step through
+   aux_provider_handoff.run_in_thread, but nothing covered it. The new real-TLS test in
+   test_aux_stranger_close_siblings.py streams one chunk, then cancels while the second step's worker is
+   blocked on the stalled body. It pins: the SQLite header survives fd reuse, the client is closed once, on
+   that step's worker (never the loop thread), and the scope's socket sweep reached the socket.
+
+2. _close_pair: AsyncGeminiNativeClient wraps the sync leaf itself, and its close() is a coroutine. On an
+   abandoned to_thread worker (no running loop) _schedule_async_close ran asyncio.run, whose to_thread closed
+   the leaf on yet another executor thread, and then the leaf was closed again directly. FD-safe (fn had
+   returned) but roundabout. Skip the async wrapper's close when its _real_client is the sync leaf being
+   closed next. RED before: closed_on == ['asyncio_0', 'asyncio_1'].
+
+3. _iter_pool_sockets also walks a client's `_http` (GeminiNativeClient's httpx client). Before, the
+   abandoned-Gemini sweep logged tcp_shutdown=0: the fd stayed safe, but the provider read (read timeout
+   1200 s) kept running, and billing, after a cancel. RED before: tcp_shutdown=0.
+
+4. run_in_thread docstring: force_close_tcp_sockets cannot reach Bedrock's boto3/urllib3 sockets, so a
+   cancelled Bedrock worker gets tcp_shutdown=0; the fd stays safe but the read and billing run to its own
+   timeout. The sync twin behaves the same way. The siblings test docstring now lists Gemini.
+
+Tests: tests/agent/test_aux_stranger_close_siblings.py + test_aux_abandoned_provider_tls_fd.py green;
+every test file importing the touched modules (41 files, 657 tests) green.
+---
+ agent/agent_runtime_helpers.py                |  4 +-
+ agent/aux_provider_handoff.py                 |  5 ++
+ agent/auxiliary_class_routing.py              |  5 +-
+ .../agent/test_aux_stranger_close_siblings.py | 76 ++++++++++++++++++-
+ 4 files changed, 84 insertions(+), 6 deletions(-)
+
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 608617497b..ab49c9555b 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -3504,8 +3504,8 @@ def _iter_pool_sockets(client: Any):
+     walks mount transports and in-flight ``PoolRequest.connection`` objects (``_connections``
+     is empty during checkout)."""
+     try:
+-        # Some SDK wrappers *are* the httpx client; fall through so mount-aware discovery runs.
+-        http_client = getattr(client, "_client", None)
++        # Some SDK wrappers *are* the httpx client; fall through so mount-aware discovery runs. ``_http``: Gemini.
++        http_client = getattr(client, "_client", None) or getattr(client, "_http", None)
+         pools = list(_iter_httpx_pools_with_owner(client if http_client is None else http_client))
+     except Exception:
+         return
+diff --git a/agent/aux_provider_handoff.py b/agent/aux_provider_handoff.py
+index bff2a95e9b..f86a275055 100644
+--- a/agent/aux_provider_handoff.py
++++ b/agent/aux_provider_handoff.py
+@@ -75,6 +75,11 @@ async def run_in_thread(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) ->
+     ``client_scope`` on the loop thread. The worker is then recorded as abandoned there, so the scope only
+     shuts the sockets down and the worker closes the client once ``fn`` returns. A worker cancelled before
+     it started never touches the socket and is not recorded.
++
++    ``force_close_tcp_sockets`` walks httpx pools only, so it cannot reach Bedrock's boto3/urllib3 sockets: a
++    cancelled Bedrock worker logs ``tcp_shutdown=0``. Its fd stays safe (``BedrockAuxiliaryClient.close`` is a
++    no-op, so no thread closes those sockets), but the provider read keeps running, and billing, until its own
++    timeout. The sync twin (``_run_protected_sync_provider_call``) behaves the same way.
+     """
+     attempt, lock, state = ProviderAttempt(), threading.Lock(), ["pending"]
+ 
+diff --git a/agent/auxiliary_class_routing.py b/agent/auxiliary_class_routing.py
+index 8d708e6978..2c137bfe32 100644
+--- a/agent/auxiliary_class_routing.py
++++ b/agent/auxiliary_class_routing.py
+@@ -357,5 +357,8 @@ def class_routed_async(callback):
+ 
+ 
+ def _close_pair(aux, client, sync_client) -> None:
+-    aux._close_cached_client(client, close_async=True)
++    # AsyncGeminiNativeClient wraps the sync leaf itself: its coroutine close() would, on an abandoned to_thread
++    # worker (no running loop), asyncio.run a to_thread close on yet another thread. Close the leaf here instead.
++    if getattr(client, "_real_client", None) is not sync_client:
++        aux._close_cached_client(client, close_async=True)
+     aux._close_cached_client(sync_client, close_async=True)
+diff --git a/tests/agent/test_aux_stranger_close_siblings.py b/tests/agent/test_aux_stranger_close_siblings.py
+index 4ed23ba3e2..0f17632abe 100644
+--- a/tests/agent/test_aux_stranger_close_siblings.py
++++ b/tests/agent/test_aux_stranger_close_siblings.py
+@@ -4,9 +4,9 @@ The hub incident (a TLS alert written into ``inbox.db``'s header) came from one
+ whose socket another thread was still reading: the fd number went to a SQLite file and the reader's next
+ ``SSL_read`` took ``SQLit`` from it. Two more paths had the same shape:
+ 
+-1. ``class_routed_async``: adapter clients (Anthropic, Codex, Bedrock) run the sync SDK call on an
+-   ``asyncio.to_thread`` worker; a cancelled await leaves that worker reading while the ``finally`` closed
+-   the per-call client from the loop thread.
++1. ``class_routed_async``: adapter clients (Anthropic, Codex, Bedrock, Gemini) run the sync SDK call on an
++   ``asyncio.to_thread`` worker (Gemini: the create and each stream step); a cancelled await leaves that
++   worker reading while the ``finally`` closed the per-call client from the loop thread.
+ 2. ``_store_cached_client`` (Nous 401 refresh): replacing a shared cache entry closed the old client
+    although another caller can be mid-request on it.
+ """
+@@ -16,6 +16,7 @@ import asyncio
+ import os
+ import sqlite3
+ import threading
++from types import SimpleNamespace
+ 
+ import httpx
+ import pytest
+@@ -23,6 +24,7 @@ from openai import OpenAI
+ 
+ from agent import auxiliary_class_routing as routing
+ from agent import auxiliary_client as aux
++from agent.gemini_native_adapter import GeminiNativeClient
+ from tests.agent.test_aux_abandoned_provider_tls_fd import (  # stalling_stream: fixture, resolved by name below
+     SQLITE_MAGIC, _fd_is_open, stalling_stream,
+ )
+@@ -133,6 +135,74 @@ def test_cancelled_async_class_call_never_hands_the_to_thread_workers_tls_fd_to_
+     assert http.is_closed
+ 
+ 
++class _StallingGeminiClient(GeminiNativeClient):
++    """A real ``GeminiNativeClient`` (own ``_http``, real ``close`` and ``_advance_stream_iterator``) whose stream
++    yields one chunk without I/O, then reads the stalled TLS body on the next step."""
++
++    def __init__(self, http: httpx.Client, url: str, seen: dict, reading: threading.Event) -> None:
++        super().__init__(api_key="test", base_url=url, http_client=http)
++        self.closed_on: list[str] = []
++
++        def chunks():
++            yield "first"  # step 1: handed back to the loop, so step 2 is a fresh run_in_thread call
++            _stream_until_stalled(http, url, seen, reading)  # step 2: blocks on the stalled body
++            yield "second"
++
++        self.chat = SimpleNamespace(completions=SimpleNamespace(create=lambda **_kwargs: chunks()))
++
++    def close(self) -> None:
++        self.closed_on.append(threading.current_thread().name)
++        super().close()
++
++
++def test_cancelled_gemini_stream_step_is_closed_by_the_worker_reading_it(tls_stream, tmp_path, monkeypatch, caplog):
++    caplog.set_level("INFO", logger="agent.aux_provider_handoff")
++    http = httpx.Client(verify=tls_stream.ssl_context, timeout=httpx.Timeout(20.0))
++    seen: dict = {"returned": threading.Event()}
++    reading = threading.Event()
++    sync_client = _StallingGeminiClient(http, tls_stream.url, seen, reading)
++
++    monkeypatch.setattr(routing, "_class_request", lambda *args: ("class:deep", "owner", {}, None, "class:deep"))
++    monkeypatch.setattr(routing, "_prepare", lambda *args: (
++        {"provider": "gemini", "model": "deep", "api_mode": "chat_completions", "base_url": ""}, sync_client, {}))
++    received: list = []
++
++    async def relay(client, kwargs, *, create, **_):
++        return await create(kwargs)
++
++    async def acreate(client, kwargs, task=None, **_):  # the real _to_async_client: AsyncGeminiNativeClient
++        async for chunk in await client.chat.completions.create(**kwargs, stream=True):
++            received.append(chunk)
++
++    monkeypatch.setattr(aux, "_relay_async_completion", relay)
++    monkeypatch.setattr(aux, "_acreate_with_progress", acreate)
++
++    async def owner() -> bool:
++        call = asyncio.ensure_future(routing.class_routed_async(lambda *a, **k: None)(task="compression", messages=[]))
++        assert await asyncio.to_thread(reading.wait, 15), "the stream step never started reading"
++        call.cancel()  # mid-stream: the first chunk arrived, the second step's worker is blocked in the read
++        try:
++            await call
++        except asyncio.CancelledError:
++            return True
++        return False
++
++    loop = asyncio.new_event_loop()  # not asyncio.run: its executor shutdown would wait for the stalled worker
++    try:
++        assert loop.run_until_complete(owner())
++        header = _header_after_fd_reuse(tmp_path, seen["fd"], tls_stream, seen["returned"])
++    finally:
++        tls_stream.resume.set()
++        loop.run_until_complete(loop.shutdown_default_executor())
++        loop.close()
++    assert received == ["first"]
++    assert header[:16] == SQLITE_MAGIC, f"TLS bytes landed in the SQLite header: {header!r}"
++    # Closed once, directly, by the stream step's worker: never the loop thread, never another executor thread.
++    assert sync_client.closed_on == [seen["thread"].name]
++    assert "handed to 1 abandoned provider daemon(s) (tcp_shutdown=1)" in caplog.text  # GeminiNativeClient._http
++    assert http.is_closed
++
++
+ def test_replacing_a_cached_client_never_closes_it_under_a_live_tls_read(tls_stream, tmp_path, monkeypatch):
+     monkeypatch.setattr(aux, "_client_cache", {})
+     http = httpx.Client(verify=tls_stream.ssl_context, timeout=httpx.Timeout(20.0))
+-- 
+2.43.0
+

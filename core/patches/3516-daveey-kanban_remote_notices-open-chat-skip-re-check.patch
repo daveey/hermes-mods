@@ -1,0 +1,207 @@
+From a9b36dadc49305bf12518d6d89a38ba77ef0e28d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:27:06 +0000
+Subject: [PATCH] [daveey] kanban_remote_notices: open-chat skip re-checks the
+ poller's claim row and finds it by the link session (PR #2158 review nits)
+
+t_01a1d4b998c9fb3b, follow-up to review 5890358132 (t_01a1d4b57c45f9a0) on PR #2158. Diagnostic logging only.
+
+- `_note_open_chat` treated a stored "claimed by the live poller" marker as healthy forever. A claim later
+  released undelivered (`release_undelivered`) or held by a dead backend (a crashed turn) left the stuck
+  open-chat notice at DEBUG, the exact case the INFO line exists for. Past the grace window the sweep now reads
+  the claim's ledger row: missing, or undelivered under a dead holder, is stuck (INFO once); delivered or held
+  by a live backend stays DEBUG. A delivered row is final, so it is cached and later passes skip the read; an
+  unreadable ledger counts as held (this only picks a log level).
+- `collect` logged its claim under `claim_session` (the live session key unless per_link) while the sweep looked
+  the marker up by the link's session, so a card linked to a lineage ancestor still logged one INFO line past
+  grace on the healthy path. The marker (`_poller_claims`) is now keyed by the link session on both sides and
+  stores the session the ledger row is keyed by.
+- Tests: released-undelivered and dead-holder claims log the open-chat INFO line past grace (RED before: DEBUG
+  only); an ancestor-linked healthy claim logs only the poller's INFO line, before and after ack (RED before: a
+  second, open-chat INFO line).
+
+Verified: 36 test files importing kanban_remote_notices, 533 passed; scripts/check --base origin/main ok.
+---
+ .../tui_gateway/test_kanban_remote_notices.py | 58 ++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          | 69 ++++++++++++++++---
+ 2 files changed, 116 insertions(+), 11 deletions(-)
+
+diff --git a/tests/tui_gateway/test_kanban_remote_notices.py b/tests/tui_gateway/test_kanban_remote_notices.py
+index bd84ea9ff3..41c4f396fc 100644
+--- a/tests/tui_gateway/test_kanban_remote_notices.py
++++ b/tests/tui_gateway/test_kanban_remote_notices.py
+@@ -969,3 +969,61 @@ def test_sweep_names_its_own_in_flight_claim_and_the_gateway_fifo_once(tmp_path,
+         assert _wait_lines(caplog) == [
+             f"remote Kanban notice {ref} {state} for chat {CHAT} waits: left to the gateway's FIFO (the gateway "
+             "runs this chat's turns)"]
++
++
++def test_open_chat_skip_logs_info_once_a_poller_claim_is_released_undelivered(tmp_path, caplog):
++    """PR #2158 review: a stored "claimed by the live poller" marker counted as healthy forever, so a notice whose
++    claim was later released undelivered (release_undelivered, or a crashed turn's claim) only logged DEBUG past
++    the grace window. The sweep now reads the claim's ledger row: no row, or a dead holder, is stuck."""
++    import logging
++    from tui_gateway import kanban_remote_late
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = time.time()
++    replica = _hub(tmp_path, [_card("t_released", CHAT, status="done", at=now - 40)])
++    ref = "hub/default/default/t_released"
++    caplog.set_level(logging.DEBUG, logger=krn.__name__)
++    with _chat_db(tmp_path) as opener:
++        for case in ("released", "crashed"):
++            caplog.clear()
++            krn._reset_for_tests()
++            ledger = tmp_path / f"{case}.db"
++            sweep = dict(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger,
++                         waker=_GraceWaker(60.0), live_ids={CHAT})
++            claims = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + 1)
++            assert claims
++            if case == "released":
++                kanban_remote_late.release_undelivered(claims, ledger)
++                assert _ledger_row(ledger, CHAT, ref) is None
++            else:
++                _orphan_holder(ledger, CHAT, ref)
++            sweep_remote_notices(now=now + 120, **sweep)
++            stuck = [line for line in _wait_lines(caplog, logging.INFO) if "claimed by the live poller" not in line]
++            assert [line.split(" waits: ")[1] for line in stuck] == [
++                "chat is open in this backend; its live poller claims it"], (case, stuck)
++
++
++def test_open_chat_skip_finds_the_poller_claim_of_a_card_linked_to_a_lineage_ancestor(tmp_path, caplog):
++    """PR #2158 review: collect recorded its claim under the live session key while the sweep looked it up by the
++    link's session, so a card linked to a compacted ancestor still logged one INFO line past grace."""
++    import logging
++    from tui_gateway import kanban_remote_notices as krn
++
++    now = time.time()
++    replica = _hub(tmp_path, [_card("t_ancestor", OTHER, status="done", at=now - 40)])
++    caplog.set_level(logging.DEBUG, logger=krn.__name__)
++    with _chat_db(tmp_path) as opener:
++        krn._reset_for_tests()
++        ledger = tmp_path / "ancestor.db"
++        claims = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=now + 1, lineage=(OTHER,))
++        assert [c["session"] for c in claims] == [CHAT]  # claimed under the live session key, not the link's
++        sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger,
++                             waker=_GraceWaker(60.0), live_ids={CHAT, OTHER}, now=now + 120)
++        info = _wait_lines(caplog, logging.INFO)
++        assert len(info) == 1 and "claimed by the live poller" in info[0], info
++        assert all(krn.ack(c, ledger=ledger) for c in claims)  # delivered: final, and still no open-chat INFO
++        for later in (180, 240):
++            sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=opener, ledger=ledger,
++                                 waker=_GraceWaker(60.0), live_ids={CHAT, OTHER}, now=now + later)
++        assert _wait_lines(caplog, logging.INFO) == info
++        assert krn._poller_claims[(OTHER, claims[0]["ref"], claims[0]["state"])] == krn._CLAIM_DELIVERED
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index c169e07ac2..6905b1dd65 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -670,7 +670,7 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+                 if verdict == "offer":
+                     out.append(_notice_item(card, claim_session, me, profile, now))
+                     offered.add((ref, state))
+-                    _note_wait(claim_session, ref, state, f"{_POLLER_CLAIM}{os.getpid()}")  # after the claim is out
++                    _note_poller_claim(sid, claim_session, ref, state)  # after the claim is out; never raises
+         finally:
+             conn.close()
+         from tui_gateway.kanban_remote_late import collect_groups, release_undelivered
+@@ -757,6 +757,8 @@ _waits: dict[tuple, str] = {}
+ _waits_lock = threading.Lock()
+ _WAITS_MAX = 5000
+ _POLLER_CLAIM = "claimed by the live poller of backend pid "
++_poller_claims: dict[tuple, str] = {}  # (link session, ref, state) -> session the poller's ledger row is keyed by
++_CLAIM_DELIVERED = "\0delivered"  # _poller_claims value once the row read back delivered
+ 
+ 
+ def _note_wait(session: str, ref: str, state: str, why: str) -> None:
+@@ -777,17 +779,61 @@ def _note_wait(session: str, ref: str, state: str, why: str) -> None:
+             logger.debug("remote kanban: wait log failed", exc_info=True)
+ 
+ 
+-def _note_open_chat(sid: str, ref: str, state: str, waker, observed_at, now) -> None:
++def _note_poller_claim(link_sid: str, claim_session: str, ref: str, state: str) -> None:
++    """Log the live poller's claim and remember which ledger row holds it, keyed by the LINK's session: the sweep
++    looks it up by the link, while the claim may sit under the live session key of a compacted chat (PR #2158
++    review). Never raises."""
++    try:
++        with _waits_lock:
++            _poller_claims.pop((link_sid, ref, state), None)
++            _poller_claims[(link_sid, ref, state)] = claim_session
++            while len(_poller_claims) > _WAITS_MAX:
++                _poller_claims.pop(next(iter(_poller_claims)), None)
++    except Exception:  # diagnostics only
++        with contextlib.suppress(Exception):
++            logger.debug("remote kanban: poller claim marker failed", exc_info=True)
++    _note_wait(claim_session, ref, state, f"{_POLLER_CLAIM}{os.getpid()}")
++
++
++def _poller_claim_state(claim_session: str, ref: str, state: str, ledger) -> str:
++    """``delivered`` (final), ``held`` (in flight under a live backend, or the ledger is unreadable: this only
++    picks a log level) or ``stuck``: released undelivered (``release_undelivered``) or held by a dead pid."""
++    try:
++        with contextlib.closing(_ledger(ledger)) as conn:
++            row = conn.execute("SELECT delivered, holder_pid, holder_start FROM notices "
++                               "WHERE session=? AND ref=? AND state=?", (claim_session, ref, state)).fetchone()
++    except Exception:
++        logger.debug("remote kanban: poller claim readback failed", exc_info=True)
++        return "held"
++    if row is None:
++        return "stuck"
++    if row["delivered"]:
++        return "delivered"
++    return "held" if _holder_alive(row["holder_pid"], row["holder_start"]) else "stuck"
++
++
++def _note_open_chat(sid: str, ref: str, state: str, waker, observed_at, now, ledger=None) -> None:
+     """The healthy path: this backend's live poller claims the notice within seconds and logs that claim. Only a
+-    notice still unclaimed past the waker's grace window logs the open-chat skip at INFO (PR #2116 review)."""
+-    with _waits_lock:
+-        last = _waits.get((sid, ref, state), "")
++    notice past the waker's grace window whose poller claim is missing, released undelivered or held by a dead
++    backend logs the open-chat skip at INFO (PR #2116, #2158 reviews)."""
+     grace = waker.grace_s if waker is not None else 0.0
+-    if observed_at is not None and now is not None and now - observed_at >= grace and not last.startswith(
+-            _POLLER_CLAIM):
+-        _note_wait(sid, ref, state, "chat is open in this backend; its live poller claims it")
+-    else:
+-        logger.debug("remote Kanban notice %s %s for chat %s: chat is open in this backend", ref, state, sid)
++    if observed_at is not None and now is not None and now - observed_at >= grace:
++        with _waits_lock:
++            claim_session = _poller_claims.get((sid, ref, state))
++        if claim_session is None:
++            verdict = "stuck"
++        elif claim_session == _CLAIM_DELIVERED:
++            verdict = "delivered"
++        else:
++            verdict = _poller_claim_state(claim_session, ref, state, ledger)
++        if verdict == "stuck":
++            _note_wait(sid, ref, state, "chat is open in this backend; its live poller claims it")
++            return
++        if verdict == "delivered" and claim_session != _CLAIM_DELIVERED:
++            with _waits_lock:  # final: later passes skip the ledger read
++                if _poller_claims.get((sid, ref, state)) == claim_session:
++                    _poller_claims[(sid, ref, state)] = _CLAIM_DELIVERED
++    logger.debug("remote Kanban notice %s %s for chat %s: chat is open in this backend", ref, state, sid)
+ 
+ 
+ def _wait_reason(conn, session: str, ref: str, state: str) -> Optional[str]:
+@@ -892,6 +938,7 @@ def _reset_for_tests() -> None:
+     _swept_loaded.clear()
+     _last_stale.clear()
+     _waits.clear()
++    _poller_claims.clear()
+     with _woken_lock:
+         _woken.clear()
+ 
+@@ -1181,7 +1228,7 @@ def _deliver_link(owner, key, task, link, *, me, ref, state, path, live, session
+         if memo_key in _delivered:
+             return
+         if sid in live:
+-            _note_open_chat(sid, ref, state, waker, observed_at, now)
++            _note_open_chat(sid, ref, state, waker, observed_at, now, ledger)
+             return
+         if waker is not None and observed_at is not None and now is not None and now - observed_at < waker.grace_s:
+             return  # a live poller (any backend) claims within seconds; it owns the chat's turn
+-- 
+2.43.0
+

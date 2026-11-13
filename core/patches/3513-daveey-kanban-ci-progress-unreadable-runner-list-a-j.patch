@@ -1,0 +1,261 @@
+From caf4d5dad45a06ce93d0557c0063237bc48b43d1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:59:28 +0000
+Subject: [PATCH] [daveey] kanban ci progress: unreadable runner list + a job
+ running on the labels = busy, not offline
+
+When neither `actions/runners` list is readable (403/404: the token lacks admin scope), a self-hosted job queued
+past QUEUED_LIMIT_SECONDS was `not_starting`: the card was woken and `runners-offline.<labels>` asserted, even
+when the pool was online and working through a queue. Now that case first looks for a job asking for exactly the
+same labels that a runner is running or took within QUEUED_LIMIT_SECONDS: this run's own jobs, then the jobs of up
+to RECENT_RUNS_MAX (4) in-progress, then recently updated completed, runs of the repo. A hit is `busy` (the
+existing non-waking state from 7d78374d70; logged at INFO as "runner list unreadable, but runner X took job N"),
+so the park is allowed and nothing is woken; the next sweep re-reads. No hit keeps `not_starting`. Those reads
+respect the sweep deadline (OverBudget -> deferred, as the runner-list read does). GitHub-hosted labels read no
+run lists.
+
+Scope note: card t_01a1d4f0a0cc8638 asked for the readable-runner-list check too; 7d78374d70 (#2040 follow-ups,
+landed 12:48 UTC, 19 min after the incident) already returns `busy` when a readable repo/org list has an online
+runner covering the labels. This PR adds the card's remaining item, the 403/404 fallback. The card suggested `ok`
+for the fallback; it returns `busy`, main's state for "queued, pool alive".
+
+## Five whys
+
+Problem. 2026-11-13 04:29:12 PST, `kanban_ci_progress.apply` woke t_01a1d49e9453f7fa (owner of state PR #2179,
+approved at a7033dde93): "CI run 43423320884 queued 15 min, no runner for labels self-hosted,macOS,hermes-state
+... no machine is picking it up", asserted shared blocker `runners-offline.hermes-state`, run outcome
+`ci_run_unstartable`. From 04:29:21 the card sat ready with `respawn_guarded: shared_blocker` until the 30-min
+probe; an operator `hermes kanban resume` was refused ("resume requires an active_pr hold"). The runner was online:
+at 04:36 `gh api repos/example-org/hermes/actions/runners` showed `mini-hermes-state-1 online
+busy=true` (labels self-hosted,macOS,ARM64,hermes-state); its _diag logs show back-to-back ~10 min
+`hermes_state (macOS)` jobs 03:56-04:36, then #2179's jobs 04:36:30-04:37:29; the run succeeded by 04:42.
+
+Why 1. `ci_run_progress` called any job queued > QUEUED_LIMIT_SECONDS (15 min) with no `runner_name`
+`not_starting` (core 2b80c7272d, hermes_cli/kanban_ci_progress.py:150-160).
+
+Why 2. Queue age was its only signal: at 2b80c7272d the module read only the run's jobs (`_fetch_jobs`), no
+actions/runners read. (7d78374d70 has since added the runner-list read; a token that cannot list runners still
+had only queue age.)
+
+Why 3. The hermes-state pool is one self-hosted runner on daveey-mini running one job at a time; with two or more
+core PRs ahead, any macOS job waits >15 min. That is a healthy queue, not an offline pool.
+
+Root (happened). The 11-11 design targeted labels with no runner at all (`self-hosted,ci-fast`) and keyed on queue
+time alone, which also matches a busy single-runner pool.
+
+Root (not caught). tests/hermes_cli/test_kanban_ci_progress.py covered "queued with no runner" and "started", not
+"queued behind a busy online runner" (7d78374d70 added the readable-list case; this adds the unreadable one).
+
+## Proof
+
+RED (new tests on main's module): 2 failed, 48 passed. With runners 403 and a job running on the labels the sweep
+woke the card (`['t_...'] == []`); with runners 403 and a job started 11 min ago the 20-min park was refused.
+GREEN: tests/hermes_cli/test_kanban_ci_progress.py 50 passed. A stale (40 min) job, or a recent job on other
+labels, still gives `not_starting`; GitHub-hosted labels make no run-list read.
+Live read through the broker (user/github), 2026-11-13: repo runner list readable (mini-hermes-state-1 online busy,
+labels self-hosted,macOS,ARM64,hermes-state), so main's check already returns `busy` there; org list 403
+(admin:org), which matters only to a token without repo admin.
+---
+ hermes_cli/kanban_ci_progress.py            | 63 ++++++++++++++++-
+ tests/hermes_cli/test_kanban_ci_progress.py | 76 +++++++++++++++++++++
+ 2 files changed, 137 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index bfacfe724e..5cf579c571 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -11,8 +11,12 @@ longer than ``QUEUED_LIMIT_SECONDS`` with no runner assigned.
+ 
+ A job nobody picked up can also mean the runners are online but saturated. When the repo's or org's self-hosted
+ runner list is readable (``actions/runners``) and a runner that is ``online`` carries every label the job asks for,
+-the run is ``busy`` instead: a park on it is allowed and nothing is woken. When the list is unreadable (the token
+-lacks admin scope) the run stays ``not_starting`` and every message says only that no runner picked it up. The org
++the run is ``busy`` instead: a park on it is allowed and nothing is woken. When neither list is readable (the token
++lacks admin scope) a self-hosted job is still ``busy`` when a job asking for the same labels is running or a runner
++took it within ``QUEUED_LIMIT_SECONDS`` (this run's jobs, then recent runs of the repo): 2026-11-13, run
++43423320884 waited 15 min behind ~10 min jobs on the one-runner ``hermes-state`` pool, which was online and busy,
++and the card owning an approved PR was woken behind ``runners-offline.hermes-state``. With no such job the run
++stays ``not_starting`` and every message says only that no runner picked it up. The org
+ list can include runners in groups this repo may not use, so such a runner online for the labels reads as ``busy``
+ and nothing is woken (a false negative, never a false wake); the repo list is read first and decides alone when it
+ has an online match.
+@@ -68,6 +72,7 @@ NO_CREDENTIAL_WARN_SECONDS = 60 * 60
+ SWEEP_EVERY_SECONDS = 60
+ MAX_CARDS_PER_SWEEP = 6
+ SWEEP_BUDGET_SECONDS = 90
++RECENT_RUNS_MAX = 4  # runs per status whose jobs the unreadable-runner-list fallback reads
+ BLOCKER_PREFIX = "runners-offline"
+ AUTHOR = "kanban-dispatcher"
+ 
+@@ -239,9 +244,63 @@ def ci_run_progress(ref: str, *, hint: str = "", fetch: Optional[Fetch] = None,
+                         repo, run_id, age, name, ",".join(labels))
+             return Progress(BUSY, repo, run_id, labels, age,
+                             detail=f"runner {name} is online for those labels; the runners are saturated")
++    elif "self-hosted" in {x.lower() for x in labels}:
++        try:
++            took = _recent_job_on(repo, labels, (data or {}).get("jobs") or [], now, deadline)
++        except OverBudget as exc:
++            return Progress("unknown", repo, run_id, labels, age, detail=str(exc), deferred=True)
++        if took:
++            logger.info("ci run %s/%s queued %ss: runner list unreadable, but %s on %s, so the runners are "
++                        "saturated", repo, run_id, age, took, ",".join(labels))
++            return Progress(BUSY, repo, run_id, labels, age,
++                            detail=f"runner list unreadable, but {took} on those labels; the runners are saturated")
+     return Progress(NOT_STARTING, repo, run_id, labels, age, runners_readable=runners is not None)
+ 
+ 
++def _recent_job_on(repo: str, labels: list[str], jobs: list, now: float, deadline: Optional[float]) -> str:
++    """With the runner lists unreadable: a job asking for exactly ``labels`` that a runner is running, or took
++    within ``QUEUED_LIMIT_SECONDS``, shows the pool alive. This run's jobs first, then the jobs of up to
++    ``RECENT_RUNS_MAX`` in-progress or recently updated runs of the repo. "" when none or unreadable; raises
++    :class:`OverBudget` when ``deadline`` passed before a read."""
++    want = {x.lower() for x in labels}
++    cutoff = now - QUEUED_LIMIT_SECONDS
++
++    def took(js) -> str:
++        for j in js:
++            if not isinstance(j, dict) or not j.get("runner_name"):
++                continue
++            if {str(x).lower() for x in j.get("labels") or []} != want:
++                continue
++            started = _epoch(j.get("started_at"))
++            if j.get("status") == "in_progress" or (started is not None and started >= cutoff):
++                return f"runner {j.get('runner_name')} took job {j.get('id')}"
++        return ""
++
++    def read(path: str) -> dict:
++        if deadline is not None and time.monotonic() >= deadline:
++            raise OverBudget(f"sweep budget spent before {path.split('?', 1)[0]} was read")
++        return _gh_api(path) or {}
++
++    found = took(jobs)
++    try:
++        runs: list = []
++        for status in ("in_progress", "completed"):
++            if found:
++                break
++            runs = [r for r in read(f"repos/{repo}/actions/runs?status={status}&per_page=10").get("workflow_runs")
++                    or [] if isinstance(r, dict) and r.get("id")
++                    and (status == "in_progress" or (_epoch(r.get("updated_at")) or 0) >= cutoff)]
++            for run in runs[:RECENT_RUNS_MAX]:
++                found = took(read(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100").get("jobs") or [])
++                if found:
++                    break
++    except OverBudget:
++        raise
++    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
++        logger.debug("ci run progress: recent runs of %s unreadable: %s", repo, exc)
++    return found
++
++
+ def describe(p: Progress) -> str:
+     labels = ",".join(p.labels) or "(none)"
+     seen = ("no online runner has them" if p.runners_readable
+diff --git a/tests/hermes_cli/test_kanban_ci_progress.py b/tests/hermes_cli/test_kanban_ci_progress.py
+index a0829c9725..a126e13729 100644
+--- a/tests/hermes_cli/test_kanban_ci_progress.py
++++ b/tests/hermes_cli/test_kanban_ci_progress.py
+@@ -32,6 +32,10 @@ LABELS = ["self-hosted", "ci-fast"]
+ BLOCKER = "runners-offline.ci-fast"
+ 
+ 
++def _iso(age: int) -> str:
++    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))
++
++
+ @pytest.fixture
+ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+     home = tmp_path / ".hermes"
+@@ -74,6 +78,13 @@ def fake_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+         "    if not os.path.exists(src):\n"
+         "        sys.stderr.write('HTTP 403: Resource not accessible by integration\\n'); sys.exit(1)\n"
+         "    sys.stdout.write(open(src).read()); sys.exit(0)\n"
++        "if '/actions/runs?' in path:\n"
++        "    status = path.split('status=', 1)[-1].split('&', 1)[0]\n"
++        f"    src = os.path.join({str(tmp_path)!r}, f'runs-{{status}}.json')\n"
++        "    sys.stdout.write(open(src).read() if os.path.exists(src) else '{\"workflow_runs\": []}'); sys.exit(0)\n"
++        f"other = os.path.join({str(tmp_path)!r}, 'jobs-' + path.split('/runs/', 1)[-1].split('/', 1)[0] + '.json')\n"
++        "if os.path.exists(other):\n"
++        "    sys.stdout.write(open(other).read()); sys.exit(0)\n"
+         f"sys.stdout.write(open({str(jobs)!r}).read())\n")
+     script.chmod(script.stat().st_mode | stat.S_IEXEC)
+     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+@@ -91,6 +102,12 @@ def fake_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+             (org_runners if org else repo_runners).write_text(json.dumps({"total_count": len(runners),
+                                                                           "runners": list(runners)}))
+ 
++        def recent(self, status: str, run_id: int, *, updated_age: int, jobs: list[dict]) -> None:
++            """One recent run of the repo with ``status`` (as the run list shows it) and its jobs."""
++            (tmp_path / f"runs-{status}.json").write_text(json.dumps({"total_count": 1, "workflow_runs": [{
++                "id": run_id, "status": status, "updated_at": _iso(updated_age)}]}))
++            (tmp_path / f"jobs-{run_id}.json").write_text(json.dumps({"total_count": len(jobs), "jobs": jobs}))
++
+         def calls(self, what: str = "") -> int:
+             lines = calls.read_text().splitlines() if calls.exists() else []
+             return sum(1 for line in lines if what in line)
+@@ -892,3 +909,62 @@ def test_a_running_sweep_counts_against_the_probe_budget(kanban_home, fake_gh, m
+             release.set()
+         kcp._SWEEPS.clear()
+         assert kwc.run_due_wake_checks(conn, wait=True)["submitted"] == [tid]
++
++
++# --- runner list unreadable: a job running on the same labels shows the pool alive (2026-11-13, run 43423320884) --
++# The hermes-state pool is one runner taking ~10 min jobs back to back; a run queued behind two core PRs waits past
++# 15 min. A token without admin scope cannot list runners (the fixture's default: HTTP 403), so the pool's own
++# recent jobs are the evidence that it is taking work.
++
++def _taken(*, run_id: int, started_age: int, status: str = "completed", labels=LABELS) -> dict:
++    return {"id": run_id * 10, "run_id": run_id, "name": "hermes_state (macOS)", "status": status,
++            "conclusion": "success" if status == "completed" else None, "created_at": _iso(started_age + 60),
++            "started_at": _iso(started_age), "labels": list(labels), "runner_name": "ci-fast-1", "runner_id": 7}
++
++
++def test_unreadable_runners_with_a_job_running_on_the_labels_neither_wakes_nor_blocks(kanban_home, fake_gh,
++                                                                                       monkeypatch, caplog) -> None:
++    fake_gh.serve(age=2 * 60)
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch)
++        fake_gh.serve(age=20 * 60)
++        fake_gh.recent("in_progress", 555, updated_age=60, jobs=[_taken(run_id=555, started_age=9 * 60,
++                                                                         status="in_progress")])
++        with caplog.at_level("INFO", logger=kcp.logger.name):
++            assert kcp.sweep(conn) == []
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert "ci_run_unstartable" not in [e.kind for e in kb.list_events(conn, tid)]
++        assert BLOCKER not in ksb.blocker_states(conn)
++    assert any("runner list unreadable, but runner ci-fast-1 took job 5550" in r.getMessage()
++               for r in caplog.records), caplog.text
++    p = kcp.ci_run_progress(RUN_URL)
++    assert p.state == kcp.BUSY and "ci-fast-1" in p.detail, p
++
++
++def test_unreadable_runners_with_a_recently_started_job_on_the_labels_parks(kanban_home, fake_gh,
++                                                                            monkeypatch) -> None:
++    fake_gh.serve(age=20 * 60)
++    fake_gh.recent("completed", 556, updated_age=60, jobs=[_taken(run_id=556, started_age=11 * 60)])
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        assert _park_on_run().get("status") == "scheduled"
++
++
++@pytest.mark.parametrize("job", [
++    _taken(run_id=557, started_age=40 * 60),  # the pool's last job started long ago
++    _taken(run_id=557, started_age=5 * 60, labels=("self-hosted", "ci-slow")),  # another pool is alive
++], ids=["stale", "other-labels"])
++def test_unreadable_runners_and_no_recent_job_on_the_labels_is_not_starting(kanban_home, fake_gh, job) -> None:
++    fake_gh.serve(age=20 * 60)
++    fake_gh.recent("completed", 557, updated_age=60, jobs=[job])
++    p = kcp.ci_run_progress(RUN_URL)
++    assert p.state == kcp.NOT_STARTING and not p.runners_readable, p
++
++
++def test_github_hosted_labels_read_no_recent_runs(kanban_home, fake_gh) -> None:
++    queued = {"jobs": [{"id": 1, "status": "queued", "created_at": _iso(20 * 60), "labels": ["ubuntu-latest"],
++                        "runner_name": None}]}
++    p = kcp.ci_run_progress(RUN_URL, fetch=lambda _repo, _run: queued)
++    assert p.state == kcp.NOT_STARTING, p
++    assert fake_gh.calls("actions/runs?") == 0
+-- 
+2.43.0
+

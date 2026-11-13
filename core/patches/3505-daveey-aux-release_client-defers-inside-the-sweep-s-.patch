@@ -1,0 +1,129 @@
+From 6a1dcd4d626742dfb31098d6caa83a71c950c56c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:03:57 +0000
+Subject: [PATCH] [daveey] aux: release_client defers inside the sweep's try;
+ setup_logging test for logging.debug_ssl_close
+
+Follow-up to the two non-blocking nits in review 5890190501 of PR #2137.
+
+1. release_client ran `deferred = sum(attempt.defer(...))` before the try whose finally opens the
+   `swept` gate. If a later defer() raised after an earlier one succeeded (or an async KeyboardInterrupt
+   landed on the owner thread), the already-deferred daemon parked forever in the unbounded
+   `swept.wait()` and the client never closed. The defers now run inside the try, counted one by one,
+   and the finally both opens the gate and counts down every attempt that took no share, so the
+   daemon holding one still closes the client on its own thread.
+   Test: test_a_defer_raising_after_another_succeeded_still_closes_on_the_first_daemon (second defer
+   raises KeyboardInterrupt). RED on f079b6f91f: the daemon is still alive after join(5); GREEN here.
+
+2. logging.debug_ssl_close is a DEFAULT_CONFIG key with no config.yaml -> setup_logging test (the
+   per-key invariant hermes_cli/AGENTS.md asks for). New parametrized
+   test_debug_ssl_close_from_config_yaml_installs_the_tripwire writes the key to a temp config.yaml
+   (absent / false / true / "on"), runs setup_logging(force=True) and checks the
+   agent.ssl_close_tripwire wrappers on ssl.SSLSocket, uninstalling after. Mutation proof: with the
+   install_if_enabled call in setup_logging removed, the true and "on" cases fail.
+
+Tests: tests/agent/test_aux_abandoned_provider_tls_fd.py, tests/test_hermes_logging.py,
+tests/agent/test_auxiliary_client.py: 284 passed, 4 skipped.
+---
+ agent/aux_provider_handoff.py                 | 11 +++++---
+ .../test_aux_abandoned_provider_tls_fd.py     | 25 +++++++++++++++++++
+ tests/test_hermes_logging.py                  | 21 ++++++++++++++++
+ 3 files changed, 54 insertions(+), 3 deletions(-)
+
+diff --git a/agent/aux_provider_handoff.py b/agent/aux_provider_handoff.py
+index 9ff704390d..bff2a95e9b 100644
+--- a/agent/aux_provider_handoff.py
++++ b/agent/aux_provider_handoff.py
+@@ -139,13 +139,18 @@ def release_client(client: Any, close: Callable[[Any], None], abandoned: list[Pr
+ 
+     # Defer before the shutdown wakes the daemon: shutting down first let a woken daemon finish before the
+     # defer, so the close fell back to this thread (FD-safe then, but no longer the daemon's).
+-    deferred = sum(attempt.defer(daemon_done) for attempt in abandoned)
++    # The defers run inside the try: if one raises after another succeeded (or an async KeyboardInterrupt
++    # lands here), the finally still opens the gate and counts down every attempt that took no share, so the
++    # daemons already holding one close the client instead of parking forever in swept.wait().
++    deferred = 0
+     try:
++        for attempt in abandoned:
++            deferred += bool(attempt.defer(daemon_done))
+         shutdown_count = force_close_tcp_sockets(getattr(client, "_real_client", None) or client) if deferred else 0
+     finally:
+         swept.set()
+-    for _ in range(len(abandoned) - deferred):
+-        one_done()
++        for _ in range(len(abandoned) - deferred):
++            one_done()
+     if deferred:
+         logger.info("auxiliary client close handed to %d abandoned provider daemon(s) (tcp_shutdown=%d)",
+                     deferred, shutdown_count)
+diff --git a/tests/agent/test_aux_abandoned_provider_tls_fd.py b/tests/agent/test_aux_abandoned_provider_tls_fd.py
+index 35038855bf..9a08db7a67 100644
+--- a/tests/agent/test_aux_abandoned_provider_tls_fd.py
++++ b/tests/agent/test_aux_abandoned_provider_tls_fd.py
+@@ -282,6 +282,31 @@ def test_mixed_finished_and_reading_daemons_close_once_on_the_last_reader(monkey
+     assert log == ["sweep", "close"]
+ 
+ 
++def test_a_defer_raising_after_another_succeeded_still_closes_on_the_first_daemon(monkeypatch):
++    """[daveey] One daemon took the deferred close, then the next defer() raised (or an async KeyboardInterrupt
++    landed on the owner): the sweep gate must still open and the attempts that took no share must still count
++    down, or the first daemon parks forever in ``swept.wait()`` and the client never closes."""
++    from agent import agent_runtime_helpers
++    log: list = []
++    reading, broken = handoff.ProviderAttempt(), handoff.ProviderAttempt()
++
++    def defer_raises(release):
++        raise KeyboardInterrupt
++
++    monkeypatch.setattr(broken, "defer", defer_raises)
++    monkeypatch.setattr(agent_runtime_helpers, "force_close_tcp_sockets", lambda c: log.append("sweep") or 1)
++    with pytest.raises(KeyboardInterrupt):
++        with handoff.client_scope("client", lambda c: log.append(("close", threading.current_thread().name))):
++            handoff.note_abandoned(reading)
++            handoff.note_abandoned(broken)
++    assert log == []  # the sweep never ran, and the reading daemon still owns the close
++    daemon = threading.Thread(target=reading.finish, name="hermes-protected-aux-provider", daemon=True)
++    daemon.start()
++    daemon.join(5)
++    assert not daemon.is_alive(), "the deferred daemon parked in swept.wait()"
++    assert log == [("close", "hermes-protected-aux-provider")]
++
++
+ def test_note_abandoned_outside_a_scope_is_a_no_op():
+     handoff.note_abandoned(handoff.ProviderAttempt())
+ 
+diff --git a/tests/test_hermes_logging.py b/tests/test_hermes_logging.py
+index db3c7cb3cc..471d9a6538 100644
+--- a/tests/test_hermes_logging.py
++++ b/tests/test_hermes_logging.py
+@@ -763,6 +763,27 @@ class TestReadLoggingConfig:
+         mb = 1024 * 1024
+         assert seen == {"agent.log": (5 * mb, 3), "errors.log": (2 * mb, 2), "gateway.log": (5 * mb, 3)}
+ 
++    @pytest.mark.parametrize("value, installed", [(None, False), (False, False), (True, True), ("on", True)])
++    def test_debug_ssl_close_from_config_yaml_installs_the_tripwire(self, hermes_home, value, installed):
++        """[daveey] ``logging.debug_ssl_close`` (a DEFAULT_CONFIG key, off by default) reaches
++        agent.ssl_close_tripwire only through setup_logging's config read: prove the key end to end."""
++        import ssl
++
++        import hermes_yaml as yaml
++        from agent import ssl_close_tripwire
++        from hermes_cli.config_defaults import DEFAULT_CONFIG
++
++        assert DEFAULT_CONFIG["logging"]["debug_ssl_close"] is False
++        logging_cfg = {"level": "INFO"} if value is None else {"debug_ssl_close": value}
++        (hermes_home / "config.yaml").write_text(yaml.safe_dump({"logging": logging_cfg}), encoding="utf-8")
++        assert not hasattr(ssl.SSLSocket.recv, "__wrapped__")
++        try:
++            hermes_logging.setup_logging(hermes_home=hermes_home, force=True)
++            assert hasattr(ssl.SSLSocket.recv, "__wrapped__") is installed
++        finally:
++            ssl_close_tripwire.uninstall()
++        assert not hasattr(ssl.SSLSocket.recv, "__wrapped__")
++
+ 
+ 
+ class TestExternalRotationRecovery:
+-- 
+2.43.0
+

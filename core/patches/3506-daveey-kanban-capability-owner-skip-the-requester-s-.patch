@@ -1,0 +1,414 @@
+From 35f1ee105f583da05c97ffbc2c2c17075d2c67d2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:52:30 +0000
+Subject: [PATCH] [daveey] kanban capability owner: skip the requester's bound
+ origin placeholder in create_overlap; wake on a rejected owner request
+
+Hub card t_01a1d49003c65ca4 (placed on the hub by macbook; macbook placeholder t_01a1d48f676074bc, scheduled,
+same title) blocked with needs=['host:macbook']. macbook refused the owner create as create_overlap whose only
+match was that placeholder, no owner existed, and wait-check exited 2 until the card was woken
+wake_check_broken 4 minutes later with nothing done (t_01a1d4dc5eb85b00).
+
+Five whys:
+1. No owner card: macbook's kanban_create refused create_overlap (sent row, matches=[t_01a1d48f676074bc]).
+2. The placeholder matched: the owner title/body quote the waiting card's title, which the placeholder shares.
+3. It was not exempt: overlap_exclusions only walked the waiting card and its awaiting.ref chain upward; the
+   placeholder waits on the hub card (downward), and the holder-side scan only skipped card["id"] == waiting.
+4. Nothing modelled "a card bound to the waiting card" on either side.
+5. A rejected request was mapped to wait-check exit 2 ("cannot tell"), so the dispatcher treated a terminal
+   refusal as a broken probe instead of waking the card with it.
+
+Fix:
+- Requester: kanban_capability_routing.bound_cards() adds the origin placeholder named in the forward footer
+  ("This card was <gw> card <id>; it completes there ...") and local cards parked on the waiting card to
+  overlap_exclusions, so they ride distinct_from.
+- Holder: kanban_overlap skips, for a capability-owner create, a local card forwarded to the waiting card
+  (placement_forwarded.remote_task_id) or scheduled with awaiting.ref == the waiting card. Older requesters
+  that send no distinct_from for it are covered too. Same-title strangers still refuse.
+- wait_check: a request in a failed terminal state exits 0 at once with the refusal text (code, matches,
+  error) so the card wakes to re-plan; owner_status keeps refusing a park on a dead request.
+
+Tests: test_kanban_capability_owner_origin_mirror.py (RED on main: 6/6 fail; GREEN here), and
+test_kanban_capability_routing.py's two rejected-request tests now pin the wake-with-refusal contract (RED on
+main: 2 fail).
+---
+ hermes_cli/kanban_capability_routing.py       |  53 ++++-
+ hermes_cli/kanban_overlap.py                  |  28 ++-
+ ...t_kanban_capability_owner_origin_mirror.py | 183 ++++++++++++++++++
+ .../test_kanban_capability_routing.py         |  11 +-
+ 4 files changed, 266 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_capability_owner_origin_mirror.py
+
+diff --git a/hermes_cli/kanban_capability_routing.py b/hermes_cli/kanban_capability_routing.py
+index 9712000d73..0f70e6dbc5 100644
+--- a/hermes_cli/kanban_capability_routing.py
++++ b/hermes_cli/kanban_capability_routing.py
+@@ -160,7 +160,33 @@ def overlap_exclusions(conn, task_id: str) -> list[str]:
+         ref = str(awaiting.get("ref") or "")
+         if _TASK_ID.fullmatch(ref):
+             stack.append(ref)
+-    return seen
++    return seen + [b for b in bound_cards(conn, task_id) if b not in seen]
++
++
++# The footer kanban_placement_forward.remote_args writes on a card it places on another gateway.
++_PLACED_FROM = re.compile(r"^This card was \S+ card (t_[0-9a-f]{8,32}); it completes there when this one is done\.$",
++                          re.MULTILINE)
++
++
++def bound_cards(conn, task_id: str) -> list[str]:
++    """Cards whose completion is bound to ``task_id``: they wait on it, so they never do its work.
++
++    The origin placeholder of a placed card (named in the forward's footer; it lives on the gateway that
++    placed it and is parked on this card) and local cards whose current park waits on it. The owner title
++    quotes the waiting card's title, which these cards share, so the holder's create_overlap check matched
++    the origin placeholder and refused the owner (hub t_01a1d49003c65ca4 -> macbook t_01a1d48f676074bc).
++    """
++    out: list[str] = []
++    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    for tid in _PLACED_FROM.findall((row[0] if row else "") or ""):
++        if tid != task_id and tid not in out:
++            out.append(tid)
++    rows = conn.execute(
++        "SELECT t.id FROM tasks t WHERE t.status = 'scheduled' AND t.id != ? AND (SELECT json_extract(e.payload, "
++        "'$.awaiting.ref') FROM task_events e WHERE e.kind IN ('scheduled', 'continued') AND e.task_id = t.id "
++        "ORDER BY e.id DESC LIMIT 1) = ? LIMIT 16", (task_id, task_id)).fetchall()
++    out += [r[0] for r in rows if r[0] not in out]
++    return out
+ 
+ 
+ def _strip_overlap_options(argv: list[str]) -> list[str]:
+@@ -924,10 +950,35 @@ def _local_owner(conn, task, entry: dict, *, need: str, rid: str, self_gw: str,
+     return 1, f"{rid} -> local owner {owner} (this gateway holds {need})"
+ 
+ 
++def _rejected(rid: str) -> Optional[str]:
++    """The holder's refusal when request ``rid`` ended in a terminal state other than done, else None.
++
++    A rejected owner request will never make a card, so the waiting card must not keep probing it: wait-check
++    wakes the card at once with this text (exit 0), never the "cannot tell" exit 2 that only woke it after three
++    strikes as ``wake_check_broken`` (hub t_01a1d49003c65ca4: create_overlap on macbook, woken 4 min later with
++    nothing done and no rejection shown)."""
++    from hermes_cli.kanban_placement import FAILED_STATES, remote_rejection
++    why = remote_rejection(rid)
++    if not why or why.get("state") not in FAILED_STATES:
++        return None
++    matches = ", ".join(f"{m.get('id')} on {m.get('gateway') or '?'} ({m.get('status') or '?'})"
++                        for m in (why.get("matches") or [])[:3])
++    gw = ((_sent(rid) or {}).get("body") or {}).get("to_gw") or "the holder"
++    return (f"capability owner request {rid} was {why['state']} by {gw} ({why.get('code') or why['state']}"
++            + (f": matches {matches}" if matches else "") + f"): {str(why.get('error') or '')[:400]}. "
++            "No owner card exists, so this card was woken to re-plan. Blocking again with the same needs routes "
++            "one fresh request (a new generation); if the refusal names a card that really owns this work, "
++            "continue that card instead.")
++
++
+ def wait_check(target: str) -> tuple[int, str]:
+     rids = [r for r in (target or "").split(",") if r.strip()]
+     if not rids:
+         return 2, "error: no request id"
++    rejected = [msg for msg in (_rejected(r.strip()) for r in rids) if msg]
++    if rejected:
++        # Terminal: wake now with the refusal (a pending sibling request does not hold the card on a dead one).
++        return 0, "; ".join(rejected)
+     results = [owner_status(r.strip()) for r in rids]
+     rc = 2 if any(r[0] == 2 for r in results) else (0 if all(r[0] == 0 for r in results) else 1)
+     return rc, "; ".join(m for _, m in results)
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index b6a4202546..e0a6d3b47c 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -30,7 +30,8 @@ equals a board slug does not count.
+ Closed cards never match (a replica's stale legacy ``<board>/<id>`` row never outvotes its qualified
+ ``<profile>/<board>/<id>`` twin). Heuristic exemptions (singletons ignore these except the capability
+ waiting card): the creator's own card, the new card's parents, cards the same chat or the same
+-worker created (fan-out), the waiting card a capability-owner create quotes, and another capability-owner
++worker created (fan-out), the waiting card a capability-owner create quotes, a local card bound to that
++waiting card (its deferred-placement origin, or a card parked on it: :func:`_bound_to`), and another capability-owner
+ card for that same waiting card, a card the new one parks/waits/depends on (:func:`waits_on`), a card whose failed
+ execution the new one recovers (:func:`recovers`: ``self-heal: kanban card t_X ... failed 2x``), and a card that
+ names a different target (:func:`distinct_target`: another repo, host or process, an inverted check at another
+@@ -552,10 +553,16 @@ def _board_cards(c: sqlite3.Connection, slug: str, self_gw: Optional[str], *,
+     ``create_task`` waits for the write lock, so a slow concurrent create can commit a row older than the check."""
+     marks = ",".join("?" * len(OPEN))
+     newer = " AND (t.rowid > ? OR t.created_at >= ?)" if since is not None else ""
++    # ``placed_as``: the card on another gateway this one was forwarded to (deferred placement); ``awaits``: the
++    # card its latest park waits on. Either binds this card's completion to that card (:func:`_bound_to`).
+     rows = c.execute(
+         "SELECT t.id, t.title, t.body, t.status, t.session_id, (SELECT json_extract(e.payload, "
+         "'$.creator_task_id') FROM task_events e WHERE e.task_id = t.id AND e.kind = 'created' "
+-        f"LIMIT 1), t.idempotency_key FROM tasks t WHERE t.status IN ({marks}){newer}",
++        "LIMIT 1), t.idempotency_key, (SELECT json_extract(e.payload, '$.remote_task_id') FROM task_events e "
++        "WHERE e.kind = 'placement_forwarded' AND e.task_id = t.id AND json_extract(e.payload, "
++        "'$.remote_task_id') IS NOT NULL ORDER BY e.id DESC LIMIT 1), (SELECT json_extract(e.payload, "
++        "'$.awaiting.ref') FROM task_events e WHERE e.kind IN ('scheduled', 'continued') AND e.task_id = t.id "
++        f"ORDER BY e.id DESC LIMIT 1) FROM tasks t WHERE t.status IN ({marks}){newer}",
+         (*OPEN, *(since or ()))).fetchall()
+     if not rows:
+         return []
+@@ -569,8 +576,10 @@ def _board_cards(c: sqlite3.Connection, slug: str, self_gw: Optional[str], *,
+     return [{"id": tid, "board": slug, "gateway": self_gw or "local", "status": status, "title": title,
+              "body": body or "",
+              "session_id": sess, "creator_task_id": creator, "local": True, "key_family": key_family(key),
++             "placed_as": placed if isinstance(placed, str) else None,
++             "awaits": awaits if isinstance(awaits, str) and status == "scheduled" else None,
+              "chats": sorted(chats.get(tid, set()) | ({sess} if sess else set()))}
+-            for tid, title, body, status, sess, creator, key in rows]
++            for tid, title, body, status, sess, creator, key, placed, awaits in rows]
+ 
+ 
+ def _local_cards(self_gw: Optional[str]) -> Iterable[dict]:
+@@ -659,6 +668,17 @@ def capability_owner_waiting_id(title: str, body: str) -> Optional[str]:
+     return None
+ 
+ 
++def _bound_to(card: dict, waiting_id: str) -> bool:
++    """True when ``card`` completes only through ``waiting_id``: it was forwarded there by deferred placement
++    (``placement_forwarded``, the origin placeholder the placed card's body names), or it is parked on it.
++
++    Such a card waits on the waiting card by construction, so it can never do the capability owner's scoped
++    action: counting it as an owner refused every owner create a placed card asked its origin gateway for
++    (hub t_01a1d49003c65ca4, macbook placeholder t_01a1d48f676074bc).
++    """
++    return waiting_id in (card.get("placed_as"), card.get("awaits"))
++
++
+ def _sibling_owner(card_title: str, waiting_id: str) -> bool:
+     found = _OWNER_TITLE_RE.match(card_title or "")
+     return bool(found and found.group(1) == waiting_id)
+@@ -701,7 +721,7 @@ def _find(*, title: str, body: str, target_board: str, session_id: Optional[str]
+             continue
+         # The capability owner executes this exact waiting card, even for a singleton.
+         # Keep other mirror owners visible; do not exempt a whole family or envelope.
+-        if card["id"] == waiting:
++        if waiting and (card["id"] == waiting or _bound_to(card, waiting)):
+             continue
+         if not singleton and (card["id"] in skip
+                 or (waiting and _sibling_owner(card.get("title") or "", waiting))
+diff --git a/tests/hermes_cli/test_kanban_capability_owner_origin_mirror.py b/tests/hermes_cli/test_kanban_capability_owner_origin_mirror.py
+new file mode 100644
+index 0000000000..54335bdd9f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_capability_owner_origin_mirror.py
+@@ -0,0 +1,183 @@
++"""A placed card's capability owner is not a duplicate of its origin placeholder (t_01a1d4dc5eb85b00). [daveey]
++
++Replays hub t_01a1d49003c65ca4: macbook forwarded card t_01a1d48f676074bc to the hub by deferred placement and
++parked it on the hub copy. The hub worker hit a MacBook-only step and blocked with needs=['host:macbook'];
++macbook refused the owner create as create_overlap with that placeholder (same title, it waits on the hub card
++by construction), no owner card existed, and wait-check exited 2 until the card was woken wake_check_broken.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++from hermes_cli import kanban_capability_routing as kcr
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_overlap
++from hermes_cli import kanban_placement_forward as forward
++from tests.hermes_cli import test_kanban_capability_routing as base
++
++env = base.env
++_apply_owner_create, _cli, publish = base._apply_owner_create, base._cli, base.publish
++
++TITLE = ("Hub session writes during gateway startup return 503 \"owner_unavailable: starting\" "
++         "instead of riding out the startup window")
++NEED = "host:macbook"
++REASON = "Live proof needs the MacBook Desktop hermes:api IPC and its probe scripts."
++
++
++def _set(conn, tid: str, status: str) -> None:
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
++
++
++def _park_on(conn, tid: str, ref: str, gateway: str = "hub") -> None:
++    _set(conn, tid, "scheduled")
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "scheduled", {"awaiting": {"kind": "card", "ref": ref, "gateway": gateway},
++                                                  "reason": "deferred placement"})
++
++
++def _replicate(hub, gw: str, tid: str, title: str, status: str) -> None:
++    hub.execute("INSERT OR REPLACE INTO replica VALUES (?, 'tasks', ?, 1, 1, ?, ?)",
++                (gw, f"default/default/{tid}", json.dumps({"id": tid, "board": "default", "gateway": gw,
++                                                           "status": status, "title": title}), int(time.time())))
++    hub.commit()
++
++
++def _placed_on_hub(env):
++    """The hub copy of a macbook card (body built by the real forward), with the macbook placeholder replicated
++    as the hub sees it. Returns (hub card, macbook placeholder)."""
++    with kbc.connect_closing() as conn:
++        # Build the forwarded body from a stand-in for macbook's card, then retire the stand-in: on the hub the
++        # placeholder exists only in the replica.
++        placeholder = kb.create_task(conn, title=TITLE, body="Fix spec: retry while starting.", assignee="default")
++        body = forward.remote_args(conn, kb.get_task(conn, placeholder), self_gw="macbook")["body"]
++        _set(conn, placeholder, "archived")
++        hub_card = kb.create_task(conn, title=TITLE, body=body, assignee="default")
++        _set(conn, hub_card, "ready")
++        assert kb.claim_task(conn, hub_card, claimer="worker") is not None
++    _replicate(env["hub"], "macbook", placeholder, TITLE, "scheduled")
++    return hub_card, placeholder
++
++
++# --- 1. the owner create is not refused against the requester's own placeholder -------------------------
++
++
++def test_placed_card_routes_host_need_to_its_origin_and_the_owner_is_created(env, monkeypatch):
++    """Acceptance 1: a hub-placed card whose origin placeholder is scheduled on macbook routes needs=['host:macbook']
++    and the owner card IS created on macbook (on main: create_overlap with the placeholder)."""
++    publish(env["hub"], "macbook", {NEED: time.time()})
++    applied = _apply_owner_create(env, monkeypatch)
++    hub_card, placeholder = _placed_on_hub(env)
++    with kbc.connect_closing() as conn:
++        out = kcr.route(conn, hub_card, [NEED], reason=REASON)
++        task = kb.get_task(conn, hub_card)
++        assert task is not None and task.status == "scheduled"
++    assert not applied.get("rejected"), applied
++    assert applied.get("owner"), applied
++    assert placeholder in applied["matches"] and placeholder in applied["distinct"], applied
++    assert out["routes"][0]["gateway"] == "macbook"
++    rc, msg = kcr.wait_check(kcr.request_id(hub_card, NEED))
++    assert rc == 1, msg  # pending on the owner card, not a rejection
++
++
++def test_genuine_twin_on_the_origin_gateway_still_refuses_the_owner(env, monkeypatch):
++    """Only the bound placeholder is exempt: another open card on macbook with the same title still refuses."""
++    publish(env["hub"], "macbook", {NEED: time.time()})
++    applied = _apply_owner_create(env, monkeypatch)
++    hub_card, placeholder = _placed_on_hub(env)
++    stranger = "t_01a1d4ffffff0001"
++    _replicate(env["hub"], "macbook", stranger, TITLE, "running")
++    with kbc.connect_closing() as conn:
++        try:
++            kcr.route(conn, hub_card, [NEED], reason=REASON)
++        except Exception as exc:  # the synchronous fake rejects before the park
++            applied["error"] = str(exc)
++    assert applied.get("rejected"), applied
++    assert stranger in applied["matches"] and stranger not in applied["distinct"], applied
++    assert placeholder in applied["distinct"], applied
++
++
++def test_bound_cards_reads_the_forward_footer_and_local_parks(env):
++    with kbc.connect_closing() as conn:
++        hub_card = kb.create_task(conn, title=TITLE, assignee="default",
++                                  body="x\n\nThis card was macbook card t_01a1d48f676074bc; it completes there "
++                                       "when this one is done.\n\n---\nPlaced on hub by macbook's rule.")
++        local_waiter = kb.create_task(conn, title=TITLE, assignee="default")
++        _park_on(conn, local_waiter, hub_card)
++        unrelated = kb.create_task(conn, title=TITLE, assignee="default")
++        _park_on(conn, unrelated, "t_01a1d4aaaaaa0000")
++        assert kcr.bound_cards(conn, hub_card) == ["t_01a1d48f676074bc", local_waiter]
++        excl = kcr.overlap_exclusions(conn, hub_card)
++    assert excl[0] == hub_card and "t_01a1d48f676074bc" in excl and local_waiter in excl
++    assert unrelated not in excl
++
++
++def _owner_text(waiting: str) -> tuple[str, str]:
++    return (f"Capability owner: {NEED} for hub/{waiting} ({TITLE[:80]})",
++            f"Capability owner card for waiting card hub/default/default/{waiting} (\"{TITLE}\").\n")
++
++
++def test_holder_skips_its_placeholder_even_without_distinct_from(env):
++    """Target side (an older requester sends no distinct_from for it): macbook's overlap scan must not count its
++    own placeholder, bound by placement_forwarded or by its park, while a same-title stranger still matches."""
++    waiting = "t_01a1d49003c65ca4"
++    with kbc.connect_closing() as conn:
++        forwarded = kb.create_task(conn, title=TITLE, assignee="default")
++        with kb.write_txn(conn):
++            kb._append_event(conn, forwarded, "placement_forwarded",
++                             {"request_id": "placement:macbook:abc", "remote_task_id": waiting})
++        _set(conn, forwarded, "scheduled")
++        parked = kb.create_task(conn, title=TITLE, assignee="default")
++        _park_on(conn, parked, waiting)
++        stranger = kb.create_task(conn, title=TITLE, assignee="default")
++        _park_on(conn, stranger, "t_01a1d4aaaaaa0000")
++    title, body = _owner_text(waiting)
++    ids = [m["id"] for m in kanban_overlap.find(title=title, body=body, target_board="default", session_id=None,
++                                                self_tid=None, parents=[])]
++    assert forwarded not in ids and parked not in ids, ids
++    assert stranger in ids, ids
++    # Not an owner create: the exemption needs the capability-owner shape, so a plain twin still matches.
++    plain = [m["id"] for m in kanban_overlap.find(title=TITLE, body="", target_board="default", session_id=None,
++                                                  self_tid=None, parents=[])]
++    assert forwarded in plain and parked in plain
++
++
++# --- 2. a rejected owner request wakes the card at once with the refusal ---------------------------------
++
++# The hub's sent row for capability-owner:t_01a1d49003c65ca4:host:macbook (2026-11-13 12:05 UTC), abridged.
++REFUSAL = json.dumps({"ok": False, "created": False, "code": "create_overlap", "matches": [
++    {"id": "t_01a1d48f676074bc", "board": "default", "gateway": "macbook", "status": "scheduled", "title": TITLE}],
++    "total_matches": 1, "note": "No card was created: 1 open card(s) already look like this work."})
++
++
++def _rejected_request(env, rid: str) -> None:
++    env["hub"].execute("INSERT INTO sent VALUES (?, ?, 'rejected', ?, 0, 0, 1)",
++                       (rid, json.dumps({"to_gw": "macbook", "key": "default/default/new"}),
++                        json.dumps({"error": REFUSAL})))
++    env["hub"].commit()
++
++
++def test_rejected_owner_request_wakes_with_the_refusal_not_a_broken_probe(env, capsys):
++    """Acceptance 2: exit 0 (the dispatcher wakes the card on the first probe) carrying the refusal, where main
++    exited 2 three times and woke it wake_check_broken with "Fix the probe"."""
++    rid = "capability-owner:t_01a1d49003c65ca4:host:macbook"
++    _rejected_request(env, rid)
++    rc, msg = kcr.wait_check(rid)
++    assert rc == 0, msg
++    assert "rejected by macbook" in msg and "create_overlap" in msg and "t_01a1d48f676074bc" in msg, msg
++    assert _cli("wait-check", "capability-owner", rid) == 0
++    assert "create_overlap" in capsys.readouterr().out
++    # The park producer check still refuses parking on a dead request (owner_status keeps "not live").
++    assert kcr.owner_status(rid)[0] == 2
++
++
++def test_one_rejected_request_wakes_even_while_another_is_pending(env):
++    pending = "capability-owner:t_01a1d49003c65ca4:ssh:mini"
++    env["hub"].execute("INSERT INTO sent VALUES (?, ?, 'local', NULL, 0, 0, 0)",
++                       (pending, json.dumps({"to_gw": "mini", "key": "default/default/new"})))
++    rejected = "capability-owner:t_01a1d49003c65ca4:host:macbook"
++    _rejected_request(env, rejected)
++    rc, msg = kcr.wait_check(f"{pending},{rejected}")
++    assert rc == 0 and rejected in msg, msg
+diff --git a/tests/hermes_cli/test_kanban_capability_routing.py b/tests/hermes_cli/test_kanban_capability_routing.py
+index 70460f745b..9adb648daa 100644
+--- a/tests/hermes_cli/test_kanban_capability_routing.py
++++ b/tests/hermes_cli/test_kanban_capability_routing.py
+@@ -263,11 +263,14 @@ def test_needs_with_human_request_is_refused(env, monkeypatch):
+     assert "error" in out and env["calls"] == []
+ 
+ 
+-def test_rejected_owner_request_is_cannot_tell_not_not_yet(env):
++def test_rejected_owner_request_wakes_now_with_the_refusal(env):
++    """A rejected request never makes an owner card: wake the card at once (0) with the refusal, never the
++    "cannot tell" 2 that woke it only after three strikes as wake_check_broken (t_01a1d4dc5eb85b00)."""
+     env["hub"].execute("INSERT INTO sent VALUES ('capability-owner:t_x:ssh:mini', ?, 'rejected', ?, 0, 0, 1)",
+                        (json.dumps({"to_gw": "mini", "key": "default/default/new"}), json.dumps({"error": "no"})))
+     env["hub"].commit()
+-    assert kcr.wait_check("capability-owner:t_x:ssh:mini")[0] == 2
++    rc, msg = kcr.wait_check("capability-owner:t_x:ssh:mini")
++    assert rc == 0 and "rejected by mini" in msg and "no" in msg, msg
+     assert kcr.wait_check("capability-owner:t_unknown:ssh:mini")[0] == 2
+ 
+ 
+@@ -722,11 +725,11 @@ def test_capability_route_creates_owner_when_reason_duplicates_requester_title(e
+ 
+ def test_unrelated_title_twin_still_rejects_the_owner_create(env, monkeypatch):
+     """Excluding the waiting card must not disable overlap. A different open card with the
+-    same title is still a second owner, and wait-check reports the rejection (2)."""
++    same title is still a second owner, and wait-check wakes the card with the rejection (0)."""
+     _tid, awaited, stranger, rid, applied = _route_overlapping(env, monkeypatch, stranger=True)
+     assert applied.get("rejected"), applied
+     assert "create_overlap" in applied.get("error", ""), applied
+     assert stranger in applied["matches"] and stranger not in applied["distinct"]
+     assert awaited in applied.get("distinct", [])
+     rc, msg = kcr.wait_check(rid)
+-    assert rc == 2 and "rejected" in msg, msg
++    assert rc == 0 and "rejected" in msg and "create_overlap" in msg, msg
+-- 
+2.43.0
+
