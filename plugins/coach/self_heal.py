@@ -4460,11 +4460,18 @@ def _adopt_complaint_lane(d: dict, fp: str, store, now: float) -> Optional[dict]
     lane = LaneState(store.root)
     owners = []
     entries = lane.read()
+    rejected = set((entries.get(fp) or {}).get("rejected_owners") or [])
     for ofp, e in entries.items():
         # An alias retains the old turn even if its canonical fingerprint later recurs.
         # Consult the canonical lifecycle rather than trusting a stale copied verdict.
         canonical = entries.get(e["complaint_owner"], {}) if e.get("complaint_owner") else e
         if (ofp == fp and not e.get("complaint_owner")) or not canonical or canonical.get("status") == "declined":
+            continue
+        card = e.get("fix_card") or e.get("card")
+        if card and (card in rejected or card in (canonical.get("rejected_owners") or [])):
+            # A refused owner stays refused on every adoption path. An alias holds a COPY of its canonical lane's
+            # card, so a requeued lane re-adopted the very card revalidation had just refused, from its own alias,
+            # and became its own complaint owner (agent-07ffde73f6 -> kanban-c91f12bc2f -> t_01a1cca14f4dd08a, 11-13).
             continue
         if e.get("session_id") != sid:
             card = e.get("fix_card") or e.get("card")
@@ -5839,6 +5846,8 @@ def reconcile(store=None, runner=None, now: Optional[float] = None) -> list:
                 st = lane.update(fp, adopt_card=st.get("fix_card"), adopt_via=via or "unknown",
                                  adopt_rule=st.get("adopt_rule") or (1 if via == "session" else None))
             what = _revalidate_adoption(lane, store, fp, st, runner, now, (recs.get(fp) or {}).get("detect"))
+            if not what and st.get("status") == "adopted":
+                what = _release_refused_alias(lane, store, fp, st, lane.read(), now)
         except Exception as exc:  # health: allow BLE001 -- advisory re-judgement; the receipt path below still runs
             store.log({"event": "selfheal_adoption_revalidate_error", "fingerprint": fp, "error": str(exc)[:200]})
             what = None
@@ -5935,24 +5944,61 @@ def _revalidate_adoption(lane, store, fp: str, st: dict, runner, now: float,
                            rejected_owners=sorted(set(st.get("rejected_owners") or []) | {card}),
                            adopt_card=None, adopt_via=None, adopt_checked_at=now):
         return None  # the lane moved meanwhile (a receipt, a re-approval): that newer state stands
-    requeued = False
-    if rec.get("source") and st.get("symptom"):
-        payload = {k: v for k, v in {**d, "p_defect": rec.get("p"), "host": rec.get("host")}.items()
-                   if v not in (None, "")}
-        db = _pending_db(store)
-        try:
-            with db:
-                db.execute("INSERT INTO pending VALUES (?, ?, ?, ?) ON CONFLICT(fp) DO UPDATE SET "
-                           "payload=excluded.payload, retry=excluded.retry, version=excluded.version",
-                           (fp, json.dumps(payload), now, f"revalidate-{int(now)}"))
-            requeued = True
-        finally:
-            db.close()
+    requeued = _requeue_detection(store, fp, st, d, rec, now, "revalidate")
     store.log({"event": "selfheal_adoption_rejected", "fingerprint": fp, "card": card, "was": "approved",
                "by": "revalidate", "rule": ADOPT_RULE, "why": why, "symptom": st.get("symptom"),
                "session_id": st.get("session_id"), "requeued": requeued,
                "title": str(text.get("title") or "")[:120]})
     return f"adoption of {card} rejected ({why}); " + ("refile queued" if requeued else "no detection to refile")
+
+
+def _requeue_detection(store, fp: str, st: dict, d: dict, rec: dict, now: float, tag: str) -> bool:
+    """Queue the defect in selfheal_pending so the next retry pass files (or adopts) a fresh owner."""
+    if not (rec.get("source") and st.get("symptom")):
+        return False
+    payload = {k: v for k, v in {**d, "p_defect": rec.get("p"), "host": rec.get("host")}.items()
+               if v not in (None, "")}
+    db = _pending_db(store)
+    try:
+        with db:
+            db.execute("INSERT INTO pending VALUES (?, ?, ?, ?) ON CONFLICT(fp) DO UPDATE SET "
+                       "payload=excluded.payload, retry=excluded.retry, version=excluded.version",
+                       (fp, json.dumps(payload), now, f"{tag}-{int(now)}"))
+    finally:
+        db.close()
+    return True
+
+
+def _release_refused_alias(lane, store, fp: str, st: dict, lanes: dict, now: float) -> Optional[str]:
+    """An `adopted` (complaint-turn alias) lane whose card a revalidation refused (for it, or for its canonical lane)
+    waits on nothing real: until 11-13 `_adopt_complaint_lane` re-adopted a refused card from an alias's copy
+    (agent-07ffde73f6 -> its own alias kanban-c91f12bc2f -> t_01a1cca14f4dd08a). Release it: stale, the card added to
+    `rejected_owners`, and the detection re-queued for a fresh owner. A self-alias on a card nobody refused (a
+    same-turn re-detection of an owner that already had a card) is left alone: refiling it would reopen a resolved
+    complaint."""
+    card = st.get("fix_card")
+    if st.get("status") != "adopted" or not card:
+        return None
+    owner = st.get("complaint_owner")
+    own = set(st.get("rejected_owners") or [])
+    if card not in own and card not in set(((lanes.get(owner) or {}) if owner and owner != fp else {})
+                                          .get("rejected_owners") or []):
+        return None
+    held = {"status": "adopted", "fix_card": card, "complaint_owner": owner}
+    if not lane.transition(fp, held, status="stale", fix_card=None, complaint_owner=None, closed_at=now,
+                           filed_day=None, rejected_owners=sorted(set(st.get("rejected_owners") or []) | {card})):
+        return None
+    rec = _detect_record(store, fp)
+    d = {"fingerprint": fp, "component": st.get("component"), "symptom": st.get("symptom"),
+         "session_id": st.get("session_id"), "source": rec.get("source"), "kind": rec.get("kind"),
+         "evidence": rec.get("evidence"), "quote": rec.get("quote") or rec.get("evidence"),
+         "complaint_at": st.get("complaint_at") or rec.get("ts"), "at": rec.get("ts") or st.get("complaint_at")}
+    requeued = _requeue_detection(store, fp, st, d, rec, now, "alias-release")
+    why = f"card refused for {fp}" if card in own else f"card refused for {owner}"
+    store.log({"event": "selfheal_adoption_rejected", "fingerprint": fp, "card": card, "was": "adopted",
+               "by": "alias_release", "rule": ADOPT_RULE, "why": why, "complaint_owner": owner,
+               "symptom": st.get("symptom"), "session_id": st.get("session_id"), "requeued": requeued})
+    return f"alias adoption of {card} released ({why}); " + ("refile queued" if requeued else "no detection to refile")
 
 
 def _reconcile_fp(lane, store, fp: str, st: dict, runner, now: float, via: str = "") -> Optional[str]:
