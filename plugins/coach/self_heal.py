@@ -5968,6 +5968,16 @@ def pool_args(args: dict) -> dict:
     return {**args, "home_pin": False, "runs_on": list(POOL_LABELS), "body": remote_body(args.get("body") or "")}
 
 
+def _verify_board(board: Optional[str], st: dict, fix_card: str) -> Optional[str]:
+    """A digest owner reference is not a create-board slug. Keep local routing separate from owner lookup."""
+    if not board or ":" not in board:
+        return board
+    located = _owner_location(st, fix_card)
+    if located and located[0]:
+        return "default"  # foreign owner boards need not exist on this gateway
+    return board.partition(":")[2] or "default"
+
+
 def _file_verify(fp: str, st: dict, fix_card: str, r: dict, store, runner, now: float) -> Optional[str]:
     """File the VERIFY child of ``fix_card``: on the pool through hub-admin/hub-read when this gateway is remote-
     reachable (:func:`remote_verify`), else machine-pinned here. -> its id, or None (logged)."""
@@ -5976,7 +5986,7 @@ def _file_verify(fp: str, st: dict, fix_card: str, r: dict, store, runner, now: 
     args = {"title": f"{VERIFY_TITLE} {incident_title(st.get('symptom') or fp)}",
             "body": with_fp_line(verify_brief(fp, st, fix_card, remote=remote), fp),
             "idempotency_key": verify_key(fp, generation(st) or 1), "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
-            "max_runtime": VERIFY_RUNTIME, "skills": list(VERIFY_SKILLS), "board": r["board"],
+            "max_runtime": VERIFY_RUNTIME, "skills": list(VERIFY_SKILLS), "board": _verify_board(r["board"], st, fix_card),
             "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES),
             "home_pin": not remote, "runs_on": list(VERIFY_POOL_LABELS) if remote else [],
             "parents": [fix_card]}
@@ -5989,7 +5999,7 @@ def _file_verify(fp: str, st: dict, fix_card: str, r: dict, store, runner, now: 
                          "not on this board. Read it with `cross_task` "
                          f"(or `hermes kanban wait-check task {fix_card} --gateway {located[0]}`); "
                          "\"no such task\" from this board says nothing about it.")
-    elif located and located[1] != (r.get("board") or "default"):
+    elif located and located[1] != (args.get("board") or "default"):
         # Same host, another board: a parent edge cannot cross boards, and the default-board `show` misses it.
         args["parents"] = []
         args["body"] += (f"\n\nOwner location: `{fix_card}` is on this host's board `{located[1]}` "
@@ -6667,7 +6677,7 @@ def _recover_completion_receipt(fp: str, store, runner, now: float) -> Optional[
                        "quote": str(rec.get("evidence") or rec.get("quote") or "")[:200]})
             return None
         r = route({"component": st.get("component")})
-        r["board"] = st.get("board") or r["board"]
+        r["board"] = _verify_board(st.get("board") or r["board"], st, st["fix_card"])
         b = budget(r["board"], now)
         if _budget_unavailable(b, fp, store):
             return None
