@@ -1521,6 +1521,22 @@ card is filed only when the unexplained rest is over the threshold by itself. Te
 hub+mini, `saturated_conns == []`, cascade ~120, one uplink card reused then :2; a single-conn kanban/board storm
 stays saturation; port mapping; teardown cascade).
 
+Backend down (2026-11-13 12:31 PST: a core update restarted the mini's backend, the Desktop marked conn=mac-mini down
+for 61 s, and the detector filed "link saturation on conn=mac-mini" for 19 fail-fast lines across 7 paths while the
+link answered /api/health in 0.12 s). A third kind is set aside before saturation is judged. `backend_down`: timeouts
+on a conn inside one of the Desktop's own down-gate episodes, from `[remote-down] conn:<c>::... marked down (<reason>)`
+to `... answered again; gate open` (2 s slack at each edge). While the gate is closed every request fails fast with a
+line that quotes the first timeout, so one outage repeats the needle on every polled path. An episode with no
+`answered again` ends 60 s after its last gate line (`marked down` or `trial exceeded`); an `answered again` whose
+`marked down` is older than the scanned lines covers the lines before it. The report's `backend_down` has `count`,
+`by_conn` and `episodes` (conn, start, end, seconds, answered, reason), and the incident card's evidence names each
+episode. These timeouts no longer make a conn saturated or a path significant; the raw and awake counts are
+unchanged, so the incident card's threshold still sees them. Not covered: a card of its own for a conn that stays
+down (the incident card carries it). Tests: `tests/test_backend_timeout_backend_down.py` (the real 12:26-12:40 PST
+desktop.log slice: `saturated_conns == []`, one 61 s episode with reason `read ECONNRESET`, only the incident card
+filed; bursts with no gate line, after the gate reopened, or under another conn's gate stay saturation; episode
+edges; gate-line parsing; the fail-fast line's quoted age).
+
 #### Timestamp contract and rollout
 
 Production scans use UTC instants and read the producer's immutable numeric offset:

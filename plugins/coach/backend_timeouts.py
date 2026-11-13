@@ -37,6 +37,12 @@ Saturation is judged only on timeouts the link's own traffic can explain. Two ki
   `backend-timeouts:<host>:uplink-stall`, asks for the host's network/Tailscale path, not per-path byte attribution.
 - reconnect_cascade: timeouts on a conn within 30 s after `[ssh] teardown conn:<c>` or `[slow-link] ... treating it
   as down` for it: in-flight requests and the new tunnel's backlog failing together, not traffic.
+- backend_down: timeouts on a conn while the Desktop's own down gate held it down, from
+  `[remote-down] conn:<c>::... marked down (<reason>)` to `... answered again; gate open`. While the gate is closed
+  every request fails fast with a line that quotes the first timeout ("is down (Timed out ..., 27s ago)"), so one
+  outage logs the needle once per poll on every path at once: that is the far-end backend being away (a restart, a
+  hang), not traffic filling the link (2026-11-13 12:31 PST: a core update restarted the mini's backend; 61 s down,
+  19 quoted timeouts across 7 paths, filed as "link saturation"). The episodes are reported with their reason.
 --dry-run prints the report and files nothing. --hours prints a per-hour histogram of every timeout still in the
 logs (for checking past bursts). No Inbox items. Exit 2 with count:null when
 clock/coverage evidence is unresolved; this is not a healthy raw-zero receipt.
@@ -71,7 +77,7 @@ STAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.]\d{3} (?:([+-]
 API_RE = re.compile(r"\[hermes:api (?:[A-Z]+ )?(\S+?)\]")
 PATH_RE = re.compile(r"(/api/[^\s\]\)'\"?,:]+)")
 CONN_RE = re.compile(r"\bconn=([\w.-]+)")
-AFTER_RE = re.compile(r"Timed out connecting to Hermes backend after (\d+)ms(?:, (\d+)s ago)?")
+AFTER_RE = re.compile(r"Timed out connecting to Hermes backend after (\d+)ms(?: \([^)]*\))?(?:, (\d+)s ago)?")
 TAG_RE = re.compile(r"\[([a-z][\w:.-]*)\]")
 ID_SEG_RE = re.compile(r"^(?=.*\d)[\w.-]{8,}$|^\d+$|^t_[0-9a-f]+$")
 SLOW_LINK_RE = re.compile(r"\[slow-link\] https?://127\.0\.0\.1:(\d+)(?: is slow| timed out .*treating it as down)")
@@ -79,6 +85,8 @@ FORWARD_RE = re.compile(r"\[ssh\] forwarding 127\.0\.0\.1:(\d+) ->")
 CANCEL_RE = re.compile(r"\[ssh\] cancelled forward 127\.0\.0\.1:(\d+)")
 TEARDOWN_RE = re.compile(r"\[ssh\] teardown conn:([\w.-]+?)(?:::|[\s(]|$)")
 PROBE_SLOW_RE = re.compile(r"\[remote-timing\] conn:([\w.-]+?)::\S* dispatch probe slow")
+GATE_RE = re.compile(r"\[remote-down\] conn:([\w.-]+?)::\S* (marked down(?: \((.*)\);)?|trial exceeded|answered again)")
+GATE_KINDS = {"marked down": "gate_down", "trial exceeded": "gate_trial", "answered again": "gate_up"}
 LINE_CONN_RE = re.compile(r"\bconn[:=]([\w.-]+?)(?:::|[\s)\],]|$)")
 ROTATED = 3
 DEFAULT_THRESHOLD = 30
@@ -99,6 +107,8 @@ STALL_BUCKET_S = 300    # judged per 5-minute bucket
 STALL_PAIR_S = 60       # two remote conns' stall signals start within this many seconds of each other
 LOCAL_CONNS = {"local", "primary", "?"}
 CASCADE_S = 30          # timeouts within this long after a teardown / treated-as-down are a reconnect cascade
+DOWN_EDGE_S = 2         # a timeout this close to a down episode's edges belongs to it (the line that closed the gate)
+DOWN_OPEN_S = 60        # an episode with no `answered again` ends this long after its last gate line
 PROBE_PORT_S = 2        # a `[slow-link]` line and its conn's `dispatch probe slow` line are logged together
 CLOSED = {"done", "archived"}
 ACTIVE = {"triage", "ready", "running", "review", "blocked"}  # works the card's own text (blocked: David acts)
@@ -136,7 +146,13 @@ def route_of(line: str) -> str:
 
 def link_event(line: str, ts: datetime) -> Optional[tuple]:
     """(ts, kind, conn, port) for a Desktop link-state line, else None. kind: slow | down | probe_slow | teardown |
-    forward | cancel. `conn` is None when the line names only a local port."""
+    forward | cancel | gate_down | gate_trial | gate_up. `conn` is None when the line names only a local port. A
+    gate_down carries the gate's reason in the port slot."""
+    if "[remote-down]" in line:
+        m = GATE_RE.search(line)
+        if m:
+            return (ts, GATE_KINDS[m.group(2).split(" (", 1)[0]], m.group(1), m.group(3))
+        return None
     if "[slow-link]" in line:
         m = SLOW_LINK_RE.search(line)
         if m:
@@ -185,7 +201,7 @@ def resolve_link_events(events: list, since: Optional[datetime] = None) -> tuple
             if last_teardown and (ts - last_teardown[0]).total_seconds() <= CASCADE_S:
                 port_conn.setdefault(port, last_teardown[1])
             continue
-        if kind == "probe_slow":
+        if kind == "probe_slow" or kind.startswith("gate_"):
             out.append((ts, kind, conn))
             continue
         near = {c for t, c in probes if abs((t - ts).total_seconds()) <= PROBE_PORT_S}
@@ -367,6 +383,7 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
             "awake_since_wake": dict(awake_since_wake.most_common()),
             "awake_conn_bursts": cls["awake_conn_bursts"],
             "client_stall": cls["client_stall"], "reconnect_cascade": cls["reconnect_cascade"],
+            "backend_down": cls["backend_down"],
             "awake_explained_by_path": cls["explained_by_path"],
             "first": first.isoformat(sep=" ") if first else None, "last": last.isoformat(sep=" ") if last else None}
 
@@ -379,10 +396,43 @@ def _burst_buckets(timeouts: list) -> dict:
     return out
 
 
+def down_episodes(resolved: list, reasons: dict, lo: datetime, now: datetime) -> list:
+    """[{conn, start, end, open, reason}] from the Desktop's down-gate lines, oldest first. An episode runs from
+    `marked down` (or, when that line is older than the retained log, the first gate line seen) to `answered again`.
+    One that never answers ends DOWN_OPEN_S after its last gate line: a Desktop that quit while a conn was down
+    logs no `answered again`, and its next launch starts with the gate open."""
+    open_eps: dict = {}
+    out = []
+
+    def close(conn, end, still_open):
+        ep = open_eps.pop(conn)
+        out.append({"conn": conn, "start": ep["start"], "end": min(end, now), "open": still_open,
+                    "reason": ep["reason"]})
+
+    for ts, kind, conn in resolved:
+        if not kind.startswith("gate_"):
+            continue
+        ep = open_eps.get(conn)
+        if ep and (ts - ep["last"]).total_seconds() > DOWN_OPEN_S and kind != "gate_up":
+            close(conn, ep["last"] + timedelta(seconds=DOWN_OPEN_S), True)
+            ep = None
+        if kind == "gate_up":
+            if ep is None:  # went down before the retained lines
+                open_eps[conn] = {"start": lo, "last": ts, "reason": None}
+            close(conn, ts, False)
+        elif ep is None:
+            open_eps[conn] = {"start": ts, "last": ts, "reason": reasons.get((ts, conn))}
+        else:
+            ep["last"] = ts
+    for conn in list(open_eps):
+        close(conn, open_eps[conn]["last"] + timedelta(seconds=DOWN_OPEN_S), True)
+    return sorted((e for e in out if e["end"] >= lo), key=lambda e: e["start"])
+
+
 def classify(awake: list, link_events: list, start: datetime, now: datetime) -> dict:
-    """Split awake timeouts into reconnect_cascade, client_stall and the rest; only the rest feeds
-    awake_conn_bursts (and so :func:`saturated_conns`). A timeout can be both cascade and stall: it is reported in
-    both and set aside once."""
+    """Split awake timeouts into backend_down, reconnect_cascade, client_stall and the rest; only the rest feeds
+    awake_conn_bursts (and so :func:`saturated_conns`). A timeout can be in several: it is reported in each and set
+    aside once."""
     lo = start - timedelta(seconds=STALL_BUCKET_S)
     # Ports are mapped over every retained line (a mapping learned before the window still holds until the port is
     # forwarded again); only the window's events count.
@@ -397,11 +447,18 @@ def classify(awake: list, link_events: list, start: datetime, now: datetime) -> 
         if kind in ("slow", "probe_slow"):
             signals.setdefault(conn, []).append(ts.timestamp())
 
+    episodes = down_episodes(resolved, {(e[0], e[2]): e[3] for e in link_events if e[1] == "gate_down"}, lo, now)
+    edge = timedelta(seconds=DOWN_EDGE_S)
+
     def in_cascade(ts, conn):
         return any(0 <= (ts - d).total_seconds() <= CASCADE_S for d in downs.get(conn, ()))
 
+    def in_down(ts, conn):
+        return any(e["conn"] == conn and e["start"] - edge <= ts <= e["end"] + edge for e in episodes)
+
     cascade_ids = {id(t) for t in awake if in_cascade(t[0], t[2])}
-    rest = [t for t in awake if id(t) not in cascade_ids]
+    down_ids = {id(t) for t in awake if in_down(t[0], t[2])}
+    rest = [t for t in awake if id(t) not in cascade_ids and id(t) not in down_ids]
     for conn, buckets in _burst_buckets(rest).items():
         for b, c in buckets.items():
             if len(c) >= BURST_MIN_PATHS:
@@ -417,7 +474,7 @@ def classify(awake: list, link_events: list, start: datetime, now: datetime) -> 
                             stall_buckets.setdefault(int(t) // STALL_BUCKET_S, set()).update((a, b))
     stalled_ids = {id(t) for t in awake if int(t[0].timestamp()) // STALL_BUCKET_S in stall_buckets}
     kept = [t for t in rest if id(t) not in stalled_ids]
-    explained = Counter(t[1] for t in awake if id(t) in cascade_ids or id(t) in stalled_ids)
+    explained = Counter(t[1] for t in awake if id(t) in cascade_ids or id(t) in stalled_ids or id(t) in down_ids)
     tz = now.tzinfo
 
     def bucket_iso(b):
@@ -432,6 +489,13 @@ def classify(awake: list, link_events: list, start: datetime, now: datetime) -> 
         "reconnect_cascade": {"count": len(cascade_ids),
                               "by_conn": dict(Counter(t[2] for t in awake if id(t) in cascade_ids).most_common()),
                               "teardowns": sum(len(v) for v in downs.values())},
+        "backend_down": {"count": len(down_ids),
+                         "by_conn": dict(Counter(t[2] for t in awake if id(t) in down_ids).most_common()),
+                         "episodes": [{"conn": e["conn"], "start": e["start"].isoformat(sep=" "),
+                                       "end": e["end"].isoformat(sep=" "),
+                                       "seconds": round((e["end"] - e["start"]).total_seconds(), 1),
+                                       "answered": not e["open"], "reason": e["reason"]}
+                                      for e in episodes if e["end"] >= start]},
         "explained_by_path": dict(explained.most_common()),
     }
 
@@ -443,7 +507,7 @@ def stall_dominant(rep: dict) -> bool:
 
 
 def unexplained_count(rep: dict) -> int:
-    """Awake timeouts that are neither client_stall nor reconnect_cascade."""
+    """Awake timeouts that are neither client_stall, reconnect_cascade nor backend_down."""
     return (rep.get("awake_count") or 0) - sum((rep.get("awake_explained_by_path") or {}).values())
 
 
@@ -876,9 +940,18 @@ def uplink_card_title(host: str) -> str:
 def _stall_md(rep: dict) -> str:
     cs = rep.get("client_stall") or {}
     rc = rep.get("reconnect_cascade") or {}
+    bd = rep.get("backend_down") or {}
+    down = ""
+    if bd.get("count"):
+        eps = "; ".join(f"conn={e['conn']} {e['start']} for {e['seconds']} s"
+                        f"{'' if e['answered'] else ' (no answer logged)'} ({e['reason'] or 'reason not logged'})"
+                        for e in bd.get("episodes") or [])
+        down = (f"Backend down: {bd['count']} timeouts were logged while the Desktop's down gate held their conn down "
+                f"(by conn {bd.get('by_conn') or {}}); most are fail-fast lines quoting one timeout, not new ones. "
+                f"The far-end backend was away (restart or hang), which is not link traffic. Episodes: {eps}.")
     if not cs.get("count") and not rc.get("count"):
-        return ""
-    return (f"Client-side stall: {cs.get('count', 0)} awake timeouts fell in 5-minute buckets where several remote "
+        return down
+    return (down + "\n" if down else "") + (f"Client-side stall: {cs.get('count', 0)} awake timeouts fell in 5-minute buckets where several remote "
             f"conns ({', '.join(cs.get('conns') or []) or 'none'}) stalled within {STALL_PAIR_S} s of each other "
             f"(buckets starting {', '.join(cs.get('buckets') or []) or 'none'}; by conn {cs.get('by_conn') or {}}).\n"
             f"Reconnect cascade: {rc.get('count', 0)} timeouts within {CASCADE_S} s after a teardown / treated-as-down "
