@@ -56,13 +56,12 @@ Saturation is judged only on timeouts the link's own traffic can explain. Two ki
   ONE card, key `backend-timeouts:<host>:backend-stall:<conn>` ("hung backend on conn=X"), asking for the backend
   host's loop stalls and observer (ptrace/py-spy) commands, not byte attribution. Its leftover timeouts are the same
   hang, so they make no path card and no generic incident card.
-- backend_cold_start: timeouts on the Desktop's own backend (`conn=local`/`primary`, or a line naming no conn)
-  within 45 s after `[backend] Hermes gateway is ready`. That conn has no tunnel or link to saturate. A supervised
-  gateway publishes READY and only then mounts its dashboard API in the background, so the Desktop's first polls wait
-  on that mount past their 4-8 s timeouts (2026-11-13 13:58 PST: READY 13:58:49.99, the first `/api` request entered
-  the app at 13:58:59.3, 11 timeouts across 6 paths, filed as "link saturation on conn=local"; all 29 local timeouts
-  that day sat in the minute of a READY line). They are reported with the READY times and set aside. A local conn is
-  never a saturated conn: what is left on it goes to the generic incident and path cards, which time the backend.
+- backend_cold_start: informational correlation of positively local timeouts (`conn=local`/`primary`, or an
+  explicit `[fleet-roster] local:`/`primary:` entry) within 45 s after `[backend] Hermes gateway is ready`.
+  READY proximity does not establish an API-mount cause or recovery. These failures remain in residual/path
+  accounting. Raw connection counts are unchanged, including `?` for fleet-roster entries without `conn=`.
+  A local conn has no tunnel to saturate; an unknown conn cannot identify a saturated link. Both remain eligible
+  for generic incident and path cards. An unknown entry is never made local merely by proximity to READY.
 --dry-run prints the report and files nothing. --hours prints a per-hour histogram of every timeout still in the
 logs (for checking past bursts). No Inbox items. Exit 2 with count:null when
 clock/coverage evidence is unresolved; this is not a healthy raw-zero receipt.
@@ -137,10 +136,10 @@ SAT_SHARE = 0.5         # ... and hold at least this share of the conn's awake t
 # Client-side stall: several independent remote links stalling together = the Desktop host's own uplink.
 STALL_BUCKET_S = 300    # judged per 5-minute bucket
 STALL_PAIR_S = 60       # two remote conns' stall signals start within this many seconds of each other
-LOCAL_CONNS = {"local", "primary", "?"}
-# The Desktop's own backend just (re)started: READY is published before the gateway's dashboard API is mounted.
+LOCAL_CONNS = {"local", "primary"}
+# READY proximity is correlation only; it does not prove API mount state.
 READY_MARK = "[backend] Hermes gateway is ready"
-COLD_START_S = 45       # a local-conn timeout this soon after a READY line is the cold start, not traffic
+COLD_START_S = 45       # informational startup-correlation window; never suppresses failures
 CASCADE_S = 30          # timeouts within this long after a teardown / treated-as-down are a reconnect cascade
 DOWN_EDGE_S = 2         # a timeout this close to a down episode's edges belongs to it (the line that closed the gate)
 DOWN_OPEN_S = 60        # an episode with no `answered again` ends this long after its last gate line
@@ -267,10 +266,11 @@ def resolve_link_events(events: list, since: Optional[datetime] = None) -> tuple
     return out, unmapped
 
 
-def iter_timeouts(files: list, *, strict=False, evidence=None, events=None, fail_fast=None):
+def iter_timeouts(files: list, *, strict=False, evidence=None, events=None, fail_fast=None, local_evidence=None):
     """Yield (datetime, route, conn, lookback_s) per log entry naming the timeout. Stack/continuation lines without a stamp count only
     if their entry's stamped line did not already (one entry = one timeout). With `events` (a list), link-state
-    lines (:func:`link_event`) are appended to it from the same pass."""
+    lines (:func:`link_event`) are appended to it from the same pass. `local_evidence`, when supplied, receives
+    one per-entry boolean before each yield; raw connection names remain unchanged."""
     for path in files:
         last_ts, counted = None, False
         try:
@@ -307,6 +307,10 @@ def iter_timeouts(files: list, *, strict=False, evidence=None, events=None, fail
                 lookback = (int(a.group(1)) / 1000.0 + int(a.group(2) or 0)) if a else 0.0
                 if fail_fast is not None and FAIL_FAST in line:  # still yielded; the caller sees the list grow
                     fail_fast.append(last_ts)
+                if local_evidence is not None:
+                    # Attribute this entry only, never every unknown conn near a local READY.
+                    local_evidence.append(bool(m and m.group(1) in LOCAL_CONNS) or bool(
+                        not m and re.search(r"\[fleet-roster\] (?:local|primary):", line)))
                 yield last_ts, route_of(line), (m.group(1) if m else "?"), lookback
 
 
@@ -390,6 +394,7 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
     link_events: list = []
     echoes: list = []  # grows by one just before a down-gate fail-fast entry is yielded
     seen_echoes = 0
+    local_evidence, local_ids = [], set()
     ff_path: Counter = Counter()
     ff_conn: Counter = Counter()
     ff_awake = 0
@@ -403,7 +408,7 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
         raise ValueError('no Desktop logs found; bounded count unproven')
     evidence = {}
     for ts, route, conn, lookback in iter_timeouts(files, strict=bool(now.tzinfo), evidence=evidence,
-                                                   events=link_events, fail_fast=echoes):
+                                                   events=link_events, fail_fast=echoes, local_evidence=local_evidence):
         is_echo, seen_echoes = len(echoes) > seen_echoes, len(echoes)
         if now.tzinfo and ts.tzinfo is None:
             # Any legal datetime UTC offset is strictly within +/-24 hours.
@@ -426,6 +431,8 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
                 awake_by_conn[conn] += 1
                 awake_since_wake[wake_bucket(ts, wake_ends)] += 1
                 awake.append((ts, route, conn))
+                if local_evidence[-1]:
+                    local_ids.add(id(awake[-1]))
                 ff_awake += is_echo
             if is_echo:
                 ff_path[route] += 1
@@ -433,7 +440,8 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
             first = ts if first is None or ts < first else first
             last = ts if last is None or ts > last else last
     coverage_start = evidence.get('coverage_start')
-    cls = classify(awake, [e for e in link_events if (e[0].tzinfo is None) == (now.tzinfo is None)], start, now)
+    cls = classify(awake, [e for e in link_events if (e[0].tzinfo is None) == (now.tzinfo is None)], start, now,
+                   local_ids=local_ids)
     if now.tzinfo and not by_path and (coverage_start is None or coverage_start > start):
         raise ValueError('raw zero unproven: retained offset-stamped logs do not cover window start')
     return {"window_start": start.isoformat(sep=" "), "window_end": now.isoformat(sep=" "),
@@ -553,8 +561,8 @@ def backend_stall_episodes(link_events: list, resolved: list, lo: datetime, now:
     return sorted(out, key=lambda e: e["teardown"])
 
 
-def classify(awake: list, link_events: list, start: datetime, now: datetime) -> dict:
-    """Split awake timeouts into backend_down, backend_cold_start, reconnect_cascade, client_stall and the rest; only the rest feeds
+def classify(awake: list, link_events: list, start: datetime, now: datetime, *, local_ids=None) -> dict:
+    """Split awake timeouts into backend_down, reconnect_cascade, client_stall and the rest; only the rest feeds
     awake_conn_bursts (and so :func:`saturated_conns`). A timeout can be in several: it is reported in each and set
     aside once."""
     lo = start - timedelta(seconds=STALL_BUCKET_S)
@@ -590,16 +598,16 @@ def classify(awake: list, link_events: list, start: datetime, now: datetime) -> 
 
     readies = sorted(e[0] for e in link_events if e[1] == "ready" and lo <= e[0] <= now)
 
-    def in_cold_start(ts, conn):
-        return conn in LOCAL_CONNS and any(0 <= (ts - r).total_seconds() <= COLD_START_S for r in readies)
-
-    cold_ids = {id(t) for t in awake if in_cold_start(t[0], t[2])}
-    rest = [t for t in awake if id(t) not in cascade_ids and id(t) not in down_ids and id(t) not in cold_ids]
+    # Informational only: these failures still need incident/path owners.
+    cold_ids = {id(t) for t in awake
+                if (t[2] in LOCAL_CONNS or id(t) in (local_ids or ()))
+                and any(0 <= (t[0] - r).total_seconds() <= COLD_START_S for r in readies)}
+    rest = [t for t in awake if id(t) not in cascade_ids and id(t) not in down_ids]
     for conn, buckets in _burst_buckets(rest).items():
         for b, c in buckets.items():
             if len(c) >= BURST_MIN_PATHS:
                 signals.setdefault(conn, []).append(float(b * BURST_BUCKET_S))
-    remote = sorted(c for c in signals if c not in LOCAL_CONNS)
+    remote = sorted(c for c in signals if c not in LOCAL_CONNS and c != "?")
     stall_buckets: dict = {}  # 5-min bucket -> set(conns)
     for i, a in enumerate(remote):
         for b in remote[i + 1:]:
@@ -625,7 +633,7 @@ def classify(awake: list, link_events: list, start: datetime, now: datetime) -> 
     stall_conns = sorted(c for c, s in stall_share.items() if s > BACKEND_STALL_SHARE)
     kept = [t for t in rest if id(t) not in stalled_ids and id(t) not in stall_ids]
     explained = Counter(t[1] for t in awake if id(t) in cascade_ids or id(t) in stalled_ids or id(t) in down_ids
-                        or id(t) in stall_ids or id(t) in cold_ids)
+                        or id(t) in stall_ids)
     tz = now.tzinfo
 
     def bucket_iso(b):
@@ -672,8 +680,8 @@ def stall_dominant(rep: dict) -> bool:
 
 
 def unexplained_count(rep: dict) -> int:
-    """Awake timeouts that are neither client_stall, reconnect_cascade, backend_down, backend_cold_start nor
-    backend_stall."""
+    """Awake timeouts that are neither client_stall, reconnect_cascade, backend_down nor backend_stall.
+    Startup correlation remains eligible for incident/path ownership."""
     return (rep.get("awake_count") or 0) - sum((rep.get("awake_explained_by_path") or {}).values())
 
 
@@ -728,8 +736,8 @@ def saturated_conns(rep: dict, threshold: int) -> list:
     found = []
     for conn, b in (rep.get("awake_conn_bursts") or {}).items():
         n = b.get("count") or 0
-        if conn in hung or conn in LOCAL_CONNS or not total or not (n >= threshold or n >= PATH_SHARE * total):
-            continue  # the Desktop's own backend has no tunnel or link: its bursts are the backend, not saturation
+        if conn in hung or conn in LOCAL_CONNS or conn == "?" or not total or not (n >= threshold or n >= PATH_SHARE * total):
+            continue  # local has no tunnel; unknown cannot establish a particular saturated link
         if (len(b.get("burst_by_path") or {}) >= SAT_MIN_PATHS and (b.get("burst_buckets") or 0) >= SAT_MIN_BURSTS
                 and (b.get("in_bursts") or 0) >= SAT_SHARE * n):
             found.append((-n, conn))
@@ -1239,8 +1247,9 @@ def _stall_md(rep: dict) -> str:
     if bc.get("count"):
         cold = (f"Backend cold start: {bc['count']} timeouts on the Desktop's own backend (by conn "
                 f"{bc.get('by_conn') or {}}) came within {COLD_START_S} s after `{READY_MARK}` "
-                f"({', '.join(bc.get('readies') or [])}). The backend had just (re)started and its API was not "
-                f"mounted yet; that conn has no link, so this is not traffic.")
+                f"({', '.join(bc.get('readies') or [])}). Startup correlation only: READY proximity does not "
+                f"prove the API was not mounted or that these failures are fixed. Local failures remain "
+                f"eligible for incident/path ownership; investigate backend readiness and latency.")
     head = "\n".join(x for x in (down, cold, _hung_md(rep)) if x)
     if not cs.get("count") and not rc.get("count"):
         return head
