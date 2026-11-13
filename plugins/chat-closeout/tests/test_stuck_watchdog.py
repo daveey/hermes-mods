@@ -8,6 +8,7 @@ import tempfile
 
 import pytest
 from test_closeout import plugin, core
+from test_watchdog_resolution import isolate_claim_policy
 
 H = 3600.0
 DAY = 24 * H
@@ -105,7 +106,8 @@ def real_board(monkeypatch):
         led = core.Ledger(home / 'ledger.db')
         monkeypatch.setattr(plugin, 'ledger', lambda: led)
         plugin._state.clear()
-        yield led, kb, connect_closing
+        with isolate_claim_policy(monkeypatch):
+            yield led, kb, connect_closing
 
 
 def test_real_board_files_and_closes_one_card(real_board):
