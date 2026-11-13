@@ -232,6 +232,14 @@ Registration requires core to advertise literal `True` for `needs_buffer` and
 Unsupported core refuses this plugin before hooks are installed; update core first.
 This refusal is not a claim of active protection on an older runtime.
 
+When a reply asks for an approval with no ready published request, `publication_buffer`
+holds it with a nudge to publish `action_request`. At the hold budget it replaces the
+reply with "The approval request is not ready…" only once this hook's own nudges have
+used the whole budget. Otherwise (the iteration cap's tool-less summary call, where
+core passes `attempt == hold_budget` without any hold, or holds spent by other gates)
+the agent never saw the nudge or cannot act on it now, so the reply is kept and a note
+says no approval was requested (`tests/test_budget_boundary.py`).
+
 Buffering is static for foreground turns while the plugin is loaded, including
 when the extraction off switch is set; disable the plugin itself to remove its
 buffering contribution. Core still excludes its normal background contexts.

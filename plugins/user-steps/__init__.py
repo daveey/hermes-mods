@@ -359,8 +359,26 @@ def _card_asks(session_id: str, user_msg: str) -> list[dict]:
         return []
 
 
+NOT_READY = ('The approval request is not ready: the agent has not provided a complete exact plan. No approval is '
+             'requested and no permission has been granted.')
+NO_REQUEST_NOTE = ('Note: no approval request was published for this reply, so nothing above is an approval request '
+                   'and no permission has been granted.')
+PUBLISH_NUDGE = ('Complete the missing agent work now: publish action_request with the FULL EXACT inline plan, scope, '
+                 'consequences, limits, exclusions and approve/change/decline choices. If an open request already asks '
+                 'this, revise THAT one (its requestId and expectedRevision) instead of creating another; a matching '
+                 'title alone does not make it the same request. Do not ask the user to request a plan, and do not '
+                 'invent approval. If this is only a clarification, publish kind choice/input with concrete answer '
+                 'labels instead. Then present the decision.')
+
+
+def _publish_nudges(turn_messages: Any) -> int:
+    """How many of this hook's own publish nudges core kept in the turn (flagged synthetic user rows)."""
+    return sum(1 for m in turn_messages or () if isinstance(m, dict) and m.get('role') == 'user'
+               and m.get('_pre_final_gate_synthetic') and PUBLISH_NUDGE in str(m.get('content') or ''))
+
+
 def publication_buffer(session_id='', platform='', final_response='', attempt=0,
-                       hold_budget=2, **_: Any):
+                       hold_budget=2, turn_messages=None, **_: Any):
     """Return missing plan work to the agent, never to a user-facing button."""
     if not _eligible(session_id, platform) or not core._worth_asking(final_response):
         return None
@@ -405,8 +423,14 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     if all([covered(s) for s in approvals]):
         return None
     if attempt >= hold_budget:
-        return {'replace': 'The approval request is not ready: the agent has not provided a complete exact plan. No approval is requested and no permission has been granted.'}
-    return {'hold': True, 'nudge': 'Complete the missing agent work now: publish action_request with the FULL EXACT inline plan, scope, consequences, limits, exclusions and approve/change/decline choices. If an open request already asks this, revise THAT one (its requestId and expectedRevision) instead of creating another; a matching title alone does not make it the same request. Do not ask the user to request a plan, and do not invent approval. If this is only a clarification, publish kind choice/input with concrete answer labels instead. Then present the decision.'}
+        if _publish_nudges(turn_messages) < hold_budget:
+            # Core's exhaustion boundary reached without this hook spending its holds: the iteration cap's
+            # tool-less summary call (core passes attempt == budget), or other gates' holds. The agent was never
+            # told to publish, or cannot now, so keep its reply (a one-shot's only deliverable) and say plainly
+            # that it requests nothing (hub one-shot local-18520ccf, 2026-11-13).
+            return {'append': NO_REQUEST_NOTE}
+        return {'replace': NOT_READY}
+    return {'hold': True, 'nudge': PUBLISH_NUDGE}
 
 
 publication_buffer.needs_buffer = True

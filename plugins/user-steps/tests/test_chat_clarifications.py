@@ -140,7 +140,9 @@ def test_missing_plan_returns_agent_work(monkeypatch, env):
     monkeypatch.setattr(plugin.core, '_worth_asking', lambda _: True)
     monkeypatch.setattr(plugin.core, 'extract', lambda *_, **__: {'steps': [{'kind': 'approve', 'text': 'Approve the changes?'}]})
     assert plugin.publication_buffer(session_id='session', final_response='Approve?')['hold']
-    assert 'replace' in plugin.publication_buffer(session_id='session', final_response='Approve?', attempt=2)
+    nudged = [{'role': 'user', 'content': plugin.PUBLISH_NUDGE, '_pre_final_gate_synthetic': True}] * 2
+    assert 'replace' in plugin.publication_buffer(session_id='session', final_response='Approve?', attempt=2,
+                                                  turn_messages=nudged)
     result = json.loads(plugin.publish_action_request({'request': {'kind': 'approval', 'scope': {'complete': False}}}, 'session'))
     assert result['status'] == 422 and 'agent work' in result['error']
     broken = dict(schemaVersion=2, owner=OWNER, requestId='00000000-0000-0000-0000-000000000099',
