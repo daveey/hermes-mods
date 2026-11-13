@@ -1,0 +1,214 @@
+From 436eb6c13565b8114de5ec3041a1bb198c7ca45c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:34:03 +0000
+Subject: [PATCH] [daveey] kanban workspace_source: the unpublished_workspace
+ park refusal names the publish refusal
+
+Symptom (LIVE proof of t_01a1cc30806b0e62, card t_01a1d5b1c1798e2a on hermes-worker-4): `kanban_schedule` on a
+worktree card with publish_on_park enabled was refused with only `unpublished_workspace: commit and push the task
+branch before parking, or add UNPUBLISHED_WORK_REASON=...`. The real cause, `source_clone_unregistered`, went only
+to a `workspace_source_publish_refused` event, so the agent could not tell the fix was registering the clone. It
+parked with UNPUBLISHED_WORK_REASON and the card stayed host-bound.
+
+Why: the preflight (outer) turns every PublishRefused into a `retained` receipt and an event; the publication guard
+(inner) then refuses on the unpublished branch with fixed text and never sees the refusal.
+
+Fix:
+- kanban_source_preflight scopes a per-(task, run) refusal list in a ContextVar around the ending; compute_receipt
+  records each PublishRefused there; `refusal_hint(task_id, run_id)` renders the last one.
+- The guard's `unpublished_workspace` message appends
+  ` (workspace_source publish refused: <code>: <detail>[; <fix>])`. For `source_clone_unregistered` the fix names
+  `kanban.workspace_source.clones` ({"<owner>/<name>": "<clone root>"}).
+- prove_origin's `source_clone_unregistered` detail names the worktree's own clone root (the git common dir's
+  parent), e.g. the second checkout ~/code/coworld-terraform vs the registered ~/code/_src/coworld-terraform.
+No behaviour change: sibling clones stay fail-closed (not auto-registered); receipts and events are unchanged.
+
+Proof:
+- RED on base (source files reverted, new tests kept): test_unpublished_park_refusal_names_the_publish_refusal fails
+  (`'workspace_source publish refused: source_clone_unregistered:' in 'unpublished_workspace: ...'`).
+- GREEN: test_kanban_source_publish.py 77 passed; with test_kanban_publication_recovery.py,
+  test_kanban_workspace_publication.py, test_kanban_source_resolver.py 140 passed. scripts/check --base origin/main ok.
+- test_publish_refusal_hint_is_scoped_to_the_preflighted_run kills the task/run scope mutants; the
+  publish_on_park=False test pins the unchanged message when no publish was attempted.
+---
+ hermes_cli/kanban_source_preflight.py         | 38 +++++++++++--
+ hermes_cli/kanban_source_publish.py           |  4 +-
+ hermes_cli/kanban_workspace_publication.py    |  4 +-
+ .../hermes_cli/test_kanban_source_publish.py  | 56 +++++++++++++++++++
+ 4 files changed, 95 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_source_preflight.py b/hermes_cli/kanban_source_preflight.py
+index 838259ef5a..570a7f3ef6 100644
+--- a/hermes_cli/kanban_source_preflight.py
++++ b/hermes_cli/kanban_source_preflight.py
+@@ -17,6 +17,7 @@ ending's transaction ``with_source_receipt`` only reads it.
+ 
+ from __future__ import annotations
+ 
++import contextvars
+ import logging
+ import sqlite3
+ from functools import wraps
+@@ -26,6 +27,11 @@ from hermes_cli import kanban_source_board as board_calls
+ from hermes_cli import kanban_source_receipt as carrier
+ 
+ _log = logging.getLogger(__name__)
++# (task_id, run_id, [(code, detail)]) for the ending being preflighted: the agent-facing ``unpublished_workspace``
++# refusal names the publish refusal, so its fix (e.g. registering the clone) is visible, not only in an event.
++_REFUSALS: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextVar("kanban_source_refusals", default=None)
++_HINTS = {"source_clone_unregistered": "register the worktree's clone under kanban.workspace_source.clones "
++                                       "({\"<owner>/<name>\": \"<clone root>\"})"}
+ 
+ 
+ def _retained(run: board_calls.AttachedRun, reason: str) -> dict:
+@@ -71,12 +77,30 @@ def compute_receipt(conn: sqlite3.Connection, task_id: str, run: board_calls.Att
+     except pub.PublishRefused as exc:
+         _log.warning("workspace_source: %s not published (%s); custody stays here", task_id, exc)
+         _event(conn, task_id, run, exc.code, exc.detail)
++        _note_refusal(task_id, run.run_id, exc.code, exc.detail)
+         return _retained(run, f"publish_error={exc.code}")
+     except Exception as exc:  # health: allow BLE001 -- a preflight must never refuse an ending; fail closed (retained)
+         _log.warning("workspace_source: preflight of %s failed", task_id, exc_info=True)
+         return _retained(run, f"preflight_error={type(exc).__name__}")
+ 
+ 
++def _note_refusal(task_id: str, run_id: int, code: str, detail: str) -> None:
++    scope = _REFUSALS.get()
++    if scope and scope[0] == task_id and scope[1] == run_id:
++        scope[2].append((code, detail))
++
++
++def refusal_hint(task_id: str, run_id: Optional[int]) -> str:
++    """`` (workspace_source publish refused: <code>: <detail>; <fix>)`` for this run's preflight, else ``""``."""
++    scope = _REFUSALS.get()
++    if not scope or scope[0] != task_id or scope[1] != run_id or not scope[2]:
++        return ""
++    code, detail = scope[2][-1]
++    text = f"{code}: {detail[:1000]}" if detail else code
++    fix = _HINTS.get(code)
++    return f" (workspace_source publish refused: {text}" + (f"; {fix})" if fix else ")")
++
++
+ def _event(conn: sqlite3.Connection, task_id: str, run: board_calls.AttachedRun, code: str, detail: str) -> None:
+     from hermes_cli import kanban_db as kb
+     try:
+@@ -110,9 +134,13 @@ def source_receipt_preflight(fn: Callable) -> Callable:
+         row = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+         if row is None or row[0] is None or carrier.staged_receipt(task_id, row[0]) is not None:
+             return fn(conn, task_id, *args, **kwargs)
+-        _run_id, receipt = receipt_for_current_run(conn, task_id)
+-        if receipt is None:
+-            return fn(conn, task_id, *args, **kwargs)
+-        with carrier.staged(task_id, int(row[0]), receipt):
+-            return fn(conn, task_id, *args, **kwargs)
++        token = _REFUSALS.set((task_id, int(row[0]), []))
++        try:
++            _run_id, receipt = receipt_for_current_run(conn, task_id)
++            if receipt is None:
++                return fn(conn, task_id, *args, **kwargs)
++            with carrier.staged(task_id, int(row[0]), receipt):
++                return fn(conn, task_id, *args, **kwargs)
++        finally:
++            _REFUSALS.reset(token)
+     return wrapped
+diff --git a/hermes_cli/kanban_source_publish.py b/hermes_cli/kanban_source_publish.py
+index bc0f2494ae..d9cad6b022 100644
+--- a/hermes_cli/kanban_source_publish.py
++++ b/hermes_cli/kanban_source_publish.py
+@@ -157,7 +157,9 @@ def prove_origin(path: str, cfg: Settings, *, lookup: Optional[Callable[[str], d
+         except clones.ProofFailed as exc:
+             code = {"wrong_repo": "source_remote_unsupported"}.get(exc.code, exc.code)
+             raise PublishRefused(code, exc.detail) from exc
+-    raise PublishRefused("source_clone_unregistered", f"{path} is not a worktree of a registered clone")
++    owner = common.parent if common.name == ".git" else common
++    raise PublishRefused("source_clone_unregistered",
++                         f"{path} is not a worktree of a registered clone (its clone is {owner})")
+ 
+ 
+ # --- step 4: secret scan ----------------------------------------------------------------------------------------
+diff --git a/hermes_cli/kanban_workspace_publication.py b/hermes_cli/kanban_workspace_publication.py
+index e2ae0cb223..283702050b 100644
+--- a/hermes_cli/kanban_workspace_publication.py
++++ b/hermes_cli/kanban_workspace_publication.py
+@@ -152,8 +152,10 @@ def publication_guard(fn):
+         for observed in observations:
+             if observed['state'] != 'published':
+                 if not reason or not reason[1].strip():
++                    from hermes_cli.kanban_source_preflight import refusal_hint
+                     raise ValueError('unpublished_workspace: commit and push the task branch before parking, or add '
+-                                     'UNPUBLISHED_WORK_REASON=<why work must remain on this host> to the checkpoint/reason')
++                                     'UNPUBLISHED_WORK_REASON=<why work must remain on this host> to the checkpoint/reason'
++                                     + refusal_hint(task_id, row[1]))
+                 observed['retention_reason'] = reason[1].strip()[:1000]
+         token = _receipt.set((id(conn), task_id, row[1], observations))
+         try:
+diff --git a/tests/hermes_cli/test_kanban_source_publish.py b/tests/hermes_cli/test_kanban_source_publish.py
+index 1f143ce7e8..10cc102f1b 100644
+--- a/tests/hermes_cli/test_kanban_source_publish.py
++++ b/tests/hermes_cli/test_kanban_source_publish.py
+@@ -513,6 +513,62 @@ def test_rejected_push_classified(card, monkeypatch):
+     assert card.remote() is None
+ 
+ 
++def test_unpublished_park_refusal_names_the_publish_refusal(card, monkeypatch):
++    """The worktree's clone is not registered (a second checkout of the same repo): the agent-facing
++    ``unpublished_workspace`` refusal names ``source_clone_unregistered``, the clone and the config key, not only the
++    ``workspace_source_publish_refused`` event."""
++    commit(card.path, "x.txt")
++    cfg = kws.Settings(**{**card.cfg.__dict__, "clones": {}})
++    monkeypatch.setattr(kws, "settings", lambda config=None: cfg)
++    with kbc.write_txn(card.conn):
++        card.conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(card.path), card.id))
++    with pytest.raises(ValueError) as refused:
++        kb.schedule_task(card.conn, card.id, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z", clock_only=True,
++                         expected_run_id=card.run_id)
++    text = str(refused.value)
++    assert text.startswith("unpublished_workspace:")
++    assert "workspace_source publish refused: source_clone_unregistered:" in text
++    assert f"its clone is {card.world.homes['hub'].clone}" in text
++    assert "kanban.workspace_source.clones" in text
++    task = kb.get_task(card.conn, card.id)
++    assert task is not None and task.status == "running"  # refused: run ownership intact
++    assert card.remote() is None
++
++
++def test_publish_refusal_hint_is_scoped_to_the_preflighted_run():
++    """Only the run being preflighted gets its refusal named; another card or run (a nested ending) gets none."""
++    assert pre.refusal_hint("t_a", 7) == ""
++    token = pre._REFUSALS.set(("t_a", 7, []))
++    try:
++        assert pre.refusal_hint("t_a", 7) == ""
++        pre._note_refusal("t_b", 7, "dirty_source", "x")
++        pre._note_refusal("t_a", 8, "dirty_source", "x")
++        assert pre.refusal_hint("t_a", 7) == ""
++        pre._note_refusal("t_a", 7, "dirty_source", "untracked files")
++        assert pre.refusal_hint("t_a", 7) == " (workspace_source publish refused: dirty_source: untracked files)"
++        assert pre.refusal_hint("t_b", 7) == "" and pre.refusal_hint("t_a", 8) == ""
++        pre._note_refusal("t_a", 7, "source_clone_unregistered", "")
++        assert pre.refusal_hint("t_a", 7).startswith(
++            " (workspace_source publish refused: source_clone_unregistered; register the worktree's clone under "
++            "kanban.workspace_source.clones")
++    finally:
++        pre._REFUSALS.reset(token)
++    assert pre.refusal_hint("t_a", 7) == ""
++
++
++def test_unpublished_park_refusal_without_publish_refusal_is_unchanged(card, monkeypatch):
++    """No publish was attempted (publish_on_park off): the refusal carries no publish hint."""
++    commit(card.path, "x.txt")
++    cfg = kws.Settings(**{**card.cfg.__dict__, "publish_on_park": False})
++    monkeypatch.setattr(kws, "settings", lambda config=None: cfg)
++    with kbc.write_txn(card.conn):
++        card.conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(card.path), card.id))
++    with pytest.raises(ValueError) as refused:
++        kb.schedule_task(card.conn, card.id, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z", clock_only=True,
++                         expected_run_id=card.run_id)
++    assert str(refused.value).endswith("to the checkpoint/reason")
++
++
+ # --- endings carry the receipt; the ending always proceeds (S6) ------------------------------------------------------
+ 
+ def _leaving_op(conn, tid, status):
+-- 
+2.43.0
+

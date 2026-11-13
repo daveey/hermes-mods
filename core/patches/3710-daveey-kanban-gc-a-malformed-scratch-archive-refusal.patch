@@ -1,0 +1,167 @@
+From dfbe28cf6e1bf3804134cc856050555b9f684078 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:04:30 +0000
+Subject: [PATCH] [daveey] kanban gc: a malformed scratch archive-refusal memo
+ entry is dropped, never aborts the pass
+
+Follow-up to PR #2407 review (t_01a1d5cef2bb3e55), card t_01a1d5d9728e55a3.
+
+Why: a JSON-valid refusals-<board>.json entry with a non-numeric `retry_at`
+(or a bad/missing `count`) made `skip_logged` raise ValueError. In the aged
+scratch loop of `hermes kanban gc` that call sits outside
+`_archive_and_remove_scratch`'s try, so one bad entry aborted the board's whole
+GC pass (fail closed: nothing deleted, but GC stopped). A non-numeric `last_at`
+instead discarded every entry. The module promises unreadable state is empty.
+
+Fix: `Refusals` validates each loaded entry against the shape `record()`
+writes (finite, formattable `last_at`/`retry_at`; int `count` >= 1, not bool;
+list-or-null `fingerprint`; str-or-null `reason`). Malformed entries are dropped
+with one WARNING per load and their trees count as never refused, so every
+removal guard runs on them as before. Custody, owner_unverified and protection
+guards are unchanged.
+
+Proof: tests/hermes_cli/test_kanban_scratch_gc_backoff.py
+- test_malformed_memo_entry_is_dropped_and_the_aged_pass_completes: memo with
+  retry_at "x" / count null; RED on the base (ValueError: could not convert
+  string to float: 'x' at kanban_scratch_backoff.py:95), GREEN after: pass
+  completes, the bad tree is attempted fresh (count 1), a valid sibling entry
+  still backs off, one "dropped 1 malformed" warning.
+- test_memo_loader_drops_each_malformed_field (11 cases): RED on the base, GREEN.
+---
+ hermes_cli/kanban_scratch_backoff.py          | 41 +++++++++++++---
+ .../test_kanban_scratch_gc_backoff.py         | 47 +++++++++++++++++++
+ 2 files changed, 82 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_scratch_backoff.py b/hermes_cli/kanban_scratch_backoff.py
+index 565d78561a..f086dbe2ec 100644
+--- a/hermes_cli/kanban_scratch_backoff.py
++++ b/hermes_cli/kanban_scratch_backoff.py
+@@ -17,12 +17,14 @@ Two bounds, both fail-safe (each one only *keeps* a tree for later):
+ 
+ Every guard in the removal path still runs for every tree that is attempted.
+ State lives at ``<kanban home>/kanban/scratch-gc/refusals-<board>.json``, host
+-local and never synced; an unreadable file is treated as empty.
++local and never synced; an unreadable file is treated as empty and a malformed
++entry (wrong field types) is dropped with one warning, so neither can stop a pass.
+ """
+ from __future__ import annotations
+ 
+ import json
+ import logging
++import math
+ import os
+ import time
+ from pathlib import Path
+@@ -71,6 +73,22 @@ def fingerprint(path: Path, completed_at) -> Optional[list]:
+     return [str(path), completed_at, st.st_ino, st.st_dev, st.st_mtime_ns]
+ 
+ 
++def _finite(value) -> bool:
++    """A real epoch-seconds number ``time.gmtime`` can format (no bool, NaN, inf or year > 5000)."""
++    return (isinstance(value, (int, float)) and not isinstance(value, bool)
++            and math.isfinite(value) and abs(value) < 1e11)
++
++
++def _well_formed(entry) -> bool:
++    """The shape :meth:`Refusals.record` writes, so :func:`skip_logged` never raises on loaded state."""
++    return (isinstance(entry, dict)
++            and _finite(entry.get("last_at")) and _finite(entry.get("retry_at"))
++            and isinstance(entry.get("count"), int) and not isinstance(entry["count"], bool)
++            and entry["count"] >= 1
++            and (entry.get("fingerprint") is None or isinstance(entry["fingerprint"], list))
++            and (entry.get("reason") is None or isinstance(entry["reason"], str)))
++
++
+ class Refusals:
+     """Per-tree archive refusals of one board, with exponential retry backoff."""
+ 
+@@ -80,12 +98,23 @@ class Refusals:
+         self.entries: dict[str, dict] = {}
+         try:
+             data = json.loads(self.file.read_text(encoding="utf-8-sig"))
+-            if isinstance(data, dict) and isinstance(data.get("entries"), dict):
+-                cutoff = now() - FORGET_S
+-                self.entries = {k: v for k, v in data["entries"].items()
+-                                if isinstance(v, dict) and float(v.get("last_at") or 0) >= cutoff}
+         except (OSError, ValueError, TypeError):
+-            self.entries = {}
++            return
++        if not (isinstance(data, dict) and isinstance(data.get("entries"), dict)):
++            return
++        cutoff = now() - FORGET_S
++        dropped = 0
++        for key, entry in data["entries"].items():
++            if not _well_formed(entry):
++                dropped += 1
++            elif entry["last_at"] >= cutoff:
++                self.entries[key] = entry
++        if dropped:
++            # Hand-edited or foreign state: those trees count as never refused (fail-safe,
++            # every removal guard still runs on them).
++            log.warning("Scratch GC refusal backoff %s: dropped %d malformed entr%s; "
++                        "those trees are retried as never refused", self.file, dropped,
++                        "y" if dropped == 1 else "ies")
+ 
+     def backing_off(self, key: str, path: Path, completed_at) -> Optional[dict]:
+         """The entry when *key* was refused and its retry time is still ahead for the same tree."""
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc_backoff.py b/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
+index 663bd8676e..c7efbc9083 100644
+--- a/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
++++ b/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
+@@ -114,6 +114,53 @@ def test_unreadable_state_is_empty_and_never_blocks(remote, archives):
+     assert archives == [path] and _state()[tid]["count"] == 1
+ 
+ 
++def _write_entries(entries):
++    bo._path("default").parent.mkdir(parents=True, exist_ok=True)
++    bo._path("default").write_text(json.dumps({"version": 1, "entries": entries}))
++
++
++def test_malformed_memo_entry_is_dropped_and_the_aged_pass_completes(remote, archives, caplog, capsys):
++    """A JSON-valid memo whose entry has ``retry_at: "x"`` / ``count: null`` must not abort the pass."""
++    import time
++    tid, path = _bare_refused(remote)
++    fp = bo.fingerprint(path, OLD)
++    good_tid, good_path = _bare_refused(remote)
++    now = time.time()
++    _write_entries({
++        tid: {"fingerprint": fp, "count": None, "last_at": now, "retry_at": "x", "reason": "r"},
++        good_tid: {"fingerprint": bo.fingerprint(good_path, OLD), "count": 1, "last_at": now,
++                   "retry_at": now + 3600, "reason": "kept"},
++    })
++    caplog.set_level(logging.INFO, logger="hermes_cli.kanban_scratch_backoff")
++    assert helpers._gc() == 0
++    assert "GC complete" in capsys.readouterr().out
++    assert archives == [path], "the malformed entry is no refusal; the valid one still backs off"
++    assert good_path.exists() and path.exists()  # bare repo: refused again, kept
++    entry = _state()[tid]
++    assert entry["count"] == 1 and isinstance(entry["retry_at"], float)
++    assert caplog.text.count("dropped 1 malformed") == 1
++
++
++@pytest.mark.parametrize("bad", [
++    {"retry_at": "x"}, {"count": None}, {"count": "2"}, {"count": True}, {"count": 0},
++    {"last_at": "y"}, {"retry_at": float("inf")}, {"retry_at": 1e300}, {"retry_at": None},
++    {"fingerprint": "p"}, {"reason": 5},
++])
++def test_memo_loader_drops_each_malformed_field(tmp_path, bad):
++    tree = tmp_path / "tree"
++    tree.mkdir()
++    now = 1_000_000.0
++    good = {"fingerprint": bo.fingerprint(tree, 5), "count": 2, "last_at": now, "retry_at": now + 60,
++            "reason": "r"}
++    entries = {"ok": dict(good), "bad": {**good, **bad}}
++    bo._path("default").parent.mkdir(parents=True, exist_ok=True)
++    bo._path("default").write_text(json.dumps({"version": 1, "entries": entries}, allow_nan=True))
++    refusals = bo.Refusals("default", now=lambda: now)
++    assert set(refusals.entries) == {"ok"}
++    assert bo.skip_logged(refusals, "bad", tree, 5, "t") is False
++    assert bo.skip_logged(refusals, "ok", tree, 5, "t") is True
++
++
+ def test_budget_defers_the_rest_oldest_first_and_pass_completes(remote, archives, caplog, capsys):
+     _newer, newer_path = _task(remote=remote)
+     _older, older_path = _task(remote=remote, completed_at=OLD - 3600)
+-- 
+2.43.0
+

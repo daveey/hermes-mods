@@ -1,0 +1,192 @@
+From a6f0ead0a8180ee0a111bc2293e07a64e170e541 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:31:23 +0000
+Subject: [PATCH] [daveey] kanban: awaited-card report_lag warns again when a
+ warned park re-parks on a finished card
+
+Review 5895271396 (nit 1) on #2432 at e33c3b5abb: report_lag's `_WARNED` mark was keyed by park only and the
+awaited ref it stored was never compared. The mark cleared only when a later throttled replica scan (60 s/board)
+found the park no longer waiting on a finished card, so a warned park that left `scheduled` and re-parked inside
+one scan window, still naming a finished card (the same or another), was never warned again:
+`awaited_card_done_park_lag` went blind for it.
+
+Fix: the mark is now (awaited card, park episode), the episode being the id of the card's latest
+`scheduled`/`continued` event (the same park `named_cards` reads its `awaiting` ref from). The replica scan and
+`expedite` re-arm a warned park whose episode or awaited card changed; an unchanged mark is still skipped, so a
+park episode warns once (no per-scan spam) and nothing new is probed: one indexed event read per warned park, only
+on the existing throttled scan. Nit 2: the `_WARNED` comment and `report_lag` docstring no longer say the mark
+lasts "until it leaves scheduled".
+
+Proof: test_a_warned_park_that_re_parks_within_one_scan_window_on_a_finished_card_is_warned_again[same card,
+other card]: warn once, same episode across later scans stays once, re-park within 60 s still on a done card is
+warned again. RED with only the source reverted to origin/main (both params: `assert [] == [owner]` at the
+re-warn); GREEN 23/23 in tests/hermes_cli/test_kanban_awaited_card_wake.py; scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban_awaited_card_wake.py        | 53 ++++++++++++++-----
+ .../test_kanban_awaited_card_wake.py          | 36 +++++++++++++
+ 2 files changed, 77 insertions(+), 12 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaited_card_wake.py b/hermes_cli/kanban_awaited_card_wake.py
+index f9a864a947..e908c148e4 100644
+--- a/hermes_cli/kanban_awaited_card_wake.py
++++ b/hermes_cli/kanban_awaited_card_wake.py
+@@ -19,7 +19,8 @@ rebuilt replica, with the pages a pull applied before its Resync, :func:`changes
+ reconcile``'s standalone pull (``kanban_sync_backlog.replica_at_head``).
+ 
+ Detection: when an awaited card reached done/archived and its park is still ``scheduled`` more than
+-``LAG_WARN_SECONDS`` later, the wake-check tick logs one ``awaited_card_done_park_lag`` WARNING (``report_lag``).
++``LAG_WARN_SECONDS`` later, the wake-check tick logs one ``awaited_card_done_park_lag`` WARNING (``report_lag``)
++per park episode and awaited card: a park that re-parks still naming a finished card is warned again.
+ It reads the awaited cards' status from the replica itself (at most once per ``_SCAN_SECONDS`` per board), so a
+ status that arrived by any path is seen, not only one ``expedite`` was handed.
+ """
+@@ -42,7 +43,10 @@ _FINISHED = ("done", "archived")
+ _LOCK = threading.Lock()
+ # (board db path, waiting card) -> (awaited card, its status, when this gateway applied it)
+ _WATCH: dict[tuple[str, str], tuple[str, str, float]] = {}
+-_WARNED: dict[tuple[str, str], str] = {}  # parks already warned for (-> awaited card), until they leave scheduled
++# (board db path, waiting card) -> (awaited card, park episode) it was warned for: one warning per park episode and
++# awaited card. A later replica scan re-arms it when the park re-parked (new episode) or names another finished
++# card, and drops it once the park no longer waits on a finished card.
++_WARNED: dict[tuple[str, str], tuple[str, Optional[int]]] = {}
+ _SCANNED: dict[str, float] = {}  # board db path -> when report_lag last read the replica
+ 
+ 
+@@ -117,17 +121,39 @@ def _expedite(live: sqlite3.Connection, changed: Mapping[str, str], now: float)
+                 moved.append(task_id)
+                 logger.info("kanban awaited-card wake: %s re-probes now: awaited card %s is %s", task_id, ref,
+                             changed[ref])
+-    _remember(key, hits, changed, now)
++    _remember(live, key, hits, changed, now)
+     if moved:
+         sync.wake_dispatcher()
+     return moved
+ 
+ 
+-def _remember(key: str, hits: list, changed: Mapping[str, str], now: float) -> None:
++def _episode(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
++    """The park episode: the id of the card's latest park event (the park ``named_cards`` reads its ref from)."""
++    try:
++        row = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind IN ('scheduled','continued')",
++                           (task_id,)).fetchone()
++    except sqlite3.Error:
++        return None
++    return row[0] if row else None
++
++
++def _rearm(conn: sqlite3.Connection, key: str, task_id: str, ref: str) -> bool:
++    """Whether the park may be watched for ``ref``: never warned, or warned for another awaited card or an earlier
++    park episode (that mark is dropped). Call under ``_LOCK``."""
++    mark = _WARNED.get((key, task_id))
++    if mark is None:
++        return True
++    if mark == (ref, _episode(conn, task_id)):
++        return False
++    del _WARNED[(key, task_id)]
++    return True
++
++
++def _remember(live: sqlite3.Connection, key: str, hits: list, changed: Mapping[str, str], now: float) -> None:
+     with _LOCK:
+         for task_id, _cmd, ref in hits:
+             if changed[ref] in _FINISHED:
+-                if (key, task_id) not in _WARNED:
++                if _rearm(live, key, task_id, ref):
+                     _WATCH.setdefault((key, task_id), (ref, changed[ref], now))
+             else:
+                 _WATCH.pop((key, task_id), None)
+@@ -165,8 +191,9 @@ def _replica_finished(conn: sqlite3.Connection) -> Optional[dict[str, tuple[str,
+ 
+ 
+ def _scan(conn: sqlite3.Connection, key: str, now: float) -> None:
+-    """Record the parks whose awaited card the replica shows finished, whatever path applied it, and forget the
+-    warned mark of a park that no longer waits on a finished card. At most once per ``_SCAN_SECONDS`` per board."""
++    """Record the parks whose awaited card the replica shows finished, whatever path applied it (re-arming a warned
++    park that re-parked or now names another finished card), and forget the warned mark of a park that no longer
++    waits on a finished card. At most once per ``_SCAN_SECONDS`` per board."""
+     with _LOCK:
+         last = _SCANNED.get(key)
+         if last is not None and 0 <= now - last < _SCAN_SECONDS:
+@@ -181,7 +208,7 @@ def _scan(conn: sqlite3.Connection, key: str, now: float) -> None:
+         return
+     with _LOCK:
+         for task_id, (ref, status) in found.items():
+-            if (key, task_id) not in _WARNED:
++            if _rearm(conn, key, task_id, ref):
+                 _WATCH.setdefault((key, task_id), (ref, status, now))
+         for k in [k for k in _WARNED if k[0] == key and k[1] not in found]:
+             del _WARNED[k]
+@@ -190,9 +217,11 @@ def _scan(conn: sqlite3.Connection, key: str, now: float) -> None:
+ 
+ def report_lag(conn: sqlite3.Connection, *, now: Optional[float] = None) -> list[str]:
+     """Log one WARNING per park still ``scheduled`` ``LAG_WARN_SECONDS`` after its awaited card finished (seen by
+-    ``expedite`` when it applied, or by the replica scan at most ``_SCAN_SECONDS`` later), then mark it warned
+-    until it leaves ``scheduled``; a park that left ``scheduled`` is forgotten silently. Returns the warned cards.
+-    Beyond the throttled replica read it reads only the recorded parks."""
++    ``expedite`` when it applied, or by the replica scan at most ``_SCAN_SECONDS`` later), then mark it warned for
++    that awaited card and park episode: a later scan warns again only after the park re-parks (a new episode) or
++    names another finished card, and drops the mark once it no longer waits on a finished card. A recorded park that
++    left ``scheduled`` before its warning is forgotten silently. Returns the warned cards. Beyond the throttled
++    replica read it reads only the recorded parks (and a warned park's latest park event)."""
+     key = _db_key(conn)
+     now = time.time() if now is None else float(now)
+     _scan(conn, key, now)
+@@ -209,7 +238,7 @@ def report_lag(conn: sqlite3.Connection, *, now: Optional[float] = None) -> list
+         with _LOCK:
+             _WATCH.pop((key, task_id), None)
+             if row is not None and row[0] == "scheduled":
+-                _WARNED[(key, task_id)] = ref
++                _WARNED[(key, task_id)] = (ref, _episode(conn, task_id))
+                 _bound()
+         if row is not None and row[0] == "scheduled":
+             warned.append(task_id)
+diff --git a/tests/hermes_cli/test_kanban_awaited_card_wake.py b/tests/hermes_cli/test_kanban_awaited_card_wake.py
+index 001f247bb6..44796a08ac 100644
+--- a/tests/hermes_cli/test_kanban_awaited_card_wake.py
++++ b/tests/hermes_cli/test_kanban_awaited_card_wake.py
+@@ -380,6 +380,42 @@ def test_lag_warning_reads_the_replica_for_a_status_no_expedite_was_handed(
+     assert len(lags()) == 1
+ 
+ 
++@pytest.mark.parametrize("other_card", [False, True])
++def test_a_warned_park_that_re_parks_within_one_scan_window_on_a_finished_card_is_warned_again(
++        live, svc, kanban_home, probes, caplog, other_card):
++    """Review 5895271396 nit 1 on #2432: the warned mark was keyed by park only, and a scan that still found the park
++    on a finished card kept it, so a re-park inside one ``_SCAN_SECONDS`` window was never warned again."""
++    caplog.set_level("WARNING", logger=acw.__name__)
++    owner, t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW} --until review")
++    _other(svc, REVIEW, {"status": "done"})
++    _other(svc, UNRELATED, {"status": "done"})
++    ksc._pull_replica(BOARD, svc.hub(ME), ME, kanban_home / "kanban.db", diagnostic=True)
++
++    def lags():
++        return [r.getMessage() for r in caplog.records if "awaited_card_done_park_lag" in r.getMessage()]
++
++    scanned = t0 + acw._SCAN_SECONDS
++    acw.report_lag(live, now=scanned)
++    warned_at = scanned + acw.LAG_WARN_SECONDS + 1
++    assert acw.report_lag(live, now=warned_at) == [owner]
++    acw.report_lag(live, now=warned_at + 30)  # same episode, no scan due: still once
++    assert len(lags()) == 1
++    # The park wakes, runs and re-parks inside the scan window, still on a finished card (the same one or another).
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (owner,))
++    assert kb.claim_task(live, owner, claimer="worker") is not None
++    ref = UNRELATED if other_card else REVIEW
++    assert kb.schedule_task(live, owner, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z still waiting",
++                            wake_check=f"hermes kanban wait-check task {ref} --until review", check_every=EVERY)
++    rescanned = warned_at + acw._SCAN_SECONDS
++    assert acw.report_lag(live, now=rescanned) == []  # the scan re-arms the new episode
++    assert acw.report_lag(live, now=rescanned + acw.LAG_WARN_SECONDS + 1) == [owner]  # before the fix: []
++    assert len(lags()) == 2 and f"task={owner} awaited={ref} lag_s=" in lags()[-1]
++    for later in range(2, 12):  # the new episode across later scans: warned once
++        acw.report_lag(live, now=rescanned + acw.LAG_WARN_SECONDS + 60 * later)
++    assert len(lags()) == 2
++
++
+ def test_the_replica_read_is_throttled_and_skipped_without_a_replica(live, monkeypatch):
+     calls = []
+     monkeypatch.setattr(acw, "_replica_finished", lambda conn: calls.append(1) or None)
+-- 
+2.43.0
+

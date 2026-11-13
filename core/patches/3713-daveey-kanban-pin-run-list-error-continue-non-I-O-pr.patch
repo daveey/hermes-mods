@@ -1,0 +1,109 @@
+From 126d9a35b53e0c3694a17c3161e0fc6fed99f3f2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:42:33 +0000
+Subject: [PATCH] [daveey] kanban: pin run-list-error continue, non-I/O
+ propagation and the in-progress page size in the CI-progress pool scan
+
+Post-merge check t_01a1d5e5c01ace56 of #2380/#2397 found three exact-anchor
+mutants of `_recent_job_on` that the suite did not kill (74 passed each).
+Tests only; no production change.
+
+- A4: `continue` -> `break` after an unreadable run list. New
+  test_unreadable_in_progress_run_list_does_not_skip_the_completed_runs
+  [match/no-match]: the in-progress list raises HTTP 502, the completed list
+  holds a recent run whose job matches (BUSY, remembered) or does not
+  (NOT_STARTING, not remembered).
+- A6: dropping `if not isinstance(exc, unreadable): raise exc` in batch().
+  New test_unexpected_job_read_error_propagates_out_of_the_scan
+  [KeyError/TypeError]: ci_run_progress catches no non-I/O error from the
+  pool scan, so it propagates (to the sweep's own handler) and nothing is
+  remembered.
+- B2: in-progress per_page 100 -> 25. test_scan_lists_more_than_ten_in_progress_runs
+  now lists IN_PROGRESS_RUNS_MAX runs with the match at the last index, so
+  any page size below the cap fails (index 21 only caught <= 21).
+
+RED/GREEN (scripts/run_tests.sh tests/hermes_cli/test_kanban_ci_progress.py):
+  base+tests: 78 passed, 0 failed, 0 skipped
+  A4: 2 failed (the new run-list test, both params), 76 passed
+  A6: 2 failed (the new propagation test, both params), 76 passed
+  B2: 1 failed (test_scan_lists_more_than_ten_in_progress_runs), 77 passed
+scripts/check --base origin/main: 19 checks, ok.
+
+Card: t_01a1d5fa17bb4590
+---
+ tests/hermes_cli/test_kanban_ci_progress.py | 52 +++++++++++++++++++--
+ 1 file changed, 48 insertions(+), 4 deletions(-)
+
+diff --git a/tests/hermes_cli/test_kanban_ci_progress.py b/tests/hermes_cli/test_kanban_ci_progress.py
+index f7ea6f6cbe..e49bf8cb03 100644
+--- a/tests/hermes_cli/test_kanban_ci_progress.py
++++ b/tests/hermes_cli/test_kanban_ci_progress.py
+@@ -1262,13 +1262,17 @@ def test_job_lists_of_a_scan_are_read_concurrently(kanban_home, monkeypatch) ->
+ 
+ def test_scan_lists_more_than_ten_in_progress_runs(kanban_home, monkeypatch) -> None:
+     """On 2026-11-13 the run holding the one ``hermes-state`` runner sat at index 23 of 24 in-progress runs: a
+-    run list read with ``per_page=10`` never sees it and answers ``not_starting`` for a busy pool."""
++    run list read with ``per_page=10`` never sees it and answers ``not_starting`` for a busy pool. The match sits
++    at the last index the scan reads, so a run list read with any page size below ``IN_PROGRESS_RUNS_MAX`` misses
++    it."""
++    last = 900 + kcp.IN_PROGRESS_RUNS_MAX - 1
++
+     def jobs_for(run_id: int) -> list:
+-        return [_taken(run_id=run_id, started_age=60, status="in_progress")] if run_id == 921 else []
++        return [_taken(run_id=run_id, started_age=60, status="in_progress")] if run_id == last else []
+ 
+-    _scan_api(monkeypatch, 23, jobs_for)
++    _scan_api(monkeypatch, kcp.IN_PROGRESS_RUNS_MAX, jobs_for)
+     p = kcp.ci_run_progress(RUN_URL, fetch=lambda *_: _QUEUED, fetch_runners=lambda _r: None)
+-    assert p.state == kcp.BUSY and "took job 9210" in p.detail, p
++    assert p.state == kcp.BUSY and f"took job {last * 10}" in p.detail, p
+ 
+ 
+ @pytest.mark.parametrize("match,state", [(True, kcp.BUSY), (False, kcp.NOT_STARTING)], ids=["match", "no-match"])
+@@ -1320,3 +1324,43 @@ def test_unreadable_job_list_does_not_skip_the_completed_runs(kanban_home, monke
+     monkeypatch.setattr(kcp, "_gh_api", api)
+     p = kcp.ci_run_progress(RUN_URL, fetch=lambda *_: _QUEUED, fetch_runners=lambda _r: None)
+     assert p.state == kcp.BUSY and "took job 9500" in p.detail, p
++
++
++@pytest.mark.parametrize("match,state", [(True, kcp.BUSY), (False, kcp.NOT_STARTING)], ids=["match", "no-match"])
++def test_unreadable_in_progress_run_list_does_not_skip_the_completed_runs(kanban_home, monkeypatch, match,
++                                                                          state) -> None:
++    """PR #2380: a 502 on the in-progress run list does not end the scan: the completed list is still read, and
++    its recent run's job shows the pool alive. With no match there the answer is not remembered."""
++    reads: list[str] = []
++
++    def api(path: str) -> dict:
++        reads.append(path)
++        if "actions/runs?" in path:
++            if "status=completed" in path:
++                return {"workflow_runs": [{"id": 950, "status": "completed", "updated_at": _iso(60)}]}
++            raise RuntimeError("gh api exit 1: HTTP 502")
++        labels = LABELS if match else ("self-hosted", "ci-slow")
++        return {"jobs": [_taken(run_id=950, started_age=60, status="completed", labels=labels)]}
++
++    monkeypatch.setattr(kcp, "_gh_api", api)
++    p = kcp.ci_run_progress(RUN_URL, fetch=lambda *_: _QUEUED, fetch_runners=lambda _r: None)
++    assert p.state == state, p
++    assert match is ("took job 9500" in p.detail), p
++    assert any("/runs/950/jobs" in path for path in reads), reads
++    assert bool(kcp._POOL_SCANS) is match  # a match is remembered; "none" with an unread list is not
++
++
++@pytest.mark.parametrize("exc", [KeyError("jobs"), TypeError("bad payload")], ids=["KeyError", "TypeError"])
++def test_unexpected_job_read_error_propagates_out_of_the_scan(kanban_home, monkeypatch, exc) -> None:
++    """PR #2380: only I/O failures (OSError, RuntimeError, ValueError, TimeoutExpired) are noted and skipped. A bug
++    in a job read is not swallowed as "unreadable": ``ci_run_progress`` catches no such error from the pool scan,
++    so it reaches the sweep's own handler instead of reading ``not_starting``."""
++    def jobs_for(run_id: int) -> list:
++        if run_id == 901:
++            raise exc
++        return []
++
++    _scan_api(monkeypatch, 4, jobs_for)
++    with pytest.raises(type(exc)):
++        kcp.ci_run_progress(RUN_URL, fetch=lambda *_: _QUEUED, fetch_runners=lambda _r: None)
++    assert kcp._POOL_SCANS == {}
+-- 
+2.43.0
+

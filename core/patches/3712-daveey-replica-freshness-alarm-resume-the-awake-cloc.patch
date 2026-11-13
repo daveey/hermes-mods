@@ -1,0 +1,311 @@
+From 19b820b48f134541ec1455b3c7313394d80de788 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:38:41 +0000
+Subject: [PATCH] [daveey] replica-freshness alarm: resume the awake clock
+ across gateway restarts
+
+The replica-freshness check (#2345) kept `(stamp, monotonic since, open)` per board only in process memory, and the
+first observation after a start set `since = now`. hermes-hub restarts its gateway on every core update: 148 times
+on 2026-11-13 UTC, median 4.2 min apart, and every telemetry line since deploy read `not advanced for 0 awake s`.
+A replica stuck behind across restarts (the 2026-11-12 hub incident shape) therefore never reached
+REPLICA_STALE_S = 1200 s and never alarmed; after a restart an open incident also re-filed (a comment via the
+idempotent report path).
+
+Fix: each observation is also written to `<kanban home>/kanban/.replica-age.json` (beside `.sync-state.json`) as
+`{stamp, since, open, seen_at, boot}`. A process with no in-memory observation resumes it when it is safe:
+- same boot id (`/proc/sys/kernel/random/boot_id`; macOS `kern.bootsessionuuid`): monotonic time is shared by every
+  process of one boot and stops in sleep (Linux CLOCK_MONOTONIC, macOS), so a resumed clock still never counts a
+  Mac's sleep; no boot id -> no resume (old behaviour);
+- `since <= seen_at <= now` (no clock from the future);
+- last observed within REPLICA_STALE_S: a longer unwatched span (gateway down, sync off) says nothing about the
+  replica, so the clock starts afresh instead of alarming at once.
+A detached/unsynced board drops its record, so a later attach starts afresh. The one-card-per-incident path is
+unchanged; the persisted `open` flag keeps a restarted process from filing the same incident again.
+
+Also pins two mutants that survived the post-merge check (t_01a1d5c30d953d84):
+- A7 `_mode(path) not in ("primary",)`: shadow-mode boards are judged too (test_a_shadow_mode_board_is_judged_too);
+- A9 `note_round` dropped from `outbox_age.after_round`: the card's last-round text comes through the loop's own
+  call (test_the_sync_loops_after_round_records_the_outcome_the_card_names).
+Both new tests fail with their mutant applied (2 failed, 24 passed) and pass without it.
+
+RED on main (b4e84e04ce): test_a_stall_across_gateway_restarts_every_4_min_files_exactly_one_card and
+test_restarts_resume_the_awake_clock_but_never_count_sleep fail `assert 0 == 1` (no card ever filed).
+GREEN: tests/hermes_cli/test_kanban_sync_replica_age.py 26 passed (test_sleep_never_counts included);
+tests/hermes_cli/test_kanban_sync*.py 54 files, 1422 tests passed.
+
+Card: t_01a1d5ead18cf1c3
+---
+ hermes_cli/kanban_sync_replica_age.py         |  94 +++++++++++++-
+ .../test_kanban_sync_replica_age.py           | 116 ++++++++++++++++++
+ 2 files changed, 209 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_sync_replica_age.py b/hermes_cli/kanban_sync_replica_age.py
+index fc1c8525a6..26afb6db0d 100644
+--- a/hermes_cli/kanban_sync_replica_age.py
++++ b/hermes_cli/kanban_sync_replica_age.py
+@@ -14,13 +14,21 @@ unreadable replica counts as a stamp that has not advanced. When the stamp has n
+ path (comment at most hourly on an open card, a new card once it is done). Monotonic time stands still while a Mac
+ sleeps, so a laptop's sleep never counts. The incident ends (one INFO line) when the stamp advances.
+ 
++The observation is also kept in ``.replica-age.json`` beside ``.sync-state.json`` (with the boot id), so a gateway
++restart resumes the same awake clock and open incident: on 2026-11-13 the hub restarted its gateway 148 times
++(median 4.2 min apart) and an in-memory clock never reached the bound (t_01a1d5ead18cf1c3). Monotonic time is shared
++by every process of one boot and stops in sleep (Linux CLOCK_MONOTONIC, macOS), so a resumed clock still never counts
++sleep; another boot, or a span of over :data:`REPLICA_STALE_S` with no observation, starts afresh.
++
+ One check covers every shape: rounds ending behind, rounds failing, no rounds at all (a dead loop or a give-up),
+ and a missing replica. The card names the host, board, stamp (PT), awake minutes, the last round's outcome, the
+ loop's recorded stop, the pending outbox, the running core and the cards frozen behind a remote parent.
+ """
+ from __future__ import annotations
+ 
++import json
+ import logging
++import os
+ import socket
+ import sqlite3
+ import threading
+@@ -39,6 +47,7 @@ NO_ROUND_S = 300.0
+ TELEMETRY_EVERY_S = 3600.0
+ KEY = "kanban-sync-replica-stale"
+ AUTHOR = "kanban-sync-replica"
++_MEMO = ".replica-age.json"
+ _FROZEN_CAP = 25
+ _PT = "America/Los_Angeles"
+ 
+@@ -130,14 +139,96 @@ def check(boards: list[tuple[str, Path]], *, now: float, wall: Callable[[], floa
+     return out
+ 
+ 
++def _boot_id() -> Optional[str]:
++    """This boot's identity (monotonic time is comparable across processes only within one boot), else None."""
++    try:
++        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip() or None
++    except OSError:
++        pass
++    try:  # macOS: kern.bootsessionuuid
++        import ctypes
++        import ctypes.util
++        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
++        buf = ctypes.create_string_buffer(64)
++        size = ctypes.c_size_t(len(buf))
++        if libc.sysctlbyname(b"kern.bootsessionuuid", buf, ctypes.byref(size), None, ctypes.c_size_t(0)) == 0:
++            return buf.value.decode("ascii", "replace") or None
++    except (OSError, AttributeError, TypeError, ValueError):
++        pass
++    return None
++
++
++def _memo_path() -> Path:
++    """Beside ``.sync-state.json``: each board's observation, so a gateway restart resumes the awake clock."""
++    from hermes_cli import kanban_db as kb
++    return kb.kanban_home() / "kanban" / _MEMO
++
++
++def _load_memo() -> dict[str, Any]:
++    try:
++        memo = json.loads(_memo_path().read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return {}
++    return memo if isinstance(memo, dict) else {}
++
++
++def _save_memo(update: Callable[[dict[str, Any]], None]) -> None:
++    target = _memo_path()
++    try:
++        memo = _load_memo()
++        update(memo)
++        target.parent.mkdir(parents=True, exist_ok=True)
++        temp = target.with_name(f"{_MEMO}.{os.getpid()}.{threading.get_ident()}.tmp")
++        temp.write_text(json.dumps(memo), encoding="utf-8")
++        temp.replace(target)
++    except OSError:
++        log.debug("kanban sync: cannot record the replica observation at %s", target, exc_info=True)
++
++
++def _resume(slug: str, now: float) -> Optional[_Seen]:
++    """The previous process's observation of ``slug``, when it is safe to keep counting from it: the same boot
++    (monotonic time stops in sleep on Linux and macOS and is shared by every process of one boot), not in the
++    future, and observed within :data:`REPLICA_STALE_S` (a longer unwatched span says nothing about the replica)."""
++    rec = _load_memo().get(slug)
++    boot = _boot_id()
++    if not isinstance(rec, dict) or boot is None or rec.get("boot") != boot:
++        return None
++    try:
++        stamp = None if rec.get("stamp") is None else float(rec["stamp"])
++        since, seen_at = float(rec["since"]), float(rec["seen_at"])
++    except (KeyError, TypeError, ValueError):
++        return None
++    if not since <= seen_at <= now or now - seen_at > REPLICA_STALE_S:
++        return None
++    return _Seen(stamp, since, bool(rec.get("open")))
++
++
++def _remember(slug: str, seen: Optional[_Seen], now: float) -> None:
++    boot = _boot_id()
++
++    def update(memo: dict[str, Any]) -> None:
++        if seen is None or boot is None:
++            memo.pop(slug, None)
++        else:
++            memo[slug] = {"stamp": seen.stamp, "since": seen.since, "open": seen.open, "seen_at": now, "boot": boot}
++
++    _save_memo(update)
++
++
+ def _check_board(slug: str, path: Path, now: float, wall: Callable[[], float], file_fn, board_status) -> Optional[str]:
+     if _mode(path) not in ("primary", "shadow"):
+         with _LOCK:
+-            _SEEN.pop(slug, None)  # detached or unsynced: nothing to judge, and a later attach starts afresh
++            known = _SEEN.pop(slug, None)  # detached or unsynced: nothing to judge, and a later attach starts afresh
++        if known is not None or slug in _load_memo():
++            _remember(slug, None, now)
+         return None
+     stamp = _stamp(slug)
+     with _LOCK:
+         seen = _SEEN.get(slug)
++        if seen is None:
++            seen = _resume(slug, now)  # a restarted gateway keeps counting the same incident
++            if seen is not None:
++                _SEEN[slug] = seen
+         # Any change counts: ``pulled_at`` is wall time, and a wall clock stepped back (NTP, a manual fix) writes
+         # stamps below the remembered one on healthy rounds.
+         if seen is None or (stamp is not None and (seen.stamp is None or stamp != seen.stamp)):
+@@ -150,6 +241,7 @@ def _check_board(slug: str, path: Path, now: float, wall: Callable[[], float], f
+         if due:
+             seen.open = True
+         rnd = _ROUNDS.get(slug)
++    _remember(slug, seen, now)
+     _telemetry(slug, seen, elapsed, now)
+     if not due:
+         return None
+diff --git a/tests/hermes_cli/test_kanban_sync_replica_age.py b/tests/hermes_cli/test_kanban_sync_replica_age.py
+index b666fbd949..ce015edfce 100644
+--- a/tests/hermes_cli/test_kanban_sync_replica_age.py
++++ b/tests/hermes_cli/test_kanban_sync_replica_age.py
+@@ -312,6 +312,122 @@ def test_an_unreachable_board_lists_the_local_mirror_status_instead(live, kanban
+     assert child in body and "running (local mirror" in body
+ 
+ 
++def test_a_shadow_mode_board_is_judged_too(live, kanban_home):
++    """``shadow`` boards pull the Board's feed as well: a stale replica there files the same one card."""
++    sync.set_mode(live, "shadow")
++    host = Host(kanban_home, _pt("2026-11-12 18:00:00"))
++    _stamp(host.wall)
++    host.check()
++    host.run(21 * MIN, each=lambda: host.round(behind=True))
++    assert len(host.cards) == 1
++
++
++def test_the_sync_loops_after_round_records_the_outcome_the_card_names(live, kanban_home):
++    """``run_forever`` calls only ``outbox_age.after_round``; the card's last-round text must come through it."""
++    host = Host(kanban_home, _pt("2026-11-12 18:00:00"))
++    _stamp(host.wall)
++    host.check()
++
++    def loop_round():
++        outbox_age.after_round([ksc.RoundResult(board=BOARD, mode="primary", behind=False, error="HubError: 502")],
++                               host.boards, mono=lambda: host.mono, age=lambda _p: None)
++
++    host.run(21 * MIN, each=loop_round)
++    assert len(host.cards) == 1 and "last round failed: HubError: 502" in host.cards[0][1]
++
++
++# --- process restarts (the hub's gateway restarts on every core update, ~4 min apart on 2026-11-13) ---------------
++
++def _restart():
++    """A new gateway process: every in-memory observation is gone; files on disk and awake time carry on."""
++    outbox_age.reset()
++
++
++def test_a_stall_across_gateway_restarts_every_4_min_files_exactly_one_card(live, kanban_home):
++    """hermes-hub 2026-11-13: 148 gateway restarts, median 4.2 min apart; every telemetry line read `not advanced
++    for 0 awake s`. The replica stops advancing and the checking process restarts every 4 min for 30 min."""
++    host = Host(kanban_home, _pt("2026-11-13 08:00:00"))
++    _stamp(host.wall)
++    host.check()
++    for _ in range(8):  # 32 awake minutes
++        host.run(4 * MIN, each=lambda: host.round(behind=True))
++        _restart()
++        host.check()
++    assert len(host.cards) == 1
++    assert _fired(host) == ["08:20 PT"]
++    assert "2026-11-13 08:00:00 PST" in host.cards[0][1]
++
++
++def test_restarts_resume_the_awake_clock_but_never_count_sleep(live, kanban_home):
++    """Awake time between processes counts; the wall clock's 5 h asleep across a restart does not."""
++    host = Host(kanban_home, _pt("2026-11-12 08:00:00"))
++    _stamp(host.wall)
++    host.check()
++    host.run(10 * MIN, each=lambda: host.round(behind=True))
++    _restart()
++    host.sleep(5 * 3600)
++    host.run(9 * MIN, each=lambda: host.round(behind=True))
++    assert host.cards == []  # 19 awake minutes
++    host.run(2 * MIN, each=lambda: host.round(behind=True))
++    assert len(host.cards) == 1
++
++
++def test_a_new_boot_starts_the_clock_afresh(live, kanban_home, monkeypatch):
++    """Monotonic time is only comparable within one boot: after a reboot the remembered clock is discarded."""
++    host = Host(kanban_home, _pt("2026-11-12 08:00:00"))
++    _stamp(host.wall)
++    host.check()
++    host.run(15 * MIN, each=lambda: host.round(behind=True))
++    _restart()
++    monkeypatch.setattr(replica_age, "_boot_id", lambda: "another-boot")
++    host.check()
++    host.run(15 * MIN, each=lambda: host.round(behind=True))
++    assert host.cards == []
++    host.run(6 * MIN, each=lambda: host.round(behind=True))
++    assert len(host.cards) == 1
++
++
++def test_an_unwatched_gap_starts_the_clock_afresh(live, kanban_home):
++    """No check for over 20 awake minutes (sync turned off, the gateway down): nothing is known about that span."""
++    host = Host(kanban_home, _pt("2026-11-12 08:00:00"))
++    _stamp(host.wall)
++    host.check()
++    host.run(5 * MIN, each=lambda: host.round(behind=True))
++    _restart()
++    host.mono += 3600
++    host.wall += 3600
++    host.check()
++    assert host.cards == []
++
++
++def test_an_open_incident_survives_a_restart_without_filing_again(live, kanban_home):
++    host = Host(kanban_home, _pt("2026-11-12 08:00:00"))
++    _stamp(host.wall)
++    host.check()
++    host.run(21 * MIN, each=lambda: host.round(behind=True))
++    assert len(host.cards) == 1
++    for _ in range(5):
++        _restart()
++        host.run(4 * MIN, each=lambda: host.round(behind=True))
++    assert len(host.cards) == 1
++    host.run(1 * MIN, each=lambda: host.round(head=True))  # incident over
++    host.run(21 * MIN, each=lambda: host.round(behind=True))
++    assert len(host.cards) == 2
++
++
++def test_a_detached_board_forgets_the_remembered_clock(live, kanban_home):
++    host = Host(kanban_home, _pt("2026-11-12 08:00:00"))
++    _stamp(host.wall)
++    host.check()
++    host.run(15 * MIN, each=lambda: host.round(behind=True))
++    sync.set_mode(live, "off")
++    host.check()
++    sync.set_mode(live, "primary")
++    _restart()
++    host.run(15 * MIN, each=lambda: host.round(behind=True))
++    assert host.cards == []
++
++
+ # --- replays of the 2026-11-12 incidents ---------------------------------------------------------------------------
+ 
+ def _fired(host):
+-- 
+2.43.0
+

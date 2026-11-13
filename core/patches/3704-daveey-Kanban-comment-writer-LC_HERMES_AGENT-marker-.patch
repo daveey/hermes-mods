@@ -1,0 +1,455 @@
+From 96e94c7cca7f57c9fda3afbf27621e5b16ff4d5f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:48:24 +0000
+Subject: [PATCH] [daveey] Kanban comment writer: LC_HERMES_AGENT marker
+ survives `ssh <Mac> hermes kanban comment`
+
+Two agent-written comments recorded writer_kind=human (replica 40715 on
+t_01a1d3a625e2f2b8, 41612 on t_01a1d5199d20cf3f): an agent's terminal ran
+`ssh <Mac> 'hermes kanban comment ...'`. Mac sshd accepts only LANG LC_*
+(/etc/ssh/sshd_config.d/100-macos.conf), so every HERMES_* marker is dropped,
+the remote shell starts clean, and the ancestry walk (sshd-session and
+launchd skipped as root's) ends human.
+
+Fix: use the LC_ prefix stock OpenSSH already forwards and accepts on every
+host (client `SendEnv LANG LC_*`, server `AcceptEnv LANG LC_*`). No sshd
+edit, no sudo.
+
+- kanban_comment_writer: LC_HERMES_AGENT joins AGENT_ENV_MARKERS (blank still
+  means no marker). New helpers: ssh_agent_marker_value / stamp_ssh_agent_marker
+  (the child's HERMES_SESSION_ID, else an inherited marker, else "1"; an unsafe
+  value becomes "1") and marker_session: when the CLI has no HERMES_SESSION_ID,
+  a session-id-shaped LC_HERMES_AGENT (hermes_state_ids shapes or
+  local-<64 hex>) becomes writer_session; "1" names none. Docstring no longer
+  lists `ssh <host> hermes kanban comment` as out of reach.
+- Exported next to every HERMES_AGENT site:
+  - terminal wrapper (BaseEnvironment._wrap_command, every backend):
+    `export LC_HERMES_AGENT="${HERMES_SESSION_ID:-${LC_HERMES_AGENT:-1}}"`,
+    and the snapshot dump unsets it like AI_AGENT/HERMES_AGENT (a shared
+    snapshot would otherwise carry one session's id into another's commands);
+  - local spawn factory (_finalize_child_env: build_subprocess_env scrubbed
+    path, hermes_subprocess_env, _sanitize_subprocess_env), stamped after the
+    session bridge so it names this child's session. The unscrubbed
+    build_subprocess_env path stays byte-preserving (it inherits main()'s "1");
+  - execute_code child (_build_child_env, after _bridge_session_identity);
+  - Kanban worker env (dispatcher): "1" after dropping the mirrored session
+    vars, so a worker never carries a previous gateway turn's session id;
+  - main()/gateway entrypoints setdefault "1"; MCP stdio servers carry it.
+- drop_agent_attribution drops it, so the Desktop GUI (and its terminal pane,
+  a person's shell) never starts with it.
+
+Unchanged: a person's shell sets no LC_HERMES_AGENT, so their ssh notes stay
+human; `/kanban` typed in a composer stays human; a leaked marker only lowers
+authority.
+
+Tests (tests/hermes_cli/test_kanban_cli_comment_writer.py,
+test_kanban_worker_session_source.py): ancestor env with only
+LC_HERMES_AGENT=<sid> -> agent with that writer_session; blank -> human;
+person's ssh with LANG/LC_CTYPE only -> human; marker value rules; real-bash
+wrapper export; snapshot exclusion; build_subprocess_env, execute_code child,
+entrypoint, MCP and worker env carry it.
+RED on origin/main: 18 failed, 48 passed. GREEN: 67 passed.
+91 files importing the touched builders: 1701 passed (one byte-preservation
+failure found and fixed by not stamping the unscrubbed path).
+---
+ gateway/run.py                                |   4 +-
+ hermes_cli/kanban_comment_writer.py           |  50 ++++++--
+ hermes_cli/kanban_db_dispatch.py              |   7 +-
+ hermes_cli/main.py                            |   4 +-
+ hermes_cli/top_level_env.py                   |   2 +-
+ .../test_kanban_cli_comment_writer.py         | 110 +++++++++++++++++-
+ .../test_kanban_worker_session_source.py      |  31 +++++
+ tools/code_execution_env.py                   |   4 +
+ tools/environments/base_session_env.py        |  10 +-
+ tools/environments/local.py                   |   3 +
+ tools/mcp_tool_config.py                      |   2 +-
+ 11 files changed, 206 insertions(+), 21 deletions(-)
+
+diff --git a/gateway/run.py b/gateway/run.py
+index 6f6f08d1be..e90c83b241 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4938,8 +4938,8 @@ def main():
+ 
+     # Advertise the harness to children (mirrors _advertise_agent_env in hermes_cli/main.py, inlined to
+     # avoid its startup side effects). Value must equal registry id ``hermes-agent`` exactly.
+-    os.environ.setdefault("AI_AGENT", "hermes-agent")
+-    os.environ.setdefault("HERMES_AGENT", "true")
++    for _key, _value in (("AI_AGENT", "hermes-agent"), ("HERMES_AGENT", "true"), ("LC_HERMES_AGENT", "1")):
++        os.environ.setdefault(_key, _value)  # LC_: ssh-forwardable twin (kanban_comment_writer)
+ 
+     def _register_identity() -> None:
+         # Ledger registration + Windows job-object attach so update-time reapers can identify this gateway.
+diff --git a/hermes_cli/kanban_comment_writer.py b/hermes_cli/kanban_comment_writer.py
+index 914306246f..a8469f3b97 100644
+--- a/hermes_cli/kanban_comment_writer.py
++++ b/hermes_cli/kanban_comment_writer.py
+@@ -37,11 +37,15 @@ terminal app started from an agent, the TUI's ``!`` shell) labels a person's not
+ only withholds operator authority; so does Windows, where an unreadable or exited ancestor (the
+ parent of ``explorer.exe``) leaves every walk inconclusive. Out of reach: a same-user process that
+ deliberately destroys its marked ancestry (``exec env -i`` replacing the tool shell, double-fork
+-daemonizing) or hands its command to a process outside its ancestry (``tmux send-keys``,
+-``ssh <host> hermes kanban comment``, whose remote sshd session starts clean) — evasion or a
+-handoff, not provenance, which needs real authentication. The dashboard API uses this ancestry
+-reader for resolved raw loopback TCP peers (``kanban_http_comment_writer``); remote/unresolvable
+-HTTP peers retain the legacy human default, not a claim of authenticated human identity.
++daemonizing) or hands its command to a process outside its ancestry (``tmux send-keys``)
++— evasion or a handoff, not provenance, which needs real authentication. ``ssh <host> hermes
++kanban comment`` is in reach: sshd starts the remote session clean except for ``LANG``/``LC_*``,
++which stock OpenSSH forwards and accepts on every host (``SendEnv``/``AcceptEnv LANG LC_*``), so
++every agent tool subprocess also carries :data:`SSH_AGENT_MARKER` (its session id, else ``1``)
++and the remote login shell starts with it. A person's shell never sets it. The dashboard API uses
++this ancestry reader for resolved raw loopback TCP peers (``kanban_http_comment_writer``);
++remote/unresolvable HTTP peers retain the legacy human default, not a claim of authenticated human
++identity.
+ """
+ from __future__ import annotations
+ 
+@@ -66,8 +70,39 @@ AGENT_ENV_MARKERS: tuple[str, ...] = (
+     "CLAUDECODE",                      # Claude Code's Bash tool
+     "HERMES_SUPERVISED_CHILD",         # the systemd/launchd gateway service and all it spawns
+     "HERMES_DESKTOP",                  # a Desktop agent backend (`serve`), never the GUI's terminal
++    "LC_HERMES_AGENT",                 # agent marker that stock ssh forwards (SendEnv/AcceptEnv LANG LC_*)
+ )
+ 
++# Exported (session id, else ``1``) into every agent tool subprocess next to HERMES_AGENT, so it
++# survives ``ssh <Mac> hermes kanban comment``, where sshd drops every HERMES_* variable.
++SSH_AGENT_MARKER = "LC_HERMES_AGENT"
++_SAFE_MARKER_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
++_HEADLESS_SESSION = re.compile(r"^local-[0-9a-f]{64}$")  # a Kanban worker / one-shot run's session
++
++
++def ssh_agent_marker_value(env: Mapping[str, str]) -> str:
++    """:data:`SSH_AGENT_MARKER`'s value for a child built from ``env``: its ``HERMES_SESSION_ID``,
++    else an inherited marker, else ``1``. A value unsafe to carry (spaces, control bytes) is ``1``."""
++    for name in ("HERMES_SESSION_ID", SSH_AGENT_MARKER):
++        value = str(env.get(name) or "").strip()
++        if value:
++            return value if _SAFE_MARKER_VALUE.match(value) else "1"
++    return "1"
++
++
++def stamp_ssh_agent_marker(env: dict[str, str]) -> dict[str, str]:
++    """Set :data:`SSH_AGENT_MARKER` in an agent tool child's ``env`` (in place) and return it."""
++    env[SSH_AGENT_MARKER] = ssh_agent_marker_value(env)
++    return env
++
++
++def marker_session(env: Mapping[str, str]) -> Optional[str]:
++    """The session id an inherited :data:`SSH_AGENT_MARKER` names when it is session-id shaped
++    (not the ``1`` placeholder): the writer session of a note sent over ssh."""
++    from hermes_state_ids import is_known_session_id
++    value = str(env.get(SSH_AGENT_MARKER) or "").strip()
++    return value if value and (is_known_session_id(value) or _HEADLESS_SESSION.match(value)) else None
++
+ MAX_ANCESTRY = 64
+ 
+ # [daveey] Non-interactive automation runners: a command they started is a scheduled job or a
+@@ -270,7 +305,8 @@ def cli_comment_writer(*, read: Optional[ProcReader] = None, env: Optional[Mappi
+     path; the real one only with the real reader), or when that can't be ruled out, or when
+     ``author`` is an agent handle (:func:`is_agent_handle`); each only ever lowers authority.
+     ``human`` only after a complete walk found none. ``writer_session`` is the agent's inherited
+-    ``HERMES_SESSION_ID`` when it has one."""
++    ``HERMES_SESSION_ID`` when it has one, else the session an ssh-forwarded
++    :data:`SSH_AGENT_MARKER` names."""
+     env = os.environ if env is None else env
+     if cgroup is None and (read or _read_proc) is _REAL_READ:
+         cgroup = _self_cgroup
+@@ -286,5 +322,5 @@ def cli_comment_writer(*, read: Optional[ProcReader] = None, env: Optional[Mappi
+         found = "author_handle"
+     if found is None:
+         return "human", None, "clean-ancestry"
+-    session = str(env.get("HERMES_SESSION_ID") or "").strip()[:200] or None
++    session = str(env.get("HERMES_SESSION_ID") or "").strip()[:200] or marker_session(env)
+     return "agent", session, found
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index df87b06dbf..0be2713dbf 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2694,11 +2694,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, o
+     # assignee's secrets, which replace values but never remove one (kanban_worker_env).
+     if routed:
+         env = worker_client_env(env, profile_home)
+-    # The dispatcher is detached from every conversation; its worker must never
+-    # inherit routing mirrored by a previous gateway turn.
++    # The dispatcher is detached from every conversation; its worker must never inherit routing mirrored
++    # by a previous gateway turn (nor its session id in the ssh agent marker its tools re-stamp). [daveey]
+     from gateway.session_context import _VAR_MAP
+-    for key in _VAR_MAP:
+-        env.pop(key, None)
++    env = {k: v for k, v in env.items() if k not in _VAR_MAP} | {"LC_HERMES_AGENT": "1"}
+ 
+     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml:
+     # without it the child's get_hermes_home() falls back to the DEFAULT
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 4e6aee818b..227dbe8f63 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -3073,8 +3073,8 @@ def _advertise_agent_env() -> None:
+     other agents set it — earendil-works/pi#7493) so generic tooling can attribute subprocesses to the
+     harness that spawned them. Hermes running inside another agent's terminal).
+     """
+-    os.environ.setdefault("AI_AGENT", "hermes-agent")
+-    os.environ.setdefault("HERMES_AGENT", "true")
++    for key, value in (("AI_AGENT", "hermes-agent"), ("HERMES_AGENT", "true"), ("LC_HERMES_AGENT", "1")):
++        os.environ.setdefault(key, value)  # LC_: ssh-forwardable twin (SendEnv/AcceptEnv LANG LC_*)
+ 
+ 
+ def _attach_plugin_cli_command(subparsers, cmd_info) -> None:
+diff --git a/hermes_cli/top_level_env.py b/hermes_cli/top_level_env.py
+index 6f9af24f24..146551b45c 100644
+--- a/hermes_cli/top_level_env.py
++++ b/hermes_cli/top_level_env.py
+@@ -38,7 +38,7 @@ def scrub_leaked_worker_env(environ: Optional[MutableMapping[str, str]] = None)
+ 
+ 
+ _AGENT_ATTRIBUTION_KEYS = ("HERMES_AGENT", "AI_AGENT", "HERMES_DESKTOP", "HERMES_SUPERVISED_CHILD",
+-                           "HERMES_SESSION_ID")
++                           "HERMES_SESSION_ID", "LC_HERMES_AGENT")
+ 
+ 
+ def drop_agent_attribution(env: dict[str, str]) -> dict[str, str]:
+diff --git a/tests/hermes_cli/test_kanban_cli_comment_writer.py b/tests/hermes_cli/test_kanban_cli_comment_writer.py
+index a5092b785e..899f99d38a 100644
+--- a/tests/hermes_cli/test_kanban_cli_comment_writer.py
++++ b/tests/hermes_cli/test_kanban_cli_comment_writer.py
+@@ -104,6 +104,114 @@ def test_gateway_service_descendant_is_an_agent():
+     assert kcw.agent_ancestor(read=_me({}, 700, gw)) == "700:HERMES_SUPERVISED_CHILD"
+ 
+ 
++# `ssh <Mac> 'hermes kanban comment …'` from an agent's terminal: macOS sshd (AcceptEnv LANG LC_*)
++# drops every HERMES_* variable, so the remote login shell carries only the LC_ marker; sshd-session
++# and launchd are root's (skipped).
++SID = "local-" + "ab" * 32
++SSH_FROM_AGENT: Table = {800: (700, {"HOME": "/Users/d", "LANG": "en_US.UTF-8", "LC_HERMES_AGENT": SID}),
++                         700: (1, None), 1: (0, None)}
++
++
++def test_ssh_session_from_an_agent_is_an_agent():
++    assert kcw.agent_ancestor(read=_me({"PATH": "/usr/bin"}, 800, SSH_FROM_AGENT)) == "800:LC_HERMES_AGENT"
++    kind, session, evidence = kcw.cli_comment_writer(read=_me({}, 800, SSH_FROM_AGENT),
++                                                     env={"LC_HERMES_AGENT": SID})
++    assert (kind, session, evidence) == ("agent", SID, "800:LC_HERMES_AGENT")
++
++
++@pytest.mark.parametrize("value", ["", "  "])
++def test_blank_ssh_marker_is_human(value):
++    table = {800: (700, {"HOME": "/Users/d", "LC_HERMES_AGENT": value}), 700: (1, None), 1: (0, None)}
++    assert kcw.agent_ancestor(read=_me({}, 800, table)) is None
++    assert kcw.cli_comment_writer(read=_me({}, 800, table), env={"LC_HERMES_AGENT": value})[0] == "human"
++
++
++def test_person_ssh_session_is_human():
++    """A person's own ssh into the Mac forwards LANG/LC_* too, but their shell set no marker."""
++    table = {800: (700, {"HOME": "/Users/d", "LANG": "en_US.UTF-8", "LC_CTYPE": "UTF-8"}), 700: (1, None),
++             1: (0, None)}
++    assert kcw.cli_comment_writer(read=_me({}, 800, table), env={})[0] == "human"
++
++
++@pytest.mark.parametrize("value,session", [(SID, SID), ("20261026_170127_f07c32", "20261026_170127_f07c32"),
++                                           ("1", None), ("true", None), ("", None)])
++def test_ssh_marker_names_the_writer_session_only_when_session_shaped(value, session):
++    assert kcw.marker_session({"LC_HERMES_AGENT": value}) == session
++    # HERMES_SESSION_ID, when the CLI inherited one, still wins.
++    assert kcw.cli_comment_writer(read=_me({}, 800, SSH_FROM_AGENT),
++                                  env={"HERMES_SESSION_ID": "sess-a", "LC_HERMES_AGENT": value})[1] == "sess-a"
++
++
++@pytest.mark.parametrize("env,value", [({"HERMES_SESSION_ID": "sess-a"}, "sess-a"), ({}, "1"),
++                                       ({"LC_HERMES_AGENT": SID}, SID),
++                                       ({"HERMES_SESSION_ID": "sess-a", "LC_HERMES_AGENT": SID}, "sess-a"),
++                                       ({"HERMES_SESSION_ID": "a b\nc"}, "1")])
++def test_ssh_marker_value_is_the_session_id_else_1(env, value):
++    assert kcw.stamp_ssh_agent_marker(dict(env))["LC_HERMES_AGENT"] == value
++
++
++# --- every agent tool subprocess exports the ssh-forwardable marker -----------------------------
++
++def test_terminal_wrapper_exports_ssh_marker_with_the_session_id():
++    """Real bash through the terminal tool's wrapper (every backend, remote ones included)."""
++    from tools.environments.local import LocalEnvironment
++    env = LocalEnvironment.__new__(LocalEnvironment)
++    env._snapshot_ready = False
++    env._session_id = "lcmark0"
++    env._cwd_marker = "__HERMES_CWD_lcmark0__"
++    env._snapshot_path = "/tmp/hermes-snap-lcmark0.sh"
++    env._snapshot_passthrough_names = set()
++    wrapped = env._wrap_command('echo "LC=$LC_HERMES_AGENT"', "/tmp")
++    clean = {k: v for k, v in os.environ.items() if k not in ("LC_HERMES_AGENT", "HERMES_SESSION_ID")}
++    run = lambda e: subprocess.run(["bash", "-c", wrapped], env=e, capture_output=True, text=True,
++                                   timeout=30, check=False).stdout
++    assert "LC=1\n" in run(clean)
++    assert f"LC={SID}\n" in run({**clean, "HERMES_SESSION_ID": SID})
++
++
++def test_terminal_snapshot_does_not_persist_the_ssh_marker():
++    from tools.environments.base_session_env import _export_dump_excluding_session_vars
++    snippet = _export_dump_excluding_session_vars("/tmp/x")
++    assert " LC_HERMES_AGENT " in snippet.split("export -p")[0]
++
++
++def test_local_subprocess_env_exports_ssh_marker(monkeypatch):
++    from tools.environments.local import build_subprocess_env
++    monkeypatch.delenv("LC_HERMES_AGENT", raising=False)
++    monkeypatch.setenv("HERMES_SESSION_ID", SID)
++    assert build_subprocess_env()["LC_HERMES_AGENT"] == SID
++    monkeypatch.delenv("HERMES_SESSION_ID")
++    assert build_subprocess_env()["LC_HERMES_AGENT"] == "1"
++    # The unscrubbed path stays byte-preserving: it carries the marker main() advertised.
++    monkeypatch.setenv("LC_HERMES_AGENT", "1")
++    assert build_subprocess_env(scrub_secrets=False)["LC_HERMES_AGENT"] == "1"
++
++
++def test_execute_code_child_env_exports_ssh_marker(tmp_path, monkeypatch):
++    from tools.code_execution_env import _build_child_env
++    monkeypatch.delenv("LC_HERMES_AGENT", raising=False)
++    monkeypatch.setenv("HERMES_SESSION_ID", SID)
++    env = _build_child_env(rpc_endpoint="fixture", rpc_token="fixture", tmpdir=str(tmp_path),
++                           child_python=sys.executable)
++    assert env["LC_HERMES_AGENT"] == SID
++
++
++def test_entrypoints_advertise_the_ssh_marker(monkeypatch):
++    from hermes_cli.main import _advertise_agent_env
++    monkeypatch.delenv("LC_HERMES_AGENT", raising=False)
++    _advertise_agent_env()
++    assert os.environ["LC_HERMES_AGENT"] == "1"
++    monkeypatch.setenv("LC_HERMES_AGENT", SID)  # an outer agent's (ssh-forwarded) marker is kept
++    _advertise_agent_env()
++    assert os.environ["LC_HERMES_AGENT"] == SID
++
++
++def test_mcp_stdio_server_env_carries_the_ssh_marker(monkeypatch):
++    from tools.mcp_tool_config import _build_safe_env
++    monkeypatch.setenv("LC_HERMES_AGENT", "1")
++    assert _build_safe_env(None)["LC_HERMES_AGENT"] == "1"
++
++
+ @pytest.mark.parametrize("table", [
+     {10: (11, {}), 11: (10, {})},                    # loop
+     {10: (99, {})},                                  # an ancestor vanished mid-walk
+@@ -330,7 +438,7 @@ def test_desktop_relaunch_env_drops_agent_markers(monkeypatch):
+     """Desktop reopened after an update run from an agent/backend starts its terminal pane clean."""
+     from hermes_cli.top_level_env import clean_launch_env
+     marked = {k: "1" for k in ("HERMES_AGENT", "AI_AGENT", "HERMES_DESKTOP", "HERMES_SUPERVISED_CHILD",
+-                               "HERMES_SESSION_ID")}
++                               "HERMES_SESSION_ID", "LC_HERMES_AGENT")}
+     assert kcw.env_agent_marker(clean_launch_env({"HOME": "/h", **marked})) is None
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_worker_session_source.py b/tests/hermes_cli/test_kanban_worker_session_source.py
+index eae44b4615..a0e82ee408 100644
+--- a/tests/hermes_cli/test_kanban_worker_session_source.py
++++ b/tests/hermes_cli/test_kanban_worker_session_source.py
+@@ -63,6 +63,37 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
+     assert captured["env"]["HERMES_SESSION_SOURCE"] == "kanban"
+ 
+ 
++def test_worker_env_carries_the_ssh_marker_without_a_stale_session(monkeypatch, tmp_path):
++    """The worker is an agent (ssh-forwardable LC_HERMES_AGENT), but never a previous turn's session id."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    captured = {}
++
++    class _Proc:
++        pid = 4321
++
++    def _fake_popen(cmd, **kwargs):
++        captured["env"] = kwargs["env"]
++        return _Proc()
++
++    monkeypatch.setattr("subprocess.Popen", _fake_popen)
++    monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
++    monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
++    monkeypatch.setenv("HERMES_SESSION_ID", "20261026_170127_f07c32")  # a mirrored gateway turn
++    task = kb.Task(id="t_b21733fc", title="ship it", body=None, assignee="default", status="in_progress",
++                   priority=0, created_by=None, created_at=0, started_at=None, completed_at=None,
++                   workspace_kind="scratch", workspace_path=None, claim_lock=None, claim_expires=None,
++                   tenant=None)
++    workspace = str(tmp_path / "ws")
++    os.makedirs(workspace, exist_ok=True)
++
++    kbd._default_spawn(task, workspace)
++
++    assert captured["env"]["LC_HERMES_AGENT"] == "1"
++    assert "HERMES_SESSION_ID" not in captured["env"]
++
++
+ def test_kanban_rows_stay_out_of_the_session_list(db):
+     """A `kanban` row is filtered by the same exclude the sidebar sends."""
+     db.create_session(session_id="chat", source="desktop")
+diff --git a/tools/code_execution_env.py b/tools/code_execution_env.py
+index ada55b555e..ba845ab598 100644
+--- a/tools/code_execution_env.py
++++ b/tools/code_execution_env.py
+@@ -172,6 +172,10 @@ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
+         child_env["TZ"] = _tz_name
+     child_env.pop("HERMES_TIMEZONE", None)
+     _bridge_session_identity(child_env)
++    # [daveey] The ssh-forwardable agent marker (this turn's session id, else 1): a script's
++    # `ssh <Mac> hermes kanban comment` must not read as a person's.
++    from hermes_cli.kanban_comment_writer import stamp_ssh_agent_marker
++    stamp_ssh_agent_marker(child_env)
+     apply_subprocess_home_env(child_env)
+     # Multiplexed gateway/Desktop (#110303): the server process env carries the machine-default
+     # HERMES_HOME, but this turn runs under a per-profile override (ContextVar bound per turn).
+diff --git a/tools/environments/base_session_env.py b/tools/environments/base_session_env.py
+index 0f73df1f13..df47a85db5 100644
+--- a/tools/environments/base_session_env.py
++++ b/tools/environments/base_session_env.py
+@@ -122,10 +122,11 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
+     extra_unset = "".join(f" {shlex.quote(name)}" for name in sorted(safe_names))
+     return (
+         "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+-        # AI_AGENT / HERMES_AGENT are per-command attribution markers re-exported
++        # AI_AGENT / HERMES_AGENT / LC_HERMES_AGENT are per-command attribution markers re-exported
+         # by every wrapper with ${VAR:-default} semantics; persisting them would
+-        # let the FIRST command's value override a later outer-harness value.
+-        "AI_AGENT HERMES_AGENT "
++        # let the FIRST command's value override a later outer-harness value (and
++        # LC_HERMES_AGENT carries the session id: a shared snapshot would leak it).
++        "AI_AGENT HERMES_AGENT LC_HERMES_AGENT "
+         # Scope markers stamped onto a delegate_task child's / cron run's subprocess
+         # env; a snapshot taken inside that window would re-assert them on every
+         # later ``source`` and fence the PARENT session's kanban CLI (#90782).
+@@ -228,6 +229,9 @@ def _wrap_command_script(
+     parts += restore
+     parts += [
+         'export AI_AGENT="${AI_AGENT:-hermes-agent}" HERMES_AGENT="${HERMES_AGENT:-true}"',
++        # [daveey] The ssh-forwardable agent marker (kanban_comment_writer.SSH_AGENT_MARKER): stock
++        # OpenSSH sends/accepts LC_*, so `ssh <Mac> hermes kanban comment` still reads as an agent's.
++        'export LC_HERMES_AGENT="${HERMES_SESSION_ID:-${LC_HERMES_AGENT:-1}}"',
+         'export GIT_PAGER="${GIT_PAGER:-cat}" PAGER="${PAGER:-cat}"',
+         # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
+         f"builtin cd -- {quoted_cwd} || exit 126",
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index 18ec253c3e..b2ec6fbe38 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -313,6 +313,9 @@ def _finalize_child_env(env: dict) -> dict:
+     Kanban scrub. Returns the (possibly new) dict."""
+     _apply_profile_home(env)
+     _inject_session_context_env(env)
++    # [daveey] After the session bridge, so the marker names THIS child's session (ssh-forwardable).
++    from hermes_cli.kanban_comment_writer import stamp_ssh_agent_marker
++    stamp_ssh_agent_marker(env)
+     _strip_hermes_owned_pythonpath_and_runtime_markers(env)
+     strip_supervised_process_identity(env)
+     _apply_windows_msys_bash_env_defaults(env)
+diff --git a/tools/mcp_tool_config.py b/tools/mcp_tool_config.py
+index 847407d28a..5c989650a0 100644
+--- a/tools/mcp_tool_config.py
++++ b/tools/mcp_tool_config.py
+@@ -225,7 +225,7 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
+             env[key] = os.environ[key]
+     # [daveey] Harness attribution (non-secret): a stdio server is the agent's tool, so a
+     # `hermes kanban comment` it runs must not read as a person's (kanban_comment_writer).
+-    for key in ("AI_AGENT", "HERMES_AGENT"):
++    for key in ("AI_AGENT", "HERMES_AGENT", "LC_HERMES_AGENT"):
+         if os.environ.get(key):
+             env[key] = os.environ[key]
+     # Pin the ACTIVE (served) profile's home so a stdio child never falls back to the
+-- 
+2.43.0
+

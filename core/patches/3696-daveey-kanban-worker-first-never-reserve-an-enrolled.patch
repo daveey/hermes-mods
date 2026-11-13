@@ -1,0 +1,712 @@
+From 47343b4e8c364411324b0ce33646614215ac7033 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:28:51 +0000
+Subject: [PATCH] [daveey] kanban worker-first: never reserve an enrolled card
+ every pool worker's pickup gate refuses; repin it to its origin
+
+Problem (t_01a1d560c6d3bc3c, 11-13, MacBook default board): t_01a1d5386cb55abf and t_01a1d54acc8c8e54 quoted
+the hub CLI's task-list command in backticks as evidence. kanban_placement_coordination.requirements() reads a
+backticked hub CLI action as a home-only coordination action (ACTION_REASON), so claim_refusal(), every pool
+worker's pickup gate, refused both cards on every worker. They were enrolled worker-first and
+kanban_worker_placement.reevaluate() reserved a worker about every 10 s for 42 and 22 minutes (lease_version
+1519 and 642, 79+ queue comments listing worker-2/worker-3 as eligible). Nobody ever ran them; `kanban move
+--pool` was refused too (repin_unavailable). Only rewording the bodies freed them.
+
+Scope: PR #2339 (892a5a061a) already stops creation from enrolling such a card. This change covers the rest: a
+card that is still enrolled (created by a gateway on older code, or whose body was edited after enrollment to
+quote a home action outside an "Existing work checked" section) keeps looping on main.
+
+Five whys: the card never ran because no worker claimed it -> every worker's pickup gate refused its text ->
+the placement tick reserved without asking that gate -> the tick judges the card by pool membership and labels
+only, while text the gate reads as an action is invisible to the Board (it never reads card text) -> nothing on
+the origin side compared the two, so the reserve loop had no exit.
+
+Fix (one shared verdict, kanban_placement_coordination.pool_refusal / pickup_refusals; new module
+kanban_worker_pickup_gate):
+- Placement tick (reevaluate -> _repin_target -> origin_target): an enrolled card whose text the gate reads as a
+  home-only action, or whose `requires` is malformed, is never reserved. It records queue reason
+  `capability_mismatch` once (one comment quoting the matched text) and an unstarted ready card is repinned to
+  its origin (`runs_on machine:<origin>`, the existing creator repin route, kanban_worker_repin.eligibility). A
+  Board refusal of that repin is not re-asked at the same revision; a started card is left alone without
+  reserves.
+- Queue reason: a Board reply's candidate whose pickup gate refuses the card (label mismatch included) is
+  annotated `pickup_gate_refused` (+ missing labels) and is never shown as eligible. A queue-reason comment
+  carries the capability_mismatch text only when the observation is a new transition (main's `commented`).
+- Boundary: label mismatches stay with the Board's own structural `origin` return (attested registry it owns);
+  this change acts only on the machine-state-independent verdicts. Unknown members, an unreadable registry,
+  held/stale members and an empty pool are never refusals.
+- requirements() now also reports the matched span (internal _requirements); its return shape is unchanged.
+- reevaluate keeps CC 20: the not_claimable backoff moved into _backed_off, the target choice into
+  _repin_target.
+
+Proof (base b3745e62d5, which carries #2339):
+- RED on main with only the new test file: 11 failed, 1 passed (the gate-accepts regression). The enrolled-card
+  test reports "reserved 4 times in 4 ticks; no worker can claim it"; the started-card and Board-refused tests
+  reserve too.
+- GREEN: tests/hermes_cli/test_kanban_worker_first_pickup_gate.py 12 passed; all 108 test files importing the
+  touched modules (and kanban_placement / kanban_worker_repin): 2850 passed, 0 failed. scripts/check: 19 ok.
+- The kept hunks are the ones the earlier head db6d59dfcf ran 14 mutants and a 5822-row hub replay against
+  (12 killed, 1 redundant guard removed, 1 equivalent; 0 disagreements with claim_refusal). This trim removes
+  only the creation path (now #2339's) and resolves one conflict with main's `commented` queue-reason gate.
+- Reachability: test_an_edited_enrolled_body_still_hits_the_gate pins that the incident text, outside an
+  "Existing work checked" section, still makes claim_refusal refuse on main, so such an enrolled card exists.
+---
+ hermes_cli/kanban_placement_coordination.py   | 113 +++++++--
+ hermes_cli/kanban_queue_reason.py             |  26 +-
+ hermes_cli/kanban_worker_pickup_gate.py       | 114 +++++++++
+ hermes_cli/kanban_worker_placement.py         |  45 +++-
+ .../test_kanban_worker_first_pickup_gate.py   | 228 ++++++++++++++++++
+ 5 files changed, 493 insertions(+), 33 deletions(-)
+ create mode 100644 hermes_cli/kanban_worker_pickup_gate.py
+ create mode 100644 tests/hermes_cli/test_kanban_worker_first_pickup_gate.py
+
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index 49d07fe621..3607673a8a 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -196,29 +196,35 @@ def _strip_read_paths(text, roots):
+ 
+ def requirements(text):
+     """Return required labels and an unsupported-action refusal, without changing text."""
++    labels, refusal, _ = _requirements(text)
++    return labels, refusal
++
++
++def _requirements(text):
++    """:func:`requirements` plus the text span that matched a refusal (None without one)."""
+     labels = set()
+     # Reader/broker attestations do not grant managed-worker board administration.
+-    if re.search(r"\binstall-boards\.py\b|\bhermes kanban boards (?:create|subscribe)\b|"
+-                 r"\bcreate board replicas\b|\battach primary/pickup subscriptions\b",
+-                 text, re.IGNORECASE):
+-        return labels, ACTION_REASON
+-    for start, _, action in _actions(text, _HUB, _HUB_ACTIONS):
++    if admin := re.search(r"\binstall-boards\.py\b|\bhermes kanban boards (?:create|subscribe)\b|"
++                          r"\bcreate board replicas\b|\battach primary/pickup subscriptions\b",
++                          text, re.IGNORECASE):
++        return labels, ACTION_REASON, admin.group()
++    for start, end, action in _actions(text, _HUB, _HUB_ACTIONS):
+         if _HUB_ADMIN.search(text[:start].rsplit("\n", 1)[-1]):
+             labels.add(HUB_WRITE)
+             continue
+         if action not in ("status", "pull"):
+-            return labels, ACTION_REASON
++            return labels, ACTION_REASON, text[start:end]
+         labels.add("capability:coordination-read")
+-    for _, _, action in _actions(text, _CROSS, {"read", "list", "comment"}):
++    for start, end, action in _actions(text, _CROSS, {"read", "list", "comment"}):
+         if action not in ("read", "list"):
+-            return labels, ACTION_REASON
++            return labels, ACTION_REASON, text[start:end]
+         labels.add("capability:coordination-read")
+     if re.search(r"\b(?:parent|sibling)[ -]card (?:lookup|read)|\bkanban_show\b", text, re.IGNORECASE):
+         labels.add("capability:coordination-read")
+     for tool, label in _TOOLS.items():
+         if re.search(r"\b" + re.escape(tool) + r"\b", text, re.IGNORECASE):
+             labels.add(label)
+-    return labels, None
++    return labels, None, None
+ 
+ 
+ def requirement_label(name):
+@@ -348,25 +354,41 @@ def access_text(text, cfg, *, target=None, requires=None):
+     return text
+ 
+ 
+-def claim_refusal(card, me):
+-    """Revalidate actual destination of enrolled cards, never override explicit pins."""
+-    if card.get("placement_policy") != "worker-first-v1":
+-        return None
++def _claim_text(card):
++    """The text the pickup gate judges: title plus body, minus evidence and the origin's placement note."""
+     from hermes_cli.kanban_placement import without_evidence, without_placement_note
+-    text = f"{card.get('title') or ''}\n{without_evidence(without_placement_note(card.get('body') or ''))}"
+-    from hermes_cli.kanban_runs_on_capabilities import _loads
+-    # Wire rows can bypass creator validation. Never turn corrupt contracts into
+-    # empty requirements, or let one malformed card crash the dispatch loop.
++    return f"{card.get('title') or ''}\n{without_evidence(without_placement_note(card.get('body') or ''))}"
++
++
++def _claim_requires(card):
++    """The card's declared ``requires`` as a list of names, or None when it is malformed."""
+     requires = card.get("requires")
+     if requires is None or requires == "":
+-        requires = []  # Legacy rows have no declaration.
+-    elif isinstance(requires, str):
++        return []  # Legacy rows have no declaration.
++    if isinstance(requires, str):
+         try:
+             requires = json.loads(requires)
+         except ValueError:
+-            return "invalid worker access requirements"
++            return None
+     if not isinstance(requires, list) or not all(isinstance(r, str) for r in requires):
+-        return "invalid worker access requirements"
++        return None
++    return requires
++
++
++INVALID_REQUIRES = "invalid worker access requirements"
++
++
++def claim_refusal(card, me):
++    """Revalidate actual destination of enrolled cards, never override explicit pins."""
++    if card.get("placement_policy") != "worker-first-v1":
++        return None
++    text = _claim_text(card)
++    from hermes_cli.kanban_runs_on_capabilities import _loads
++    # Wire rows can bypass creator validation. Never turn corrupt contracts into
++    # empty requirements, or let one malformed card crash the dispatch loop.
++    requires = _claim_requires(card)
++    if requires is None:
++        return INVALID_REQUIRES
+     if refusal := check(text, {}, target=me, skills=_loads(card.get("skills"), []), requires=requires):
+         return refusal
+     from hermes_cli import kanban_mandatory_pin as mandatory
+@@ -375,6 +397,55 @@ def claim_refusal(card, me):
+     return None
+ 
+ 
++def pickup_refusals(card, names):
++    """``{machine: {"reason", "quote"[, "missing_labels"]}}`` for each of ``names`` whose pickup gate
++    (:func:`claim_refusal`) refuses ``card`` for a reason no change of that machine's state lifts. [daveey]
++
++    t_01a1d560c6d3bc3c: worker-first placement reserved cards every worker's gate refused, every ~10 s for 42 min.
++    Text the gate reads as a home-only action, or a malformed ``requires``, refuses on every machine (``quote`` is
++    the matched text). Otherwise a member refuses when its registry entry lacks a label the card needs (text,
++    skills, declared access, mandatory pin; ``quote`` names them). Liveness is NOT judged here: a held, stale or
++    pickup-off member may take the card later, and a member the registry does not know, or an unreadable registry,
++    is no refusal either. The card's ``placement_policy`` is ignored: the placement tick asks before reserving.
++    """
++    names = list(dict.fromkeys(n for n in names or [] if isinstance(n, str) and n))
++    requires = _claim_requires(card)
++    if requires is None:
++        return {n: {"reason": INVALID_REQUIRES, "quote": str(card.get("requires"))[:200]} for n in names}
++    required, refusal, quote = _requirements(_claim_text(card))
++    if refusal:
++        return {n: {"reason": refusal, "quote": quote} for n in names}
++    from hermes_cli import kanban_mandatory_pin as mandatory
++    from hermes_cli.kanban_runs_on_capabilities import _loads
++    pin = mandatory.requirements(card)
++    required |= skill_requirements(_loads(card.get("skills"), [])) | access_requirements(requires) | pin
++    machines = _machines() if required and names else None
++    if machines is None:
++        return {}
++    out = {}
++    for name in names:
++        entry = machines.get(name)
++        labels = entry.get("labels") if isinstance(entry, dict) else None
++        if not isinstance(labels, list):
++            continue  # unknown to the registry: not this gate's refusal
++        missing = sorted(required - {v for v in labels if isinstance(v, str)})
++        if missing:
++            out[name] = {"reason": mandatory.REASON if set(missing) <= pin else REASON,
++                         "quote": ", ".join(sorted(required)), "missing_labels": missing}
++    return out
++
++
++def pool_refusal(card, names):
++    """``{"reason", "quote", "machines"}`` when :func:`pickup_refusals` refuses ``card`` on EVERY one of ``names``
++    (so no pool worker could ever claim it), else None. An empty pool is no refusal."""
++    names = list(dict.fromkeys(n for n in names or [] if isinstance(n, str) and n))
++    refused = pickup_refusals(card, names)
++    if not names or len(refused) != len(names):
++        return None
++    first = refused[names[0]]
++    return {"reason": first["reason"], "quote": first["quote"], "machines": refused}
++
++
+ def _free_slot(entry):
+     metrics = entry.get("metrics") if isinstance(entry.get("metrics"), dict) else {}
+     active, cap = metrics.get("active_card_runs"), entry.get("max_card_runs")
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index add3983243..76f2103bba 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -21,6 +21,9 @@ CODES = {"reserved", "draining", "admission_limits", "no_live_candidate", "capab
+ _REJECTIONS = {"invalid_policy", "not_creator", "not_claimable", "worker_pool_disabled",
+                "unauthorized_candidate", "explicit_pin", "revision_conflict", "not_found"}
+ _TOKEN = re.compile(r"^[A-Za-z0-9_.:/+-]{1,120}$")
++# Origin-side candidate reason: that machine's pickup gate (coordination.claim_refusal) refuses the card, so the
++# Board's own per-candidate rollup must not show it as eligible (t_01a1d560c6d3bc3c).
++PICKUP_REFUSED = "pickup_gate_refused"
+ # Board-authored structural return (state "origin"): no configured pool worker is attested to run the card.
+ _ORIGIN_REASON = re.compile(r"^no pool worker can run it: missing [A-Za-z0-9_.:/+-]{1,120}(, [A-Za-z0-9_.:/+-]{1,120}){0,63}$")
+ 
+@@ -269,6 +272,9 @@ def describe(value):
+     for key in ("error_class", "rejection_code"):
+         if value.get(key):
+             details.append(value[key])
++    gate = value.get("pickup_gate")
++    if isinstance(gate, dict) and gate.get("reason"):
++        details.insert(0, f"pickup gate: {gate['reason']} (`{gate.get('quote') or ''}`)")
+     at = value.get("observed_at_ms", value.get("recorded_at_ms"))
+     if at is not None:
+         details.append(f"observed {_stamp(at)}")
+@@ -339,14 +345,28 @@ def _record(conn, task_id, gateway, value, *, fence=None, comment=True):
+             return False
+         kb._append_event(conn, task_id, EVENT, value)
+         if comment and commented:  # a card no pool worker can run gets the owner's repin notice as its comment
+-            kb.add_comment(conn, task_id, "worker-placement", describe(value), origin_gateway=gateway)
++            kb.add_comment(conn, task_id, "worker-placement", comment if isinstance(comment, str) else describe(value),
++                           origin_gateway=gateway)
+         return True
+ 
+ 
+-def record_reply(conn, task_id, gateway, reply, pool=None):
++def mark_refused(value, refused):
++    """``value`` with :data:`PICKUP_REFUSED` (and the missing labels) on each candidate whose pickup gate refuses the
++    card (``refused``: :func:`hermes_cli.kanban_placement_coordination.pickup_refusals`)."""
++    for candidate in value.get("candidates", []):
++        why = (refused or {}).get(candidate["machine"])
++        if why is None:
++            continue
++        candidate["reasons"] = sorted({*candidate["reasons"], PICKUP_REFUSED})
++        if labels := _tokens(why.get("missing_labels")):
++            candidate["missing_labels"] = sorted({*candidate.get("missing_labels", []), *labels})
++    return value
++
++
++def record_reply(conn, task_id, gateway, reply, pool=None, refused=None):
+     from hermes_cli import kanban_repin_notice as repin
+ 
+-    value = normalize(reply)
++    value = mark_refused(normalize(reply), refused)
+     clear_streak(gateway, task_id)  # the Board answered for this card: a transient failure streak is over
+     recorded = _record(conn, task_id, gateway, value, comment=not repin.no_pool_worker(value, pool))
+     # Every reply, not only a changed one: a card queued before the notice existed gets it on the next pass.
+diff --git a/hermes_cli/kanban_worker_pickup_gate.py b/hermes_cli/kanban_worker_pickup_gate.py
+new file mode 100644
+index 0000000000..4f02081bb5
+--- /dev/null
++++ b/hermes_cli/kanban_worker_pickup_gate.py
+@@ -0,0 +1,114 @@
++"""Worker-first placement honours the pool's pickup gate (:func:`kanban_placement_coordination.claim_refusal`). [daveey]
++
++Incident t_01a1d560c6d3bc3c (11-13, MacBook default board): two cards quoted the hub CLI's task-list command in
++backticks as evidence. :func:`kanban_placement_coordination.requirements` reads that as a home-only coordination
++action, so every pool worker's pickup gate refused them, yet creation enrolled them worker-first and the origin's
++placement tick reserved a worker about every 10 s (lease_version 1519 and 642) for 42 and 22 minutes. Nobody ever
++ran them, and ``kanban move --pool`` was refused too; only rewording the bodies freed them.
++
++Creation no longer enrolls such a card (``creation_decision`` refuses a card whose ``required_labels`` is None), but a
++card enrolled by a gateway still on older code, or one whose body was edited after enrollment to quote a home action,
++is still enrolled. Two entry points share :func:`kanban_placement_coordination.pool_refusal` (the gate's
++machine-state-independent verdict over the whole pool):
++
++* the placement tick (:func:`origin_target`): a card already enrolled is never reserved again. It gets one
++  ``capability_mismatch`` queue reason with a comment quoting the matched text, and an unstarted ready card is
++  repinned to its origin through the Board's creator repin (what ``hermes kanban move --runs-on machine:<origin>``
++  does, :func:`kanban_worker_repin.eligibility`);
++* the queue reason (:func:`refusals`): a Board reply never lists a candidate as eligible when that machine's
++  pickup gate refuses the card (label mismatches included: annotation only, the Board keeps routing those).
++"""
++from __future__ import annotations
++
++import json
++import logging
++
++logger = logging.getLogger(__name__)
++
++REPIN_WHY = ("every pool worker's pickup gate refuses it ({reason}: `{quote}`); repinned to its origin {origin} "
++             "(what `hermes kanban move --runs-on {origin}` does) instead of reserving a worker that never claims it")
++COMMENT = ("No pool worker can claim this card: every candidate's pickup gate refuses it ({reason}: `{quote}`), so "
++           "its origin reserves none. An unstarted ready card is repinned to its origin {origin} (`hermes kanban "
++           "move {task} --runs-on {origin}`); otherwise reword the text or move the card.")
++QUOTE_CAP = 200
++
++
++def _gate(card, pool):
++    """The pool-wide refusal this module acts on, or None. Only the machine-state-independent verdicts (text the
++    gate reads as a home-only action, malformed ``requires``): the Board cannot read card text, so it reserves such
++    a card forever. A label mismatch is the Board's own structural ``origin`` return ("no pool worker can run it:
++    missing ..."), from the attested registry it owns; it stays there."""
++    from hermes_cli import kanban_placement_coordination as coordination
++    if not isinstance(pool, list):
++        return None
++    gate = coordination.pool_refusal(card, pool)
++    if gate is None or gate["reason"] not in (coordination.ACTION_REASON, coordination.INVALID_REQUIRES):
++        return None
++    return {**gate, "quote": str(gate["quote"] or "")[:QUOTE_CAP]}
++
++
++def refusals(row, pool):
++    """:func:`kanban_placement_coordination.pickup_refusals` for a reserve's queue reason; ``{}`` on any fault
++    (a diagnostic never controls dispatch)."""
++    from hermes_cli import kanban_placement_coordination as coordination
++    try:
++        return coordination.pickup_refusals(dict(row), pool if isinstance(pool, list) else [])
++    except Exception:  # health: allow BLE001 -- an annotation must not suppress a reserve or its record
++        logger.warning("pickup gate annotation failed for %s", row["id"], exc_info=True)
++        return {}
++
++
++def origin_target(conn, row, gateway, pool, *, refused_at=None):
++    """None when some member of ``pool`` may claim ``row`` (reserve as today). Otherwise ``(labels, why)``:
++    ``labels`` is ``[machine:<gateway>]`` when the origin repin applies now, or None when nothing may be asked this
++    tick (started card, or the Board refused that repin at ``refused_at``, this revision). Either way the caller
++    makes no reserve. The queue reason is recorded once per card."""
++    from hermes_cli import kanban_queue_reason as queue
++    from hermes_cli import kanban_worker_repin as repin
++    from hermes_cli.kanban_worker_placement import POLICY
++
++    if row["placement_policy"] != POLICY:
++        return None
++    try:
++        gate = _gate(dict(row), pool)
++    except Exception:  # health: allow BLE001 -- a gate fault keeps today's reserve; it never stops the tick
++        logger.warning("pickup gate check failed for %s", row["id"], exc_info=True)
++        return None
++    if gate is None:
++        return None
++    origin = f"machine:{gateway}"
++    queue.try_record(record_mismatch, conn, row["id"], gateway, gate, origin)
++    why = REPIN_WHY.format(origin=origin, reason=gate["reason"], quote=gate["quote"])
++    if refused_at == row["sync_version"]:
++        return None, why
++    if not repin.eligibility(conn, row["id"], [origin]).get("ok"):
++        return None, why
++    return [origin], why
++
++
++def record_mismatch(conn, task_id, gateway, gate, origin):
++    """Append the ``capability_mismatch`` observation and its one comment, unless this card already has the same
++    one for its current lifecycle (any earlier event, not only the latest: a Board refusal between ticks must not
++    make it a new transition). True when written."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_queue_reason as queue
++
++    machines = gate["machines"]
++    value = {"version": 1, "code": "capability_mismatch",
++             "candidates": [{"machine": name, "reasons": [queue.PICKUP_REFUSED],
++                             **({"missing_labels": machines[name]["missing_labels"]}
++                                if machines[name].get("missing_labels") else {})} for name in sorted(machines)],
++             "pickup_gate": {"reason": gate["reason"], "quote": gate["quote"]}}
++    with kb.write_txn(conn):
++        row = queue._owned_row(conn, task_id, gateway, None)
++        if row is None:
++            return False
++        value["lifecycle"] = queue._lifecycle(conn, task_id, row)
++        mine = queue._signature(value)
++        for (payload,) in conn.execute(
++                "SELECT payload FROM task_events WHERE task_id=? AND kind=? AND json_valid(payload) "
++                "AND json_extract(payload, '$.code')='capability_mismatch'", (task_id, queue.EVENT)):
++            if queue._signature(json.loads(payload)) == mine:
++                return False
++    comment = COMMENT.format(reason=gate["reason"], quote=gate["quote"], origin=origin, task=task_id)
++    return queue._record(conn, task_id, gateway, value, comment=comment)
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 130e7a5f6f..b1c494b5dd 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -384,6 +384,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None, may_pull=True):
+     from hermes_cli import kanban_placement_recovery as recovery
+     rows = recovery.select_rows(conn, board, gateway, cursor, MAX_RESERVES_PER_TICK)
+     from hermes_cli import kanban_queue_reason as queue
++    from hermes_cli import kanban_worker_pickup_gate as pickup_gate
+ 
+     attempted = 0
+     last = None
+@@ -404,15 +405,11 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None, may_pull=True):
+             if row["placement_policy"] is None and mode is None:
+                 continue
+             key = (board, row["id"])
+-            held = _refused.get(key)
+-            if held and held[0] == row["sync_version"] and now < held[1]:
++            if _backed_off(key, row["sync_version"], now):
+                 continue  # refused not_claimable at this revision: wait for the feed, don't re-ask every tick
+-            _refused.pop(key, None)
+-            if len(_refused) > 1024:  # cards that left the query never come back to clear their entry
+-                for stale in [k for k, (_, until) in _refused.items() if until <= now]:
+-                    del _refused[stale]
+-            labels, why = (None, None) if mode else _selfcheck_unrefused(
+-                key, row, *_move_target(conn, row, gateway, cfg))
++            labels, why, skip = _repin_target(conn, row, key, gateway, cfg, mode, candidates)
++            if skip:
++                continue  # no candidate's pickup gate takes it and no repin may be asked: never reserve
+             stage = "recover" if mode else ("reserve" if labels is None else "repin")
+             held = _queued.get(key)
+             identity = _local_identity(conn, row["id"]) if labels is None else None
+@@ -437,7 +434,8 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None, may_pull=True):
+                     from hermes_cli.kanban_placement_recovery import request_assignment
+                     reply = request_assignment(hub, board, row, mode, candidates)
+                     _remember_queued(reply, key, row["sync_version"], identity)
+-                    queue.try_record(queue.record_reply, conn, row["id"], gateway, reply, candidates)
++                    queue.try_record(queue.record_reply, conn, row["id"], gateway, reply, candidates,
++                                     refused=pickup_gate.refusals(row, candidates))
+                 attempted += 1
+             except OSError as exc:
+                 timing = queue.call_timing(budget, started, time.monotonic())
+@@ -555,6 +553,35 @@ def _move_target(conn, row, gateway, cfg):
+     return pool_target(conn, row, gateway, cfg) or (None, None)
+ 
+ 
++def _backed_off(key, revision, now):
++    """True while a ``not_claimable`` refusal of ``key`` at ``revision`` holds (:data:`_refused`); otherwise clear
++    it and prune expired entries (cards that left the query never come back to clear their own)."""
++    held = _refused.get(key)
++    if held and held[0] == revision and now < held[1]:
++        return True
++    _refused.pop(key, None)
++    if len(_refused) > 1024:
++        for stale in [k for k, (_, until) in _refused.items() if until <= now]:
++            del _refused[stale]
++    return False
++
++
++def _repin_target(conn, row, key, gateway, cfg, mode, candidates):
++    """``(labels, why, skip)`` for one selected row: a recovery reserves (``mode`` set); else the self-check's
++    pool repin, else the origin repin when no candidate's pickup gate takes the card
++    (:func:`kanban_worker_pickup_gate.origin_target`, t_01a1d560c6d3bc3c), else the reserve ``(None, None)``.
++    ``skip``: such a card has no repin to ask now; it must not be reserved either."""
++    from hermes_cli import kanban_worker_pickup_gate as pickup_gate
++
++    if mode:
++        return None, None, False
++    labels, why = _selfcheck_unrefused(key, row, *_move_target(conn, row, gateway, cfg))
++    if labels is None and (home := pickup_gate.origin_target(
++            conn, row, gateway, candidates, refused_at=_selfcheck_refused.get(key))) is not None:
++        return home[0], home[1], home[0] is None
++    return labels, why, False
++
++
+ def _selfcheck_unrefused(key, row, labels, why):
+     """``(labels, why)``, except a self-check repin (``why`` set) the Board refused at this revision becomes the
+     reserve ``(None, None)``. A new revision clears the refusal so the repin is asked again."""
+diff --git a/tests/hermes_cli/test_kanban_worker_first_pickup_gate.py b/tests/hermes_cli/test_kanban_worker_first_pickup_gate.py
+new file mode 100644
+index 0000000000..3f15ded539
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_first_pickup_gate.py
+@@ -0,0 +1,228 @@
++"""Worker-first placement honours the pool's pickup gate (``kanban_placement_coordination.claim_refusal``). [daveey]
++
++Incident (11-13, MacBook default board): t_01a1d5386cb55abf and t_01a1d54acc8c8e54 quoted the hub CLI's task-list
++command in backticks as evidence. ``requirements()`` reads that as a home-only coordination action, so every pool
++worker's pickup gate refused both cards, yet creation enrolled them worker-first and ``reevaluate`` reserved a
++worker about every 10 s (lease_version 1519 and 642) for 42 and 22 minutes; nobody ever ran them. Creation no longer
++enrolls such a card (PR #2339), but one enrolled by a gateway still on older code, or whose body was edited after
++enrollment, still is. Entry paths covered: the origin's placement tick (``kanban_worker_placement.reevaluate``) and
++the queue reason a Board reply records.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_placement as placement
++from hermes_cli import kanban_placement_coordination as coord
++from hermes_cli import kanban_queue_reason as queue
++from hermes_cli import kanban_worker_node as wn
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_worker_node as node_fixtures
++from tests.hermes_cli.test_kanban_worker_move_request import PlacementHub
++from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, WORKER
++
++gws = node_fixtures.gws
++svc = node_fixtures.svc
++POOLS = {"worker_pools": {HUB: [WORKER]}}
++# The shape both incident bodies had: the hub CLI's task-list command quoted as evidence, not as a step.
++QUOTED = "hermes-hub tasks"
++BODY = f"Evidence: `{QUOTED}` had no open card for it, so nobody owns the fix yet."
++TICKS = 4
++
++
++def _mismatch_events(conn, tid):
++    return [json.loads(p) for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id", (tid, queue.EVENT))
++        if json.loads(p).get("code") == "capability_mismatch"]
++
++
++def _placement_comments(conn, tid):
++    return [b for (b,) in conn.execute(
++        "SELECT body FROM task_comments WHERE task_id=? AND author='worker-placement' ORDER BY id", (tid,))]
++
++
++def _enrolled(origin, body):
++    """A card enrolled worker-first directly (an old-code gateway, or a body edited after enrollment)."""
++    origin.enter()
++    tid = kb.create_task(origin.conn, title="Fix the parser", body=body, assignee="default",
++                         placement_policy=wp.POLICY)
++    origin.round()
++    origin.round()
++    return tid
++
++
++def _ticks(origin, hub, n=TICKS):
++    for _ in range(n):
++        origin.enter()
++        wp.reevaluate(origin.conn, hub, BOARD, HUB, cfg=POOLS)
++        wp._queued.clear()  # as if each tick came after the queued keepalive: the throttle is not what stops it
++
++
++# --- cards already enrolled -------------------------------------------------------------------------------------
++
++def test_an_edited_enrolled_body_still_hits_the_gate():
++    """Reachability on main: the incident text outside an "Existing work checked" section still refuses everywhere,
++    so an enrolled card carrying it (old-code gateway, body edited after enrollment) is still possible."""
++    card = {"title": "Fix the parser", "body": BODY, "placement_policy": wp.POLICY}
++    assert coord.claim_refusal(card, "worker-2") == coord.ACTION_REASON
++    assert coord.pool_refusal(card, ["worker-2", "worker-3"])["quote"] == QUOTED
++
++
++def test_an_enrolled_card_every_pickup_gate_refuses_is_repinned_to_its_origin_once(gws, svc, monkeypatch):
++    origin, _worker = gws
++    monkeypatch.setattr(wp, "local_admission", lambda conn_: True)
++    tid = _enrolled(origin, BODY)
++    row = dict(origin.conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    assert coord.claim_refusal(row, WORKER) == coord.ACTION_REASON  # the pickup gate refuses every candidate
++
++    hub = PlacementHub(svc, HUB)
++    _ticks(origin, hub)
++    assert hub.reserves == [], f"reserved {len(hub.reserves)} times in {TICKS} ticks; no worker can claim it"
++    assert [r["runs_on"] for r in hub.repins] == [[f"machine:{HUB}"]]
++    local = origin.conn.execute("SELECT placement_policy, runs_on FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert (local["placement_policy"], json.loads(local["runs_on"])) == (None, [f"machine:{HUB}"])
++    [event] = _mismatch_events(origin.conn, tid)
++    assert event["pickup_gate"] == {"reason": coord.ACTION_REASON, "quote": QUOTED}
++    assert [c["machine"] for c in event["candidates"]] == [WORKER]
++    assert event["candidates"][0]["reasons"] == ["pickup_gate_refused"]
++    [comment] = _placement_comments(origin.conn, tid)
++    assert f"`{QUOTED}`" in comment and coord.ACTION_REASON in comment and f"machine:{HUB}" in comment
++
++    # The origin runs it; the worker never could.
++    origin.tick()
++    assert kb.get_task(origin.conn, tid).status == "running"
++    assert svc.board(BOARD)["leases"][tid]["holder"] == HUB
++
++
++def test_a_started_card_every_gate_refuses_is_never_reserved_and_noted_once(gws, svc, monkeypatch):
++    """The origin repin covers only unstarted cards; a started one stays put without reserves or a comment loop."""
++    origin, _worker = gws
++    tid = _enrolled(origin, BODY)
++    origin.enter()
++    origin.conn.execute("UPDATE tasks SET started_at=1 WHERE id=?", (tid,))
++    origin.conn.commit()
++    origin.round()  # the edit is acknowledged, so the tick selects the card again
++    hub = PlacementHub(svc, HUB)
++    _ticks(origin, hub)
++    assert hub.reserves == [] and hub.repins == []
++    assert len(_mismatch_events(origin.conn, tid)) == 1
++    assert len(_placement_comments(origin.conn, tid)) == 1
++
++
++def test_origin_target_ignores_a_card_not_enrolled_worker_first(gws):
++    from hermes_cli import kanban_worker_pickup_gate as gate
++    origin, _worker = gws
++    tid = _enrolled(origin, BODY)
++    row = dict(origin.conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    assert gate.origin_target(origin.conn, row, HUB, [WORKER]) is not None
++    assert gate.origin_target(origin.conn, {**row, "placement_policy": None}, HUB, [WORKER]) is None
++
++
++def test_a_board_refused_origin_repin_is_not_asked_again_at_that_revision(gws, svc, monkeypatch):
++    from hermes_cli import kanban_sync_client as ksc
++    origin, _worker = gws
++    tid = _enrolled(origin, BODY)
++
++    class Refusing(PlacementHub):
++        def repin(self, board, **kw):
++            self.repins.append(kw)
++            raise ksc.HubError(409, json.dumps({"error": "invalid_pin"}))
++
++    hub = Refusing(svc, HUB)
++    _ticks(origin, hub)
++    assert hub.reserves == [] and len(hub.repins) == 1
++    assert len(_mismatch_events(origin.conn, tid)) == 1
++
++
++# --- regressions ------------------------------------------------------------------------------------------------
++
++def test_a_card_the_gate_accepts_is_enrolled_and_reserved_as_today(gws, svc, monkeypatch):
++    body = "Fix the off-by-one in the parser and add a test."
++    args = {"title": "Fix the parser", "body": body}
++    assert placement.decide(args, cfg={"worker_pools": {"macbook": ["worker-2"]}},
++                            self_gw="macbook")["placement_policy"] == wp.POLICY
++    origin, _worker = gws
++    tid = _enrolled(origin, body)
++    hub = PlacementHub(svc, HUB)
++    _ticks(origin, hub, 2)
++    assert hub.reserves == [tid, tid] and hub.repins == []
++    assert _mismatch_events(origin.conn, tid) == []
++
++
++@pytest.mark.parametrize("body", [
++    "Evidence: hermes-hub's task list had no open card for it.",
++    "Checked on hermes-hub earlier: no open card for it.",
++])
++def test_a_plain_prose_mention_is_not_an_action(body):
++    assert coord.requirements(body) == (set(), None)
++    assert coord.pool_refusal({"title": "Fix the parser", "body": body}, ["worker-2"]) is None
++    result = placement.decide({"title": "Fix the parser", "body": body},
++                              cfg={"worker_pools": {"macbook": ["worker-2"]}}, self_gw="macbook")
++    assert result["placement_policy"] == wp.POLICY
++
++
++# --- label-level refusals and the queue reason ------------------------------------------------------------------
++
++CORE = "Land it with hermes-core-wt ship."
++
++
++def _registry(monkeypatch, machines):
++    monkeypatch.setattr(wn, "registry", lambda **kw: {"machines": machines})
++
++
++def test_label_refusal_needs_every_known_candidate_to_lack_the_labels(monkeypatch):
++    card = {"title": "Fix the parser", "body": CORE}
++    plain = {"labels": ["pool:worker"]}
++    _registry(monkeypatch, {"worker-2": plain, "worker-3": plain})
++    gate = coord.pool_refusal(card, ["worker-2", "worker-3"])
++    assert gate["reason"] == coord.REASON and gate["quote"] == "capability:core-ship"
++    assert gate["machines"]["worker-2"]["missing_labels"] == ["capability:core-ship"]
++    # A member that carries the labels takes it, even while held or stale: liveness is not a refusal.
++    _registry(monkeypatch, {"worker-2": plain, "worker-3": {"labels": ["capability:core-ship"], "hold": True}})
++    assert coord.pool_refusal(card, ["worker-2", "worker-3"]) is None
++    assert set(coord.pickup_refusals(card, ["worker-2", "worker-3"])) == {"worker-2"}
++    # A member the registry does not know, or no registry at all, is not a refusal.
++    _registry(monkeypatch, {"worker-2": plain})
++    assert coord.pool_refusal(card, ["worker-2", "worker-3"]) is None
++    monkeypatch.setattr(wn, "registry", lambda **kw: None)
++    assert coord.pool_refusal(card, ["worker-2"]) is None
++    # A card needing no label is never refused, whatever the registry says; nor is any card by an empty pool.
++    assert coord.pickup_refusals({"title": "Fix the parser"}, ["worker-2"]) == {}
++    assert coord.pool_refusal({"title": "x", "body": BODY}, []) is None
++
++
++def test_invalid_requires_refuses_everywhere():
++    gate = coord.pool_refusal({"title": "x", "requires": "not json"}, ["worker-2"])
++    assert gate["reason"] == "invalid worker access requirements"
++
++
++def test_a_label_mismatch_is_left_to_the_board_and_still_reserved(gws, svc, monkeypatch):
++    """The Board owns label routing (its structural ``origin`` return); this gate acts only on text it can't read."""
++    origin, _worker = gws
++    tid = _enrolled(origin, CORE)
++    _registry(monkeypatch, {WORKER: {"labels": ["pool:worker"]}})
++    row = dict(origin.conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    assert coord.pool_refusal(row, [WORKER])["reason"] == coord.REASON
++    hub = PlacementHub(svc, HUB)
++    _ticks(origin, hub, 2)
++    assert hub.reserves == [tid, tid] and hub.repins == []
++    assert _mismatch_events(origin.conn, tid) == []
++
++
++def test_the_queue_reason_never_lists_a_refusing_candidate_as_eligible(gws, monkeypatch):
++    origin, _worker = gws
++    tid = _enrolled(origin, CORE)
++    reply = {"state": "queued", "observation": {"version": 1, "code": "workers_saturated", "candidates": [
++        {"machine": "worker-2", "reasons": []}, {"machine": "worker-3", "reasons": ["saturated"]}]}}
++    _registry(monkeypatch, {"worker-2": {"labels": ["pool:worker"]},
++                            "worker-3": {"labels": ["capability:core-ship"]}})
++    row = dict(origin.conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    refused = coord.pickup_refusals(row, ["worker-2", "worker-3"])
++    origin.enter()
++    assert queue.record_reply(origin.conn, tid, HUB, reply, ["worker-2", "worker-3"], refused=refused)
++    text = queue.describe(queue.latest(origin.conn, tid))
++    assert "worker-2: pickup_gate_refused (missing capability:core-ship)" in text, text
++    assert "eligible" not in text and "worker-3: saturated" in text, text
+-- 
+2.43.0
+

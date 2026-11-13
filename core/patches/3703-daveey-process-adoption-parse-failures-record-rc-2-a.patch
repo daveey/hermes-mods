@@ -1,0 +1,710 @@
+From 56ff5a68cf06dd3fff6130c9ef26ec98f3b5e41c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:19:57 +0000
+Subject: [PATCH] [daveey] process adoption: parse failures record rc 2; a
+ foreign kill settles as killed; foreign poll/wait get the local policy; docks
+ map unknown
+
+Follow-up to PR #2376 review 5894247825 (nits 1-4; nit 5 was declined on the PR).
+
+1. Parse failures record their status. The exit recorder pasted the command inline into
+   `( ... )`, which bash parses whole before running: a syntax error (or an unterminated
+   heredoc that ate the closing paren) killed the recording shell itself with status 2,
+   nothing was recorded, and the adopted job settled as `unknown`. The child now `eval`s the
+   shell-quoted command text, so the parse error ends only the child and the recorder writes
+   its 2. `eval` parses one command at a time, as an unwrapped `bash -c` does: an unterminated
+   heredoc now behaves exactly as it does unwrapped (warning, runs), and aliases defined
+   earlier in the command apply to later lines (they did not inside the compound).
+
+2. A foreign kill settles as killed. `process_manage kill` from a process that does not
+   supervise the job (process_registry_foreign) returned `killed`, but the supervisor only
+   saw the PID go with no recorded status and its one completion notice said "status
+   unknown". The foreign kill now writes a `<log>.killed` marker (termination source) before
+   signalling; the supervisor's log reader settles a marked exit as killed (-15,
+   termination_source process.kill, "terminated by process.kill"), for an adopter and for a
+   live spawner holding the Popen alike. A kill that leaves the root alive (survivors, scope
+   stop failed) withdraws the marker, so a later natural exit is not misreported. The foreign
+   poll/log/wait exit fields read the marker too. The marker also retires the log after the
+   result retention, as a recorded `.exit` does (a killed job never writes one).
+
+3. Foreign poll/wait use the local post-processing. `_handle_process` applied
+   `apply_wait_poll_policy` and `with_masked_success_hint` before the foreign fallback, so a
+   foreign result skipped both; they now run after it (the policy is a no-op for a session
+   this registry does not hold, the masked-success hint applies).
+
+4. Docks map `unknown`. `cli_process_dock` and the TUI `processRoster` had no mapping for the
+   `unknown` (and `watcher_lost`) completion reasons, so an unrecorded exit (exit_code None)
+   painted as done. Both now show an `unknown` status: `?` glyph, verdict "status unknown"
+   (new `cli.dock.verdict_unknown` key in all 17 catalogs).
+
+Proof:
+- RED (tests only, source at main): 8 failures in test_process_restart_adoption_matrix.py
+  (syntax_error x2, unterminated_heredoc x2, owner kill notice, masked hint, kill-marker
+  retention) and test_process_dock.py (unknown status); vitest processDock "never paints a
+  re-adopted job whose exit status was not recorded as done" fails.
+- GREEN: both files 25+ passed; vitest processDock 3/3; tsc --noEmit, eslint, prettier clean.
+- Mutants killed: dropping the reader's kill-marker branch fails the owner-kill and
+  spawner-kill tests; dropping either marker withdrawal fails the withdraw tests.
+- Wider: 15 importing/related files (process registry, readopt, persist, wait auto-notify,
+  completion delivery, i18n, ...) 352 passed, 4 skipped.
+- scripts/check --base origin/main: 19 checks ok.
+---
+ hermes_cli/cli_process_dock.py                | 11 ++-
+ locales/af.yaml                               |  1 +
+ locales/ar.yaml                               |  1 +
+ locales/de.yaml                               |  1 +
+ locales/en.yaml                               |  1 +
+ locales/es.yaml                               |  1 +
+ locales/fr.yaml                               |  1 +
+ locales/ga.yaml                               |  1 +
+ locales/hu.yaml                               |  1 +
+ locales/it.yaml                               |  1 +
+ locales/ja.yaml                               |  1 +
+ locales/ko.yaml                               |  1 +
+ locales/pt.yaml                               |  1 +
+ locales/ru.yaml                               |  1 +
+ locales/tr.yaml                               |  1 +
+ locales/uk.yaml                               |  1 +
+ locales/zh-hant.yaml                          |  1 +
+ locales/zh.yaml                               |  1 +
+ tests/hermes_cli/test_process_dock.py         | 13 +++
+ .../test_process_restart_adoption_matrix.py   | 98 ++++++++++++++++++-
+ tools/process_registry.py                     |  6 +-
+ tools/process_registry_foreign.py             | 22 ++++-
+ tools/process_registry_output_log.py          | 55 ++++++++++-
+ ui-tui/src/__tests__/processDock.test.tsx     | 11 +++
+ ui-tui/src/app/processRoster.ts               | 18 +++-
+ ui-tui/src/lib/processGlyph.ts                |  3 +-
+ 26 files changed, 232 insertions(+), 22 deletions(-)
+
+diff --git a/hermes_cli/cli_process_dock.py b/hermes_cli/cli_process_dock.py
+index 3336cceee2..ea8e5d7e8c 100644
+--- a/hermes_cli/cli_process_dock.py
++++ b/hermes_cli/cli_process_dock.py
+@@ -15,8 +15,10 @@ from agent.i18n import t
+ # leaves; the completion notification in the transcript is the durable record.
+ RETAIN_SECONDS = 60
+ 
+-# Reader-thread exits report "exited"; `kill_process` / `kill_all` stamp "killed".
+-_STATUS_BY_REASON = {"killed": "killed", "lost": "lost", "failed_start": "failed"}
++# Reader-thread exits report "exited"; `kill_process` / `kill_all` stamp "killed". A re-adopted job
++# whose status was never recorded settles "unknown" (or "watcher_lost"): not a success. [daveey]
++_STATUS_BY_REASON = {"killed": "killed", "lost": "lost", "failed_start": "failed",
++                     "unknown": "unknown", "watcher_lost": "unknown"}
+ 
+ 
+ def _last_output_line(buffer: str) -> str:
+@@ -72,10 +74,11 @@ def process_rows(now: float | None = None) -> list:
+     return rows
+ 
+ 
+-_GLYPH = {"running": "⚙", "done": "✔", "failed": "✘", "killed": "✘", "lost": "?"}
++_GLYPH = {"running": "⚙", "done": "✔", "failed": "✘", "killed": "✘", "lost": "?", "unknown": "?"}
+ # Finished-status id → catalog key of the exit verdict (looked up at paint time).
+ _VERDICT_KEYS = {"done": "cli.dock.exit_code", "failed": "cli.dock.exit_code",
+-                 "killed": "cli.dock.verdict_killed", "lost": "cli.dock.verdict_lost"}
++                 "killed": "cli.dock.verdict_killed", "lost": "cli.dock.verdict_lost",
++                 "unknown": "cli.dock.verdict_unknown"}
+ 
+ 
+ def process_activity(row: dict) -> str:
+diff --git a/locales/af.yaml b/locales/af.yaml
+index e37807bb91..1ccfc961b5 100644
+--- a/locales/af.yaml
++++ b/locales/af.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "uitgang {code}"
+     verdict_killed: "doodgemaak"
+     verdict_lost: "verlore"
++    verdict_unknown: "status onbekend"
+     verdict_ago: "{verdict} · {seconds}s gelede"
+     process_gone: "Hierdie proses word nie meer gevolg nie."
+     no_output: "Nog geen uitvoer nie."
+diff --git a/locales/ar.yaml b/locales/ar.yaml
+index 2e21c8a370..396ec8fd8e 100644
+--- a/locales/ar.yaml
++++ b/locales/ar.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "خروج {code}"
+     verdict_killed: "أُنهيت"
+     verdict_lost: "مفقودة"
++    verdict_unknown: "الحالة غير معروفة"
+     verdict_ago: "{verdict} · قبل {seconds} ث"
+     process_gone: "هذه العملية لم تعد مُتابَعة."
+     no_output: "لا مخرجات بعد."
+diff --git a/locales/de.yaml b/locales/de.yaml
+index fb9f63d407..dbd9bfb4e7 100644
+--- a/locales/de.yaml
++++ b/locales/de.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "Exit {code}"
+     verdict_killed: "beendet (kill)"
+     verdict_lost: "verloren"
++    verdict_unknown: "Status unbekannt"
+     verdict_ago: "{verdict} · vor {seconds}s"
+     process_gone: "Dieser Prozess wird nicht mehr verfolgt."
+     no_output: "Noch keine Ausgabe."
+diff --git a/locales/en.yaml b/locales/en.yaml
+index 25aa9d79ae..6704a5e910 100644
+--- a/locales/en.yaml
++++ b/locales/en.yaml
+@@ -2427,6 +2427,7 @@ cli:
+     exit_code: "exit {code}"
+     verdict_killed: "killed"
+     verdict_lost: "lost"
++    verdict_unknown: "status unknown"
+     verdict_ago: "{verdict} · {seconds}s ago"
+     process_gone: "This process is no longer tracked."
+     no_output: "No output yet."
+diff --git a/locales/es.yaml b/locales/es.yaml
+index 670fab740f..a98612609e 100644
+--- a/locales/es.yaml
++++ b/locales/es.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "salida {code}"
+     verdict_killed: "detenido"
+     verdict_lost: "perdido"
++    verdict_unknown: "estado desconocido"
+     verdict_ago: "{verdict} · hace {seconds}s"
+     process_gone: "Este proceso ya no se rastrea."
+     no_output: "Aún no hay salida."
+diff --git a/locales/fr.yaml b/locales/fr.yaml
+index e408684e17..a74aca0203 100644
+--- a/locales/fr.yaml
++++ b/locales/fr.yaml
+@@ -2597,6 +2597,7 @@ cli:
+     exit_code: "sortie {code}"
+     verdict_killed: "tué"
+     verdict_lost: "perdu"
++    verdict_unknown: "statut inconnu"
+     verdict_ago: "{verdict} · il y a {seconds} s"
+     process_gone: "Ce processus n'est plus suivi."
+     no_output: "Pas encore de sortie."
+diff --git a/locales/ga.yaml b/locales/ga.yaml
+index 39e64135e7..9104b0513f 100644
+--- a/locales/ga.yaml
++++ b/locales/ga.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "scor {code}"
+     verdict_killed: "maraithe"
+     verdict_lost: "caillte"
++    verdict_unknown: "stádas anaithnid"
+     verdict_ago: "{verdict} · {seconds}s ó shin"
+     process_gone: "Ní rianaítear an próiseas seo a thuilleadh."
+     no_output: "Gan aschur fós."
+diff --git a/locales/hu.yaml b/locales/hu.yaml
+index 9a577cb94d..a4c889b40c 100644
+--- a/locales/hu.yaml
++++ b/locales/hu.yaml
+@@ -2344,6 +2344,7 @@ cli:
+     exit_code: "kilépés {code}"
+     verdict_killed: "leállítva"
+     verdict_lost: "elveszett"
++    verdict_unknown: "állapot ismeretlen"
+     verdict_ago: "{verdict} · {seconds} mp-cel ezelőtt"
+     process_gone: "Ezt a folyamatot már nem követjük."
+     no_output: "Még nincs kimenet."
+diff --git a/locales/it.yaml b/locales/it.yaml
+index 9db94947e2..dcd7dc00bf 100644
+--- a/locales/it.yaml
++++ b/locales/it.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "uscita {code}"
+     verdict_killed: "terminato"
+     verdict_lost: "perso"
++    verdict_unknown: "stato sconosciuto"
+     verdict_ago: "{verdict} · {seconds}s fa"
+     process_gone: "Questo processo non è più tracciato."
+     no_output: "Ancora nessun output."
+diff --git a/locales/ja.yaml b/locales/ja.yaml
+index aa75a84cf0..ca4fdf4cbb 100644
+--- a/locales/ja.yaml
++++ b/locales/ja.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "終了コード {code}"
+     verdict_killed: "強制終了"
+     verdict_lost: "消失"
++    verdict_unknown: "状態不明"
+     verdict_ago: "{verdict} · {seconds} 秒前"
+     process_gone: "このプロセスはもう追跡されていません。"
+     no_output: "まだ出力はありません。"
+diff --git a/locales/ko.yaml b/locales/ko.yaml
+index 9b8204f522..77a625861c 100644
+--- a/locales/ko.yaml
++++ b/locales/ko.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "종료 코드 {code}"
+     verdict_killed: "강제 종료됨"
+     verdict_lost: "유실됨"
++    verdict_unknown: "상태 알 수 없음"
+     verdict_ago: "{verdict} · {seconds}초 전"
+     process_gone: "이 프로세스는 더 이상 추적되지 않아요."
+     no_output: "아직 출력이 없어요."
+diff --git a/locales/pt.yaml b/locales/pt.yaml
+index b90e5f89a3..6be88b2b82 100644
+--- a/locales/pt.yaml
++++ b/locales/pt.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "saída {code}"
+     verdict_killed: "encerrado"
+     verdict_lost: "perdido"
++    verdict_unknown: "estado desconhecido"
+     verdict_ago: "{verdict} · há {seconds}s"
+     process_gone: "Este processo não é mais rastreado."
+     no_output: "Nenhuma saída ainda."
+diff --git a/locales/ru.yaml b/locales/ru.yaml
+index 0f449c9dd1..2e2afbc8a8 100644
+--- a/locales/ru.yaml
++++ b/locales/ru.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "код выхода {code}"
+     verdict_killed: "убит"
+     verdict_lost: "потерян"
++    verdict_unknown: "статус неизвестен"
+     verdict_ago: "{verdict} · {seconds} с назад"
+     process_gone: "Этот процесс больше не отслеживается."
+     no_output: "Вывода пока нет."
+diff --git a/locales/tr.yaml b/locales/tr.yaml
+index af2d0f8bcc..026b6deecf 100644
+--- a/locales/tr.yaml
++++ b/locales/tr.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "çıkış {code}"
+     verdict_killed: "sonlandırıldı"
+     verdict_lost: "kayboldu"
++    verdict_unknown: "durum bilinmiyor"
+     verdict_ago: "{verdict} · {seconds} sn önce"
+     process_gone: "Bu süreç artık izlenmiyor."
+     no_output: "Henüz çıktı yok."
+diff --git a/locales/uk.yaml b/locales/uk.yaml
+index 0469e4bbf8..bd10527cd5 100644
+--- a/locales/uk.yaml
++++ b/locales/uk.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "код виходу {code}"
+     verdict_killed: "зупинено"
+     verdict_lost: "втрачено"
++    verdict_unknown: "статус невідомий"
+     verdict_ago: "{verdict} · {seconds} с тому"
+     process_gone: "Цей процес більше не відстежується."
+     no_output: "Виводу ще немає."
+diff --git a/locales/zh-hant.yaml b/locales/zh-hant.yaml
+index 04d0aa8d34..628ff3e059 100644
+--- a/locales/zh-hant.yaml
++++ b/locales/zh-hant.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "結束碼 {code}"
+     verdict_killed: "已終止"
+     verdict_lost: "已遺失"
++    verdict_unknown: "狀態不明"
+     verdict_ago: "{verdict} · {seconds} 秒前"
+     process_gone: "此程序已不再追蹤。"
+     no_output: "尚無輸出。"
+diff --git a/locales/zh.yaml b/locales/zh.yaml
+index 0719feb4d6..500c864078 100644
+--- a/locales/zh.yaml
++++ b/locales/zh.yaml
+@@ -2327,6 +2327,7 @@ cli:
+     exit_code: "退出码 {code}"
+     verdict_killed: "已终止"
+     verdict_lost: "已丢失"
++    verdict_unknown: "状态未知"
+     verdict_ago: "{verdict} · {seconds} 秒前"
+     process_gone: "此进程已不再被跟踪。"
+     no_output: "尚无输出。"
+diff --git a/tests/hermes_cli/test_process_dock.py b/tests/hermes_cli/test_process_dock.py
+index fd93ded0fc..6a632a5558 100644
+--- a/tests/hermes_cli/test_process_dock.py
++++ b/tests/hermes_cli/test_process_dock.py
+@@ -77,3 +77,16 @@ def test_monitor_controls_stop_processes_and_never_steer_them():
+         assert any(r['id'] == slow_id and r['status'] == 'killed' for r in dock.processes)
+     finally:
+         process_registry.kill_process(slow_id)
++
++
++def test_unrecorded_exit_status_is_never_painted_as_done():
++    """A re-adopted job that settled ``unknown`` (no status recorded) or ``watcher_lost`` is not a success."""
++    from hermes_cli import cli_process_dock as dock
++
++    for reason in ('unknown', 'watcher_lost'):
++        status = dock.process_status({'status': 'exited', 'completion_reason': reason, 'exit_code': None})
++        assert status == 'unknown'
++        row = {'status': status, 'exit_code': None, 'since_exit': 4}
++        assert dock.process_glyph(row) == '?'
++        assert dock.process_activity(row) == t('cli.dock.verdict_ago', verdict=t('cli.dock.verdict_unknown'), seconds=4)
++    assert t('cli.dock.verdict_unknown') == 'status unknown'
+diff --git a/tests/tools/test_process_restart_adoption_matrix.py b/tests/tools/test_process_restart_adoption_matrix.py
+index 261739af1c..468d74e6e0 100644
+--- a/tests/tools/test_process_restart_adoption_matrix.py
++++ b/tests/tools/test_process_restart_adoption_matrix.py
+@@ -62,6 +62,7 @@ import json, sys
+ from pathlib import Path
+ import tools.process_registry as pr
+ from tools import process_registry_output_log as logs
++from tools.process_registry_notifications import format_process_notification
+ pr.CHECKPOINT_PATH = Path(sys.argv[1])
+ logs.output_dir = lambda: Path(sys.argv[2])
+ registry = pr.ProcessRegistry()
+@@ -72,7 +73,9 @@ sys.stdin.readline()
+ session = registry.get(sys.argv[3])
+ done = session is not None and session._completion_event.wait(20)
+ print(json.dumps({"done": bool(done), "events": [
+-    {k: e.get(k) for k in ("session_id", "exit_code", "completion_reason")} for e in events]}), flush=True)
++    {k: e.get(k) for k in ("session_id", "exit_code", "completion_reason")} for e in events],
++    "sources": [e.get("termination_source") for e in events],
++    "notices": [format_process_notification(e) for e in events]}), flush=True)
+ '''
+ 
+ 
+@@ -115,9 +118,21 @@ _CASES = {
+     "heredoc": ("sh <<'EOF'\nprintf 'heredoc\\n'\nexit 5\nEOF", 5),
+     # A command's own EXIT trap replaced the recorder's.
+     "own_exit_trap": ("trap 'echo bye' EXIT; exit 6", 6),
++    # A parse error killed the recording shell itself (the inline compound was parsed whole before
++    # it ran), so nothing was recorded and the job settled as unknown instead of bash's 2.
++    "syntax_error": ("printf 'before\\n'; if then", 2),
++    # Unterminated: it ate the compound's closing paren (unknown). Unwrapped, bash warns and runs it.
++    "unterminated_heredoc": ("sh <<EOF\nexit 5", 5),
+ }
+ 
+ 
++@pytest.mark.parametrize("case", ["syntax_error", "unterminated_heredoc"])
++def test_parse_failure_cases_match_the_unwrapped_command(case):
++    """The expected codes are what the same text exits with under a plain ``bash -c``."""
++    body, expected = _CASES[case]
++    assert subprocess.run(["bash", "-c", body], capture_output=True, timeout=10, check=False).returncode == expected
++
++
+ @pytest.mark.parametrize("exit_while_down", [False, True])
+ @pytest.mark.parametrize("case", sorted(_CASES))
+ def test_adopted_job_reports_its_real_exit_code(checkpoint, tmp_path, monkeypatch, case, exit_while_down):
+@@ -254,6 +269,83 @@ def test_owner_chat_kills_a_job_another_process_adopted(adopted_elsewhere):
+     killed = _call("kill", job["id"])
+     assert killed["status"] == "killed", killed
+     assert registry._detached_host_fate(job["pid"], job["entry"]["host_start_time"]) != "running"
++    # Until the supervisor's receipt lands, this chat's own poll reports the kill too.
++    polled = _call("poll", job["id"])
++    assert (polled["completion_reason"], polled["exit_code"]) == ("killed", -15), polled
+     report = _adopter_report(adopter)
+-    assert report["done"] and len(report["events"]) == 1
+-    assert report["events"][0]["completion_reason"] == "unknown"
++    # The supervisor's one notice agrees with the kill result (it said "status unknown").
++    assert report["done"] and report["events"] == [
++        {"session_id": job["id"], "exit_code": -15, "completion_reason": "killed"}]
++    assert report["sources"] == ["process.kill"]
++    assert "terminated by process.kill" in report["notices"][0]
++    assert "status unknown" not in report["notices"][0]
++
++
++@pytest.mark.parametrize("failure", ["survivors", "scope_stop"])
++def test_foreign_kill_that_leaves_the_job_alive_withdraws_its_kill_marker(adopted_elsewhere, monkeypatch, failure):
++    """A kill that did not end the job must not make its later natural exit read as killed."""
++    job, adopter, gate, registry = adopted_elsewhere
++    if failure == "scope_stop" and not job["entry"].get("systemd_unit"):
++        pytest.skip("this host runs the job without a systemd scope")
++    monkeypatch.setattr(registry, "_terminate_host_pid", lambda *a, **k: None)
++    monkeypatch.setattr("tools.process_registry._stop_systemd_unit", lambda unit: failure != "scope_stop")
++    monkeypatch.setattr(registry, "_post_kill_survivors", lambda session: [job["pid"]])
++    killed = _call("kill", job["id"])
++    assert killed["status"] == "error" and killed["process_running"] is True, killed
++    assert not Path(job["log"]).with_suffix(".killed").exists()
++    gate.touch()
++    report = _adopter_report(adopter)
++    assert report["events"] == [{"session_id": job["id"], "exit_code": 7, "completion_reason": "exited"}]
++
++
++def test_foreign_wait_gets_the_masked_success_hint_like_a_local_one(monkeypatch):
++    """The foreign fallback's poll/wait result runs through the same post-processing as a local one."""
++    import tools.process_registry_foreign as foreign
++    failure = "Traceback (most recent call last)\n  File \"run.py\"\nValueError: boom"
++    head = {"status": "exited", "session_id": "proc_feedface0001", "exit_code": 0,
++            "command": "python3 run.py 2>&1 | tail -5"}
++    for action, key in (("wait", "output"), ("poll", "output_preview")):
++        result = {**head, key: failure}
++        monkeypatch.setattr(foreign, "foreign_action", lambda registry, a, sid, args, r=result: dict(r))
++        answered = _call(action, "proc_feedface0001")
++        assert answered["exit_code"] == 0 and "NOT of the command before the pipe" in answered.get("hint", ""), answered
++
++
++def test_foreign_kill_of_a_job_its_spawner_still_supervises_settles_as_killed(checkpoint, tmp_path, monkeypatch):
++    """The supervisor can be the live spawner itself (it holds the Popen): its reader honours the
++    kill marker too instead of reporting the signal's bare exit."""
++    import tools.process_registry_foreign as foreign
++    monkeypatch.setattr("tools.process_registry_output_log.output_dir", lambda: tmp_path)
++    registry = ProcessRegistry()
++    session = registry.spawn_local("printf 'started\\n'; sleep 30", cwd=str(tmp_path), session_key=TUI_KEY,
++                                   owner_task_id=TUI_KEY, persist_on_release=True)
++    try:
++        assert session.process is not None and session.output_log
++        deadline = time.monotonic() + 10
++        while "started" not in Path(session.output_log).read_text():
++            assert time.monotonic() < deadline, "job never started"
++            threading.Event().wait(0.02)
++        registry._write_checkpoint()
++        entry = next(e for e in json.loads(checkpoint.read_text()) if e["session_id"] == session.id)
++        assert foreign.foreign_kill(registry, entry)["status"] == "killed"
++        assert session._completion_event.wait(10)
++        assert (session.exit_code, session.completion_reason, session.termination_source) == (
++            -15, "killed", "process.kill")
++    finally:
++        if session._reader_thread:
++            session._reader_thread.join(5)
++        registry.kill_process(session.id)
++
++
++def test_a_kill_marker_retires_its_log_like_a_recorded_exit(tmp_path, monkeypatch):
++    """A killed job records no ``.exit``: its kill marker ages its log out instead (it never would)."""
++    from tools import process_registry_output_log as logs
++    from tools.process_registry_results import RESULT_RETENTION_SECONDS
++    monkeypatch.setattr(logs, "output_dir", lambda: tmp_path)
++    old = time.time() - RESULT_RETENTION_SECONDS - 60
++    for name in ("proc_killed", "proc_live"):
++        (tmp_path / f"{name}.log").write_text("x")
++    logs.record_kill(tmp_path / "proc_killed.log", "process.kill")
++    os.utime(tmp_path / "proc_killed.killed", (old, old))
++    logs.worker_output_log("proc_new", persist=True)
++    assert sorted(p.name for p in tmp_path.glob("proc_*")) == ["proc_live.log"]
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index e7da07369c..e5e3494769 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -2639,11 +2639,11 @@ def _handle_process(args, **kw):
+             return tool_error(f"session_id is required for {action}")
+         handler, redact = _SESSION_ACTIONS[action]
+         from tools.process_registry_wait_policy import apply_wait_poll_policy, with_masked_success_hint
+-        result = with_masked_success_hint(apply_wait_poll_policy(action, session_id, handler(session_id, args)))
++        result = handler(session_id, args)
+         if result.get("status") == "not_found":
+-            # A live job another Hermes process re-adopted after a restart (process_registry_foreign).
+-            from tools.process_registry_foreign import foreign_action
++            from tools.process_registry_foreign import foreign_action  # a job another live Hermes re-adopted
+             result = foreign_action(process_registry, action, session_id, args) or result
++        result = with_masked_success_hint(apply_wait_poll_policy(action, session_id, result))  # foreign jobs too
+         return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
+     return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
+ 
+diff --git a/tools/process_registry_foreign.py b/tools/process_registry_foreign.py
+index 39e912892d..a564491bd5 100644
+--- a/tools/process_registry_foreign.py
++++ b/tools/process_registry_foreign.py
+@@ -101,8 +101,10 @@ def _running(registry, entry: dict[str, Any]) -> bool:
+ 
+ 
+ def _exit_fields(entry: dict[str, Any]) -> dict[str, Any]:
+-    from tools.process_registry_output_log import adoptable_log, recorded_exit_code
++    from tools.process_registry_output_log import adoptable_log, recorded_exit_code, recorded_kill_source
+     log = adoptable_log(entry.get("output_log"))
++    if log and (killed_by := recorded_kill_source(log)):
++        return {"exit_code": -15, "completion_reason": "killed", "termination_source": killed_by}
+     code = recorded_exit_code(log) if log else None
+     if code is None:
+         return {"exit_code": None, "completion_reason": "unknown",
+@@ -172,17 +174,31 @@ def foreign_wait(registry, entry: dict[str, Any], timeout: Optional[int]) -> dic
+ 
+ def foreign_kill(registry, entry: dict[str, Any]) -> dict[str, Any]:
+     """Signal the job's tree (and stop its scope) without taking it over: the supervisor's reader
+-    sees the exit and records it. A recycled or gone PID is never signalled."""
++    sees the exit and records it. A recycled or gone PID is never signalled. A kill marker beside the
++    job's log, written before the signal, tells that reader the exit was this kill (its notice says
++    killed, as for a local kill, not "status unknown"); a kill that leaves the job alive withdraws it."""
+     from tools.process_registry import _stop_systemd_unit
++    from tools.process_registry_output_log import adoptable_log, clear_kill, record_kill
+     if not _running(registry, entry):
+         return {**_head(registry, entry, False), **_exit_fields(entry), "status": "already_exited"}
++    log = adoptable_log(entry.get("output_log"))
++    if log:
++        try:
++            record_kill(log, "process.kill")
++        except OSError:
++            log = ""  # the supervisor then reports "status unknown"; the kill itself still goes ahead
+     registry._terminate_host_pid(entry["pid"], entry.get("host_start_time"))
+     unit = entry.get("systemd_unit") or ""
+     if unit and not _stop_systemd_unit(unit):
++        alive = _running(registry, entry)
++        if log and alive:
++            clear_kill(log)
+         return {"status": "error", "error": f"Kill incomplete: systemd scope {unit} did not stop",
+-                "session_id": entry["session_id"], "scope_stop_failed": unit, "process_running": _running(registry, entry)}
++                "session_id": entry["session_id"], "scope_stop_failed": unit, "process_running": alive}
+     survivors = registry._post_kill_survivors(registry._session_from_entry(entry))
+     if survivors:
++        if log and _running(registry, entry):
++            clear_kill(log)
+         alive = ", ".join(map(str, survivors))
+         return {"status": "error", "error": f"Kill incomplete: {len(survivors)} process(es) still alive ({alive})",
+                 "session_id": entry["session_id"], "survivors": survivors, "process_running": True}
+diff --git a/tools/process_registry_output_log.py b/tools/process_registry_output_log.py
+index 922ed64c4e..df2284fb2e 100644
+--- a/tools/process_registry_output_log.py
++++ b/tools/process_registry_output_log.py
+@@ -42,13 +42,14 @@ def worker_output_log(session_id: str, *, persist: bool = False) -> Optional[Pat
+     directory = output_dir()
+     make_user_dir(directory, mode=0o700, parents=True, exist_ok=True)
+     from tools.process_registry_results import RESULT_RETENTION_SECONDS
+-    # Only a recorded exit retires a log: a quiet process can run longer than the retention.
++    # Only a recorded exit (or kill) retires a log: a quiet process can run longer than the retention.
+     cutoff = time.time() - RESULT_RETENTION_SECONDS
+-    for exited in directory.glob("proc_*.exit"):
++    for exited in [*directory.glob("proc_*.exit"), *directory.glob("proc_*.killed")]:
+         with suppress(FileNotFoundError):
+             if exited.stat().st_mtime < cutoff:
+                 exited.with_suffix(".log").unlink(missing_ok=True)
+-                exited.unlink()
++                for suffix in (".exit", ".killed"):
++                    exited.with_suffix(suffix).unlink(missing_ok=True)
+     return directory / f"{session_id}.log"
+ 
+ 
+@@ -87,10 +88,16 @@ def record_exit_command(log: Path, command: str) -> str:
+     own shell was removable by the command: ``exec`` replaced that shell and a user ``trap ... EXIT``
+     overwrote it (both then settled as lost, -1), and a SIGTERM to the job ran it with ``$?`` 0
+     (a false success). A shell killed by a signal records nothing, so the adopter reports the
+-    status as unknown. [daveey]"""
++    status as unknown.
++
++    The child ``eval``s the command text rather than having it pasted inline: an inline compound is
++    parsed whole before it runs, so a syntax error (or an unterminated heredoc eating the closing
++    ``)``) killed the recording shell itself with status 2 and recorded nothing (settled as unknown).
++    Under ``eval`` the parse error ends only the child, and the recorder writes its 2; the command
++    is parsed one command at a time, exactly as ``bash -c`` runs it unwrapped. [daveey]"""
+     import shlex
+     target = shlex.quote(_exit_path(log).as_posix())
+-    return (f"__hermes_exit_file={target}\n(\n{command}\n)\n__hermes_rc=$?\n"
++    return (f"__hermes_exit_file={target}\n(eval {shlex.quote(command)})\n__hermes_rc=$?\n"
+             "printf '%s\\n' \"$__hermes_rc\" > \"$__hermes_exit_file\"\nexit \"$__hermes_rc\"")
+ 
+ 
+@@ -110,6 +117,36 @@ def recorded_exit_code(log) -> Optional[int]:
+         return None
+ 
+ 
++def _kill_path(log) -> Path:
++    return Path(log).with_suffix(".killed")
++
++
++def record_kill(log, source: str) -> None:
++    """Mark beside the log that a ``process_manage kill`` from another Hermes process is ending the
++    job, so its supervisor (which only sees the PID go, with no status recorded) settles it as
++    killed instead of "status unknown". Written before the signal. [daveey]"""
++    path = _kill_path(log)
++    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
++    with os.fdopen(fd, "w", encoding="utf-8") as stream:
++        stream.write(source or "process.kill")
++
++
++def clear_kill(log) -> None:
++    """Withdraw a kill marker: the kill left the job running."""
++    with suppress(OSError):
++        _kill_path(log).unlink()
++
++
++def recorded_kill_source(log) -> str:
++    """The termination source of a kill another process recorded for this job's log, or ``""``."""
++    if not log:
++        return ""
++    try:
++        return _kill_path(log).read_text(encoding="utf-8-sig").strip() or "process.kill"
++    except OSError:
++        return ""
++
++
+ class ProcessOutputLogMixin:
+     """The subclass supplies ``_ingest_output``, ``_clean_shell_noise``, ``_finish_reader``,
+     ``_finish_exited`` and ``_detached_host_fate``. See ProcessRegistry."""
+@@ -168,6 +205,14 @@ class ProcessOutputLogMixin:
+         except OSError as exc:
+             logger.warning("Process output log %s unreadable: %s", session.output_log, exc)
+         ingest(decoder.decode(b"", final=True), final=True)
++        if killed_by := recorded_kill_source(session.output_log):
++            # Another Hermes process's process_manage kill ended it (process_registry_foreign): report
++            # the kill, as a local kill_process does, not the signal's "status unknown". [daveey]
++            if proc is not None:
++                with suppress(ChildProcessError, OSError):
++                    proc.wait()
++            self._finish_exited(session, -15, reason="killed", source=killed_by)
++            return
+         if proc is not None:
+             self._finish_reader(session, decoder, ingest, "Log", proc.wait, lambda: proc.returncode)
+             return
+diff --git a/ui-tui/src/__tests__/processDock.test.tsx b/ui-tui/src/__tests__/processDock.test.tsx
+index bf75b4b28d..3642c20143 100644
+--- a/ui-tui/src/__tests__/processDock.test.tsx
++++ b/ui-tui/src/__tests__/processDock.test.tsx
+@@ -75,6 +75,17 @@ it('keeps running processes, ages finished ones out after the retention window,
+   expect(buildProcessRows([{ ...exited('x', 1), exited_at: null }], NOW * 1000)).toEqual([])
+ })
+ 
++it('never paints a re-adopted job whose exit status was not recorded as done', () => {
++  for (const reason of ['unknown', 'watcher_lost']) {
++    const [row] = buildProcessRows(
++      [{ ...exited('proc_unknown', 3), completion_reason: reason, exit_code: null }],
++      NOW * 1000
++    )
++
++    expect(row).toMatchObject({ status: 'unknown', detail: 'status unknown · 3s ago' })
++  }
++})
++
+ it('paints a Processes block under the agents without letting either block hide the other', () => {
+   const agents = Array.from({ length: 6 }, (_, i) => agent(`child-${i}`))
+   const processes = buildProcessRows([running, exited('fresh', 5)], NOW * 1000)
+diff --git a/ui-tui/src/app/processRoster.ts b/ui-tui/src/app/processRoster.ts
+index 930d06b1b8..61d419787c 100644
+--- a/ui-tui/src/app/processRoster.ts
++++ b/ui-tui/src/app/processRoster.ts
+@@ -26,7 +26,7 @@ export interface ProcessRow {
+   id: string
+   /** Seconds since exit; 0 while running. */
+   sinceExitSeconds: number
+-  status: 'done' | 'failed' | 'killed' | 'lost' | 'running'
++  status: 'done' | 'failed' | 'killed' | 'lost' | 'running' | 'unknown'
+ }
+ 
+ /** A finished process stays on the dock long enough to read its exit line, then
+@@ -43,7 +43,14 @@ export function applyProcessSnapshot(sid: string | null, processes: ProcessEntry
+   }
+ }
+ 
+-const REASON_STATUS: Record<string, ProcessRow['status']> = { failed_start: 'failed', killed: 'killed', lost: 'lost' }
++// A re-adopted job whose status was never recorded settles `unknown` (or `watcher_lost`): not a success.
++const REASON_STATUS: Record<string, ProcessRow['status']> = {
++  failed_start: 'failed',
++  killed: 'killed',
++  lost: 'lost',
++  unknown: 'unknown',
++  watcher_lost: 'unknown'
++}
+ 
+ export const processStatus = (entry: ProcessEntry): ProcessRow['status'] => {
+   if (entry.status !== 'exited') {
+@@ -70,7 +77,12 @@ export const processVerdict = (row: ProcessRow, exitCode: number | null | undefi
+     return row.detail ? `last: ${row.detail}` : 'starting'
+   }
+ 
+-  const verdict = row.status === 'killed' || row.status === 'lost' ? row.status : `exit ${exitCode ?? '?'}`
++  const verdict =
++    row.status === 'killed' || row.status === 'lost'
++      ? row.status
++      : row.status === 'unknown'
++        ? 'status unknown'
++        : `exit ${exitCode ?? '?'}`
+ 
+   return `${verdict} · ${row.sinceExitSeconds}s ago`
+ }
+diff --git a/ui-tui/src/lib/processGlyph.ts b/ui-tui/src/lib/processGlyph.ts
+index 2b23d6ce9f..7faeac64c0 100644
+--- a/ui-tui/src/lib/processGlyph.ts
++++ b/ui-tui/src/lib/processGlyph.ts
+@@ -9,7 +9,8 @@ export const PROCESS_GLYPH: Record<ProcessRow['status'], { color: (t: Theme) =>
+   done: { color: t => t.color.statusGood, glyph: '✔' },
+   failed: { color: t => t.color.error, glyph: '✘' },
+   killed: { color: t => t.color.warn, glyph: '✘' },
+-  lost: { color: t => t.color.muted, glyph: '?' }
++  lost: { color: t => t.color.muted, glyph: '?' },
++  unknown: { color: t => t.color.muted, glyph: '?' }
+ }
+ 
+ export const processGlyph = (status: ProcessRow['status'], t: Theme): { color: string; glyph: string } => {
+-- 
+2.43.0
+

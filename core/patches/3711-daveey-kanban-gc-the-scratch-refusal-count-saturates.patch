@@ -1,0 +1,90 @@
+From 473c29597c17736c27d9d57504629a109367160d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:33:22 +0000
+Subject: [PATCH] [daveey] kanban gc: the scratch refusal count saturates at
+ MAX_COUNT, so 2 ** count never stalls a pass
+
+Review nit on #2448 (review 5895402033): a well-formed memo entry with a huge
+count (hand-edited state) made Refusals.record() compute BASE_S * 2 ** (count - 1)
+before min(CAP_S, ...): 51 s / ~1.25 GB at count 1e10 when that tree was refused
+again, the same 'one JSON-valid entry stops the pass' class this PR fixes.
+
+record() now saturates count at MAX_COUNT (64; CAP_S is already reached at 4),
+and the loader drops entries above it, so loaded and written state agree.
+
+RED: test_memo_loader_drops_each_malformed_field[count=1e10] kept the entry;
+test_record_saturates_count_so_the_backoff_exponent_stays_small had no MAX_COUNT.
+GREEN: both backoff test files, 23 passed.
+---
+ hermes_cli/kanban_scratch_backoff.py             |  6 ++++--
+ .../hermes_cli/test_kanban_scratch_gc_backoff.py | 16 +++++++++++++++-
+ 2 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_scratch_backoff.py b/hermes_cli/kanban_scratch_backoff.py
+index f086dbe2ec..00b35f88a1 100644
+--- a/hermes_cli/kanban_scratch_backoff.py
++++ b/hermes_cli/kanban_scratch_backoff.py
+@@ -35,6 +35,7 @@ log = logging.getLogger(__name__)
+ BASE_S = 2 * 3600
+ CAP_S = 24 * 3600
+ FORGET_S = 14 * 86400
++MAX_COUNT = 64  # count saturates here: CAP_S is reached at 4, and 2 ** count must stay cheap
+ DEFAULT_BUDGET_S = 1200  # the worker/Mac GC wrappers kill a board's pass at 1800 s
+ 
+ 
+@@ -84,7 +85,7 @@ def _well_formed(entry) -> bool:
+     return (isinstance(entry, dict)
+             and _finite(entry.get("last_at")) and _finite(entry.get("retry_at"))
+             and isinstance(entry.get("count"), int) and not isinstance(entry["count"], bool)
+-            and entry["count"] >= 1
++            and 1 <= entry["count"] <= MAX_COUNT
+             and (entry.get("fingerprint") is None or isinstance(entry["fingerprint"], list))
+             and (entry.get("reason") is None or isinstance(entry["reason"], str)))
+ 
+@@ -126,7 +127,8 @@ class Refusals:
+     def record(self, key: str, path: Path, completed_at, reason: str) -> None:
+         prior = self.entries.get(key) or {}
+         fp = fingerprint(path, completed_at)
+-        count = int(prior.get("count") or 0) + 1 if prior.get("fingerprint") == fp else 1
++        count = (min(MAX_COUNT, int(prior.get("count") or 0) + 1)
++                 if prior.get("fingerprint") == fp else 1)
+         now = self._now()
+         self.entries[key] = {"fingerprint": fp, "count": count, "last_at": now,
+                              "retry_at": now + min(CAP_S, BASE_S * 2 ** (count - 1)),
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc_backoff.py b/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
+index c7efbc9083..238894a7c9 100644
+--- a/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
++++ b/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
+@@ -144,7 +144,7 @@ def test_malformed_memo_entry_is_dropped_and_the_aged_pass_completes(remote, arc
+ @pytest.mark.parametrize("bad", [
+     {"retry_at": "x"}, {"count": None}, {"count": "2"}, {"count": True}, {"count": 0},
+     {"last_at": "y"}, {"retry_at": float("inf")}, {"retry_at": 1e300}, {"retry_at": None},
+-    {"fingerprint": "p"}, {"reason": 5},
++    {"fingerprint": "p"}, {"reason": 5}, {"count": 10**10},
+ ])
+ def test_memo_loader_drops_each_malformed_field(tmp_path, bad):
+     tree = tmp_path / "tree"
+@@ -161,6 +161,20 @@ def test_memo_loader_drops_each_malformed_field(tmp_path, bad):
+     assert bo.skip_logged(refusals, "ok", tree, 5, "t") is True
+ 
+ 
++def test_record_saturates_count_so_the_backoff_exponent_stays_small(tmp_path):
++    """A tree refused forever stops growing ``count`` at MAX_COUNT (else 2 ** count stalls)."""
++    tree = tmp_path / "tree"
++    tree.mkdir()
++    now = 1_000_000.0
++    refusals = bo.Refusals("default", now=lambda: now)
++    refusals.entries["t"] = {"fingerprint": bo.fingerprint(tree, 5), "count": bo.MAX_COUNT,
++                             "last_at": now, "retry_at": now, "reason": "r"}
++    refusals.record("t", tree, 5, "again")
++    assert refusals.entries["t"]["count"] == bo.MAX_COUNT
++    assert refusals.entries["t"]["retry_at"] == now + bo.CAP_S
++    assert set(bo.Refusals("default", now=lambda: now).entries) == {"t"}, "the writer's max loads back"
++
++
+ def test_budget_defers_the_rest_oldest_first_and_pass_completes(remote, archives, caplog, capsys):
+     _newer, newer_path = _task(remote=remote)
+     _older, older_path = _task(remote=remote, completed_at=OLD - 3600)
+-- 
+2.43.0
+

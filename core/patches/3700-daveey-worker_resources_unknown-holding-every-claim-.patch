@@ -1,0 +1,342 @@
+From 8612771af01200f99e9c3ac3b07969b0c1147cdb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:08:45 +0000
+Subject: [PATCH] [daveey] worker_resources_unknown holding every claim >10 min
+ opens one repair card per host per incident
+
+---
+ hermes_cli/kanban_parent_unclaimed.py         |   2 +
+ hermes_cli/worker_resource_admission.py       |  40 +++--
+ hermes_cli/worker_resources_unknown_alarm.py  | 141 ++++++++++++++++++
+ .../test_worker_resources_unknown_alarm.py    | 104 +++++++++++++
+ 4 files changed, 275 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/worker_resources_unknown_alarm.py
+ create mode 100644 tests/hermes_cli/test_worker_resources_unknown_alarm.py
+
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 14db23e23d..c894b75d54 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -188,6 +188,8 @@ def safe_sweep(conn) -> int:
+         posted = 0
+     from hermes_cli import kanban_pickup_stall
+     kanban_pickup_stall.safe_sweep(conn)  # pinned foreign cards this worker node has not picked up [daveey]
++    from hermes_cli import worker_resources_unknown_alarm
++    worker_resources_unknown_alarm.safe_sweep(conn)  # every claim here refused worker_resources_unknown
+     return posted + kanban_chat_wait.safe_sweep(conn)
+ 
+ 
+diff --git a/hermes_cli/worker_resource_admission.py b/hermes_cli/worker_resource_admission.py
+index 3726c91137..65071d5394 100644
+--- a/hermes_cli/worker_resource_admission.py
++++ b/hermes_cli/worker_resource_admission.py
+@@ -126,21 +126,37 @@ def occupied_count_for_host(echo=None, *, claimant=None) -> int | None:
+ 
+ 
+ def refusal(echo=None, *, enabled=None, claimant=None) -> str | None:
+-    """Pre-lease and final-lock check. Unknown observations fail closed."""
++    """Pre-lease and final-lock check. Unknown observations fail closed.
++
++    Every answer of an enabled worker feeds the host-wide unknown-streak alarm
++    (``worker_resources_unknown_alarm``)."""
++    from hermes_cli import worker_resources_unknown_alarm as alarm
+     try:
+         if not (capacity.worker_enabled() if enabled is None else enabled):
+             return None
+-        directory = capacity.policy_root() / 'worker-resources'
+-        if _pressure(directory):
+-            return 'worker_load_pressure'
+-        occupied_count = occupied_count_for_host(echo, claimant=claimant)
+-        from hermes_cli.kanban_admission import _root_max_in_progress
+-        ok, cap = _root_max_in_progress(root=capacity.policy_root())
+-        if occupied_count is None or not ok or cap is None:
+-            return 'worker_resources_unknown'
+-        if occupied_count > cap if claimant is not None else occupied_count >= cap:
+-            return 'worker_capacity_full'
+-        return None
+     except Exception as exc:  # health: allow BLE001 -- any unreadable policy/controller must refuse claims
+         _log_unknown(exc)
++        alarm.observe(True, exc)
++        return 'worker_resources_unknown'
++    try:
++        answer = _refusal(echo, claimant=claimant)
++    except Exception as exc:  # health: allow BLE001 -- any unreadable policy/controller must refuse claims
++        _log_unknown(exc)
++        alarm.observe(True, exc)
++        return 'worker_resources_unknown'
++    alarm.observe(answer == 'worker_resources_unknown')
++    return answer
++
++
++def _refusal(echo, *, claimant):
++    directory = capacity.policy_root() / 'worker-resources'
++    if _pressure(directory):
++        return 'worker_load_pressure'
++    occupied_count = occupied_count_for_host(echo, claimant=claimant)
++    from hermes_cli.kanban_admission import _root_max_in_progress
++    ok, cap = _root_max_in_progress(root=capacity.policy_root())
++    if occupied_count is None or not ok or cap is None:
+         return 'worker_resources_unknown'
++    if occupied_count > cap if claimant is not None else occupied_count >= cap:
++        return 'worker_capacity_full'
++    return None
+diff --git a/hermes_cli/worker_resources_unknown_alarm.py b/hermes_cli/worker_resources_unknown_alarm.py
+new file mode 100644
+index 0000000000..6e49a9d44a
+--- /dev/null
++++ b/hermes_cli/worker_resources_unknown_alarm.py
+@@ -0,0 +1,141 @@
++"""An agent repair card when ``worker_resources_unknown`` holds every claim on this worker. [daveey]
++
++t_01a1d5bf526e1344 (2026-11-13): worker-1 spawned nothing for 17 min. A state-suite shard's board under
++``/dev/shm`` stayed registered in the account worker inventory after the run deleted it, so every
++``refusal()`` failed closed as ``worker_resources_unknown``. The "dispatcher stuck" WARNING only logged it;
++the record was moved by hand.
++
++``refusal()`` is host-wide: its inventory and policy are the account's, so while it answers unknown no
++claim on this host can pass. :func:`observe` keeps that streak in ``<policy root>/worker-resources/
++unknown.json`` (first seen, last seen, the failing check, the registered record it names), rewritten on a
++new streak, a changed detail or every :data:`REFRESH_SECONDS`, and removed by the first other answer. The
++dispatcher sweep (:func:`sweep`) opens ONE agent repair card per host per incident once a fresh streak is
++older than :data:`STALL_SECONDS`, placed off this host (``kanban_pickup_stall.alarm_placement``), naming the
++record path. A streak whose last observation is older than :data:`GAP_SECONDS` (nothing tried to claim)
++is a new incident. No Inbox post, no human ask.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import logging
++import os
++import tempfile
++import time
++from pathlib import Path
++from typing import Any, Optional
++
++_log = logging.getLogger(__name__)
++
++STALL_SECONDS = 600
++REFRESH_SECONDS = 60
++GAP_SECONDS = 300
++KEY_PREFIX = "worker-resources-unknown:"
++
++
++def _path() -> Path:
++    from hermes_cli import worker_compute_capacity as capacity
++    return capacity.policy_root() / "worker-resources" / "unknown.json"
++
++
++def record_for(exc: Optional[BaseException]) -> Optional[str]:
++    """The inventory record naming a registered board that vanished, or None."""
++    name = getattr(exc, "filename", None)
++    if not isinstance(exc, FileNotFoundError) or not name or not os.path.isabs(str(name)):
++        return None
++    from hermes_cli import worker_compute_capacity as capacity
++    digest = hashlib.sha256(str(name).encode()).hexdigest()
++    return str(capacity.policy_root() / "worker-resources" / "boards" / f"{digest}.json")
++
++
++def read() -> Optional[dict[str, Any]]:
++    try:
++        state = json.loads(_path().read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return None
++    return state if isinstance(state, dict) and isinstance(state.get("since"), (int, float)) else None
++
++
++def _write(state: dict[str, Any]) -> None:
++    path = _path()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
++        json.dump(state, handle)
++    os.replace(handle.name, path)
++
++
++def observe(unknown: bool, exc: Optional[BaseException] = None, *, now: Optional[float] = None) -> None:
++    """Record one ``refusal()`` answer. Never raises: the claim gate must not depend on its alarm."""
++    try:
++        now = time.time() if now is None else now
++        state: Optional[dict[str, Any]] = read()
++        if not unknown:
++            if state is not None:
++                _path().unlink(missing_ok=True)
++            return
++        detail = f"{type(exc).__name__}: {exc}" if exc is not None else "occupancy or max_in_progress unreadable"
++        if state is None or now - float(state.get("last", 0)) > GAP_SECONDS:
++            state = {"since": now}
++        elif state.get("detail") == detail and now - float(state["last"]) < REFRESH_SECONDS:
++            return
++        state = {**state, "last": now, "detail": detail, "record": record_for(exc)}
++        _write(state)
++    except Exception:  # health: allow BLE001 -- alarm bookkeeping must never change the claim answer
++        _log.debug("worker_resources_unknown streak not recorded", exc_info=True)
++
++
++def sweep(conn, *, now: Optional[float] = None) -> Optional[str]:
++    """The repair card id covering a stalled streak, or None."""
++    state = read()
++    now = time.time() if now is None else now
++    if state is None or now - float(state.get("last", 0)) > GAP_SECONDS:
++        return None
++    since = float(state["since"])
++    if now - since <= STALL_SECONDS:
++        return None
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_pickup_stall as stall
++    from hermes_cli import kanban_worker_node as wn
++    if sync.board_mode(conn) != "primary":
++        return None
++    own = wn._own(conn)
++    minutes = int((now - since) // 60)
++    record = state.get("record")
++    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
++    target = f"record {record}" if record else "no registered record named"
++    body = (f"Since {started} ({minutes} min) every worker_resource_admission.refusal() on {own} answered "
++            f"`worker_resources_unknown`, so no card can claim there (threshold {STALL_SECONDS} s).\n\n"
++            f"Failing check: `{state.get('detail')}`\nInventory {target}.\n\n"
++            f"On {own}: read the record (`cat <record>`), check whether its board or directory still exists and "
++            "which process registered it (a test or scratch harness writing the real account inventory is a bug "
++            "to fix at its source). A record whose board is gone for good may be moved out under the account "
++            "admission lock (`hermes_cli.admission_fence.admission_lock(<account>/.hermes)`); keep a copy as "
++            f"evidence. Verify `refusal()` returns None and {own} claims again. This is agent-owned repair, not "
++            "a human decision.")
++    key = f"{KEY_PREFIX}{own}:"
++    now_ms = int(now * 1000)
++    card = stall._covering_repair(conn, key, now_ms)  # one card per host per incident
++    if card is None:
++        from hermes_cli import kanban_db as kb
++        from hermes_cli.kanban_triage_sweep import _supervisor_profile
++        reg = wn.registry()
++        assignee = _supervisor_profile()
++        # Never pinned here: this host is the one claiming nothing.
++        runs_on, why = stall.alarm_placement(own, None if reg is None else (reg.get("machines") or {}),
++                                             assignee=assignee, now_ms=now_ms)
++        card = kb.create_task(
++            conn, title=(f"worker_resources_unknown holds every claim on {own} for {minutes} min: "
++                         f"{record or state.get('detail')}")[:240],
++            body=body + f"\n\nPlaced with runs_on {runs_on}: {why}.", assignee=assignee,
++            created_by=stall.DETECTOR, workspace_kind="scratch", requires=list(stall._REQUIRES),
++            idempotency_key=f"{key}{now_ms}", runs_on=runs_on, priority=-1)
++        _log.warning("worker_resources_unknown on %s for %d min: repair card %s", own, minutes, card)
++    return card
++
++
++def safe_sweep(conn) -> Optional[str]:
++    try:
++        return sweep(conn)
++    except Exception:  # health: allow BLE001 -- the detector must never stop dispatch
++        _log.warning("kanban dispatcher: worker_resources_unknown sweep failed", exc_info=True)
++        return None
+diff --git a/tests/hermes_cli/test_worker_resources_unknown_alarm.py b/tests/hermes_cli/test_worker_resources_unknown_alarm.py
+new file mode 100644
+index 0000000000..82343ca9e0
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_resources_unknown_alarm.py
+@@ -0,0 +1,104 @@
++"""``worker_resources_unknown`` holding every claim on a worker opens one agent repair card per host per incident.
++
++t_01a1d5bf526e1344 (2026-11-13): a state-suite shard's board under /dev/shm stayed registered in worker-1's account
++inventory after the run deleted it, and every claim deferred ``worker_resources_unknown`` for 17 min. Only the
++"dispatcher stuck" WARNING noticed; nothing filed a card. Same fake-Board two-gateway harness as
++``test_kanban_worker_node``.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import sqlite3
++import time
++
++from hermes_cli import worker_account_boards as inventory
++from hermes_cli import worker_compute_capacity as capacity
++from hermes_cli import worker_resource_admission as admission
++from hermes_cli import worker_resources_unknown_alarm as alarm
++from tests.hermes_cli import test_kanban_worker_node as support
++
++WORKER = support.WORKER
++svc = support.svc
++gws = support.gws
++
++
++def _alarms(conn):
++    return conn.execute("SELECT * FROM tasks WHERE idempotency_key LIKE ? ORDER BY created_at, id",
++                        (f"{alarm.KEY_PREFIX}%",)).fetchall()
++
++
++def _leak_a_board(tmp_path):
++    """A registered board whose file is gone from a surviving, non-ephemeral directory: unknown, never free."""
++    board = tmp_path / "kept-dir" / "kanban.db"
++    board.parent.mkdir()
++    conn = sqlite3.connect(board)
++    try:
++        inventory.register(conn)
++    finally:
++        conn.close()
++    board.unlink()
++    return board
++
++
++def test_refusal_records_the_streak_and_names_the_record(tmp_path):
++    board = _leak_a_board(tmp_path)
++    assert admission.refusal(enabled=True) == "worker_resources_unknown"
++    state = alarm.read()
++    digest = hashlib.sha256(str(board.resolve()).encode()).hexdigest()
++    want = str(capacity.policy_root() / "worker-resources" / "boards" / f"{digest}.json")
++    assert state["record"] == want and "FileNotFoundError" in state["detail"]
++    first = state["since"]
++    assert admission.refusal(enabled=True) == "worker_resources_unknown"
++    assert alarm.read()["since"] == first  # one streak, not restarted by every claim
++    assert admission.refusal(enabled=False) is None  # a disabled gate is no observation
++    assert alarm.read()["since"] == first
++
++
++def test_any_other_answer_ends_the_streak_and_a_gap_starts_a_new_one(tmp_path):
++    alarm.observe(True, now=1000.0)
++    alarm.observe(True, now=1100.0)
++    assert alarm.read()["since"] == 1000.0
++    alarm.observe(False, now=1150.0)
++    assert alarm.read() is None
++    alarm.observe(True, now=2000.0)
++    alarm.observe(True, now=2000.0 + alarm.GAP_SECONDS + 1)  # nothing tried to claim in between
++    assert alarm.read()["since"] == 2000.0 + alarm.GAP_SECONDS + 1
++
++
++def _streak(seconds, *, record="/acct/.hermes/worker-resources/boards/abc.json"):
++    now = time.time()
++    path = capacity.policy_root() / "worker-resources" / "unknown.json"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps({"since": now - seconds, "last": now, "detail": "FileNotFoundError: gone",
++                                "record": record}))
++
++
++def test_a_streak_past_ten_minutes_files_one_card_off_this_host(gws):
++    _hub, worker = gws
++    _streak(alarm.STALL_SECONDS - 60)
++    worker.tick()
++    assert not _alarms(worker.conn)  # not long enough yet
++    _streak(alarm.STALL_SECONDS + 60)
++    worker.tick()
++    [card] = _alarms(worker.conn)
++    assert "abc.json" in card["title"] and WORKER in card["title"]
++    assert "abc.json" in card["body"] and card["human_request"] is None
++    assert f"machine:{WORKER}" not in (card["runs_on"] or "")  # the stalled host must not own its alarm
++    worker.tick()
++    assert len(_alarms(worker.conn)) == 1  # same incident: the open card is reused
++
++
++def test_a_stale_streak_files_nothing(gws):
++    _hub, worker = gws
++    path = capacity.policy_root() / "worker-resources" / "unknown.json"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    old = time.time() - 3 * 3600
++    path.write_text(json.dumps({"since": old, "last": old + 60, "detail": "x", "record": None}))
++    worker.tick()
++    assert not _alarms(worker.conn)
++
++
++def test_observe_never_raises(monkeypatch):
++    monkeypatch.setattr(alarm, "_path", lambda: (_ for _ in ()).throw(OSError("unreadable")))
++    alarm.observe(True)  # bookkeeping failure must not change the claim answer
+-- 
+2.43.0
+

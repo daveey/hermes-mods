@@ -1,0 +1,616 @@
+From fef1a058e9b25fc2fd17ca706531c0bdd8162b95 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:19:00 +0000
+Subject: [PATCH] [daveey] desktop: per-plugin JSON pools; single-flight
+ hub-sync /status
+
+>From 05:00 to 08:05 PST on 2026-11-13 the runners plugin kept 11 slow (~30 s)
+/v1/fleet reads in flight per 15 s poll. Overlapping polls and their retries
+filled the shared 50-socket JSON keep-alive pool, and every other request
+(kanban/board 1964, hub-sync/status 501) queued past its 30 s total deadline:
+2803 timeouts in 30 min. hermes-mods 61a0321c fixed runners, but nothing
+stopped the next plugin from doing the same.
+
+Plugin pools (electron/api-transport.ts, json-fetch.ts): every
+/api/plugins/<id>/... JSON request now uses an agent for that plugin, created
+lazily and capped at PLUGIN_POOL_MAX_SOCKETS = 8. A Node agent caps sockets per
+origin, and each connection is its own origin, so the cap applies per
+(connection, plugin). A plugin that floods queues only behind itself. Core
+routes keep the shared 50-socket JSON pool, kanban and hub-sync keep their own
+sockets, and the probe pool is unchanged. One shared /api/plugins/* pool was
+rejected: kanban/board is itself a plugin route and would still starve.
+
+Single-flight audit:
+- kanban/board, kanban/boards: already single-flight. A React Query interval
+  tick or a new observer joins the read in flight (no cancelRefetch), and
+  socket frames wait for it (invalidateAfterInFlight). The shared board poll
+  options are now boardPoll()/boardPollMs(), pinned by
+  api.board-poll.test.ts: a read slower than four poll intervals, page and
+  count pill both polling, a live frame mid-read, at most one read in flight.
+- hub-sync/status: was not single-flight. learnHubGatewayName runs for every
+  answering gateway on every board poll, with no in-flight dedupe and no
+  caching of a miss. Now one /status read is in flight per connection, and a
+  miss is not asked again for 60 s.
+
+Tests:
+- json-fetch.test.ts: 60 concurrent runners reads held for 30 s, then a
+  kanban/board read with a 3 s deadline. Fails on main ("Timed out connecting
+  to Hermes backend after 3000ms"). Passes with the fix, and the flood holds
+  exactly PLUGIN_POOL_MAX_SOCKETS sockets.
+- hub-sync.test.ts: 3 overlapping askers make 3 /status calls on main and 1
+  with the fix; a miss is not asked again within 60 s.
+---
+ apps/desktop/electron/api-transport.ts        | 46 ++++++++-
+ apps/desktop/electron/json-fetch.test.ts      | 99 ++++++++++++++++++-
+ apps/desktop/electron/json-fetch.ts           |  7 +-
+ .../src/plugins/kanban/api.board-poll.test.ts | 99 +++++++++++++++++++
+ apps/desktop/src/plugins/kanban/api.ts        | 14 +++
+ apps/desktop/src/plugins/kanban/board.tsx     |  7 +-
+ apps/desktop/src/plugins/kanban/plugin.tsx    |  7 +-
+ apps/desktop/src/store/hub-sync.test.ts       | 57 +++++++++--
+ apps/desktop/src/store/hub-sync.ts            | 44 +++++++--
+ 9 files changed, 352 insertions(+), 28 deletions(-)
+ create mode 100644 apps/desktop/src/plugins/kanban/api.board-poll.test.ts
+
+diff --git a/apps/desktop/electron/api-transport.ts b/apps/desktop/electron/api-transport.ts
+index 4991a2fc28..ecc167b0a8 100644
+--- a/apps/desktop/electron/api-transport.ts
++++ b/apps/desktop/electron/api-transport.ts
+@@ -76,11 +76,50 @@ const HTTPS_PROBE_AGENT = keepAliveAgent(https, PROBE_POOL_MAX_SOCKETS)
+ 
+ export type JsonRequestPool = 'json' | 'probe'
+ 
+-function jsonAgentFor(protocol: string, pool: JsonRequestPool = 'json') {
++// [daveey] Plugin pools: every `/api/plugins/<id>/...` JSON call rides a pool of its own plugin, at most
++// PLUGIN_POOL_MAX_SOCKETS sockets per connection (a Node agent caps sockets per origin, and each connection is its
++// own origin). On 2026-11-13 the runners plugin kept 11 slow (30 s) /v1/fleet reads in flight per 15 s poll; they
++// filled the shared 50-socket JSON pool and every other call (kanban/board, hub-sync/status) queued past its total
++// deadline: 2803 timeouts in 30 min. Now a plugin that floods only queues behind itself: core calls keep the JSON
++// pool and each other plugin, kanban included, keeps its own sockets.
++export const PLUGIN_POOL_MAX_SOCKETS = 8
++const PLUGIN_PATH = /^\/api\/plugins\/([^/?#]+)/
++const PLUGIN_AGENTS = new Map<string, http.Agent>()
++
++/** The plugin id a request path is addressed to (`/api/plugins/<id>/...`), or null for a core route. */
++export function pluginOfPath(pathname: string): null | string {
++  const match = PLUGIN_PATH.exec(pathname || '')
++
++  return match ? match[1].toLowerCase() : null
++}
++
++function pluginAgentFor(protocol: string, plugin: string): http.Agent {
++  const key = `${protocol === 'https:' ? 'https' : 'http'}:${plugin}`
++  let agent = PLUGIN_AGENTS.get(key)
++
++  if (!agent) {
++    agent = keepAliveAgent(protocol === 'https:' ? https : http, PLUGIN_POOL_MAX_SOCKETS)
++    PLUGIN_AGENTS.set(key, agent)
++  }
++
++  return agent
++}
++
++/**
++ * The agent for one JSON request. `pathname` (the request URL's path) routes a plugin route to that plugin's own
++ * pool; the probe pool and core routes are unchanged.
++ */
++function jsonAgentFor(protocol: string, pool: JsonRequestPool = 'json', pathname = '') {
+   if (pool === 'probe') {
+     return protocol === 'https:' ? HTTPS_PROBE_AGENT : HTTP_PROBE_AGENT
+   }
+ 
++  const plugin = pluginOfPath(pathname)
++
++  if (plugin) {
++    return pluginAgentFor(protocol, plugin)
++  }
++
+   return protocol === 'https:' ? HTTPS_JSON_AGENT : HTTP_JSON_AGENT
+ }
+ 
+@@ -97,10 +136,13 @@ function destroyKeepaliveAgents() {
+     HTTP_PROBE_AGENT,
+     HTTPS_PROBE_AGENT,
+     HTTP_DOWNLOAD_AGENT,
+-    HTTPS_DOWNLOAD_AGENT
++    HTTPS_DOWNLOAD_AGENT,
++    ...PLUGIN_AGENTS.values()
+   ]) {
+     agent.destroy()
+   }
++
++  PLUGIN_AGENTS.clear()
+ }
+ 
+ function requestTimeoutError(timeoutMs: number): Error {
+diff --git a/apps/desktop/electron/json-fetch.test.ts b/apps/desktop/electron/json-fetch.test.ts
+index 8e42146d0b..7bbb479541 100644
+--- a/apps/desktop/electron/json-fetch.test.ts
++++ b/apps/desktop/electron/json-fetch.test.ts
+@@ -3,7 +3,13 @@ import type { AddressInfo } from 'node:net'
+ 
+ import { afterAll, describe, expect, it } from 'vitest'
+ 
+-import { destroyKeepaliveAgents, PROBE_POOL_MAX_SOCKETS, requestDeadlineBudgetMs } from './api-transport'
++import {
++  destroyKeepaliveAgents,
++  PLUGIN_POOL_MAX_SOCKETS,
++  pluginOfPath,
++  PROBE_POOL_MAX_SOCKETS,
++  requestDeadlineBudgetMs
++} from './api-transport'
+ import { fetchJsonWith, fetchPublicJsonWith, type JsonFetchDeps } from './json-fetch'
+ 
+ /**
+@@ -146,6 +152,97 @@ describe('fetchJson request pools', () => {
+   })
+ })
+ 
++describe('fetchJson plugin pools', () => {
++  // [daveey] 2026-11-13: the runners plugin kept ~11 slow /v1/fleet reads in flight per 15 s poll, each answered after
++  // ~30 s; overlapping polls and their retries filled the 50-socket JSON pool, and kanban/board queued past its total
++  // deadline. 60 such reads is more than the JSON pool holds, so on a shared pool the board read below can't get a
++  // socket at all.
++  const SLOW_PLUGIN_CALLS = 60
++  const SLOW_RESPONSE_MS = 30_000
++  const BOARD_DEADLINE_MS = 3_000
++
++  /** /api/plugins/runners/* answers after SLOW_RESPONSE_MS (or at `release()`); every other path answers at once. */
++  function slowPluginServer() {
++    const slow: Array<{ res: http.ServerResponse; timer: ReturnType<typeof setTimeout> }> = []
++
++    const answer = (res: http.ServerResponse) => {
++      res.writeHead(200, { 'Content-Type': 'application/json' })
++      res.end('{"ok":true}')
++    }
++
++    const server = loopbackServer((req, res) => {
++      if (req.url?.startsWith('/api/plugins/runners/')) {
++        const entry = { res, timer: setTimeout(() => answer(res), SLOW_RESPONSE_MS) }
++        slow.push(entry)
++
++        return
++      }
++
++      res.writeHead(200, { 'Content-Type': 'application/json' })
++      res.end(JSON.stringify({ path: req.url }))
++    })
++
++    return {
++      slow,
++      ...server,
++      release() {
++        for (const { res, timer } of slow.splice(0)) {
++          clearTimeout(timer)
++          answer(res)
++        }
++      }
++    }
++  }
++
++  it('one plugin with 30 s responses cannot starve a concurrent kanban/board read', async () => {
++    const srv = slowPluginServer()
++    const base = await srv.listen()
++
++    const flood = Array.from({ length: SLOW_PLUGIN_CALLS }, () =>
++      fetchJsonWith(deps, `${base}/api/plugins/runners/fleet`, 'token', { timeoutMs: SLOW_RESPONSE_MS * 2 })
++    )
++
++    try {
++      // The flood holds every socket its pool will give it before the board read goes out.
++      const until = Date.now() + 2_000
++
++      while (srv.slow.length < Math.min(SLOW_PLUGIN_CALLS, 50) && Date.now() < until) {
++        await new Promise(resolve => setTimeout(resolve, 10))
++      }
++
++      const startedAt = Date.now()
++
++      await expect(
++        fetchJsonWith(deps, `${base}/api/plugins/kanban/board?board=default`, 'token', { timeoutMs: BOARD_DEADLINE_MS })
++      ).resolves.toEqual({ path: '/api/plugins/kanban/board?board=default' })
++      expect(Date.now() - startedAt).toBeLessThan(BOARD_DEADLINE_MS)
++      // A core route is not held behind the flood either.
++      await expect(
++        fetchJsonWith(deps, `${base}/api/status`, 'token', { timeoutMs: BOARD_DEADLINE_MS })
++      ).resolves.toEqual({
++        path: '/api/status'
++      })
++      // The flooding plugin holds at most its own share of sockets on this connection.
++      expect(srv.slow.length).toBe(PLUGIN_POOL_MAX_SOCKETS)
++    } finally {
++      // Answer the held reads, then each queued one as it reaches the server, so the flood settles before close.
++      const drain = setInterval(() => srv.release(), 5)
++      await Promise.allSettled(flood)
++      clearInterval(drain)
++      await srv.close()
++    }
++  }, 20_000)
++
++  it('names the plugin a path is addressed to, and only plugin paths', () => {
++    expect(pluginOfPath('/api/plugins/kanban/board')).toBe('kanban')
++    expect(pluginOfPath('/api/plugins/Hub-Sync/status')).toBe('hub-sync')
++    expect(pluginOfPath('/api/plugins/runners')).toBe('runners')
++    expect(pluginOfPath('/api/status')).toBeNull()
++    expect(pluginOfPath('/api/pluginsx/kanban')).toBeNull()
++    expect(pluginOfPath('')).toBeNull()
++  })
++})
++
+ const helpers = {
+   fetchJson: (url: string, options: any) => fetchJsonWith(deps, url, 'session-token', options),
+   fetchPublicJson: (url: string, options: any) => fetchPublicJsonWith(deps, url, options)
+diff --git a/apps/desktop/electron/json-fetch.ts b/apps/desktop/electron/json-fetch.ts
+index 78cf40bd11..a4d318ca19 100644
+--- a/apps/desktop/electron/json-fetch.ts
++++ b/apps/desktop/electron/json-fetch.ts
+@@ -58,8 +58,9 @@ export function fetchJsonWith(deps: JsonFetchDeps, url: string, token: null | st
+ 
+         const parsed = new URL(url)
+         const client = parsed.protocol === 'https:' ? https : http
+-        // The dispatch health probe rides its own small pool (pool: 'probe') so a saturated JSON pool can't fail it.
+-        const agent = jsonAgentFor(parsed.protocol, options.pool === 'probe' ? 'probe' : 'json')
++        // The dispatch health probe rides its own small pool (pool: 'probe') so a saturated JSON pool can't fail it;
++        // a plugin route rides its plugin's own pool (api-transport PLUGIN_POOL_MAX_SOCKETS) so one plugin can't.
++        const agent = jsonAgentFor(parsed.protocol, options.pool === 'probe' ? 'probe' : 'json', parsed.pathname)
+ 
+         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+           reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+@@ -182,7 +183,7 @@ export function fetchPublicJsonWith(deps: JsonFetchDeps, url: string, options: a
+         }
+ 
+         const client = parsed.protocol === 'https:' ? https : http
+-        const agent = jsonAgentFor(parsed.protocol)
++        const agent = jsonAgentFor(parsed.protocol, 'json', parsed.pathname)
+ 
+         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+           reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+diff --git a/apps/desktop/src/plugins/kanban/api.board-poll.test.ts b/apps/desktop/src/plugins/kanban/api.board-poll.test.ts
+new file mode 100644
+index 0000000000..0e0f6279c5
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/api.board-poll.test.ts
+@@ -0,0 +1,99 @@
++import { type PluginRestOptions, type PluginStorage, queryClient } from '@hermes/plugin-sdk'
++import { QueryObserver } from '@tanstack/react-query'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++// [daveey] A board read slower than the board poll interval must not stack polls. On 2026-11-13 board reads queued
++// 30 s behind a saturated socket pool; every overlapping read would have been one more request in that queue. The
++// page and the count pill poll the same key (boardPoll), the socket opens at that key's snapshot, and live frames
++// refresh it only after the read in flight settles, so there is at most one board read in flight at a time.
++// (completion-notify's one-time per-board baseline read is not a poll; it is stubbed out here.)
++vi.mock('./completion-notify', () => ({
++  bindCompletionNotify: vi.fn(),
++  onKanbanEventsFrame: vi.fn(async () => false)
++}))
++
++const { $boardSlug, bindApi, boardPoll, boardPollMs, fetchBoard } = await import('./api')
++const { setConnection } = await import('@/store/session')
++
++const BOARD = { assignees: [], columns: [], latest_event_id: 7, now: 0, tenants: [] }
++
++const storage = (slug: string): PluginStorage => ({
++  get: <T>(key: string, fallback: T) => (key === 'boardSlug' ? (slug as T) : fallback),
++  remove: vi.fn(),
++  set: vi.fn()
++})
++
++afterEach(() => {
++  vi.useRealTimers()
++  setConnection(null)
++  $boardSlug.set('')
++  queryClient.clear()
++})
++
++describe('kanban board poll', () => {
++  it('a slow board read does not start overlapping polls', async () => {
++    vi.useFakeTimers()
++
++    const boardReads: Array<(board: typeof BOARD) => void> = []
++    let onFrame: (data: unknown) => void = () => undefined
++
++    const rest = async <T>(path: string, _opts?: PluginRestOptions): Promise<T> => {
++      if (path === '/board?board=ops') {
++        // Answers only when the test says so: far slower than the poll interval.
++        return new Promise<T>(resolve => boardReads.push(board => resolve(board as T)))
++      }
++
++      throw new Error(`unexpected REST path: ${path}`)
++    }
++
++    const socket = vi.fn((_path: string, handler: (data: unknown) => void) => {
++      onFrame = handler
++
++      return vi.fn()
++    })
++
++    const dispose = bindApi(rest, storage('ops'), socket)
++
++    // The board page (fast poll) and the count pill (slow poll) on the same board.
++    const page = new QueryObserver(queryClient, {
++      ...boardPoll('local', 'ops', false, boardPollMs(true)),
++      queryFn: () => fetchBoard(false)
++    })
++
++    const pill = new QueryObserver(queryClient, {
++      ...boardPoll('local', 'ops', false, boardPollMs(false)),
++      queryFn: () => fetchBoard(false)
++    })
++
++    const unsubscribe = [page.subscribe(() => undefined), pill.subscribe(() => undefined)]
++
++    try {
++      await vi.advanceTimersByTimeAsync(0)
++      expect(boardReads).toHaveLength(1)
++
++      // Four of the page's poll intervals and one of the pill's pass while the first read is still out.
++      await vi.advanceTimersByTimeAsync(boardPollMs(true) * 4 + 1)
++      expect(boardReads).toHaveLength(1)
++
++      // It answers: the socket opens at its tail, and the next interval tick reads once more.
++      boardReads[0](BOARD)
++      await vi.advanceTimersByTimeAsync(0)
++      expect(socket).toHaveBeenCalledWith('/events?board=ops&since=7', expect.any(Function))
++      await vi.advanceTimersByTimeAsync(boardPollMs(true))
++      expect(boardReads).toHaveLength(2)
++
++      // A live frame while that second read is slow waits for it instead of starting a parallel read.
++      onFrame({ cursor: 8, events: [{ task_id: 't1' }] })
++      await vi.advanceTimersByTimeAsync(boardPollMs(true) * 2 + 1)
++      expect(boardReads).toHaveLength(2)
++
++      // Once it settles, the deferred refresh reads exactly once.
++      boardReads[1](BOARD)
++      await vi.advanceTimersByTimeAsync(0)
++      expect(boardReads).toHaveLength(3)
++    } finally {
++      unsubscribe.forEach(stop => stop())
++      dispose()
++    }
++  })
++})
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index f9186533fe..5d8217c350 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -536,6 +536,19 @@ function withBoard(path: string, params: Record<string, string> = {}): string {
+ export const boardKeyPrefix = (scope: string) => ['kanban', 'board', scope] as const
+ export const boardKey = (scope: string, slug: string, archived: boolean) =>
+   [...boardKeyPrefix(scope), slug, archived] as const
++
++/** [daveey] Board poll interval: the socketless heartbeat, faster when the board spans gateways (no socket there). */
++export const boardPollMs = (spansGateways: boolean) => (spansGateways ? 15_000 : 60_000)
++
++/** [daveey] The board poll every board view runs (page, count pill), minus its queryFn (`() => fetchBoard(archived)`,
++ *  added at the call site so test doubles of fetchBoard apply): one key, so one cache and one poll. Single-flight: an
++ *  interval tick (and a new view mounting) while a read is in flight joins it rather than starting another, because
++ *  neither passes cancelRefetch; socket refreshes wait for the read in flight (invalidateAfterInFlight).
++ *  api.board-poll.test.ts pins that a board read slower than the interval does not stack polls. */
++export const boardPoll = (scope: string, slug: string, archived: boolean, refetchInterval: number) => ({
++  queryKey: boardKey(scope, slug, archived),
++  refetchInterval
++})
+ export const taskKey = (scope: string, slug: string, id: string, owner?: TaskOwner) =>
+   owner
+     ? (['kanban', 'task', owner.gateway, owner.board, id, owner.profile] as const)
+@@ -1047,6 +1060,7 @@ export const fetchTask = async (id: string, owner?: TaskOwner, read: PluginRestO
+   const downloadAttachment = captureGatewayFileDownload(
+     owner ? { connectionId: owner.gateway, profile: owner.profile } : undefined
+   )
++
+   const [path, opts] = forTask(id, `/tasks/${id}`, {}, owner)
+   const detail = await call<KanbanTaskDetail>(path, { ...opts, ...read })
+ 
+diff --git a/apps/desktop/src/plugins/kanban/board.tsx b/apps/desktop/src/plugins/kanban/board.tsx
+index a3a895e0d5..84ac3087ea 100644
+--- a/apps/desktop/src/plugins/kanban/board.tsx
++++ b/apps/desktop/src/plugins/kanban/board.tsx
+@@ -71,6 +71,8 @@ import {
+   $lanesByProfile,
+   boardKey,
+   boardKeyPrefix,
++  boardPoll,
++  boardPollMs,
+   boardsKey,
+   bulkTasks,
+   createTask,
+@@ -1215,9 +1217,8 @@ export function KanbanBoardPage() {
+   const spansGateways = gateways.length > 1
+ 
+   const { data: board, error } = useQuery({
+-    queryFn: () => fetchBoard(archived),
+-    queryKey: boardKey(scope, slug, archived),
+-    refetchInterval: spansGateways ? 15_000 : 60_000
++    ...boardPoll(scope, slug, archived, boardPollMs(spansGateways)),
++    queryFn: () => fetchBoard(archived)
+   })
+ 
+   // A filter naming a gateway that left the registry shows everything.
+diff --git a/apps/desktop/src/plugins/kanban/plugin.tsx b/apps/desktop/src/plugins/kanban/plugin.tsx
+index d58e08668a..8bd12eaf18 100644
+--- a/apps/desktop/src/plugins/kanban/plugin.tsx
++++ b/apps/desktop/src/plugins/kanban/plugin.tsx
+@@ -31,7 +31,7 @@ import {
+   useValue
+ } from '@hermes/plugin-sdk'
+ 
+-import { $boardSlug, bindApi, boardKey, fetchBoard, rememberTaskOwner, useKanbanScope } from './api'
++import { $boardSlug, bindApi, boardPoll, boardPollMs, fetchBoard, rememberTaskOwner, useKanbanScope } from './api'
+ import { $blockedSectionOpen, BlockedTasksSection } from './blocked-section'
+ import { KanbanBoardPage } from './board'
+ import { KANBAN_LOCALES } from './i18n'
+@@ -49,9 +49,8 @@ function KanbanCount() {
+ 
+   // Socket-invalidated like the page (same cache); slow socketless heartbeat.
+   const { data: board } = useQuery({
+-    queryFn: () => fetchBoard(false),
+-    queryKey: boardKey(scope, slug, false),
+-    refetchInterval: 60_000
++    ...boardPoll(scope, slug, false, boardPollMs(false)),
++    queryFn: () => fetchBoard(false)
+   })
+ 
+   if (!board) {
+diff --git a/apps/desktop/src/store/hub-sync.test.ts b/apps/desktop/src/store/hub-sync.test.ts
+index 12585aa101..1668326732 100644
+--- a/apps/desktop/src/store/hub-sync.test.ts
++++ b/apps/desktop/src/store/hub-sync.test.ts
+@@ -58,16 +58,25 @@ describe('gateway names', () => {
+     $connectionsRegistry.set(null)
+     rest.handler = () => new Error('backend not running')
+     expect(await learnHubGatewayName('local')).toBe(false)
+-    expect(pluginRest).toHaveBeenLastCalledWith('hub-sync', '/status', expect.objectContaining({connectionId: 'local', passive: true}))
+-    registry({id:'local'}, {id:'remote'})
+-    rest.handler = () => ({gateway:'remote',available:true})
++    expect(pluginRest).toHaveBeenLastCalledWith(
++      'hub-sync',
++      '/status',
++      expect.objectContaining({ connectionId: 'local', passive: true })
++    )
++    registry({ id: 'local' }, { id: 'remote' })
++    rest.handler = () => ({ gateway: 'remote', available: true })
+     expect(await learnHubGatewayName('remote')).toBe(true)
+-    expect(pluginRest).toHaveBeenLastCalledWith('hub-sync', '/status', expect.objectContaining({connectionId: 'remote', passive: true}))
++    expect(pluginRest).toHaveBeenLastCalledWith(
++      'hub-sync',
++      '/status',
++      expect.objectContaining({ connectionId: 'remote', passive: true })
++    )
+   })
+ 
+-  it('learns a connection\'s hub name from its own /status and persists it', async () => {
++  it("learns a connection's hub name from its own /status and persists it", async () => {
+     registry({ id: 'local' }, { id: 'conn-7', label: 'Studio' })
+-    rest.handler = (path, opts) => (path === '/status' && opts.connectionId === 'conn-7' ? { available: true, gateway: 'mini' } : new Error('x'))
++    rest.handler = (path, opts) =>
++      path === '/status' && opts.connectionId === 'conn-7' ? { available: true, gateway: 'mini' } : new Error('x')
+ 
+     expect(await learnHubGatewayName('conn-7')).toBe(true)
+     expect(hubGatewayForConnection('conn-7')).toBe('mini')
+@@ -103,6 +112,40 @@ describe('gateway names', () => {
+     expect(connectionForHubGateway('mini')).toBe('new')
+     expect(hubGatewayForConnection('old')).toBeUndefined()
+   })
++
++  it('a slow /status is single-flight: overlapping askers share one read', async () => {
++    registry({ id: 'local' }, { id: 'slow' })
++    let answer!: (value: unknown) => void
++    rest.handler = () => new Promise(resolve => (answer = resolve))
++
++    const asks = [learnHubGatewayName('slow'), learnHubGatewayName('slow'), learnHubGatewayName('slow')]
++
++    await Promise.resolve()
++    expect(pluginRest).toHaveBeenCalledTimes(1)
++    answer({ available: true, gateway: 'mini' })
++    expect(await Promise.all(asks)).toEqual([true, true, true])
++    expect(pluginRest).toHaveBeenCalledTimes(1)
++  })
++
++  it('a failed or hub-less /status is not re-asked on every board poll', async () => {
++    vi.useFakeTimers()
++
++    try {
++      registry({ id: 'local' }, { id: 'cloud' })
++      rest.handler = () => ({ available: false, gateway: null })
++
++      expect(await learnHubGatewayName('cloud')).toBe(false)
++      vi.advanceTimersByTime(15_000)
++      expect(await learnHubGatewayName('cloud')).toBe(false)
++      expect(pluginRest).toHaveBeenCalledTimes(1)
++      vi.advanceTimersByTime(60_000)
++      rest.handler = () => ({ available: true, gateway: 'cloud-gw' })
++      expect(await learnHubGatewayName('cloud')).toBe(true)
++      expect(pluginRest).toHaveBeenCalledTimes(2)
++    } finally {
++      vi.useRealTimers()
++    }
++  })
+ })
+ 
+ describe('hubSessionOwner', () => {
+@@ -155,7 +198,7 @@ describe('hubSessionOwner', () => {
+ })
+ 
+ describe('hubRequest', () => {
+-  it('posts to the primary gateway\'s hub-sync', async () => {
++  it("posts to the primary gateway's hub-sync", async () => {
+     registry({ id: 'local' }, { id: 'mini' })
+     rest.handler = (path, opts) => ({ id: 'hr-1', path, opts, queued_locally: true, state: 'local' })
+ 
+diff --git a/apps/desktop/src/store/hub-sync.ts b/apps/desktop/src/store/hub-sync.ts
+index 1852278d79..58c61e0941 100644
+--- a/apps/desktop/src/store/hub-sync.ts
++++ b/apps/desktop/src/store/hub-sync.ts
+@@ -225,9 +225,17 @@ export async function hubGet<T extends object>(
+ }
+ 
+ const statusChecked = new Map<string, number>()
+-
+-/** Ask `connectionId` which hub gateway it is (cached STATUS_TTL_MS). True
+- *  when it answered — which also proves the gateway is reachable now. */
++/** [daveey] A /status read in flight per connection: concurrent askers (every board poll's answering gateways,
++ *  project routing) share it instead of each opening one. */
++const statusInFlight = new Map<string, Promise<boolean>>()
++/** [daveey] When a connection's /status last failed or said "no hub-sync": not asked again for STATUS_RETRY_MS.
++ *  Board polls ask every answering gateway each 15 s, so a gateway without hub-sync (or a slow one) was asked on
++ *  every poll: 501 hub-sync/status timeouts in 30 min on 2026-11-13. */
++const statusFailedAt = new Map<string, number>()
++const STATUS_RETRY_MS = 60_000
++
++/** Ask `connectionId` which hub gateway it is (cached STATUS_TTL_MS; a miss is not re-asked for STATUS_RETRY_MS;
++ *  single-flight per connection). True when it answered — which also proves the gateway is reachable now. */
+ export async function learnHubGatewayName(connectionId: string): Promise<boolean> {
+   const at = statusChecked.get(connectionId)
+ 
+@@ -235,15 +243,33 @@ export async function learnHubGatewayName(connectionId: string): Promise<boolean
+     return true
+   }
+ 
+-  const status = await hubGet<{ gateway?: string }>('/status', connectionId)
++  const failedAt = statusFailedAt.get(connectionId)
+ 
+-  if (status?.gateway) {
+-    statusChecked.set(connectionId, Date.now())
++  if (failedAt !== undefined && Date.now() - failedAt < STATUS_RETRY_MS) {
++    return false
++  }
+ 
+-    return true
++  let pending = statusInFlight.get(connectionId)
++
++  if (!pending) {
++    pending = hubGet<{ gateway?: string }>('/status', connectionId)
++      .then(status => {
++        if (status?.gateway) {
++          statusChecked.set(connectionId, Date.now())
++          statusFailedAt.delete(connectionId)
++
++          return true
++        }
++
++        statusFailedAt.set(connectionId, Date.now())
++
++        return false
++      })
++      .finally(() => statusInFlight.delete(connectionId))
++    statusInFlight.set(connectionId, pending)
+   }
+ 
+-  return false
++  return pending
+ }
+ 
+ /** Queue an owner request on the primary gateway (works with the hub down). */
+@@ -370,6 +396,8 @@ export function _resetHubSyncForTests(): void {
+   }
+ 
+   statusChecked.clear()
++  statusInFlight.clear()
++  statusFailedAt.clear()
+   whereCache.clear()
+   whereInFlight.clear()
+ }
+-- 
+2.43.0
+

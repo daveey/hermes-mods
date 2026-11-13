@@ -1,0 +1,181 @@
+From aca3d608f87b552bf58474c9243a5819cc21642a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:21:37 +0000
+Subject: [PATCH] [daveey] kanban resume: a core-update requeue does not spend
+ the operator resume receipt
+
+Problem: an operator resume grants an active_pr-held card one continuation. When
+hermes-sync's restart-safe core-update requeue reclaimed that continuation run, the
+guard held the card active_pr again with no work done (MacBook board,
+t_01a1d560c6d3bc3c, 2026-11-13: run 14054 requeued, a second resume was needed).
+
+Why: resumed_after() compared the receipt's after_run with the raw newest task_runs
+row, so the requeued run counted as the run that consumed it. Every other one-shot
+handoff (released_after, the dependency-park handoff) already passes over requeues.
+
+Fix: walk runs newest first, passing over core-update requeues and attested unused
+grants (kanban_core_update_requeue._skipped, the view latest_run_skipping_requeues
+uses). The receipt holds while the named run is reached before any real run, so it
+survives a requeue after it and is honoured when it names a requeued run itself. Fail
+closed as before: the next real claim, a crash/timeout/gave_up/spawn_failed event, or
+a reclaim with any other reason spends it.
+
+Proof: tests/hermes_cli/test_kanban_operator_resume_requeue.py. RED on b3745e62d5
+(2 failed: guard returned active_pr after the requeue); GREEN with the fix, plus all
+14 test files importing kanban_operator_resume / kanban_hold_release /
+kanban_core_update_requeue (230 passed).
+---
+ hermes_cli/kanban_operator_resume.py          | 30 +++++--
+ .../test_kanban_operator_resume_requeue.py    | 82 +++++++++++++++++++
+ 2 files changed, 105 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_operator_resume_requeue.py
+
+diff --git a/hermes_cli/kanban_operator_resume.py b/hermes_cli/kanban_operator_resume.py
+index 2ec3d817ae..89d3fb40dd 100644
+--- a/hermes_cli/kanban_operator_resume.py
++++ b/hermes_cli/kanban_operator_resume.py
+@@ -7,7 +7,8 @@ process or its tool shells) is refused, so an implementer cannot resume itself.
+ 
+ One continuation: the receipt names the card's latest run by portable identity and
+ lapses as soon as a newer run is claimed, so a crash of the resumed run guards again.
+-It never authorizes a merge.
++A hermes-sync core-update requeue is a pause, not a run (:mod:`kanban_core_update_requeue`):
++it neither spends the receipt nor stops one recorded after it. It never authorizes a merge.
+ """
+ from __future__ import annotations
+ 
+@@ -86,12 +87,29 @@ def resume(conn, task_id: str, *, reason: str, actor: str) -> dict:
+     return payload
+ 
+ 
++def _still_current(conn, task_id, after) -> bool:
++    """``after`` names the newest run once core-update requeues (pauses) are passed over.
++
++    Walk newest first: a requeue may follow the named run or be the named run itself; the
++    first real run that is not the named one (a claim, crash or other reclaim) spends it."""
++    from hermes_cli.kanban_core_update_requeue import _skipped
++    from hermes_cli.kanban_dependency_review import _checkpoint_matches_run
++
++    for run in conn.execute("SELECT * FROM task_runs WHERE task_id = ? ORDER BY id DESC", (task_id,)):
++        if isinstance(after, dict) and _checkpoint_matches_run(after, run):
++            return True
++        if not _skipped(conn, run):
++            return False
++    return after is None
++
++
+ def resumed_after(conn, task_id: str, since: int) -> bool:
+-    """A receipt strictly after the newest PR comment whose run is still the latest run."""
++    """A receipt strictly after the newest PR comment whose run is still the latest run.
++
++    "Latest" skips hermes-sync core-update requeues, as ``released_after`` does: a requeue
++    is a pause, so it neither spends the receipt nor stops one recorded right after it."""
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_dependency_review import _checkpoint_matches_run
+ 
+-    latest = _latest_run(conn, task_id)
+     now = int(time.time())
+     for event in conn.execute("SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ?",
+                               (task_id, EVENT)):
+@@ -101,9 +119,7 @@ def resumed_after(conn, task_id: str, since: int) -> bool:
+                 or data.get("scope") != "one_continuation" or data.get("merge_authorized") is not False):
+             continue
+         after = data.get("after_run", False)
+-        if after is None and latest is None:
+-            return True
+-        if isinstance(after, dict) and latest is not None and _checkpoint_matches_run(after, latest):
++        if (after is None or isinstance(after, dict)) and _still_current(conn, task_id, after):
+             return True
+     return False
+ 
+diff --git a/tests/hermes_cli/test_kanban_operator_resume_requeue.py b/tests/hermes_cli/test_kanban_operator_resume_requeue.py
+new file mode 100644
+index 0000000000..c12a2c4762
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_operator_resume_requeue.py
+@@ -0,0 +1,82 @@
++"""An operator resume survives a hermes-sync core-update requeue of the resumed run. [daveey]
++
++Production (MacBook board, t_01a1d560c6d3bc3c, 2026-11-13): an operator resumed a card held
++``active_pr``; its run 14054 was requeued 5 min later by the core updater's restart-safe
++requeue and changed nothing, yet the guard held the card ``active_pr`` again because the
++receipt named the run before 14054. A requeue is a pause (:mod:`kanban_core_update_requeue`),
++so the receipt stays valid; the next real claim, a crash or any other reclaim still spends it.
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_operator_resume as resume
++from hermes_cli.kanban_core_update_requeue import CORE_UPDATE_REQUEUE_REASON
++from tests.hermes_cli import test_kanban_operator_resume as base
++
++kanban_home, clock, _held, _guard = base.kanban_home, base.clock, base._held, base._guard
++
++
++def _resumed(clock):
++    with kbc.connect_closing() as conn:
++        tid = _held(conn)  # R0: published the PR, then crashed
++        clock[0] += 60
++        resume.resume(conn, tid, reason="operator: continue the PR", actor="op")
++    assert _guard(tid) is None
++    return tid
++
++
++def _run(clock, tid, reason, *, crashed=False):
++    clock[0] += 60
++    with kbc.connect_closing() as conn:
++        claimed = kb.claim_task(conn, tid)
++        assert claimed is not None
++        if crashed:
++            run_id = kb.get_task(conn, tid).current_run_id
++            with kb.write_txn(conn):
++                kb._append_event(conn, tid, "crashed", {"error": "boom"}, run_id=run_id)
++        clock[0] += 60
++        assert kb.reclaim_task(conn, tid, reason=reason, signal_fn=lambda *_: None)
++        assert kb.get_task(conn, tid).status == "ready"
++
++
++def test_core_update_requeue_keeps_the_receipt_until_the_next_real_run(kanban_home, clock):
++    tid = _resumed(clock)
++    _run(clock, tid, CORE_UPDATE_REQUEUE_REASON)  # R1: requeued, a pause
++    assert _guard(tid) is None
++    _run(clock, tid, CORE_UPDATE_REQUEUE_REASON)  # a second drain is still a pause
++    assert _guard(tid) is None
++    _run(clock, tid, "worker crashed")  # R2: the real continuation spends the receipt
++    assert _guard(tid) == "active_pr"
++
++
++def test_resume_recorded_while_newest_run_is_requeued_is_honoured(kanban_home, clock):
++    with kbc.connect_closing() as conn:
++        tid = _held(conn)
++    _run(clock, tid, CORE_UPDATE_REQUEUE_REASON)  # the newest run is a requeue (the 08:07 resume)
++    assert _guard(tid) == "active_pr"
++    clock[0] += 60
++    with kbc.connect_closing() as conn:
++        payload = resume.resume(conn, tid, reason="operator: continue the PR", actor="op")
++        newest = conn.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
++                              (tid,)).fetchone()
++    assert newest["outcome"] == "reclaimed" and payload["after_run"] == resume._identity(newest)
++    assert _guard(tid) is None
++    _run(clock, tid, CORE_UPDATE_REQUEUE_REASON)
++    assert _guard(tid) is None
++    _run(clock, tid, "worker crashed")
++    assert _guard(tid) == "active_pr"
++
++
++@pytest.mark.parametrize("reason,crashed", [
++    (CORE_UPDATE_REQUEUE_REASON, True),  # a requeue with crash evidence is no pause
++    ("worker crashed", False),
++    (CORE_UPDATE_REQUEUE_REASON + " (by hand)", False),
++    (None, False),
++], ids=["requeue_with_crash_event", "crash", "near_miss_reason", "no_reason"])
++def test_crash_or_other_reclaim_spends_the_receipt(kanban_home, clock, reason, crashed):
++    tid = _resumed(clock)
++    _run(clock, tid, reason, crashed=crashed)
++    assert _guard(tid) == "active_pr"
+-- 
+2.43.0
+

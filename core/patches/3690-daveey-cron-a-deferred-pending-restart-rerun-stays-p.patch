@@ -1,0 +1,166 @@
+From 4d32262db6f6acf60c270c67cebd3f3e63a1a875 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:11:26 +0000
+Subject: [PATCH] [daveey] cron: a deferred pending restart rerun stays pending
+ (held in DarkWake, exempt from one-shot grace)
+
+Follow-up to PR #2364 (a4d31b4651), review 5894674747 nit 1, card t_01a1d5c5d776510c.
+
+Gap: when the draining owner refused a pending restart rerun (defer_unadmitted), _marker kept the
+rerun's `at` (so the next attempt is still recognised as the rerun) but _apply re-armed
+next_run_at=now. pending_rerun compares next_run_at to marker.at, so it read False: the re-armed
+rerun was neither held in a DarkWake (hold_for_wake) nor exempt from the one-shot grace gate
+(retire_expired_oneshot), and a one-shot rerun held past ONESHOT_GRACE_SECONDS would be retired.
+
+Fix: the kept marker also records the re-arm instant as `fire_at`; pending_rerun matches
+next_run_at against `fire_at` when present, else `at`. `at` keeps its meaning for _skip_reason.
+
+Tests:
+- new test_deferred_pending_rerun_stays_held_and_survives_the_oneshot_grace[in 30m, every 120m]:
+  defer a pending rerun, assert pending_rerun, held while host_fully_awake() is False, not retired
+  past ONESHOT_GRACE_SECONDS, fires on full wake. RED at base 3de04d8928 (2 failed: "the deferred
+  rerun is no longer pending"), GREEN at head.
+- the `clock` (test_restart_rerun.py) and `home` (test_restart_cut.py) fixtures stub
+  host_fully_awake to True, so the pre-existing rerun-is-due tests and
+  test_owner_cut_of_a_rerun_that_was_awake_ten_minutes_stops no longer depend on a MacBook's power
+  state; dropped the now-unneeded raising=False.
+- tests/cron/test_restart_rerun.py + test_restart_cut.py: 80 passed. tests/cron +
+  test_messaging_exactly_once + test_session_cron: 2656 passed, 0 failed. scripts/check: 19 ok.
+---
+ cron/restart_rerun.py            | 11 ++++++----
+ tests/cron/test_restart_cut.py   |  3 ++-
+ tests/cron/test_restart_rerun.py | 35 ++++++++++++++++++++++++++++++--
+ 3 files changed, 42 insertions(+), 7 deletions(-)
+
+diff --git a/cron/restart_rerun.py b/cron/restart_rerun.py
+index bd0a0e39ca..ea1b27b967 100644
+--- a/cron/restart_rerun.py
++++ b/cron/restart_rerun.py
+@@ -178,7 +178,9 @@ def _future_slot_pending(job: dict[str, Any], now: str) -> bool:
+ def _marker(job: dict[str, Any], record: dict[str, Any], now: str, deferred: bool,
+             reruns: int = 1) -> dict[str, Any]:
+     """The loop guard written with a reschedule. A deferral marks itself ``deferred`` so it spends no
+-    rerun, except when it defers a pending rerun: that keeps the rerun's time, still unsettled.
++    rerun, except when it defers a pending rerun: that keeps the rerun's time, still unsettled, and
++    records the re-armed fire's own instant as ``fire_at`` (``pending_rerun`` reads it), so the
++    deferred rerun is still held in a DarkWake and exempt from the one-shot grace gate.
+     ``reruns`` counts the reruns this original cut has spent (written only past the first)."""
+     if not deferred:
+         marker: dict[str, Any] = {"execution_id": record["id"], "at": now}
+@@ -188,7 +190,7 @@ def _marker(job: dict[str, Any], record: dict[str, Any], now: str, deferred: boo
+     prior = job.get(MARKER_KEY)
+     if (isinstance(prior, dict) and not prior.get("deferred") and not prior.get("settled")
+             and _parse(prior.get("at")) is not None):
+-        kept = {"execution_id": record["id"], "at": prior["at"]}
++        kept = {"execution_id": record["id"], "at": prior["at"], "fire_at": now}
+         if prior.get("reruns"):
+             kept["reruns"] = prior["reruns"]
+         return kept
+@@ -221,13 +223,14 @@ def _apply(job: dict[str, Any], record: dict[str, Any], now: str, deferred: bool
+ 
+ 
+ def pending_rerun(job: dict[str, Any]) -> bool:
+-    """Whether the job's queued fire is a restart rerun no run has claimed yet."""
++    """Whether the job's queued fire is a restart rerun no run has claimed yet. A deferred pending
++    rerun keeps the rerun's ``at`` and is queued at its re-arm instant ``fire_at`` (``_marker``)."""
+     from cron import extra_fire
+ 
+     marker = job.get(MARKER_KEY)
+     if not isinstance(marker, dict) or marker.get("settled") or marker.get("deferred"):
+         return False
+-    at = marker.get("at")
++    at = marker.get("fire_at") or marker.get("at")
+     if not at or job.get("next_run_at") != at:
+         return False
+     if (job.get("schedule") or {}).get("kind") == "once":
+diff --git a/tests/cron/test_restart_cut.py b/tests/cron/test_restart_cut.py
+index 649605f30a..5daaabbe67 100644
+--- a/tests/cron/test_restart_cut.py
++++ b/tests/cron/test_restart_cut.py
+@@ -25,6 +25,8 @@ FAR_FUTURE = "0 0 1 1 *"
+ def home(tmp_path, monkeypatch):
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+     monkeypatch.setattr("cron.executions._end_interrupted_sessions", lambda _records: None)
++    # A pending rerun is held while the host is not fully awake: a MacBook on battery is no DarkWake.
++    monkeypatch.setattr("cron.restart_rerun.host_fully_awake", lambda: True)
+     scheduler._running_job_ids.clear()
+     scheduler._running_fire_owners.clear()
+     scheduler._interrupted_job_ids.clear()
+@@ -121,7 +123,6 @@ def test_owner_cut_of_a_rerun_the_host_slept_through_is_rerun_again(home, monkey
+     rerun was cut by the same sleep after ~30 awake seconds in an hour. That rerun never ran, so it
+     is re-armed (rerun 2 of 3), not dropped."""
+     job = jobs.create_job(prompt="probe", schedule=FAR_FUTURE, name="probe", deliver="local")
+-    monkeypatch.setattr("cron.restart_rerun.host_fully_awake", lambda: True, raising=False)
+     monkeypatch.setattr(scheduler, "run_job", _cut_with_clock(900, 900))
+     first = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
+     assert scheduler.run_one_job(first) is True
+diff --git a/tests/cron/test_restart_rerun.py b/tests/cron/test_restart_rerun.py
+index 7e653867f1..f3b07c761a 100644
+--- a/tests/cron/test_restart_rerun.py
++++ b/tests/cron/test_restart_rerun.py
+@@ -35,6 +35,9 @@ def clock(tmp_path, monkeypatch):
+     state = {"now": datetime.fromisoformat("2026-10-28T09:00:00-07:00")}
+     monkeypatch.setattr("cron.jobs._hermes_now", lambda: state["now"])
+     monkeypatch.setattr("cron.executions._hermes_now", lambda: state["now"])
++    # A rerun is held while the host is not fully awake (hold_for_wake): read awake here, so a
++    # test run on a MacBook on battery is no DarkWake. ``awake_host`` drives it per test.
++    monkeypatch.setattr("cron.restart_rerun.host_fully_awake", lambda: True)
+     return state
+ 
+ 
+@@ -135,7 +138,7 @@ def test_deferral_inherits_only_a_pending_rerun_marker(settled):
+     job = {"restart_rerun": {"execution_id": "old", "at": old, "settled": settled}}
+     marker = _marker(job, {"id": "deferred"}, now, deferred=True)
+     assert marker == ({"execution_id": "deferred", "at": now, "deferred": True} if settled
+-                      else {"execution_id": "deferred", "at": old})
++                      else {"execution_id": "deferred", "at": old, "fire_at": now})
+ 
+ 
+ def test_skipped_rerun_expires_guard_but_still_rejects_replay(clock, monkeypatch):
+@@ -709,7 +712,7 @@ def _owner_cut(job_id, clock, *, awake=None, wall=None, minutes=1):
+ @pytest.fixture()
+ def awake_host(monkeypatch):
+     state = {"awake": True}
+-    monkeypatch.setattr("cron.restart_rerun.host_fully_awake", lambda: state["awake"], raising=False)
++    monkeypatch.setattr("cron.restart_rerun.host_fully_awake", lambda: state["awake"])
+     return state
+ 
+ 
+@@ -816,6 +819,34 @@ def test_oneshot_rerun_held_past_grace_fires_on_full_wake(clock, awake_host):
+     assert get_job(job["id"]) is not None
+ 
+ 
++@pytest.mark.parametrize("schedule", ["in 30m", "every 120m"])
++def test_deferred_pending_rerun_stays_held_and_survives_the_oneshot_grace(clock, awake_host, schedule):
++    """A pending rerun the draining owner refused (defer_unadmitted) is re-armed for now but keeps
++    the rerun's own time: it is still the pending rerun, so it is held in a DarkWake and the
++    one-shot grace gate never retires it as missed."""
++    from cron.jobs import ONESHOT_GRACE_SECONDS
++    from cron.restart_cut import defer_unadmitted
++    from cron.restart_rerun import pending_rerun
++
++    job = create_job("remind me", schedule, name="reminder")
++    clock["now"] += timedelta(minutes=31 if schedule.startswith("in") else 121)
++    assert _owner_cut(job["id"], clock, awake=900, wall=900)[1]
++    clock["now"] += timedelta(minutes=1)
++    claimed, record = _start(job["id"])
++    assert defer_unadmitted(claimed, record["id"], "runtime_draining", claimed["fire_claim"]["by"])
++    deferred = get_job(job["id"])
++    assert deferred["next_run_at"] == clock["now"].isoformat(), "re-armed for the next gateway"
++    assert pending_rerun(deferred), f"the deferred rerun is no longer pending: {deferred['restart_rerun']}"
++
++    awake_host["awake"] = False
++    assert _due_ids() == [], "a deferred restart rerun never fires into a DarkWake"
++    clock["now"] += timedelta(seconds=ONESHOT_GRACE_SECONDS + 60)
++    assert _due_ids() == [], "still held in the DarkWake"
++    assert get_job(job["id"]) is not None, "held past the one-shot grace, never retired as missed"
++    awake_host["awake"] = True
++    assert _due_ids() == [job["id"]], "it fires on the first fully awake tick"
++
++
+ def test_full_wake_probe_reads_pmset_assertions(monkeypatch):
+     from cron import restart_rerun
+ 
+-- 
+2.43.0
+

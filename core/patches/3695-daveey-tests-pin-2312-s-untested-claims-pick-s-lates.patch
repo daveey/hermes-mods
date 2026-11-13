@@ -1,0 +1,234 @@
+From 027f934ea5a16f0923cce17a91e56f66f204f374 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:39:58 +0000
+Subject: [PATCH] [daveey] tests: pin #2312's untested claims (pick's
+ latest/before/origin, released-links limits)
+
+Post-merge check t_01a1d59497a6a6d7 of core #2312 (6db912bb4b) found exact-anchor mutants surviving the seven
+suites around kanban_completion_refs.pick and kanban_chat_links_released. Tests only, no production change.
+
+New tests (tests/hermes_cli/test_kanban_completion_refs_sync.py):
+- test_a_pre_uid_replay_binds_its_runs_latest_receipt_not_an_earlier_red_one: two receipts in one worker run,
+  red then the green bound one (live shape: MacBook t_01a1d54bdcb29711, run 14023, receipts 260539/260550);
+  the pre-uid replay on the hub verifies. Kills M09 (max -> min).
+- test_a_receipt_written_after_the_completion_never_binds: a later same-run receipt binds neither by uid nor
+  by the run fallback. Kills M10 (drop `r["id"] < before`).
+- test_an_imported_completions_integer_never_binds_a_receipt_written_on_this_board: the worker integer names a
+  red hub-local receipt of the same card and run; the replayed receipt decides. Kills M11.
+
+New file tests/hermes_cli/test_kanban_chat_links_released.py:
+- test_the_released_reader_returns_only_released_links_of_this_profile: kills M19 (released=1) and M24.
+- test_a_closed_card_reader_lists_no_other_profiles_released_link: replica_cards with closed statuses never
+  lists another origin profile's released link (also kills M24).
+- test_open_status_readers_never_consult_the_released_reader: replica_cards with OPEN_STATUSES and
+  LISTED_STATUSES, and links_diff, neither grow nor call kanban_chat_links_released.read. Kills M18.
+
+Mutant results (one pytest process per file over completion_refs_sync, chat_links_released, chat_links,
+chat_tasks, chat_links_parity, origin_ledger, pr_acceptance, goal_receipt; the evidence script's anchors):
+M09, M10, M11, M18, M19, M24 KILLED; baseline GREEN, 0 skipped.
+
+Equivalent or masked mutants, no test added:
+- M18 and M19 change no public output today. released.read already returns [] when the statuses hold no
+  closed status, and replica_cards' unreleased loop already lists an unreleased link to a closed card as
+  `unknown` under the same (chat, key), which setdefault keeps. So the tests pin them at the module boundary:
+  the spy on read for M18 and a direct read() call for M19.
+- M07/M08 (fallback ignores run_id / origin_gateway): completion_verdict's run_id equality masks them.
+- M12 (drop task_id filter): equivalent, because read_candidates already filters by task_id.
+- M16 (goal uid not passed) is owned by t_01a1d559440d3304 and not duplicated here.
+
+Card: t_01a1d5b829060dc3
+---
+ .../test_kanban_chat_links_released.py        | 100 ++++++++++++++++++
+ .../test_kanban_completion_refs_sync.py       |  72 +++++++++++++
+ 2 files changed, 172 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_chat_links_released.py
+
+diff --git a/tests/hermes_cli/test_kanban_chat_links_released.py b/tests/hermes_cli/test_kanban_chat_links_released.py
+new file mode 100644
+index 0000000000..97acdaf054
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_chat_links_released.py
+@@ -0,0 +1,100 @@
++"""Released chat links listed back for readers of closed cards only (core #2312). [daveey]
++
++``kanban_chat_links_released`` lists a chat's RELEASED links to closed cards as explicit ``done``/``archived`` rows
++for ``hermes kanban chat-tasks``. #2312 claimed three limits no test pinned (post-merge check t_01a1d59497a6a6d7
++found the mutants that drop them surviving): the open-status readers (sidebar counts, handover, links-diff) never
++consult it; it reads only released links; and only this origin profile's links count, like ``replica_cards``.
++"""
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_chat_links_released as released
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++
++ME, OTHER = "macbook", "hub"
++CLOSED = ksa.LISTED_STATUSES + ("done", "archived")
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    from hermes_cli import profiles
++    home = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [])
++    links._reset_for_tests()
++    yield home
++    links._reset_for_tests()
++
++
++def _replica(path, tasks, chat_links):
++    """``tasks``: (id, status); ``chat_links``: (task, chat profile, session, kind, released), all this gateway's."""
++    conn = sqlite3.connect(path)
++    conn.executescript(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, created_at INTEGER, "
++        "started_at INTEGER, priority INTEGER, block_kind TEXT, human_request TEXT, created_on TEXT);"
++        "CREATE TABLE task_chat_links (uid TEXT, task_id TEXT, chat_gateway TEXT, chat_profile TEXT, chat_session TEXT, "
++        "kind TEXT, released INTEGER, created_at INTEGER);")
++    conn.executemany("INSERT INTO tasks VALUES (?, ?, ?, 'worker', 1, NULL, 0, NULL, NULL, ?)",
++                     [(t, t, s, OTHER) for t, s in tasks])
++    conn.executemany("INSERT INTO task_chat_links VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
++                     [(links.link_uid(t, ME, p, s, k), t, ME, p, s, k, r) for t, p, s, k, r in chat_links])
++    conn.commit()
++    conn.close()
++    return path
++
++
++@pytest.fixture
++def rep(home, tmp_path):
++    return _replica(tmp_path / "default.db",
++                    [("t_released", "done"), ("t_unreleased", "done"), ("t_open", "running"),
++                     ("t_theirs", "done"), ("t_arch", "archived")],
++                    [("t_released", "default", "s1", "created", 1), ("t_unreleased", "default", "s1", "created", 0),
++                     ("t_open", "default", "s1", "shepherd", 0), ("t_arch", "default", "s1", "shepherd", 1),
++                     # Another origin profile's chat on this gateway, same session id: never this profile's card.
++                     ("t_theirs", "bb-tuner", "s1", "created", 1)])
++
++
++def test_the_released_reader_returns_only_released_links_of_this_profile(rep):
++    got = sorted((r["id"], r["chat_profile"]) for r in released.read(rep, ME, "default", ["s1"], CLOSED))
++    assert got == [("t_arch", "default"), ("t_released", "default")]
++    assert [r["id"] for r in released.read(rep, ME, "bb-tuner", ["s1"], CLOSED)] == ["t_theirs"]
++
++
++def test_a_closed_card_reader_lists_no_other_profiles_released_link(rep):
++    got = {c["id"]: c for c in links.replica_cards(["s1"], ME, CLOSED, replicas=[("default", rep)])}
++    assert sorted((t, c["status"], c["released"]) for t, c in got.items()) == [
++        ("t_arch", "archived", True), ("t_open", "running", False), ("t_released", "done", True),
++        ("t_unreleased", "unknown", False)]
++    assert {c["origin_profile"] for c in got.values()} == {"default"}
++
++
++def test_open_status_readers_never_consult_the_released_reader(rep, home, monkeypatch):
++    """The sidebar counts, handover and links-diff read open statuses only: they neither open the replica a second
++    time for released links nor grow by them."""
++    calls = []
++    real = released.read
++
++    def spy(*args, **kwargs):
++        calls.append(args)
++        return real(*args, **kwargs)
++
++    monkeypatch.setattr(released, "read", spy)
++    for statuses in (links.OPEN_STATUSES, ksa.LISTED_STATUSES):
++        got = sorted(c["id"] for c in links.replica_cards(["s1"], ME, statuses, replicas=[("default", rep)]))
++        assert got == ["t_open", "t_unreleased"]
++    monkeypatch.setattr(ksc, "board_paths", lambda: [("default", home / "kanban.db")])
++    monkeypatch.setattr(ksc, "shadow_path", lambda slug: rep)
++    for statuses in (links.OPEN_STATUSES, ksa.LISTED_STATUSES):
++        report = links.links_diff(ME, statuses)
++        assert report["replica_links"] == 2 and report["only_in_replica"] == {
++            "s1": [(OTHER, "default", "t_open"), (OTHER, "default", "t_unreleased")]}
++    assert calls == []
++    # The spy sees the closed-card reader, so the empty list above is not a dead spy.
++    links.replica_cards(["s1"], ME, CLOSED, replicas=[("default", rep)])
++    assert len(calls) == 1
+diff --git a/tests/hermes_cli/test_kanban_completion_refs_sync.py b/tests/hermes_cli/test_kanban_completion_refs_sync.py
+index e38c7877dd..9641afb3e2 100644
+--- a/tests/hermes_cli/test_kanban_completion_refs_sync.py
++++ b/tests/hermes_cli/test_kanban_completion_refs_sync.py
+@@ -266,3 +266,75 @@ def test_two_gateways_leasing_one_run_is_ambiguous(boards):
+         hub.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'claimed', ?, 1)",
+                     (tid, run_id, json.dumps({"holder": "worker-4", "run_uid": uid})))
+     assert verified(hub, tid) == (False, False)
++
++
++RED = {"ok": False, "classification": "failure", "head_sha": "b" * 40, "pr_url": PR, "pr_state": "OPEN",
++       "checks": [], "recovery": "", "required": []}
++
++
++def receipts(conn, tid):
++    return conn.execute("SELECT id, run_id, origin_gateway, payload FROM task_events WHERE task_id=? "
++                        "AND kind='pr_acceptance' ORDER BY id", (tid,)).fetchall()
++
++
++def test_a_pre_uid_replay_binds_its_runs_latest_receipt_not_an_earlier_red_one(boards):
++    """Live shape: MacBook t_01a1d54bdcb29711 (worker-4, pre-uid) has two receipts in run 14023 (260539, 260550).
++    The completion bound the latest: its board writes that receipt and the completion in one transaction."""
++    worker, hub = boards
++    tid = kb.create_task(worker, title="Ship it", assignee="dev", completion_contract="acme/repo")
++    run = kb.claim_task(worker, tid).current_run_id
++    with kb.write_txn(worker):  # an earlier attempt in the same run recorded a red receipt
++        kb._append_event(worker, tid, "pr_acceptance", RED, run_id=run)
++    assert kb.complete_task(worker, tid, summary="landed", expected_run_id=run, metadata={"published_pr": PR})
++    replay(worker, hub)
++    event_id, _ = payload_of(hub, tid)
++    rewrite(hub, event_id, lambda p: p.pop("pr_acceptance_event_uid", None))
++    red, green = receipts(hub, tid)
++    # Precondition: both receipts are this run's, from the same gateway, before the completion; red first.
++    assert red["run_id"] == green["run_id"] and red["origin_gateway"] == green["origin_gateway"] == "worker-3"
++    assert red["id"] < green["id"] < event_id and json.loads(red["payload"])["ok"] is False
++    assert verified(hub, tid) == (True, True)
++
++
++def test_a_receipt_written_after_the_completion_never_binds(boards):
++    """``before``: only a receipt earlier than the completion is the one it bound, by uid or by its run."""
++    worker, hub = boards
++    tid = completed_on_worker(worker)
++    replay(worker, hub)
++    event_id, payload = payload_of(hub, tid)
++    run = hub.execute("SELECT run_id FROM task_events WHERE id=?", (event_id,)).fetchone()[0]
++    (bound,) = receipts(hub, tid)
++    with kb.write_txn(hub):
++        kb._append_event(hub, tid, "pr_acceptance", json.loads(bound["payload"]), run_id=run)
++    later = receipts(hub, tid)[-1]
++    assert later["id"] > event_id and later["run_id"] == run
++    # The uid names the later receipt: no bind, even though it is green and of the same run.
++    later_uid = hub.execute("SELECT uid FROM task_events WHERE id=?", (later["id"],)).fetchone()[0]
++    assert later_uid and later_uid != payload["pr_acceptance_event_uid"]
++    rewrite(hub, event_id, lambda p: p.update(pr_acceptance_event_uid=later_uid))
++    assert verified(hub, tid) == (False, False)
++    # Pre-uid: the run's latest receipt before the completion is red, so a green one after it changes nothing.
++    rewrite(hub, event_id, lambda p: p.pop("pr_acceptance_event_uid"))
++    with kb.write_txn(hub):
++        hub.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(RED), bound["id"]))
++        hub.execute("UPDATE task_events SET origin_gateway='worker-3' WHERE id=?", (later["id"],))
++    assert verified(hub, tid) == (False, False)
++
++
++def test_an_imported_completions_integer_never_binds_a_receipt_written_on_this_board(boards):
++    """On the hub the worker's integer may name a hub-local receipt of the same card (``origin_gateway`` NULL):
++    that is not the receipt the worker bound, so the run's replayed receipt decides."""
++    worker, hub = boards
++    tid = completed_on_worker(worker)
++    replay(worker, hub)
++    event_id, payload = payload_of(hub, tid)
++    rewrite(hub, event_id, lambda p: p.pop("pr_acceptance_event_uid", None))
++    run = hub.execute("SELECT run_id FROM task_events WHERE id=?", (event_id,)).fetchone()[0]
++    worker_int = payload["pr_acceptance_event_id"]
++    local = hub.execute("SELECT id, origin_gateway FROM task_events WHERE id=?", (worker_int,)).fetchone()
++    # Precondition: the integer names a hub-written event before the completion.
++    assert local is not None and local["origin_gateway"] is None and worker_int < event_id
++    with kb.write_txn(hub):  # make it a red hub-local receipt of this card and run
++        hub.execute("UPDATE task_events SET task_id=?, kind='pr_acceptance', payload=?, run_id=? WHERE id=?",
++                    (tid, json.dumps(RED), run, worker_int))
++    assert verified(hub, tid) == (True, True)
+-- 
+2.43.0
+
