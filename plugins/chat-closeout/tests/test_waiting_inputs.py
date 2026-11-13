@@ -125,6 +125,17 @@ def test_a_ledger_write_re_reconciles_only_that_row(world):
     assert world['work']['reconcile_done'] == []  # c1 left the pending rows; c2 and c3 unchanged
 
 
+def test_a_waker_bookkeeping_write_recomputes_nothing(world):
+    """The waker's claims and retries are no settlement input (``core.SETTLE_ROW_FIELDS``)."""
+    assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+    key = plugin.waiting_inputs()
+    reset(world['work'])
+    world['led'].write('c1', failure_since=50.0, retry_after=999.0)
+    assert plugin.waiting_inputs() == key
+    assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+    assert world['work']['reconcile_done'] == []
+
+
 def test_waiting_pass_is_accounted(world, monkeypatch):
     la = pytest.importorskip('hermes_cli.loop_accounting')
     before = dict(la.counters().get('chat-closeout.waiting') or {'runs': 0, 'skips': 0, 'rows': 0})

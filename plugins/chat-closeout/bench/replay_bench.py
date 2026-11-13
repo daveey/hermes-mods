@@ -139,6 +139,29 @@ def main() -> int:
         plugin._server = lambda: type("Srv", (), {"_wake_session_turn": staticmethod(lambda *a, **k: "busy")})()
         plugin.owner_wake_tick = getattr(plugin, "owner_wake_tick", lambda **k: None)
         seq = world["seq"]
+        trace: dict = {}
+        if os.environ.get("CLOSEOUT_BENCH_TRACE") and hasattr(plugin, "wi"):
+            real_key = plugin.wi.row_key
+
+            def traced(row, cards, lineage, fields=None, extra=None):
+                keys = set(row.get("batch") or []) | set(row.get("covered") or [])
+                now = {"row": plugin.wi.digest(sorted(row.items())),
+                       "cards": plugin.wi.digest(plugin.wi.card_view(cards, keys)),
+                       "lineage": plugin.wi.digest(lineage)}
+                who = sys._getframe(1).f_code.co_name
+                sid = (who, row["session_id"])
+                last = trace.setdefault("last", {}).get(sid)
+                if last is not None:
+                    for part, value in now.items():
+                        if last[part] != value:
+                            trace.setdefault("moved", {}).setdefault(f"{who}:{part}", 0)
+                            trace["moved"][f"{who}:{part}"] += 1
+                            if part == "row" and len(trace.setdefault("row_fields", [])) < 5:
+                                trace["row_fields"].append(sorted(k for k in row if trace["rows"][sid].get(k) != row.get(k)))
+                trace["last"][sid] = now
+                trace.setdefault("rows", {})[sid] = dict(row)
+                return real_key(row, cards, lineage, fields, extra)
+            plugin.wi.row_key = traced
         # Warm-up (imports, first schema reads, first full reconcile): a process pays it once, not per window.
         plugin.waiting_source()
         plugin._host_pass(False)
@@ -152,6 +175,11 @@ def main() -> int:
         moved = {"state_msg": 0, "board_rev": 0, "hub_seq": 0}
         next_host = 0.0
         msg_ts = 10_000
+        prof = None
+        if os.environ.get("CLOSEOUT_BENCH_PROFILE"):
+            import cProfile
+            prof = cProfile.Profile()
+            prof.enable()
         for w in range(WINDOWS):
             sim = w * STEP_S
             if rng.random() < RATES["state_msg"]:
@@ -193,6 +221,12 @@ def main() -> int:
                 plugin._host_pass(False)
                 cpu["host"] += time.process_time() - c0
                 passes["host"] += 1
+        if prof is not None:
+            import pstats
+            prof.disable()
+            stats = pstats.Stats(prof, stream=sys.stderr)
+            stats.sort_stats(os.environ.get("CLOSEOUT_BENCH_PROFILE_SORT", "tottime"))
+            stats.print_stats(os.environ.get("CLOSEOUT_BENCH_PROFILE_FILTER", ""), 40)
         replay_s = WINDOWS * STEP_S
         out = {
             "plugin": str(args.plugin.resolve()),
@@ -202,6 +236,8 @@ def main() -> int:
             "pct_core": {k: round(100 * v / replay_s, 3) for k, v in cpu.items()},
             "waiting_rows": len(plugin.waiting_source()),
         }
+        if trace:
+            out["trace"] = {"moved": trace.get("moved"), "row_fields": trace.get("row_fields")}
         try:
             from hermes_cli import loop_accounting as la
             out["accounting"] = {k: v for k, v in la.counters().items() if k.startswith("chat-closeout")}
