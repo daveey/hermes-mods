@@ -56,6 +56,8 @@ def test_explicit_safe_tool_workdir(env):
     "! cd {outside} && touch evidence.json",
     "for n in 1 2; do touch evidence.json; cd {live}; done",
     "cd {outside} && cd {missing}; touch evidence.json",
+    "cd {outside} && cd - && touch evidence.json",
+    "pushd {outside} && pushd && touch evidence.json",
 ])
 def test_compound_control_flow_is_conservative(env, command):
     cwd = env.other if command.startswith("for") else env.live

@@ -1689,7 +1689,12 @@ def _check_cwd_flow(toks: list[str], cwd: str) -> Optional[str]:
                 if why:
                     return why
                 # Unknown destinations must not erase a known protected cwd.
-                successors.add(current if destination.startswith(UNKNOWN_CWD) else destination)
+                if destination.startswith(UNKNOWN_CWD):
+                    # cd - / directory-stack operations can return to a cwd
+                    # from earlier in this AND-list, not just stay here.
+                    successors.update(possible | skipped)
+                else:
+                    successors.add(destination)
             skipped.update(possible)  # failed/skipped commands retain their cwd
             if not compound and op == "&&":
                 possible = successors
