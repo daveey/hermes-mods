@@ -421,11 +421,12 @@ def test_owner_on_another_local_board_is_recorded(store, home, tmp_path, monkeyp
     assert sh.LaneState(store2.root).get("agent-04039a9129")["owner_board"] == "default"
 
 
-def test_verify_card_for_a_remote_owner_is_not_parented_on_a_card_this_board_lacks(store, home, tmp_path, monkeypatch):
+@pytest.mark.parametrize("board", [None, "macbook:default"])
+def test_verify_card_for_a_remote_owner_is_not_parented_on_a_card_this_board_lacks(store, home, tmp_path, monkeypatch, board):
     hdb = hub_db(tmp_path / "hub" / "hub.db", [("macbook", "default", OWNER, "done")],
                  [("macbook", "default", "ok", NOW - 40)])
     monkeypatch.setattr(sh, "_lookup_sources", lambda runner: (home, hdb))
-    _approved(store, "bb-448ec69637", OWNER, board=None)
+    _approved(store, "bb-448ec69637", OWNER, board=board)
     r = Runner()
     sh.reconcile(store, runner=r, now=NOW)
     st = sh.LaneState(store.root).get("bb-448ec69637")
@@ -433,7 +434,25 @@ def test_verify_card_for_a_remote_owner_is_not_parented_on_a_card_this_board_lac
     (create,) = r.creates()
     text = " ".join(map(str, create))
     assert "--parent" not in create and "gateway `macbook`" in text and "cross_task" in text
+    expected_board = "default" if board else "bb"
+    assert create[create.index("--board") + 1] == expected_board
+    assert st["board"] == board  # retain the digest owner reference for later lookups
     assert not ev(store, "selfheal_stale")
+
+
+@pytest.mark.parametrize("board, gateway, expected", [
+    ("remote:work", "remote", "default"),
+    ("local:work", None, "work"),
+    ("work", "remote", "work"),
+    (None, "remote", None),
+])
+def test_verify_create_normalizes_only_qualified_boards(store, monkeypatch, board, gateway, expected):
+    st = {"owner_card": OWNER, "owner_gateway": gateway, "owner_board": "work"}
+    calls = []
+    monkeypatch.setattr(sh, "_run_card", lambda args, runner: (calls.append(args) or (0, "t_0000000000000002", "")))
+    sh._file_verify("agent-test", st, OWNER, {"board": board}, store, Runner(), NOW)
+    assert calls[0]["board"] == expected
+    assert calls[0]["parents"] == ([] if gateway else [OWNER])
 
 
 def test_replica_described_candidates_obey_adopt_statuses(tmp_path):
