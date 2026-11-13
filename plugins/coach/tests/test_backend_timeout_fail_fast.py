@@ -115,6 +115,21 @@ def test_real_timeouts_during_an_outage_still_file_the_incident(tmp_path, capsys
     assert out["over_threshold"] is True and len(board.creates()) >= 1
 
 
+def test_card_body_states_fail_fast_awake_count(tmp_path, capsys):
+    """The filed incident card says how many awake lines are fail-fast echoes left out of the threshold."""
+    lines = []
+    for i in range(32):
+        t = END - timedelta(minutes=29) + timedelta(seconds=40 * i)
+        lines.append(timeout(t, HUB_SYNC, "mac-mini"))
+        lines += [fail_fast(t + timedelta(seconds=s), BOARD) for s in (5, 10, 15)]
+    install(tmp_path, "\n".join(lines) + "\n")
+    board = Board()
+    out = report(tmp_path, capsys, board=board)
+    assert out["fail_fast"]["awake_count"] == 96
+    bodies = [body for _argv, body in board.creates()]
+    assert any('96 of the awake lines are down-gate "Failing fast" lines' in (b or "") for b in bodies), bodies
+
+
 def test_fail_fast_lines_alone_never_reach_the_threshold(tmp_path, capsys):
     lines = [fail_fast(END - timedelta(minutes=20) + timedelta(seconds=s), HUB_SYNC, ago=s) for s in range(60)]
     install(tmp_path, timeout(END - timedelta(minutes=21), HUB_SYNC, "mac-mini") + "\n" + "\n".join(lines) + "\n")
