@@ -540,7 +540,9 @@ def test_worker_share_real_filer_uses_selected_worker_pin(core):
     core.kp.portable_reason(fields, {})
 
 
-def test_kanban_drift_actual_create_is_explicitly_local(core, tmp_path):
+def test_kanban_drift_actual_create_joins_the_worker_pool(core, tmp_path):
+    # kanban-drift files with placement "auto" (94153ea2): on the hub "local" is a hub slot that the admission
+    # judge refuses for routine repair work, so the producer must never pin "local" or ask for a hub slot.
     monitor = load("drift_placement_producer_test", PLUGINS / "kanban-drift" / "monitor.py")
     got = []
 
@@ -555,6 +557,7 @@ def test_kanban_drift_actual_create_is_explicitly_local(core, tmp_path):
     instance.sample("target-a", report)
     instance.sample("target-a", report)
     assert len(got) == 1
-    assert got[0]["placement"] == "local" and got[0]["completion_contract"] == "local-only"
+    assert got[0]["placement"] == "auto" and got[0]["completion_contract"] == "local-only"
+    assert not got[0].get("hub_reason")
     assert HOSTILE in got[0]["body"]
     core.kp.portable_reason(got[0], {})
