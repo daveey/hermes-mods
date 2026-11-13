@@ -1469,11 +1469,40 @@ def social_thread(fields: dict[str, str]) -> Optional[list]:
     return turns
 
 
+_SOCIAL_CARD_RE = re.compile(
+    r"\A(?P<head>.*?)\n\n::social-card(?:\{session=\"[A-Za-z0-9_.:-]+\"\})?\n\n"
+    r"<!-- social-card:text\n(?P<plain>.*)\n-->\Z", re.S)
+
+
+def _escape_comment_text(text: str) -> str:
+    # One extra space after "--" before ">" and after "<" before "!--": the result never holds "-->" or "<!--"
+    # (so it cannot close the hidden comment), and it is injective, so plain_message_text can undo it exactly.
+    return re.sub(r"<( *)!--", r"< \1!--", re.sub(r"--( *)>", r"-- \1>", text))
+
+
+def _unescape_comment_text(text: str) -> str:
+    return re.sub(r"< ( *)!--", r"<\1!--", re.sub(r"-- ( *)>", r"--\1>", text))
+
+
+def plain_message_text(content: Optional[str]) -> str:
+    """The plain text of a stored Inbox message: what raw readers (scripts reading ``state.db`` messages, e.g. the
+    x-reply watcher's readback) should parse. A ``::social-card`` message (see ``_social_card``) is unwrapped and
+    its hidden comment unescaped, giving exactly the text the card would have had without a ``thread`` field; any
+    other message is returned unchanged. Contract pinned by tests/test_social_card.py (round trip of every render
+    path), so a rendering change that breaks raw readers fails Inbox CI."""
+    content = content or ""
+    m = _SOCIAL_CARD_RE.match(content)
+    if not m:
+        return content
+    return f"{m['head']}\n\n{_unescape_comment_text(m['plain'])}"
+
+
 def _social_card(head: str, rest: list[str], sid: Optional[str]) -> str:
     """Desktop draws the card from the item's fields; the full plain text stays in the message
-    (inside an HTML comment, hidden by the Desktop renderer) for the card's agent, CLI and raw readers."""
+    (inside an HTML comment, hidden by the Desktop renderer) for the card's agent, CLI and raw readers.
+    Raw readers get it back with ``plain_message_text``."""
     attr = f'{{session="{sid}"}}' if sid and re.fullmatch(r"[A-Za-z0-9_.:-]+", sid) else ""
-    plain = "\n\n".join(rest).replace("-->", "-- >").replace("<!--", "< !--")
+    plain = _escape_comment_text("\n\n".join(rest))
     return f"{head}\n\n::social-card{attr}\n\n<!-- social-card:text\n{plain}\n-->"
 
 

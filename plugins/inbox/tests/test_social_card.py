@@ -136,6 +136,60 @@ def test_repost_update_also_uses_directive(env):
     assert upd.startswith("**Update ") and f'::social-card{{session="{sid}"}}' in upd and "> Draft reply v2" in upd
 
 
+SNAP = {"name": "bsky-reply-draft", "label": "Bluesky reply draft",
+        "fields": {"text": {"preview": True, "max": 300}, "thread": {"max": 16000}},
+        "actions": [{"id": "post", "label": "Post"}]}
+TRICKY = ["plain body", "", "x --> y <!-- z", "already -- > and < !-- escaped",
+          "---> <<!-- -->-->", "--   > and <   !--", "<!-->", "<!--  >",
+          "<!-- x-reply-context:start -->\nctx\n<!-- x-reply-context:end -->"]
+
+
+@pytest.mark.parametrize("body", TRICKY)
+def test_plain_message_text_inverts_every_render_path(body):
+    """Contract for raw readers (e.g. x_reply_adapter): plain_message_text(stored message) is the
+    exact text the card would have had without the social-card wrapper, whatever the render path."""
+    social = {"text": "Draft --> reply", "thread": json.dumps(THREAD)}
+    plain_fields = {"text": "Draft --> reply"}
+    expected_post = store._typed_post_text("Title", body, "t", SNAP, plain_fields, "s1")
+    expected_upd = store._typed_update_text(body, SNAP, plain_fields, 1_000_000.0, "s1")
+    assert "::social-card" not in expected_post  # baseline: no thread -> plain render
+    cases = [
+        (store._typed_post_text("Title", body, "t", SNAP, social, "s1"), expected_post),
+        (store._typed_post_text("Title", body, "t", SNAP, social, None), expected_post),
+        (store._typed_update_text(body, SNAP, social, 1_000_000.0, "s1"), expected_upd),
+        (expected_post, expected_post),  # typed, no thread: passes through
+        (store._post_text("Title", body, "", "t"), None),  # untyped: passes through
+    ]
+    for stored, want in cases:
+        if want is None:
+            want = stored
+        assert store.plain_message_text(stored) == want
+        if "::social-card" in stored:  # the hidden copy still cannot close the comment early
+            hidden = stored.split("<!-- social-card:text\n", 1)[1][:-4]
+            assert "-->" not in hidden and "<!--" not in hidden
+    assert body in store.plain_message_text(cases[0][0])
+
+
+def test_hidden_text_escape_is_safe_and_exactly_invertible():
+    import random
+    rng = random.Random(3299286)
+    for _ in range(50_000):
+        t = "".join(rng.choice("<!- >x\n") for _ in range(rng.randint(0, 16)))
+        e = store._escape_comment_text(t)
+        assert "-->" not in e and "<!--" not in e, (t, e)
+        assert store._unescape_comment_text(e) == t, (t, e)
+
+
+def test_plain_message_text_reads_messages_stored_before_the_inverse_existed():
+    # d8d7283d-era stored message: '-->' / '<!--' escaped by a single space
+    old = ("**T**\n\n::social-card{session=\"s\"}\n\n<!-- social-card:text\n"
+           "< !-- x-reply-context:start -- >\nctx\n< !-- x-reply-context:end -- >\n\n> d\n-->")
+    assert store.plain_message_text(old) == (
+        "**T**\n\n<!-- x-reply-context:start -->\nctx\n<!-- x-reply-context:end -->\n\n> d")
+    assert store.plain_message_text("no card here --> < !--") == "no card here --> < !--"
+    assert store.plain_message_text(None) == ""
+
+
 def test_social_thread_parser():
     assert store.social_thread({"thread": json.dumps(THREAD)}) == THREAD
     assert store.social_thread({}) is None

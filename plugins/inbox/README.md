@@ -26,6 +26,13 @@ under "Why this reply". The full plain text (body, previews, actions line) stays
 HTML comment, so the card's agent and raw readers still see everything. Cards without a valid `thread` render as
 before. Tests: `tests/test_social_card.py`, `desktop-plugins/inbox/test/social-card.test.mjs`.
 
+**Raw readers** (scripts that read a card's stored message from `state.db`, like the x-reply watcher's readback)
+must parse `store.plain_message_text(content)`, never the raw message: it unwraps a social card and undoes the
+comment escaping exactly (one space is inserted after `--` before `>` and after `<` before `!--`), so the result is
+the text the card would have had without `thread`; other messages pass through unchanged.
+`test_plain_message_text_inverts_every_render_path` pins this for every render path, so a format change that
+would break raw readers fails Inbox CI instead of their cron jobs.
+
 ## Producer settlement
 
 A producer reports the terminal result of an **existing** decision without impersonating a
