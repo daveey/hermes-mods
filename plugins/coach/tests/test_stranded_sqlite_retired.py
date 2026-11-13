@@ -105,7 +105,14 @@ def test_absent_profile_home_with_board_path_skipped(tmp_path):
     assert sw.scan(str(home), str(proc)) == []
 
 
-@pytest.mark.parametrize('rel', [('kanban', 'other'), ('kanban',), ('profiles', 'fixture', 'kanban', 'other')])
+@pytest.mark.parametrize('rel', [
+    ('kanban', 'other'),
+    ('kanban',),
+    ('profiles', 'fixture', 'kanban', 'other'),
+    # Match the board path's depth without its required "boards" component.
+    ('kanban', 'other', 'not-a-board'),
+    ('profiles', 'fixture', 'kanban', 'other', 'not-a-board'),
+])
 def test_non_board_paths_not_suppressed(tmp_path, rel):
     """Only <base>/kanban/boards/<slug>/ is a board dir: an absent sibling dir must not hide a finding."""
     home = tmp_path / 'home'
