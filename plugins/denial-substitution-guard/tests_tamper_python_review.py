@@ -9,15 +9,17 @@ GUARD = Path(os.environ.get('DENIAL_GUARD_UNDER_TEST') or Path(__file__).with_na
 S = importlib.util.spec_from_file_location('python_tamper_review_guard', GUARD)
 g = importlib.util.module_from_spec(S); S.loader.exec_module(g)
 G = '/h/denial-grants.json'
+# Time bounds below are CPU time of the analyzing thread (time.thread_time), not wall
+# time: they bound the analyzer's work, which parallel test load must not inflate.
 
 
 class PythonReviewFindings(unittest.TestCase):
     def test_f1_nested_containers_bounded_time(self):
         for opener, closer in (('[', ']'), ('(', ',)'), ('{', '}'), ("{'k':", '}')):
             code = 'x=' + opener * 22 + "'a'" + closer * 22
-            start = time.monotonic()
+            start = time.thread_time()
             g._tamper('python', code)
-            self.assertLess(time.monotonic() - start, 2.0, opener)
+            self.assertLess(time.thread_time() - start, 2.0, opener)
 
     def test_f2_nested_recursion_bound_keeps_outer_sites(self):
         code = "exec(%r)\nopen('%s','w')" % ('x=1' + '+1' * 3000, G)
@@ -52,9 +54,9 @@ class PythonReviewFindings(unittest.TestCase):
             'two_valued': "import sys\nc=sys.argv\nx=[" + "('a' if c else 'b')," * 5000 + ']',
         }
         for name, code in cases.items():
-            start = time.monotonic()
+            start = time.thread_time()
             g._tamper('python', code)
-            self.assertLess(time.monotonic() - start, 3.0, name)
+            self.assertLess(time.thread_time() - start, 3.0, name)
         # Width still keeps the protected word and command shape.
         wide = "import subprocess\nsubprocess.run(['rm','-f'," + "'/x/plain'," * 2000 + f"'{G}'])"
         self.assertIsNotNone(g._tamper('python', wide))
@@ -74,9 +76,9 @@ class PythonReviewFindings(unittest.TestCase):
             'format_copies': 'x="' + 'a{}' * 8000 + '"\n' + '\n'.join(f'y{i}=x.format(1)' for i in range(3000)),
         }
         for name, code in cases.items():
-            start = time.monotonic()
+            start = time.thread_time()
             self.assertIsNone(g._tamper('python', code), name)
-            self.assertLess(time.monotonic() - start, 3.0, name)
+            self.assertLess(time.thread_time() - start, 3.0, name)
         # Work-bound exhaustion applies the baseline rule, never "no mutation".
         self.assertIsNotNone(g._tamper('python', cases['plus_self'] + f"open('{G}','w')"))
 

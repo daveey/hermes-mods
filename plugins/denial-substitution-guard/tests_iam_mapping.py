@@ -174,9 +174,9 @@ class IamMappingTests(unittest.TestCase):
             self.g.record_from_result('terminal', {'command': f'aws ssm send-command --instance-ids i-0{n} --comment {n}'},
                                       text, root=self.root)
         cmd = 'aws ' + ' '.join(['-x'] * 40000) + ' ssm send-command --instance-ids i-0fff'
-        start = time.monotonic()
+        start = time.thread_time()
         self.g.classify('terminal', {'command': cmd}, root=self.root)
-        self.assertLess(time.monotonic() - start, 3.0)
+        self.assertLess(time.thread_time() - start, 3.0)
 
     def test_iam_wildcard_denial_action(self):
         self.g.record_from_result('terminal', {'command': 'aws s3api put-object --bucket b --key k'},

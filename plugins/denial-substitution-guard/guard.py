@@ -959,10 +959,29 @@ def _nested_entries(args):
             except ValueError: inner = {}
             except RecursionError:
                 yield None, call.get("arguments"); continue
+            # "Too deep to decode" must not depend on the C stack: Python 3.12+
+            # bounds the JSON decoder by stack bytes, so a large `ulimit -s`
+            # decodes what an 8 MiB stack (or 3.11's frame limit) refuses.
+            if _json_depth(call.get("arguments")) > _JSON_MAX_DEPTH:
+                yield None, call.get("arguments"); continue
         yield str(call.get("name") or call.get("tool") or ""), inner
 
 
 _NESTED_MAX = 16
+# Deeper string-JSON arguments are opaque on every interpreter and stack size
+# (below the ~1000 that Python 3.11's recursion limit decodes).
+_JSON_MAX_DEPTH = 512
+_JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"', re.S)
+_JSON_BRACKET = re.compile(r"[\[\]{}]")
+
+
+def _json_depth(text):
+    """Bracket nesting depth of decoded JSON text (strings removed); linear, no recursion."""
+    depth = deepest = 0
+    for match in _JSON_BRACKET.finditer(_JSON_STRING.sub("", text)):
+        depth += 1 if match.group() in "[{" else -1
+        deepest = max(deepest, depth)
+    return deepest
 
 
 def _call_texts(tool_name, args, depth=0):

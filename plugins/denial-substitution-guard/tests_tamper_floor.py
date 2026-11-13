@@ -78,9 +78,9 @@ class Floor(unittest.TestCase):
         text = ('; '.join(f'E{k}=' for k in range(1000))
                 + '; function g { :; :; :; :; :; :; :; :; :; :; }; function f { g; g; g; g; g; g; g; g; g; g; }; '
                 + '; '.join('f' for _ in range(100)))
-        start = time.time()
+        start = time.thread_time()
         g._tamper('shell', text)
-        self.assertLess(time.time() - start, 3.0)
+        self.assertLess(time.thread_time() - start, 3.0)
 
     def test_work_exhaustion_fails_closed_on_write_keyword(self):
         # REVIEW-FLOOR B1: the per-command +len(state) charge exhausts the
@@ -103,9 +103,9 @@ class Floor(unittest.TestCase):
                 self.assertIsNotNone(g._tamper('python', text))
         for text in holds:
             with self.subTest(text[-60:]):
-                start = time.time()
+                start = time.thread_time()
                 self.assertIsNotNone(g._tamper('shell', text))
-                self.assertLess(time.time() - start, 3.0)
+                self.assertLess(time.thread_time() - start, 3.0)
         # Exhaustion holds unconditionally: verbs outside WRITE_SHELL and
         # split command names (REVIEW-FLOOR-B1-CORRECTION F1), and a Python
         # string after an exhausting one (F2), must not escape.

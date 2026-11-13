@@ -18,9 +18,11 @@ def sysfam(unit, width, calls, tail=''):
 
 class W1bReviewFindings(unittest.TestCase):
     def timed(self, kind, code, limit=3.0):
-        start = time.monotonic()
+        # The bound is on the analyzer's own work, so it is CPU time of this thread: wall
+        # time under the full parallel suite selection measures the scheduler (4.5 s seen).
+        start = time.thread_time()
         result = g._tamper(kind, code)
-        self.assertLess(time.monotonic() - start, limit, code[:60])
+        self.assertLess(time.thread_time() - start, limit, code[:60])
         return result
 
     def test_b1_reused_shell_text_shares_python_budget(self):
@@ -63,9 +65,9 @@ class W1bReviewFindings(unittest.TestCase):
         inner = "x='%s';" % ('a' * 20000) + ';'.join('y%d=x+x' % i for i in range(2500))
         shell = ' ; '.join('python3 -c "%s"' % inner for _ in range(4))
         self.assertLess(len(shell), 262144)
-        start = time.monotonic()
+        start = time.thread_time()
         g._tamper('shell', shell)
-        single = time.monotonic() - start
+        single = time.thread_time() - start
         self.assertLess(single, 3.0)
         g._tamper('python', 'x=1')
         self.assertIsNotNone(g._tamper('shell', shell + ' ; rm -f ' + G))

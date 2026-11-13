@@ -131,6 +131,13 @@ class ToolNameTests(Base):
         bomb = {'name': 'terminal', 'arguments': '[' * 100000 + '0' + ']' * 100000}
         self.assertIsNotNone(self.held('tool_call', bomb))
         self.assertTrue(self.g.is_mutating('tool_call', bomb))
+        # The depth bound is explicit, not the C stack: Python 3.12+ decodes the
+        # bomb above under a large `ulimit -s`, and 600 levels decode anywhere.
+        deep = {'name': 'terminal', 'arguments': '[' * 600 + '0' + ']' * 600}
+        self.assertIsNotNone(self.held('tool_call', deep))
+        self.assertTrue(self.g.is_mutating('tool_call', deep))
+        quoted = {'name': 'terminal', 'arguments': json.dumps({'command': 'ls', 'note': '[' * 600})}
+        self.assertFalse(self.g.is_mutating('tool_call', quoted))  # brackets inside strings are not depth
 
     def test_prefixed_tamper_is_checked(self):
         for tool, args in (('mcp__terminal', {'command': 'rm ~/.hermes/denial-ledger.jsonl'}),
@@ -179,9 +186,9 @@ class RootTamperTests(Base):
                  'ssh h ' + ' '.join(['"aws x"'] * 30000), 'python3 ' + '-u ' * 80000 + '-c pass']
         for text in texts:
             with self.subTest(n=text[:12]):
-                start = time.monotonic()
+                start = time.thread_time()
                 self.held('terminal', {'command': text})
-                self.assertLess(time.monotonic() - start, 5.0)
+                self.assertLess(time.thread_time() - start, 5.0)
 
     def test_configured_root_path_mutations_hold(self):
         r = str(self.root)
