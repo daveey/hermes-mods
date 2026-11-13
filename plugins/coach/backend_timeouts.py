@@ -23,6 +23,11 @@ Each awake path with >= 20% of the awake count (or >= the threshold) also needs 
 is active and names the path, or, while it waits in todo/scheduled, an open parent that names it. A path with neither
 gets its own card, key `backend-timeouts:<host>:<path>` (commented hourly while open; :2, ... once closed), so a
 catch-all parked behind a fleet-only parent no longer hides an unowned hub-sync/status burst (agent-23f6a4d787).
+Before that, each connection (`conn=`) is checked for link saturation: its timeouts spread over >= 3 paths that time
+out together in shared 2-second buckets (>= 2 such buckets, >= half of the conn's timeouts in them). One saturated
+tunnel makes every path on it time out at once, so such a conn gets ONE card, key `backend-timeouts:<host>:conn:<conn>`,
+naming the top paths as candidates and asking for per-path byte/request attribution. Its burst timeouts no longer make
+paths significant; a path keeps its own card only when its timeouts outside those bursts are significant by themselves.
 --dry-run prints the report and files nothing. --hours prints a per-hour histogram of every timeout still in the
 logs (for checking past bursts). No Inbox items. Exit 2 with count:null when
 clock/coverage evidence is unresolved; this is not a healthy raw-zero receipt.
@@ -68,6 +73,12 @@ TOP_PATHS = 8
 # A path with this share of the awake count (or >= the threshold) needs its own owner card (agent-23f6a4d787).
 PATH_SHARE = 0.2
 PATHS_KEY = "paths"
+# Link/connection saturation: a conn whose timeouts land on several paths in the same seconds is one incident.
+BURST_BUCKET_S = 2      # "the same seconds": timeouts bucketed by this many seconds
+BURST_MIN_PATHS = 2     # a bucket where >= this many paths of one conn time out together is a shared burst
+SAT_MIN_PATHS = 3       # the bursts span at least this many distinct paths
+SAT_MIN_BURSTS = 2      # ... and recur: at least this many burst buckets
+SAT_SHARE = 0.5         # ... and hold at least this share of the conn's awake timeouts
 CLOSED = {"done", "archived"}
 ACTIVE = {"triage", "ready", "running", "review", "blocked"}  # works the card's own text (blocked: David acts)
 
@@ -214,6 +225,7 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
     awake_by_path: Counter = Counter()
     awake_by_conn: Counter = Counter()
     awake_since_wake: Counter = Counter()
+    conn_buckets: dict = {}  # conn -> time bucket -> Counter(route): which paths timed out together
     wake_ends = sorted(hi for _, hi in intervals)
     sleep_count = 0
     spanning_count = 0
@@ -244,6 +256,8 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
                 awake_by_path[route] += 1
                 awake_by_conn[conn] += 1
                 awake_since_wake[wake_bucket(ts, wake_ends)] += 1
+                bucket = int(ts.timestamp()) // BURST_BUCKET_S
+                conn_buckets.setdefault(conn, {}).setdefault(bucket, Counter())[route] += 1
             first = ts if first is None or ts < first else first
             last = ts if last is None or ts > last else last
     coverage_start = evidence.get('coverage_start')
@@ -258,7 +272,52 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
             "awake_by_path": dict(awake_by_path.most_common()),
             "awake_by_conn": dict(awake_by_conn.most_common()),
             "awake_since_wake": dict(awake_since_wake.most_common()),
+            "awake_conn_bursts": conn_bursts(conn_buckets),
             "first": first.isoformat(sep=" ") if first else None, "last": last.isoformat(sep=" ") if last else None}
+
+
+def conn_bursts(conn_buckets: dict) -> dict:
+    """Per conn: its awake timeouts by path, and how many fell in shared bursts (a time bucket in which
+    >= BURST_MIN_PATHS of its paths timed out together), by path. Threshold-free; :func:`saturated_conns` judges."""
+    out = {}
+    for conn, buckets in conn_buckets.items():
+        paths: Counter = Counter()
+        in_bursts: Counter = Counter()
+        n_bursts = 0
+        for c in buckets.values():
+            paths.update(c)
+            if len(c) >= BURST_MIN_PATHS:
+                n_bursts += 1
+                in_bursts.update(c)
+        out[conn] = {"count": sum(paths.values()), "paths": dict(paths.most_common()), "burst_buckets": n_bursts,
+                     "in_bursts": sum(in_bursts.values()), "burst_by_path": dict(in_bursts.most_common())}
+    return out
+
+
+def saturated_conns(rep: dict, threshold: int) -> list:
+    """Conns classified as link/connection saturation, biggest first: significant by count (>= PATH_SHARE of the
+    awake count, or >= the threshold), with >= SAT_SHARE of their timeouts in >= SAT_MIN_BURSTS shared bursts that
+    span >= SAT_MIN_PATHS paths. A single slow path never qualifies: its timeouts do not co-occur with other paths."""
+    total = rep.get("awake_count") or 0
+    found = []
+    for conn, b in (rep.get("awake_conn_bursts") or {}).items():
+        n = b.get("count") or 0
+        if not total or not (n >= threshold or n >= PATH_SHARE * total):
+            continue
+        if (len(b.get("burst_by_path") or {}) >= SAT_MIN_PATHS and (b.get("burst_buckets") or 0) >= SAT_MIN_BURSTS
+                and (b.get("in_bursts") or 0) >= SAT_SHARE * n):
+            found.append((-n, conn))
+    return [conn for _, conn in sorted(found)]
+
+
+def _saturation_md(rep: dict, threshold: int) -> str:
+    lines = []
+    for conn in saturated_conns(rep, threshold):
+        b = rep["awake_conn_bursts"][conn]
+        lines.append(f"Link/connection saturation suspected on conn={conn}: {b['in_bursts']} of its {b['count']} "
+                     f"awake timeouts fell in {b['burst_buckets']} shared {BURST_BUCKET_S}-second bursts across "
+                     f"{len(b['burst_by_path'])} paths.")
+    return "\n".join(lines)
 
 
 def hours(home: Path) -> dict:
@@ -323,8 +382,25 @@ def card_title(host: str, rep: dict, window_min: int) -> str:
     return f"Desktop backend timeouts: {rep['count']} in {window_min} min"
 
 
-def card_body(host: str, rep: dict, probe: dict, threshold: int, window_min: int) -> str:
-    seen = fence_evidence(f"""Detected by hermes-mods plugins/coach/backend_timeouts.py (cron, every 10 min) on {host}.
+ATTRIBUTE_MD = """Attribute bytes and requests per path on the far end of the connection, not timeouts: the paths that time out
+   are mostly victims queued behind whatever fills the link. On the backend host, capture its loopback port for 30 s
+   (`sudo timeout 30 tcpdump -i lo -w /tmp/bt.pcap 'tcp port <backend port>'`), then sum requests and response bytes
+   per request path (e.g. `tshark -r /tmp/bt.pcap -Y http.response -T fields -e http.response_for.uri -e
+   http.content_length_header`, or a small dpkt/scapy parser when responses are chunked). The path with the most
+   bytes or requests is the suspect even if its timeout count is not the highest."""
+
+
+def _saturation_step(rep: dict, threshold: int) -> str:
+    conns = saturated_conns(rep, threshold)
+    if not conns:
+        return ""
+    names = ", ".join(f"conn={c}" for c in conns)
+    return f"3. The evidence names link/connection saturation on {names}. {ATTRIBUTE_MD}\n"
+
+
+def _evidence(host: str, rep: dict, probe: dict, threshold: int, window_min: int) -> str:
+    sat = _saturation_md(rep, threshold)
+    return fence_evidence(f"""Detected by hermes-mods plugins/coach/backend_timeouts.py (cron, every 10 min) on {host}.
 
 The Desktop app on {host} logged {rep['count']} "{NEEDLE}" lines in the last {window_min} min
 ({rep['first']} .. {rep['last']}, explicit UTC offsets; threshold {threshold}).
@@ -334,12 +410,16 @@ after a wake but were issued before it).
 The threshold applies only to awake timeouts; raw count remains unchanged.
 Awake timeouts by backend connection: {rep.get("awake_by_conn") or "(none)"}; by time since last observed wake:
 {rep.get("awake_since_wake") or "(none)"}.
-
+{(chr(10) + sat + chr(10)) if sat else ""}
 ## Top request paths
 {_paths_md(rep)}
 
 ## Host
 {_host_md(probe)}""")
+
+
+def card_body(host: str, rep: dict, probe: dict, threshold: int, window_min: int) -> str:
+    seen = _evidence(host, rep, probe, threshold, window_min)
     return f"""The Desktop backend timed out on requests. Users see this as chats that won't load,
 archive asking "task status unavailable", stale boards.
 
@@ -353,7 +433,7 @@ archive asking "task status unavailable", stale boards.
    top paths above against the local backend, `ps`/`sample` the busiest `hermes serve`, and check recent core
    commits for per-request work (e.g. 2026-10-27: a per-request kanban integrity_check, fixed in f2d0e23785).
 2. Fix the cause (not just a restart). Use the five-whys skill for the chain.
-
+{_saturation_step(rep, threshold)}
 ## Acceptance
 - After the fix, a fresh 30-minute window shows zero timeouts:
   `python3 ~/code/hermes-mods/plugins/coach/backend_timeouts.py --dry-run` prints `"count": 0` with `window_start`
@@ -506,10 +586,19 @@ def file_card(home: Path, host: str, now: datetime, rep: dict, probe: dict, thre
 
 
 def significant_paths(rep: dict, threshold: int) -> list:
-    """Awake paths big enough to need their own owner: >= PATH_SHARE of the awake count, or >= the threshold."""
+    """Awake paths big enough to need their own owner: >= PATH_SHARE of the awake count, or >= the threshold,
+    counting only timeouts that stand apart from their conn: a saturated conn's shared-burst timeouts belong to its
+    conn card (:func:`saturated_conns`), so a victim path gets no card of its own."""
     total = rep.get("awake_count") or 0
-    return [p for p, n in (rep.get("awake_by_path") or {}).items()
-            if total and (n >= threshold or n >= PATH_SHARE * total)]
+    absorbed: Counter = Counter()
+    for conn in saturated_conns(rep, threshold):
+        absorbed.update(rep["awake_conn_bursts"][conn].get("burst_by_path") or {})
+    out = []
+    for p, n in (rep.get("awake_by_path") or {}).items():
+        apart = n - absorbed[p]
+        if total and (apart >= threshold or apart >= PATH_SHARE * total):
+            out.append(p)
+    return out
 
 
 def path_token(path: str) -> str:
@@ -559,67 +648,149 @@ def path_card_title(path: str, n: int, window_min: int) -> str:
     return f"Desktop backend timeouts on {path_token(path)}: {n} in {window_min} min (no owner card)"
 
 
+def conn_card_title(conn: str, info: dict, window_min: int) -> str:
+    return (f"Desktop link saturation on conn={conn}: {info['count']} timeouts across "
+            f"{len(info['paths'])} paths in {window_min} min (one card for the conn)")
+
+
+def conn_token(conn: str) -> str:
+    """How a card names a saturated connection; the host card's evidence and the conn card both carry it."""
+    return f"conn={conn}"
+
+
+def conn_card_body(host: str, conn: str, rep: dict, probe: dict, threshold: int, window_min: int,
+                   previous: str) -> str:
+    info = rep["awake_conn_bursts"][conn]
+    burst_by = info.get("burst_by_path") or {}
+    cands = "\n".join(f"- `{p}`: {n} ({burst_by.get(p, 0)} in shared bursts)"
+                      for p, n in list(info["paths"].items())[:TOP_PATHS]) or "- (none)"
+    pct = round(100.0 * info["in_bursts"] / info["count"]) if info["count"] else 0
+    return f"""Link/connection saturation on `{conn_token(conn)}`, not one slow handler: {info['count']} of
+{rep.get('awake_count')} awake timeouts went over this connection, and {info['in_bursts']} of them ({pct}%) fell in
+{info['burst_buckets']} shared {BURST_BUCKET_S}-second bursts in which several paths timed out together
+({len(burst_by)} paths in all). One saturated tunnel or link makes every path on it time out at once, so this one card
+stands for the whole connection; the detector files no per-path card for these victims.
+{previous}
+{home_pin_note("confirming the tunnel is the bottleneck needs the Desktop host that logged the timeouts and its tunnel")}
+
+## Candidate paths on {conn_token(conn)}
+{cands}
+
+Most of these are probably victims. The cause is whichever path sends the most bytes or requests over the link,
+and that may not be the one with the most timeouts.
+
+## Evidence
+{_evidence(host, rep, probe, threshold, window_min)}
+
+## Do this
+1. Confirm the link is the bottleneck. Time `/api/health` through the Desktop's tunnel for this conn, then through a
+   fresh tunnel to the same port (`ssh -o ControlPath=none -L ...`), then on the backend host's loopback. Read
+   `ss -tnoi` on the backend host for this peer's Send-Q / notsent.
+2. {ATTRIBUTE_MD}
+3. Fix the path that floods the link (request rate, refetch storms, response size), not its victims. Use the
+   five-whys skill for the chain.
+
+## Acceptance
+- After the fix, a fresh 30-minute window shows zero timeouts on this conn:
+  `python3 ~/code/hermes-mods/plugins/coach/backend_timeouts.py --dry-run` shows no `{conn}` entry in
+  `awake_by_conn`, with `window_start` later than the fix. A restart alone does not satisfy this.
+- Paste that output and the per-path byte/request attribution in a comment before completing.
+"""
+
+
+def _ensure_owner(home: Path, st: dict, skey: str, base: str, now: datetime, runner: Callable, what: str,
+                  find_owner: Callable, make_body: Callable, title: str, still: str) -> dict:
+    """One owner for `skey`: reuse our open card (comment hourly), accept another owner (`find_owner()`), else file
+    `base` (:2, :3, ... once the earlier one closed)."""
+    paths_st = st.setdefault(PATHS_KEY, {})
+    now_s = now.timestamp()
+    ent = paths_st.get(skey) or {}
+    tid = ent.get("task_id")
+    previous = ""
+    if tid:
+        status = _card_status(runner, tid)
+        if status is not None and status not in CLOSED:
+            if now_s - float(ent.get("last_comment") or 0) < COMMENT_EVERY_S:
+                return {"owner": tid, "action": "throttled"}
+            r = _run(runner, ["hermes", "kanban", "comment", tid, "--author", "backend-timeouts-watch", still])
+            ent["last_comment"] = now_s
+            save_state(home, st)
+            return {"owner": tid, "action": "commented" if r.returncode == 0 else "comment_failed"}
+        previous = (f"\nEarlier card for this {what} `{tid}` closed ({status}).\n" if status else
+                    f"\nEarlier card for this {what} `{tid}` has unreadable status; treating it as closed.\n")
+    owner = find_owner()
+    if owner is not None:
+        return {"owner": owner, "action": "owned"}
+    sequence = int(ent.get("sequence") or 0) + 1 if tid else 1
+    key = base if sequence == 1 else f"{base}:{sequence}"
+    try:
+        pin, body = home_route(make_body(previous))
+    except HomePinUnresolved as exc:
+        return {"action": "create_failed", "out": str(exc)[-300:]}
+    r = _run(runner, ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", key,
+                      "--created-by", "backend-timeouts-watch", "--body-file", "-", "--json", *pin, title], body)
+    try:
+        new_tid = json.loads(r.stdout).get("id") if r.returncode == 0 else None
+    except (ValueError, TypeError, AttributeError):
+        new_tid = None
+    if not isinstance(new_tid, str) or not new_tid:
+        return {"action": "create_failed", "key": key, "rc": r.returncode}
+    paths_st[skey] = {"task_id": new_tid, "sequence": sequence, "created": now_s, "last_comment": now_s}
+    save_state(home, st)
+    return {"owner": new_tid, "action": "created", "key": key}
+
+
 def file_path_cards(home: Path, host: str, now: datetime, rep: dict, probe: dict, threshold: int,
                     window_min: int, runner: Callable, host_result: dict) -> dict:
-    """Every significant path gets an owner: reuse our open per-path card (comment hourly), accept an owning
-    host/parent card, else file `backend-timeouts:<host>:<path>` (:2, :3, ... once the earlier one closed)."""
+    """Every saturated conn, then every significant path, gets an owner: reuse our open card (comment hourly),
+    accept an owning host/parent card, else file `backend-timeouts:<host>:conn:<conn>` (at most one per conn) or
+    `backend-timeouts:<host>:<path>` (:2, :3, ... once the earlier one closed). Output keys: the path, or
+    `conn=<conn>`."""
     if host_result.get("action") not in {"commented", "comment_failed", "throttled"}:
         return {}  # a fresh host card lists every top path; a failed create means the board is unusable now
     st = load_state(home)
     host_ent = next((v for k, v in st.items() if k != PATHS_KEY and isinstance(v, dict)
                      and v.get("task_id") == host_result.get("task_id")), {"task_id": host_result.get("task_id")})
-    paths_st = st.setdefault(PATHS_KEY, {})
-    now_s = now.timestamp()
     n_by = rep.get("awake_by_path") or {}
+    host_tid = host_result.get("task_id")
     out = {}
+    for conn in saturated_conns(rep, threshold):
+        info = rep["awake_conn_bursts"][conn]
+        tok = conn_token(conn)
+
+        def find_conn_owner(info=info, tok=tok):
+            owner = path_owner(runner, host_ent, tok)
+            if owner is not None:
+                return owner
+            # an active host card already working on the conn's top paths owns them, as before this check existed
+            top = list(info.get("burst_by_path") or {})[:3]
+            owners = {path_owner(runner, host_ent, p) for p in top}
+            return owners.pop() if top and len(owners) == 1 and None not in owners else None
+
+        def conn_body(previous, conn=conn, tok=tok):
+            why = (f"No open card names `{tok}`: the incident card `{host_tid}` is not working on it (it is closed, "
+                   f"or waits behind parents about other paths).\n")
+            return why + conn_card_body(host, conn, rep, probe, threshold, window_min, previous)
+
+        still = (f"Still firing at {now.isoformat()} on {host}: {tok} {info['count']} of {rep.get('awake_count')} "
+                 f"awake timeouts in {window_min} min, {info['in_bursts']} in {info['burst_buckets']} shared "
+                 f"bursts across {len(info.get('burst_by_path') or {})} paths.\nTop paths:\n"
+                 + "\n".join(f"- `{p}`: {n}" for p, n in list(info["paths"].items())[:TOP_PATHS]))
+        out[tok] = _ensure_owner(home, st, f"{host}:conn:{conn}", f"backend-timeouts:{host}:conn:{conn}", now,
+                                 runner, "connection", find_conn_owner, conn_body,
+                                 conn_card_title(conn, info, window_min), still)
     for path in significant_paths(rep, threshold):
-        skey = f"{host}:{path}"
-        ent = paths_st.get(skey) or {}
-        tid = ent.get("task_id")
-        previous = ""
-        if tid:
-            status = _card_status(runner, tid)
-            if status is not None and status not in CLOSED:
-                if now_s - float(ent.get("last_comment") or 0) < COMMENT_EVERY_S:
-                    out[path] = {"owner": tid, "action": "throttled"}
-                    continue
-                text = (f"Still firing at {now.isoformat()} on {host}: {path} {n_by.get(path)} of "
-                        f"{rep.get('awake_count')} awake timeouts in {window_min} min.")
-                r = _run(runner, ["hermes", "kanban", "comment", tid, "--author", "backend-timeouts-watch", text])
-                ent["last_comment"] = now_s
-                save_state(home, st)
-                out[path] = {"owner": tid, "action": "commented" if r.returncode == 0 else "comment_failed"}
-                continue
-            previous = (f"\nEarlier card for this path `{tid}` closed ({status}).\n" if status else
-                        f"\nEarlier card for this path `{tid}` has unreadable status; treating it as closed.\n")
-        owner = path_owner(runner, host_ent, path)
-        if owner is not None:
-            out[path] = {"owner": owner, "action": "owned"}
-            continue
-        sequence = int(ent.get("sequence") or 0) + 1 if tid else 1
-        base = f"backend-timeouts:{host}:{path}"
-        key = base if sequence == 1 else f"{base}:{sequence}"
-        why = (f"No open card names `{path}`: the incident card `{host_result.get('task_id')}` is not working on it "
-               f"(it is closed, or waits behind parents about other paths). This card owns `{path_token(path)}` "
-               f"({n_by.get(path)} of {rep.get('awake_count')} awake timeouts).\n{previous}\n")
-        try:
-            pin, body = home_route(why + card_body(host, rep, probe, threshold, window_min))
-        except HomePinUnresolved as exc:
-            out[path] = {"action": "create_failed", "out": str(exc)[-300:]}
-            continue
-        r = _run(runner, ["hermes", "kanban", "create", "--assignee", "default", "--idempotency-key", key,
-                          "--created-by", "backend-timeouts-watch", "--body-file", "-", "--json",
-                          *pin, path_card_title(path, n_by.get(path) or 0, window_min)], body)
-        try:
-            new_tid = json.loads(r.stdout).get("id") if r.returncode == 0 else None
-        except (ValueError, TypeError, AttributeError):
-            new_tid = None
-        if not isinstance(new_tid, str) or not new_tid:
-            out[path] = {"action": "create_failed", "key": key, "rc": r.returncode}
-            continue
-        paths_st[skey] = {"task_id": new_tid, "sequence": sequence, "created": now_s, "last_comment": now_s}
-        save_state(home, st)
-        out[path] = {"owner": new_tid, "action": "created", "key": key}
+        def path_body(previous, path=path):
+            why = (f"No open card names `{path}`: the incident card `{host_tid}` is not working on it "
+                   f"(it is closed, or waits behind parents about other paths). This card owns `{path_token(path)}` "
+                   f"({n_by.get(path)} of {rep.get('awake_count')} awake timeouts).\n{previous}\n")
+            return why + card_body(host, rep, probe, threshold, window_min)
+
+        still = (f"Still firing at {now.isoformat()} on {host}: {path} {n_by.get(path)} of "
+                 f"{rep.get('awake_count')} awake timeouts in {window_min} min.")
+        out[path] = _ensure_owner(home, st, f"{host}:{path}", f"backend-timeouts:{host}:{path}", now, runner,
+                                  "path", lambda path=path: path_owner(runner, host_ent, path), path_body,
+                                  path_card_title(path, n_by.get(path) or 0, window_min), still)
     return out
 
 
@@ -670,7 +841,8 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] =
     res = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "host": host, "home": str(home),
            "dry_run": a.dry_run, "threshold": threshold, "window_min": window, **rep,
            "power": power_report, "clock": clock,
-           "over_threshold": rep["awake_count"] >= threshold, "cards": []}
+           "over_threshold": rep["awake_count"] >= threshold, "saturated_conns": saturated_conns(rep, threshold),
+           "cards": []}
     if res["over_threshold"]:
         res["host_probe"] = (probe or probe_host)()
         if not a.dry_run:

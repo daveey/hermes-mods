@@ -1475,6 +1475,18 @@ every timeout still in the logs. Tests: `tests/test_backend_timeouts.py` (40 lin
 repeat the same day comments instead of duplicating, lost state, next day, rotated logs, histogram; also passes
 under Python 3.9).
 
+Link/connection saturation (2026-11-13: one saturated hub ssh tunnel filed three per-path cards, kanban/board,
+kanban/boards and hub-sync/status, for one cause): awake timeouts are bucketed per `conn=` in 2-second buckets. A
+conn that is significant (>= 20% of the awake count or >= the threshold) with >= half of its timeouts in >= 2 shared
+buckets (>= 2 paths timing out together) spanning >= 3 paths is classified as saturation (`saturated_conns` in the
+JSON report). It gets at most ONE card, key `backend-timeouts:<host>:conn:<conn>`, naming its top paths as candidates
+and asking for per-path byte/request attribution on the far end (loopback tcpdump + per-path sum); the host card's
+evidence and Do list name it too. A path's shared-burst timeouts on a saturated conn no longer count toward its own
+path card; it keeps one only when its timeouts outside those bursts are significant by themselves. Tests:
+`tests/test_backend_timeout_conn_bursts.py` (a burst across paths gives one conn card and no path cards; a single
+slow path gives one path card; a path standing apart keeps its card; two conns; an active card naming the conn owns
+it).
+
 #### Timestamp contract and rollout
 
 Production scans use UTC instants and read the producer's immutable numeric offset:
