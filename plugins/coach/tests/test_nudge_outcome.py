@@ -649,6 +649,40 @@ def test_legacy_bare_outcome_check_failed_keeps_class_check_failed():
     assert sg.unjudged_outcome({"resolved": None, "evidence": "outcome check failed"}) == "check_failed"
 
 
+def test_legacy_judge_unavailable_evidence_without_flag_is_judge_unavailable(tmp_path):
+    """(d) a row with the "judge unavailable: ..." evidence but no judge_error flag (a legacy row, or a writer other
+    than the post_llm hook) is still class judge_unavailable from its evidence alone, and is never filed."""
+    out = _uout("judge unavailable: SubscriptionQuotaUnavailable: anthropic subscription quota exhausted until 09:00",
+                judged=True, error="SubscriptionQuotaUnavailable")
+    assert "judge_error" not in out and out["resolved"] is None
+    assert sg.unjudged_outcome(out) == "judge_unavailable"
+    got, later, logged = _collect(tmp_path, [U_NUDGE, out])
+    assert got == [] and later == [], got
+    assert [r["nudge_id"] for r in logged if r.get("event") == "nudge_outcome_judge_unavailable"] == ["n_614e"]
+
+
+def test_second_opinion_raising_quota_error_is_unconfirmed_not_judge_unavailable(tmp_path):
+    """(e) the report_only second opinion raises (quota out) after the screen fails the revision: check() treats it
+    as no second opinion, so the outcome is the unconfirmed screen_fallback (no judge_error, class ""), never filed."""
+    z = {k: 0 for k in rc.RULES}
+    called = []
+
+    def screen(s, p):
+        return json.dumps({**z, "report_only": 0.9, "evidence": "the follow-up remains open"})
+
+    def confirm():
+        called.append(1)
+        raise SubscriptionQuotaUnavailable("quota out")
+    res = rc.nudge_outcome("report_only", U_REPLY, "what's next?", [], screen, confirm=confirm)
+    assert called == [1]
+    assert res["resolved"] is None and res.get("unconfirmed") is True and res.get("src") == "screen_fallback", res
+    assert res["evidence"].startswith("report_only second opinion due but unavailable; screen alone: ")
+    assert "judge_error" not in res and "error" not in res
+    assert sg.unjudged_outcome(res) == ""
+    got, later, _ = _collect(tmp_path, [U_NUDGE, _uout(res["evidence"], judged=True, unconfirmed=True)])
+    assert got == [] and later == [], got
+
+
 def test_live_hooks_quota_out_recheck_logs_typed_outcome_and_error_event(tmp_path, monkeypatch):
     """Entry path: the live pre_verify hook with a re-check judge that raises a quota error logs the typed outcome
     (judge_error, error) plus a nudge_outcome_error event with the traceback tail, and the collector files nothing."""
