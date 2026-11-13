@@ -132,3 +132,15 @@ def test_engineering_budget_and_denial_blocks_are_not_held():
     for r in ("Add at least $5 of pay-per-use credit, then unblock.", "Buy API credit, then unblock.",
               "Please raise the Anthropic budget so the eval can finish."):
         assert h.credit_ask("kanban_block", {"reason": r}), r
+
+
+# Self-heal agent-2c90bd7aa7: a CI cost estimate ("add about $4/day") with no AI billing context was held as an AI
+# credit ask. A bare $ amount now needs AI billing context or credit/top-up wording (mirrors coach reply_check).
+def test_non_ai_cost_estimate_blocks_are_not_held():
+    h = fresh()
+    for r in ("Blacksmith macOS CI: the two short jobs (Native memory and real-codesign) add about $4/day. Reply A or B.",
+              "Turning both jobs on would add about $4/day in cost; approve or decline, then unblock.",
+              "Enabling them would add about $4/day of CI runner minutes. Unblock = enable."):
+        assert h.credit_ask("kanban_block", {"reason": r}) is None, r
+    for r in ("Please add about $250 of Anthropic credit, then unblock.", "Add $250 of credit, then unblock."):
+        assert h.credit_ask("kanban_block", {"reason": r}), r
