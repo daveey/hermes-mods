@@ -614,3 +614,126 @@ def test_a_model_marked_repeat_is_framed_onto_the_existing_tile(tmp_path):
                              action_store=store, action_owner=OWNER, llm=lambda *a: json.dumps(payload))
     assert [s['id'] for s in out['steps']] == [tile['id']] and tile['id'] in out['text']
     assert len(live(store)) == 1 and len(ledger.read('session-a')['steps']) == 1
+
+
+# ---- same decision across replies: equal lettered menu, or an ask already inside an open tile's scope -----------
+# Live MacBook chat ..f07c32 (2026-11-13): request 2948b7f0 (step us_852f91e2d3) held both macOS CI picks. The 11:54
+# reply then minted us_64aeb33b63 from a bare reminder sentence (same A/B/C menu, reworded) and us_60b82616bf from the
+# restated second question (whose card ask 2948b7f0's scope already quoted): three tiles for two decisions.
+
+BLACKSMITH_ASK = ('"A = move the hermes_state lane plus the Native memory and real-codesign jobs to Blacksmith 6vcpu '
+                  'macOS (~$26/day, ~$770/mo); B = move only the sub-minute Native memory + real-codesign jobs '
+                  '(~$4/day, ~$120/mo; lane stays on the mini); C = no spend, keep everything on the mini."')
+TESTS_OS_ASK = ('"Pick how macOS platforms-marked tests should get CI: A) PR lane on the mini, B) scheduled '
+                'non-required lane, C) keep manual."')
+NEEDS_YOU_1108 = (
+    "**Needs you: reply here with a letter for each**\n"
+    "1. **Moving macOS CI off the overloaded Mac mini** has been waiting on your answer for over 3 hours. The ask is: "
+    f"{BLACKSMITH_ASK} It's also in your For-you list.\n"
+    "   - **If you pick A or B,** an agent moves those jobs.\n"
+    "   - **If you pick C, or don't answer,** nothing changes.\n"
+    "   - I'd pick B.\n"
+    "2. **macOS CI for the tests marked as posix/macOS-only.** These tests never run on macOS in CI today. The ask is: "
+    f"{TESTS_OS_ASK}\n"
+    "   - **If you pick A or B,** an agent builds that lane.\n"
+    "   - **If you pick C, or don't answer,** they stay manual.\n"
+    "   - I'd pick B.")
+STEP_852F = {'text': 'Pick macOS CI option A, B, or C (B recommended)', 'kind': 'choose',
+             'verbatim_span': "**If you pick C, or don't answer,** nothing changes.",
+             'options': ['B: sub-minute jobs only (~$120/mo)', 'A: lane plus jobs (~$770/mo)',
+                         'C: no spend, keep on mini']}
+STATUS_1154 = ("I've gone through all 95 card updates since my 10:36 message. Every fix they report merged exactly as "
+               "reviewed. A fix for the state guard is running now. Two macOS CI choices still need you.")
+STEP_64AE = {'text': 'Pick macOS CI option A, B, or C (B recommended)', 'kind': 'choose',
+             'verbatim_span': 'Two macOS CI choices still need you.',
+             'options': ['B: sub-minute jobs only (~$120/mo)', 'A: lane + jobs to Blacksmith (~$770/mo)',
+                         'C: no spend, keep on the mini']}
+NEEDS_YOU_1154 = (
+    "**Needs you: one letter for each.** Both cards are still waiting on you, and both questions are under one item "
+    "in your For-you list.\n"
+    f"1. **Moving macOS CI off the overloaded Mac mini** (MacBook board). The card asks: {BLACKSMITH_ASK}\n"
+    "   - **I'd pick B:** for $4/day it ends the 16-minute median wait the short jobs have.\n"
+    "2. **macOS CI for tests marked posix/macOS-only** (worker-6 board). These tests never run on macOS in CI today. "
+    f"The card asks: {TESTS_OS_ASK}\n"
+    "   - I'd pick B.\n"
+    "   - If you pick A or B, an agent builds that lane. If you pick C, or don't answer, they stay manual.")
+STEP_60B8 = {'text': 'Pick how macOS-marked tests should get CI: A, B, or C (B recommended)', 'kind': 'choose',
+             'verbatim_span': '**macOS CI for tests marked posix/macOS-only** (worker-6 board). These tests never run '
+                              'on macOS in CI today.',
+             'options': ['B: scheduled non-required lane', 'A: PR lane on the mini', 'C: keep manual']}
+
+
+def _open_macos_tile(store, ledger):
+    first = reply(store, ledger, NEEDS_YOU_1108, [dict(STEP_852F)])
+    assert len(live(store)) == 1
+    return first['steps'][0]
+
+
+def test_reminder_sentence_with_the_open_tiles_lettered_menu_reuses_it(tmp_path):
+    # (i) us_64aeb33b63: a bare "... still need you." reminder, read with the open tile's A/B/C menu reworded.
+    store, ledger = env(tmp_path)
+    tile = _open_macos_tile(store, ledger)
+    out = reply(store, ledger, STATUS_1154, [dict(STEP_64AE)])
+    assert len(live(store)) == 1
+    assert [s['id'] for s in out['steps']] == [tile['id']]
+
+
+def test_restated_question_quoted_in_the_open_tiles_scope_reuses_it(tmp_path):
+    # (ii) us_60b82616bf: the second question had no step of its own, but its card ask sits in 2948b7f0's scope.
+    store, ledger = env(tmp_path)
+    tile = _open_macos_tile(store, ledger)
+    out = reply(store, ledger, NEEDS_YOU_1154, [dict(STEP_60B8)])
+    assert len(live(store)) == 1
+    assert [s['id'] for s in out['steps']] == [tile['id']]
+
+
+def test_the_1154_reply_with_reminder_and_restated_questions_leaves_one_tile(tmp_path):
+    # The live 11:54 reply carried both: one open tile before, exactly one after.
+    store, ledger = env(tmp_path)
+    tile = _open_macos_tile(store, ledger)
+    out = reply(store, ledger, STATUS_1154 + "\n\n" + NEEDS_YOU_1154, [dict(STEP_64AE), dict(STEP_60B8)])
+    assert len(live(store)) == 1
+    assert {s['id'] for s in out['steps']} == {tile['id']}
+
+
+def test_same_letters_with_other_labels_is_a_new_ask(tmp_path):
+    # Equal letters prove nothing: a different A/B/C menu is a different decision.
+    store, ledger = env(tmp_path)
+    _open_macos_tile(store, ledger)
+    text = 'One more: which cache store should the scheduler use? A: Redis, B: SQLite files, C: in-memory only.'
+    reply(store, ledger, text, [{'text': 'Pick the scheduler cache store: A, B or C', 'kind': 'choose',
+                                 'verbatim_span': text, 'options': ['A: Redis', 'B: SQLite files', 'C: in-memory only']}])
+    assert len(live(store)) == 2
+
+
+def test_a_new_question_beside_a_quote_of_the_open_scope_is_a_new_ask(tmp_path):
+    # Its paragraph quotes the open tile's card ask, but the step's own menu is not in that quote: a new decision.
+    store, ledger = env(tmp_path)
+    _open_macos_tile(store, ledger)
+    text = (f"The tests-os card still asks {TESTS_OS_ASK} Separately, should the new lane run nightly or "
+            "weekly?")
+    reply(store, ledger, text, [{'text': 'Pick how often the new lane runs', 'kind': 'choose',
+                                 'verbatim_span': 'Separately, should the new lane run nightly or weekly?',
+                                 'options': ['A: nightly', 'B: weekly']}])
+    assert len(live(store)) == 2
+
+
+def test_two_lettered_questions_in_one_new_reply_stay_two_tiles(tmp_path):
+    # The scope rule is for LATER replies: two questions of one fresh paragraph are two asks.
+    store, ledger = env(tmp_path)
+    reply(store, ledger, NEEDS_YOU_1108, [dict(STEP_852F), {**STEP_60B8, 'verbatim_span':
+          "**macOS CI for the tests marked as posix/macOS-only.** These tests never run on macOS in CI today."}])
+    assert len(live(store)) == 2
+
+
+def test_a_gate_held_draft_publishes_no_tile(plugin, monkeypatch):
+    # 2c (refuted live: the 11:08 draft was delivered, ask-gate verdict ok, turn ended text_response 5636 chars).
+    # The pre_final_gate callback only judges; the transform that publishes runs on the delivered reply alone.
+    monkeypatch.setattr(plugin, 'aux_llm', lambda *a: json.dumps({'steps': [
+        {'text': 'Approve deploying build 9', 'kind': 'approve', 'verbatim_span': 'Want me to deploy build 9?',
+         'options': []}, dict(STEP_852F)], 'resolved': []}))
+    out = plugin.publication_buffer(session_id='session-a', platform='cli',
+                                    final_response='Want me to deploy build 9?\n\n' + NEEDS_YOU_1108)
+    assert out and out.get('hold') is True
+    assert plugin.core.ActionStore().requests(OWNER) == []
+    assert plugin._ledger().read('session-a').get('steps', []) == []

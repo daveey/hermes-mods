@@ -1582,7 +1582,8 @@ def open_asks(store, owner, steps=()) -> list[dict]:
     by_rid = {s['requestId']: s for s in steps
               if s.get('requestId') and s.get('status') == 'open' and s.get('session') == sid}
     return [{'id': r['requestId'], 'kind': r['kind'], 'title': r['title'], 'step': by_rid.get(r['requestId']),
-             'labels': [c.get('label') for c in r.get('choices', [])]}
+             'labels': [c.get('label') for c in r.get('choices', [])],
+             'scope': str((r.get('scope') or {}).get('markdown') or '')}
             for r in store.requests(owner)
             if r['state'] in ('open', 'needs_context') and not r.get('resolution')]
 
@@ -1842,14 +1843,90 @@ def split_repeats(repeats, tiles: dict, reply: str) -> tuple[list, list]:
     return kept, dropped
 
 
+# ---- same decision across replies: the open tile's lettered menu, or an ask inside its frozen scope ----------
+# Live MacBook chat ..f07c32: request 2948b7f0 held both macOS CI picks. A later reply minted one tile from a bare
+# reminder sentence ("Two macOS CI choices still need you.") read with the same A/B/C menu reworded, and one from
+# the restated second question, whose card ask the open request's scope already quoted. Both rules are LATER-reply
+# only (an ask minted in this reply is never their target) and need the step's own menu or sentence, never a title.
+
+_LETTERED = re.compile(r"^\s*\(?([a-h])\s*[):.=\u2013\u2014-]\s*(\S.*)$", re.I)
+_LABEL_STOP = frozenset({"a", "an", "the", "to", "on", "of", "in", "at", "for", "with", "and", "or", "mo", "day"})
+_QUOTED = re.compile(r'"([^"\n]{40,})"')
+_LABEL_MATCH = 0.6
+
+
+def _label_words(label: str) -> list[str]:
+    t = _norm(label).replace("+", " plus ").replace("&", " and ")
+    return [w for w in re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)*", t) if w not in _LABEL_STOP]
+
+
+def _lettered_menu(options) -> Optional[dict]:
+    """{letter: label words} when every option is lettered ("B: sub-minute jobs only"), at least two, letters
+    distinct and every label has words; else None."""
+    out: dict = {}
+    for o in options or ():
+        m = _LETTERED.match(str(o or ""))
+        words = _label_words(m.group(2)) if m else []
+        if not m or not words or m.group(1).lower() in out:
+            return None
+        out[m.group(1).lower()] = words
+    return out if len(out) >= 2 else None
+
+
+def _same_label(a: list[str], b: list[str]) -> bool:
+    """The label's leading word is the same and most of the shorter label's words are in the other."""
+    sa, sb = set(a), set(b)
+    return a[0] == b[0] and len(sa & sb) / min(len(sa), len(sb)) >= _LABEL_MATCH
+
+
+def same_lettered_menu(candidate: dict, ask: dict) -> bool:
+    """(i) A choose step whose lettered menu is the open choice's own: the same letters, each with the same
+    label (``_same_label``). The open side is its extracted step's options, else the request's choice labels."""
+    if candidate.get('kind') != 'choose' or ask.get('kind') != 'choice':
+        return False
+    mine = _lettered_menu(candidate.get('options'))
+    step = ask.get('step') if isinstance(ask.get('step'), dict) else {}
+    theirs = _lettered_menu(step.get('options')) or _lettered_menu(ask.get('labels'))
+    return bool(mine and theirs and mine.keys() == theirs.keys()
+                and all(_same_label(mine[k], theirs[k]) for k in mine))
+
+
+def inside_open_scope(candidate: dict, ask: dict, reply: str = "") -> bool:
+    """(ii) The step's own ask already sits in the open request's frozen scope markdown: its specific evidence
+    sentence is in that scope, or its paragraph quotes a card ask (``"..."``, 40+ chars) that the scope quotes too
+    and that quote IS this step's ask (the sentence contains it, or it carries every label of the step's menu)."""
+    scope = _norm(str(ask.get('scope') or "")).replace('"', "")
+    span = ask_key(candidate.get('verbatim_span')).replace('"', "")
+    if not scope or _EXTRACTED_KIND.get(candidate.get('kind'), 'input') != ask.get('kind'):
+        return False
+    # A sentence that IS the whole scope or the title is only an equal title: no identity (README).
+    whole = {ask_key(ask.get('scope')).replace('"', ""), ask_key(ask.get('title')).replace('"', "")}
+    if len(span) >= _SPAN_KEY_MIN and len(span.split()) >= 5 and span in scope and span not in whole:
+        return True
+    block = locate(reply, str(candidate.get('verbatim_span') or "")) if reply else None
+    if block is None:
+        return False
+    menu = [_words(_LETTERED.sub(r"\2", str(o or ""))) for o in candidate.get('options') or ()]
+    menu_ok = len(menu) >= 2 and all(menu)
+    for q in _QUOTED.findall(_norm(block["text"])):
+        q = q.strip()
+        if q not in scope:
+            continue
+        if q in _norm(str(candidate.get('verbatim_span') or "")) or (menu_ok and all(m <= _words(q) for m in menu)):
+            return True
+    return False
+
+
 def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optional[dict] = None,
                   turn_requests=(), reply: str = "") -> Optional[dict]:
     """The open ask ``candidate`` (an extracted step) provably repeats, or None (it is its own ask).
 
-    Exact provenance only, never title, word or menu similarity on its own:
+    Exact provenance only, never title or word similarity on its own (a menu only when lettered and equal):
     - the model marked this exact sentence as a repeat of an open id (request id or extracted step id) and the
       sentence or its paragraph corroborates it (``repeat_corroborated``);
     - the evidence sentence (a specific one) is the sentence an open extracted ask came from in an EARLIER reply;
+    - in a LATER reply: a choose step offers the open choice's own lettered menu (``same_lettered_menu``), or the
+      step's own ask already sits in an open request's frozen scope (``inside_open_scope``);
     - the request was published or revised by the producer tool in this very turn (``turn_requests``,
       server-recorded) and the candidate restates its title, or is the approve/change/decline menu of the only
       such approval (or its sentence was already read as that approval in this reply).
@@ -1876,6 +1953,12 @@ def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optiona
     # One sentence can carry two different asks: the same-sentence rule is for LATER replies only.
     hit = pick([a for a in asks if long_span and a['step'] is not None and not a.get('fresh')
                 and span == ask_key(a['step'].get('verbatim_span'))])
+    if hit:
+        return hit
+    # Same decision in a LATER reply: the open tile's own lettered menu, or an ask its frozen scope already carries.
+    earlier = [a for a in asks if not a.get('fresh')]
+    hit = pick([a for a in earlier if same_lettered_menu(candidate, a)]) or \
+        pick([a for a in earlier if inside_open_scope(candidate, a, reply)])
     if hit:
         return hit
     mine = [a for a in asks if a['id'] in turn]

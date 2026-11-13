@@ -444,7 +444,8 @@ declarations, quoted questions, and the exact reply that produced a stale approv
 ## One decision, one tile (by provenance, never by title)
 
 Two open requests with the same title are two requests. Equal or similar titles,
-shared card ids, overlapping words and matching menu labels are never identity
+shared card ids, overlapping words and matching menu labels are never identity (an
+equal lettered A/B/C menu in a later reply is, below)
 (implementation plan acceptance #2: no fuzzy dedup; missing identity does not trigger
 fuzzy dedup). `same_open_ask` (core.py) frames an extracted ask onto an existing
 open, undecided request of the same session only with exact provenance:
@@ -454,6 +455,16 @@ open, undecided request of the same session only with exact provenance:
   and the reply corroborates it (below);
 - the evidence sentence (30+ characters, 5+ words) is the sentence an open ask was
   extracted from in an EARLIER reply;
+- in a LATER reply, a `choose` step offers the open choice's own lettered menu: the
+  same letters, each label with the same leading word and mostly the same words
+  (`same_lettered_menu`: "A: lane + jobs to Blacksmith" is "A: lane plus jobs");
+- in a LATER reply, the step's own ask already sits in the frozen scope markdown of an
+  open request of the same kind: its specific evidence sentence is part of that scope
+  (not the whole scope or the title: that is only an equal title), or its paragraph
+  quotes (`"…"`, 40+ characters) a card ask the scope quotes too and that quote carries
+  every label of the step's menu (`inside_open_scope`). Live chat ..f07c32: a bare
+  "Two macOS CI choices still need you." and the restated second question each minted
+  a tile beside the open request that held both picks;
 - the request was published or revised by the `action_request` tool in this very turn
   (server-recorded `turn_requests`; reset when the next turn starts), and the ask
   restates its title or is the approve/change/decline menu of the only such approval;
