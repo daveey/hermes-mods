@@ -1701,18 +1701,40 @@ class Ledger:
 
 
 def pending_closeouts(ledger: "Ledger", read: Callable[[list[str]], dict],
-                      proof: Optional[Callable[[str, str, dict[str, Any]], bool]] = None) -> dict[str, list[str]]:
+                      proof: Optional[Callable[[str, str, dict[str, Any]], bool]] = None, *,
+                      rows: Optional[list[dict[str, Any]]] = None,
+                      row_key: Optional[Callable[[dict[str, Any], Any], Optional[str]]] = None,
+                      cache: Any = None, stats: Optional[dict[str, int]] = None) -> dict[str, list[str]]:
     """``{session_id: batch ids}`` for chats whose whole batch has settled but whose close-out turn has not run for
     that state: the sidebar keeps them grey "waiting" until the closing answer lands. Read-only; it applies the
-    same reconcile the waker persists, so the sidebar can never wait on a row the waker would skip."""
+    same reconcile the waker persists, so the sidebar can never wait on a row the waker would skip.
+
+    Incremental (``row_key`` and ``cache``, WAITING-INPUTS.md): a row whose key (its fields, its cards as read, its
+    lineage's transcript watermark) equals the one its last answer was computed under keeps that answer without a
+    reconcile or transcript proof. ``rows``: the pending rows already read. ``stats`` counts ``recomputed`` rows."""
     out: dict[str, list[str]] = {}
-    for row in ledger.pending():
+    pending = ledger.pending() if rows is None else rows
+    for row in pending:
         cards = read(row["batch"])
         sid = row["session_id"]
-        fix = reconcile_done(row, cards, (lambda t, c, sid=sid: proof(sid, t, c)) if proof else None)
-        row = {**row, **fix}
-        if (row["batch"] or unlinked_removed(row)) and pending_key(row, cards):
-            out[sid] = sorted(row["batch"]) or unlinked_removed(row)
+        key = row_key(row, cards) if row_key is not None and cache is not None else None
+        hit = cache.get(sid, key) if key is not None else None
+        if hit is not None:
+            result = hit[1]
+        else:
+            fix = reconcile_done(row, cards, (lambda t, c, sid=sid: proof(sid, t, c)) if proof else None)
+            row = {**row, **fix}
+            result = None
+            if (row["batch"] or unlinked_removed(row)) and pending_key(row, cards):
+                result = sorted(row["batch"]) or unlinked_removed(row)
+            if cache is not None:
+                cache.put(sid, key, result)
+            if stats is not None:
+                stats["recomputed"] = stats.get("recomputed", 0) + 1
+        if result:
+            out[sid] = list(result)
+    if cache is not None:
+        cache.keep(r["session_id"] for r in pending)
     return out
 
 

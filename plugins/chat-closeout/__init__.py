@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import bisect
 import contextlib
+import hashlib
 import importlib.util
 import json
 import logging
@@ -36,6 +37,7 @@ if __package__:
     from . import core
     from . import owner_wake
     from . import routing
+    from . import waiting_inputs as wi
 else:  # pytest imports the hyphenated plugin dir without a parent package
     _spec = importlib.util.spec_from_file_location("chat_closeout_core", Path(__file__).with_name("core.py"))
     core = importlib.util.module_from_spec(_spec)
@@ -49,6 +51,11 @@ else:  # pytest imports the hyphenated plugin dir without a parent package
     routing = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(routing)
     routing = sys.modules.setdefault("chat_closeout_routing", routing)
+    _spec = importlib.util.spec_from_file_location("chat_closeout_waiting_inputs",
+                                                   Path(__file__).with_name("waiting_inputs.py"))
+    wi = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(wi)
+    wi = sys.modules.setdefault("chat_closeout_waiting_inputs", wi)
 
 logger = logging.getLogger("chat_closeout")
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
@@ -1643,25 +1650,242 @@ def pre_final_gate(session_id: str = "", platform: str = "", final_response: str
 pre_final_gate.needs_buffer = True
 
 # ---- sidebar: a settled batch stays "waiting" until its close-out ----------------------------------------------
+# ---- declared inputs (WAITING-INPUTS.md; design t_01a1d563324d7e8e row C) --------------------------------------
+_wi_lock = threading.RLock()
+_wi: dict[str, Any] = {}
+
+
+def _wi_reset() -> None:
+    """Forget every input watcher and per-row answer (tests; a ledger/home switch is also caught by the keys)."""
+    with _wi_lock:
+        _wi.clear()
+    with _waiting_lock:
+        _state.pop("waiting_cache", None)
+        _state.pop("waiting_memo", None)
+    _state.pop("host_memo", None)
+
+
+def _wi_get(name: str, factory: Callable[[], Any]) -> Any:
+    with _wi_lock:
+        if name not in _wi:
+            _wi[name] = factory()
+        return _wi[name]
+
+
+def _revision_digest(name: str, path: Path, read: Callable[[sqlite3.Connection], Any]) -> Any:
+    """``read(conn)`` of ``path`` as a portable value, re-read only when its committed revision in this process
+    (``core.revision_token``: the retained observer's ``data_version``) moved. A missing file is ``"absent"``."""
+    if not path.exists():
+        return "absent"
+    token = core.revision_token(path)
+    with _wi_lock:
+        hit = _wi.get(name)
+    if token is not None and hit is not None and hit[0] == (str(path), token):
+        return hit[1]
+    conn = core.ro_connect(path)
+    try:
+        conn.execute("BEGIN")
+        try:
+            value = read(conn)
+        finally:
+            conn.rollback()
+    finally:
+        conn.close()
+    if token is not None and core.revision_token(path) == token:
+        with _wi_lock:
+            _wi[name] = ((str(path), token), value)
+    return value
+
+
+def _pending_rows() -> list[dict]:
+    """The ledger's pending rows, re-read only when the ledger's committed revision moved (copies: callers may
+    update them)."""
+    led = ledger()
+    token = core.revision_token(led.path)
+    with _wi_lock:
+        hit = _wi.get("pending")
+    if token is None or hit is None or hit[0] != (str(led.path), token):
+        rows = led.pending()
+        if token is not None and core.revision_token(led.path) == token:
+            with _wi_lock:
+                _wi["pending"] = ((str(led.path), token), rows)
+    else:
+        rows = hit[1]
+    return [dict(r) for r in rows]
+
+
+def _origin_ledger_path() -> Path:
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "kanban" / "origin-ledger.db"
+
+
+def _origin_digest() -> Any:
+    """The origin ledger's committed content (every obligation and receipt row), as a digest."""
+    def read(conn):
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        h = hashlib.sha1()
+        for t in tables:
+            h.update(t.encode())
+            for r in conn.execute(f'SELECT * FROM "{t}" ORDER BY rowid'):
+                h.update(json.dumps(list(r), default=str).encode())
+        return h.hexdigest()
+    return _revision_digest("origin", _origin_ledger_path(), read)
+
+
+def _lineages(sids: list[str]) -> Optional[dict[str, list]]:
+    """``{sid: lineage watermark}`` (``wi.lineage_key`` of the chat and its compression tip) for every chat, None
+    when a state.db can't be read. The tip is looked up again only when the chain's end markers moved."""
+    watch = _wi_get("lineage", wi.LineageWatch)
+    with _wi_lock:
+        tips: dict[str, tuple] = _wi.setdefault("tips", {})
+    paths = state_dbs()
+
+    def ids_of(sid: str) -> list[str]:
+        hit = tips.get(sid)
+        return [sid] + ([hit[1]] if hit and hit[1] and hit[1] != sid else [])
+
+    def marker(marks: dict, ids: list[str]) -> Any:
+        return [[i, [[n, list(w)[3:]] for n, w in marks.get(i, ())]] for i in ids]  # end_reason, child count
+
+    want = {i for s in sids for i in ids_of(s)}
+    marks = watch.watermarks(paths, want, _ro)
+    if marks is None:
+        return None
+    moved = [s for s in sids if s not in tips or tips[s][0] != marker(marks, ids_of(s))]
+    if moved:
+        for sid in moved:
+            try:
+                tip = _compression_tip(sid)
+            except Exception:
+                return None
+            tips[sid] = (None, tip)
+        want = {i for s in sids for i in ids_of(s)}
+        marks = watch.watermarks(paths, want, _ro)
+        if marks is None:
+            return None
+        for sid in moved:
+            tips[sid] = (marker(marks, ids_of(sid)), tips[sid][1])
+    for sid in [s for s in tips if s not in set(sids)]:
+        tips.pop(sid, None)
+    return {sid: wi.lineage_key(marks, ids_of(sid)) for sid in sids}
+
+
+def _shadow_parts(now: float) -> list:
+    """Each sync shadow / link-only board ``_board_coverage`` may consult: its content key and its freshness at now."""
+    from hermes_cli import kanban_session_activity as ksa
+    kanban = _kanban_root() / "kanban"
+    stems: set[str] = set()
+    for sub in ("sync-shadow", "sync-links"):
+        if (kanban / sub).is_dir():
+            stems.update(p.stem for p in (kanban / sub).glob("*.db") if _BOARD_SLUG.fullmatch(p.stem))
+    tables = getattr(getattr(ksa, "_revision", None), "SHADOW_TABLES", ("tasks", "task_chat_links"))
+    out = []
+    for stem in sorted(stems):
+        path = kanban / "sync-shadow" / f"{stem}.db"
+        if not path.is_file():
+            out.append([stem, None, False])
+            continue
+        try:
+            fresh, _found = _read_shadow(stem, set())
+        except Exception:
+            fresh = None
+        out.append([stem, ksa._board_content_key(path, tables), fresh])
+    return out
+
+
+def _input_parts(rows: list[dict], now: float, *, host: bool = False) -> dict[str, Any]:
+    """Every input a waiting pass (``host``: a host wake pass) reads, as content keys; raises when one can't be
+    read. Rows are whole pending rows: a write to any field re-runs the pass (whole rows, not a hand-kept list of
+    the fields core reads, so a new read in core can never be missed)."""
+    from hermes_cli import kanban_session_activity as ksa
+    sids = [r["session_id"] for r in rows]
+    tails = {str(k).rsplit("/", 1)[-1] for r in rows for k in (r.get("batch") or [])}
+    replica = _wi_get("replica", wi.ReplicaWatch)
+    hub = hub_db_path()
+    replica.refresh(hub, tails, core.ro_connect, core.revision_token(Path(hub)) if hub is not None else None)
+    lineages = _lineages(sids)
+    if lineages is None:
+        raise LookupError("a state.db is unreadable")
+    stale_after = float(getattr(ksa, "HUB_STALE_AFTER_S", wi.HUB_STALE_AFTER_S))
+    return {
+        "v": [wi.VERSION, "host" if host else "waiting"],
+        "scope": list(ksa._origin_scope()) if hasattr(ksa, "_origin_scope") else None,
+        "ledger": str(ledger().path),
+        "rows": [[r["session_id"], sorted(r.items())] for r in rows],
+        "origin": _origin_digest(),
+        "boards": [[str(p), ksa._board_content_key(Path(p))] for p in board_paths()],
+        "shadows": _shadow_parts(now),
+        "replica": replica.key(now, stale_after),
+        "lineage": [[s, lineages[s]] for s in sids],
+        "floor": int(now // wi.FLOOR_S),
+    }
+
+
+def waiting_inputs() -> Any:
+    """``register_waiting_source(inputs=)``: a portable key that moves whenever ``waiting_source`` could answer
+    differently (WAITING-INPUTS.md). Raises (no adoption) when an input can't be read or has no portable key.
+    Core reads it on every annotation fingerprint, so it is accounted too (P1 ``chat-closeout.waiting_inputs``)."""
+    if _off():
+        return ["off"]
+    with wi.accounting_pass("chat-closeout.waiting_inputs"), _proof_pass():
+        parts = _input_parts(_pending_rows(), time.time())
+        return wi.portable([parts[k] for k in sorted(parts)])
+
+
+def _waiting_row_key(lineages: Optional[dict[str, list]]) -> Callable[[dict, Any], Optional[str]]:
+    def key(row: dict, cards: Any) -> Optional[str]:
+        return wi.row_key(row, cards, (lineages or {}).get(row["session_id"]))
+    return key
+
+
 def waiting_source() -> dict[str, list[str]]:
     """kanban_session_activity waiting source: chats whose cards all settled but whose close-out has not run yet.
     Cached for 3 s (the session list polls). Single-flight: polls that arrive while a pass runs wait for it and
-    share its answer instead of each starting their own."""
+    share its answer instead of each starting their own.
+
+    Change-proportional (WAITING-INPUTS.md): the answer is reused while every declared input is unchanged, and a
+    pass after an input moved re-reconciles only the rows whose own key moved. Accounted as P1
+    ``chat-closeout.waiting`` (rows = rows re-reconciled)."""
     if _off():
         return {}
     with _waiting_lock:
         hit = _state.get("waiting_cache")
         if hit and time.monotonic() - hit[0] < 3.0:
             return hit[1]
-        try:
-            with _proof_pass():
+        with wi.accounting_pass("chat-closeout.waiting") as acct, _proof_pass():
+            # One proof pass for the inputs and the reconcile: the watermark seeks and the proofs share connections.
+            now = time.time()
+            try:
+                rows = _pending_rows()
+                parts = _input_parts(rows, now)
+            except Exception:
+                logger.debug("chat-closeout: waiting inputs unavailable; full pass", exc_info=True)
+                rows, parts = None, None
+                acct.fallback()
+            memo = _state.get("waiting_memo")
+            if parts is not None and memo is not None and memo[0] == parts:
+                acct.skip()
+                _state["waiting_cache"] = (time.monotonic(), memo[1])
+                return memo[1]
+            stats: dict[str, int] = {}
+            try:
                 # Settlement only: the light read skips the per-card handoff/ask subqueries nobody reads here.
-                reader = _pass_reader(light=True)
+                reader = _pass_reader(light=True, rows=rows)
                 _upgraded(reader)
-                out = core.pending_closeouts(ledger(), reader, proof=session_proof)
-        except Exception:
-            logger.debug("chat-closeout waiting source failed", exc_info=True)
-            out = {}
+                if parts is None:
+                    out = core.pending_closeouts(ledger(), reader, proof=session_proof)
+                else:
+                    lineages = dict(parts["lineage"])
+                    out = core.pending_closeouts(ledger(), reader, proof=session_proof, rows=rows,
+                                                 row_key=_waiting_row_key(lineages),
+                                                 cache=_wi_get("waiting_rows", wi.RowCache), stats=stats)
+            except Exception:
+                logger.debug("chat-closeout waiting source failed", exc_info=True)
+                out, parts = {}, None
+            acct.rows(stats.get("recomputed", 0))
+            acct.change(memo is None or memo[1] != out)
+            _state["waiting_memo"] = (parts, out) if parts is not None else None
         _state["waiting_cache"] = (time.monotonic(), out)
         return out
 
@@ -1672,7 +1896,11 @@ def _register_waiting_source() -> None:
     except Exception:
         return
     reg = getattr(ksa, "register_waiting_source", None)
-    if reg is not None:  # older cores lack the seam: the row just goes green a little early
+    if reg is None:  # older cores lack the seam: the row just goes green a little early
+        return
+    try:
+        reg("chat-closeout", waiting_source, inputs=waiting_inputs)
+    except TypeError:  # a core whose seam takes no inputs: every adoption re-runs the source, as before
         reg("chat-closeout", waiting_source)
 
 
@@ -1737,15 +1965,62 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
             return []
         if read is None:
             read = _pass_reader(rows=rows)
-    with _proof_pass():
-        return _wake_tick(now=now, wake=wake, unseen=unseen, last_user=last_user, read=read, proof=proof,
-                          mono=mono, healthy=healthy, rows=rows, live=only if only is not None else live)
+    with wi.accounting_pass("chat-closeout.wake_tick") as acct, _proof_pass():
+        # Host keys (WAITING-INPUTS.md) only for a real full pass: injected readers/proofs/clocks (tests, the
+        # residual pass's own rows) see no shortcut.
+        keyed = only is None and read is None and proof is None and now is None and unseen is None
+        parts = memo = None
+        if keyed:
+            try:
+                rows = _pending_rows()
+                parts = _input_parts(rows, time.time(), host=True)
+            except Exception:
+                logger.debug("chat-closeout: host inputs unavailable; full pass", exc_info=True)
+                rows, parts = None, None
+                acct.fallback()
+            memo = _state.get("host_memo")
+            if parts is not None and memo is not None and memo == parts:
+                acct.skip()  # every row was quiet under exactly these inputs: nothing it decides can differ
+                return []
+            if rows is not None:
+                read = _pass_reader(rows=rows)
+        stats: dict[str, int] = {}
+        done = _wake_tick(now=now, wake=wake, unseen=unseen, last_user=last_user, read=read, proof=proof,
+                          mono=mono, healthy=healthy, rows=rows, live=only if only is not None else live,
+                          lineages=dict(parts["lineage"]) if parts is not None else None, stats=stats)
+        acct.rows(stats.get("recomputed", 0))
+        acct.change(bool(done) or bool(stats.get("wrote")))
+        quiet = parts is not None and stats.get("complete") and not done \
+            and stats.get("recomputed", 0) == stats.get("quiet", 0) \
+            and not stats.get("wrote")
+        _state["host_memo"] = parts if quiet else None
+        return done
+
+
+def _host_row_key(row: dict, cards: Any, lineages: Optional[dict[str, list]]) -> Optional[str]:
+    """A host-pass row's inputs: the whole ledger row, its cards as read (full read) and its lineage watermark."""
+    if lineages is None:
+        return None
+    return wi.row_key(row, cards, lineages.get(row["session_id"]))
+
+
+def _row_quiet(row: dict, cards: Any) -> bool:
+    """Nothing time-judged can make this row act: no close-out or ask key (so no quiet period, wake cap or claim
+    applies), no unlinked entry and no missing or stranded batch entry (whose clocks age every healthy pass)."""
+    if row.get("unlinked") or row.get("closing") is not None:
+        return False
+    if core.pending_key(row, cards) or core.ask_relay_key(row, cards):
+        return False
+    uncertain = getattr(cards, "uncertain", frozenset())
+    return not any((cards.get(k) is None and k not in uncertain) or core.is_stranded(cards.get(k))
+                   for k in row.get("batch") or [])
 
 
 def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=None, rows=None,
-               live=None) -> list[dict]:
+               live=None, lineages=None, stats=None) -> list[dict]:
     now = time.time() if now is None else now
     mono = time.monotonic() if mono is None else mono
+    stats = {} if stats is None else stats
     read = read or _pass_reader()
     healthy = healthy or getattr(read, "healthy", None) or (lambda: False)
     if wake is None:
@@ -1762,21 +2037,30 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
     led = ledger()
     live = live or set()  # chats live in this process: a refusal another process recorded does not hold them off
     done: list[dict] = []
-    for row in (led.pending() if rows is None else rows):
+    quiet_rows = _wi_get("host_rows", wi.RowCache)
+    pending = led.pending() if rows is None else rows
+    for row in pending:
         sid = row["session_id"]
+        cards = core.canonical_view(read(row["batch"]))
+        hkey = _host_row_key(row, cards, lineages)
+        if quiet_rows.get(sid, hkey) is not None:
+            continue  # quiet under exactly these inputs last pass: the same reads decide the same nothing
+        quiet_rows.put(sid, None, None)
+        stats["recomputed"] = stats.get("recomputed", 0) + 1
         if _session_source(sid).lower() in SKIP_PLATFORMS:
             # A worker/cron transcript is not a chat: it cannot be resumed (resume is refused), so a ledger row for
             # it (stamped by a turn that ran without HERMES_KANBAN_TASK) would retry and raise ask-failed forever.
             led.write(sid, batch=[], open=[], failure_since=None, retry_after=0)
+            stats["wrote"] = stats.get("wrote", 0) + 1
             logger.info("chat-closeout: dropped ledger row of non-chat session %s", sid)
             continue
         if _session_gone(sid):
             # A deleted chat (e.g. a worker's throwaway Desktop test chat) can never take a close-out turn, so its
             # row would sit pending and the watchdog would file a no-closeout card for nobody.
             led.write(sid, batch=[], open=[], failure_since=None, retry_after=0)
+            stats["wrote"] = stats.get("wrote", 0) + 1
             logger.info("chat-closeout: dropped ledger row of deleted chat %s", sid)
             continue
-        cards = core.canonical_view(read(row["batch"]))
         fix = core.reconcile(row, cards)
         fix.update(_reconcile_asks(sid, {**row, **fix}, cards))
         fix.update(core.track_unlinked({**row, **fix}, cards, healthy=healthy, now=now, mono=mono))
@@ -1784,12 +2068,18 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
                                        lambda t, c, sid=sid: (proof or session_proof)(sid, t, c)))
         if fix:
             led.write(sid, **fix)
+            stats["wrote"] = stats.get("wrote", 0) + 1
             row = {**row, **fix}
             if not row["batch"] and not core.unlinked_removed(row):
                 continue
+        elif _row_quiet(row, cards):
+            quiet_rows.put(sid, hkey, True)
+            stats["quiet"] = stats.get("quiet", 0) + 1
+            continue
         key = core.pending_key(row, cards)
         if key and key != row.get("settled_sig"):
             led.write(sid, settled_sig=key, settled_at=now)
+            stats["wrote"] = stats.get("wrote", 0) + 1
         ids = _lineage(sid)
         if key and core.wakes_last_hour(row, now) >= core.MAX_WAKES_PER_HOUR:
             if _state.setdefault("capped", {}).get(sid) != key:
@@ -1836,6 +2126,7 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
             led.release(sid, due, result, now=now, backoff=backoff)
             logger.info("chat-closeout: close-out wake of %s deferred (%s)", sid, result)
         done.append({"session_id": sid, "result": result, "sig": due})
+    stats["complete"] = True  # every pending row was judged (an early return leaves no host memo)
     return done
 
 
@@ -2576,7 +2867,11 @@ def _host_pass(relays: bool, live: Optional[set[str]] = None) -> None:
                        ("owner_relay_tick", lambda: owner_relay_tick(live) if live else None),
                        ("watchdog_tick", lambda: watchdog_tick())):
         try:
-            call()
+            if name == "wake_tick":
+                call()  # accounts itself (``chat-closeout.wake_tick``, with its skips and rows)
+            else:
+                with wi.accounting_pass(f"chat-closeout.{name}"):
+                    call()
         except Exception:
             logger.warning("chat-closeout %s failed", name, exc_info=True)
 
