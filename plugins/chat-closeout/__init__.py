@@ -1653,6 +1653,7 @@ pre_final_gate.needs_buffer = True
 # ---- declared inputs (WAITING-INPUTS.md; design t_01a1d563324d7e8e row C) --------------------------------------
 _wi_lock = threading.RLock()
 _wi: dict[str, Any] = {}
+INPUTS_REUSE_S = 1.0  # a waiting pass reuses the inputs core read for its fingerprint at most this long ago
 
 
 def _wi_reset() -> None:
@@ -1662,6 +1663,7 @@ def _wi_reset() -> None:
     with _waiting_lock:
         _state.pop("waiting_cache", None)
         _state.pop("waiting_memo", None)
+        _state.pop("inputs_hit", None)
     _state.pop("host_memo", None)
 
 
@@ -1790,14 +1792,14 @@ def _shadow_parts(now: float) -> list:
             fresh, _found = _read_shadow(stem, set())
         except Exception:
             fresh = None
-        out.append([stem, ksa._board_content_key(path, tables), fresh])
+        out.append([stem, wi.portable_digest(ksa._board_content_key(path, tables)), fresh])
     return out
 
 
 def _input_parts(rows: list[dict], now: float, *, host: bool = False) -> dict[str, Any]:
     """Every input a waiting pass (``host``: a host wake pass) reads, as content keys; raises when one can't be
-    read. Rows are whole pending rows: a write to any field re-runs the pass (whole rows, not a hand-kept list of
-    the fields core reads, so a new read in core can never be missed)."""
+    read. Rows: the fields settlement reads (``core.SETTLE_ROW_FIELDS``, the only fields the waiting pass hands to
+    core, so a field core newly reads fails the settlement tests rather than going unkeyed); ``host``: whole rows."""
     from hermes_cli import kanban_session_activity as ksa
     sids = [r["session_id"] for r in rows]
     tails = {str(k).rsplit("/", 1)[-1] for r in rows for k in (r.get("batch") or [])}
@@ -1812,9 +1814,10 @@ def _input_parts(rows: list[dict], now: float, *, host: bool = False) -> dict[st
         "v": [wi.VERSION, "host" if host else "waiting"],
         "scope": list(ksa._origin_scope()) if hasattr(ksa, "_origin_scope") else None,
         "ledger": str(ledger().path),
-        "rows": [[r["session_id"], sorted(r.items())] for r in rows],
+        "rows": [[r["session_id"], sorted(r.items()) if host else [[f, r.get(f)] for f in core.SETTLE_ROW_FIELDS]]
+                 for r in rows],
         "origin": _origin_digest(),
-        "boards": [[str(p), ksa._board_content_key(Path(p))] for p in board_paths()],
+        "boards": [[str(p), wi.portable_digest(ksa._board_content_key(Path(p)))] for p in board_paths()],
         "shadows": _shadow_parts(now),
         "replica": replica.key(now, stale_after),
         "lineage": [[s, lineages[s]] for s in sids],
@@ -1829,8 +1832,14 @@ def waiting_inputs() -> Any:
     if _off():
         return ["off"]
     with wi.accounting_pass("chat-closeout.waiting_inputs"), _proof_pass():
-        parts = _input_parts(_pending_rows(), time.time())
-        return wi.portable([parts[k] for k in sorted(parts)])
+        rows = _pending_rows()
+        parts = _input_parts(rows, time.time())
+        # Parts built here from plain JSON data are digested as they are; only core's values go through portable.
+        key = [wi.portable(parts[k]) if k == "scope" else wi.strict_digest(parts[k]) for k in sorted(parts)]
+    # Core runs ``waiting_source`` right after a fingerprint it could not adopt: that pass reuses these reads. They
+    # were taken before its own reads, so a change in between only re-runs the next pass, never hides one.
+    _state["inputs_hit"] = (time.monotonic(), rows, parts)
+    return key
 
 
 def _waiting_row_key(lineages: Optional[dict[str, list]]) -> Callable[[dict, Any], Optional[str]]:
@@ -1856,9 +1865,13 @@ def waiting_source() -> dict[str, list[str]]:
         with wi.accounting_pass("chat-closeout.waiting") as acct, _proof_pass():
             # One proof pass for the inputs and the reconcile: the watermark seeks and the proofs share connections.
             now = time.time()
+            reuse = _state.pop("inputs_hit", None)
             try:
-                rows = _pending_rows()
-                parts = _input_parts(rows, now)
+                if reuse is not None and time.monotonic() - reuse[0] <= INPUTS_REUSE_S:
+                    rows, parts = [dict(r) for r in reuse[1]], reuse[2]
+                else:
+                    rows = _pending_rows()
+                    parts = _input_parts(rows, now)
             except Exception:
                 logger.debug("chat-closeout: waiting inputs unavailable; full pass", exc_info=True)
                 rows, parts = None, None
@@ -1874,12 +1887,13 @@ def waiting_source() -> dict[str, list[str]]:
                 reader = _pass_reader(light=True, rows=rows)
                 _upgraded(reader)
                 if parts is None:
-                    out = core.pending_closeouts(ledger(), reader, proof=session_proof)
+                    out = core.pending_closeouts(ledger(), reader, proof=session_proof, fields=core.SETTLE_ROW_FIELDS)
                 else:
                     lineages = dict(parts["lineage"])
                     out = core.pending_closeouts(ledger(), reader, proof=session_proof, rows=rows,
                                                  row_key=_waiting_row_key(lineages),
-                                                 cache=_wi_get("waiting_rows", wi.RowCache), stats=stats)
+                                                 cache=_wi_get("waiting_rows", wi.RowCache), stats=stats,
+                                                 fields=core.SETTLE_ROW_FIELDS)
             except Exception:
                 logger.debug("chat-closeout waiting source failed", exc_info=True)
                 out, parts = {}, None

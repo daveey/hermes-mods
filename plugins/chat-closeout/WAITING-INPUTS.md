@@ -21,7 +21,7 @@ raises, so no fingerprint is produced and core reads locally. It is made of:
 
 | part | what | how it is read |
 |---|---|---|
-| `rows` | the whole pending ledger rows | re-read only when the ledger's committed revision moves (`core.revision_token`) |
+| `rows` | each pending ledger row's settlement fields (`core.SETTLE_ROW_FIELDS`; the waiting pass settles from only these, so the waker's bookkeeping writes — claims, retries, wake results — are no input) | re-read only when the ledger's committed revision moves (`core.revision_token`) |
 | `origin` | digest of the origin ledger's obligations and receipts | re-read only when its committed revision moves |
 | `boards` | each local board's content key (`ksa._board_content_key`: bookkeeping writes excluded) | core's cached key |
 | `shadows` | each sync shadow's content key plus its freshness judged at now | core's cached key, `core.shadow_rows` cache |
@@ -47,6 +47,10 @@ key moved:
 - a ledger write re-reconciles that row.
 
 The batch read itself (one union query per pass) still runs, because a row's key includes its cards as read.
+
+`waiting_inputs()` leaves its reads for the waiting pass core runs right after a fingerprint it could not adopt
+(`INPUTS_REUSE_S` = 1 s). Those reads were taken before the pass's own, so a change in between only re-runs the next
+pass.
 
 ## Host pass
 

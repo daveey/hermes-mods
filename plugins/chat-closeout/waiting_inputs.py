@@ -46,6 +46,11 @@ def digest(value: Any) -> str:
     return hashlib.sha1(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
 
+def strict_digest(value: Any) -> str:
+    """``digest`` of plain JSON data only: anything else raises (a cross-process key must not stringify objects)."""
+    return hashlib.sha1(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def file_stat(path: Optional[Path]) -> Optional[tuple]:
     """(dev, ino, size, mtime_ns) of the file and its -wal: a process-local GATE only, never a key value."""
     if path is None:
@@ -77,6 +82,19 @@ def portable(value: Any) -> Any:
     if isinstance(value, frozenset) or isinstance(value, set):
         return sorted(portable(v) for v in value)
     raise Unportable(type(value).__name__)
+
+
+def portable_digest(value: Any, _memo: dict[int, tuple[Any, str]] = {}) -> str:  # noqa: B006 - process memo
+    """``digest(portable(value))``, reused while ``value`` is the very same object (core's content keys are cached
+    tuples: a board's key can be large and is rebuilt only when the board changed). Raises like ``portable``."""
+    hit = _memo.get(id(value))
+    if hit is not None and hit[0] is value:
+        return hit[1]
+    out = digest(portable(value))
+    if len(_memo) > 256:
+        _memo.clear()
+    _memo[id(value)] = (value, out)
+    return out
 
 
 # ---- P1 accounting (core ``hermes_cli.loop_accounting``, card A); a no-op on older cores -------------------------

@@ -1591,23 +1591,35 @@ class Ledger:
                 c.close()
 
 
+# What settling one ledger row reads (``reconcile_done``, ``pending_key`` -> ``closeout_key``, ``unlinked_removed``).
+# The sidebar's waiting pass settles from only these, so the waker's bookkeeping writes are no input to it.
+SETTLE_ROW_FIELDS = ("batch", "covered", "unlinked", "done_sig", "done_at", "closing")
+
+
 def pending_closeouts(ledger: "Ledger", read: Callable[[list[str]], dict],
                       proof: Optional[Callable[[str, str, dict[str, Any]], bool]] = None, *,
                       rows: Optional[list[dict[str, Any]]] = None,
                       row_key: Optional[Callable[[dict[str, Any], Any], Optional[str]]] = None,
-                      cache: Any = None, stats: Optional[dict[str, int]] = None) -> dict[str, list[str]]:
+                      cache: Any = None, stats: Optional[dict[str, int]] = None,
+                      fields: Optional[Iterable[str]] = None) -> dict[str, list[str]]:
     """``{session_id: batch ids}`` for chats whose whole batch has settled but whose close-out turn has not run for
     that state: the sidebar keeps them grey "waiting" until the closing answer lands. Read-only; it applies the
     same reconcile the waker persists, so the sidebar can never wait on a row the waker would skip.
 
     Incremental (``row_key`` and ``cache``, WAITING-INPUTS.md): a row whose key (its fields, its cards as read, its
     lineage's transcript watermark) equals the one its last answer was computed under keeps that answer without a
-    reconcile or transcript proof. ``rows``: the pending rows already read. ``stats`` counts ``recomputed`` rows."""
+    reconcile or transcript proof. ``rows``: the pending rows already read. ``stats`` counts ``recomputed`` rows.
+    ``fields``: settle each row from only these fields (``SETTLE_ROW_FIELDS``), so writes to any other field are no
+    input."""
     out: dict[str, list[str]] = {}
     pending = ledger.pending() if rows is None else rows
     for row in pending:
         cards = read(row["batch"])
         sid = row["session_id"]
+        if fields is not None:
+            # Only the fields settlement reads: the waker's bookkeeping (claims, retries, wake results) is no input,
+            # and a field missing here fails the settlement tests instead of going unnoticed.
+            row = {"session_id": sid, **{f: row.get(f) for f in fields}}
         key = row_key(row, cards) if row_key is not None and cache is not None else None
         hit = cache.get(sid, key) if key is not None else None
         if hit is not None:
