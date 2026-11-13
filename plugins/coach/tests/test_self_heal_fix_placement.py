@@ -417,3 +417,18 @@ def test_verify_natural_event_must_carry_the_failing_precondition(remote):
     assert "<first fix sha>^" in live and "temporary worktree" in live
     assert "Record fixed only when both hold" in live
     assert "pre-fix run also passes proves nothing" in live
+
+
+# selfheal lesson [verify-retry-receipt-first] (x5): a retried VERIFY whose quota-killed run had already recorded
+# `event fixed` must read that receipt back first and never re-record. Both VERIFY variants carry the step-0 check.
+@pytest.mark.parametrize("remote", [False, True], ids=["machine-pinned", "pool"])
+def test_verify_retry_reads_receipt_before_any_work(remote):
+    body = sh.verify_brief(FP, {"symptom": "x"}, "t_fix", remote=remote)
+    assert "\n0. " in body
+    head = " ".join(body.split("\n0. ", 1)[1].split("\n1. ", 1)[0].split())
+    assert "retry" in head and "before any work" in head
+    assert "selfheal_fixed" in head and "log.jsonl" in head and "selfheal_lane.json" in head
+    assert FP in head
+    assert "never re-record" in head
+    if remote:
+        assert "hub-admin 'grep selfheal_fixed" in head
