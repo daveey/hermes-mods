@@ -245,7 +245,7 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   "Decision for you:" header, and is not restated next turn. user-steps drops it, so no For-you request opens and the
   chat is not painted red. A choice that really blocks you gets a direct question instead ("Should I add it? yes/no").
 - [ ] No reply asks the user to paste or run a command; `run_in_user_terminal` was used instead.
-- [ ] No reply restates an open ask as a bare reminder sentence ('… still need you') outside the ask itself; quote the open tile's title instead.
+- [ ] No reply restates an open ask as a bare reminder sentence ('… still need you') outside the ask itself; leave it out, since the open tile already shows it. user-steps holds such a reply once and names the open request: delete the restatement, or re-send unchanged only if it is a different decision.
 - [ ] Every Chrome ask came after a `browser_focus` that returned that tab shown on the user's display (else the noVNC view was opened).
 - [ ] Every other-Mac GUI ask tried `remote_approve_dialog` first (for prompts) and carries a verified `::screenshare` button.
 - [ ] Every Inbox post is a user-only decision with `ask` set; agent-fixable work went to a Kanban card.

@@ -616,10 +616,17 @@ def test_a_model_marked_repeat_is_framed_onto_the_existing_tile(tmp_path):
     assert len(live(store)) == 1 and len(ledger.read('session-a')['steps']) == 1
 
 
-# ---- same decision across replies: equal lettered menu, or an ask already inside an open tile's scope -----------
+# ---- one decision, one tile: identity is provenance only; a restatement is refused pre-send ------------------
 # Live MacBook chat ..f07c32 (2026-11-13): request 2948b7f0 (step us_852f91e2d3) held both macOS CI picks. The 11:54
 # reply then minted us_64aeb33b63 from a bare reminder sentence (same A/B/C menu, reworded) and us_60b82616bf from the
-# restated second question (whose card ask 2948b7f0's scope already quoted): three tiles for two decisions.
+# restated second question (whose card ask 2948b7f0's scope already quoted): three tiles for two decisions. At 13:17
+# a status headline ("The only thing waiting on you is the macOS CI pick.") minted 2288f5b4 the same way.
+#
+# Four review rounds of PR #93 each found false merges in title/menu/scope identity rules (one decision folded onto
+# another, silently losing an ask). So nothing is ever merged by what a sentence says: core.same_open_ask keeps its
+# provenance-only rules, every regression below stays two tiles at publication, and the pre-send gate
+# (publication_buffer) holds a reply ONCE when an ask that maps to no open request by provenance would mint a tile
+# beside an open one. The agent, which knows whether it meant a new decision, drops the restatement or re-sends.
 
 BLACKSMITH_ASK = ('"A = move the hermes_state lane plus the Native memory and real-codesign jobs to Blacksmith 6vcpu '
                   'macOS (~$26/day, ~$770/mo); B = move only the sub-minute Native memory + real-codesign jobs '
@@ -661,6 +668,16 @@ STEP_60B8 = {'text': 'Pick how macOS-marked tests should get CI: A, B, or C (B r
              'verbatim_span': '**macOS CI for tests marked posix/macOS-only** (worker-6 board). These tests never run '
                               'on macOS in CI today.',
              'options': ['B: scheduled non-required lane', 'A: PR lane on the mini', 'C: keep manual']}
+# 13:17 PST: request 2288f5b4 (step us_a9defb1d27) minted from this headline while 2948b7f0 was open (withdrawn 13:21).
+HEADLINE_1317 = (
+    "**All 38 updates check out.** Every merge in the batch landed exactly as approved, with required CI green, and no "
+    "wrong behaviour turned up. Two bugs still have unmerged fixes: lifecycle-guard #2485 and the duplicate For-you "
+    "tiles (hermes-mods #93). Tests for 5 untested-code gaps are still being written. The only thing waiting on you is "
+    "the macOS CI pick. (Checked 13:15 PST: that card is still blocked and the request is your only open ask from "
+    "this chat.)")
+STEP_A9DE = {'text': 'Pick macOS CI option A, B, or C (B recommended)', 'kind': 'choose',
+             'verbatim_span': 'The only thing waiting on you is the macOS CI pick.',
+             'options': ['B (recommended)', 'A', 'C']}
 
 
 def _open_macos_tile(store, ledger):
@@ -669,61 +686,113 @@ def _open_macos_tile(store, ledger):
     return first['steps'][0]
 
 
-def test_reminder_sentence_with_the_open_tiles_lettered_menu_reuses_it(tmp_path):
-    # (i) us_64aeb33b63: a bare "... still need you." reminder, read with the open tile's A/B/C menu reworded.
-    store, ledger = env(tmp_path)
-    tile = _open_macos_tile(store, ledger)
-    out = reply(store, ledger, STATUS_1154, [dict(STEP_64AE)])
-    assert len(live(store)) == 1
-    assert [s['id'] for s in out['steps']] == [tile['id']]
+# -- the pre-send gate, through the plugin's real publication_buffer -------------------------------------------
+
+def _gate_open(plugin, text=NEEDS_YOU_1108, step=STEP_852F):
+    """Open one extracted tile in the plugin's own store (the delivered 11:08 reply); return (store, request)."""
+    store, ledger = plugin.core.ActionStore(), plugin._ledger()
+    plugin.core.process_reply(text, 'session-a', ledger=ledger, action_store=store, action_owner=OWNER,
+                              llm=lambda *a: json.dumps({'steps': [dict(step)], 'resolved': []}))
+    [req] = [r for r in store.requests(OWNER) if r['state'] == 'open']
+    return store, req
 
 
-def test_restated_question_quoted_in_the_open_tiles_scope_reuses_it(tmp_path):
-    # (ii) us_60b82616bf: the second question had no step of its own, but its card ask sits in 2948b7f0's scope.
-    store, ledger = env(tmp_path)
-    tile = _open_macos_tile(store, ledger)
-    out = reply(store, ledger, NEEDS_YOU_1154, [dict(STEP_60B8)])
-    assert len(live(store)) == 1
-    assert [s['id'] for s in out['steps']] == [tile['id']]
+def _gate(plugin, monkeypatch, text, steps, repeats=None, **kw):
+    payload = {'steps': [dict(s) for s in steps], 'resolved': []}
+    if repeats is not None:
+        payload['repeats'] = repeats
+    monkeypatch.setattr(plugin, 'aux_llm', lambda *a: json.dumps(payload))
+    return plugin.publication_buffer(session_id='session-a', platform='cli', final_response=text, **kw)
 
 
-def test_the_1154_reply_with_reminder_and_restated_questions_leaves_one_tile(tmp_path):
-    # The live 11:54 reply carried both: one open tile before, exactly one after.
-    store, ledger = env(tmp_path)
-    tile = _open_macos_tile(store, ledger)
-    out = reply(store, ledger, STATUS_1154 + "\n\n" + NEEDS_YOU_1154, [dict(STEP_64AE), dict(STEP_60B8)])
-    assert len(live(store)) == 1
-    assert {s['id'] for s in out['steps']} == {tile['id']}
+def _send(plugin, text, steps, repeats=None):
+    """The delivered reply's transform (process_reply), as transform_llm_output runs it."""
+    payload = {'steps': [dict(s) for s in steps], 'resolved': []}
+    if repeats is not None:
+        payload['repeats'] = repeats
+    return plugin.core.process_reply(text, 'session-a', ledger=plugin._ledger(), action_store=plugin.core.ActionStore(),
+                                     action_owner=OWNER, llm=lambda *a: json.dumps(payload))
 
 
-def test_same_letters_with_other_labels_is_a_new_ask(tmp_path):
-    # Equal letters prove nothing: a different A/B/C menu is a different decision.
-    store, ledger = env(tmp_path)
-    _open_macos_tile(store, ledger)
-    text = 'One more: which cache store should the scheduler use? A: Redis, B: SQLite files, C: in-memory only.'
-    reply(store, ledger, text, [{'text': 'Pick the scheduler cache store: A, B or C', 'kind': 'choose',
-                                 'verbatim_span': text, 'options': ['A: Redis', 'B: SQLite files', 'C: in-memory only']}])
-    assert len(live(store)) == 2
+def _open_titles(store):
+    return [r['title'] for r in store.requests(OWNER) if r['state'] in ('open', 'needs_context')]
 
 
-def test_a_new_question_beside_a_quote_of_the_open_scope_is_a_new_ask(tmp_path):
-    # Its paragraph quotes the open tile's card ask, but the step's own menu is not in that quote: a new decision.
-    store, ledger = env(tmp_path)
-    _open_macos_tile(store, ledger)
-    text = (f"The tests-os card still asks {TESTS_OS_ASK} Separately, should the new lane run nightly or "
-            "weekly?")
-    reply(store, ledger, text, [{'text': 'Pick how often the new lane runs', 'kind': 'choose',
-                                 'verbatim_span': 'Separately, should the new lane run nightly or weekly?',
-                                 'options': ['A: nightly', 'B: weekly']}])
-    assert len(live(store)) == 2
+def _after_nudge(held):
+    return {'attempt': 1, 'turn_messages': [{'role': 'assistant', 'content': 'draft', '_pre_final_gate_synthetic': True},
+                                            {'role': 'user', 'content': held['nudge'], '_pre_final_gate_synthetic': True}]}
 
 
-def test_two_lettered_questions_in_one_new_reply_stay_two_tiles(tmp_path):
-    # The scope rule is for LATER replies: two questions of one fresh paragraph are two asks.
-    store, ledger = env(tmp_path)
-    reply(store, ledger, NEEDS_YOU_1108, [dict(STEP_852F), {**STEP_60B8, 'verbatim_span':
-          "**macOS CI for the tests marked as posix/macOS-only.** These tests never run on macOS in CI today."}])
-    assert len(live(store)) == 2
+def test_the_1154_reply_is_held_pre_send_naming_the_open_request(plugin, monkeypatch):
+    # Live 11:54: both a reminder sentence and the restated second question would have minted tiles.
+    store, req = _gate_open(plugin)
+    held = _gate(plugin, monkeypatch, STATUS_1154 + '\n\n' + NEEDS_YOU_1154, [STEP_64AE, STEP_60B8])
+    assert held and held.get('hold') is True, held
+    assert req['requestId'] in held['nudge'] and req['title'] in held['nudge']
+    assert STEP_64AE['verbatim_span'] in held['nudge'] and 'macOS CI for tests marked' in held['nudge']
+    assert plugin.OPEN_ASK_NUDGE_HEAD in held['nudge']
+    # The agent drops the restatements; the re-sent reply asks nothing new, so it passes and mints nothing.
+    revised = STATUS_1154.replace(' Two macOS CI choices still need you.', '')
+    assert _gate(plugin, monkeypatch, revised, [], **_after_nudge(held)) is None
+    _send(plugin, revised, [])
+    assert _open_titles(store) == [req['title']]
+    assert store.get(OWNER, req['requestId']) == req  # untouched: revision, title and scope
+
+
+def test_the_1317_headline_is_held_pre_send_and_its_revision_leaves_one_tile(plugin, monkeypatch):
+    # Live 13:17 (2288f5b4 / us_a9defb1d27): a status headline whose last sentence points at the open pick.
+    store, req = _gate_open(plugin)
+    held = _gate(plugin, monkeypatch, HEADLINE_1317, [STEP_A9DE])
+    assert held and held.get('hold') is True and req['requestId'] in held['nudge'], held
+    revised = HEADLINE_1317.replace(' The only thing waiting on you is the macOS CI pick.', '')
+    assert _gate(plugin, monkeypatch, revised, [], **_after_nudge(held)) is None
+    _send(plugin, revised, [])
+    assert _open_titles(store) == [req['title']] and store.get(OWNER, req['requestId']) == req
+
+
+def test_a_headline_inside_an_agent_written_directive_mints_nothing_and_is_not_held(plugin, monkeypatch):
+    # The text of a ::user-step marker is an attribute, not prose: no block holds the span, so the transform mints
+    # nothing for it and the gate, which mirrors the transform, does not hold the reply either.
+    store, req = _gate_open(plugin)
+    text = plugin.core.directive(['us_a9defb1d27'], 'session-a', HEADLINE_1317)
+    assert _gate(plugin, monkeypatch, text, [STEP_A9DE]) is None
+    _send(plugin, text, [STEP_A9DE])
+    assert _open_titles(store) == [req['title']] and store.get(OWNER, req['requestId']) == req
+
+
+def test_the_check_holds_once_and_a_resent_ask_gets_its_own_tile(plugin, monkeypatch):
+    # The agent says "different decision" by re-sending unchanged: never held twice, never merged.
+    store, req = _gate_open(plugin)
+    text = 'Which Linux runner should the babybear repo use? A: Blacksmith 4vcpu Linux, B: GitHub-hosted ubuntu.'
+    step = {'text': 'Pick the babybear Linux runner', 'kind': 'choose', 'verbatim_span': text,
+            'options': ['A: Blacksmith 4vcpu Linux', 'B: GitHub-hosted ubuntu']}
+    held = _gate(plugin, monkeypatch, text, [step])
+    assert held and held.get('hold') is True
+    assert _gate(plugin, monkeypatch, text, [step], **_after_nudge(held)) is None
+    _send(plugin, text, [step])
+    assert sorted(_open_titles(store)) == sorted([req['title'], 'Pick the babybear Linux runner'])
+    assert store.get(OWNER, req['requestId']) == req
+
+
+def test_the_check_never_holds_without_an_open_request_or_at_the_budget(plugin, monkeypatch):
+    text = 'Which Linux runner should the babybear repo use? A: Blacksmith 4vcpu Linux, B: GitHub-hosted ubuntu.'
+    step = {'text': 'Pick the babybear Linux runner', 'kind': 'choose', 'verbatim_span': text,
+            'options': ['A: Blacksmith 4vcpu Linux', 'B: GitHub-hosted ubuntu']}
+    assert _gate(plugin, monkeypatch, text, [step]) is None  # nothing open: a first ask is never held
+    _gate_open(plugin)
+    assert _gate(plugin, monkeypatch, text, [step], attempt=2, hold_budget=2) is None  # budget spent: deliver
+
+
+def test_the_check_does_not_hold_an_ask_provenance_maps_onto_the_open_tile(plugin, monkeypatch):
+    # The extractor's corroborated repeat, and the same evidence sentence, already land on the open tile.
+    store, req = _gate_open(plugin)
+    step_id = plugin._ledger().read('session-a')['steps'][0]['id']
+    span = "**If you pick C, or don't answer,** nothing changes."
+    assert _gate(plugin, monkeypatch, 'Still open from earlier:\n\n' + span,
+                 [dict(STEP_852F, text='Pick the macOS CI option')]) is None  # same evidence sentence
+    quote = 'Pick macOS CI option A, B, or C (B recommended): that one still needs you.'
+    assert _gate(plugin, monkeypatch, quote, [], repeats=[{'id': step_id, 'verbatim_span': quote}]) is None
+    assert _open_titles(store) == [req['title']]
 
 
 def test_a_gate_held_draft_publishes_no_tile(plugin, monkeypatch):
@@ -739,8 +808,64 @@ def test_a_gate_held_draft_publishes_no_tile(plugin, monkeypatch):
     assert plugin._ledger().read('session-a').get('steps', []) == []
 
 
-# ---- false merges the two rules must never make (independent review of PR #93, card t_01a1d695aceb1bb1) --------
-# A false merge is worse than a duplicate: the answer to one ask would be recorded on the other.
+def test_an_open_ask_hold_never_publishes_and_a_publish_hold_wins(plugin, monkeypatch):
+    # The open-request hold judges only; an unplanned approval in the same reply gets the publish nudge first.
+    store, req = _gate_open(plugin)
+    held = _gate(plugin, monkeypatch, STATUS_1154, [STEP_64AE])
+    assert held['hold'] and _open_titles(store) == [req['title']]
+    both = _gate(plugin, monkeypatch, 'Want me to deploy build 9?\n\n' + STATUS_1154, [
+        {'text': 'Approve deploying build 9', 'kind': 'approve', 'verbatim_span': 'Want me to deploy build 9?',
+         'options': []}, STEP_64AE])
+    assert both['hold'] and both['nudge'] == plugin.PUBLISH_NUDGE
+
+
+# -- publication never merges by title, menu or scope: the live shapes and every reviewer probe stay two tiles ----
+# A false merge is worse than a duplicate: the answer to one ask would be recorded on the other. Each of these
+# merged into one tile under some round of PR #93's identity rules (reviews 5897-5898xxxxxx; cards t_01a1d695aceb1bb1,
+# t_01a1d6a6bd2f3f8b, t_01a1d6b234acd4ac, t_01a1d6c233649a46, t_01a1d6d66cd9a092, t_01a1d6ec29639a32). The gate
+# above, not publication, is what keeps the live restatements to one tile.
+
+@pytest.mark.parametrize('text,steps', [
+    pytest.param(STATUS_1154, [STEP_64AE], id='1154-reminder'),
+    pytest.param(NEEDS_YOU_1154, [STEP_60B8], id='1154-restated-question'),
+    pytest.param(HEADLINE_1317, [STEP_A9DE], id='1317-headline'),
+])
+def test_publication_never_folds_a_live_restatement_by_what_it_says(tmp_path, text, steps):
+    # Had the agent re-sent it unchanged after the hold, it is a visible, withdrawable duplicate, never a merge.
+    store, ledger = env(tmp_path)
+    tile = _open_macos_tile(store, ledger)
+    [before] = live(store)
+    out = reply(store, ledger, text, [dict(s) for s in steps])
+    assert len(live(store)) == 2 and tile['id'] not in {s['id'] for s in out['steps']}
+    assert store.get(OWNER, before['requestId']) == before
+
+
+def test_same_letters_with_other_labels_is_a_new_ask(tmp_path):
+    store, ledger = env(tmp_path)
+    _open_macos_tile(store, ledger)
+    text = 'One more: which cache store should the scheduler use? A: Redis, B: SQLite files, C: in-memory only.'
+    reply(store, ledger, text, [{'text': 'Pick the scheduler cache store: A, B or C', 'kind': 'choose',
+                                 'verbatim_span': text, 'options': ['A: Redis', 'B: SQLite files', 'C: in-memory only']}])
+    assert len(live(store)) == 2
+
+
+def test_a_new_question_beside_a_quote_of_the_open_scope_is_a_new_ask(tmp_path):
+    store, ledger = env(tmp_path)
+    _open_macos_tile(store, ledger)
+    text = (f"The tests-os card still asks {TESTS_OS_ASK} Separately, should the new lane run nightly or "
+            "weekly?")
+    reply(store, ledger, text, [{'text': 'Pick how often the new lane runs', 'kind': 'choose',
+                                 'verbatim_span': 'Separately, should the new lane run nightly or weekly?',
+                                 'options': ['A: nightly', 'B: weekly']}])
+    assert len(live(store)) == 2
+
+
+def test_two_lettered_questions_in_one_new_reply_stay_two_tiles(tmp_path):
+    store, ledger = env(tmp_path)
+    reply(store, ledger, NEEDS_YOU_1108, [dict(STEP_852F), {**STEP_60B8, 'verbatim_span':
+          "**macOS CI for the tests marked as posix/macOS-only.** These tests never run on macOS in CI today."}])
+    assert len(live(store)) == 2
+
 
 def test_a_boilerplate_scope_sentence_is_not_the_open_ask(tmp_path):
     store, ledger = env(tmp_path)
@@ -756,46 +881,26 @@ def test_a_boilerplate_scope_sentence_is_not_the_open_ask(tmp_path):
     assert len(live(store)) == 2
 
 
-def test_generic_yes_no_menus_are_not_the_same_decision(tmp_path):
-    store, ledger = env(tmp_path)
-    t1 = 'Should I deploy build 9 to the hub tonight? A: yes, B: no.'
-    reply(store, ledger, t1, [{'text': 'Deploy build 9 tonight?', 'kind': 'choose', 'verbatim_span': t1,
-                               'options': ['A: yes', 'B: no']}])
-    t2 = 'Separate question: should I rotate the GitHub deploy key now? A: yes, B: no.'
-    reply(store, ledger, t2, [{'text': 'Rotate the deploy key now?', 'kind': 'choose', 'verbatim_span': t2,
-                               'options': ['A: yes', 'B: no']}])
+@pytest.mark.parametrize('t1,s1,t2,s2', [
+    pytest.param('Should I deploy build 9 to the hub tonight? A: yes, B: no.',
+                 {'text': 'Deploy build 9 tonight?', 'options': ['A: yes', 'B: no']},
+                 'Separate question: should I rotate the GitHub deploy key now? A: yes, B: no.',
+                 {'text': 'Rotate the deploy key now?', 'options': ['A: yes', 'B: no']}, id='generic-yes-no'),
+    pytest.param('Should the release notes template stay as it is? A: keep it as is, B: change it now.',
+                 {'text': 'Keep the release notes template?', 'options': ['A: keep it as is', 'B: change it now']},
+                 'And the PR template, a separate file? A: keep it as is, B: change it now.',
+                 {'text': 'Keep the PR template?', 'options': ['A: keep it as is', 'B: change it now']},
+                 id='generic-keep-change'),
+    pytest.param('Where should the Linux PR lane run? A: PR lane on the mini, B: PR lane on the hub.',
+                 {'text': 'Pick where the Linux lane runs', 'options': ['A: PR lane on the mini', 'B: PR lane on the hub']},
+                 'And the Windows lane, which is a separate card? A: PR lane on worker-6, B: PR lane on worker-7.',
+                 {'text': 'Pick where the Windows lane runs',
+                  'options': ['A: PR lane on worker-6', 'B: PR lane on worker-7']}, id='only-the-target-differs'),
+])
+def test_generic_menus_are_not_the_same_decision(tmp_path, t1, s1, t2, s2):
+    store = _two_replies(tmp_path, t1, {**s1, 'kind': 'choose', 'verbatim_span': t1},
+                         t2, {**s2, 'kind': 'choose', 'verbatim_span': t2})
     assert len(live(store)) == 2
-
-
-def test_generic_keep_or_change_menus_are_not_the_same_decision(tmp_path):
-    store, ledger = env(tmp_path)
-    t1 = 'Should the release notes template stay as it is? A: keep it as is, B: change it now.'
-    reply(store, ledger, t1, [{'text': 'Keep the release notes template?', 'kind': 'choose', 'verbatim_span': t1,
-                               'options': ['A: keep it as is', 'B: change it now']}])
-    t2 = 'And the PR template, a separate file? A: keep it as is, B: change it now.'
-    reply(store, ledger, t2, [{'text': 'Keep the PR template?', 'kind': 'choose', 'verbatim_span': t2,
-                               'options': ['A: keep it as is', 'B: change it now']}])
-    assert len(live(store)) == 2
-
-
-def test_menus_differing_only_in_the_target_are_not_the_same_decision(tmp_path):
-    store, ledger = env(tmp_path)
-    t1 = 'Where should the Linux PR lane run? A: PR lane on the mini, B: PR lane on the hub.'
-    reply(store, ledger, t1, [{'text': 'Pick where the Linux lane runs', 'kind': 'choose', 'verbatim_span': t1,
-                               'options': ['A: PR lane on the mini', 'B: PR lane on the hub']}])
-    t2 = 'And the Windows lane, which is a separate card? A: PR lane on worker-6, B: PR lane on worker-7.'
-    reply(store, ledger, t2, [{'text': 'Pick where the Windows lane runs', 'kind': 'choose', 'verbatim_span': t2,
-                               'options': ['A: PR lane on worker-6', 'B: PR lane on worker-7']}])
-    assert len(live(store)) == 2
-
-
-def test_a_lettered_menu_matching_two_open_choices_maps_onto_neither():
-    # Menu identity needs exactly one open choice: with two equal open menus the step is its own ask.
-    asks = [{'id': rid, 'kind': 'choice', 'title': 'Pick macOS CI option', 'labels': [], 'scope': '',
-             'step': {'id': 'us_' + rid, 'options': list(STEP_852F['options']), 'verbatim_span': 'x'}}
-            for rid in ('r1', 'r2')]
-    assert core.same_open_ask(dict(STEP_64AE), asks[:1], reply=STATUS_1154)['id'] == 'r1'
-    assert core.same_open_ask(dict(STEP_64AE), asks, reply=STATUS_1154) is None
 
 
 _DEPLOY_SCOPE = 'Deploy build 9 to the hub and restart its gateway.\n\nIf you decline, nothing changes and the card stays blocked.'
@@ -821,20 +926,6 @@ def test_the_publication_gate_holds_a_new_approval_beside_an_unrelated_ready_one
     assert out and out.get('hold') is True, out
 
 
-def test_hyphenated_words_are_not_menu_letters():
-    assert core._lettered_menu(['B-tree index on users', 'E-mail the owner']) is None
-    assert core._lettered_menu(['A - lane plus jobs', 'B - sub-minute jobs only']) is not None
-
-
-# ---- re-review of PR #93 (card t_01a1d6a6bd2f3f8b): a menu needs a subject anchor, a quote must BE the ask ---------
-
-def test_directly_asks_still_blanks_short_quotes():
-    # The new 40+ char card-ask pattern must not rebind the module's _QUOTED (directly_asks, silent default).
-    assert core.directly_asks('The card log says "please approve it".') is False
-    assert core.directly_asks('Its title was "Can you confirm?" earlier.') is False
-    assert core.directly_asks('Can you confirm?') is True
-
-
 def _two_replies(tmp_path, t1, s1, t2, s2):
     store, ledger = env(tmp_path)
     reply(store, ledger, t1, [s1])
@@ -848,24 +939,24 @@ _RUNNER_MENU = ['A: Blacksmith macOS runner (~$120/mo)', 'B: self-hosted mini ru
 
 
 @pytest.mark.parametrize('t1,s1,t2,s2', [
-    pytest.param(  # r1: one PR menu for two PRs
+    pytest.param(
         'PR #12 (login fix) is green. What should I do with it? A: rebase and merge it, B: close it unmerged, C: leave '
         'it for review.', {'text': 'Decide PR #12', 'options': _PR_MENU},
         'Separately, PR #13 (billing refactor) is green too. A: rebase and merge it, B: close it unmerged, C: leave '
         'it for review.', {'text': 'Decide PR #13', 'options': _PR_MENU}, id='r1-same-pr-menu-two-prs'),
-    pytest.param(  # r2: one cost menu for two repos
+    pytest.param(
         'hermes-mods macOS CI: A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini runner (free)?',
         {'text': 'Pick the hermes-mods macOS runner', 'options': _RUNNER_MENU},
         'babybear macOS CI, a separate budget line: A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini '
         'runner (free)?', {'text': 'Pick the babybear macOS runner', 'options': _RUNNER_MENU}, id='r2-cost-menu-two-repos'),
-    pytest.param(  # r3: longer generic labels for two projects
+    pytest.param(
         'Database migration: A: go ahead with the proposed plan today, B: hold off until next week.',
         {'text': 'Decide the DB migration timing',
          'options': ['A: go ahead with the proposed plan today', 'B: hold off until next week']},
         'Logo redesign: A: go ahead with the proposed plan today, B: hold off until next week.',
         {'text': 'Decide the logo redesign timing',
          'options': ['A: go ahead with the proposed plan today', 'B: hold off until next week']}, id='r3-generic-labels'),
-    pytest.param(  # r4: cost figures shared across compute vs storage menus
+    pytest.param(
         'Which CI compute should we buy? A: Blacksmith 6vcpu runner (~$120/mo), B: GitHub larger runner (~$770/mo)?',
         {'text': 'Pick CI compute', 'options': ['A: Blacksmith 6vcpu runner ~$120/mo', 'B: GitHub larger runner ~$770/mo']},
         'Which artifact storage should we buy? A: Blacksmith storage add-on (~$120/mo), B: GitHub storage add-on '
@@ -884,12 +975,10 @@ _GENERIC_APPROVE_Q = '"If you approve, an agent runs it as planned; if you decli
 
 
 def test_quoted_boilerplate_in_scope_and_span_is_not_the_open_ask(tmp_path):
-    # r5: the open choice's paragraph quotes generic card boilerplate; a later question quotes it too.
-    store, ledger = env(tmp_path)
+    store, ledger = env(tmp_path)  # r5
     t1 = f'The cache-store card asks: {_GENERIC_PICK_Q} A is Redis, B is SQLite.'
     reply(store, ledger, t1, [{'text': 'Pick the cache store', 'kind': 'choose', 'verbatim_span': 'A is Redis, B is SQLite.',
                                'options': ['A: Redis', 'B: SQLite']}])
-    assert len(live(store)) == 1
     t2 = f'The logo-colour card asks the same: {_GENERIC_PICK_Q} So should the logo be blue or green?'
     reply(store, ledger, t2, [{'text': 'Pick the logo colour', 'kind': 'choose', 'verbatim_span': t2,
                                'options': ['A: blue', 'B: green']}])
@@ -897,8 +986,7 @@ def test_quoted_boilerplate_in_scope_and_span_is_not_the_open_ask(tmp_path):
 
 
 def test_a_new_approval_quoting_a_producer_approvals_boilerplate_is_a_new_ask(tmp_path):
-    # r6: approval scope quotes generic terms; a new approval quotes them beside its own question.
-    store, ledger = env(tmp_path)
+    store, ledger = env(tmp_path)  # r6
     store.create(dict(OWNER), approval('Deploy build 9 to the hub',
                                        markdown=f'The deploy card asks: {_GENERIC_APPROVE_Q}\n\nDeploy build 9 and restart.'))
     text = f'Same terms as the deploy, {_GENERIC_APPROVE_Q} Should I also rotate the GitHub deploy key now?'
@@ -908,8 +996,7 @@ def test_a_new_approval_quoting_a_producer_approvals_boilerplate_is_a_new_ask(tm
 
 
 def test_the_publication_gate_holds_a_new_approval_quoting_ready_boilerplate(plugin, monkeypatch):
-    # r7: r6 through publication_buffer: the rotate-key approval is not "covered" by the ready deploy approval.
-    store = plugin.core.ActionStore()
+    store = plugin.core.ActionStore()  # r7
     store.create(dict(OWNER), approval('Deploy build 9 to the hub',
                                        markdown=f'The deploy card asks: {_GENERIC_APPROVE_Q}\n\nDeploy build 9 and restart.'))
     text = f'Same terms as the deploy, {_GENERIC_APPROVE_Q} Should I also rotate the GitHub deploy key now?'
@@ -921,8 +1008,7 @@ def test_the_publication_gate_holds_a_new_approval_quoting_ready_boilerplate(plu
 
 
 def test_the_open_card_ask_quoted_beside_a_new_question_in_one_sentence_is_a_new_ask(tmp_path):
-    # r8: the quote is in the evidence sentence, but the sentence asks its own question.
-    store, ledger = env(tmp_path)
+    store, ledger = env(tmp_path)  # r8
     reply(store, ledger, NEEDS_YOU_1108, [dict(STEP_852F)])
     span = f'Beyond the card ask {TESTS_OS_ASK} should the new lane also run on Linux, yes or no?'
     reply(store, ledger, span, [{'text': 'Should the new lane also run on Linux?', 'kind': 'choose',
@@ -930,35 +1016,6 @@ def test_the_open_card_ask_quoted_beside_a_new_question_in_one_sentence_is_a_new
     assert len(live(store)) == 2, [r['title'] for r in live(store)]
 
 
-def test_the_restated_card_ask_alone_as_evidence_is_inside_the_open_scope(tmp_path):
-    # Positive twin of r8: the evidence sentence IS the quoted card ask, nothing else asked.
-    store, ledger = env(tmp_path)
-    _open_macos_tile(store, ledger)
-    text = f'The tests-os card still asks: {TESTS_OS_ASK}'
-    [ask] = core.open_asks(store, dict(OWNER))
-    assert core.inside_open_scope({**STEP_60B8, 'verbatim_span': text}, ask, text)
-    assert not core.inside_open_scope({**STEP_60B8, 'verbatim_span': text + ' Also, Linux too?'}, ask,
-                                      text + ' Also, Linux too?')
-    reply(store, ledger, text, [{**STEP_60B8, 'verbatim_span': text}])
-    assert len(live(store)) == 1
-
-
-def test_menu_identity_needs_the_same_subject():
-    ask = {'id': 'r1', 'kind': 'choice', 'title': 'Pick macOS CI option', 'labels': [], 'scope': '',
-           'step': {'id': 'us_r1', 'text': STEP_852F['text'], 'options': list(STEP_852F['options']),
-                    'verbatim_span': 'x'}}
-    assert core.same_lettered_menu(dict(STEP_64AE), ask)
-    assert not core.same_lettered_menu({**STEP_64AE, 'text': 'Pick babybear CI option A, B, or C'}, ask)
-    # Identity is not enough: the sentence must point at the ask without asking anything (same_reminder).
-    assert core.same_reminder(dict(STEP_64AE), ask, STATUS_1154)
-    asks_again = 'Which macOS CI option do you want? A: lane plus jobs, B: sub-minute jobs only, C: no spend.'
-    assert not core.same_reminder({**STEP_64AE, 'verbatim_span': asks_again}, ask, asks_again)
-    assert core._subject('Pick macOS CI option A, B, or C (B recommended)') == {'macos', 'ci'}
-
-
-# ---- re-review of PR #93 (card t_01a1d6b234acd4ac): the subject anchor must read the evidence, not only the text --
-
-_R2_T1 = 'hermes-mods macOS CI: A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini runner (free)?'
 _R2_T2 = ('babybear macOS CI, a separate budget line: A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini '
           'runner (free)?')
 
@@ -969,10 +1026,11 @@ _R2_T2 = ('babybear macOS CI, a separate budget line: A: Blacksmith macOS runner
                  'self-hosted mini runner (free).',
                  'For babybear, which macOS CI runner do you want? A: Blacksmith macOS runner (~$120/mo), B: '
                  'self-hosted mini runner (free).', id='p1-repo-named-only-in-the-evidence'),
-    pytest.param('Pick the macOS runner', _R2_T1, _R2_T2, id='p1b-r2-evidence-generic-text'),
+    pytest.param('Pick the macOS runner',
+                 'hermes-mods macOS CI: A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini runner (free)?',
+                 _R2_T2, id='p1b-r2-evidence-generic-text'),
     pytest.param('Pick the macOS CI runner',
                  'For hermes-mods:\nWhich one? A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini runner (free).',
-                 # (an identical evidence sentence is main's same-sentence rule, so the second one is worded apart)
                  'For babybear:\nWhich one do you want? A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini '
                  'runner (free).', id='p1c-repo-named-before-a-bare-menu-sentence'),
 ])
@@ -984,96 +1042,16 @@ def test_the_same_generic_step_text_for_two_repos_named_in_the_evidence_is_a_new
     assert len(live(store)) == 2, [r['title'] for r in live(store)]
 
 
-def test_a_reminder_that_names_only_the_open_asks_words_reuses_it(tmp_path):
-    # Positive twin: the same reply as p1, restated for hermes-mods, is the open tile.
-    t1 = ('For hermes-mods, which macOS CI runner do you want? A: Blacksmith macOS runner (~$120/mo), B: self-hosted '
-          'mini runner (free).')
-    t2 = 'The hermes-mods macOS CI runner pick still needs you.'
-    # (the subject must be in the open ask's own title or step text: its evidence sentence can carry context)
-    store = _two_replies(tmp_path, t1, {'text': 'Pick the hermes-mods macOS CI runner', 'kind': 'choose',
-                                        'options': _RUNNER_MENU, 'verbatim_span': t1},
-                         t2, {'text': 'Pick the hermes-mods macOS CI runner', 'kind': 'choose', 'options': _RUNNER_MENU,
-                              'verbatim_span': t2})
-    assert len(live(store)) == 1
-
-
-def test_evidence_names_only_open_reads_the_sentence_then_the_lead():
-    # The open side's own words only (its title and step text), never its evidence sentence or scope (M5).
-    ask = {'id': 'r1', 'kind': 'choice', 'title': 'Pick the hermes-mods macOS CI option', 'labels': [],
-           'scope': 'babybear',
-           'step': {'id': 'us_r1', 'text': 'Pick the macOS CI runner', 'options': list(_RUNNER_MENU),
-                    'verbatim_span': 'For hermes-mods, which macOS CI runner?'}}
-    step = {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': list(_RUNNER_MENU)}
-    assert core._evidence_names_only_open({**step, 'verbatim_span': 'Two macOS CI choices still need you.'}, ask)
-    assert not core._evidence_names_only_open({**step, 'verbatim_span': 'The babybear macOS CI pick still needs you.'},
-                                              ask)
-    # (a menu sentence never reaches this check any more: same_reminder refuses any reply that presents a menu)
-    bare = 'That one still needs you.'
-    assert core._evidence_names_only_open({**step, 'verbatim_span': bare}, ask, 'For hermes-mods: ' + bare)
-    assert not core._evidence_names_only_open({**step, 'verbatim_span': bare}, ask, 'For babybear: ' + bare)
-    # No open-label discount (review 5898461042 B4): the open menu mentioning babybear does not hide it.
-    labelled = {**ask, 'step': {**ask['step'], 'options': ["A: Blacksmith macOS runner",
-                                                           "B: share babybear's self-hosted mini runner"]}}
-    assert not core._evidence_names_only_open({**step, 'verbatim_span': 'The babybear macOS CI runner pick still '
-                                               'needs you.'}, labelled)
-    assert not core._evidence_names_only_open({**step, 'verbatim_span': 'The babybear pick still needs you.'}, ask)
-    assert not core._evidence_names_only_open({**step, 'verbatim_span': 'That one still needs you.'}, ask,
-                                              'Now babybear.\n\nThat one still needs you.')
-
-
-def test_a_card_ask_quoted_by_two_open_scopes_maps_onto_neither():
-    # Scope identity needs exactly one open request, like menu identity.
-    text = f'The tests-os card still asks: {TESTS_OS_ASK}'
-    asks = [{'id': rid, 'kind': 'choice', 'title': 'Pick macOS test CI', 'labels': [], 'step': None,
-             'scope': NEEDS_YOU_1108} for rid in ('r1', 'r2')]
-    cand = {**STEP_60B8, 'verbatim_span': text}
-    assert core.same_open_ask(cand, asks[:1], reply=text)['id'] == 'r1'
-    assert core.same_open_ask(cand, asks, reply=text) is None
-
-
-# ---- re-review of PR #93 (card t_01a1d6c233649a46, review 5898199961): a sentence lands on an open tile only when it
-# only POINTS at it (asks nothing, presents no menu) and carries its exact title/text or menu. ----------------------
-
-# Live MacBook chat ..f07c32, 13:17 PST: request 2288f5b4 (step us_a9defb1d27) minted from this headline while
-# 2948b7f0 was open; same title, a reminder sentence, options "B (recommended)", "A", "C" (withdrawn 13:21).
-HEADLINE_1317 = (
-    "**All 38 updates check out.** Every merge in the batch landed exactly as approved, with required CI green, and no "
-    "wrong behaviour turned up. Two bugs still have unmerged fixes: lifecycle-guard #2485 and the duplicate For-you "
-    "tiles (hermes-mods #93). Tests for 5 untested-code gaps are still being written. The only thing waiting on you is "
-    "the macOS CI pick. (Checked 13:15 PST: that card is still blocked and the request is your only open ask from "
-    "this chat.)")
-STEP_A9DE = {'text': 'Pick macOS CI option A, B, or C (B recommended)', 'kind': 'choose',
-             'verbatim_span': 'The only thing waiting on you is the macOS CI pick.',
-             'options': ['B (recommended)', 'A', 'C']}
-
-
-def test_the_1317_headline_naming_the_open_pick_reuses_it_untouched(tmp_path):
-    store, ledger = env(tmp_path)
-    tile = _open_macos_tile(store, ledger)
-    [before] = live(store)
-    out = reply(store, ledger, HEADLINE_1317, [dict(STEP_A9DE)])
-    [after] = live(store)
-    assert after['requestId'] == before['requestId'] and [s['id'] for s in out['steps']] == [tile['id']]
-    assert (after['revision'], after['title'], after['scope']) == (before['revision'], before['title'], before['scope'])
-
-
-def test_a_real_new_ask_in_the_same_session_still_gets_its_own_tile(tmp_path):
-    # Acceptance 2: another subject with its own question and menu, after the 13:17 headline mapped.
-    store, ledger = env(tmp_path)
-    _open_macos_tile(store, ledger)
-    reply(store, ledger, HEADLINE_1317, [dict(STEP_A9DE)])
-    text = 'Which Linux runner should the babybear repo use? A: Blacksmith 4vcpu Linux, B: GitHub-hosted ubuntu.'
-    reply(store, ledger, text, [{'text': 'Pick the babybear Linux runner', 'kind': 'choose', 'verbatim_span': text,
-                                 'options': ['A: Blacksmith 4vcpu Linux', 'B: GitHub-hosted ubuntu']}])
-    assert len(live(store)) == 2
-
-
 _OPEN_HM = ('For hermes-mods, which macOS CI runner do you want? A: Blacksmith macOS runner (~$120/mo), B: self-hosted '
             'mini runner (free).')
 _MENU_TXT = 'A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini runner (free).'
+_S = {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': list(_RUNNER_MENU)}
+_BULLETS = '- Blacksmith macOS runner (~$120/mo)\n- self-hosted mini runner (free)'
+_REMIND = 'That macOS CI runner pick still needs you.'
 
-
-@pytest.mark.parametrize('t1,t2,span2', [
+# (t1, t2, span2): every probe of reviews 5898199961 (M, R), 5898461042 (F, K) and 5898725409 (N, menu, scope).
+# span2 None = the whole t2. Each folded a distinct decision onto the open tile under some identity rule.
+PROBES = [
     pytest.param(_OPEN_HM, f'Next up is babybear. Which macOS CI runner do you want? {_MENU_TXT}',
                  f'Which macOS CI runner do you want? {_MENU_TXT}', id='M1-subject-in-the-sentence-before'),
     pytest.param(_OPEN_HM, f'Now babybear.\n\nWhich one do you want? {_MENU_TXT}',
@@ -1090,114 +1068,111 @@ _MENU_TXT = 'A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini runner (
                  f'For the other Mac, which macOS CI runner do you want? {_MENU_TXT}', None, id='M3c-left-other'),
     pytest.param(f"For Will's laptop, which macOS CI runner do you want? {_MENU_TXT}",
                  f"For May's laptop, which macOS CI runner do you want? {_MENU_TXT}", None, id='M3d-will-may'),
-    pytest.param(_OPEN_HM,
-                 'For babybear, which macOS CI runner do you want? A: babybear on Blacksmith macOS runner (~$120/mo), '
-                 'B: babybear on self-hosted mini runner (free).', None, id='M4-subject-inside-the-labels'),
     pytest.param('For hermes-mods (babybear stays on GitHub runners), which macOS CI runner do you want? '
                  + _MENU_TXT, f'For babybear, which macOS CI runner do you want? {_MENU_TXT}', None,
                  id='M5-other-subject-as-context-in-the-open-ask'),
-    # The same shapes as reminders (no question, no menu): the sentence or its lead names another subject.
     pytest.param(_OPEN_HM, 'The babybear macOS CI runner pick still needs you.', None, id='R1-reminder-other-subject'),
     pytest.param(_OPEN_HM, 'Now babybear.\n\nThat one still needs you.', 'That one still needs you.',
                  id='R2-bare-reminder-after-another-subject'),
     pytest.param('For hermes-mods (babybear stays on GitHub runners), which macOS CI runner do you want? '
                  + _MENU_TXT, 'The babybear macOS CI runner pick still needs you.', None,
                  id='R3-reminder-naming-the-open-asks-context-subject'),
-    # A reminder sentence beside a NEW presentation of the menu: the reply asks again, so it is its own ask.
-    pytest.param(_OPEN_HM, f'For babybear: {_MENU_TXT}\n\nThat macOS CI runner pick still needs you.',
-                 'That macOS CI runner pick still needs you.', id='R4-reminder-beside-a-new-menu'),
-])
-def test_a_same_text_same_menu_ask_for_another_subject_is_a_new_tile(tmp_path, t1, t2, span2):
-    # Same generic step text and the same menu on both sides: only the reply tells the subjects apart.
-    s = {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': list(_RUNNER_MENU)}
-    s2 = dict(s)
-    if 'babybear on ' in t2:  # M4: the candidate's own labels carry its subject
-        s2['options'] = ['A: babybear on Blacksmith macOS runner (~$120/mo)',
-                         'B: babybear on self-hosted mini runner (free)']
-    store = _two_replies(tmp_path, t1, {**s, 'verbatim_span': t1}, t2, {**s2, 'verbatim_span': span2 or t2})
+    pytest.param(_OPEN_HM, f'For babybear: {_MENU_TXT}\n\n{_REMIND}', _REMIND, id='R4-reminder-beside-a-new-menu'),
+    pytest.param(_OPEN_HM, f'For babybear, choose one:\n{_BULLETS}\n\n{_REMIND}', _REMIND, id='F1-bulleted-menu'),
+    pytest.param(_OPEN_HM, 'For babybear: 1) Blacksmith macOS runner (~$120/mo), 2) self-hosted mini runner (free).'
+                 f'\n\n{_REMIND}', _REMIND, id='F2-numbered-menu'),
+    pytest.param(_OPEN_HM, 'For babybear: Blacksmith macOS runner (~$120/mo) or self-hosted mini runner (free).'
+                 f'\n\n{_REMIND}', _REMIND, id='F3-x-or-y'),
+    pytest.param(_OPEN_HM, 'For babybear: **A)** Blacksmith macOS runner (~$120/mo), **B)** self-hosted mini runner '
+                 f'(free).\n\n{_REMIND}', _REMIND, id='F4-bold-letters'),
+    pytest.param(_OPEN_HM, 'For babybear: A. Blacksmith macOS runner (~$120/mo), B. self-hosted mini runner (free).'
+                 f'\n\n{_REMIND}', _REMIND, id='F5-dot-letters-inline'),
+    pytest.param(_OPEN_HM, 'Next up is babybear. The macOS CI runner pick still needs you.',
+                 'The macOS CI runner pick still needs you.', id='F6-subject-in-the-sentence-before'),
+    pytest.param(_OPEN_HM, 'Now babybear.\n\nThe macOS CI runner pick still needs you.',
+                 'The macOS CI runner pick still needs you.', id='F7-subject-in-the-paragraph-before'),
+    pytest.param(_OPEN_HM, '## babybear\n\nThe macOS CI runner pick still needs you.',
+                 'The macOS CI runner pick still needs you.', id='F8-heading-before'),
+    pytest.param(_OPEN_HM, 'babybear is next. I need a decision on the macOS CI runner.',
+                 'I need a decision on the macOS CI runner.', id='F9-need-a-decision'),
+    pytest.param(_OPEN_HM, 'Now babybear. Also choose the macOS CI runner.', 'Also choose the macOS CI runner.',
+                 id='F10-also-choose'),
+    pytest.param(_OPEN_HM, 'babybear next. I need you to pick the macOS CI runner.',
+                 'I need you to pick the macOS CI runner.', id='F11-need-you-to-pick'),
+    pytest.param(_OPEN_HM, 'babybear is set up now. The only thing waiting on you is the macOS CI runner pick.',
+                 'The only thing waiting on you is the macOS CI runner pick.', id='F12-1317-wording-after-a-status'),
+    pytest.param(_OPEN_HM, 'The only thing waiting on you is the macOS CI runner pick.', None, id='K1-1317-headline'),
+    pytest.param(_OPEN_HM, 'Two macOS CI runner choices still need you.', None, id='K6-plural'),
+    pytest.param(_OPEN_HM, 'The macOS CI runner pick still needs you. Want me to merge #93 meanwhile?',
+                 'The macOS CI runner pick still needs you.', id='K4-other-question'),
+    pytest.param(_OPEN_HM, 'Moving babybear to Blacksmith needs your OK.\n\n' + _REMIND, _REMIND, id='K8-needs-your-ok'),
+    pytest.param(_OPEN_HM, '> For babybear, should the macOS CI runner move to Blacksmith?\n\n' + _REMIND, _REMIND,
+                 id='K9-block-quote'),
+] + [pytest.param(_OPEN_HM, lead + '\n\n' + _REMIND, _REMIND, id=pid) for pid, lead in {
+    # review 5898725409: asks with no trigger word
+    'N1-green-light': 'Moving babybear to Blacksmith ($120/mo) just needs your green light.',
+    'N2-unless-you-object': "I'll move babybear to Blacksmith ($120/mo) tomorrow unless you object.",
+    'N3-vs': 'babybear also needs a runner: Blacksmith ($120/mo) vs the mini (free).',
+    'N4-slash': 'babybear runner: Blacksmith ($120/mo) / the mini (free), your word.',
+    'N5-say-the-word': "Say the word and I'll move babybear to Blacksmith ($120/mo).",
+    'N6-thumbs-up': 'A thumbs up here moves babybear to Blacksmith ($120/mo).',
+    'N7-waiting-for-word': 'babybear: moving it to Blacksmith costs $120/mo. Waiting for your word on that.',
+    'N8-fine-to': 'Fine to move babybear to Blacksmith ($120/mo) too.',
+    'N9-yes-no': 'Move babybear to Blacksmith ($120/mo): yes/no.',
+    'N10-go-no-go': 'I still need a go/no-go on moving babybear to Blacksmith ($120/mo).',
+    'N11-ping-me': 'Ping me if babybear should move to Blacksmith ($120/mo).',
+    'N12-holding-for-you': 'Holding the babybear Blacksmith move ($120/mo) until you sign it off.',
+    # review 5898725409: menus the lexical gate missed
+    'MN1-brackets': 'For babybear: [A] Blacksmith macOS runner (~$120/mo) [B] self-hosted mini runner (free)',
+    'MN2-option-1-2-no-punct': 'For babybear: option 1 Blacksmith macOS runner, option 2 self-hosted mini runner.',
+    'MN3-roman': 'For babybear: (i) Blacksmith macOS runner, (ii) self-hosted mini runner.',
+    'MN4-table': ('For babybear, the runners:\n\n| Runner | Cost |\n|---|---|\n| Blacksmith macOS | $120/mo |\n'
+                  '| self-hosted mini | free |'),
+    'MN5-bullets-full-sentences-no-colon': ('For babybear there are two routes.\n- Move it to the Blacksmith macOS '
+                                            'runner, $120 a month.\n- Keep it on the self-hosted mini runner, free.'),
+    'MN6-bold-lines': '**Blacksmith** — $120/mo for babybear\n**Mini** — free for babybear',
+    'MN7-letters-split-by-text': ('For babybear:\nA) Blacksmith macOS runner, $120/mo.\nIt is the fastest.\n'
+                                  'B) self-hosted mini runner, free.'),
+    'MN8-emoji-numbers': 'For babybear: 1\ufe0f\u20e3 Blacksmith macOS runner 2\ufe0f\u20e3 self-hosted mini runner',
+    'MN9-headings': '### babybear option 1: Blacksmith ($120/mo)\n\n### babybear option 2: the mini (free)',
+    'MN10-first-second': 'For babybear, first route: Blacksmith ($120/mo). Second route: the mini (free).',
+    'S2-open-menu-quoted-for-another-subject': ('For babybear as well: "A: Blacksmith macOS runner (~$120/mo), B: '
+                                                'self-hosted mini runner (free)."'),
+    'W1-single-quoted-ask': "The babybear card asks: 'Move babybear to Blacksmith now'. ",
+}.items()]
+
+
+@pytest.mark.parametrize('t1,t2,span2', PROBES)
+def test_no_probe_ever_folds_a_distinct_decision_onto_the_open_tile(tmp_path, t1, t2, span2):
+    store = _two_replies(tmp_path, t1, {**_S, 'verbatim_span': t1}, t2, {**_S, 'verbatim_span': span2 or t2})
     assert len(live(store)) == 2, [r['title'] for r in live(store)]
 
 
-@pytest.mark.parametrize('t2', [
-    pytest.param('The hermes-mods macOS CI runner pick still needs you.', id='names-the-open-subject'),
-    pytest.param('The macOS CI runner pick still needs you.', id='names-nothing-new'),
-])
-def test_a_reminder_that_only_points_at_the_open_ask_reuses_it(tmp_path, t2):
-    s = {'text': 'Pick the hermes-mods macOS CI runner', 'kind': 'choose', 'options': list(_RUNNER_MENU)}
-    store = _two_replies(tmp_path, _OPEN_HM, {**s, 'verbatim_span': _OPEN_HM}, t2, {**s, 'verbatim_span': t2})
-    assert len(live(store)) == 1
+@pytest.mark.parametrize('t1,t2,span2', PROBES)
+def test_every_probe_is_held_pre_send_never_mapped(plugin, monkeypatch, t1, t2, span2):
+    # The gate never decides identity either: each probe is returned to the agent with the open request named.
+    store, req = _gate_open(plugin, t1, {**_S, 'verbatim_span': t1})
+    held = _gate(plugin, monkeypatch, t2, [{**_S, 'verbatim_span': span2 or t2}])
+    assert held and held.get('hold') is True and req['requestId'] in held['nudge'], held
 
 
-def test_an_equal_title_that_asks_again_is_a_new_tile(tmp_path):
-    # Exact title alone is not enough: the later sentence asks its own question.
-    s = {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': []}
-    t2 = 'For babybear, should the macOS CI runner be Blacksmith or the mini?'
-    store = _two_replies(tmp_path, _OPEN_HM, {**s, 'verbatim_span': _OPEN_HM}, t2, {**s, 'verbatim_span': t2})
+def test_scope_probes_stay_two_tiles(tmp_path):
+    # Review 5898725409: a request sentence the open scope holds, and the live card ask quoted for another repo.
+    t1 = (_OPEN_HM + ' Separately, please approve deleting the stale runner images on worker-3. '
+          'A thumbs up moves the babybear lane too.')
+    store = _two_replies(tmp_path, t1, {**_S, 'verbatim_span': t1},
+                         'Please approve deleting the stale runner images on worker-3.\n\n' + _REMIND,
+                         {**_S, 'verbatim_span': _REMIND})
+    assert len(live(store)) == 2
+    store, ledger = env(tmp_path / 'live')
+    _open_macos_tile(store, ledger)
+    reply(store, ledger, f'babybear has the same choice. The card asks: {BLACKSMITH_ASK}\n\n' + HEADLINE_1317,
+          [dict(STEP_A9DE)])
     assert len(live(store)) == 2
 
 
-# ---- re-review of PR #93 (card t_01a1d6d66cd9a092, review 5898461042): a reminder lands only when the WHOLE reply
-# asks nothing new. Any question, request, choice verb, alternative or menu (lettered or not) anywhere in the reply,
-# outside text the open request's frozen scope already carries, keeps every candidate its own tile. ---------------
-
-_S = {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': list(_RUNNER_MENU)}
-_BULLETS = '- Blacksmith macOS runner (~$120/mo)\n- self-hosted mini runner (free)'
-_REMIND = 'That macOS CI runner pick still needs you.'
-
-
-@pytest.mark.parametrize('t2,span2', [
-    # B1: the new menu is unlettered, or lettered in a shape the old check missed
-    pytest.param(f'For babybear, choose one:\n{_BULLETS}\n\n{_REMIND}', _REMIND, id='F1-bulleted-menu'),
-    pytest.param('For babybear: 1) Blacksmith macOS runner (~$120/mo), 2) self-hosted mini runner (free).\n\n'
-                 + _REMIND, _REMIND, id='F2-numbered-menu'),
-    pytest.param('For babybear: Blacksmith macOS runner (~$120/mo) or self-hosted mini runner (free).\n\n'
-                 + _REMIND, _REMIND, id='F3-x-or-y'),
-    pytest.param('For babybear: **A)** Blacksmith macOS runner (~$120/mo), **B)** self-hosted mini runner (free).\n\n'
-                 + _REMIND, _REMIND, id='F4-bold-letters'),
-    pytest.param('For babybear: A. Blacksmith macOS runner (~$120/mo), B. self-hosted mini runner (free).\n\n'
-                 + _REMIND, _REMIND, id='F5-dot-letters-inline'),
-    pytest.param('For babybear:\nA. Blacksmith macOS runner\nB. self-hosted mini runner\n\n' + _REMIND, _REMIND,
-                 id='F5b-dot-letters-lines'),
-    pytest.param('For babybear:\nA - Blacksmith macOS runner\nB - self-hosted mini runner\n\n' + _REMIND, _REMIND,
-                 id='F5c-dash-letters-lines'),
-    pytest.param('For babybear, a separate budget line:\n- Blacksmith macOS runner, $120 a month.\n'
-                 '- The self-hosted mini runner, free.\n\n' + _REMIND, _REMIND, id='F5d-bullets-after-a-colon'),
-    # B3: requests and imperatives the old _ASKS_ANEW missed (the subject sits in the lead)
-    pytest.param('babybear is next. I need a decision on the macOS CI runner.',
-                 'I need a decision on the macOS CI runner.', id='F9-need-a-decision'),
-    pytest.param('Now babybear. Also choose the macOS CI runner.', 'Also choose the macOS CI runner.',
-                 id='F10-also-choose'),
-    pytest.param('babybear next. I need you to pick the macOS CI runner.', 'I need you to pick the macOS CI runner.',
-                 id='F11-need-you-to-pick'),
-    pytest.param('babybear next. Just pick one for the macOS CI runner.', 'Just pick one for the macOS CI runner.',
-                 id='F11b-just-pick-one'),
-    pytest.param('babybear next: go with Blacksmith or the mini for the macOS CI runner.',
-                 'go with Blacksmith or the mini for the macOS CI runner.', id='F11c-go-with'),
-    pytest.param('babybear next. Give me a letter for the macOS CI runner.',
-                 'Give me a letter for the macOS CI runner.', id='F11d-give-me-a-letter'),
-    pytest.param('babybear next. Your pick for the macOS CI runner: Blacksmith, the mini.',
-                 'Your pick for the macOS CI runner: Blacksmith, the mini.', id='F11e-your-pick-for'),
-])
-def test_a_reminder_in_a_reply_that_asks_anything_new_is_its_own_tile(tmp_path, t2, span2):
-    store = _two_replies(tmp_path, _OPEN_HM, {**_S, 'verbatim_span': _OPEN_HM}, t2, {**_S, 'verbatim_span': span2})
-    assert len(live(store)) == 2, [r['title'] for r in live(store)]
-
-
-def test_the_open_menu_naming_another_subject_does_not_hide_it(tmp_path):
-    # B4 / F13: the open hermes-mods menu mentions babybear in a label; a babybear reminder is not that tile.
-    menu = ['A: Blacksmith macOS runner (~$120/mo)', "B: share babybear's self-hosted mini runner (free)"]
-    t1 = ("For hermes-mods, which macOS CI runner do you want? A: Blacksmith macOS runner (~$120/mo), B: share "
-          "babybear's self-hosted mini runner (free).")
-    t2 = 'The babybear macOS CI runner pick still needs you.'
-    s = {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': menu}
-    store = _two_replies(tmp_path, t1, {**s, 'verbatim_span': t1}, t2, {**s, 'verbatim_span': t2})
-    assert len(live(store)) == 2, [r['title'] for r in live(store)]
-
-
 def test_the_1317_headline_beside_a_new_unlettered_menu_is_its_own_tile(tmp_path):
-    # F14, the live shape: the 13:17 headline plus a NEW bulleted babybear budget question in the same reply; the
-    # extractor reads that ask with the open title and the headline as its evidence.
-    store, ledger = env(tmp_path)
+    store, ledger = env(tmp_path)  # F14, the live shape
     _open_macos_tile(store, ledger)
     text = HEADLINE_1317 + ('\n\nFor babybear, a separate budget line:\n- Blacksmith 6vcpu macOS (~$26/day)\n'
                             '- sub-minute jobs only (~$4/day)\n- no spend')
@@ -1205,88 +1180,7 @@ def test_the_1317_headline_beside_a_new_unlettered_menu_is_its_own_tile(tmp_path
     assert len(live(store)) == 2
 
 
-@pytest.mark.parametrize('t2,span2', [
-    # B2 (F6, F7, F8, F12): another subject in the lead, but the reply presents NO ask at all: no question, request,
-    # choice verb, alternative or menu. A tile minted here would carry the open tile's own title and menu (the
-    # extractor has nothing else to read), so it could only be a duplicate; if the other subject's decision is
-    # presented later, that reply asks and gets its own tile (the twins above).
-    pytest.param('Next up is babybear. The macOS CI runner pick still needs you.',
-                 'The macOS CI runner pick still needs you.', id='F6-subject-in-the-sentence-before'),
-    pytest.param('Now babybear.\n\nThe macOS CI runner pick still needs you.',
-                 'The macOS CI runner pick still needs you.', id='F7-subject-in-the-paragraph-before'),
-    pytest.param('## babybear\n\nThe macOS CI runner pick still needs you.',
-                 'The macOS CI runner pick still needs you.', id='F8-heading-before'),
-    pytest.param('babybear is set up now. The only thing waiting on you is the macOS CI runner pick.',
-                 'The only thing waiting on you is the macOS CI runner pick.', id='F12-1317-wording-after-a-status'),
-    pytest.param('The only thing waiting on you is the macOS CI runner pick.',
-                 'The only thing waiting on you is the macOS CI runner pick.', id='K1-1317-headline'),
-    pytest.param('Two macOS CI runner choices still need you.', 'Two macOS CI runner choices still need you.',
-                 id='K6-plural'),
-])
-def test_a_reply_that_presents_no_ask_reuses_the_open_tile(tmp_path, t2, span2):
-    store = _two_replies(tmp_path, _OPEN_HM, {**_S, 'verbatim_span': _OPEN_HM}, t2, {**_S, 'verbatim_span': span2})
-    assert len(live(store)) == 1, [r['title'] for r in live(store)]
-
-
-@pytest.mark.parametrize('t2', [
-    pytest.param('The macOS CI runner pick still needs you; reply with a letter when ready.', id='K2-reply-letter'),
-    pytest.param('The macOS CI runner pick is still your call.', id='K3-your-call'),
-    pytest.param('The macOS CI runner pick still needs you. Want me to merge #93 meanwhile?', id='K4-other-question'),
-    pytest.param('The macOS CI runner pick still needs you.\n\nUnrelated: PR #12 is green. A: rebase and merge it, '
-                 'B: close it.', id='K5-other-menu-elsewhere'),
-])
-def test_known_false_splits_stay_two_tiles(tmp_path, t2):
-    # Accepted trade-off (non-blocking in review 5898461042): a reminder beside ANY other ask, or worded as a
-    # request, is a duplicate tile. A duplicate is visible and withdrawable; a false merge loses an ask.
-    span = t2.split('\n')[0].split(' Want')[0]
-    store = _two_replies(tmp_path, _OPEN_HM, {**_S, 'verbatim_span': _OPEN_HM}, t2, {**_S, 'verbatim_span': span})
-    assert len(live(store)) == 2
-
-
-@pytest.mark.parametrize('text,want', [
-    ('A: Blacksmith macOS runner, B: self-hosted mini runner', True),
-    ('**A)** Blacksmith macOS runner, **B)** self-hosted mini runner', True),
-    ('A. Blacksmith macOS runner, B. self-hosted mini runner', True),
-    ('A. Blacksmith macOS runner\nB. self-hosted mini runner', True),
-    ('A - Blacksmith macOS runner\nB - self-hosted mini runner', True),
-    ('Option A: Blacksmith macOS runner; Option B: self-hosted mini runner', True),
-    ('1) Blacksmith macOS runner 2) self-hosted mini runner', True),
-    ('- Blacksmith macOS runner\n- self-hosted mini runner', True),
-    ('**A:** Blacksmith macOS runner\n**B:** self-hosted mini runner', True),
-    ('Merged today, both green.', False),
-    ('(Checked 13:15 PST: that card is still blocked.)', False),
-    ('- Fixed the state guard, merged as abc123 after review.\n- The tests-os card is still blocked on you here.',
-     False),
-])
-def test_presents_menu_sees_unlettered_and_lettered_menus(text, want):
-    assert core._presents_menu(text) is want
-
-
-def test_the_live_replies_present_no_new_ask_beyond_the_open_scope():
-    # The live 11:54 and 13:17 replies ask nothing the open 2948b7f0 scope (NEEDS_YOU_1108) does not already carry.
-    assert not core._reply_asks(STATUS_1154 + '\n\n' + NEEDS_YOU_1154, NEEDS_YOU_1108)
-    assert not core._reply_asks(HEADLINE_1317, NEEDS_YOU_1108)
-    # ...while without that scope, the 11:54 "Needs you" block asks (its pick sentences are only exempt as scope).
-    assert core._reply_asks(NEEDS_YOU_1154, '')
-
-
-@pytest.mark.parametrize('t2', [
-    # Nothing in the reply is skipped as "not prose": a quoted, block-quoted or directive-wrapped ask still asks.
-    pytest.param('The babybear card asks: "Should babybear move its macOS CI to Blacksmith now"\n\n' + _REMIND,
-                 id='quoted-new-card-ask'),
-    pytest.param('> For babybear, should the macOS CI runner move to Blacksmith?\n\n' + _REMIND, id='block-quote'),
-    pytest.param(core.directive(['us_other'], 'session-a', 'For babybear, should it move to Blacksmith?')
-                 + '\n\n' + _REMIND, id='agent-written-directive'),
-    pytest.param('Moving babybear to Blacksmith needs your OK.\n\n' + _REMIND, id='needs-your-ok'),
-])
-def test_a_reminder_beside_an_ask_in_any_wrapping_is_its_own_tile(tmp_path, t2):
-    store = _two_replies(tmp_path, _OPEN_HM, {**_S, 'verbatim_span': _OPEN_HM}, t2, {**_S, 'verbatim_span': _REMIND})
-    assert len(live(store)) == 2, [r['title'] for r in live(store)]
-
-
-def test_the_1317_headline_wrapped_in_an_agent_directive_still_reuses_the_open_tile(tmp_path):
-    # The live 13:17 reply wrapped the headline in its own ::user-step marker; unwrapped, it asks nothing new.
-    store, ledger = env(tmp_path)
-    _open_macos_tile(store, ledger)
-    reply(store, ledger, core.directive(['us_a9defb1d27'], 'session-a', HEADLINE_1317), [dict(STEP_A9DE)])
-    assert len(live(store)) == 1
+def test_directly_asks_still_blanks_short_quotes():
+    assert core.directly_asks('The card log says "please approve it".') is False
+    assert core.directly_asks('Its title was "Can you confirm?" earlier.') is False
+    assert core.directly_asks('Can you confirm?') is True
