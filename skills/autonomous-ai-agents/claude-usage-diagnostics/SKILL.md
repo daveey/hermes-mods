@@ -73,9 +73,7 @@ Test successful-probe recovery through select → persisted auth row → fresh p
 
 ### 3b. Verify account-selection and rotation plugins together
 
-- Test actual configured PluginManager discovery with both account-selection and fast-rate-limit-fallback enabled, not just each plugin's isolated suite. Wrapping a shared recovery function can make another plugin's fingerprint guard refuse installation even when core source is unchanged.
-- Require combined recovery and unload/reload tests before recommending activation: verify selected-account wire identity, cooldown preservation, long-reset rotation/fallback, and both installers active. Never bypass compatibility by indiscriminately unwrapping `__wrapped__` or accepting new hashes; explicitly audit supported wrapper composition and reject foreign wrappers.
-- Distinguish on-disk implementation, fresh-process discovery, and activation in the owning live gateway/compute child. A mocked browser harness proves UI interactions, not native-app deployment or real provider dispatch.
+Before recommending activation of account-selection plus fast-rate-limit-fallback, read `references/plugin-composition.md`.
 
 ### 3c. "Codex provider quota exhausted" even though a fallback is configured
 
@@ -91,30 +89,7 @@ Test successful-probe recovery through select → persisted auth row → fresh p
 
 ### 3d. The default model changed by itself while a provider was exhausted
 
-- **Symptom:** `model.default` and `provider` flip to another provider's model, for example to
-  `claude-sonnet-5` with `base_url` and `api_mode` written as well. No session asked for that model.
-- **Mechanism:** when every credential of the main provider is exhausted and no fallback works, Desktop opens its
-  provider picker. It looks like a first run ("getting started").
-  - Choosing an already signed-in provider there finishes at once. Anthropic is an `external` flow, so
-    "I've signed in" succeeds immediately.
-  - Desktop then saves that provider's recommended default (`GET /api/model/recommended-default?provider=<slug>`)
-    through `POST /api/model/set` before the confirm card appears. See `completeWithModelConfirm` in
-    `apps/desktop/src/store/onboarding.ts`; this applies unless your core defers that write until the user
-    confirms.
-- **Rule out agents first:** search `state.db` `messages.tool_calls` in the window for the model id,
-  `api/model/set` and `model.default`.
-- **The backend doesn't log model saves,** so time a flip from config history instead. Per-host config snapshots
-  from a sync tool (`git log -p -- <host>/config.yaml`) bracket each write. A shared-config re-apply that reverts
-  the flip within one sync interval is that tool working as designed, not a second bug.
-- **Prevention:** a working `fallback_providers` entry keeps `setup.runtime_check` ready, because it runs the
-  session resolver including the fallback chain. The picker then doesn't open.
-- **Log scans must stay bounded.** Desktop logs rotate at about 10 MB each (`gui.log*`, `desktop.log*`; `agent.log*`
-  is about 5 MB).
-  - Scanning several time windows across every rotation with awk in one call hit the 420 s tool timeout, which
-    silently ended the turn.
-  - First check `ls -la` sizes and each file's first and last timestamp. Then `rg` only the covering file with an
-    anchored timestamp regex such as `'^2026-10-26 (15:0[3-9]|15:1[0-7])'`.
-  - `desktop.log` records backend events, not renderer requests, so there is no request log for `/api/model/set`.
+When `model.default`/`provider` flipped with no session asking (Desktop's provider picker after a pool wall), read `references/default-model-flip.md`.
 
 ### 3e. False provider-wide quota walls (revoked tokens, stale cooldowns)
 
@@ -175,6 +150,7 @@ Grep transcripts for 429 `task-notification` storms — each names a dead subage
   openai-codex <stale id>` and prove with a one-line `hermes chat -q ... --provider openai-codex`. No re-auth needed.
 - **Grey / "0/N" usage chips (any usage widget) usually mean expired tokens, not no capacity.** The pool only refreshes a token when it selects that entry, and every usage fetcher (core and community plugins alike) is read-only, so idle accounts' ~8h access tokens lapse → state `unknown`. Check `expires_at_ms` in auth.json first; `hermes auth refresh anthropic <n>` fixes it now (model cooldowns survive the refresh). The `oauth-keepalive` user plugin (`~/.hermes/plugins/oauth-keepalive`) prevents recurrence; if chips grey out again, confirm it's enabled (`hermes plugins list`).
 
+- **`hermes usage` reads only the currently selected account, never the pool.** "N% weekly left" from it can be the one account with headroom, even a user-disabled one (`[disabled]` in `hermes auth list`), while every enabled account sits at 100%. A disabled row is not capacity. For pool headroom, read every account's `/api/oauth/usage` (step 2) next to the `hermes auth list` markers before calling an outage "not quota".
 - **Never argue from the usage modal** — it shows session limit, weekly all-models, and only *some* per-model buckets; per-model weekly caps and request-rate throttles can be invisible while calls still 429. Quote the transcript error, then verify live.
 - **When the user's direct observation contradicts your measurement, distrust the measurement first.** "It works in the desktop app on account X" while your probe says X is 429 means your probe differs from the real client. Find that difference. Don't invent a server-side theory (per-token buckets, hidden throttles) to explain away what the user is seeing.
 - **Never kill processes on a theory.** Before killing anything as "feeding the rate limit", confirm it actually calls the Anthropic API: check its command line for `claude`, an SDK, or an API host. SSH/staging loops and watchers don't consume quota. Killing them destroys the user's work and helps nothing.
