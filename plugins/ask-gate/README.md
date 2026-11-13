@@ -499,6 +499,11 @@ epoch timestamp (not the age of the approval). Maximum accepted read age is 30 s
 `vetoed`, `pending`, or `new_scope`; the last requires an authoritative absence for the exact current scope, not
 an older/mismatched approval. Readers must be bounded, read-only and return no secrets or raw principal evidence.
 Adapter exceptions fail closed without exposing exception contents. Duplicate names are refused.
+The recovery hold names the adapter and which step failed: `resolve` raising means the adapter could not
+classify the ask and no store was read (fix its ask attribution: an adapter must return `None`, not raise,
+for asks it cannot attribute to its own domain, e.g. another repo's "merge PR #N"); a `read` failure names
+the check (read raised, unverified, stale, target mismatch, unknown state). Tests:
+`test_recovery_names_adapter_and_failed_store_check`, `test_recovery_says_classification_failed_before_any_store_read`.
 
 For deployment, set `plugins.entries.ask-gate.settings.approval_adapters` to a list of absolute Python file
 paths in trusted private configuration. Each file exports `register(registry)` and calls

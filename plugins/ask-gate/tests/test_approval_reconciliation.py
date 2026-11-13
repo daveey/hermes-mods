@@ -95,6 +95,54 @@ def test_store_failure_does_not_become_approval_ask(gate):
         dispose()
 
 
+# The recovery hold named neither the adapter nor the failed check, so a resolve() that
+# raised while merely classifying an unrelated merge ask (no store read at all) looked like
+# an unreadable approval store; agents could not tell what to fix (t_01a1d37dad2e9137).
+@pytest.mark.parametrize("reader, check", [
+    (lambda target: snapshot(verified=False), "unverified"),
+    (lambda target: snapshot(observed_at=0), "stale"),
+    (lambda target: snapshot(target={**TARGET, "revision": "b" * 40}), "target mismatch"),
+    (lambda target: snapshot(state="expired"), "unknown state"),
+])
+def test_recovery_names_adapter_and_failed_store_check(gate, reader, check):
+    dispose = setup(gate, reader)
+    try:
+        message = call(gate)["message"]
+        assert "Approval state could not be reconciled" in message
+        assert "`example-store`" in message and "approval store" in message
+        assert check in message
+    finally:
+        dispose()
+
+
+def test_recovery_names_store_read_exception_without_leaking_it(gate):
+    def unavailable(target):
+        raise OSError("/private/secret/store.sqlite offline")
+    dispose = setup(gate, unavailable)
+    try:
+        message = call(gate)["message"]
+        assert "`example-store`" in message and "read raised" in message
+        assert "/private/secret" not in message
+    finally:
+        dispose()
+
+
+def test_recovery_says_classification_failed_before_any_store_read(gate):
+    def resolve(context):
+        raise RuntimeError("cannot attribute /private/secret ask")
+    dispose = gate.approval_reconciliation.register(
+        "example-store", resolve, lambda target: pytest.fail("no read after a failed resolve"))
+    gate.LOG.add("s1", "terminal", "inspect", "head " + "a" * 40)
+    try:
+        message = call(gate)["message"]
+        assert "Approval state could not be reconciled" in message
+        assert "`example-store`" in message
+        assert "could not classify" in message and "no approval store was read" in message
+        assert "/private/secret" not in message
+    finally:
+        dispose()
+
+
 def test_current_store_reread_on_each_attempt(gate):
     states = iter(["pending", "approved", "vetoed"])
     dispose = setup(gate, lambda target: snapshot(next(states)))
