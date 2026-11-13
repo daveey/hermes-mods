@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import importlib.util
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -87,6 +88,9 @@ CREATE TABLE IF NOT EXISTS fired (
   result TEXT, route TEXT, supervisor_task TEXT, PRIMARY KEY (card_key, premise));
 CREATE TABLE IF NOT EXISTS wakes (session_id TEXT NOT NULL, at REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS wakes_by_session ON wakes (session_id, at);
+CREATE TABLE IF NOT EXISTS relays (
+  session_id TEXT PRIMARY KEY, cards TEXT NOT NULL, prompt TEXT NOT NULL, display_text TEXT NOT NULL,
+  posted_at REAL NOT NULL, posted_pid INTEGER);
 """
 
 
@@ -161,6 +165,37 @@ class WakeLog:
 
     def rows(self) -> list[tuple]:
         return self._run("SELECT card_key, premise, session_id, result, route, supervisor_task FROM fired")
+
+    # A host-pass wake refused because the chat is live in another process is posted here for that process's
+    # residual pass (``take_relays``): only the backend holding a chat can start a turn in it.
+    def post_relay(self, session_id: str, cards: list[tuple[str, str]], prompt: str, display_text: str,
+                   now: float) -> None:
+        self._run("INSERT INTO relays (session_id, cards, prompt, display_text, posted_at, posted_pid) "
+                  "VALUES (?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET cards=excluded.cards, "
+                  "prompt=excluded.prompt, display_text=excluded.display_text, posted_at=excluded.posted_at, "
+                  "posted_pid=excluded.posted_pid",
+                  (session_id, json.dumps(sorted([list(c) for c in cards])), prompt, display_text, now, os.getpid()))
+
+    def relays_for(self, session_ids: Iterable[str], now: float) -> list[dict[str, Any]]:
+        """Unexpired relays for these chats (by primary key); an expired one is dropped (its claims expired too)."""
+        ids = sorted({str(s) for s in session_ids if s})
+        if not ids:
+            return []
+        self._run("DELETE FROM relays WHERE posted_at < ?", (now - CLAIM_TTL_S,))
+        out: list[dict[str, Any]] = []
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            for sid, cards, prompt, text, at in self._run(
+                    f"SELECT session_id, cards, prompt, display_text, posted_at FROM relays WHERE session_id IN "
+                    f"({','.join('?' for _ in chunk)}) ORDER BY session_id", tuple(chunk)):
+                out.append({"session_id": sid, "cards": [tuple(c) for c in json.loads(cards)], "prompt": prompt,
+                            "display_text": text, "posted_at": at})
+        return out
+
+    def take_relay(self, session_id: str, posted_at: float) -> bool:
+        """CAS: exactly one process takes a posted relay."""
+        return self._run("DELETE FROM relays WHERE session_id=? AND posted_at=?",
+                         (session_id, posted_at))[0][0] == 1
 
 
 # ---- what counts -----------------------------------------------------------------------------------------------
@@ -240,12 +275,15 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
          supervise: Callable[[list[dict[str, Any]], str, str], str],
          last_user: Callable[[str], float], now: Optional[float] = None,
          canonical: Callable[[str], str] = lambda sid: sid,
-         dependents: Optional[Callable[[dict[str, Any]], list[str]]] = None) -> list[dict[str, Any]]:
+         dependents: Optional[Callable[[dict[str, Any]], list[str]]] = None,
+         relay_refused: bool = False) -> list[dict[str, Any]]:
     """One owner-wake pass. ``cards``: ``parked_waits()`` rows. ``chat_info(sid)``: ``{archived, end_reason, source}``
     or None when no store has the chat. ``supervise(cards, sid, why)`` creates one board-supervisor card for an
     orphaned chat's due cards and returns its id. ``canonical(sid)`` maps a session id to the chat it belongs to now
     (its compression tip), so one chat is one group and one rate-limit counter. ``dependents(card)`` names the open
-    cards still waiting on a card (``dependents_from``); the wake text says not to close those. Returns what it did."""
+    cards still waiting on a card (``dependents_from``); the wake text says not to close those. ``relay_refused``:
+    this is the host pass of one process (the chat-closeout host lease), so a refused chat wake is posted for the
+    process the chat is live in (``take_relays``). Returns what it did."""
     now = time.time() if now is None else now
 
     def annotate(claimed: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -337,8 +375,9 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
                 continue
             assert wake is not None
             tried_this_tick += 1  # failed attempts count too: a refusing chat can't burn the tick
+            prompt = wake_prompt(annotate(claimed))
             try:
-                result = wake(sid, wake_prompt(annotate(claimed)), display_kind="kanban_notice",
+                result = wake(sid, prompt, display_kind="kanban_notice",
                               display_metadata={"display_text": notice_text(claimed), "owner_wake": True,
                                                 "task_ids": [c["key"] for c in claimed]},
                               label="owner-wake")
@@ -356,6 +395,12 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
                 if result == "busy":  # the chat is mid-turn: retry next tick
                     for c in claimed:
                         log.release(str(c["key"]), c["wait"]["premise"])
+                elif result == "refused" and relay_refused:
+                    # Live in another process (the host pass runs in one process only): post it for that
+                    # process's residual pass. The claims stay unfinished, so nobody else wakes it meanwhile.
+                    _bookkeep(lambda: log.post_relay(
+                        sid, [(str(c["key"]), c["wait"]["premise"]) for c in claimed], prompt,
+                        notice_text(claimed), now), sid)
                 # refused/error: keep the unfinished claim; it expires after CLAIM_TTL_S, which is the retry backoff
                 logger.info("owner-wake: wake of %s deferred (%s)", sid, result)
                 done.append({"session_id": sid, "route": "chat", "result": result, "cards": [c["key"] for c in claimed]})
@@ -386,6 +431,43 @@ def tick(*, cards: Iterable[dict[str, Any]], wake: Optional[Callable[..., str]],
                     [c["key"] for c in claimed], task_id)
         done.append({"session_id": sid, "route": "supervisor", "result": "routed",
                      "cards": [c["key"] for c in claimed], "supervisor_task": task_id, "why": orphaned})
+    return done
+
+
+def take_relays(*, live: Iterable[str], wake: Optional[Callable[..., str]], log: WakeLog,
+                now: Optional[float] = None) -> list[dict[str, Any]]:
+    """A residual pass's owner wakes: the relays the host pass posted (``tick(relay_refused=True)``) for chats live
+    in THIS process, by primary key. Each is taken by one process (CAS), then woken here with the host pass's
+    prompt; the cards' claims are finished as the host pass would have. ``busy`` re-posts it for the next pass;
+    refused/error leaves the claims to expire (CLAIM_TTL_S), as in ``tick``."""
+    now = time.time() if now is None else now
+    if wake is None:
+        return []
+    done: list[dict[str, Any]] = []
+    for relay in log.relays_for(live, now):
+        sid, cards = relay["session_id"], relay["cards"]
+        if not log.take_relay(sid, relay["posted_at"]):
+            continue
+        keys = [k for k, _ in cards]
+        try:
+            result = wake(sid, relay["prompt"], display_kind="kanban_notice",
+                          display_metadata={"display_text": relay["display_text"], "owner_wake": True,
+                                            "task_ids": keys},
+                          label="owner-wake")
+        except Exception:
+            logger.warning("owner-wake: relayed wake of %s failed", sid, exc_info=True)
+            result = "error"
+        if result == "started":
+            _bookkeep(lambda: (log.note_wake(sid, now), log.note_wake("__chats__", now)), sid)
+            for key, premise in cards:
+                _bookkeep(lambda k=key, p=premise: log.finish(k, p, "started", "chat"), sid)
+            logger.info("owner-wake: woke %s for %s (relayed from the host pass)", sid, keys)
+        elif result == "busy":
+            _bookkeep(lambda: log.post_relay(sid, cards, relay["prompt"], relay["display_text"],
+                                             relay["posted_at"]), sid)
+        else:
+            logger.info("owner-wake: relayed wake of %s deferred (%s)", sid, result)
+        done.append({"session_id": sid, "route": "relay", "result": result, "cards": keys})
     return done
 
 
