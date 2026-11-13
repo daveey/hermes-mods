@@ -1843,13 +1843,15 @@ def split_repeats(repeats, tiles: dict, reply: str) -> tuple[list, list]:
     return kept, dropped
 
 
-# ---- same decision across replies: the open tile's lettered menu, or an ask inside its frozen scope ----------
-# Live MacBook chat ..f07c32: request 2948b7f0 held both macOS CI picks. A later reply minted one tile from a bare
-# reminder sentence ("Two macOS CI choices still need you.") read with the same A/B/C menu reworded, and one from
-# the restated second question, whose card ask the open request's scope already quoted. Both rules are LATER-reply
-# only (an ask minted in this reply is never their target) and need the step's own specific menu AND subject, or a
-# quoted card ask with its own lettered menu that is the step's whole ask; never a title, a generic menu (yes/no),
-# a menu alone, quoted boilerplate or a bare scope sentence (independent reviews of PR #93).
+# ---- same decision across replies: a reminder of the open tile, or an ask inside its frozen scope -------------
+# Live MacBook chat ..f07c32: request 2948b7f0 held both macOS CI picks. Later replies minted tiles from bare
+# reminder sentences ("Two macOS CI choices still need you.", "The only thing waiting on you is the macOS CI pick.")
+# read with the open tile's own title, and one from the restated second question, whose card ask the open request's
+# scope already quoted. Both rules are LATER-reply only (an ask minted in this reply is never their target). A
+# reminder lands only when it asks nothing itself (no question, request or menu of its own) and carries the open
+# ask's exact title/text or specific menu; a quoted card ask only when it carries its own lettered menu and is the
+# step's whole ask. A re-asked question, a generic menu, quoted boilerplate or a bare scope sentence never does
+# (independent reviews of PR #93: a false merge loses an ask, a duplicate tile only shows twice).
 
 _LETTERED = re.compile(r"^\s*\(?([a-h])\s*(?:[):.=\u2013\u2014]|-(?=\s))\s*(\S.*)$", re.I)
 # Words that say nothing about WHICH decision a label belongs to: function words, units and generic answers
@@ -1901,13 +1903,12 @@ def _same_label(a: set, b: set) -> bool:
     return len(shared) >= _LABEL_SHARED_MIN and len(shared) / min(len(a), len(b)) >= _LABEL_MATCH
 
 
-def same_lettered_menu(candidate: dict, ask: dict, reply: str = "") -> bool:
-    """(i) A choose step whose lettered menu is the open choice's own: the same letters, each label sharing at least
-    two of its specific words (``_lettered_menu`` / ``_same_label``). Generic menus (yes/no, approve/decline, labels
-    that differ only in a one-word target) never match. The open side is its extracted step's options, else the
-    request's choice labels. The step's text must name the open ask's subject, and its evidence may name nothing
-    the open ask never mentions (``_evidence_names_only_open``). ``same_open_ask`` also requires that exactly one
-    open choice matches."""
+def same_lettered_menu(candidate: dict, ask: dict) -> bool:
+    """A choose step whose lettered menu is the open choice's own: the same letters, each label sharing at least
+    two of its specific words (``_lettered_menu`` / ``_same_label``), and the same subject in the step text.
+    Generic menus (yes/no, approve/decline, labels that differ only in a one-word target) never match. The open
+    side is its extracted step's options, else the request's choice labels. Identity only: ``same_reminder``
+    decides whether the sentence may land on it."""
     if candidate.get('kind') != 'choose' or ask.get('kind') != 'choice':
         return False
     mine = _lettered_menu(candidate.get('options'))
@@ -1919,48 +1920,117 @@ def same_lettered_menu(candidate: dict, ask: dict, reply: str = "") -> bool:
     # A menu says nothing about the subject (the same runner menu for two repos, "go ahead today / hold off" for
     # two projects): the step's subject must also be the open ask's own, word for word.
     subject = _subject(candidate.get('text'))
-    if not (subject and subject in (_subject(step.get('text')), _subject(ask.get('title')))):
+    return bool(subject and subject in (_subject(step.get('text')), _subject(ask.get('title'))))
+
+
+def _same_text(candidate: dict, ask: dict) -> bool:
+    """The step's text is, exactly (``ask_key``), the open ask's title or its extracted step's text."""
+    key = ask_key(candidate.get('text'))
+    step = ask.get('step') if isinstance(ask.get('step'), dict) else {}
+    return len(key) >= _ASK_KEY_MIN and key in (ask_key(ask.get('title')), ask_key(step.get('text')))
+
+
+def same_reminder(candidate: dict, ask: dict, reply: str = "") -> bool:
+    """(i) A LATER reply's sentence that only POINTS at the open ask: identical (the open ask's exact title or step
+    text, or its own lettered menu with the same subject), and asking nothing itself. Live ..f07c32: "Two macOS CI
+    choices still need you." (11:54) and "The only thing waiting on you is the macOS CI pick." (13:17), each read
+    by the extractor with the open tile's own title.
+
+    Asking nothing (``_presents_no_ask``): the sentence's paragraph has no question mark, no direct request and no
+    lettered menu, and no paragraph of the reply presents a lettered menu, except card asks the open request's
+    frozen scope already quotes. A re-asked question ("For babybear, which runner? A: ..., B: ...") never lands
+    here, whatever its wording: a false merge loses an ask, a duplicate tile only shows twice. The sentence must
+    also name nothing the open ask's own title, text, evidence or labels never say (``_evidence_names_only_open``):
+    "The babybear macOS CI pick still needs you." is not the hermes-mods tile."""
+    if _EXTRACTED_KIND.get(candidate.get('kind'), 'input') != ask.get('kind'):
         return False
-    # The step text is the extractor's summary: two repos named only in the evidence can get one generic text
-    # ("Pick the macOS CI runner" for hermes-mods and for babybear). The evidence itself must name nothing new.
-    return _evidence_names_only_open(candidate, ask, reply)
+    if not (_same_text(candidate, ask) or same_lettered_menu(candidate, ask)):
+        return False
+    return _presents_no_ask(candidate, ask, reply) and _evidence_names_only_open(candidate, ask, reply)
 
 
-# Reminder and question words that name no subject ("Two macOS CI choices still need you." -> {macos, ci}).
-# "separate", "different", "another" are deliberately absent: they announce a new subject.
-_EVIDENCE_STOP = _SUBJECT_STOP | frozenset("""need needs needed still waiting waits left remain remains remaining
-    pending open two three four both each every more question questions decision decisions ask asks asked want
-    wants like prefer would could can will shall may might please here there tell let know thing things same
-    again reminder note there's it's that's i'd i'm you're we're has have had been being was were are am""".split())
+def _presents_no_ask(candidate: dict, ask: dict, reply: str) -> bool:
+    if not reply:
+        return False
+    block = locate(reply, str(candidate.get('verbatim_span') or ""))
+    if block is None:
+        return False
+    scope = _norm(str(ask.get('scope') or "")).replace('"', "")
+
+    def own(text: str) -> str:  # the text minus card asks the open scope already quotes
+        return _QUOTED_ASK.sub(lambda m: " " if m.group(1).strip() in scope else m.group(0), _norm(text))
+
+    if _asks_anew(own(block["text"])):
+        return False
+    return not any(_presents_menu(own(para)) for para in re.split(r"\n\s*\n", reply))
+
+
+# ``_DIRECT_REQUEST`` minus its reminder phrasings ("still need you", "waiting on you", "needs your", "until you"):
+# a sentence that says an ask is still pending points at it; a question, a "please"/"can you"/"let me know" or an
+# imperative "Pick ..." asks (again).
+_ASKS_ANEW = re.compile(
+    r"\?"
+    r"|\b(?:please|kindly)\b"
+    r"|\b(?:can|could|would|will) you\b"
+    r"|\byou(?:'ll| will)? (?:need to|must|have to|should)\b"
+    r"|\b(?:let me know|tell me|your call|up to you)\b"
+    r"|(?:^|[.!:;,\u2014\u2013]\s*|\n\s*(?:[-*\u2022]|\d+[.)])\s*)(?:please\s+)?"
+    r"(?:approve|confirm|decide|choose|pick|select|reply|answer|say)\b(?!\s+of\b)",
+    re.I)
+
+
+def _asks_anew(text: str) -> bool:
+    """A question mark, a direct request or an imperative choice verb outside quotes."""
+    return bool(_ASKS_ANEW.search(re.sub(r'"[^"]*"', '""', _plain(text or ""))))
+
+
+def _presents_menu(text: str) -> bool:
+    """Some line of ``text`` (or the text run together) carries a specific lettered menu."""
+    return any(_quoted_menu_ask(chunk) for chunk in [text, *text.split("\n")] if chunk.strip())
+
+
+# Reminder words that name no subject ("Two macOS CI choices still need you." -> {macos, ci}). Words that can tell
+# two subjects apart are deliberately absent ("separate", "another", "other", "left", "will", "may", "three");
+# digits are kept whatever their length.
+_EVIDENCE_STOP = _SUBJECT_STOP | frozenset("""need needs needed still waiting waits remain remains remaining
+    pending open two both question questions decision decisions ask asks asked want wants like prefer would
+    please here there thing things again reminder note there's it's that's i'd i'm you're we're has have had been
+    being was were are am""".split())
 
 
 def _naming_words(text, drop: set) -> set:
-    """Words of ``text`` that could name a subject: no stop words, no menu-label words (``drop``), plural-folded."""
-    return {_fold(w) for w in _label_words(str(text or "")) if len(w) > 1 and w not in _EVIDENCE_STOP} - drop
+    """Words of ``text`` that could name a subject: no stop words, no open-menu label words (``drop``),
+    plural-folded. Digits count ("Mac mini 2" vs "Mac mini 3")."""
+    return {_fold(w) for w in _label_words(str(text or ""))
+            if (len(w) > 1 or w.isdigit()) and w not in _EVIDENCE_STOP} - drop
 
 
 def _fold(w: str) -> str:
-    return w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
+    return w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is", "ws")) else w
 
 
 def _evidence_names_only_open(candidate: dict, ask: dict, reply: str = "") -> bool:
-    """Every naming word of the step's evidence sentence is in the open ask's title, step text, evidence, labels or
-    frozen scope. A sentence that names nothing of its own (\"Which one? A: ..., B: ...\") is read with the text
-    before it in its paragraph (\"For babybear: ...\")."""
+    """Every naming word of the step's evidence sentence is one of the open ask's OWN words: its title and its
+    extracted step's text, never its evidence sentence or frozen scope (another subject can sit there as context:
+    "For hermes-mods (babybear stays on GitHub runners), which ..."). Only the open side's label words are
+    discounted, never the candidate's: a subject named inside the candidate's labels still counts. A sentence that
+    names nothing of its own ("That one still needs you.") is read with the text before it in its paragraph, else
+    with the paragraph before it. A reminder that adds any other word (a subject the title lacks, "queue",
+    "free") stays its own tile: a duplicate is the lesser harm."""
     step = ask.get('step') if isinstance(ask.get('step'), dict) else {}
-    labels = [str(o or "") for o in list(candidate.get('options') or ()) + list(step.get('options') or ())
-              + list(ask.get('labels') or ())]
+    labels = [str(o or "") for o in list(step.get('options') or ()) + list(ask.get('labels') or ())]
     drop = {_fold(w) for o in labels for w in _label_words(_LETTERED.sub(r"\2", o))}
-    known = _naming_words(" ".join(str(x or "") for x in (
-        ask.get('title'), ask.get('scope'), step.get('text'), step.get('verbatim_span'))), set())
+    known = _naming_words(" ".join(str(x or "") for x in (ask.get('title'), step.get('text'))), set())
     span = str(candidate.get('verbatim_span') or "")
     names = _naming_words(span, drop)
     if not names and reply:
         nspan = _norm(span)
-        for para in re.split(r"\n\s*\n", reply):
-            text = _norm(para)
+        paras = [_norm(p) for p in re.split(r"\n\s*\n", reply)]
+        for i, text in enumerate(paras):
             if nspan and nspan in text:
                 names = _naming_words(text[:text.find(nspan)], drop)
+                if not names and i:
+                    names = _naming_words(paras[i - 1], drop)
                 break
     return names <= known
 
@@ -2024,8 +2094,9 @@ def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optiona
     - the model marked this exact sentence as a repeat of an open id (request id or extracted step id) and the
       sentence or its paragraph corroborates it (``repeat_corroborated``);
     - the evidence sentence (a specific one) is the sentence an open extracted ask came from in an EARLIER reply;
-    - in a LATER reply: a choose step offers the open choice's own lettered menu (``same_lettered_menu``), or the
-      step's own ask already sits in an open request's frozen scope (``inside_open_scope``);
+    - in a LATER reply: a sentence that asks nothing itself and carries the open ask's exact title or step text, or
+      its own lettered menu (``same_reminder``), or the step's own ask already sits in an open request's frozen
+      scope (``inside_open_scope``);
     - the request was published or revised by the producer tool in this very turn (``turn_requests``,
       server-recorded) and the candidate restates its title, or is the approve/change/decline menu of the only
       such approval (or its sentence was already read as that approval in this reply).
@@ -2058,7 +2129,7 @@ def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optiona
     earlier = [a for a in asks if not a.get('fresh')]
     # Either rule maps only onto exactly one open ask: two equal menus or two scopes quoting the same card ask are
     # two requests, and picking one would be a guess.
-    menus = [a for a in earlier if same_lettered_menu(candidate, a, reply)]
+    menus = [a for a in earlier if same_reminder(candidate, a, reply)]
     scopes = [a for a in earlier if inside_open_scope(candidate, a, reply)]
     hit = (menus[0] if len(menus) == 1 else None) or (scopes[0] if len(scopes) == 1 else None)
     if hit:

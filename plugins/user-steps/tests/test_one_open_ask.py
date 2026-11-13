@@ -949,6 +949,10 @@ def test_menu_identity_needs_the_same_subject():
                     'verbatim_span': 'x'}}
     assert core.same_lettered_menu(dict(STEP_64AE), ask)
     assert not core.same_lettered_menu({**STEP_64AE, 'text': 'Pick babybear CI option A, B, or C'}, ask)
+    # Identity is not enough: the sentence must point at the ask without asking anything (same_reminder).
+    assert core.same_reminder(dict(STEP_64AE), ask, STATUS_1154)
+    asks_again = 'Which macOS CI option do you want? A: lane plus jobs, B: sub-minute jobs only, C: no spend.'
+    assert not core.same_reminder({**STEP_64AE, 'verbatim_span': asks_again}, ask, asks_again)
     assert core._subject('Pick macOS CI option A, B, or C (B recommended)') == {'macos', 'ci'}
 
 
@@ -985,17 +989,20 @@ def test_a_reminder_that_names_only_the_open_asks_words_reuses_it(tmp_path):
     t1 = ('For hermes-mods, which macOS CI runner do you want? A: Blacksmith macOS runner (~$120/mo), B: self-hosted '
           'mini runner (free).')
     t2 = 'The hermes-mods macOS CI runner pick still needs you.'
-    store = _two_replies(tmp_path, t1, {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': _RUNNER_MENU,
-                                        'verbatim_span': t1},
-                         t2, {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': _RUNNER_MENU,
+    # (the subject must be in the open ask's own title or step text: its evidence sentence can carry context)
+    store = _two_replies(tmp_path, t1, {'text': 'Pick the hermes-mods macOS CI runner', 'kind': 'choose',
+                                        'options': _RUNNER_MENU, 'verbatim_span': t1},
+                         t2, {'text': 'Pick the hermes-mods macOS CI runner', 'kind': 'choose', 'options': _RUNNER_MENU,
                               'verbatim_span': t2})
     assert len(live(store)) == 1
 
 
 def test_evidence_names_only_open_reads_the_sentence_then_the_lead():
-    ask = {'id': 'r1', 'kind': 'choice', 'title': 'Pick macOS CI option', 'labels': [], 'scope': 'hermes-mods macOS CI',
+    # The open side's own words only (its title and step text), never its evidence sentence or scope (M5).
+    ask = {'id': 'r1', 'kind': 'choice', 'title': 'Pick the hermes-mods macOS CI option', 'labels': [],
+           'scope': 'babybear',
            'step': {'id': 'us_r1', 'text': 'Pick the macOS CI runner', 'options': list(_RUNNER_MENU),
-                    'verbatim_span': 'x'}}
+                    'verbatim_span': 'For hermes-mods, which macOS CI runner?'}}
     step = {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': list(_RUNNER_MENU)}
     assert core._evidence_names_only_open({**step, 'verbatim_span': 'Two macOS CI choices still need you.'}, ask)
     assert not core._evidence_names_only_open({**step, 'verbatim_span': 'The babybear macOS CI pick still needs you.'},
@@ -1003,6 +1010,9 @@ def test_evidence_names_only_open_reads_the_sentence_then_the_lead():
     bare = 'Which one? A: Blacksmith macOS runner, B: self-hosted mini runner.'
     assert core._evidence_names_only_open({**step, 'verbatim_span': bare}, ask, 'For hermes-mods:\n' + bare)
     assert not core._evidence_names_only_open({**step, 'verbatim_span': bare}, ask, 'For babybear:\n' + bare)
+    assert not core._evidence_names_only_open({**step, 'verbatim_span': 'The babybear pick still needs you.'}, ask)
+    assert not core._evidence_names_only_open({**step, 'verbatim_span': 'That one still needs you.'}, ask,
+                                              'Now babybear.\n\nThat one still needs you.')
 
 
 def test_a_card_ask_quoted_by_two_open_scopes_maps_onto_neither():
@@ -1013,3 +1023,108 @@ def test_a_card_ask_quoted_by_two_open_scopes_maps_onto_neither():
     cand = {**STEP_60B8, 'verbatim_span': text}
     assert core.same_open_ask(cand, asks[:1], reply=text)['id'] == 'r1'
     assert core.same_open_ask(cand, asks, reply=text) is None
+
+
+# ---- re-review of PR #93 (card t_01a1d6c233649a46, review 5898199961): a sentence lands on an open tile only when it
+# only POINTS at it (asks nothing, presents no menu) and carries its exact title/text or menu. ----------------------
+
+# Live MacBook chat ..f07c32, 13:17 PST: request 2288f5b4 (step us_a9defb1d27) minted from this headline while
+# 2948b7f0 was open; same title, a reminder sentence, options "B (recommended)", "A", "C" (withdrawn 13:21).
+HEADLINE_1317 = (
+    "**All 38 updates check out.** Every merge in the batch landed exactly as approved, with required CI green, and no "
+    "wrong behaviour turned up. Two bugs still have unmerged fixes: lifecycle-guard #2485 and the duplicate For-you "
+    "tiles (hermes-mods #93). Tests for 5 untested-code gaps are still being written. The only thing waiting on you is "
+    "the macOS CI pick. (Checked 13:15 PST: that card is still blocked and the request is your only open ask from "
+    "this chat.)")
+STEP_A9DE = {'text': 'Pick macOS CI option A, B, or C (B recommended)', 'kind': 'choose',
+             'verbatim_span': 'The only thing waiting on you is the macOS CI pick.',
+             'options': ['B (recommended)', 'A', 'C']}
+
+
+def test_the_1317_headline_naming_the_open_pick_reuses_it_untouched(tmp_path):
+    store, ledger = env(tmp_path)
+    tile = _open_macos_tile(store, ledger)
+    [before] = live(store)
+    out = reply(store, ledger, HEADLINE_1317, [dict(STEP_A9DE)])
+    [after] = live(store)
+    assert after['requestId'] == before['requestId'] and [s['id'] for s in out['steps']] == [tile['id']]
+    assert (after['revision'], after['title'], after['scope']) == (before['revision'], before['title'], before['scope'])
+
+
+def test_a_real_new_ask_in_the_same_session_still_gets_its_own_tile(tmp_path):
+    # Acceptance 2: another subject with its own question and menu, after the 13:17 headline mapped.
+    store, ledger = env(tmp_path)
+    _open_macos_tile(store, ledger)
+    reply(store, ledger, HEADLINE_1317, [dict(STEP_A9DE)])
+    text = 'Which Linux runner should the babybear repo use? A: Blacksmith 4vcpu Linux, B: GitHub-hosted ubuntu.'
+    reply(store, ledger, text, [{'text': 'Pick the babybear Linux runner', 'kind': 'choose', 'verbatim_span': text,
+                                 'options': ['A: Blacksmith 4vcpu Linux', 'B: GitHub-hosted ubuntu']}])
+    assert len(live(store)) == 2
+
+
+_OPEN_HM = ('For hermes-mods, which macOS CI runner do you want? A: Blacksmith macOS runner (~$120/mo), B: self-hosted '
+            'mini runner (free).')
+_MENU_TXT = 'A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini runner (free).'
+
+
+@pytest.mark.parametrize('t1,t2,span2', [
+    pytest.param(_OPEN_HM, f'Next up is babybear. Which macOS CI runner do you want? {_MENU_TXT}',
+                 f'Which macOS CI runner do you want? {_MENU_TXT}', id='M1-subject-in-the-sentence-before'),
+    pytest.param(_OPEN_HM, f'Now babybear.\n\nWhich one do you want? {_MENU_TXT}',
+                 f'Which one do you want? {_MENU_TXT}', id='M2-subject-in-the-paragraph-before'),
+    pytest.param(_OPEN_HM, f'## babybear\n\nWhich one do you want? {_MENU_TXT}',
+                 f'Which one do you want? {_MENU_TXT}', id='M2b-subject-in-a-heading'),
+    pytest.param(_OPEN_HM, f'**babybear**\nWhich macOS CI runner do you want here? {_MENU_TXT}',
+                 f'Which macOS CI runner do you want here? {_MENU_TXT}', id='M2c-subject-in-a-bold-lead'),
+    pytest.param(f'For phase two, which macOS CI runner do you want? {_MENU_TXT}',
+                 f'For phase three, which macOS CI runner do you want? {_MENU_TXT}', None, id='M3-number-words'),
+    pytest.param(f'For Mac mini 2, which macOS CI runner do you want? {_MENU_TXT}',
+                 f'For Mac mini 3, which macOS CI runner do you want? {_MENU_TXT}', None, id='M3b-single-digits'),
+    pytest.param(f'For the left Mac, which macOS CI runner do you want? {_MENU_TXT}',
+                 f'For the other Mac, which macOS CI runner do you want? {_MENU_TXT}', None, id='M3c-left-other'),
+    pytest.param(f"For Will's laptop, which macOS CI runner do you want? {_MENU_TXT}",
+                 f"For May's laptop, which macOS CI runner do you want? {_MENU_TXT}", None, id='M3d-will-may'),
+    pytest.param(_OPEN_HM,
+                 'For babybear, which macOS CI runner do you want? A: babybear on Blacksmith macOS runner (~$120/mo), '
+                 'B: babybear on self-hosted mini runner (free).', None, id='M4-subject-inside-the-labels'),
+    pytest.param('For hermes-mods (babybear stays on GitHub runners), which macOS CI runner do you want? '
+                 + _MENU_TXT, f'For babybear, which macOS CI runner do you want? {_MENU_TXT}', None,
+                 id='M5-other-subject-as-context-in-the-open-ask'),
+    # The same shapes as reminders (no question, no menu): the sentence or its lead names another subject.
+    pytest.param(_OPEN_HM, 'The babybear macOS CI runner pick still needs you.', None, id='R1-reminder-other-subject'),
+    pytest.param(_OPEN_HM, 'Now babybear.\n\nThat one still needs you.', 'That one still needs you.',
+                 id='R2-bare-reminder-after-another-subject'),
+    pytest.param('For hermes-mods (babybear stays on GitHub runners), which macOS CI runner do you want? '
+                 + _MENU_TXT, 'The babybear macOS CI runner pick still needs you.', None,
+                 id='R3-reminder-naming-the-open-asks-context-subject'),
+    # A reminder sentence beside a NEW presentation of the menu: the reply asks again, so it is its own ask.
+    pytest.param(_OPEN_HM, f'For babybear: {_MENU_TXT}\n\nThat macOS CI runner pick still needs you.',
+                 'That macOS CI runner pick still needs you.', id='R4-reminder-beside-a-new-menu'),
+])
+def test_a_same_text_same_menu_ask_for_another_subject_is_a_new_tile(tmp_path, t1, t2, span2):
+    # Same generic step text and the same menu on both sides: only the reply tells the subjects apart.
+    s = {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': list(_RUNNER_MENU)}
+    s2 = dict(s)
+    if 'babybear on ' in t2:  # M4: the candidate's own labels carry its subject
+        s2['options'] = ['A: babybear on Blacksmith macOS runner (~$120/mo)',
+                         'B: babybear on self-hosted mini runner (free)']
+    store = _two_replies(tmp_path, t1, {**s, 'verbatim_span': t1}, t2, {**s2, 'verbatim_span': span2 or t2})
+    assert len(live(store)) == 2, [r['title'] for r in live(store)]
+
+
+@pytest.mark.parametrize('t2', [
+    pytest.param('The hermes-mods macOS CI runner pick still needs you.', id='names-the-open-subject'),
+    pytest.param('The macOS CI runner pick still needs you.', id='names-nothing-new'),
+])
+def test_a_reminder_that_only_points_at_the_open_ask_reuses_it(tmp_path, t2):
+    s = {'text': 'Pick the hermes-mods macOS CI runner', 'kind': 'choose', 'options': list(_RUNNER_MENU)}
+    store = _two_replies(tmp_path, _OPEN_HM, {**s, 'verbatim_span': _OPEN_HM}, t2, {**s, 'verbatim_span': t2})
+    assert len(live(store)) == 1
+
+
+def test_an_equal_title_that_asks_again_is_a_new_tile(tmp_path):
+    # Exact title alone is not enough: the later sentence asks its own question.
+    s = {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': []}
+    t2 = 'For babybear, should the macOS CI runner be Blacksmith or the mini?'
+    store = _two_replies(tmp_path, _OPEN_HM, {**s, 'verbatim_span': _OPEN_HM}, t2, {**s, 'verbatim_span': t2})
+    assert len(live(store)) == 2

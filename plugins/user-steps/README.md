@@ -455,23 +455,29 @@ open, undecided request of the same session only with exact provenance:
   and the reply corroborates it (below);
 - the evidence sentence (30+ characters, 5+ words) is the sentence an open ask was
   extracted from in an EARLIER reply;
-- in a LATER reply, a `choose` step offers the lettered menu of exactly one open choice
-  AND names the same subject: the same letters, each label sharing at least two of its
-  specific words with the open label (`same_lettered_menu`: "A: lane + jobs to Blacksmith
-  (~$770/mo)" is "A: lane plus jobs (~$770/mo)"), and the step text's subject words (no
-  verbs of choosing, letters or function words: "Pick macOS CI option A, B, or C" ->
-  {macos, ci}) equal the open step's text or title. The step text is the extractor's
-  summary, so the evidence is checked too: every naming word of the evidence sentence
-  (no reminder or question words such as "two", "still", "need", no menu-label words)
-  must appear in the open ask's title, step text, evidence or frozen scope; a sentence
-  that names nothing of its own ("Which one? A: …, B: …") is read with the paragraph
-  text before it (`_evidence_names_only_open`). Specific means not generic (yes/no,
-  approve/decline, keep/change and function words are dropped) and not shared with
-  another label of the same menu, so "A: yes / B: no" or "PR lane on the mini / on the
-  hub" against "on worker-6 / worker-7" never match. A menu alone names no subject: the
-  same runner or "go ahead today / hold off" menu for two repos or projects stays two
-  tiles, even when the extractor gives both the same generic text ("Pick the macOS CI
-  runner") and only the evidence names the repo;
+- in a LATER reply, a sentence that only POINTS at exactly one open ask (`same_reminder`).
+  Identity: the step text is exactly (`ask_key`) the open ask's title or extracted
+  step text, or a `choose` step offers its lettered menu with the same subject (each
+  label sharing at least two specific words, `same_lettered_menu`: "A: lane + jobs to
+  Blacksmith (~$770/mo)" is "A: lane plus jobs (~$770/mo)"; yes/no, approve/decline,
+  keep/change and words shared with another label of the same menu never count).
+  Pointing, not asking (`_presents_no_ask`): the sentence's paragraph has no `?`, no
+  "please"/"can you"/"let me know" and no imperative "Pick …/Choose …" (reminder
+  phrasings such as "still need you" or "waiting on you" are allowed), and no paragraph
+  of the reply presents a lettered menu, apart from card asks the open request's frozen
+  scope already quotes. Any re-asked question, however worded ("Next up is babybear.
+  Which macOS CI runner do you want? A: …, B: …"), is its own tile. Last, every
+  naming word of the sentence (no reminder words such as "two", "still", "need"; digits
+  and words like "other", "left", "three" do count) must be in the open ask's own title
+  or step text, never only in its evidence or scope, where another subject can sit as
+  context; a sentence that names nothing ("That one still needs you.") is read with
+  the paragraph text before it, else the paragraph before (`_evidence_names_only_open`).
+  So "The babybear macOS CI pick still needs you." is not the hermes-mods tile, and a
+  reminder that adds any word the title lacks ("the mini queue is at 16 minutes") stays
+  its own tile: a duplicate shows twice and can be withdrawn, a false merge loses an
+  ask. Live chat ..f07c32: "Two macOS CI choices still need you." (11:54) and "The only
+  thing waiting on you is the macOS CI pick." (13:17) each minted a tile with the open
+  request's own title;
 - in a LATER reply, the step's paragraph quotes (`"…"`, 40+ characters) a card ask that
   the frozen scope markdown of an open request of the same kind quotes too, the quote
   carries its own specific lettered menu ("A) PR lane on the mini, B) scheduled
@@ -481,9 +487,9 @@ open, undecided request of the same session only with exact provenance:
   sentence asks nothing of its own (`inside_open_scope`). Quoted boilerplate ("If you
   approve, …; if you decline, nothing changes.") carries no menu and never counts, nor
   does a bare scope sentence. Both rules map only when exactly one open request
-  matches (two scopes quoting one card ask, or two equal menus, map onto neither). Live chat ..f07c32: a bare "Two macOS CI choices still
-  need you." and the restated second question each minted a tile beside the open
-  request that held both picks;
+  matches (two scopes quoting one card ask, or two open asks a reminder points at, map
+  onto neither). Live chat ..f07c32: the restated second question minted a tile beside
+  the open request that held both picks;
 - the request was published or revised by the `action_request` tool in this very turn
   (server-recorded `turn_requests`; reset when the next turn starts), and the ask
   restates its title or is the approve/change/decline menu of the only such approval;
