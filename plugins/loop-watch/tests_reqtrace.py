@@ -299,3 +299,84 @@ def test_secret_absent_from_slow_report_and_stats_sink():
     assert SYN not in blob
     assert [r for r in reps if r["kind"] == "request_stats"]
     assert "path=a.txt" in blob and "path=b.txt" in blob
+
+
+async def _deep(ev, n):
+    if n:
+        return await _deep(ev, n - 1)
+    await ev.wait()
+
+
+def _parked_tasks(ev, count, depth=12):
+    return [asyncio.ensure_future(_deep(ev, depth)) for _ in range(count)]
+
+
+def test_sampler_spends_a_bounded_share_of_loop_time_under_a_large_task_backlog():
+    # hermes-hub 2026-11-12: with a deep backlog every pass walked thousands of await chains on the loop,
+    # and sample_on_loop became the main loop stall (feedback: slower loop -> more tasks -> slower pass).
+    reps = []
+    trace = rt.ReqTrace(sink=reps.append, slow_s=0.5, sample_after_s=0.05, sample_s=0.01)
+    spent = [0.0]
+    original = trace.sample_on_loop
+
+    def timed():
+        t0 = time.perf_counter()
+        try:
+            original()
+        finally:
+            spent[0] += time.perf_counter() - t0
+
+    trace.sample_on_loop = timed
+
+    async def slow(scope, receive, send):
+        await asyncio.sleep(1.5)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    async def main():
+        ev = asyncio.Event()
+        tasks = _parked_tasks(ev, 4000)
+        await asyncio.sleep(0)
+        t0 = time.perf_counter()
+        sent = await _drive(trace.wrap(slow), "/api/slow", trace, tick_s=0.002)
+        wall = time.perf_counter() - t0
+        ev.set()
+        await asyncio.gather(*tasks)
+        return sent, wall
+
+    sent, wall = asyncio.run(main())
+    assert sent[0]["status"] == 200
+    share = spent[0] / wall
+    assert share <= 0.12, f"sampler used {share:.0%} of loop wall time"
+    assert len(reps) == 1 and reps[0]["samples"] >= 1  # still diagnoses the slow request
+
+
+def test_other_tasks_walk_is_capped_per_pass():
+    calls = []
+    real = rt._task_chain
+
+    def counting(task):
+        calls.append(task)
+        return real(task)
+
+    trace = rt.ReqTrace(sink=lambda r: None, sample_after_s=0.0, sample_s=0.0)
+    trace.others_cap = 50
+
+    async def main():
+        ev = asyncio.Event()
+        tasks = _parked_tasks(ev, 1000, depth=2)
+        await asyncio.sleep(0)
+        req = rt._Req(1, "GET", "/x", trace.clock() - 5, asyncio.current_task())
+        trace.inflight[1] = req
+        rt._task_chain = counting
+        try:
+            trace.sample_on_loop()
+        finally:
+            rt._task_chain = real
+        ev.set()
+        await asyncio.gather(*tasks)
+        return req
+
+    req = asyncio.run(main())
+    assert sum(req.samples.values()) == 1
+    assert len(calls) <= 1 + 50, len(calls)

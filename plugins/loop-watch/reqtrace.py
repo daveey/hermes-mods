@@ -40,6 +40,12 @@ SLOW_S = 2.0
 SAMPLE_AFTER_S = 1.0
 SAMPLE_S = 0.25
 MAX_SAMPLES = 40
+# The sampler runs ON the loop it watches. Each pass walks every task's await chain, so its cost grows
+# with the backlog: on hermes-hub (2026-11-12, ~3,500 Desktop timeouts in 30 min) sample_on_loop was the
+# innermost loop frame in most of 463 stalls totalling 1,441 s, a feedback loop where a slow backend
+# queued more tasks, which made every pass slower. Cap its share of loop wall time, and the task walk.
+SAMPLE_LOOP_BUDGET = 0.05  # fraction of loop wall time the sampler may spend, measured per pass
+OTHERS_SCAN_CAP = 256  # tasks walked per pass for the "other tasks" breakdown
 CHAIN_DEPTH = 18
 TOP_N = 6
 MAX_REPORTS_PER_HOUR = 120
@@ -193,6 +199,11 @@ class ReqTrace:
         self._stats_stop = threading.Event()
         self._stats_thread = None
         self._stats_closed = False
+        self.sample_budget = SAMPLE_LOOP_BUDGET
+        self.others_cap = OTHERS_SCAN_CAP
+        self._next_sample_at = 0.0  # loop-budget gate, set by the previous pass's measured cost
+        self._sample_queued = False  # one pending sample_on_loop callback at a time
+        self.sampler_cost_s = 0.0  # cumulative wall time spent in sample_on_loop (diagnostic/tests)
 
     # ---- ASGI side (runs on the loop) ----
     def wrap(self, app):
@@ -402,8 +413,24 @@ class ReqTrace:
             log.debug("loop-watch slow-request sink failed: %s", exc)
 
     def sample_on_loop(self) -> None:
-        """Called ON the loop: sample await chains of every request waiting past ``sample_after_s``."""
+        """Called ON the loop: sample await chains of every request waiting past ``sample_after_s``.
+
+        Self-limiting: a pass's own cost sets the earliest next pass so the sampler spends at most
+        ``sample_budget`` of loop wall time, and the other-tasks walk stops after ``others_cap`` tasks."""
+        self._sample_queued = False
         now = self.clock()
+        if now < self._next_sample_at:
+            return
+        try:
+            self._sample_pass(now)
+        finally:
+            end = self.clock()
+            cost = max(0.0, end - now)
+            self.sampler_cost_s += cost
+            budget = min(1.0, max(1e-3, float(self.sample_budget)))
+            self._next_sample_at = end + cost * (1.0 - budget) / budget
+
+    def _sample_pass(self, now: float) -> None:
         with self._lock:
             due = [r for r in self.inflight.values()
                    if r.resp_at is None and now - r.t0 >= self.sample_after_s
@@ -421,7 +448,7 @@ class ReqTrace:
                 others = Counter()
                 req_tasks = {id(x.task) for x in due}
                 try:
-                    for t in asyncio.all_tasks():
+                    for t in itertools.islice(asyncio.all_tasks(), max(0, int(self.others_cap))):
                         if id(t) in req_tasks:
                             continue
                         ch = _task_chain(t)
@@ -435,13 +462,16 @@ class ReqTrace:
     def tick(self, loop) -> None:
         """From the watcher thread: schedule a sample on the loop if any request is overdue."""
         now = self.clock()
+        if self._sample_queued or now < self._next_sample_at:
+            return  # a pass is already queued, or the loop-budget gate has not reopened
         with self._lock:
             overdue = any(r.resp_at is None and now - r.t0 >= self.sample_after_s for r in self.inflight.values())
         if overdue:
+            self._sample_queued = True
             try:
                 loop.call_soon_threadsafe(self.sample_on_loop)
             except RuntimeError:
-                pass
+                self._sample_queued = False
 
 
 # A task chain whose innermost frame is one of these is a long-lived idle waiter (server accept loop,
