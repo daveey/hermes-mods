@@ -172,7 +172,19 @@ def _ro_connect(path, timeout=10):
         return c
 
 
-def _viewed_in_db(session_id: str, skill: str) -> bool:
+def _norm_file(f: Any) -> str | None:
+    """A reference path relative to the skill dir, normalised for comparison ("./references/x.md" == "references/x.md")."""
+    if not isinstance(f, str) or not f.strip():
+        return None
+    return os.path.normpath(f.strip()).lstrip("/")
+
+
+def _view_key(skill: str, file: str | None) -> str:
+    return f"{skill}\0{file}" if file else skill
+
+
+def _viewed_in_db(session_id: str, skill: str, file: str | None = None) -> bool:
+    """Did the session's history call skill_view for `skill`? With `file`, only a view of that file counts."""
     try:
         con = _ro_connect(_home() / 'state.db', timeout=1)
         try:
@@ -180,7 +192,9 @@ def _viewed_in_db(session_id: str, skill: str) -> bool:
                     "select tool_calls from messages where session_id=? and tool_calls like '%skill_view%'", (session_id,)):
                 for c in json.loads(tc or "[]"):
                     fn = c.get("function") or {}
-                    if fn.get("name") == "skill_view" and _args(fn.get("arguments")).get("name") == skill:
+                    a = _args(fn.get("arguments"))
+                    if fn.get("name") == "skill_view" and a.get("name") == skill and (
+                            file is None or _norm_file(a.get("file_path")) == file):
                         return True
         finally:
             con.close()
@@ -189,11 +203,13 @@ def _viewed_in_db(session_id: str, skill: str) -> bool:
     return False
 
 
-def skill_viewed(session_id: str, skill: str) -> bool:
+def skill_viewed(session_id: str, skill: str, file: str | None = None) -> bool:
+    """A SKILL.md row is silenced by any view of its skill. A `file:` row quotes a reference file that a plain
+    skill_view never shows (defect agent-4638e42212), so only a view of that exact file silences it."""
     with _lock:
-        if skill in _viewed.get(session_id, ()):
+        if _view_key(skill, file) in _viewed.get(session_id, ()):
             return True
-    return _viewed_in_db(session_id, skill)
+    return _viewed_in_db(session_id, skill, file) if file else _viewed_in_db(session_id, skill)
 
 
 # ---------------------------------------------------------------- hook
@@ -201,10 +217,20 @@ def build_injection(row: dict, dirs: list[Path] | None = None) -> str | None:
     path = find_skill(str(row["skill"]), dirs)
     if not path:
         return None
+    file = _norm_file(row.get("file"))
+    if file:  # a reference file inside the skill dir; anything resolving outside it is ignored
+        root = path.parent.resolve()
+        path = (root / file).resolve()
+        if root not in path.parents or not path.is_file():
+            return None
     text = path.read_text()
     parts = [s for s in (extract_section(text, w) for w in row.get("sections") or []) if s]
     if not parts:
         return None
+    if file:
+        return (f"\n\n{MARK} This call is governed by skill `{row['skill']}`, reference `{file}` "
+                f"(not in its SKILL.md; read it with skill_view(name='{row['skill']}', file_path='{file}')). "
+                f"Its rule (shown once):\n\n" + "\n\n".join(parts))
     return (f"\n\n{MARK} You have not loaded skill `{row['skill']}` this session, and this call is governed by it. "
             f"Its rules (shown once):\n\n" + "\n\n".join(parts))
 
@@ -214,7 +240,11 @@ def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = N
         a = _args(args)
         if tool_name == "skill_view" and session_id and a.get("name"):
             with _lock:
-                _viewed.setdefault(session_id, set()).add(str(a["name"]))
+                seen = _viewed.setdefault(session_id, set())
+                seen.add(str(a["name"]))
+                f = _norm_file(a.get("file_path"))
+                if f:
+                    seen.add(_view_key(str(a["name"]), f))
             return None
         if not isinstance(result, str) or MARK in result:
             return None
@@ -227,7 +257,7 @@ def transform_tool_result(tool_name: str = "", args: Any = None, result: Any = N
             with _lock:
                 if row["id"] in _fired.get(sid, ()):
                     continue
-            if skill_viewed(sid, str(row["skill"])):
+            if skill_viewed(sid, str(row["skill"]), _norm_file(row.get("file"))):
                 continue
             inj = build_injection(row)
             if inj:

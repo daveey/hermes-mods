@@ -69,7 +69,7 @@ def env(tmp_path, monkeypatch):
         (d / "SKILL.md").write_text(body)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(st, "_skill_dirs", lambda: [home / "skills"])
-    monkeypatch.setattr(st, "_viewed_in_db", lambda s, k: False)
+    monkeypatch.setattr(st, "_viewed_in_db", lambda s, k, f=None: False)
     st._viewed.clear(); st._fired.clear()
     return home
 
@@ -325,3 +325,93 @@ def test_py_spy_dump_row_shipped_section_resolves():
     text = (REPO / "skills" / "devops" / "machine-investigate" / "SKILL.md").read_text()
     for sec in r["sections"]:
         assert "one instant" in st.extract_section(text, sec)
+
+
+# Defect agent-4638e42212: `gh api /users/<u>/settings/billing/budgets` returned 404 and the agent told David "no
+# budget is configured". The correct reading lived only in github-ci-wait's references/actions-outages.md, which
+# a row could not quote, and a plain skill_view("github-ci-wait") earlier in the session silenced every row for it.
+CI_WAIT = REPO / "skills" / "devops" / "github-ci-wait"
+BUDGET_REF = "references/actions-outages.md"
+BUDGET_CMD = "gh api /users/you/settings/billing/budgets 2>&1; echo EXIT=$?"
+BUDGET_RESULT = json.dumps({"output": '{"message":"Not Found","documentation_url":"https://docs.github.com/rest",'
+                                      '"status":"404"}gh: Not Found (HTTP 404)\nEXIT=1', "exit_code": 0})
+
+
+@pytest.fixture
+def ci_home(env):
+    d = env / "skills" / "devops" / "github-ci-wait"
+    (d / "references").mkdir(parents=True)
+    (d / "SKILL.md").write_text((CI_WAIT / "SKILL.md").read_text())
+    (d / BUDGET_REF).write_text((CI_WAIT / BUDGET_REF).read_text())
+    return env
+
+
+def _budget_note(out):
+    return out and "does NOT mean no budget" in (json.loads(out).get(st.FIELD, "") if out.startswith("{") else out)
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("terminal", {"command": BUDGET_CMD}),
+    ("execute_code", {"code": f"r = terminal({BUDGET_CMD!r})"}),
+])
+def test_budgets_404_row_fires(ci_home, tool, args):  # (a)
+    out = run(tool, args, BUDGET_RESULT)
+    assert _budget_note(out), out
+    guidance = json.loads(out)[st.FIELD]
+    assert BUDGET_REF in guidance and "browser_exec" in guidance
+    assert "authorization hold" not in guidance  # one bullet, not the whole list
+    assert run(tool, args, BUDGET_RESULT) is None  # once per session
+
+
+def test_budgets_404_row_fires_after_plain_skill_view(ci_home):  # (b)
+    run("skill_view", {"name": "github-ci-wait"}, "skill text")
+    assert _budget_note(run("terminal", {"command": BUDGET_CMD}, BUDGET_RESULT))
+
+
+def test_budgets_404_row_fires_after_other_reference_view(ci_home):
+    run("skill_view", {"name": "github-ci-wait", "file_path": "references/bulk-run-status.md"}, "text")
+    assert _budget_note(run("terminal", {"command": BUDGET_CMD}, BUDGET_RESULT))
+
+
+def test_budgets_404_row_suppressed_after_reference_view(ci_home):  # (c)
+    run("skill_view", {"name": "github-ci-wait", "file_path": BUDGET_REF}, "reference text")
+    assert run("terminal", {"command": BUDGET_CMD}, BUDGET_RESULT) is None
+
+
+def test_budgets_404_row_suppressed_by_reference_view_in_history(ci_home, monkeypatch):
+    monkeypatch.setattr(st, "_viewed_in_db", lambda s, k, f=None: k == "github-ci-wait" and f == BUDGET_REF)
+    assert run("terminal", {"command": BUDGET_CMD}, BUDGET_RESULT) is None
+
+
+def test_budgets_404_row_history_plain_view_does_not_suppress(ci_home, monkeypatch):
+    monkeypatch.setattr(st, "_viewed_in_db", lambda s, k, f=None: k == "github-ci-wait" and f is None)
+    assert _budget_note(run("terminal", {"command": BUDGET_CMD}, BUDGET_RESULT))
+
+
+@pytest.mark.parametrize("cmd,result", [
+    (BUDGET_CMD, json.dumps({"output": '{"budgets": []}', "exit_code": 0})),               # call worked
+    ("gh api /orgs/x/settings/billing/usage", BUDGET_RESULT),                                 # other endpoint
+])
+def test_budgets_404_row_negatives(ci_home, cmd, result):
+    assert run("terminal", {"command": cmd}, result) is None
+
+
+def test_reference_view_does_not_suppress_skill_md_rows(env):  # (d) old rows unchanged
+    run("skill_view", {"name": "token-broker", "file_path": "references/x.md"}, "text")
+    assert run("terminal", {"command": "token-broker scopes"}) is None  # any view of the skill still counts
+
+
+def test_file_row_missing_or_escaping_file_is_noop(ci_home):
+    (ci_home / "skill-triggers.yaml").write_text(
+        "triggers:\n  - id: f1\n    skill: github-ci-wait\n    file: references/nope.md\n    tools: [web_search]\n"
+        "    sections: [Usage]\n  - id: f2\n    skill: github-ci-wait\n    file: ../../token-broker/SKILL.md\n"
+        "    tools: [web_search]\n    sections: [Hard rules]\n")
+    assert run("web_search", {}) is None
+
+
+def test_budgets_404_row_shipped_section_resolves():
+    rows = {r["id"]: r for r in st.load_rows(user_path=P / "nonexistent.yaml")}
+    r = rows["github-personal-budgets-404"]
+    assert r["skill"] == "github-ci-wait" and r["file"] == BUDGET_REF
+    inj = st.build_injection(r, dirs=[REPO / "skills"])
+    assert inj and "does NOT mean no budget" in inj and BUDGET_REF in inj

@@ -5,6 +5,10 @@ session already ran `skill_view(<skill>)`. Table: `triggers.yaml`; override/add 
 `<HERMES_HOME>/skill-triggers.yaml` (same `id` replaces, `disabled: [id]` removes). A `sections` entry is a heading
 prefix or the **bold** lead-in of a paragraph or list item (a list item comes out alone, without its siblings).
 
+A row with `file: references/<f>.md` quotes that reference file instead of SKILL.md (a path outside the skill dir or
+a missing file injects nothing). A plain `skill_view(<skill>)` never shows a reference, so only
+`skill_view(<skill>, file_path=<file>)` silences such a row.
+
 A result that is a JSON object stays one valid JSON document: the rules go in its `skill_triggers` field instead of
 being appended as prose, because machine readers (cron consumers calling `handle_function_call`, e.g. kanban-drift)
 `json.loads` the whole result. Other results (plain text, arrays, non-JSON) keep the prose append.

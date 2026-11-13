@@ -61,9 +61,12 @@ workers to stop chasing tests.
      means GitHub is blocking all *paid* usage on the account, not one workflow or repo.
    - Usage: `gh api "/users/<user>/settings/billing/usage?year=Y&month=M"` returns per-day, per-repo, per-SKU
      items: aggregate `grossAmount` by (repo, sku) and by day to find the runaway workflow (hosted macOS is the
-     usual one). There's no API for a personal account's budgets (`/settings/billing/budgets` is 404): read the
-     Budgets, Payment information and Payment history pages yourself with `browser_exec(local=true)` (the user's
-     signed-in Chrome) instead of asking for screenshots.
+     usual one).
+   - **A 404 from `/users/<user>/settings/billing/budgets` does NOT mean no budget is set.** GitHub has no
+     budgets API for a personal account, so the call is 404 whether or not stop-usage
+     budgets exist, and an org call working says nothing about it. Never report "no budget"/"uncapped" from it:
+     read the Budgets, Payment information and Payment history pages yourself with `browser_exec(local=true)` (the
+     user's signed-in Chrome) instead of asking for screenshots, and treat headroom as unknown until you have.
    - Mail: search the user's Gmail (same browser) for GitHub mail since the block began (budget reached,
      payment failed, `[GitHub Support]`). No such mail plus a budget under its cap plus all-successful payments
      points away from budget/charges.
