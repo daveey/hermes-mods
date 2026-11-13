@@ -192,6 +192,26 @@ Allocations made before loop-watch registered (most imports) are not traced. The
 census thread, holds the GIL for roughly a second per million live blocks, and briefly needs about
 150 bytes of extra memory per live block (a 5M-block heap: ~750 MB). After the one report the census
 stops tracing (if it started it), releasing the per-block overhead. A failing snapshot writes
-`status: unknown` with the exception type. Remove the env var after the diagnostic run. `tests_heap.py` covers env parsing, default-off, attribution of a held allocation
-to its line, value privacy, the one-shot trigger and output cap, and that the cache census defaults
-are unchanged.
+`status: unknown` with the exception type. Remove the env var after the diagnostic run.
+
+**TTL.** If no request is consumed within `HERMES_LOOP_WATCH_HEAP_CENSUS_TTL_S` seconds (default
+21600 = 6 h; unset, non-numeric, non-finite or <= 0 means the default), the census thread stops
+tracing (only if loop-watch started it; tracing that was already on is left alone), writes
+`result.json` with `{"schema": 1, "kind": "heap_census", "status": "expired", "ttl_s", "frames",
+"tracing_left_on"}` and no scan, and exits. The one request opportunity is then spent; a later
+`request` file is never consumed. Send the request well inside the TTL (a 1 h warm-up fits the
+default); raise the TTL in the same launcher env for a longer warm-up. When the census arms, loop-watch
+logs one WARNING to agent.log naming `HERMES_LOOP_WATCH_HEAP_CENSUS=<frames>`, the pid and the TTL,
+and another when it expires, so a forgotten opt-in is visible instead of only slow.
+
+**Keep it out of shared `.env` files.** hermes-cred-relay copies `.env` keys to every gateway. A
+`HERMES_LOOP_WATCH_HEAP_CENSUS` set in one host's diagnostic `.env` once reached two other gateways,
+and every process started there traced for its whole life (allocation-heavy paths 5-20x
+slower, Desktop polls of minutes). The relay's `env_deny` therefore holds `^HERMES_LOOP_WATCH_`; keep
+it there, and set this key on the launcher of the one process you are diagnosing. The TTL is the
+second guard.
+
+`tests_heap.py` covers env parsing, default-off, attribution of a held allocation to its line, value
+privacy, the one-shot trigger and output cap, the TTL (expiry stops tracing with a fake clock, a
+request before the TTL still reports, pre-existing tracing is never stopped), and that the cache census
+defaults are unchanged.

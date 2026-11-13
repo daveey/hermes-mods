@@ -3,13 +3,17 @@
 Default off. ``HERMES_LOOP_WATCH_HEAP_CENSUS=<frames>`` (1..32) starts ``tracemalloc`` with that many
 frames when loop-watch registers, and arms the same private one-shot trigger as the cache census
 (census.Probe) with the command ``heap-census-v1``. The report holds only code locations (file:line),
-byte sizes and block counts: never object values, keys or reprs. Tracing costs memory and CPU for the
-life of the process, so enable it for a diagnostic run only.
+byte sizes and block counts: never object values, keys or reprs. Tracing costs memory and CPU on every
+allocation, so enable it for a diagnostic run only. If no request is consumed within
+``HERMES_LOOP_WATCH_HEAP_CENSUS_TTL_S`` (default 6 h) the census stops the tracing it started and writes
+``status: expired``, so a forgotten or leaked opt-in cannot trace for a process's whole life.
 """
 from __future__ import annotations
 
 import collections
 import gc
+import logging
+import math
 import os
 import sys
 import sysconfig
@@ -21,6 +25,9 @@ COMMAND = b"heap-census-v1\n"
 MAX_OUTPUT = 65536
 TOP = 40
 ENV = "HERMES_LOOP_WATCH_HEAP_CENSUS"
+TTL_ENV = "HERMES_LOOP_WATCH_HEAP_CENSUS_TTL_S"
+DEFAULT_TTL_S = 21600.0  # 6 h
+log = logging.getLogger("loop-watch")
 
 
 def frames(env=None):
@@ -31,6 +38,16 @@ def frames(env=None):
     except ValueError:
         return 0
     return value if 1 <= value <= 32 else 0
+
+
+def ttl(env=None):
+    """Seconds to wait for a request before tracing stops on its own; the default when unset/invalid/<= 0."""
+    env = os.environ if env is None else env
+    try:
+        value = float(env.get(TTL_ENV, ""))
+    except ValueError:
+        return DEFAULT_TTL_S
+    return value if math.isfinite(value) and value > 0 else DEFAULT_TTL_S
 
 
 def _library_roots():
@@ -101,19 +118,24 @@ def safe_scan():
         return dict(schema=1, kind="heap_census", status="unknown", error=type(exc).__name__)
 
 
-def start(home, *, env=None, probe_factory=None):
+def start(home, *, env=None, probe_factory=None, clock=time.monotonic, sleep=time.sleep):
     depth = frames(env)
     if not depth:
         return None
     if getattr(sys, "_hermes_loop_watch_heap_census", False):
         return None
     setattr(sys, "_hermes_loop_watch_heap_census", True)
+    limit = ttl(env)
     started_here = not tracemalloc.is_tracing()
     if started_here:
         tracemalloc.start(depth)
+    # Loud on purpose: a leaked opt-in (e.g. a relayed .env key) must show up in agent.log, not only as slowness.
+    log.warning("loop-watch: %s=%d heap census armed in pid %d (tracemalloc %s); tracing stops after the "
+                "heap-census-v1 request or on its own after %ss (%s)", ENV, depth, os.getpid(),
+                "started" if started_here else "was already on, left alone", f"{limit:g}", TTL_ENV)
 
     def release():
-        # One-shot: tracing has no further use after the report (or without a probe).
+        # One-shot: tracing has no further use after the report, the TTL, or without a probe.
         if started_here and tracemalloc.is_tracing():
             tracemalloc.stop()
     if probe_factory is None:
@@ -130,13 +152,30 @@ def start(home, *, env=None, probe_factory=None):
         probe = probe_factory(home, command=COMMAND, scanner=safe_scan, max_output=MAX_OUTPUT, subdir="loop-watch-heap")
     except Exception:  # noqa: BLE001
         release()
+        log.warning("loop-watch: heap census could not arm its request directory; tracemalloc %s",
+                    "stopped" if started_here else "left on (loop-watch did not start it)")
         return None
+
+    deadline = clock() + limit
+
+    def expire():
+        probe.used = True  # the one opportunity is spent: a later request is never consumed
+        release()
+        try:
+            probe.write("result.json", dict(schema=1, kind="heap_census", status="expired", ttl_s=limit,
+                                            frames=depth, tracing_left_on=not started_here))
+        except OSError:
+            pass
+        log.warning("loop-watch: heap census expired after %ss with no request; tracemalloc %s",
+                    f"{limit:g}", "stopped" if started_here else "left on (loop-watch did not start it)")
 
     def run():
         try:
             while not probe.used:
-                time.sleep(1)
+                sleep(1)
                 probe.tick()
+                if not probe.used and clock() >= deadline:
+                    expire()
         finally:
             probe.close()
             release()
