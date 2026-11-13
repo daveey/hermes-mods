@@ -150,6 +150,11 @@ say what's running, never what needs the user.
 - When a worker blocks on a conflict between the approval's literal limits and live facts, settle it yourself:
   pick the reading that satisfies both the intent and the letter, and leave anything outside the approved scope
   untouched as a named follow-up. Then `kanban_comment` the ruling and unblock, rather than asking the user again.
+- "Why are you red?" (asked in the red chat itself): read the recorded reason, never guess from linked cards:
+  `hermes sessions outcome $HERMES_SESSION_ID` prints a `Desktop stripe <x> ...` line with the stuck inputs the
+  app reported (needs-input + runtime, stalled, kanban_blocked + card ids, review_wait, outcome decision); the raw
+  history is `<home>/logs/desktop-stripe.jsonl`. Needs core 53638e3f23 on the gateway and the Mac's Desktop; no
+  line means an older build or no red since it started.
 - "Still red" / "no green bar" is about the Desktop sidebar stripe, not the stored outcome. The app can paint a row
   red on its own (a queue card a restart lost, an open prompt, a turn gone quiet) while `outcome --refresh` reads
   `waiting` or `done`. Never tell David a chat is green or isn't red from `outcome` alone: read the row yourself on the Mac he
