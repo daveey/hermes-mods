@@ -1623,16 +1623,20 @@ LLM_CREDIT_RE = re.compile(
     r"|insufficient_quota|credit balance is too low|no credits remaining|\bapi\s+credits?\b"
     r"|console\.anthropic\.com|platform\.openai\.com", re.I)
 _OTHER = (r"(?:github(?:\s+actions)?|actions|aws|ec2|vast(?:\.ai)?|cloudflare|runpod|lambda\s+labs|gcp|azure|heroku"
-          r"|vercel|netlify)")
+          r"|vercel|netlify|blacksmith|runners?|build\s+machines?)")
 NON_LLM_BILLING_RE = re.compile(
     r"\bgithub\s+actions\b|\bactions\s+minutes\b"
+    # CI/infra cost wording (self-heal agent-2c90bd7aa7: "macOS runner time" on Blacksmith)
+    r"|\bblacksmith\b|\b(?:runner|CI|macOS|build)\s+(?:minutes|time|hours)\b|\bbuild\s+machines?\b"
     r"|\b" + _OTHER + r"(?:\s+account)?\s+" + _BILL + r"\b"
     r"|\b" + _BILL + _PREP + _OTHER + r"\b", re.I)
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n")
 # Money wording that is an ask on its own; budget/balance/funds/billing/spend limit are engineering words too ("retry
 # budget", "memory budget", "time budget") and need LLM billing context nearby (self-heal agent-ddabb16633). A top-up
-# counts as the noun, not as the verb that opens the match ("top-up went through; I'll check the balance").
-_STRONG_MONEY_RE = re.compile(r"\bcredits?\b|\$\s?\d|console\.anthropic\.com|platform\.openai\.com|\bmoney ask\b", re.I)
+# counts as the noun, not as the verb that opens the match ("top-up went through; I'll check the balance"). A bare $
+# amount is not AI-credit evidence either (self-heal agent-2c90bd7aa7: "the two short jobs add about $4/day" was a
+# Blacksmith CI cost estimate): it counts only with AI billing context nearby, so an unknown vendor is not AI credit.
+_STRONG_MONEY_RE = re.compile(r"\bcredits?\b|console\.anthropic\.com|platform\.openai\.com|\bmoney ask\b", re.I)
 _TOPUP_NOUN_RE = re.compile(r"\btop[- ]?ups?\b", re.I)
 
 
@@ -1646,8 +1650,8 @@ def _about_llm_credit(text: str, m: "re.Match") -> bool:
     """The money wording at m may be about LLM provider credit. Its sentence decides first, then its paragraph: the
     billing target nearest the ask wins (LLM credit/quota wording = yes; GitHub Actions/AWS/Vast/Cloudflare billing =
     no). A scope naming neither defers outward, never to other paragraphs. With no billing context at all, only strong
-    money wording counts (credit(s), a $ amount, a top-up noun, a billing URL): a bare "add $250 of credit" does, a bare
-    budget/balance/funds/billing ("raise the retry budget", "load on the memory budget") does not."""
+    money wording counts (credit(s), a top-up noun, a billing URL): a bare "add $250 of credit" does; a bare $ amount
+    ("add about $4/day") or budget/balance/funds/billing ("raise the retry budget") does not."""
     p0 = text.rfind("\n\n", 0, m.start()) + 1
     p1 = text.find("\n\n", m.end())
     p1 = len(text) if p1 < 0 else p1
