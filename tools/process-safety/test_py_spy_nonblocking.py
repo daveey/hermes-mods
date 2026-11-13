@@ -59,12 +59,12 @@ class EndToEndTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_link(self, *args, env_extra=None):
+    def run_link(self, *args, env_extra=None, timeout=30):
         env = dict(os.environ, HOME='/nonexistent-root-home')  # sudo may reset HOME; must not matter
         env.pop('PY_SPY_REAL', None)
         env.update(env_extra or {})
         return subprocess.run([sys.executable, str(self.link), *args], capture_output=True, text=True,
-                              env=env, timeout=30)
+                              env=env, timeout=timeout)
 
     def test_incident_command_reaches_real_binary_nonblocking(self):
         done = self.run_link(*INCIDENT)
@@ -82,6 +82,18 @@ class EndToEndTest(unittest.TestCase):
         done = self.run_link('record', '-p', '1')
         self.assertEqual(done.returncode, 127)
         self.assertIn('real py-spy not found', done.stderr)
+
+    def test_real_path_linked_to_the_wrapper_fails_loudly(self):
+        # A mis-run `ln -sfn` can point the uv path at the wrapper itself. The guard must refuse it
+        # rather than exec itself: the re-exec'd copy derives its home from that deeper argv[0], so
+        # today it stops one exec later, but only by luck of the layout.
+        real = Path(self.tmp.name) / 'home/.local/share/uv/tools/py-spy/bin/py-spy'
+        real.unlink()
+        os.symlink(WRAPPER, real)
+        done = self.run_link('record', '-p', '1', timeout=10)
+        self.assertEqual(done.returncode, 127, done.stderr)
+        self.assertEqual(done.stderr.count('real py-spy not found'), 1, done.stderr)
+        self.assertNotIn('added --nonblocking', done.stderr)  # refused before rewriting/exec
 
     def test_env_override(self):
         other = Path(self.tmp.name) / 'other-py-spy'
