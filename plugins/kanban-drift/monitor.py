@@ -62,10 +62,13 @@ class Monitor:
                 "No human action is requested. Verify fresh authoritative state and attach per-row evidence.\n\n"
                 + json.dumps(report, sort_keys=True))
         if not row["card"]:
+            # placement "auto", never "local": on the hub "local" is a hub slot that core's admission judge must
+            # admit, and it denies routine repair work (pool workers have hub ssh + hub-admin), so the create was
+            # refused and no repair card was ever filed (cron-0d63c0cf26). "auto" joins the worker pool.
             result = self.tool("kanban_create", {
                 "title": f"Repair persistent Kanban sync drift: {key}", "body": body,
                 "assignee": self.assignee, "requires": ["terminal", "file", "kanban"],
-                "placement": "local", "board": self.board,
+                "placement": "auto", "board": self.board,
                 "idempotency_key": "kanban-drift:" + key + ":" + row["incident"],
                 "completion_contract": "local-only"})
             row["card"] = result.get("task_id") or result.get("id") or result.get("task", {}).get("id")

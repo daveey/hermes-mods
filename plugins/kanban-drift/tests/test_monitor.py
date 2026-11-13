@@ -392,3 +392,67 @@ def test_composed_skill_triggers_hook_refusal_stays_explicit(tmp_path, monkeypat
         m.sample("worker/default", DIRTY)
     row = m.state["targets"]["worker/default"]
     assert row["card"] is None and row["incident"]  # identity kept for a safe retry, no phantom card
+
+
+# Defect cron-0d63c0cf26 (second occurrence): on the hub, placement='local' is a hub slot that core's admission
+# judge must admit, and it denied the drift repair card ("a worker with ssh and hub-admin can repair"), so no repair
+# card was ever filed. The fakes above accept any placement; this one follows core's hub rule.
+HUB_SLOT_PINS = ("local", "here", "hub", "hermes-hub")
+
+
+class HubTools(Tools):
+    """Core's hub contract: a hub-slot pin with no hub_reason is refused (the judge denies routine repair work)."""
+
+    def __call__(self, name, args):
+        if (name == "kanban_create" and not args.get("hub_reason")
+                and str(args.get("placement") or "auto").strip().lower() in HUB_SLOT_PINS):
+            self.calls.append((name, args))
+            raise RuntimeError(json.dumps({"success": False, "error": "placement_unavailable", "remedy": (
+                "On the hub, placement='local' is a hub slot and needs an admit. Instead: omit placement")}))
+        return super().__call__(name, args)
+
+
+def test_hub_rule_dirty_pair_files_one_card_readback_and_restart_dedup(tmp_path):
+    tools = HubTools()
+    state = tmp_path / "drift.json"
+    m = monitor.Monitor(state, tools)
+    assert m.sample("worker-1/default", DIRTY)["card"] is None
+    card = m.sample("worker-1/default", DIRTY)["card"]
+    assert card == "t_fixture_0"
+    assert ("kanban_show", {"task_id": card, "board": "default"}) in tools.calls  # readback
+    assert monitor.Monitor(state, tools).sample("worker-1/default", DIRTY)["card"] == card  # restart dedup
+    assert len(tools.cards) == 1 and sum(n == "kanban_create" for n, _ in tools.calls) == 1
+
+
+def _real_create_args(tmp_path):
+    tools = Tools()
+    m = monitor.Monitor(tmp_path / "drift.json", tools)
+    m.sample("worker-1/default", DIRTY)
+    m.sample("worker-1/default", DIRTY)
+    return next(args for name, args in tools.calls if name == "kanban_create")
+
+
+# Detection guard: the monitor's real create args go through core's placement planner as the hub, with a judge
+# that denies everything. They must never reach the judge (no model call, no refusal): they join the worker pool.
+# A core placement-contract change then fails this suite in CI instead of the hub cron.
+@requires_core
+@pytest.mark.parametrize("cfg", [
+    {"worker_queue": {"hermes-hub": "pool:worker"}, "worker_pools": {"hermes-hub": ["worker-1"]}},
+    {"worker_pools": {"hermes-hub": ["worker-1"]}},
+], ids=["worker_queue", "worker_pools"])
+def test_core_hub_placement_never_reaches_judge(tmp_path, monkeypatch, cfg):
+    from hermes_cli import kanban_hub_admission as judge
+    from hermes_cli import kanban_placement as kp
+    judged = []
+
+    def deny(fields, hub_reason=None):
+        judged.append(fields.get("title"))
+        return judge.Verdict(admit=False, why="fixture judge denies every hub slot")
+
+    monkeypatch.setattr(judge, "admit", deny)
+    monkeypatch.setattr(kp, "config", lambda: cfg)
+    args = _real_create_args(tmp_path)
+    out = kp.decide(args, cfg=cfg, self_gw="hermes-hub", machine_ok=lambda label: True)
+    assert out.get("where") != "refuse", out
+    assert judged == [], out  # never a hub slot, so never a model call
+    assert out.get("runs_on") or out.get("placement_policy"), out  # it joins the worker pool

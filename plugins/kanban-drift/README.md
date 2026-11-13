@@ -7,7 +7,9 @@ Configure host-local JSON with `owner_gateway`, `state_path`, `targets` (gateway
 through the installed Hermes Python bootstrap so native Kanban tools and plugins are loaded.
 Keep connection addresses and credentials out of this public repository.
 
-Two consecutive dirty samples create one agent-owned repair card through `kanban_create`.
+Two consecutive dirty samples create one agent-owned repair card through `kanban_create`, with
+`placement: "auto"` so it joins the worker pool: on the hub, `"local"` is a hub slot that the admission
+judge must admit, and it refuses routine repair work (pool workers have hub ssh and hub-admin).
 A persisted incident UUID makes create retries idempotent, including a crash after the tool's write.
 Unchanged samples do not spam comments; changed evidence refreshes the existing card.
 Clean resets the streak, but never closes the repair card. Unavailable resets the consecutive-sample
@@ -42,7 +44,10 @@ state for restart-safe dedup. Do not enable another consumer for the same target
 closed-card renewal, crash-after-create recovery, command failures, duplicate suppression, and
 main() exit codes for short vs stale unavailability (global and per-target thresholds), and presence:
 an absent host for 14 h exits 0, a reachable host with failing samples exits 1, absence past 7 days
-exits 1, and an erroring or hung presence probe counts as up.
+exits 1, and an erroring or hung presence probe counts as up. A fake create that follows core's hub
+rule (a hub-slot pin without `hub_reason` is refused) must still file exactly one card, and a core-backed
+guard runs the monitor's real create args through core's placement planner as the hub with a deny-all
+judge: they must reach the pool without ever consulting the judge.
 All card writes use isolated sinks (including a native-tool integration test with an explicitly
 isolated canonical Kanban path); tests cannot post live repair alerts. Malformed command output
 retains the exit code and bounded stderr diagnostic, while still failing unavailable.
