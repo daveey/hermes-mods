@@ -434,6 +434,44 @@ def test_backport_counts_and_is_capped(env):
     assert events(env.store, "selfheal_over_cap")[0]["kind"] == "backport"
 
 
+@pytest.mark.parametrize("count", [39, 40])
+def test_undeployed_card_obeys_daily_cap(env, count):
+    """An overdue deployment check shares the cap, not just ordinary defects/backports."""
+    fill(env.board, count)
+    d = defect(component="agent", symptom="host has not synced its fix")
+    fp = d["fingerprint"]
+    key = f"selfheal:{fp}:undeployed:laptop:abc123def456"
+    st = {"status": "fixed", "fix_card": "t_fixed", "fixed_at": NOW - 80 * 3600}
+    lane = sh.LaneState(env.store.root)
+    lane.update(fp, **st)
+    before = lane.get(fp)
+    dec = {"key": key, "label": "Laptop-A", "sha": "abc123def456" + "a" * 28,
+           "last_sync": NOW - 90 * 3600, "deployed_at": None, "overdue": True,
+           "at": NOW - 60, "why": "host still lacks the fix after 80 hours"}
+    out = sh._file_undeployed(d, fp, st, dec, env.store, "live", env.board, NOW, HUB, OPEN)
+
+    if count == 39:
+        assert out["action"] == "not_deployed" and out["card"]
+        assert len(env.board.creates()) == 1
+        assert env.board.rows("idempotency_key = ?", (key,))[0][0] == out["card"]
+        assert lane.get(fp)["undeployed"] == {key: out["card"]}
+        assert sh.cards_created_today(None, NOW) == 40
+        assert events(env.store, "selfheal_over_cap") == []
+    else:
+        assert out["action"] == "skip" and out["over_cap"] is True
+        assert out["not_deployed"] is True
+        assert env.board.rows("idempotency_key = ?", (key,)) == []
+        assert lane.get(fp) == before  # no poisoned dedup state: next occurrence may retry
+        (digest,) = env.board.creates()
+        assert digest[digest.index("--idempotency-key") + 1] == f"selfheal-digest:{DAY}"
+        ((card, body),) = env.board.comments
+        assert card == out["digest"] and fp in body and "not filed (undeployed)" in body
+        (event,) = events(env.store, "selfheal_over_cap")
+        assert event["kind"] == "undeployed" and event["count"] == event["cap"] == 40
+        assert event["digest"] == card
+        assert sh.cards_created_today(None, NOW) == 40
+
+
 def test_text_created_at_rows_never_count(env):
     """SQLite sorts text after every integer: an ISO-string created_at must not count as 'today' forever."""
     con = sqlite3.connect(env.board.db)
