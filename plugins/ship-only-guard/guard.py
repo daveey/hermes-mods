@@ -550,10 +550,22 @@ def _coupled(key, stem):
     return bool(key and stem) and (key == stem or key.startswith(stem + "_") or stem.startswith(key + "_"))
 
 
+def _skill_prose(path):
+    """Skill markdown (home/skills/**.md, skills/**.md): prose that the state/mods suites only lint file by
+    file. hermes-sync pushes live skill edits straight to state every few minutes (`sync: <host>`), so the
+    same-area rule kept refusing PRs that also touch a skill reference (#2563: 5fbd15ce4f edited
+    core-update-runtime.md). Two prose edits cannot change a check outcome the other was tested under; a
+    textual collision still fails GitHub's rebase merge (t_01a1d6b3538e8e43)."""
+    p = str(path)
+    return p.endswith(".md") and (p.startswith("home/skills/") or p.startswith("skills/"))
+
+
 def _overlap(pr, base):
     """Why the base-delta file `base` can change what the PR file `pr` was tested against, or ''."""
     if base.startswith(_WORKFLOWS) or _GLOBAL_FILE.fullmatch(base):
         return "ci"
+    if _skill_prose(pr) and _skill_prose(base):
+        return ""
     if _path_area(pr) == _path_area(base):
         return "area"
     if (pr.count("/") == base.count("/") == 1 and pr.split("/")[0] == base.split("/")[0]
@@ -679,6 +691,188 @@ def _attribute_hits(repo, names, window, subject, cwd, env):
     return "; ".join(out)
 
 
+# Land turn (t_01a1d6b3538e8e43). The drift rule above holds a PR until CI ran on a base with every later
+# state commit on its areas. Hot areas (hermes-sync, tests/, workflows) took a commit per CI cycle on
+# 2026-11-13, so a green, approved PR refreshed by update-branch went stale again before its next merge
+# attempt: #2563 was refused 4 times. A turn orders the landings instead of weakening the rule: the first
+# drift refusal of a green, approved PR records `refs/land-turn/pr-<N>` (a commit whose message carries the
+# PR's files and an expiry) and, until it expires or the PR closes, every OTHER state PR merge whose files
+# would drift the holder (`_overlap(holder_file, other_file)`) is refused, as is (in state's
+# scripts/state-push-guard pre-push) a direct non-sync push. The turn only ever adds refusals; any error
+# reading it fails open, because the drift compare still guards correctness.
+_TURN_PREFIX = "land-turn/pr-"
+_TURN_TTL = 5400             # one refreshed CI cycle (#2563: 10-45 min) plus the merge attempt, with slack
+_TURN_MAX = 6                # turn commits read per preflight (newest PR numbers first)
+_TURN_BUDGET = 6             # seconds of turn reads per preflight; the rest is skipped (fail open)
+_TURN_CALL_TIMEOUT = 5
+_TURN_SUBJECT = "land-turn pr="
+# After a turn expires its PR cannot take another until a further _TURN_TTL has passed (the cooling ref is
+# kept for that and then deleted by the next reader), so a PR whose area keeps drifting through exports never
+# holds its area for more than half of the time.
+
+
+def _now():
+    import time
+    return time.time()
+
+
+def _gh_call(args, cwd, env, payload=None, timeout=10):
+    """One bounded `gh api` call: (returncode, parsed JSON or None). Never raises."""
+    probe_env = dict(env)
+    probe_env["GH_PROMPT_DISABLED"] = "1"
+    argv = ["gh", "api", *args, *(["--input", "-"] if payload is not None else [])]
+    try:
+        p = subprocess.run(argv, cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True,
+                           timeout=timeout, input=json.dumps(payload) if payload is not None else None)
+    except (OSError, subprocess.SubprocessError):
+        return -1, None
+    try:
+        return p.returncode, json.loads(p.stdout) if p.stdout else None
+    except (ValueError, TypeError):
+        return p.returncode, None
+
+
+def parse_turn(message):
+    """The turn record in a land-turn commit message, or None. Shared format with state's state-push-guard:
+    subject `land-turn pr=<N>`, then one JSON line {"pr", "head", "expires", "files"}."""
+    lines = str(message or "").splitlines()
+    if not lines or not lines[0].startswith(_TURN_SUBJECT):
+        return None
+    for line in lines[1:]:
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            return None
+        ok = (isinstance(rec, dict) and isinstance(rec.get("pr"), int) and not isinstance(rec.get("pr"), bool)
+              and isinstance(rec.get("expires"), (int, float)) and not isinstance(rec.get("expires"), bool)
+              and 0 < rec["expires"] < 4_102_444_800 and isinstance(rec.get("files"), list)
+              and all(isinstance(f, str) and f for f in rec["files"]))
+        return rec if ok else None
+    return None
+
+
+def _turn_number(ref):
+    m = re.fullmatch(rf"refs/{re.escape(_TURN_PREFIX)}(\d+)", str(ref.get("ref", "")) if isinstance(ref, dict) else "")
+    return int(m.group(1)) if m else -1
+
+
+def _live_turns(repo, cwd, env):
+    """[(ref, record)] of unexpired turns; [] on any read failure (fail open).
+
+    Reads at most _TURN_MAX turn commits within _TURN_BUDGET seconds (the whole preflight shares the
+    pre_tool_call budget), newest PR numbers first. A turn past its cooldown (expires + _TURN_TTL) or with a
+    junk record is deleted here, so the ref list stays as short as the set of recent turns."""
+    import time
+    rc, refs = _gh_call([f"repos/{repo}/git/matching-refs/{_TURN_PREFIX}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+    if rc != 0 or not isinstance(refs, list):
+        return []
+    out, now, start = [], _now(), time.monotonic()
+    refs = sorted((r for r in refs if _turn_number(r) >= 0), key=_turn_number, reverse=True)
+    for ref in refs[:_TURN_MAX]:
+        if time.monotonic() - start > _TURN_BUDGET:
+            break
+        sha = ref.get("object", {}).get("sha") if isinstance(ref.get("object"), dict) else None
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            continue
+        rc, obj = _gh_call([f"repos/{repo}/git/commits/{sha}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+        if rc != 0 or not isinstance(obj, dict):
+            continue
+        rec = parse_turn(obj.get("message"))
+        if rec and rec["expires"] > now:
+            out.append((ref["ref"], rec))
+        elif rec is None or rec["expires"] + _TURN_TTL <= now:
+            _gh_call(["-X", "DELETE", f"repos/{repo}/git/{ref['ref']}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+    return out
+
+
+def turn_blocks(turn_files, files):
+    """(holder file, other file) when landing `files` would drift a holder with `turn_files`, else None."""
+    for hf in turn_files:
+        for f in files:
+            if _overlap(hf, f):
+                return hf, f
+    return None
+
+
+def _turn_hold_refusal(number, data, repo, cwd, env):
+    """Refusal while another open PR's live turn covers this PR's areas, else None (fail open)."""
+    files = [f["path"] for f in data.get("files") or [] if isinstance(f, dict) and isinstance(f.get("path"), str)]
+    for ref, rec in _live_turns(repo, cwd, env):
+        if rec["pr"] == int(number):
+            continue
+        hit = turn_blocks(rec["files"], files)
+        if not hit:
+            continue
+        rc, pr = _gh_call([f"repos/{repo}/pulls/{rec['pr']}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+        if rc != 0 or not isinstance(pr, dict):
+            continue   # cannot tell whether the holder is still open: fail open
+        if pr.get("state") != "open":
+            _gh_call(["-X", "DELETE", f"repos/{repo}/git/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+            continue   # the holder landed or closed: its turn is over
+        return (f"[ship-only-guard] Refused state merge of PR #{number}: PR #{rec['pr']} holds the state land "
+                f"turn until {_until(rec['expires'])} ({ref}), and this merge would change its area ({hit[1]} ~ "
+                f"{hit[0]}), sending it into another CI cycle. Wait until #{rec['pr']} merges or its turn "
+                "expires, then rerun the same merge command (the drift check will then ask for update-branch "
+                "if needed).")
+    return None
+
+
+def _turn_acquire(number, data, repo, cwd, env):
+    """Record this PR's land turn (best effort). Returns the expiry text, or '' when not recorded."""
+    head = str(data.get("headRefOid") or "")
+    files = [f["path"] for f in data.get("files") or [] if isinstance(f, dict) and isinstance(f.get("path"), str)]
+    if not re.fullmatch(r"[0-9a-f]{40}", head) or not files:
+        return ""
+    ref = f"{_TURN_PREFIX}{int(number)}"
+    import time
+    start = time.monotonic()
+    late = lambda: time.monotonic() - start > _TURN_BUDGET   # noqa: E731 - preflight shares the hook budget
+    rc, cur = _gh_call([f"repos/{repo}/git/ref/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+    if rc == 0 and isinstance(cur, dict):
+        sha = cur.get("object", {}).get("sha") if isinstance(cur.get("object"), dict) else None
+        rc2, obj = _gh_call([f"repos/{repo}/git/commits/{sha}"], cwd, env, timeout=_TURN_CALL_TIMEOUT) if sha else (-1, None)
+        rec = parse_turn(obj.get("message")) if rc2 == 0 and isinstance(obj, dict) else None
+        if rec and rec["expires"] > _now():
+            return _until(rec["expires"])   # one live turn per PR: a later refusal never extends it
+        if rec and rec["expires"] + _TURN_TTL > _now():
+            return ""                        # cooling down: others in its area get a window first
+    if late():
+        return ""
+    rc, hc = _gh_call([f"repos/{repo}/git/commits/{head}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+    tree = hc.get("tree", {}).get("sha") if rc == 0 and isinstance(hc, dict) and isinstance(hc.get("tree"), dict) else None
+    if not isinstance(tree, str) or late():
+        return ""
+    expires = int(_now()) + _TURN_TTL
+    rec = {"pr": int(number), "head": head, "expires": expires, "files": files}
+    rc, made = _gh_call([f"repos/{repo}/git/commits"], cwd, env, timeout=_TURN_CALL_TIMEOUT, payload={
+        "message": f"{_TURN_SUBJECT}{int(number)}\n\n{json.dumps(rec, sort_keys=True)}\n",
+        "tree": tree, "parents": [head]})
+    sha = made.get("sha") if rc == 0 and isinstance(made, dict) else None
+    if not isinstance(sha, str):
+        return ""
+    rc, _ = _gh_call([f"repos/{repo}/git/refs"], cwd, env, timeout=_TURN_CALL_TIMEOUT, payload={"ref": f"refs/{ref}", "sha": sha})
+    if rc != 0:
+        rc, _ = _gh_call(["-X", "PATCH", f"repos/{repo}/git/refs/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT,
+                         payload={"sha": sha, "force": True})
+    return _until(expires) if rc == 0 else ""
+
+
+def _until(epoch):
+    import datetime
+    return f"{datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc):%H:%M} UTC"
+
+
+def _turn_safe(fn, *args):
+    """The land turn only orders landings: any error in it adds nothing (the drift compare still guards)."""
+    try:
+        return fn(*args)
+    except Exception:
+        return None
+
+
 def _state_merge(words, repo, cwd, env):
     """Narrow state-only exception, never a general non-main merge allowance.
 
@@ -786,8 +980,20 @@ def _state_merge(words, repo, cwd, env):
         if bad:
             return failed(f"{len(bad)} of {len(checks)} checks not green: " + ", ".join(bad[:8])
                           + (f", +{len(bad) - 8} more" if len(bad) > 8 else ""))
-        return (_review_reply_refusal(number, data) or _approval_refusal(number, data, repo, cwd, env)
-                or _base_drift_refusal(number, repo, data, cwd, env) or True)
+        refusal = (_review_reply_refusal(number, data) or _approval_refusal(number, data, repo, cwd, env)
+                   or _turn_safe(_turn_hold_refusal, number, data, repo, cwd, env))
+        if refusal:
+            return refusal
+        drift = _base_drift_refusal(number, repo, data, cwd, env)
+        if drift and "state commit(s) landed since then" in drift:
+            # Green, approved, refused only for drift: take the land turn so the refreshed head's CI cycle
+            # is the last one (overlapping merges and direct pushes wait for it).
+            until = _turn_safe(_turn_acquire, number, data, repo, cwd, env)
+            if until:
+                drift += (f" PR #{number} now holds the state land turn until {until} (refs/{_TURN_PREFIX}"
+                          f"{number}): overlapping state PR merges and direct state pushes wait for it, so "
+                          "update-branch now and merge as soon as the new head's CI is green.")
+        return drift or True
     except (ValueError, TypeError) as e:
         return failed(f"`gh pr view {number}` returned an unexpected shape ({type(e).__name__})")
 

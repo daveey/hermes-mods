@@ -208,6 +208,44 @@ not an ancestor of `state` fail closed. Why: #2491's CI tested base 3a55357793;
 #2487 (adc4b89b37) then changed `bb_tuner_feed.py` in the same directory, #2491
 was rebase-merged without a check on the combination and state went red.
 
+Skill prose is exempt: a skill markdown file (`home/skills/**.md`, `skills/**.md`)
+on the base side never overlaps a skill markdown file in the PR, the same file
+included. The suites lint those files one at a time, and a textual collision still
+fails GitHub's rebase merge. hermes-sync pushes live skill edits straight to
+`state`, and its `sync: <host>` commit 5fbd15ce4f was one of #2563's refusals.
+Skill prose next to code (`home/skills/x/scripts/*.py`) and markdown outside
+the skill trees still overlap.
+
+**Land turn (bounded landing).** On 2026-11-13 the hot areas (`hermes-sync`,
+`tests/`, workflows) took a commit about once per CI cycle. #2563 was green and
+approved 4 times and refused 4 times; each refusal cost an update-branch and
+another CI cycle. So the first drift refusal of a green, approved PR also records
+a turn: the ref `refs/land-turn/pr-<N>` points at a commit whose message is
+`land-turn pr=<N>` plus one JSON line `{"pr", "head", "expires", "files"}`.
+The expiry is 90 minutes out (`_TURN_TTL`). A later refusal does not extend a
+live turn. After a turn expires, its PR cannot take a new one for another
+`_TURN_TTL` (the cooldown), so a PR whose area keeps drifting through sync
+exports holds that area at most half the time. Readers delete turns that are
+past their cooldown or unparseable. They read at most `_TURN_MAX` turns, newest
+PR number first, within `_TURN_BUDGET` seconds.
+While the turn is live and its PR is open, the guard refuses any other state PR
+merge with a file that would drift the holder (`_overlap(holder_file, file)`,
+the same rules as above), and names the holder and the expiry. When the holder
+has merged or closed, the turn no longer counts: the guard deletes its ref the
+next time it reads it. State's `scripts/state-push-guard` pre-push applies the
+same check to direct pushes to `state`, except hermes-sync and skills-sync exports.
+The turn only adds refusals. If the turn listing can't be read, or the turn code raises, the guard fails
+open, because the drift compare above still guards correctness. Replayed against
+the real state history of 2026-11-13 (61 merged PRs plus #2563, start times every
+5 minutes), the share of PRs that land within 2 CI cycles rose:
+
+- with a 20-minute cycle, from 79.7% to 97.2%;
+- with a 60-minute cycle, from 52.5% to 96.2%.
+
+#2563 lands within 2 cycles at every start time. The PRs still left out edit
+a path that the hosts' live sync exports, for example `hosts/daveey-mini/sync.json`
+(#2483). The simulator is attached to card t_01a1d6b3538e8e43.
+
 **Gate boundary:** this guard checks that an exact-head approval record exists;
 it does not authenticate that its author was independent (every agent posts as
 the same GitHub account), and it does not prove coverage of required-but-absent

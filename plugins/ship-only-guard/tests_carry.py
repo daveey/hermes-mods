@@ -17,6 +17,13 @@ g = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(g)
 REAL_RUN = subprocess.run
 
+
+@pytest.fixture(autouse=True)
+def _no_land_turn(monkeypatch):
+    # These cases pin the carry's gh calls; the land turn has its own fakes in tests_turn.py.
+    monkeypatch.setattr(g, "_live_turns", lambda *a: [])
+    monkeypatch.setattr(g, "_turn_acquire", lambda *a: "")
+
 R = "example/protected"
 H0 = "1fd079c68f8cc4aa5f887df5e6d3668945b68149"     # #2438's approved head
 H = "b1e5d5ef46" + "0" * 30                        # its update-branch merge

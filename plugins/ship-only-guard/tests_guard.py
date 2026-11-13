@@ -21,6 +21,13 @@ g = load("ship_guard_test", HERE / "guard.py")
 plugin = load("ship_plugin_test", HERE / "__init__.py")
 
 
+@pytest.fixture(autouse=True)
+def _no_land_turn(monkeypatch):
+    # These cases pin the preflight's other gh calls; the land turn has its own fakes in tests_turn.py.
+    monkeypatch.setattr(g, "_live_turns", lambda *a: [])
+    monkeypatch.setattr(g, "_turn_acquire", lambda *a: "")
+
+
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
     home = tmp_path / "home"
