@@ -843,6 +843,40 @@ def test_git_verifier_clean_merge_and_relocated_hunk(monkeypatch, tmp_path, git_
     assert not list((tmp_path / "home" / "cache").iterdir())
 
 
+@pytest.mark.parametrize("chain_length", [5, 140], ids=["bounded-control", "shallow-cut"])
+def test_git_verifier_shallow_cut_before_reachable_merge_base(
+        monkeypatch, tmp_path, git_history, chain_length):
+    """A short second-parent path exposes the base while a long path is cut.
+
+    Merely finding one merge base is insufficient: rev-list above that base
+    still includes a shallow boundary on the long first-parent chain.
+    """
+    import os
+    repo, heads = git_history
+    _, approved, theirs = heads["clean"]
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+
+    def git(*args):
+        return REAL_RUN(["git", "-c", "user.name=test", "-c", "user.email=test@example.com",
+                         "-c", "core.hooksPath=/dev/null", *args], cwd=repo, env=env,
+                        capture_output=True, text=True, check=True).stdout.strip()
+
+    tree = git("rev-parse", approved + "^{tree}")
+    long_tip = approved
+    for i in range(chain_length):
+        long_tip = git("commit-tree", tree, "-p", long_tip, "-m", f"long path {i}")
+    short_tip = git("commit-tree", tree, "-p", approved, "-m", "short path")
+    ours = git("commit-tree", tree, "-p", long_tip, "-p", short_tip, "-m", "join paths")
+    clean_tree = git("merge-tree", "--write-tree", ours, theirs)
+    merge = git("commit-tree", clean_tree, "-p", ours, "-p", theirs, "-m", "clean carry")
+    assert git("merge-base", "--all", ours, theirs) == git("merge-base", approved, theirs)
+    calls = local_git_verifier(monkeypatch, tmp_path, repo)
+    why = GIT_VERIFY(merge, ours, theirs, R, None, {"HERMES_HOME": str(tmp_path / "home")})
+    assert why == ("fetch depth cuts history before the merge base" if chain_length == 140 else "")
+    assert any("--depth=128" in argv for argv, _ in calls if "fetch" in argv)
+    assert not list((tmp_path / "home" / "cache").iterdir())
+
+
 @pytest.mark.parametrize("failure", ["failed", "timeout"])
 def test_git_verifier_unreadable_fetch_refuses(monkeypatch, tmp_path, git_history, failure):
     repo, heads = git_history
