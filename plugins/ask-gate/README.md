@@ -106,12 +106,14 @@ head" steer parked a test-only CI repair on David). Tests: `tests/test_agent_con
 **Owner-recommendation holds (L3, no model call).** `owner_recommendation.py` holds a `kanban_block` / blocked
 `kanban_create` whose `human_request` (interaction reply/approval) asks David to pick between options (two or more
 `choices`, or "reply yes or no / A or B / pick / choose / decide" wording) and whose action, why_human and scope name
-no limit only he can change: real money ($ amount, budget/cap, paid plan, cloud spend), an acceptance threshold or
-required gate, a credential or write/admin permission (a read-only grant is not one), other people, safety/consent/
-hard-to-reverse effects, a human-only step, or a rule David stated. Evidence is not read (it cites tool output such
-as "read-only installation token"). The refusal says "apply your recommendation and comment how to reverse".
-Runs after the agent-condition hold; an unchanged ask is held twice, then passes (`owner_recommendation_released`);
-errors fail open (`owner_recommendation_error`). `STRUCTURED_SYSTEM` carries the same rule. Logs
+no limit only he can change: real money ($ amount, budget/cap, paid plan, cloud spend, an upgrade/renewal/new
+subscription; spending existing subscription quota is not one), legal terms, an acceptance threshold, required gate or
+branch protection, a credential or write/admin permission (a read-only grant is not one), other people,
+safety/consent/hard-to-reverse effects, production/offline or personal data, a human-only step, or a rule David
+stated. Evidence is not read (it cites tool output such as "read-only installation token"). The refusal says "apply
+your recommendation and comment how to reverse". Runs after the agent-condition hold; holds are counted per (session,
+tool, blocked card), so a reworded ask does not restart the bound: two holds, then it passes
+(`owner_recommendation_released`); errors fail open (`owner_recommendation_error`). `STRUCTURED_SYSTEM` carries the same rule. Logs
 `owner_recommendation_hold`. Why: red-sweep slug owner-recommendation-not-applied (four cards on 2026-11-13: read-only
 App permissions, macOS CI lane A/B/C, Fable route parity, David's own iPhone under the same limits). Tests:
 `tests/test_owner_recommendation_hold.py` (the four exact requests held; $ over-cap, recurring paid spend, threshold
