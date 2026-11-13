@@ -484,7 +484,9 @@ def linked_state(session_id: str, limit: int = 15, db_paths: list[Path] | None =
     human_request) however old: in a long chat the oldest cards drop out of a recency list first, and those are
     the ones blocked on David (self-heal agent-d9399023fc). Pinned cards plus the chat's open cards are capped at
     LINKED_CAP by dropping the oldest non-pinned ones (a pinned card is never cut). Local watch parks
-    (``_watch_sql``) are listed outside that cap and never cut, so the list can exceed LINKED_CAP by their number."""
+    (``_watch_sql``) are listed outside that cap and never cut, so the list can exceed LINKED_CAP by their number
+    (as it can through pinned cards alone). A remote watch card has no watch flag in core's projection: it is an
+    ordinary open card."""
     out: list[dict] = []
     if not session_id:
         return out, True
