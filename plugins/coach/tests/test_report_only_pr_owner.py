@@ -270,3 +270,116 @@ def test_card_read_line_only_for_board_reads_or_card_ids():
     # status lines still sit right after their call (restart_deferral / card_closed read line i+1)
     i = next(i for i, l in enumerate(log) if l.startswith("-> terminal(zzz"))
     assert log[i + 1].lstrip().startswith("<- ERROR"), log
+
+
+# ── agent-276aaa2c41: the ask names a different card; the reply's ending names the PR / "the build card" ────────────
+# Hub session 20261112_002413_39be4c, 00:04Z 2026-11-13. The ask was the done-notice of review card t_01a1d22c3f7ee8d5;
+# the reply's ending talked about PR 1714 and "the build card" (t_01a1cc39958aa6f9, scheduled, its wake_check names
+# .../pull/1714), which the turn had read with a raw read-only sqlite query. tail_card_ids returned the ask's review
+# card alone, so the judges saw only a done card and held a true reply at p 0.9 (hub coach/log.jsonl line 73022).
+REVIEW = "t_01a1d22c3f7ee8d5"
+BUILD = "t_01a1cc39958aa6f9"
+ASK_276 = (f"[Kanban notice] Task {REVIEW} (Independent review: worker enrollment fix) is done.\n"
+           "Summary: approved at exact head.")
+REPLY_276 = (
+    "The review is done and approved.\n\n"
+    "Autoscaling is unchanged: PR 1714 (the enrollment fix) is still open, and the build card is parked on its merge. "
+    "Your autoscaling chat, which owns that merge, last wrote at 21:57Z and is waiting on your MacBook coming back "
+    "online.")
+CMD_276 = ("cd ~; D=~/.hermes/kanban.db; date -u +%T; for n in 1779 1714; do echo \"$n $(token-broker exec --scope "
+           "user/github --reason 'read PR state for close-out' -- gh pr view $n -R acme/hermes --json state,mergedAt,"
+           "headRefOid,title 2>&1 | tail -1 | cut -c1-260)\"; done; for f in $D ~/.hermes/kanban/sync-shadow/default.db;"
+           " do sqlite3 -separator ' | ' \"file:$f?mode=ro\" \"select id,status,coalesce(lease_holder,'-'),created_on,"
+           "substr(title,1,100) from tasks where status not in ('archived','done') and (title like '%1779%' or title "
+           f"like '%pre-rebase head%' or id='{BUILD}')\"; sqlite3 \"file:$f?mode=ro\" \"select substr(coalesce(summary,"
+           f"''),1,900) from task_runs where task_id='{REVIEW}' order by id desc limit 1\"; done | sort -u")
+OUT_276 = (
+    "00:03:12\n1779 {\"headRefOid\":\"c11e71f25cec5320e240694fb4510d4bddc936ef\",\"mergedAt\":\"2026-11-13T00:02:26Z\","
+    "\"state\":\"MERGED\",\"title\":\"core-wt-land: fetch an absent rejected pre-rebase head before classifying the "
+    "rejection\"}\n1714 {\"headRefOid\":\"557e763cf342e3cc38f53dc492ba9e29ac5cc10b\",\"mergedAt\":null,\"state\":\"OPEN\","
+    "\"title\":\"fix(workers): enrollment ownership and blocked Pending:Wait cleanup\"}\nI approved PR #1779 at exact "
+    "head c11e71f25c and posted a COMMENT review at that commit (read back). Not merged; t_01a1d15e7a7c779f owns "
+    f"landing.\n{BUILD} | scheduled | - | hub | Build multi-worker autoscaling: up to 3 on-demand autoscaled workers "
+    "with a free-slot target\nt_01a1d15e7a7c779f | running | worker-3 | worker-3 | core-wt rejection classification: "
+    "fetch missing pre-rebase head before patch comparison")
+WAKE_1714 = "gh pr view https://github.com/acme/hermes/pull/1714 --json state -q .state | grep -qx MERGED"
+
+
+def _log_276():
+    """The turn's real board read (state.db msgs 1257171/1257172, repo slug scrubbed, result trimmed) through the real
+    _log_call: the build card's id lies past TURN_LOG_ARG_CAP."""
+    return _tool_log([("terminal", {"command": CMD_276},
+                       json.dumps({"output": OUT_276, "exit_code": 0, "error": None}))])
+
+
+def _board_276(tmp_path, monkeypatch, wake=WAKE_1714):
+    db = _board(tmp_path / "kanban.db", [
+        (REVIEW, "Independent review: worker enrollment fix", "Review the enrollment change.", "done", None),
+        (BUILD, "Build: worker autoscaling", "Scale the pool from queue depth.", "scheduled", None)])
+    c = sqlite3.connect(db)
+    c.execute("insert into task_events (task_id, kind, payload, created_at) values (?,?,?,?)",
+              (BUILD, "scheduled", json.dumps({"reason": "SCHEDULED_UNTIL=2026-11-13T06:00:00Z waiting on the merge",
+                                               "wake_check": wake}), NOW - 1800))
+    c.commit()
+    c.close()
+    monkeypatch.setenv("COACH_BOARD_DBS", db)
+    monkeypatch.setenv("COACH_SHADOW_DBS", "")
+    return db
+
+
+def test_ask_named_card_does_not_hide_the_pr_owner_the_reply_refers_to(tmp_path, monkeypatch):
+    _board_276(tmp_path, monkeypatch)
+    log = _log_276()
+    lines = rc.named_card_facts(REPLY_276, log, now=NOW, user_ask=ASK_276)
+    assert any(f"<- BOARD task={BUILD} status=scheduled" in l for l in lines), lines
+    ids, fallback = rc.tail_card_ids(REPLY_276, log, ASK_276)
+    assert ids[0] == REVIEW and BUILD in ids and fallback is True, ids
+
+
+def test_pr_without_hash_resolves_through_the_wake_check_alone(tmp_path, monkeypatch):
+    _board_276(tmp_path, monkeypatch)
+    assert rc.tail_pr_ids(REPLY_276) == ["1714"]
+    assert rc.pr_owner_card_ids(REPLY_276, []) == [BUILD]
+
+
+def test_wake_check_by_core_wt_probe_number_resolves(tmp_path, monkeypatch):
+    _board_276(tmp_path, monkeypatch, wake="hermes-core-wt-land --review-ci-probe --repo x/y --number 1714 --sha ab")
+    assert rc.pr_owner_card_ids("PR #1714 is still open.", []) == [BUILD]
+
+
+def test_wake_check_of_a_closed_card_is_not_an_owner(tmp_path, monkeypatch):
+    db = _board_276(tmp_path, monkeypatch)
+    c = sqlite3.connect(db)
+    c.execute("update tasks set status='done' where id=?", (BUILD,))
+    c.commit()
+    c.close()
+    assert rc.pr_owner_card_ids("PR 1714 is still open.", []) == []
+
+
+def test_raw_readonly_sqlite_read_counts_as_a_turn_touched_card(tmp_path, monkeypatch):
+    _board_276(tmp_path, monkeypatch)
+    assert BUILD in rc.turn_card_ids(_log_276())
+    ec = _tool_log([("execute_code", {"code": "import sqlite3\nc = sqlite3.connect('file:/h/.hermes/kanban/sync-shadow/"
+                                               f"mac.db?mode=ro', uri=True)\nprint(c.execute(\"select status from "
+                                               f"tasks where id='{BUILD}'\").fetchall())"}, '{"output": "scheduled"}')])
+    assert rc.turn_card_ids(ec) == [BUILD]
+    assert rc.turn_card_ids(_tool_log([("terminal", {"command": f"grep {BUILD} notes.txt"}, '{"output": ""}')])) == []
+
+
+def test_ask_only_behaviour_kept_when_the_reply_names_no_pr_and_no_card(tmp_path, monkeypatch):
+    _board_276(tmp_path, monkeypatch)
+    reply = "The review is done and approved. Nothing else needs you."
+    assert rc.tail_card_ids(reply, _log_276(), ASK_276) == ([REVIEW], True)
+
+
+def test_reply_naming_a_card_id_ignores_the_ask_and_the_pr(tmp_path, monkeypatch):
+    _board_276(tmp_path, monkeypatch)
+    reply = f"PR 1714 is still open; {BUILD} is parked on its merge."
+    assert rc.tail_card_ids(reply, _log_276(), ASK_276) == ([BUILD], False)
+
+
+def test_ask_plus_referred_cards_cap_at_named_card_max(tmp_path, monkeypatch):
+    _board_276(tmp_path, monkeypatch)
+    ask = "Done: " + " ".join(f"t_01a1d22c3f7ee8{i:02x}" for i in range(rc.NAMED_CARD_MAX))
+    ids, _ = rc.tail_card_ids(REPLY_276, _log_276(), ask)
+    assert len(ids) <= rc.NAMED_CARD_MAX

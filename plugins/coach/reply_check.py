@@ -540,13 +540,32 @@ CARD_REF_RE = re.compile(r"\b(?:the|that|this|its|their)\s+(?:[\w-]+\s+){0,2}?ca
 _TOUCH_TOOLS_RE = re.compile(r"^\s*->\s*(?:mcp__)?(kanban_comment|kanban_show|kanban_create|tool_call)\(")
 
 
+# agent-276aaa2c41: the turn read "the build card" with `D=~/.hermes/kanban.db; sqlite3 "file:$D?mode=ro" ...`. A
+# terminal / execute_code call reading a board db (kanban.db, sync-shadow/*.db) touches the cards it names, in its
+# `->` line or (past the arg cap) its `<- CARDS read` line (agent_rules.card_read_line).
+_RAW_CALL_RE = re.compile(r"^\s*->\s*(?:mcp__)?(?:terminal|execute_code)\(")
+
+
 def turn_card_ids(tool_log: Optional[list]) -> list[str]:
     """Card ids this turn's kanban_comment / kanban_show / kanban_create / tool_call calls touched (a kanban_create's
-    id is in its result line), most recent first."""
+    id is in its result line), plus those a raw board-db read names, most recent first."""
     lines = list(tool_log or [])
     out: list[str] = []
     for i, line in enumerate(lines):
         m = _TOUCH_TOOLS_RE.match(line or "")
+        if not m and _RAW_CALL_RE.match(line or ""):
+            group = [line or ""]
+            for nxt in lines[i + 1:]:
+                s = (nxt or "").lstrip()
+                if s.startswith("->") or not s.startswith("<-"):
+                    break
+                group.append(nxt or "")
+            if any(_BOARD_READ_RE.search(l) for l in group if not l.lstrip().startswith("<- OK")):
+                for cid in _group_ids(group):
+                    if cid in out:
+                        out.remove(cid)
+                    out.append(cid)
+            continue
         if not m:
             continue
         text = line or ""
@@ -704,6 +723,21 @@ def pr_owner_card_ids(reply_tail: str, tool_log: Optional[list] = None) -> list[
                                 title_hits.append(cid)
                             elif p.search(body):
                                 body_hits.append(cid)
+                        # agent-276aaa2c41: the owner card's title/body never named PR 1714; its park's wake_check
+                        # (`gh pr view .../pull/1714`, or core-wt land's `--number 1714`) did. Ranked with titles.
+                        wake = re.compile(p.pattern + r"|--number[\s=]+" + re.escape(n) + r"\b", re.I)
+                        rows = conn.execute(
+                            "select e.task_id, coalesce(e.payload,'') from task_events e join tasks t on t.id=e.task_id"
+                            " where t.status not in ('done','archived') and e.kind in ('scheduled','blocked',"
+                            "'continued') and e.payload like '%wake_check%' and e.payload like ? "
+                            "order by e.created_at desc limit 50", (f"%{n}%",)).fetchall()
+                        for cid, payload in rows:
+                            try:
+                                wc = str((json.loads(payload) or {}).get("wake_check") or "")
+                            except Exception:
+                                wc = ""
+                            if wake.search(wc):
+                                title_hits.append(str(cid))
                 finally:
                     conn.close()
             except Exception:
@@ -741,7 +775,15 @@ def tail_card_ids(reply: str, tool_log: Optional[list] = None, user_ask: str = "
     if NAMED_CARD_RE.search(reply_tail):
         return ids, False
     if ids:
-        return ids, True
+        # agent-276aaa2c41: the ask named the done review card while the reply's ending talked about "PR 1714" and
+        # "the build card" (a different, scheduled card). A reply ending that names a PR or refers to a card also gets
+        # the turn-touched and PR-resolved cards, after the ask's.
+        ref = bool(CARD_REF_RE.search(reply_tail))
+        if ref or tail_pr_ids(reply_tail):
+            for cid in (turn_card_ids(tool_log) if ref else []) + pr_owner_card_ids(reply_tail, tool_log):
+                if cid not in ids:
+                    ids.append(cid)
+        return ids[:NAMED_CARD_MAX], True
     if NAMED_CARD_RE.search(tail):
         return [], False
     ref = bool(CARD_REF_RE.search(reply_tail))
