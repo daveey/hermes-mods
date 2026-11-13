@@ -222,3 +222,46 @@ def test_owner_card_text_board_slug():
     assert board.calls[-1][:4] == ["hermes", "kanban", "--board", "default"]
     assert sh._owner_card_text("t_x", "other-gw:", board)["title"] == "T"
     assert "--board" not in board.calls[-1]
+
+
+def test_requeued_detection_names_the_session_its_quote_came_from(store, monkeypatch):
+    """agent-e34c558227 (11-13): the lane held its FIRST session (10-28, "stuck?"); the newest detection came from
+    another session (11-10 22:43Z, "resume"). The revalidation requeue took session_id from the lane but quote/time
+    from the newest detection, so the refiled card linked a transcript that never contained its quote. Every
+    provenance field (session, quote, time, host, profile) must come from one detection row, stamped `detect_ts`."""
+    monkeypatch.setattr(sh, "budget", OPEN)
+    fp = "agent-6a8134f494"
+    case = CASES[fp]
+    legacy_adoption(store, fp, case)  # lane + first detect row: session A
+    det_a = case["detect"]
+    det_b = {**det_a, "ts": det_a["ts"] + 3600, "session_id": "20261111_183249_2b0f34", "evidence": "resume",
+             "host": "hub-b", "profile": "ops"}
+    store.log({"event": "selfheal_detect", "mode": "live", "fingerprint": fp, **det_b})
+    # a later filed row (no session/evidence) must not lend its own ts to the requeued detection
+    store.log({"event": "selfheal_filed", "fingerprint": fp, "card": "t_filedlater", "component": det_a["component"],
+               "source": det_a["source"], "ts": det_b["ts"] + 600})
+    sh.reconcile(store, runner=Board([case["wrong_owner"]]), now=det_a["ts"] + 86400)
+    queued = pending(store)[fp]
+    assert queued["session_id"] == det_b["session_id"], "session must come from the record the quote came from"
+    assert queued["quote"] == "resume" and queued["evidence"] == "resume"
+    assert queued["at"] == det_b["ts"] and queued["detect_ts"] == det_b["ts"]
+    assert queued["host"] == "hub-b" and queued["profile"] == "ops"
+    brief = sh._investigation_brief(dict(queued))
+    assert "session: @session:ops/20261111_183249_2b0f34" in brief and 'Quote: "resume"' in brief
+    rej = events(store, "selfheal_adoption_rejected")[0]
+    assert rej["session_id"] == det_b["session_id"]
+
+
+def test_detect_record_takes_provenance_from_one_row(store):
+    """The newest selfheal_detect row supplies session/quote/time whole: an empty field there is never back-filled
+    from an older row, and a later selfheal_filed row never moves `ts`."""
+    fp = "agent-0123456789"
+    store.log({"event": "selfheal_detect", "fingerprint": fp, "source": "complaint", "session_id": "s-old",
+               "evidence": "stuck?", "ts": 100.0, "host": "old-host"})
+    store.log({"event": "selfheal_detect", "fingerprint": fp, "source": "backstop", "session_id": None,
+               "evidence": "cron died", "ts": 200.0})
+    store.log({"event": "selfheal_filed", "fingerprint": fp, "source": "backstop", "card": "t_c", "ts": 300.0})
+    rec = sh._detect_record(store, fp)
+    assert rec["evidence"] == "cron died" and rec["ts"] == 200.0 and rec["detect_ts"] == 200.0
+    assert "session_id" not in rec and "host" not in rec and rec["card"] == "t_c"
+    assert sh._adoption_log_records(store, {fp})[fp]["detect"] == rec

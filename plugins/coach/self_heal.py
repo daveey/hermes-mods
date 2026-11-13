@@ -5482,8 +5482,54 @@ def _coach_data() -> Path:
     return Path(os.environ.get("COACH_DATA") or Path.home() / "code" / "hermes-coach-data")
 
 
+# Keys a selfheal_filed row may add to a detection record. Everything else (session, quote/evidence, time, host,
+# profile, p, stop evidence...) is provenance and comes whole from the newest selfheal_detect row: a field-by-field
+# merge over rows linked agent-e34c558227's refile to its FIRST session (10-28, "stuck?") with the newest quote
+# ("resume", another session 11-10), and a later filed row moved `ts` to the filing time.
+FILED_RECORD_KEYS = ("card", "board", "recurrence", "scheduled", "component", "source")
+
+
+def _fold_detect_row(acc: dict, r: dict) -> dict:
+    """Fold one selfheal_detect/selfheal_filed log row (oldest first) into a detection record.
+    A detect row replaces every provenance field (stamped `detect_ts`, its own `ts`); a filed row adds only
+    FILED_RECORD_KEYS, and its component/source only while no detect row has been seen."""
+    row = {k: v for k, v in r.items() if v not in (None, "")}
+    if r.get("event") == "selfheal_detect":
+        out = {**{k: acc[k] for k in ("card", "board", "recurrence", "scheduled") if k in acc}, **row}
+        if "ts" in row:
+            out["detect_ts"] = row["ts"]
+        return out
+    seen = "detect_ts" in acc
+    return {**acc, **{k: v for k, v in row.items()
+                      if k in FILED_RECORD_KEYS and not (seen and k in ("component", "source") and k in acc)}}
+
+
+# The provenance a requeued defect takes from its detection record, all from that one row.
+DETECT_PROVENANCE = ("session_id", "host", "platform", "profile")
+
+
+def _detection_defect(fp: str, st: dict, rec: dict) -> dict:
+    """The defect a lane re-queues for a fresh owner, every provenance field from ONE detection row (`rec`, the
+    newest selfheal_detect): session, host, platform, profile, quote and time. The lane's own session/time is only a
+    fallback for a record with no detect row at all (`detect_ts` absent, e.g. a lane older than its log)."""
+    one = bool(rec.get("detect_ts"))
+    d = {"fingerprint": fp, "component": st.get("component"), "symptom": st.get("symptom"),
+         "session_id": rec.get("session_id") if one else (rec.get("session_id") or st.get("session_id")),
+         "source": rec.get("source"), "kind": rec.get("kind"),
+         "evidence": rec.get("evidence"), "quote": rec.get("quote") or rec.get("evidence"),
+         "complaint_at": st.get("complaint_at") or rec.get("ts"),
+         "at": rec.get("ts") if one else (rec.get("ts") or st.get("complaint_at"))}
+    for k in ("host", "platform", "profile"):
+        if rec.get(k):
+            d[k] = rec[k]
+    if one:
+        d["detect_ts"] = rec["detect_ts"]
+    return d
+
+
 def _detect_record(store, fp: str) -> dict:
-    """The newest selfheal_detect / selfheal_filed row for `fp` (source, session, evidence), {} when none."""
+    """`fp`'s detection record, {} when none: provenance (session, evidence, ts...) whole from its newest
+    selfheal_detect row (`detect_ts`), card/board from selfheal_filed rows (_fold_detect_row)."""
     best: dict = {}
     try:
         with (Path(store.root) / "log.jsonl").open(encoding="utf-8", errors="replace") as f:
@@ -5495,7 +5541,7 @@ def _detect_record(store, fp: str) -> dict:
                 except ValueError:
                     continue
                 if r.get("fingerprint") == fp and r.get("source"):
-                    best = {**best, **{k: v for k, v in r.items() if v not in (None, "")}}
+                    best = _fold_detect_row(best, r)
     except OSError:
         pass
     return best
@@ -5976,7 +6022,7 @@ def _adoption_log_records(store, fps: set) -> dict:
                 if r.get("event") == "selfheal_adopted_owner":
                     e.update(via=r.get("via") or "session", card=r.get("card"))
                 elif r.get("source"):
-                    e["detect"] = {**(e.get("detect") or {}), **{k: v for k, v in r.items() if v not in (None, "")}}
+                    e["detect"] = _fold_detect_row(e.get("detect") or {}, r)
     except OSError:
         pass
     return out
@@ -6019,10 +6065,7 @@ def _revalidate_adoption(lane, store, fp: str, st: dict, runner, now: float,
                    "why": "owner card unreadable; kept, re-judged within the hour"})
         return None
     rec = rec if rec is not None else _detect_record(store, fp)
-    d = {"fingerprint": fp, "component": st.get("component"), "symptom": st.get("symptom"),
-         "session_id": st.get("session_id"), "source": rec.get("source"), "kind": rec.get("kind"),
-         "evidence": rec.get("evidence"), "quote": rec.get("quote") or rec.get("evidence"),
-         "complaint_at": st.get("complaint_at") or rec.get("ts"), "at": rec.get("ts") or st.get("complaint_at")}
+    d = _detection_defect(fp, st, rec)
     why = session_owner_refusal(text, d, fp, _defect_subject_cards(d), _lane_process_cards(store, fp))
     if not why:
         lane.update(fp, adopt_rule=ADOPT_RULE, adopt_checked_at=now)
@@ -6037,17 +6080,20 @@ def _revalidate_adoption(lane, store, fp: str, st: dict, runner, now: float,
     requeued = _requeue_detection(store, fp, st, d, rec, now, "revalidate")
     store.log({"event": "selfheal_adoption_rejected", "fingerprint": fp, "card": card, "was": "approved",
                "by": "revalidate", "rule": ADOPT_RULE, "why": why, "symptom": st.get("symptom"),
-               "session_id": st.get("session_id"), "requeued": requeued,
+               "session_id": d.get("session_id"), "requeued": requeued,
                "title": str(text.get("title") or "")[:120]})
     return f"adoption of {card} rejected ({why}); " + ("refile queued" if requeued else "no detection to refile")
 
 
 def _requeue_detection(store, fp: str, st: dict, d: dict, rec: dict, now: float, tag: str) -> bool:
-    """Queue the defect in selfheal_pending so the next retry pass files (or adopts) a fresh owner."""
+    """Queue the defect in selfheal_pending so the next retry pass files (or adopts) a fresh owner.
+    Guard: session, host/profile, quote and time are re-taken from `rec`'s one detection row (_detection_defect),
+    whatever the caller built, so a refile never links one session's transcript with another session's quote."""
     if not (rec.get("source") and st.get("symptom")):
         return False
-    payload = {k: v for k, v in {**d, "p_defect": rec.get("p"), "host": rec.get("host")}.items()
-               if v not in (None, "")}
+    one = _detection_defect(fp, st, rec)
+    d = {**d, **{k: one.get(k) for k in (*DETECT_PROVENANCE, "evidence", "quote", "at", "detect_ts")}}
+    payload = {k: v for k, v in {**d, "p_defect": rec.get("p")}.items() if v not in (None, "")}
     db = _pending_db(store)
     try:
         with db:
@@ -6079,15 +6125,12 @@ def _release_refused_alias(lane, store, fp: str, st: dict, lanes: dict, now: flo
                            filed_day=None, rejected_owners=sorted(set(st.get("rejected_owners") or []) | {card})):
         return None
     rec = _detect_record(store, fp)
-    d = {"fingerprint": fp, "component": st.get("component"), "symptom": st.get("symptom"),
-         "session_id": st.get("session_id"), "source": rec.get("source"), "kind": rec.get("kind"),
-         "evidence": rec.get("evidence"), "quote": rec.get("quote") or rec.get("evidence"),
-         "complaint_at": st.get("complaint_at") or rec.get("ts"), "at": rec.get("ts") or st.get("complaint_at")}
+    d = _detection_defect(fp, st, rec)
     requeued = _requeue_detection(store, fp, st, d, rec, now, "alias-release")
     why = f"card refused for {fp}" if card in own else f"card refused for {owner}"
     store.log({"event": "selfheal_adoption_rejected", "fingerprint": fp, "card": card, "was": "adopted",
                "by": "alias_release", "rule": ADOPT_RULE, "why": why, "complaint_owner": owner,
-               "symptom": st.get("symptom"), "session_id": st.get("session_id"), "requeued": requeued})
+               "symptom": st.get("symptom"), "session_id": d.get("session_id"), "requeued": requeued})
     return f"alias adoption of {card} released ({why}); " + ("refile queued" if requeued else "no detection to refile")
 
 
