@@ -1333,6 +1333,24 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
     card_hits = [(s, card_ask_for(s, card_asks, res.get("repeats") or (), reply, relayed=relayed)) for s in res["steps"]]
     restated = [(s, e) for s, e in card_hits if e is not None]
     res["steps"] = [s for s, e in card_hits if e is None]
+    # A Post/approval ask from the chat that posted an open reply-draft card restates that card: the card's Post
+    # button is the ask. Publish nothing for it (defect kanban-354519516c: the extra step kept the chat red).
+    held_by_card, kept = [], []
+    for s in res["steps"]:
+        card = reply_draft_holds(session_id, s.get("kind"), s.get("text"), s.get("verbatim_span"))
+        if card is not None:
+            held_by_card.append((s, card))
+        else:
+            kept.append(s)
+    res["steps"] = kept
+    if held_by_card:
+        with ledger.edit(root) as d:
+            log_ = d.setdefault("reply_draft_asks", [])
+            for s, card in held_by_card:
+                log_.append({"verdict": "reply_draft_holds_ask", "card": card["session_id"], "type": card["type"],
+                             "text": s.get("text"), "verbatim_span": s.get("verbatim_span"),
+                             "session": session_id, "at": now})
+            del log_[:-50]
     # The model may also leave a relay out of "steps" and report it only as a repeat of the card's id: record that
     # too, so every restatement shows in the ledger whichever way the extractor reported it.
     by_id, hit_ids = {e['id']: e for e in card_asks}, {e['id'] for _, e in restated}
@@ -3811,24 +3829,36 @@ def _retire_orphan_owners(store: "ActionStore", ledger: "Ledger", owner: dict, n
 
 
 def _reply_card_facts(owner: dict) -> list[dict]:
+    """This owner's view of the local reply-draft cards (empty unless ``owner`` is this server's own)."""
+    try:
+        if owner != server_owner(owner['storedSessionId']):
+            return []
+    except Exception:
+        return []
+    return _read_reply_cards()
+
+
+def _read_reply_cards() -> list[dict]:
     """Read only this process's profile Inbox; never interpret accepted Post as posted.
 
     Reply producers store uri/target_url (Bluesky), reply_url (X), and the Inbox
-    session_id. They do not store an originating chat. Association is therefore
-    explicit in the owning request, not inferred from an author, title or thread.
+    session_id. The Inbox also records the chat that posted a card (``origin_session``; NULL for
+    cron/no-chat producers and legacy sidecars). Association is the request's explicit card/target
+    reference or that recorded posting chat, never an author, title word or thread.
     Missing/legacy/unreadable state proves nothing and must not create a database.
     """
     try:
-        local = server_owner(owner['storedSessionId'])
-        if owner != local:
-            return []
         c = _ro_connect(home() / 'inbox' / 'inbox.db', timeout=2)
         try:
+            where = "FROM items WHERE type IN ('bsky-reply-draft','x-reply-draft')"
+            try:
+                rows = c.execute("SELECT session_id,type,state,outcome,fields_json,origin_session " + where).fetchall()
+            except sqlite3.OperationalError:  # sidecar older than origin_session
+                rows = [r + (None,) for r in c.execute(
+                    "SELECT session_id,type,state,outcome,fields_json " + where).fetchall()]
             facts = [dict(session_id=sid, type=kind, state=state, outcome=outcome,
-                         fields=json.loads(raw or '{}'))
-                    for sid, kind, state, outcome, raw in c.execute(
-                        "SELECT session_id,type,state,outcome,fields_json FROM items "
-                        "WHERE type IN ('bsky-reply-draft','x-reply-draft')")]
+                         fields=json.loads(raw or '{}'), origin_session=origin or None)
+                     for sid, kind, state, outcome, raw, origin in rows]
         finally:
             c.close()
         # Match Inbox.outcome's effective archive state, including sidebar and
@@ -3852,17 +3882,66 @@ def _reply_card_facts(owner: dict) -> list[dict]:
         return []
 
 
-def _resolved_reply(request: dict, facts: list[dict]) -> Optional[dict]:
-    """Only a duplicate approval/Post ask naming an exact card or target is moot.
+# A duplicate Post/approval ask for a reply draft, by title (retirement). Kept narrow: it only decides which
+# asks a terminal reply card may retire.
+_POST_ASK_TITLE = re.compile(
+    r'\b(?:press\s+(?:the\s+)?post|post\s+(?:this|the)\s+reply|'
+    r'(?:approve|review)\s+(?:(?:the|this)\s+)?(?:reply|draft|card))\b', re.I)
+# Publication guard: the same family, plus common phrasings ("Press **Post** on that card", "Approve posting
+# the reply", "confirm the Bluesky reply draft"). Choices and inputs are never refused (kind check).
+_POST_ASK = re.compile(
+    _POST_ASK_TITLE.pattern
+    + r"|\b(?:press|hit|tap|click)\s+(?:the\s+)?[*_`\"'\u201c]{0,2}post\b"
+    + r"|\bapprov\w*\s+(?:posting|publishing|sending)\b"
+    + r"|\b(?:approve|review|confirm)\s+(?:the|this|that)\s+(?:[\w@.]+[\s-]+){0,3}(?:reply|draft|card)\b", re.I)
+_POST_ASK_KINDS = ('approve', 'do', 'approval', 'external_step')
+_REPLY_CARD_LIVE = ('open', 'accepted')
+
+
+def owned_reply_card(session_id: str) -> Optional[dict]:
+    """The open (or Post-pressed, still running) reply-draft card this chat posted, else None.
+
+    Ownership is the Inbox's recorded posting chat (``origin_session``) within this chat's compression
+    lineage. Unknown/legacy/unreadable Inbox state proves nothing: None.
+    """
+    if not session_id:
+        return None
+    try:
+        owned = set(lineage(session_id))
+        cards = [f for f in _read_reply_cards()
+                 if f.get('origin_session') in owned and f['state'] in _REPLY_CARD_LIVE]
+    except Exception:
+        return None
+    return cards[-1] if cards else None
+
+
+def reply_draft_holds(session_id: str, kind: Optional[str], *texts) -> Optional[dict]:
+    """The owned reply-draft card that already holds this ask, when it is a Post/approval-type ask.
+
+    A pinned reply-draft card IS the ask (its Post button approves and publishes). A second "press Post" step
+    or approval from the chat that made it never closes when Post is pressed and keeps the chat red
+    (defect kanban-354519516c). Choices, inputs and unrelated asks are left alone.
+    """
+    if kind not in _POST_ASK_KINDS or not any(isinstance(t, str) and _POST_ASK.search(t) for t in texts):
+        return None
+    return owned_reply_card(session_id)
+
+
+def reply_draft_hint(card: dict) -> str:
+    return (f"reply-draft card {card['session_id']} already holds this ask (its Post button approves and "
+            f"publishes); tell David it's ready instead of asking again. Nothing was published.")
+
+
+def _resolved_reply(request: dict, facts: list[dict], owned: frozenset = frozenset()) -> Optional[dict]:
+    """Only a duplicate approval/Post ask naming an exact card or target, or one from the chat that posted
+    the card (``owned``: the request chat's lineage, matched against the card's ``origin_session``), is moot.
 
     Do not search thread/summary/author text or generic prose from the request's
     scope: those are context, not a binding. Retain an ask when any matching card
     remains open, accepted, failed or otherwise unproven.
     """
     title = request.get('title', '')
-    if not re.search(
-            r'\b(?:press\s+(?:the\s+)?post|post\s+(?:this|the)\s+reply|'
-            r'(?:approve|review)\s+(?:(?:the|this)\s+)?(?:reply|draft|card))\b', title, re.I):
+    if not _POST_ASK_TITLE.search(title):
         return None
     matched = []
     for f in facts:
@@ -3873,9 +3952,9 @@ def _resolved_reply(request: dict, facts: list[dict]) -> Optional[dict]:
             ('uri', 'target_url') if f['type'] == 'bsky-reply-draft' else ('reply_url',))]
         # URI/id continuation characters cannot turn a prefix into a binding.
         boundary = r'[\w:/?&=.%#@+\-]'
-        if not any(isinstance(v, str) and v and re.search(
-                r'(?<!' + boundary + ')' + re.escape(v) + r'(?!' + boundary + ')', title)
-                   for v in identifiers):
+        named = any(isinstance(v, str) and v and re.search(
+            r'(?<!' + boundary + ')' + re.escape(v) + r'(?!' + boundary + ')', title) for v in identifiers)
+        if not named and not (f.get('origin_session') and f['origin_session'] in owned):
             continue
         if not (f['state'] == 'archived' or
                 (f['state'] == 'resolved' and f['outcome'] in ('posted', 'archived', 'skip', 'skipped'))):
@@ -3915,8 +3994,14 @@ def reconcile_moot(store: "ActionStore", ledger: "Ledger", owner: dict, *, board
         candidates = store.moot_candidates(owner)
         owner_gone = bool(candidates) and _owner_chat_absent(owner)
         reply_facts = _reply_card_facts(owner) if candidates and not owner_gone else []
+        owned = frozenset()
+        if any(f.get('origin_session') for f in reply_facts):
+            try:
+                owned = frozenset(lineage(owner['storedSessionId']))
+            except Exception:
+                owned = frozenset()
         for r, life in candidates:
-            reply = _resolved_reply(r, reply_facts)
+            reply = _resolved_reply(r, reply_facts, owned)
             if reply is not None:
                 try:
                     out.append(withdraw_request(

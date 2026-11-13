@@ -309,13 +309,24 @@ Retirement paths and evidence review:
   Post/reply-approval asks whose title names an exact `bsky-reply-draft` or `x-reply-draft`
   session ID or target URI/URL. The profile-local Inbox is read-only: posted, archived and
   skipped outcomes qualify; `accepted/post` alone does not. A persisted session archive
-  also qualifies (as in Inbox outcome rendering). No origin metadata is stored by these
-  producers, so association requires the explicit identifier in the owning chat's ask;
-  author names, thread contents and general scope prose are not bindings. Unresolved
+  also qualifies (as in Inbox outcome rendering). Association is the explicit identifier in
+  the owning chat's ask, or the card's recorded posting chat: the Inbox stores
+  `items.origin_session` (the tool call's session, or the terminal's per-command
+  `HERMES_SESSION_ID` for `hermes inbox post` / scripts like `bsky_post_reply.py --card`), and
+  a Post-type ask from that chat (or its compression lineage) matches the card even when its
+  title names no card. Author names, thread contents and general scope prose are not
+  bindings. Unresolved
   matching cards, foreign owners and missing evidence keep the ask. Withdrawal records
   the card ID, state and outcome and never touches posting, approval receipts or decision
   operations. Regression/safety coverage: `tests/test_social_reply_withdrawal.py` and
   `tests/test_social_reply_safety.py` (including create → ask → accepted → archived).
+- **reply-draft publication guard**: a chat that posted an open (or Post-pressed) reply-draft
+  card never also publishes a Post/approval-type ask for it: an extracted `approve`/`do` step
+  is recorded under `reply_draft_asks` in the ledger instead of becoming a tile, and an
+  `action_request` approval/external step is refused (409) with "reply-draft card <id>
+  already holds this ask; tell David it's ready". Choices, inputs and asks that are not about
+  posting a reply/draft/card still publish. Legacy cards with no `origin_session` are never
+  treated as owned. Coverage: `tests/test_reply_draft_owner.py` (incident replay included).
 
 - **deleted owner**: `reconcile_moot` withdraws an undecided request by `system` with
   reason `its chat no longer exists` after a successful read confirms the session is absent

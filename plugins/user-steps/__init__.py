@@ -549,6 +549,9 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
         else:
             if 'expectedRevision' in args: raise core.ActionError('New requests have no expectedRevision')
             if refs: raise core.ActionError('Card aliases must be created by decisionCard, not supplied')
+            holder = core.reply_draft_holds(session_id, payload.get('kind'), payload.get('title'))
+            if holder is not None:
+                raise core.ActionError(core.reply_draft_hint(holder), 409)
             # Identity is provenance, never the title. A new publication revises an open request in place only
             # when it cites that request's own extracted step (an exact qualified user_step ref of this owner in
             # aliases or scope.sourceRefs), or re-sends the exact same request (a retry). An equal title alone is
