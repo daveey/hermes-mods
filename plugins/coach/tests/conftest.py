@@ -1,3 +1,4 @@
+import functools
 import importlib.util
 import os
 from pathlib import Path
@@ -425,11 +426,28 @@ BOARD_GATEWAY = "gw-board-a"
 def board_identity(monkeypatch):
     """Core's own enrollment answers for the home machine pin: a synced board whose configured gateway is
     ``BOARD_GATEWAY``. Replaced (not read from the real host config), so no test depends on where it runs.
-    ``board_identity.set(synced=..., gateway=..., error=...)`` re-points it; the default is synced + named."""
+    ``board_identity.set(synced=..., gateway=..., error=...)`` re-points it; the default is synced + named.
+
+    Without core (``--no-core`` CI) there is nothing to patch in core, and ``placement_evidence._core_identity``
+    would answer (False, None) itself. Its one seam is then replaced on every loaded copy of placement_evidence.py
+    (package import, self_heal's spec-loaded copy, the tests' own ``pe`` copies), so the same synced default holds."""
     from types import SimpleNamespace
-    pytest.importorskip("hermes_cli.kanban_db_sync")
-    from hermes_cli import kanban_db_sync, kanban_sync_client
     state = {"synced": True, "gateway": BOARD_GATEWAY, "error": None}
+    handle = SimpleNamespace(gateway=BOARD_GATEWAY, set=lambda **kw: state.update(kw), state=state)
+    try:
+        from hermes_cli import kanban_db_sync, kanban_sync_client
+    except ModuleNotFoundError as exc:
+        if exc.name != "hermes_cli":  # core is there but broken: fail loudly, never fall back silently
+            raise
+        def core_identity():  # the same order as core: unsynced wins, then a failed identity read raises
+            if not state["synced"]:
+                return False, None
+            if state["error"]:
+                raise RuntimeError(state["error"])
+            return True, state["gateway"]
+        for mod in _placement_evidence_copies():
+            monkeypatch.setattr(mod, "_core_identity", core_identity)
+        return handle
 
     def load_identity(*_a, **_k):
         if state["error"]:
@@ -438,4 +456,35 @@ def board_identity(monkeypatch):
 
     monkeypatch.setattr(kanban_db_sync, "sync_enabled", lambda: state["synced"])
     monkeypatch.setattr(kanban_sync_client, "load_identity", load_identity)
-    return SimpleNamespace(gateway=BOARD_GATEWAY, set=lambda **kw: state.update(kw), state=state)
+    return handle
+
+
+@functools.lru_cache(maxsize=None)
+def _realpath(path):
+    return os.path.realpath(path)
+
+
+def _placement_evidence_copies():
+    """Every loaded module object executed from coach's placement_evidence.py. Spec-loaded copies are often not in
+    sys.modules (self_heal's ``_placement_evidence`` fallback), so coach-owned modules' attributes are searched too."""
+    import types
+    root = os.path.realpath(Path(__file__).resolve().parents[1])
+    target = os.path.join(root, "placement_evidence.py")
+
+    def path_of(mod):
+        f = getattr(mod, "__file__", None)
+        return _realpath(f) if isinstance(f, str) else None
+
+    found = {}
+    for mod in list(sys.modules.values()):
+        if not isinstance(mod, types.ModuleType):
+            continue
+        p = path_of(mod)
+        if p == target:
+            found[id(mod)] = mod
+        if not p or not p.startswith(root + os.sep):
+            continue
+        for val in list(vars(mod).values()):
+            if isinstance(val, types.ModuleType) and path_of(val) == target:
+                found[id(val)] = val
+    return list(found.values())
