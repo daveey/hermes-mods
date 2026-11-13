@@ -116,7 +116,9 @@ def test_local_boards_read_once_per_pass_with_the_same_answer(tmp_path, monkeypa
     opens.clear()
     statements.clear()
     assert plugin.waiting_source() == expected
-    assert len(opens) == 0
+    # The board is not opened again (its retained observer). The declared-inputs pass (WAITING-INPUTS.md) opens the
+    # ledger's observer and each state.db for the lineage watermarks: never the board.
+    assert [p for p in opens if p == board] == []
     assert sum(s.startswith('SELECT t.id') for s in statements) == 1  # union still read once per pass
     read = plugin._pass_reader()
     assert read(['t_3']) == plugin.read_cards(['t_3']) and read(['t_absent']) == {}
