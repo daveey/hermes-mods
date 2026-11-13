@@ -824,3 +824,129 @@ def test_the_publication_gate_holds_a_new_approval_beside_an_unrelated_ready_one
 def test_hyphenated_words_are_not_menu_letters():
     assert core._lettered_menu(['B-tree index on users', 'E-mail the owner']) is None
     assert core._lettered_menu(['A - lane plus jobs', 'B - sub-minute jobs only']) is not None
+
+
+# ---- re-review of PR #93 (card t_01a1d6a6bd2f3f8b): a menu needs a subject anchor, a quote must BE the ask ---------
+
+def test_directly_asks_still_blanks_short_quotes():
+    # The new 40+ char card-ask pattern must not rebind the module's _QUOTED (directly_asks, silent default).
+    assert core.directly_asks('The card log says "please approve it".') is False
+    assert core.directly_asks('Its title was "Can you confirm?" earlier.') is False
+    assert core.directly_asks('Can you confirm?') is True
+
+
+def _two_replies(tmp_path, t1, s1, t2, s2):
+    store, ledger = env(tmp_path)
+    reply(store, ledger, t1, [s1])
+    assert len(live(store)) == 1
+    reply(store, ledger, t2, [s2])
+    return store
+
+
+_PR_MENU = ['A: rebase and merge it', 'B: close it unmerged', 'C: leave it for review']
+_RUNNER_MENU = ['A: Blacksmith macOS runner (~$120/mo)', 'B: self-hosted mini runner (free)']
+
+
+@pytest.mark.parametrize('t1,s1,t2,s2', [
+    pytest.param(  # r1: one PR menu for two PRs
+        'PR #12 (login fix) is green. What should I do with it? A: rebase and merge it, B: close it unmerged, C: leave '
+        'it for review.', {'text': 'Decide PR #12', 'options': _PR_MENU},
+        'Separately, PR #13 (billing refactor) is green too. A: rebase and merge it, B: close it unmerged, C: leave '
+        'it for review.', {'text': 'Decide PR #13', 'options': _PR_MENU}, id='r1-same-pr-menu-two-prs'),
+    pytest.param(  # r2: one cost menu for two repos
+        'hermes-mods macOS CI: A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini runner (free)?',
+        {'text': 'Pick the hermes-mods macOS runner', 'options': _RUNNER_MENU},
+        'babybear macOS CI, a separate budget line: A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini '
+        'runner (free)?', {'text': 'Pick the babybear macOS runner', 'options': _RUNNER_MENU}, id='r2-cost-menu-two-repos'),
+    pytest.param(  # r3: longer generic labels for two projects
+        'Database migration: A: go ahead with the proposed plan today, B: hold off until next week.',
+        {'text': 'Decide the DB migration timing',
+         'options': ['A: go ahead with the proposed plan today', 'B: hold off until next week']},
+        'Logo redesign: A: go ahead with the proposed plan today, B: hold off until next week.',
+        {'text': 'Decide the logo redesign timing',
+         'options': ['A: go ahead with the proposed plan today', 'B: hold off until next week']}, id='r3-generic-labels'),
+    pytest.param(  # r4: cost figures shared across compute vs storage menus
+        'Which CI compute should we buy? A: Blacksmith 6vcpu runner (~$120/mo), B: GitHub larger runner (~$770/mo)?',
+        {'text': 'Pick CI compute', 'options': ['A: Blacksmith 6vcpu runner ~$120/mo', 'B: GitHub larger runner ~$770/mo']},
+        'Which artifact storage should we buy? A: Blacksmith storage add-on (~$120/mo), B: GitHub storage add-on '
+        '(~$770/mo)?', {'text': 'Pick artifact storage',
+                        'options': ['A: Blacksmith storage add-on ~$120/mo', 'B: GitHub storage add-on ~$770/mo']},
+        id='r4-shared-cost-figures'),
+])
+def test_the_same_menu_for_another_subject_is_a_new_ask(tmp_path, t1, s1, t2, s2):
+    store = _two_replies(tmp_path, t1, {**s1, 'kind': 'choose', 'verbatim_span': t1},
+                         t2, {**s2, 'kind': 'choose', 'verbatim_span': t2})
+    assert len(live(store)) == 2, [r['title'] for r in live(store)]
+
+
+_GENERIC_PICK_Q = '"If you pick A, an agent does the work; if you pick B, nothing changes."'
+_GENERIC_APPROVE_Q = '"If you approve, an agent runs it as planned; if you decline, nothing changes."'
+
+
+def test_quoted_boilerplate_in_scope_and_span_is_not_the_open_ask(tmp_path):
+    # r5: the open choice's paragraph quotes generic card boilerplate; a later question quotes it too.
+    store, ledger = env(tmp_path)
+    t1 = f'The cache-store card asks: {_GENERIC_PICK_Q} A is Redis, B is SQLite.'
+    reply(store, ledger, t1, [{'text': 'Pick the cache store', 'kind': 'choose', 'verbatim_span': 'A is Redis, B is SQLite.',
+                               'options': ['A: Redis', 'B: SQLite']}])
+    assert len(live(store)) == 1
+    t2 = f'The logo-colour card asks the same: {_GENERIC_PICK_Q} So should the logo be blue or green?'
+    reply(store, ledger, t2, [{'text': 'Pick the logo colour', 'kind': 'choose', 'verbatim_span': t2,
+                               'options': ['A: blue', 'B: green']}])
+    assert len(live(store)) == 2, [r['title'] for r in live(store)]
+
+
+def test_a_new_approval_quoting_a_producer_approvals_boilerplate_is_a_new_ask(tmp_path):
+    # r6: approval scope quotes generic terms; a new approval quotes them beside its own question.
+    store, ledger = env(tmp_path)
+    store.create(dict(OWNER), approval('Deploy build 9 to the hub',
+                                       markdown=f'The deploy card asks: {_GENERIC_APPROVE_Q}\n\nDeploy build 9 and restart.'))
+    text = f'Same terms as the deploy, {_GENERIC_APPROVE_Q} Should I also rotate the GitHub deploy key now?'
+    reply(store, ledger, text, [{'text': 'Approve rotating the deploy key', 'kind': 'approve', 'verbatim_span': text,
+                                 'options': []}])
+    assert len(live(store)) == 2, [r['title'] for r in live(store)]
+
+
+def test_the_publication_gate_holds_a_new_approval_quoting_ready_boilerplate(plugin, monkeypatch):
+    # r7: r6 through publication_buffer: the rotate-key approval is not "covered" by the ready deploy approval.
+    store = plugin.core.ActionStore()
+    store.create(dict(OWNER), approval('Deploy build 9 to the hub',
+                                       markdown=f'The deploy card asks: {_GENERIC_APPROVE_Q}\n\nDeploy build 9 and restart.'))
+    text = f'Same terms as the deploy, {_GENERIC_APPROVE_Q} Should I also rotate the GitHub deploy key now?'
+    monkeypatch.setattr(plugin, 'aux_llm', lambda *a: json.dumps({'steps': [
+        {'text': 'Approve rotating the deploy key', 'kind': 'approve', 'verbatim_span': text, 'options': []}],
+        'resolved': []}))
+    out = plugin.publication_buffer(session_id='session-a', platform='cli', final_response=text)
+    assert out and out.get('hold') is True, out
+
+
+def test_the_open_card_ask_quoted_beside_a_new_question_in_one_sentence_is_a_new_ask(tmp_path):
+    # r8: the quote is in the evidence sentence, but the sentence asks its own question.
+    store, ledger = env(tmp_path)
+    reply(store, ledger, NEEDS_YOU_1108, [dict(STEP_852F)])
+    span = f'Beyond the card ask {TESTS_OS_ASK} should the new lane also run on Linux, yes or no?'
+    reply(store, ledger, span, [{'text': 'Should the new lane also run on Linux?', 'kind': 'choose',
+                                 'verbatim_span': span, 'options': ['A: yes', 'B: no']}])
+    assert len(live(store)) == 2, [r['title'] for r in live(store)]
+
+
+def test_the_restated_card_ask_alone_as_evidence_is_inside_the_open_scope(tmp_path):
+    # Positive twin of r8: the evidence sentence IS the quoted card ask, nothing else asked.
+    store, ledger = env(tmp_path)
+    _open_macos_tile(store, ledger)
+    text = f'The tests-os card still asks: {TESTS_OS_ASK}'
+    [ask] = core.open_asks(store, dict(OWNER))
+    assert core.inside_open_scope({**STEP_60B8, 'verbatim_span': text}, ask, text)
+    assert not core.inside_open_scope({**STEP_60B8, 'verbatim_span': text + ' Also, Linux too?'}, ask,
+                                      text + ' Also, Linux too?')
+    reply(store, ledger, text, [{**STEP_60B8, 'verbatim_span': text}])
+    assert len(live(store)) == 1
+
+
+def test_menu_identity_needs_the_same_subject():
+    ask = {'id': 'r1', 'kind': 'choice', 'title': 'Pick macOS CI option', 'labels': [], 'scope': '',
+           'step': {'id': 'us_r1', 'text': STEP_852F['text'], 'options': list(STEP_852F['options']),
+                    'verbatim_span': 'x'}}
+    assert core.same_lettered_menu(dict(STEP_64AE), ask)
+    assert not core.same_lettered_menu({**STEP_64AE, 'text': 'Pick babybear CI option A, B, or C'}, ask)
+    assert core._subject('Pick macOS CI option A, B, or C (B recommended)') == {'macos', 'ci'}

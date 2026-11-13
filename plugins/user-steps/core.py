@@ -1847,8 +1847,9 @@ def split_repeats(repeats, tiles: dict, reply: str) -> tuple[list, list]:
 # Live MacBook chat ..f07c32: request 2948b7f0 held both macOS CI picks. A later reply minted one tile from a bare
 # reminder sentence ("Two macOS CI choices still need you.") read with the same A/B/C menu reworded, and one from
 # the restated second question, whose card ask the open request's scope already quoted. Both rules are LATER-reply
-# only (an ask minted in this reply is never their target) and need the step's own specific menu or a quoted card
-# ask, never a title, a generic menu (yes/no) or a bare scope sentence (independent review of PR #93).
+# only (an ask minted in this reply is never their target) and need the step's own specific menu AND subject, or a
+# quoted card ask with its own lettered menu that is the step's whole ask; never a title, a generic menu (yes/no),
+# a menu alone, quoted boilerplate or a bare scope sentence (independent reviews of PR #93).
 
 _LETTERED = re.compile(r"^\s*\(?([a-h])\s*(?:[):.=\u2013\u2014]|-(?=\s))\s*(\S.*)$", re.I)
 # Words that say nothing about WHICH decision a label belongs to: function words, units and generic answers
@@ -1857,7 +1858,13 @@ _LABEL_STOP = frozenset("""a an the to on of in at for with and or but by from a
     be do does me my your you i we us our them they now then just only also all any some per mo month day week hr
     yes no ok okay sure not none either neither other else approve approved decline declined accept reject skip
     go ahead stop wait later continue proceed keep change leave""".split())
-_QUOTED = re.compile(r'"([^"\n]{40,})"')
+# NOT named _QUOTED: that module-level pattern (directly_asks, the silent-default check) blanks EVERY quote.
+_QUOTED_ASK = re.compile(r'"([^"\n]{40,})"')
+# An inline lettered menu inside a quoted card ask: "A) PR lane ...", "A = move ...", "A: ...".
+_INLINE_LETTER = re.compile(r"(?:^|[\s;,(])([a-h])\s*(?:\)|=|:)\s+")
+# Words that name no subject in a step's text ("Pick macOS CI option A, B, or C (B recommended)" -> {macos, ci}).
+_SUBJECT_STOP = _LABEL_STOP | frozenset("""pick choose decide select option options choice choices recommended
+    which what how should whether answer reply letter one""".split())
 _LABEL_MATCH = 0.6
 _LABEL_SHARED_MIN = 2   # specific words a matched pair of labels must share
 
@@ -1904,8 +1911,19 @@ def same_lettered_menu(candidate: dict, ask: dict) -> bool:
     mine = _lettered_menu(candidate.get('options'))
     step = ask.get('step') if isinstance(ask.get('step'), dict) else {}
     theirs = _lettered_menu(step.get('options')) or _lettered_menu(ask.get('labels'))
-    return bool(mine and theirs and mine.keys() == theirs.keys()
-                and all(_same_label(mine[k], theirs[k]) for k in mine))
+    if not (mine and theirs and mine.keys() == theirs.keys()
+            and all(_same_label(mine[k], theirs[k]) for k in mine)):
+        return False
+    # A menu says nothing about the subject (the same runner menu for two repos, "go ahead today / hold off" for
+    # two projects): the step's subject must also be the open ask's own, word for word.
+    subject = _subject(candidate.get('text'))
+    return bool(subject) and subject in (_subject(step.get('text')), _subject(ask.get('title')))
+
+
+def _subject(text) -> frozenset:
+    """The words of a step text or title that name WHAT is decided: no verbs of choosing, no letters, no
+    function words ("Pick macOS CI option A, B, or C (B recommended)" -> {macos, ci})."""
+    return frozenset(w for w in _label_words(str(text or "")) if len(w) > 1 and w not in _SUBJECT_STOP)
 
 
 def inside_open_scope(candidate: dict, ask: dict, reply: str = "") -> bool:
@@ -1921,13 +1939,36 @@ def inside_open_scope(candidate: dict, ask: dict, reply: str = "") -> bool:
         return False
     menu = [_words(_LETTERED.sub(r"\2", str(o or ""))) for o in candidate.get('options') or ()]
     menu_ok = len(menu) >= 2 and all(menu)
-    for q in _QUOTED.findall(_norm(block["text"])):
+    span = str(candidate.get('verbatim_span') or "")
+    nspan = _norm(span)
+    for q in _QUOTED_ASK.findall(_norm(block["text"])):
         q = q.strip()
-        if q not in scope:
+        if q not in scope or not _quoted_menu_ask(q):
             continue
-        if q in _norm(str(candidate.get('verbatim_span') or "")) or (menu_ok and all(m <= _words(q) for m in menu)):
+        if q in nspan:
+            # The quote is this step's ask only when the rest of the sentence asks nothing of its own ("Beyond the
+            # card ask "..." should the lane also run on Linux?" is a new question beside the open one).
+            if not _asks_on_its_own(nspan.replace(q, " ")):
+                return True
+        elif menu_ok and all(m <= _words(q) for m in menu) and not _asks_on_its_own(nspan):
             return True
     return False
+
+
+def _quoted_menu_ask(q: str) -> bool:
+    """A quoted card ask that carries its own specific lettered menu ("Pick how ...: A) PR lane on the mini, B)
+    scheduled non-required lane, C) keep manual."). Boilerplate ("If you pick A, an agent does the work; if you
+    pick B, nothing changes.", "If you approve, ... if you decline, nothing changes.") has none."""
+    parts = _INLINE_LETTER.split(q)
+    # split -> [lead, letter, label, letter, label, ...]
+    labels = [f"{parts[i]}: {parts[i + 1].strip(' ;,.')}" for i in range(1, len(parts) - 1, 2)]
+    return _lettered_menu(labels) is not None
+
+
+def _asks_on_its_own(text: str) -> bool:
+    """A question mark or a direct request outside quotes."""
+    t = re.sub(r'"[^"]*"', '""', text or "")
+    return "?" in t or directly_asks(t)
 
 
 def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optional[dict] = None,
