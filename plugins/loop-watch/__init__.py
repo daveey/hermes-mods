@@ -101,3 +101,16 @@ def register(ctx) -> None:
             heap.start(home)
         except Exception:  # noqa: BLE001 - a diagnostic must never break plugin registration
             pass
+    # Default-off owner census (no tracemalloc): arms only from the home's private arm file, read here so
+    # a plugin reload can arm a running process. See roots.py.
+    try:
+        try:
+            from . import roots
+        except ImportError:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("loop_watch_roots", Path(__file__).with_name("roots.py"))
+            roots = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(roots)
+        roots.start(home)
+    except Exception:  # noqa: BLE001 - a diagnostic must never break plugin registration
+        pass

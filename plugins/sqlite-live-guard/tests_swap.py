@@ -9,6 +9,8 @@ every pid and refuses an unreadable one (test_unscoped_scan_still_fails_closed).
 SWAP_TEST_PRIVILEGED_SCAN=1 (implied on GitHub Actions) instead runs the real
 whole-host scan through the helper's sudo read-only scanner.
 Core-backed cases skip without core.
+The holder scan is Linux-only: on a host without /proc/self/fd (macOS) the cases
+that reach it skip (needs_proc); test_missing_proc_refuses asserts the CLI refusal.
 """
 import contextlib
 import fcntl
@@ -49,6 +51,9 @@ SCOPE = '' if PRIVILEGED else (
     ' return [p for p in listed if p.name.isdigit() and mine(int(p.name))]\n'
     'm._proc_entries=_scoped\n')
 PREAMBLE = LOAD + SCOPE
+HAS_PROC = Path('/proc/self/fd').is_dir()
+# Only for cases that get as far as the holder scan; cases refused earlier run on every host.
+needs_proc = unittest.skipUnless(HAS_PROC, 'needs the Linux holder scan: this host has no /proc/self/fd')
 
 
 def database(path, sql='CREATE TABLE sessions(id TEXT PRIMARY KEY); INSERT INTO sessions VALUES("saved");'):
@@ -102,6 +107,7 @@ class SwapCLI(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(path)) as con:
             con.executescript(sql)
 
+    @needs_proc
     def test_normal_install(self):
         self.successful(self.cli('--stop-unit', 'fixture.service'))
         self.assertEqual((self.root / 'units.log').read_text().splitlines(),
@@ -114,6 +120,7 @@ class SwapCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn('another recovery', result.stderr)
 
+    @needs_proc
     def test_core_maintenance_lock(self):
         self.state()
         with open(self.db.parent / 'gateway.lock', 'a+b') as lock:
@@ -122,6 +129,7 @@ class SwapCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn('Exclusive maintenance refused', result.stderr)
 
+    @needs_proc
     def test_allowed_empty_runtime_omission_requires_ack(self):
         self.state()
         self.add(self.db, 'CREATE TABLE worker_receipts(id TEXT);')
@@ -132,12 +140,14 @@ class SwapCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('worker_receipts', result.stdout)
 
+    @needs_proc
     def test_allowed_omission_install(self):
         self.state()
         self.add(self.db, 'CREATE TABLE worker_receipts(id TEXT);')
         self.assertEqual((r := self.cli('--recovered-state', '--ack-runtime-loss')).returncode, 0,
                          r.stdout + r.stderr)
 
+    @needs_proc
     def test_unknown_and_durable_omissions_fail(self):
         for table in ('hosted_room_unknown', 'security_revocations', 'delivery_obligations'):
             with self.subTest(table=table):
@@ -147,6 +157,7 @@ class SwapCLI(unittest.TestCase):
                 self.assertIn(table, result.stderr)
                 self.add(self.db, f'DROP TABLE {table};')
 
+    @needs_proc
     def test_recreated_empty_security_table_is_not_preservation(self):
         self.state()
         self.add(self.db, 'CREATE TABLE security_revocations(id TEXT); INSERT INTO security_revocations VALUES("revoked");')
@@ -155,6 +166,7 @@ class SwapCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn('row loss in security_revocations', result.stderr)
 
+    @needs_proc
     def test_populated_runtime_idempotency_omission_refused(self):
         self.state()
         self.add(self.db, 'CREATE TABLE session_admissions(id TEXT); INSERT INTO session_admissions VALUES("already-started");')
@@ -162,6 +174,7 @@ class SwapCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn('row loss in session_admissions', result.stderr)
 
+    @needs_proc
     def test_epoch_floor_retained(self):
         self.state()
         self.add(self.db, 'CREATE TABLE runtime_epoch(singleton INTEGER PRIMARY KEY, epoch INTEGER, instance_id TEXT); INSERT INTO runtime_epoch VALUES(1,42,"old");')
@@ -176,6 +189,7 @@ class SwapCLI(unittest.TestCase):
         self.assertIn('foreign_key_check', result.stderr)
         self.assertFalse((self.root / 'units.log').exists())
 
+    @needs_proc
     def test_replacement_committed_wal_included(self):
         con = sqlite3.connect(self.replacement)
         self.addCleanup(con.close)
@@ -209,6 +223,7 @@ class SwapCLI(unittest.TestCase):
         self.assertEqual(proc.stdout.readline().strip(), 'ready')
         return proc
 
+    @needs_proc
     def test_live_ssh_serve_holder_blocks_and_no_abort_restart(self):
         proc = self.holder()
         result = self.cli('--stop-unit', 'fixture.service')
@@ -221,6 +236,7 @@ class SwapCLI(unittest.TestCase):
         self.assertEqual((self.root / 'units.log').read_text(), '--user stop -- fixture.service\n')
         self.assertTrue(self.db.exists())
 
+    @needs_proc
     def test_active_sidecar_holder_blocks(self):
         proc = self.holder('-wal')
         result = self.cli()
@@ -228,24 +244,28 @@ class SwapCLI(unittest.TestCase):
         self.assertIn(str(proc.pid), result.stderr)
         self.assertIn('fixture.db-wal', result.stderr)
 
+    @needs_proc
     def test_deleted_sidecar_holder_blocks(self):
         self.holder('-wal', deleted=True)
         result = self.cli()
         self.assertEqual(result.returncode, 2)
         self.assertIn('(deleted)', result.stderr)
 
+    @needs_proc
     def test_mmap_only_deleted_sidecar_blocks(self):
         self.holder('-shm', deleted=True, mapped=True)
         result = self.cli()
         self.assertEqual(result.returncode, 2)
         self.assertIn('(deleted)', result.stderr)
 
+    @needs_proc
     def test_unreadable_original_refused(self):
         self.db.write_bytes(b'not a sqlite database')
         result = self.cli()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(self.db.read_bytes(), b'not a sqlite database')
 
+    @needs_proc
     def test_partial_rename_never_restarts_and_retry_refuses(self):
         # Only OS fault injection; execute the actual argparse CLI and all real SQLite paths.
         wrapper = self.root / 'fault.py'
@@ -272,6 +292,7 @@ class SwapCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn('requires --recovered-state', result.stderr)
 
+    @needs_proc
     def test_autoincrement_floor_preserved(self):
         self.state()
         for path in (self.db, self.replacement):
@@ -282,6 +303,7 @@ class SwapCLI(unittest.TestCase):
             con.execute('INSERT INTO messages DEFAULT VALUES')
             self.assertEqual(con.execute('SELECT max(id) FROM messages').fetchone(), (1001,))
 
+    @needs_proc
     def test_empty_runtime_omission_preserves_historical_sequence(self):
         self.state()
         for path in (self.db, self.replacement):
@@ -292,6 +314,7 @@ class SwapCLI(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(self.db)) as con:
             self.assertEqual(con.execute('SELECT seq FROM sqlite_sequence WHERE name="session_admissions"').fetchone(), (100,))
 
+    @needs_proc
     def test_post_rename_original_holder_blocks(self):
         # Simulate an uncoordinated reader opening just after the last pre-rename scan.
         child = self.root / 'late_holder.py'
@@ -309,6 +332,7 @@ class SwapCLI(unittest.TestCase):
         self.assertTrue(Path(str(self.db) + '.swap-pending.json').exists())
         self.assertEqual((self.root / 'units.log').read_text(), '--user stop -- fixture.service\n')
 
+    @needs_proc
     def test_actual_sessions_recover_then_install(self):
         self.state()
         self.db.unlink()
@@ -329,6 +353,7 @@ class SwapCLI(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(self.db)) as con:
             self.assertEqual(con.execute('SELECT id FROM sessions').fetchall(), [('fixture-session',)])
 
+    @needs_proc
     def test_recheck_before_rename(self):
         wrapper = self.root / 'racer.py'
         wrapper.write_text(PREAMBLE
@@ -339,6 +364,7 @@ class SwapCLI(unittest.TestCase):
         self.assertIn('fixture late holder', result.stderr)
         self.assertTrue(self.db.exists())
 
+    @needs_proc
     def test_unscoped_scan_still_fails_closed(self):
         # The test scope must not hide production's refusal of an unreadable pid.
         if PRIVILEGED or os.access('/proc/1/fd', os.R_OK):
@@ -347,6 +373,28 @@ class SwapCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn('incomplete holder scan', result.stderr)
         self.assertTrue(self.db.exists())
+
+
+    def test_missing_proc_refuses(self):
+        # Real unsupported-host CLI on macOS; fault only the capability probe on Linux.
+        script = SCRIPT
+        if HAS_PROC:
+            script = self.root / 'noproc.py'
+            script.write_text(LOAD
+                + 'real=m.Path.is_dir\n'
+                + 'm.Path.is_dir=lambda self: False if str(self)=="/proc/self/fd" else real(self)\n'
+                + 'sys.exit(m.main())\n')
+        # Keep the probe in this process, even on privileged CI (sudo starts a fresh interpreter).
+        result = subprocess.run([sys.executable, str(script), '--db', str(self.db),
+                                 '--replacement', str(self.replacement), '--wait', '0',
+                                 '--stop-unit', 'fixture.service'],
+                                env=self.env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('holder inspection requires Linux /proc', result.stderr)
+        self.assertEqual((self.root / 'units.log').read_text(), '--user stop -- fixture.service\n')
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            self.assertEqual(con.execute('SELECT id FROM sessions').fetchall(), [('saved',)])
+        self.assertFalse(list(self.root.glob('.*.recovery-*/original.db')))
 
 
 if __name__ == '__main__':

@@ -419,8 +419,8 @@ def _patch_id(diff, cwd):
 # two parents gives over their merge base. Read through gh like the rest of the carry (no fetch, no credentials
 # in git, no cache on disk); only a path both parents changed differently is merged locally, by `git merge-file`
 # on the three blobs, and any conflict, add/add, modify/delete, symlink, submodule or oversized blob refuses.
-# That is never looser than `git merge-tree --write-tree`: it only lacks rename detection, so a rename on one
-# side meeting an edit on the other refuses (fail closed) where merge-tree would merge it.
+# This is a rejection prefilter, NOT proof of a clean Git merge: rename/delete can look clean path by path.
+# Every survivor also passes `_git_merge_tree_refusal`, including Git's rename/conflict handling.
 _MERGE_FILES = 8             # paths per merge both parents changed differently (content-merged locally)
 _MERGE_BLOB_BYTES = 1 << 20  # largest blob read for such a content merge
 _FILE_MODES = ("100644", "100755")
@@ -536,6 +536,62 @@ def _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache):
     return ""
 
 
+def _git_merge_tree_refusal(merge, ours, theirs, repo, cwd, env):
+    """Authoritative merge-tree check; a bounded shallow fetch may refuse, never guess."""
+    import tempfile
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or not all(
+            isinstance(s, str) and _SHA.fullmatch(s) for s in (merge, ours, theirs)):
+        return "merge-tree inputs are unreadable"
+    run_env = {k: v for k, v in {**os.environ, **env}.items() if not k.startswith("GIT_")}
+    run_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0")
+    home = Path(run_env.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    step = "cache"
+    try:
+        cache = home / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ship-carry-", dir=cache) as tmp:
+            def git(*args):
+                nonlocal step
+                step = args[0]
+                p = subprocess.run(["git", "-c", "core.hooksPath=" + os.devnull,
+                                    "-c", "credential.helper=!gh auth git-credential", *args],
+                                   cwd=tmp, env=run_env, capture_output=True, text=True, timeout=30)
+                if p.returncode != 0:
+                    raise _Unreadable(f"git {step} exited {p.returncode}")
+                if not isinstance(p.stdout, str):
+                    raise _Unreadable(f"git {step} returned unreadable output")
+                return p.stdout.strip()
+
+            git("init", "--bare", "--template=", "-q")
+            # Fetch full blobs: avoids lazy fetch subprocesses inside merge-tree and
+            # their separate auth/timeouts. Depth and wall time bound the attempt.
+            git("fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--depth=128",
+                "https://github.com/" + repo + ".git", merge, ours, theirs)
+            parents = git("show", "-s", "--format=%P", merge).split()
+            if parents != [ours, theirs]:
+                return "fetched merge parents differ from the reported parents"
+            bases = git("merge-base", "--all", ours, theirs).split()
+            if len(bases) != 1 or not _SHA.fullmatch(bases[0]):
+                return "merge base is unreadable or multiple (cannot prove bounded history)"
+            shallow = Path(tmp, "shallow")
+            if shallow.exists():
+                cuts = set(shallow.read_text().split())
+                relevant = set(git("rev-list", ours, theirs, "--not", bases[0]).split())
+                if cuts & relevant:
+                    return "fetch depth cuts history before the merge base"
+            want = git("merge-tree", "--write-tree", ours, theirs)
+            have = git("rev-parse", merge + "^{tree}")
+            if not _SHA.fullmatch(want) or not _SHA.fullmatch(have):
+                return "merge-tree returned an unreadable tree id"
+            if have != want:
+                return "its tree differs from the clean merge computed by git merge-tree"
+    except _Unreadable as e:
+        return str(e)
+    except (OSError, UnicodeError, subprocess.SubprocessError) as e:
+        return f"git {step} could not complete ({type(e).__name__})"
+    return ""
+
+
 def _carried_approval(head, data, repo, cwd, env):
     """(True, H0) when an approval of an earlier head H0 counts for `head`, else (False, why-or-'').
 
@@ -611,6 +667,8 @@ def _carry_one(head, h0, blocked, repo, cwd, env):
     try:
         for merge, ours, theirs in reversed(merges):
             why = _merge_tree_refusal(merge, ours, theirs, repo, cwd, env, cache)
+            if not why:
+                why = _git_merge_tree_refusal(merge, ours, theirs, repo, cwd, env)
             if why:
                 return False, f"{lead}: merge {merge[:10]} is not a clean, unedited merge of the base: {why}"
     except _Unreadable as e:

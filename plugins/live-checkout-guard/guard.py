@@ -203,7 +203,13 @@ def in_root(path: str, cwd: Optional[str] = None) -> bool:
 
 def write_where(path: str, cwd: Optional[str] = None) -> Optional[str]:
     """Where writing ``path`` would land, when that is refused (see ``_write_where``); else None."""
-    return _write_where(_resolve(path, cwd))
+    resolved = _resolve(path, cwd)
+    if resolved is None and path and path[0] not in "/~$`" and _SHELL_VARS.get() is not None:
+        # A relative output such as pr$n.json can still hit the current checkout
+        # even when a loop variable is not statically known. Absolute evidence
+        # paths retain their existing treatment.
+        return _write_where(_resolve(".", cwd))
+    return _write_where(resolved)
 
 
 def core_message(why: str) -> str:
@@ -1442,19 +1448,29 @@ def _check_segment(words: list[str], targets: list[str], cwd: str) -> tuple[Opti
         for m in filter(None, assigns):
             shell_vars[m.group(1)] = _expand(m.group(2)) if m.group(2) else ""
         return None, seg_cwd
+    shell_chdir = bool(words and words[0] in {"cd", "pushd", "command", "builtin"})
     words, cwd, git_env = _strip_wrappers(words, cwd)
     if not words:
         return None, seg_cwd
     why, new_cwd = _check_words(words, cwd, git_env)
     # env -C / sudo -D move the cwd for that one command only; cd/pushd move it for later segments
-    return why, (new_cwd if os.path.basename(words[0]) in {"cd", "pushd"} else seg_cwd)
+    return why, (new_cwd if shell_chdir and words[0] in {"cd", "pushd"} else seg_cwd)
 
 
 def _check_words(words: list[str], cwd: str, git_env: dict) -> tuple[Optional[str], str]:
     cmd = os.path.basename(words[0])
     args = words[1:]
     if cmd in {"cd", "pushd"}:
-        raw = args[0] if args and not args[0].startswith("-") else (args[1] if len(args) > 1 else "~")
+        operands = args[:]
+        while operands and operands[0] in {"-L", "-P", "-e"}:
+            operands.pop(0)
+        if operands[:1] == ["--"]:
+            operands.pop(0)
+        if len(operands) > 1 or (operands and operands[0].startswith(("-", "+"))):
+            return None, UNKNOWN_CWD
+        if not operands and cmd == "pushd":
+            return None, UNKNOWN_CWD  # directory stack is not statically known
+        raw = operands[0] if operands else "~"
         tgt = _expand(raw)
         if tgt is None or (not os.path.isabs(tgt) and cwd.startswith(UNKNOWN_CWD)):
             return None, UNKNOWN_CWD  # `cd $UNSET` / `cd $(...)`: later relative paths are not proven inside
@@ -1635,6 +1651,63 @@ def _check_update(source: str, cwd: str, approved: bool = False, depth: int = 0)
     return None
 
 
+def _cwd_segments(toks: list[str]) -> list[tuple[list[str], str]]:
+    """Keep operators: a successful cd only dominates the rest of its && list."""
+    out, cur = [], []
+    for t in toks:
+        if t in SEPARATORS or t and set(t) <= set(";&|()"):
+            out.append((cur, t))
+            cur = []
+        else:
+            cur.append(t)
+    out.append((cur, ""))
+    return out
+
+
+_CWD_PREFIXES = {"{", "!", "then", "do", "else", "elif", "if", "while", "until"}
+_CWD_COMPOUND = _CWD_PREFIXES | {"for", "select", "case", "function", "done", "fi", "}", "popd"}
+
+
+def _check_cwd_flow(toks: list[str], cwd: str) -> Optional[str]:
+    segments = _cwd_segments(toks)
+    # This is deliberately not a full shell CFG. With compounds, pipes, or
+    # subshells, retain every possible cwd and iterate for loop back-edges.
+    # Never infer success from exists(): cd can fail after this hook returns.
+    compound = any((seg and seg[0] in _CWD_COMPOUND) or
+                   (op and op not in {";", "&&", "||"}) for seg, op in segments)
+    looping = any(seg and seg[0] in {"for", "select", "while", "until"} for seg, _ in segments)
+    possible, skipped = {cwd}, set()
+    for _ in range(64 if looping else 1):
+        before = possible.copy()
+        for seg, op in segments:
+            words, targets = _redirect_targets(seg)
+            while words and words[0] in _CWD_PREFIXES:
+                words = words[1:]
+            successors = set()
+            for current in sorted(possible):
+                why, destination = _check_segment(words[:], targets, current)
+                if why:
+                    return why
+                # Unknown destinations must not erase a known protected cwd.
+                if destination.startswith(UNKNOWN_CWD):
+                    # cd - / directory-stack operations can return to a cwd
+                    # from earlier in this AND-list, not just stay here.
+                    successors.update(possible | skipped)
+                else:
+                    successors.add(destination)
+            skipped.update(possible)  # failed/skipped commands retain their cwd
+            if not compound and op == "&&":
+                possible = successors
+            else:
+                possible |= successors | skipped
+                skipped.clear()
+            if len(possible | skipped) > 64:
+                return "directory control flow exceeds safe analysis bound; use explicit workdir and absolute paths"
+        if not looping or possible == before:
+            return None
+    return "directory control flow does not converge; use explicit workdir and absolute paths"
+
+
 def check_shell(cmd: str, cwd: Optional[str] = None, *, _update_checked: bool = False) -> Optional[str]:
     cwd = os.path.expanduser(cwd) if cwd else os.getcwd()
     if not _update_checked and (why := _check_update(cmd, cwd)):
@@ -1643,12 +1716,7 @@ def check_shell(cmd: str, cwd: Optional[str] = None, *, _update_checked: bool = 
         return None
     token = _SHELL_VARS.set({}) if _SHELL_VARS.get() is None else None  # nested sh -c / eval share the outer vars
     try:
-        for seg in _segments(_tokens(cmd)):
-            words, targets = _redirect_targets(seg)
-            why, cwd = _check_segment(words, targets, cwd)
-            if why:
-                return why
-        return None
+        return _check_cwd_flow(_tokens(cmd), cwd)
     finally:
         if token is not None:
             _SHELL_VARS.reset(token)

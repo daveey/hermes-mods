@@ -32,6 +32,13 @@ OPEN = lambda board=None, now=None: {"usd": 1.0, "cap": 25.0, "running": 0, "ok_
                                      "why": ""}
 
 
+@pytest.fixture(autouse=True)
+def _split_lane(monkeypatch):
+    """These tests drive the split investigation -> fix -> verify lifecycle that lanes filed before one card per
+    defect (t_01a1d69064f6064c) still run to the end; test_self_heal_one_card.py covers the one-card lane."""
+    monkeypatch.setenv("COACH_SELFHEAL_ONE_CARD", "0")
+
+
 class Runner:
     """Fake subprocess.run: records argv; `hermes kanban ... create` returns a new task id."""
 

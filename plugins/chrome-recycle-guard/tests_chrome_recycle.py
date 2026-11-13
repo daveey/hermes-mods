@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+needs_proc = pytest.mark.skipif(not Path('/proc/self/fd').is_dir(), reason='needs Linux /proc/self/fd')
+
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("chrome_recycle", HERE / "chrome_recycle.py")
 cr = importlib.util.module_from_spec(spec)
@@ -256,6 +258,7 @@ def verdict(capsys):
 
 # ---------------------------------------------------------------- process discovery
 
+@needs_proc
 def test_pids_match_user_data_dir_even_when_argv_is_one_space_joined_string(tmp_path, chrome):
     a = chrome()
     b = subprocess.Popen([sys.executable, "-c", SLEEPER, f"x --user-data-dir={tmp_path}/profile y"])
@@ -268,6 +271,7 @@ def test_pids_match_user_data_dir_even_when_argv_is_one_space_joined_string(tmp_
         b.kill(), other.kill()
 
 
+@needs_proc
 def test_survey_maps_cdp_connections_to_daemons_and_foreign_clients(cdp, daemon, holder):
     f = cdp()
     d = daemon(f.port, "alpha", session_id="s1", tab="T1")
@@ -299,6 +303,7 @@ def test_plan_prune_keeps_protected_and_one_copy_and_min_pages():
     assert len(cr.plan_prune(t, set(), trust_attached=False, keep_pages=5)) == 1
 
 
+@needs_proc
 def test_prune_closes_stale_tabs_over_cdp_but_not_the_tab_a_live_session_drives(tmp_path, chrome, cdp, daemon,
                                                                                     capsys):
     chrome()
@@ -315,6 +320,7 @@ def test_prune_closes_stale_tabs_over_cdp_but_not_the_tab_a_live_session_drives(
     assert d.poll() is None and r.calls == []  # the live session's daemon was left running
 
 
+@needs_proc
 def test_foreign_client_protects_every_attached_tab_and_blocks_restart(tmp_path, chrome, cdp, holder, capsys):
     chrome()
     f = cdp([page("A1", "https://x.com/home"), page("A2", "https://x.com/home"),
@@ -334,6 +340,7 @@ def test_prune_is_skipped_when_a_new_client_connects_mid_run(cdp):
 
 # ---------------------------------------------------------------- daemon reaping and the in-use refusal
 
+@needs_proc
 def test_in_use_daemon_refuses_restart_even_under_memory_pressure(tmp_path, chrome, cdp, daemon, capsys):
     chrome()
     now = time.time()
@@ -346,6 +353,7 @@ def test_in_use_daemon_refuses_restart_even_under_memory_pressure(tmp_path, chro
     assert r.calls == [] and d.poll() is None and "reaped" not in v and f.closed == []
 
 
+@needs_proc
 def test_daemons_of_ended_or_idle_sessions_are_reaped_then_restart_is_allowed(tmp_path, chrome, cdp, daemon, capsys):
     chrome()
     now = time.time()
@@ -363,6 +371,7 @@ def test_daemons_of_ended_or_idle_sessions_are_reaped_then_restart_is_allowed(tm
     assert r.calls == [["systemctl", "--user", "restart", "hub-chrome.service"]]
 
 
+@needs_proc
 def test_shared_default_daemon_is_stale_only_when_its_log_is_idle(cdp, daemon):
     f = cdp()
     p = daemon(f.port, "default", session_id="whoever-spawned-it")
@@ -376,6 +385,7 @@ def test_shared_default_daemon_is_stale_only_when_its_log_is_idle(cdp, daemon):
     assert p.poll() is None
 
 
+@needs_proc
 def test_unreachable_cdp_refuses_restart(tmp_path, chrome, capsys):
     chrome()
     s = socket.socket()
@@ -389,12 +399,14 @@ def test_unreachable_cdp_refuses_restart(tmp_path, chrome, capsys):
 
 # ---------------------------------------------------------------- restart decision (no clients connected)
 
+@needs_proc
 def test_below_threshold_does_not_restart(tmp_path, chrome, cdp, capsys):
     chrome()
     r = run(tmp_path, cdp([page("A", "https://a/")]).port, "--threshold-mb", "999999", "--pressure-avail-mb", "0")
     assert verdict(capsys)["verdict"] == "below" and r.calls == []
 
 
+@needs_proc
 def test_idle_over_threshold_restarts_and_records_cooldown(tmp_path, chrome, cdp, capsys):
     chrome()
     port = cdp([page("A", "https://a/")]).port
@@ -407,6 +419,7 @@ def test_idle_over_threshold_restarts_and_records_cooldown(tmp_path, chrome, cdp
     assert verdict(capsys)["verdict"] == "cooldown" and r2.calls == []
 
 
+@needs_proc
 def test_busy_chrome_is_left_alone_even_under_pressure(tmp_path, chrome, cdp, capsys):
     chrome(SPINNER)
     r = run(tmp_path, cdp([page("A", "https://a/")]).port, "--pressure-avail-mb", "1e12",
@@ -415,17 +428,24 @@ def test_busy_chrome_is_left_alone_even_under_pressure(tmp_path, chrome, cdp, ca
     assert v["verdict"] == "busy" and v["cpu_pct"] > 25 and r.calls == []
 
 
-def test_hold_file_blocks_reap_prune_and_restart(tmp_path, chrome, cdp, daemon, capsys):
-    chrome()
+def test_hold_file_blocks_reap_prune_and_restart(tmp_path, chrome, cdp, daemon, capsys, monkeypatch):
+    browser = chrome()
     now = time.time()
     make_state_db(tmp_path, [("ended", now - 9000, now - 8000, None)])
     f = cdp([page("A1", "about:blank"), page("A2", "about:blank")])
     d = daemon(f.port, "gone", session_id="ended")
     (tmp_path / "chrome-recycle-hold").write_text("")
+    # Hold policy is portable; discovery before the decision normally reads /proc.
+    # Keep real child/CDP effects observable, but supply the scan and memory inputs.
+    monkeypatch.setattr(cr, "chrome_pids", lambda *a: [browser.pid])
+    monkeypatch.setattr(cr, "survey", lambda *a: ([{"pid": d.pid, "name": "gone", "session_id": "ended"}], 0))
+    monkeypatch.setattr(cr, "pss_mb", lambda *a: 1.0)
+    monkeypatch.setattr(cr, "mem_available_mb", lambda: 0.0)
     r = run(tmp_path, f.port, "--pressure-avail-mb", "1e12", "--pressure-threshold-mb", "0")
     assert verdict(capsys)["verdict"] == "hold" and r.calls == [] and f.closed == [] and d.poll() is None
 
 
+@needs_proc
 def test_dry_run_changes_nothing_and_failed_restart_does_not_record_cooldown(tmp_path, chrome, cdp, daemon, capsys):
     chrome()
     now = time.time()

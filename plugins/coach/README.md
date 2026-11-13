@@ -1341,8 +1341,26 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   link, quote), **Why** (the chain with evidence), **Plan** (changes, regression test, detection guard, live check),
   cost/risk, undo; then `event proposed`. It posts nothing to the Inbox and never ships the fix. Not a defect →
   `event not_defect`.
+- **One card per defect** (default; `one_card_per_defect` in `selfheal-config.json`, env `COACH_SELFHEAL_ONE_CARD`):
+  a new defect's `selfheal:<fp>` card is the whole lifecycle (`defect_brief`): triage, five-whys comment, red/green
+  regression test, ship under the standing approval, live check on the real path (`NATURAL_EVENT_RULE`), then
+  `event fixed --result` (the VERIFY child's receipt; on the hub through `hub-admin` with the result staged in
+  `/tmp/selfheal-verify`). The lane entry carries `one_card: true`; `file_fix` never files a fix/verify card for it
+  (`selfheal_fix_skipped`, a stray `proposed` returns to `filed`), and a stray proposal.md does not reconcile it to
+  `proposed`. Lanes filed before (no `one_card`) keep the split investigation → fix → verify until they finish.
+- **Filing dedupe**: every self-heal card body carries `fingerprint: <fp>` in its own evidence fence. Before a new
+  defect card, `open_owner` reads the target board (`_kanban_root`): an open card (not done/archived) keyed
+  `selfheal:<fp>` or `selfheal:<fp>:…`, or whose body has that line on its own, gets the occurrence as a comment
+  (`selfheal_dedup_commented`; again only from a new session or after an hour, else `selfheal_dedup_held`) and
+  nothing is filed. An unreadable board logs `selfheal_dedup_error` and files (the cap still bounds it).
+- **Daily card cap** (`daily_card_cap`, default 40, env `COACH_SELFHEAL_DAILY_CAP`): cards created_by `self-heal` on
+  the board since 00:00Z. At the cap a new defect (or backport/deploy-check) files no card: the day's digest card
+  (key `selfheal-digest:<YYYY-MM-DD>`, title `self-heal digest <date>: defects over the daily cap`, not counted,
+  scheduled until the next 00:00Z) gets one comment per fingerprint (`<coach>/selfheal-digest.json`), and
+  `selfheal_over_cap` is logged. The defect stays in `selfheal_pending` until midnight, then files normally (the dedupe
+  still applies). An unreadable count refuses (`selfheal_cap_unavailable`). Tests: `tests/test_self_heal_one_card.py`.
 - **Auto-approve** (default; `auto_approve` in `selfheal-config.json`, env `COACH_SELFHEAL_AUTO_APPROVE`): the hub
-  cron (every 5 min) runs `file_fix` for every `proposed` fingerprint (also `self_heal.py fix <fp>` by hand): fix
+  cron (every 5 min) runs `file_fix` for every `proposed` fingerprint of a split lane (also `self_heal.py fix <fp>` by hand): fix
   card `selfheal:<fp>:fix` whose acceptance is the regression test red before / green after, ship under the standing
   approval, verify live, and record the proof quietly with `event fixed --result result.md` (stored in
   `<coach>/selfheal-results/<fp>.md`, logged as `selfheal_fixed`). Results are never posted to the Inbox (it is for

@@ -26,6 +26,10 @@ def _no_land_turn(monkeypatch):
     # These cases pin the carry's gh calls; the land turn has its own fakes in tests_turn.py.
     monkeypatch.setattr(g, "_live_turns", lambda *a: [])
     monkeypatch.setattr(g, "_turn_acquire", lambda *a: "")
+    # Existing API/policy fixtures do not own the network Git verifier. Its real-Git
+    # fixtures below explicitly restore the helper; never contact GitHub in tests.
+    if hasattr(g, "_git_merge_tree_refusal"):
+        monkeypatch.setattr(g, "_git_merge_tree_refusal", lambda *a: "")
 
 R = "example/protected"
 H0 = "1fd079c68f8cc4aa5f887df5e6d3668945b68149"     # #2438's approved head
@@ -749,3 +753,137 @@ def test_real_hunk_relocated_inside_a_merge_refused(monkeypatch, real_merges):
 def test_real_edited_merge_refused(monkeypatch, real_merges):
     (ok, why), _ = carry_real(monkeypatch, real_merges, "edited")
     assert not ok and ("patch changed" in why or "at build.py" in why)
+
+
+# Authoritative Git verifier: real fetch/merge-tree, only the remote URL is local.
+GIT_VERIFY = g._git_merge_tree_refusal
+
+
+@pytest.fixture
+def git_history(tmp_path):
+    import os
+    repo = tmp_path / "source"
+    repo.mkdir()
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+
+    def git(*args):
+        return REAL_RUN(["git", "-c", "user.name=test", "-c", "user.email=test@example.com",
+                         "-c", "core.hooksPath=/dev/null", *args], cwd=repo, env=env,
+                        capture_output=True, text=True, check=True).stdout.strip()
+
+    git("init", "-q")
+    (repo / "f").write_text(RELOC_STATE)
+    git("add", ".")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    (repo / "f").write_text(RELOC_PR)
+    git("commit", "-qam", "approved hunk")
+    ours = git("rev-parse", "HEAD")
+    git("checkout", "-q", "--detach", base)
+    (repo / "notes").write_text("state\n")
+    git("add", ".")
+    git("commit", "-qm", "state")
+    theirs = git("rev-parse", "HEAD")
+    clean_tree = git("merge-tree", "--write-tree", ours, theirs)
+    clean = git("commit-tree", clean_tree, "-p", ours, "-p", theirs, "-m", "clean")
+    git("checkout", "-q", "--detach", clean)
+    (repo / "f").write_text(RELOC_MOVED)
+    git("add", "f")
+    moved = git("commit-tree", git("write-tree"), "-p", ours, "-p", theirs, "-m", "relocated")
+    assert g._patch_id(git("diff", base, ours), None) == g._patch_id(git("diff", theirs, moved), None)
+    git("checkout", "-q", "--detach", moved)
+    git("checkout", "-q", "--detach", base)
+    git("mv", "f", "renamed")
+    git("commit", "-qm", "rename")
+    rename = git("rev-parse", "HEAD")
+    git("checkout", "-q", "--detach", base)
+    git("rm", "f")
+    git("commit", "-qm", "delete")
+    delete = git("rev-parse", "HEAD")
+    conflict = git("commit-tree", git("rev-parse", rename + "^{tree}"), "-p", rename, "-p", delete,
+                   "-m", "resolve rename/delete")
+    return repo, {"clean": (clean, ours, theirs), "moved": (moved, ours, theirs),
+                  "conflict": (conflict, rename, delete)}
+
+
+def local_git_verifier(monkeypatch, tmp_path, repo, failure=None):
+    calls = []
+
+    def run(argv, **kw):
+        calls.append((argv, kw))
+        assert not kw.get("shell") and 0 < kw["timeout"] <= 30
+        if "fetch" in argv:
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(argv, kw["timeout"])
+            if failure == "failed":
+                return SimpleNamespace(returncode=128, stdout="", stderr="unreadable remote")
+            assert "https://github.com/example/protected.git" in argv
+            argv = [str(repo) if a == "https://github.com/example/protected.git" else a for a in argv]
+        return REAL_RUN(argv, **kw)
+
+    monkeypatch.setattr(g.subprocess, "run", run)
+    assert GIT_VERIFY is not None, "real merge-tree verifier missing"
+    return calls
+
+
+def test_git_verifier_rejects_rename_delete_conflict(monkeypatch, tmp_path, git_history):
+    repo, heads = git_history
+    local_git_verifier(monkeypatch, tmp_path, repo)
+    why = GIT_VERIFY(*heads["conflict"], R, None, {"HERMES_HOME": str(tmp_path / "home")})
+    assert "merge-tree" in why and "exited 1" in why
+
+
+def test_git_verifier_clean_merge_and_relocated_hunk(monkeypatch, tmp_path, git_history):
+    repo, heads = git_history
+    calls = local_git_verifier(monkeypatch, tmp_path, repo)
+    env = {"HERMES_HOME": str(tmp_path / "home")}
+    assert GIT_VERIFY(*heads["clean"], R, None, env) == ""
+    assert "tree differs from the clean merge" in GIT_VERIFY(*heads["moved"], R, None, env)
+    assert all("--depth=128" in a for a, _ in calls if "fetch" in a)
+    assert not list((tmp_path / "home" / "cache").iterdir())
+
+
+@pytest.mark.parametrize("failure", ["failed", "timeout"])
+def test_git_verifier_unreadable_fetch_refuses(monkeypatch, tmp_path, git_history, failure):
+    repo, heads = git_history
+    local_git_verifier(monkeypatch, tmp_path, repo, failure)
+    why = GIT_VERIFY(*heads["clean"], R, None, {"HERMES_HOME": str(tmp_path / "home")})
+    assert "fetch" in why and ("exited 128" in why or "TimeoutExpired" in why)
+
+
+def test_git_verifier_refusal_surfaces_in_carry(monkeypatch):
+    fake(monkeypatch)
+    monkeypatch.setattr(g, "_git_merge_tree_refusal", lambda *a: "git fetch exited 128")
+    assert "git fetch exited 128" in check()
+
+
+def test_git_verifier_checks_each_merge_in_chain(monkeypatch):
+    mid, tip2 = "c" * 40, "d" * 40
+    cmp = {"status": "ahead", "behind_by": 0, "commits": [node(mid, H0, BASE_TIP), node(H, mid, tip2)]}
+    fake(monkeypatch, answers={f"repos/{R}/compare/{H0}...{H}": cmp,
+                               f"repos/{R}/compare/{tip2}...state": IDENTICAL})
+    monkeypatch.setattr(g, "_merge_tree_refusal", lambda *a: "")
+    calls = []
+    monkeypatch.setattr(g, "_git_merge_tree_refusal", lambda *a: calls.append(a[:3]) or "")
+    assert check() is None
+    assert calls == [(mid, H0, BASE_TIP), (H, mid, tip2)]
+
+
+@pytest.mark.parametrize("step,output,reason", [
+    ("merge-tree", "garbage", "unreadable tree id"),
+    ("merge-tree", "a" * 40 + "\nextra", "unreadable tree id"),
+    ("merge-base", "a" * 40 + "\n" + "b" * 40, "multiple"),
+    ("show", "a" * 40, "parents differ"),
+])
+def test_git_verifier_odd_reads_refuse(monkeypatch, tmp_path, git_history, step, output, reason):
+    repo, heads = git_history
+    local_git_verifier(monkeypatch, tmp_path, repo)
+    run = g.subprocess.run
+
+    def odd(argv, **kw):
+        if step in argv:
+            return SimpleNamespace(returncode=0, stdout=output, stderr="")
+        return run(argv, **kw)
+
+    monkeypatch.setattr(g.subprocess, "run", odd)
+    assert reason in GIT_VERIFY(*heads["clean"], R, None, {"HERMES_HOME": str(tmp_path / "home")})
