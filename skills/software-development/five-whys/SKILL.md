@@ -286,6 +286,10 @@ When an execute_code traceback raises an alert, read `references/traceback-attri
 
 - Closing a "not a bug" verdict with no why-chain. If the same false alarm keeps getting filed, the filer, tagger or
   classifier is the bug.
+- Reading absence or a first sighting off the current log file only. A busy agent.log rotates about hourly, so
+  "logged nothing from 00:20 to 01:10" or "first seen at 01:19" can be the rotation, not the event. Before
+  claiming either, list the rotated files (`ls -l agent.log*`), grep them all in time order, and quote file and
+  line. A card filed on such a claim gets a wrong title and points its fix at the wrong component.
 
 ## Sources
 
