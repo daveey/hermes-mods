@@ -136,7 +136,33 @@ CREDENTIAL = {
     "scope": "One gh auth login on the MacBook; nothing else.",
     "evidence": "terminal: gh auth status -> You are not logged into any GitHub hosts",
 }
-PASSING = {"gpu_money": GPU_MONEY, "recurring_spend": RECURRING_SPEND, "threshold": THRESHOLD,
+# Isolate each boundary: no inherited incident wording can supply another limit.
+SINGLE_CHOICE = {
+    "action": "Confirm the nightly report format.",
+    "why_human": "The report format needs confirmation.",
+    "interaction": "reply",
+    "scope": "Nightly report formatting only",
+    "evidence": "Report preview uses the compact format.",
+    "choices": [{"label": "Compact", "value": "compact"}],
+}
+PLAIN_PERMISSION = dict(
+    SINGLE_CHOICE,
+    action="Reply yes or no: grant the bot the Issues permission on the repo?",
+    why_human="The bot needs a permission change.",
+    scope="Repo bot configuration", choices=[])
+CREDENTIAL_PICK = dict(
+    SINGLE_CHOICE,
+    action="Reply A or B: A) rotate the API key now, B) wait for expiry.",
+    why_human="The rotation timing needs confirmation.",
+    scope="Bot authentication", choices=[])
+HUMAN_ONLY_PICK = dict(
+    SINGLE_CHOICE,
+    action="Reply A or B: A) press the pairing button on the hub physically, B) skip pairing.",
+    why_human="Pairing needs confirmation.",
+    scope="Hub pairing", choices=[])
+PASSING = {"single_choice": SINGLE_CHOICE, "plain_permission": PLAIN_PERMISSION,
+           "credential_pick": CREDENTIAL_PICK, "human_only_pick": HUMAN_ONLY_PICK,
+           "gpu_money": GPU_MONEY, "recurring_spend": RECURRING_SPEND, "threshold": THRESHOLD,
            "write_perms": WRITE_PERMS, "rose": ROSE, "destructive": DESTRUCTIVE, "david_rule": DAVID_RULE,
            "credential": CREDENTIAL}
 
@@ -204,6 +230,27 @@ def test_real_money_and_threshold_blocks_go_through(gate, tmp_path, name):
     assert r is None
     assert gate.LLM.seen  # reached the judge
     assert not _events(tmp_path, "owner_recommendation_hold")
+
+
+@pytest.mark.parametrize("interaction", ["reply", "approval"])
+def test_single_choice_without_pick_wording_is_not_held(gate, interaction):
+    hr = dict(SINGLE_CHOICE, interaction=interaction)
+    assert gate.owner_recommendation.limit_named(hr) is None
+    assert not gate.owner_recommendation.is_pick(hr)
+    assert gate.owner_recommendation.hit(hr) is None
+
+
+@pytest.mark.parametrize("interaction", ["reply", "approval"])
+@pytest.mark.parametrize("hr_fixture,limit", [
+    (PLAIN_PERMISSION, "permission"),
+    (CREDENTIAL_PICK, "credential"),
+    (HUMAN_ONLY_PICK, "human_only"),
+])
+def test_reply_or_approval_pick_names_its_limit(gate, hr_fixture, limit, interaction):
+    hr = dict(hr_fixture, interaction=interaction)
+    assert gate.owner_recommendation.is_pick(hr)
+    assert gate.owner_recommendation.limit_named(hr) == limit
+    assert gate.owner_recommendation.hit(hr) is None
 
 
 def test_limit_names(gate):
