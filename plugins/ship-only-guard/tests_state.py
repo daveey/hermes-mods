@@ -15,7 +15,7 @@ CMD = ["gh", "pr", "merge", "12", "--repo", "example/protected", "--rebase", "--
 
 def payload(**updates):
     return {"number": 12, "state": "OPEN", "baseRefName": "state", "headRefOid": SHA,
-            "url": "https://github.com/example/protected/pull/12",
+            "url": "https://github.com/example/protected/pull/12", "reviews": [], "comments": [],
             "statusCheckRollup": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}], **updates}
 
 

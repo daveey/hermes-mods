@@ -209,3 +209,154 @@ def test_standalone_cli(repo):
     env[g.MARKER] = "1"
     allowed = subprocess.run([sys.executable, str(HERE / "guard.py"), "--gh-args", "pr", "merge", "12"], env=env, cwd=repo, capture_output=True, text=True)
     assert allowed.returncode == 0
+
+
+# --- state merge review-reply gate (t_01a1d598345b4f7b) -------------------------------------------------------
+# Every review point is answered in the PR thread before a state merge: 53 of 56 nit-bearing reviews on state PRs
+# merged 11-12/11-13 had no reply before the merge (#2315 merged 2 min after review 5893609888 listed 2 nits).
+from types import SimpleNamespace
+
+STATE_SHA = "a" * 40
+STATE_CMD = ["gh", "pr", "merge", "12", "--repo", "example/protected", "--rebase", "--match-head-commit", STATE_SHA]
+MARK = "<!-- hermes-review-reply -->"
+# A real-format PRR_ node id (msgpack [0, repo id, database id]) whose database id is 5893609888.
+NIT_ID, NIT_NUMBER = "PRR_kwDOVDjH788AAAABX0lZoA", "5893609888"
+
+
+def state_pr(reviews=(), comments=(), **updates):
+    data = {"number": 12, "state": "OPEN", "baseRefName": "state", "headRefOid": STATE_SHA,
+            "url": "https://github.com/example/protected/pull/12",
+            "statusCheckRollup": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+            "reviews": list(reviews), "comments": list(comments)}
+    data.update(updates)
+    return data
+
+
+def review(body, at="2026-11-13T15:21:04Z", node=NIT_ID):
+    return {"id": node, "author": {"login": "you"}, "authorAssociation": "MEMBER", "state": "COMMENTED",
+            "submittedAt": at, "body": body}
+
+
+def comment(body, at="2026-11-13T15:22:00Z", login="you", association="MEMBER", **author):
+    return {"id": "IC_x", "author": {"login": login, **author}, "authorAssociation": association,
+            "createdAt": at, "body": body}
+
+
+def state_check(monkeypatch, data, argv=STATE_CMD):
+    calls = []
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout=json.dumps(data))
+    monkeypatch.setattr(g.subprocess, "run", run)
+    why = g.check_argv(argv, repos={"example/protected"}, env={"GH_REPO": "example/protected"})
+    assert len(calls) == 1 and "reviews" in calls[0][-1].split(",") and "comments" in calls[0][-1].split(",")
+    return why
+
+
+NIT = "**Approve.**\n- Nit (non-blocking): the log line says `retry` where it means `requeue`."
+
+
+def test_state_merge_refuses_unanswered_nit(monkeypatch):
+    why = state_check(monkeypatch, state_pr([review(NIT)]))
+    assert why and NIT_NUMBER in why and "Nit (non-blocking): the log line" in why
+    assert MARK in why and "fixed in <sha>" in why and "declined: <reason>" in why and "rerun the same merge" in why
+
+
+def test_state_merge_allows_marked_reply_after_review(monkeypatch):
+    reply = comment(f"{MARK}\n1. declined: wording only.")
+    assert state_check(monkeypatch, state_pr([review(NIT)], [reply])) is None
+
+
+@pytest.mark.parametrize("reply", [
+    comment(f"{MARK}\nanswered early", at="2026-11-13T15:20:00Z"),                    # before the review
+    comment(f"{MARK}\nfixed", at="2026-11-13T15:21:04Z"),                              # not after it
+    comment("1. declined: wording only."),                                             # no marker
+    comment(f"{MARK}\nbot", login="github-actions", association="NONE"),               # gh's GraphQL bot shape
+    comment(f"{MARK}\nbot", login="ci-review[bot]"),
+    comment(f"{MARK}\nbot", type="Bot"),
+    comment(f"{MARK}\nbot", is_bot=True),
+    comment(f"{MARK}\napp", login="some-app", association="NONE"),
+])
+def test_state_merge_refuses_early_bot_or_unmarked_reply(monkeypatch, reply):
+    why = state_check(monkeypatch, state_pr([review(NIT)], [reply]))
+    assert why and NIT_NUMBER in why
+
+
+def test_reply_must_follow_each_nit_review(monkeypatch):
+    later = review("Second pass. Nits: rename `x`.", at="2026-11-13T15:30:00Z",
+                   node="PRR_kwDOVDjH788AAAABX0maWQ")
+    why = state_check(monkeypatch, state_pr([review(NIT), later], [comment(f"{MARK}\nok")]))
+    assert why and NIT_NUMBER not in why and "5893626457" in why and "Nits: rename" in why
+
+
+@pytest.mark.parametrize("body", [
+    "Approve. No nits.", "**Nits:** none", "Nits: none.", "Approve; no non-blocking points.",
+    "No blocking or non-blocking findings.", "Remaining shapes (none blocking): fine.", "Approve, LGTM.", "", None,
+    "Nit (non-blocking): none",
+])
+def test_state_merge_allows_negated_or_absent_nits(monkeypatch, body):
+    assert state_check(monkeypatch, state_pr([review(body)])) is None
+
+
+@pytest.mark.parametrize("body", [
+    "No test for the 404 path (non-blocking).", "Findings (non-blocking)\n1. Rename it.", "nit: typo",
+    "Looks good.\n\nNitpick: trailing space",
+])
+def test_state_merge_counts_real_points(monkeypatch, body):
+    assert state_check(monkeypatch, state_pr([review(body)]))
+
+
+@pytest.mark.parametrize("drop", ["reviews", "comments"])
+def test_state_merge_unreadable_reviews_or_comments_refused(monkeypatch, drop):
+    data = state_pr([review("Approve.")])
+    data.pop(drop)
+    why = state_check(monkeypatch, data)
+    assert why and "reviews/comments could not be read" in why
+    data[drop] = "garbled"
+    assert "could not be read" in state_check(monkeypatch, data)
+    data[drop] = [None]
+    assert "could not be read" in state_check(monkeypatch, data)
+
+
+def test_unreadable_review_time_refuses(monkeypatch):
+    why = state_check(monkeypatch, state_pr([review(NIT, at=None)], [comment(f"{MARK}\nok")]))
+    assert why and NIT_NUMBER in why
+
+
+def test_review_gate_surfaces_through_shell_and_cli(monkeypatch, tmp_path):
+    import shlex
+    data = state_pr([review(NIT)])
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(data)))
+    assert NIT_NUMBER in g.check_shell(shlex.join(STATE_CMD), repos={"example/protected"}, env={})
+    monkeypatch.setenv("SHIP_ONLY_GUARD_REPOS", '["example/protected"]')
+    assert g.main(["--gh-args", *STATE_CMD[1:]]) == 1
+
+
+def _fixture(name):
+    data = json.loads((HERE / "fixtures" / name).read_text())
+    # As of the merge: the recorded thread holds only what existed before mergedAt.
+    assert all(r["submittedAt"] < data["mergedAt"] for r in data["reviews"])
+    assert all(c["createdAt"] < data["mergedAt"] for c in data["comments"])
+    return data
+
+
+def _replay(monkeypatch, data):
+    argv = ["gh", "pr", "merge", str(data["number"]), "--repo", "example/protected", "--rebase",
+            "--match-head-commit", data["headRefOid"]]
+    return state_check(monkeypatch, data, argv)
+
+
+def test_replay_pr2315_at_merge_refused(monkeypatch):
+    why = _replay(monkeypatch, _fixture("pr2315-at-merge.json"))
+    assert why and "review 5893609888" in why and "Nit, non-blocking: a third" in why
+
+
+def test_replay_pr2348_at_merge_allowed(monkeypatch):
+    assert _replay(monkeypatch, _fixture("pr2348-at-merge.json")) is None
+
+
+def test_review_number_decoding():
+    assert g._review_number("PRR_kwDOVDjH788AAAABXz5FqA") == "5892883880"
+    assert g._review_number("PRR_kwDOVDjH788AAAABX0maWQ") == "5893626457"
+    assert g._review_number("MDE3OlB1bGxSZXF1ZXN0UmV2aWV3MQ==") == "MDE3OlB1bGxSZXF1ZXN0UmV2aWV3MQ=="
+    assert g._review_number(None) == "None"

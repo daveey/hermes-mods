@@ -82,12 +82,112 @@ def _path(value, cwd):
     return os.path.abspath(os.path.join(cwd, os.path.expanduser(value)))
 
 
+REVIEW_REPLY_MARKER = "<!-- hermes-review-reply -->"
+REVIEW_REPLY_FORMS = ('"fixed in <sha>", "follow-up <card>", "refuted: <evidence>" or "declined: <reason>"')
+_POINT = re.compile(r"\bnit(?:s|pick|picks)?\b|\bnon[- ]?blocking\b", re.IGNORECASE)
+# Ported from hermes-core-wt's review-reply gate: only a negation directly governing the phrase
+# ("no nits", "no non-blocking points", "not a non-blocking concern") makes it a verdict; one elsewhere in
+# the clause ("No test for the 404 path (non-blocking).") leaves it a point.
+_NEGATION = re.compile(r"\b(?:no|zero|0|not(?: an?| any)?|without(?: any)?)\s+(?:other |further |remaining )?"
+                       r"(?:blocking (?:or|and|nor) )?$", re.IGNORECASE)
+# "Nits: none", "Non-blocking: n/a" and "nits - nothing" are verdicts too.
+_NONE_AFTER = re.compile(r"\s*(?:\([^)]*\)|\))?\s*[:=\-\u2013\u2014]?\s*(?:none|n/a|nothing|0)\b", re.IGNORECASE)
+# gh's GraphQL author drops Bot's type and "[bot]" suffix (github-actions shows as "github-actions"), and a
+# GitHub App is never an owner/member/collaborator, so association NONE never counts as a human answer.
+_BOT_LOGINS = {"github-actions", "dependabot", "renovate", "copilot", "copilot-pull-request-reviewer"}
+
+
+def _review_point(body):
+    """The first line of a review body that raises a non-blocking point, or ''."""
+    for line in str(body or "").splitlines():
+        flat = re.sub(r"[*_`#>]", "", line)
+        for m in _POINT.finditer(flat):
+            clause = re.split(r"[.;:!?]", flat[:m.start()])[-1]
+            if _NEGATION.search(clause) or _NONE_AFTER.match(flat[m.end():]):
+                continue
+            text = " ".join(flat.split())
+            return text if len(text) <= 160 else text[:157] + "..."
+    return ""
+
+
+def _is_bot(author, association=None):
+    author = author if isinstance(author, dict) else {}
+    login = str(author.get("login") or "")
+    return (author.get("type") == "Bot" or author.get("is_bot") is True or login.endswith("[bot]")
+            or login.lower() in _BOT_LOGINS or association == "NONE")
+
+
+def _when(value):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _review_number(node_id):
+    """GitHub's numeric review id (the one in URLs and prose) from a PRR_ node id; the node id if not decodable."""
+    import base64
+    try:
+        raw = base64.urlsafe_b64decode(node_id.split("_", 1)[1] + "==")
+        if raw[0] != 0x93:  # msgpack fixarray [0, repo id, database id]
+            raise ValueError
+        i, value = 1, None
+        for _ in range(3):
+            tag = raw[i]
+            size = {0xcc: 1, 0xcd: 2, 0xce: 4, 0xcf: 8}.get(tag, 0)
+            if tag < 0x80:
+                value = tag
+            elif size:
+                value = int.from_bytes(raw[i + 1:i + 1 + size], "big")
+            else:
+                raise ValueError
+            i += 1 + size
+        return str(value)
+    except (AttributeError, IndexError, ValueError, TypeError):
+        return str(node_id)
+
+
+def _review_reply_refusal(number, data):
+    """Refusal text while a review raised non-blocking points no later marked non-bot comment answers; else None.
+    Why: 53 of 56 nit-bearing reviews on state PRs merged 11-12/11-13 had no reply before the merge (#2315)."""
+    reviews, comments = data.get("reviews"), data.get("comments")
+    if not isinstance(reviews, list) or not isinstance(comments, list) or not all(
+            isinstance(x, dict) for x in reviews + comments):
+        return (f"[ship-only-guard] Refused state merge of PR #{number}: its reviews/comments could not be read, "
+                "so unanswered review points cannot be ruled out. Rerun the same merge command once "
+                "`gh pr view --json reviews,comments` works.")
+    answers = []
+    for c in comments:
+        if REVIEW_REPLY_MARKER in str(c.get("body") or "") and not _is_bot(c.get("author"), c.get("authorAssociation")):
+            answers.append(_when(c.get("createdAt")))
+    open_points = []
+    for r in reviews:
+        point = _review_point(r.get("body"))
+        if not point:
+            continue
+        at = _when(r.get("submittedAt"))
+        if at is None or not any(t is not None and t > at for t in answers):
+            open_points.append(f"review {_review_number(r.get('id'))}: \"{point}\"")
+    if not open_points:
+        return None
+    return (f"[ship-only-guard] Refused state merge of PR #{number}: {len(open_points)} review(s) raised "
+            f"non-blocking points with no later reply in the PR thread: {'; '.join(open_points)}. Post one PR "
+            f"comment containing {REVIEW_REPLY_MARKER} that answers each point as {REVIEW_REPLY_FORMS}, then "
+            "rerun the same merge command.")
+
+
 def _state_merge(words, repo, cwd, env):
     """Narrow state-only exception, never a general non-main merge allowance.
 
-    Independent exact-head review and required-CI coverage remain caller duties;
-    this preflight additionally refuses missing/non-green visible checks. It is
-    not an atomic base lock (gh only offers an atomic head fence).
+    Returns True to allow, False when the command is not this route or any preflight
+    fails, or a refusal string naming unanswered review points. Independent exact-head
+    review and required-CI coverage remain caller duties; this preflight refuses
+    missing/non-green visible checks, and refuses while any review whose body raises a
+    non-blocking point ("nit", "non-blocking", un-negated) has no later non-bot PR
+    comment marked <!-- hermes-review-reply -->: reply before you merge. Unreadable
+    reviews/comments refuse. It is not an atomic base lock (gh only offers an atomic
+    head fence).
     """
     # Accept explicit numeric PR and repo only; avoid gh's implicit current PR,
     # URL/repo precedence, aliases, unknown options, auto-merge or admin override.
@@ -116,7 +216,7 @@ def _state_merge(words, repo, cwd, env):
             or not options.get("--rebase")
             or not re.fullmatch(r"[0-9a-f]{40}", options.get("--match-head-commit", ""))):
         return False
-    fields = "number,url,state,baseRefName,headRefOid,statusCheckRollup"
+    fields = "number,url,state,baseRefName,headRefOid,statusCheckRollup,reviews,comments"
     probe_env = dict(env)
     probe_env["GH_PROMPT_DISABLED"] = "1"
     try:
@@ -138,11 +238,13 @@ def _state_merge(words, repo, cwd, env):
         # rollup. Skipped/neutral/unknown checks conservatively require the ship path.
         if not isinstance(checks, list) or not 0 < len(checks) < 100:
             return False
-        return all(isinstance(c, dict) and (
+        if not all(isinstance(c, dict) and (
             c.get("__typename") == "CheckRun" and c.get("status") == "COMPLETED"
             and c.get("conclusion") == "SUCCESS" or
             c.get("__typename") == "StatusContext" and c.get("state") == "SUCCESS"
-        ) for c in checks)
+        ) for c in checks):
+            return False
+        return _review_reply_refusal(args[0], data) or True
     except (OSError, ValueError, TypeError, subprocess.SubprocessError):
         return False
 
@@ -242,9 +344,12 @@ def _gh(words, cwd, env, repos):
         url = next((re.fullmatch(r"https?://[^/]+/([^/]+/[^/]+)/pull/\d+/?", w) for w in rest[2:]
                     if re.fullmatch(r"https?://[^/]+/([^/]+/[^/]+)/pull/\d+/?", w)), None)
         repo = _slug(url[1]) if url else selected if selected is not None else _context(cwd, env)
-        if repo in repos and (_state_merge(words, repo, cwd, env)
-                              or _upstream_sync_merge(words, repo, cwd, env)):
-            return None
+        if repo in repos:
+            state = _state_merge(words, repo, cwd, env)
+            if isinstance(state, str):
+                return state
+            if state or _upstream_sync_merge(words, repo, cwd, env):
+                return None
         return _deny(repo, "gh pr merge (state requires explicit repo, numeric PR, --rebase, "
                      "--match-head-commit FULL_SHA and readable green exact-head state preflight; "
                      f"an upstream sync PR requires --merge, head branch {SYNC_BRANCH_PREFIX}FULL_SHA "

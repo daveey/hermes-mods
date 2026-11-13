@@ -34,6 +34,21 @@ The `pre_tool_call` hook checks `terminal`, `execute_code`, and nested `tool_cal
   Implicit pushes resolve the current branch, push remote, `remote.NAME.push`,
   `push.default`, and upstream branch configuration where available. Dry runs,
   tag-only pushes, and explicit pushes to other branches are allowed.
+- The state merge route below while any review on the PR raises a non-blocking
+  point with no later reply in the PR thread. **Reply before you merge; the guard
+  enforces it.** A review raises a point when its body says `nit`/`nits`/`nitpick`
+  or `non-blocking` without a negation directly governing it ("No nits",
+  "Nits: none", "no non-blocking points" and "No blocking or non-blocking findings"
+  are verdicts, "No test for X (non-blocking)" is a point). The answer is one
+  non-bot PR comment containing `<!-- hermes-review-reply -->`, created after the
+  review was submitted, that answers each point as "fixed in <sha>",
+  "follow-up <card>", "refuted: <evidence>" or "declined: <reason>". The refusal
+  names each unanswered review id and its first point line; rerun the same merge
+  command after replying. A comment is a bot's when its author type is Bot,
+  `is_bot` is set, its login ends in `[bot]` or is a known GraphQL bot login
+  (gh shows `github-actions[bot]` as `github-actions`), or its author association is
+  `NONE` (a GitHub App is never an owner, member or collaborator). Reviews or
+  comments missing from the read refuse.
 
 Repository inference follows literal `cd`, `git -C`, `env -C`, Git push URLs and
 remote push URLs. Probes are bounded read-only Git subprocesses with fixed argv;
@@ -66,9 +81,11 @@ The parser accepts only numeric PR, explicit `--repo OWNER/REPO` (or `-R`),
 implicit PR/repo, URL selector, extra flags, duplicate flags, or other merge mode.
 A fixed-argv `gh pr view` (15-second timeout, no shell) must confirm the same PR
 URL/number, OPEN state, base exactly `state`, matching head, and a nonempty
-all-success check rollup smaller than 100 entries. Missing/malformed/offline,
-main/other base, changed head, pending/failed/skipped/neutral checks and a possibly
-truncated rollup fail closed. This is not a blanket non-main exemption.
+all-success check rollup smaller than 100 entries. The same single read fetches
+`reviews,comments` for the review-reply check above. Missing/malformed/offline,
+main/other base, changed head, pending/failed/skipped/neutral checks, a possibly
+truncated rollup, unreadable reviews/comments and an unanswered review point fail
+closed. This is not a blanket non-main exemption.
 
 **Gate boundary:** this guard does not authenticate independent review receipts
 or prove coverage of required-but-absent CI. Those remain the landing owner's
