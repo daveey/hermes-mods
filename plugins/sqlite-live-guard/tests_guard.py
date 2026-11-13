@@ -182,8 +182,11 @@ def test_board_write_refusal_names_the_matching_hermes_kanban_verb(sql, verb):
     assert verb in msg and "hermes kanban recover" in msg
 
 
-def test_named_board_write_refusal_puts_the_board_flag_first():
-    why = plugin.guard.check_shell("sqlite3 /home/u/.hermes/kanban/boards/ops/kanban.db \"INSERT INTO task_comments "
+def test_named_board_write_refusal_puts_the_board_flag_first(tmp_path, monkeypatch):
+    # A canonical temporary home also works where /home is an OS symlink (macOS).
+    home = tmp_path.resolve() / '.hermes'
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    why = plugin.guard.check_shell(f"sqlite3 {home}/kanban/boards/ops/kanban.db \"INSERT INTO task_comments "
                                    "(task_id, body) VALUES ('t', 'x')\"")
     assert why and "hermes kanban --board ops comment" in why, why
 
@@ -288,6 +291,7 @@ def privileged_fixture_scan(monkeypatch):
         monkeypatch.setattr(swap_db, '_proc_entries', _own_tree)
 
 
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs Linux /proc/self/fd")
 def test_swap_puts_replacement_in_and_keeps_originals(tmp_path):
     live, rep = tmp_path / "kanban.db", tmp_path / "recovered.db"
     _db(live, ["a"])
@@ -303,6 +307,7 @@ def test_swap_puts_replacement_in_and_keeps_originals(tmp_path):
     old.close()
 
 
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs Linux /proc/self/fd")
 def test_swap_refuses_while_a_process_holds_the_db(tmp_path, capsys):
     live, rep = tmp_path / "kanban.db", tmp_path / "recovered.db"
     _db(live, ["a"])
@@ -332,6 +337,7 @@ def test_swap_refuses_second_concurrent_recovery(tmp_path):
         assert swap_db.main(["--db", str(live), "--replacement", str(rep), "--wait", "0", "--allow-kanban"]) == 2
 
 
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs Linux /proc/self/fd")
 def test_swap_refuses_corrupt_or_incomplete_replacement(tmp_path):
     live, rep = tmp_path / "kanban.db", tmp_path / "recovered.db"
     _db(live, ["a"])
@@ -456,6 +462,7 @@ def test_swap_helper_refuses_a_kanban_board_without_the_operator_flag(tmp_path, 
     con.close()
 
 
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs Linux /proc/self/fd")
 def test_swap_helper_records_itself_as_lock_holder(tmp_path, monkeypatch):
     import json
     live, rep = tmp_path / "fixture.db", tmp_path / "recovered.db"
@@ -537,6 +544,7 @@ def test_review_profile_and_lookalike_boards_are_not_the_default_board(tmp_home)
     assert out and "swap_db.py" in out["message"] and "recover`" not in out["message"]
 
 
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs Linux /proc/self/fd")
 def test_review_holder_record_with_a_reused_pid_is_ignored(tmp_home):
     import json
     (tmp_home / "kanban.db.recover.pid").write_text(json.dumps(
@@ -563,6 +571,7 @@ def test_review_swap_helper_clears_its_record_when_the_replacement_is_refused(tm
     assert not (tmp_path / "fixture.db.recover.pid").exists()
 
 
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs Linux /proc/self/fd")
 def test_review_swap_helper_records_the_recovery_holder_card_env(tmp_path, monkeypatch):
     import json
     live, rep = tmp_path / "fixture.db", tmp_path / "recovered.db"
