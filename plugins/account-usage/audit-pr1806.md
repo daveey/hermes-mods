@@ -31,3 +31,19 @@ Other credential-adjacent files in the diff: `agent/auxiliary_client.py` only ad
 its own module and spawns the protected provider thread via `spawn_context_thread`; selection.py
 wraps none of these, and none reads or changes credential/route state. No new fence.
 selection.py unchanged.
+
+## Re-audit: head 06d1730d9469 (card t_01a1d2c4971560ab)
+
+Merge base = fork main 19cbe548a7c7; main `run_agent.py` is still 0b079f3feca5 (kept).
+Drifted: `run_agent.py` -> 14599923e721 (added; 563b43f5894e and 54ec627c4261 kept for hosts that
+saw the older heads). `check_compat.py --core <head>` reports no other drift.
+
+`git diff efeeea0fe583 06d1730d9469 -- run_agent.py` is one line: `_spawn_background_review_now`
+calls the delegate as `__class__._spawn_background_review_run(self, ...)` (the defining class)
+instead of `AIAgent._spawn_background_review_run(...)`. Background-review custody only; the seams
+selection.py relies on (client factories, recover_with_credential_pool, _failed_credential_identity,
+switch_model, interruptible_*_api_call, perform_api_call) are untouched. `agent/auxiliary_client.py`,
+`agent/turn_facade.py` and `gateway/session_runtime_workers.py` are unchanged since efeeea0fe583; the
+turn-worker submit path still runs the turn under `copy_context().run`, so the request-local
+`account_usage_dispatch` ContextVar keeps propagating. No new credential/route fence. selection.py
+unchanged, so recovery_wrapper and fast-rate-limit-fallback/account-usage-compatibility.json need no refresh.
