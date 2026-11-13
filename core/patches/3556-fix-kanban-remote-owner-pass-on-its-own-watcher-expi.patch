@@ -1,0 +1,407 @@
+From e3334630daf3cdcd5237aece1ad84999aee44387 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 04:49:31 -0800
+Subject: [PATCH] fix(kanban): remote owner pass on its own watcher; expired
+ notices scan the transcript once
+
+The MacBook gateway admitted busy-chat remote notices 13-88 s after first sight and woke local chain
+cards 25-60 s late against a 5 s notifier interval (t_01a1d4de28a8510d). Measured in-process
+(hermes gateway profile): each remote owner pass spent 12-20 s in krn.collect asking transcript_has
+for every card past LATE_MAX_S, before _claim_notice looked at the ledger. Two chats carried 158 and
+207 such cards, all already settled, so the scans' answers were never used (365 scans = 12.15 s
+uncontended). The pass ran inline in the notifier loop, so its cost became local wake latency.
+
+- collect: the expired settle reason (transcript vs expired) is an _ExpiredReason that _claim_notice
+  resolves only on the first settle (no ledger row); settled rows cost no scan.
+- _kanban_remote_owner_watcher: supervised in _PRE_RECONNECT_WATCHERS, own INTERVAL_S cadence, the
+  only caller of kanban_remote_owner.tick, honours kanban.notify_in_gateway, stops between passes.
+- tick logs collect vs admit seconds when a pass exceeds 5 s.
+---
+ gateway/kanban_remote_owner.py                | 10 ++-
+ gateway/kanban_watchers.py                    | 37 ++++++++-
+ gateway/run_startup.py                        |  3 +-
+ .../test_kanban_remote_owner_delivery.py      | 79 +++++++++++++++++++
+ .../test_kanban_remote_expired_scan.py        | 75 ++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          | 40 +++++++---
+ 6 files changed, 229 insertions(+), 15 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_remote_expired_scan.py
+
+diff --git a/gateway/kanban_remote_owner.py b/gateway/kanban_remote_owner.py
+index c44c98dd20..3c1116beac 100644
+--- a/gateway/kanban_remote_owner.py
++++ b/gateway/kanban_remote_owner.py
+@@ -37,6 +37,7 @@ from typing import Any, Optional
+ logger = logging.getLogger(__name__)
+ 
+ INTERVAL_S = 10.0
++SLOW_PASS_S = 5.0  # a pass longer than this logs its collect vs admit split (WARNING)
+ PRODUCER = "kanban-wake"
+ _DISPLAY_LIMIT = 2000  # session_automation._DISPLAY_TEXT_LIMIT
+ 
+@@ -261,13 +262,20 @@ async def tick(runner: Any, *, force: bool = False) -> list[dict]:
+         authority = _launch_authority(runner, None)
+         if adapter is None or authority is None:
+             return []
++        started = time.monotonic()
+         plan = await asyncio.to_thread(_collect, runner, authority, _owned_lives(runner, authority))
++        collected = time.monotonic()
+         out = []
+         for live, ids, tip, items in plan:
+             for item in items:
+                 if await _admit(runner, adapter, live, ids, tip, item):
+                     out.append(item)
++        done = time.monotonic()
++        if done - started > SLOW_PASS_S:  # the pass's own cost, separate from the FIFO's: t_01a1d4de28a8510d
++            logger.warning("remote kanban owner pass took %.1fs (collect %.1fs over %d chat(s), admit %.1fs for "
++                           "%d notice(s))", done - started, collected - started, len(plan), done - collected,
++                           sum(len(items) for *_, items in plan))
+         return out
+-    except Exception:  # health: allow BLE001 -- a failed pass never stops the notifier loop; the next pass retries
++    except Exception:  # health: allow BLE001 -- a failed pass never stops the remote owner watcher; the next pass retries
+         logger.warning("remote kanban owner pass failed", exc_info=True)
+         return []
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index ea1ddd5aa9..7c149ebd33 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -75,6 +75,8 @@ class GatewayKanbanWatchersMixin:
+             await self._sleep_between_ticks(lease.retry_interval())
+         return False
+ 
++    _KANBAN_WATCHER_START_DELAY = 5.0  # seconds the notifier and remote owner watchers wait before their first pass
++
+     async def _sleep_between_ticks(self, interval: float) -> None:
+         """Sleep *interval* (floored to 1s) in 1s slices so stop() never waits a full interval."""
+         interval = max(interval, 1.0)
+@@ -137,7 +139,7 @@ class GatewayKanbanWatchersMixin:
+         self._kanban_notifier_profile = notifier_profile
+ 
+         # Initial delay so the gateway can finish wiring adapters.
+-        await asyncio.sleep(5)
++        await asyncio.sleep(self._KANBAN_WATCHER_START_DELAY)
+ 
+         # Stale done-sub GC: subs survive ``done``, so boards that never
+         # archive would accumulate rows scanned every tick. One DELETE per
+@@ -160,13 +162,40 @@ class GatewayKanbanWatchersMixin:
+                     await _KanbanNotification(
+                         self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
+                     ).deliver()
+-                # Remote cards' notices for busy chats this gateway owns (gateway/kanban_remote_owner.py). [daveey]
+-                from gateway import kanban_remote_owner
+-                await kanban_remote_owner.tick(self)
+             except Exception as exc:
+                 logger.warning("kanban notifier tick failed: %s", exc)
+             await self._sleep_between_ticks(interval)
+ 
++    async def _kanban_remote_owner_watcher(self, interval: Optional[float] = None) -> None:
++        """Admit remote cards' notices for busy chats this gateway owns (gateway/kanban_remote_owner.py). [daveey]
++
++        Its own cadence, not the notifier loop's: inline after the local deliveries, one slow pass (or a slow
++        delivery) delayed both, and the MacBook admitted busy-chat remote notices 13-88 s after it first saw
++        them (t_01a1d4de28a8510d). The only caller of ``kanban_remote_owner.tick`` (it is not re-entrant).
++        Stops between passes via ``_running``; a pass is never cancelled midway (a cancel during its
++        ``to_thread`` collect strands claims, and inside ``admit_route_wake`` it can commit with no ``_track``).
++        """
++        from gateway import kanban_remote_owner
++        try:
++            from hermes_cli.config import load_config as _load_config
++
++            cfg = await asyncio.to_thread(_load_config)
++            kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
++        except Exception:  # health: allow BLE001 -- config is advisory here: a bad file keeps the default (enabled), logged
++            logger.warning("kanban remote owner: cannot load config; continuing enabled", exc_info=True)
++            kanban_cfg = {}
++        if not kanban_cfg.get("notify_in_gateway", True):
++            logger.info("kanban remote owner: disabled via config kanban.notify_in_gateway=false")
++            return
++        # The notifier's profile context (``kanban_remote_owner._profile`` falls back to it).
++        if not getattr(self, "_kanban_notifier_profile", None):
++            self._kanban_notifier_profile = self._active_profile_name()
++        interval = kanban_remote_owner.INTERVAL_S if interval is None else interval
++        await asyncio.sleep(self._KANBAN_WATCHER_START_DELAY)  # as the notifier: let adapters wire up first
++        while self._running:
++            await kanban_remote_owner.tick(self, force=True)  # never raises
++            await self._sleep_between_ticks(interval)
++
+     def _kanban_sub_op(self, board: Optional[str], op: str, sub: dict, **extra: Any) -> Any:
+         """Sync helper (runs in to_thread): call ``kanban_db_notify.<op>`` for one subscription on its board."""
+         from hermes_cli import kanban_db as _kb
+diff --git a/gateway/run_startup.py b/gateway/run_startup.py
+index 762d60460e..23b64779ad 100644
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -1659,7 +1659,8 @@ class GatewayStartupMixin:
+     # name minus the leading underscore.
+     _PRE_RECONNECT_WATCHERS = (
+         "_session_housekeeping_watcher", "_model_catalog_refresh_watcher", "_session_stall_watcher",
+-        "_kanban_notifier_watcher", "_kanban_dispatcher_watcher", "_kanban_sync_watcher",
++        "_kanban_notifier_watcher", "_kanban_remote_owner_watcher", "_kanban_dispatcher_watcher",
++        "_kanban_sync_watcher",
+     )
+     _POST_RECONNECT_WATCHERS = (
+         "_handoff_watcher", "_async_delegation_watcher", "_loop_wakeup_watcher", "_profile_reconcile_watcher",
+diff --git a/tests/gateway/test_kanban_remote_owner_delivery.py b/tests/gateway/test_kanban_remote_owner_delivery.py
+index e64f95da5f..26a34844ce 100644
+--- a/tests/gateway/test_kanban_remote_owner_delivery.py
++++ b/tests/gateway/test_kanban_remote_owner_delivery.py
+@@ -23,6 +23,7 @@ import uuid
+ 
+ import pytest
+ 
++from tests.waiting import async_wait_until
+ from gateway import kanban_remote_owner as kro
+ from gateway import session_automation
+ from gateway.config import Platform
+@@ -787,3 +788,81 @@ async def test_a_relabelled_local_wake_last_in_a_remote_batch_keeps_guidance_thr
+         assert drained.count(GUIDANCE) == 1 and drained.endswith(GUIDANCE)
+     finally:
+         authority.db.close()
++
++
++def test_remote_notice_admitted_while_the_notifier_deliveries_are_blocked(env, monkeypatch):
++    """The remote owner pass has its own watcher and cadence (t_01a1d4de28a8510d): it ran inline after the
++    notifier's local deliveries, so a slow delivery or a slow pass held both and the MacBook admitted busy-chat
++    remote notices 13-88 s after it first saw them. A notifier stuck in a delivery must not hold it back."""
++    from gateway import kanban_watchers as kw
++    hub, runner, authority, fifo, db = env
++    authority.sessions[CHAT] = _Live(CHAT)
++    _busy(db, fifo)
++    runner._running = True
++    runner._KANBAN_WATCHER_START_DELAY = 0.0
++    in_delivery = asyncio.Event()
++    blocker = asyncio.Event()  # never set while the remote notice is waited for
++
++    class _StuckNotification:
++        def __init__(self, *a, **k):
++            pass
++
++        async def deliver(self):
++            in_delivery.set()
++            await blocker.wait()
++
++    monkeypatch.setattr(kw, "_notifier_collect", lambda *a, **k: [{"local": "delivery"}])
++    monkeypatch.setattr(kw, "_KanbanNotification", _StuckNotification)
++
++    async def scenario():
++        notifier = asyncio.ensure_future(runner._kanban_notifier_watcher(interval=1))
++        await asyncio.wait_for(in_delivery.wait(), 5)
++        owner = asyncio.ensure_future(runner._kanban_remote_owner_watcher(interval=1))
++        _publish(hub, [_done("t_01a1cfabf44499dd")])
++        try:
++            # within 2 owner-pass intervals (1 s each), plus slack for the pass itself
++            await async_wait_until(fifo.queued, timeout=2 * 1.0 + 0.5,
++                                   what="remote notice admitted within 2 owner-pass intervals")
++            assert not blocker.is_set() and not notifier.done()  # the local delivery is still stuck
++        finally:
++            runner._running = False
++            blocker.set()
++            await asyncio.wait_for(asyncio.gather(notifier, owner), 5)  # stopped between passes, not cancelled
++
++    asyncio.run(scenario())
++    [queued] = fifo.queued()
++    assert "t_01a1cfabf44499dd" in queued["text"]
++    assert _ledger("t_01a1cfabf44499dd")["holder_pid"] == os.getpid()  # claim in flight, not stranded
++
++
++def test_remote_owner_watcher_honours_notify_in_gateway(env, monkeypatch):
++    from hermes_cli import config as hc
++    _hub, runner, _authority, _fifo, _db = env
++    runner._running = True
++    calls = []
++    monkeypatch.setattr(hc, "load_config", lambda: {"kanban": {"notify_in_gateway": False}})
++    monkeypatch.setattr(kro, "tick", lambda *a, **k: calls.append(a))
++    asyncio.run(asyncio.wait_for(runner._kanban_remote_owner_watcher(interval=1), 2))
++    assert calls == []
++
++
++def test_the_notifier_loop_no_longer_runs_the_remote_owner_pass(env, monkeypatch):
++    """Exactly one caller of ``kro.tick`` (not re-entrant): the supervised remote owner watcher."""
++    from gateway import kanban_watchers as kw
++    _hub, runner, _authority, _fifo, _db = env
++    runner._running = True
++    runner._KANBAN_WATCHER_START_DELAY = 0.0
++    calls = []
++
++    async def tick(*a, **k):
++        calls.append(a)
++        return []
++
++    def collect(*a, **k):
++        runner._running = False  # one notifier pass
++        return []
++    monkeypatch.setattr(kro, "tick", tick)
++    monkeypatch.setattr(kw, "_notifier_collect", collect)
++    asyncio.run(asyncio.wait_for(runner._kanban_notifier_watcher(interval=1), 5))
++    assert calls == []
++    assert "_kanban_remote_owner_watcher" in GatewayRunner._PRE_RECONNECT_WATCHERS
+diff --git a/tests/tui_gateway/test_kanban_remote_expired_scan.py b/tests/tui_gateway/test_kanban_remote_expired_scan.py
+new file mode 100644
+index 0000000000..c0fa3e1a3d
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_expired_scan.py
+@@ -0,0 +1,75 @@
++"""An expired remote state costs a transcript scan once, on its first settle, never on every pass. [daveey]
++
++MacBook gateway, 2026-11-13 04:28-04:40 PST (t_01a1d4de28a8510d): ``collect`` asked ``transcript_has`` for every
++card whose observed state was past ``LATE_MAX_S`` on every pass, before ``_claim_notice`` looked at the ledger. Two
++busy chats carried 158 and 207 such cards, all already settled, so each owner pass spent 12-20 s in lineage
++notice-key scans whose answer was never used, and the 5 s notifier loop it shares ran 13-88 s late.
++"""
++import logging
++import sqlite3
++
++from tests.tui_gateway.test_kanban_remote_late_observed import REF, T0, TID, _chat, _ledger_row, \
++    _observed_then_starved
++from tui_gateway import kanban_remote_notices as krn
++from tests.tui_gateway.test_kanban_remote_notices import CHAT
++
++GONE = T0 + 120 + 72 * 3600 + 600  # past the 72 h late window
++
++
++class _Has:
++    def __init__(self, answer: bool) -> None:
++        self.answer, self.calls = answer, []
++
++    def __call__(self, key: str, task_id: str) -> bool:
++        self.calls.append((key, task_id))
++        return self.answer
++
++
++def test_expired_state_scans_the_transcript_once_then_never_again(tmp_path, caplog):
++    ledger = tmp_path / "ledger.db"
++    with _chat(tmp_path):
++        replica = _observed_then_starved(tmp_path, ledger)
++        has = _Has(False)
++        with caplog.at_level(logging.INFO, logger=krn.logger.name):
++            assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=GONE, transcript_has=has) == []
++            assert len(has.calls) == 1  # the first settle chooses "transcript" vs "expired"
++            for n in range(1, 6):  # later passes (the owner pass runs every few seconds), restarts included
++                if n % 2:
++                    krn._reset_for_tests()
++                assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=GONE + 10 * n,
++                                   transcript_has=has) == []
++        assert len(has.calls) == 1, f"settled expired card rescanned {len(has.calls) - 1} more time(s)"
++    row = _ledger_row(ledger, CHAT, REF)
++    assert row["delivered"] == krn.SETTLED and row["settled"] == "expired"
++    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and r.name == krn.logger.name]
++    assert len(warnings) == 1 and TID in warnings[0].getMessage()
++
++
++def test_expired_state_already_in_the_transcript_settles_transcript_without_a_warning(tmp_path, caplog):
++    ledger = tmp_path / "ledger.db"
++    with _chat(tmp_path):
++        replica = _observed_then_starved(tmp_path, ledger)
++        has = _Has(True)
++        with caplog.at_level(logging.INFO, logger=krn.logger.name):
++            assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=GONE, transcript_has=has) == []
++            assert krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=GONE + 30,
++                               transcript_has=has) == []
++        assert len(has.calls) == 1
++    row = _ledger_row(ledger, CHAT, REF)
++    assert row["delivered"] == krn.SETTLED and row["settled"] == "transcript"
++    assert not [r for r in caplog.records if r.levelno == logging.WARNING and r.name == krn.logger.name]
++    with sqlite3.connect(ledger) as conn:
++        assert conn.execute("SELECT reason FROM swept").fetchall() in ([], [("transcript",)])
++
++
++def test_many_settled_expired_cards_cost_no_scan_per_pass(tmp_path):
++    """The live shape: a long-lived chat with many expired cards, all settled. A pass scans none of them."""
++    ledger = tmp_path / "ledger.db"
++    with _chat(tmp_path):
++        replica = _observed_then_starved(tmp_path, ledger)
++        has = _Has(False)
++        krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=GONE, transcript_has=has)
++        has.calls.clear()
++        for n in range(20):
++            krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=GONE + 5 * (n + 1), transcript_has=has)
++        assert has.calls == []
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 7de96c5900..31b34d59f4 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -487,15 +487,33 @@ def _reconcile_legacy(conn, session_key: str, cards: list, now: float, transcrip
+     return out
+ 
+ 
++class _ExpiredReason:
++    """The settle reason of an observed state past ``LATE_MAX_S``: ``transcript`` when the chat already has its row
++    (under another session id of it: nothing was lost), else ``expired``. Resolved lazily, by ``_claim_notice``,
++    only when the ledger has no row for it yet: every pass offers each expired card again, and one lineage scan
++    per card per pass cost the gateway's remote owner pass 12-20 s on two chats with 158 and 207 already-settled
++    expired cards (t_01a1d4de28a8510d). ``reason`` stays None until resolved. [daveey]"""
++
++    def __init__(self, transcript_has: Callable[[str, str], bool], key: str) -> None:
++        self.transcript_has, self.key = transcript_has, key
++        self.reason: Optional[str] = None
++
++    def __call__(self) -> str:
++        self.reason = "transcript" if self.transcript_has(self.key, "") else "expired"
++        return self.reason
++
++
+ def _claim_notice(conn, *, session, ref, state, now, fresh, notice_key, task_id, transcript_has,
+-                  swept_key: Optional[tuple] = None, settle_reason: str = "stale") -> str:
++                  swept_key: Optional[tuple] = None,
++                  settle_reason: str | _ExpiredReason = "stale") -> str:
+     """``offer`` a new or orphaned claim, ``acked`` when the transcript already has it, else ``skip``.
+ 
+     A fresh claim is in flight (delivered=0, this process's pid + start). It becomes delivered only in
+     :func:`ack`, after the transcript write. A holder that is gone is re-offered unless the key is already
+     in the transcript. A state that is not fresh is recorded SETTLED (never DELIVERED, ``settled`` =
+     ``settle_reason``) with a ``swept`` row carrying ``settle_reason`` when ``swept_key`` is given; that first
+-    settle returns ``settled``.
++    settle returns ``settled``. An :class:`_ExpiredReason` is resolved only for that first settle (no row yet):
++    it may cost a transcript scan, which a row already in the ledger never needs.
+ 
+     [daveey] The dead-holder check matches the claim's own key only. It used ``notice_in_transcript``'s legacy
+     ``Kanban <task id>`` text match too, so ANY earlier notice of the same card (an earlier blocked state)
+@@ -508,6 +526,9 @@ def _claim_notice(conn, *, session, ref, state, now, fresh, notice_key, task_id,
+         (session, ref, state)).fetchone()
+     pid, start = _my_holder()
+     if row is None:
++        if not fresh and isinstance(settle_reason, _ExpiredReason):
++            settle_reason = settle_reason()  # outside the write txn: it may scan the transcript
++        reason = str(settle_reason)
+         with conn:
+             conn.execute(
+                 "INSERT INTO notices (session, ref, state, at, delivered, holder_pid, holder_start, notice_key, "
+@@ -516,8 +537,8 @@ def _claim_notice(conn, *, session, ref, state, now, fresh, notice_key, task_id,
+                  start if fresh else None, notice_key, 0 if fresh else 1))
+             if not fresh:
+                 conn.execute("UPDATE notices SET settled=? WHERE session=? AND ref=? AND state=?",
+-                             (settle_reason, session, ref, state))
+-                _swept_row(conn, swept_key, settle_reason)
++                             (reason, session, ref, state))
++                _swept_row(conn, swept_key, reason)
+         return "offer" if fresh else "settled"
+     if row["delivered"]:
+         return "skip"
+@@ -653,19 +674,20 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+                 # it in the late group). Only a seeded state (first snapshot) settles silently as ``stale``.
+                 first_seen = _observed_first_seen(fresh_times, ident)
+                 reason = "stale" if fresh or first_seen is None else _late_verdict(now, first_seen)
++                settle: str | _ExpiredReason = reason
+                 if reason == "late":
+                     fresh = True
+-                elif reason == "expired" and transcript_has is not None and transcript_has(key, ""):
+-                    reason = "transcript"  # already in the chat (another session id of it): nothing was lost
++                elif reason == "expired" and transcript_has is not None:
++                    settle = _ExpiredReason(transcript_has, key)
+                 if fresh and skip is not None and conn.execute(
+                         "SELECT 1 FROM notices WHERE session=? AND ref=? AND state=?",
+                         (claim_session, ref, state)).fetchone() is None and skip(str(task["id"])):
+-                    fresh, reason = False, "placeholder"  # recorded silently: the placeholder's notice covers it
++                    fresh, settle = False, "placeholder"  # recorded silently: the placeholder's notice covers it
+                 swept_key = (str(path), profile, sid, _notice_id(card["gw"], card["key"], task, profile, sid))
+                 verdict = _claim_notice(conn, session=claim_session, ref=ref, state=state, now=now, fresh=fresh,
+                                         notice_key=key, task_id=str(task["id"]), transcript_has=transcript_has,
+-                                        swept_key=swept_key, settle_reason=reason)
+-                if verdict == "settled" and reason == "expired":
++                                        swept_key=swept_key, settle_reason=settle)
++                if verdict == "settled" and getattr(settle, "reason", settle) == "expired":
+                     _log_dropped(task, ref, state, claim_session, first_seen or 0.0, now)  # expired: observed
+                 if verdict == "offer":
+                     out.append(_notice_item(card, claim_session, me, profile, now))
+-- 
+2.43.0
+

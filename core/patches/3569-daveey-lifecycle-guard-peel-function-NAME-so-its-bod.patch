@@ -1,0 +1,141 @@
+From 9e8d5b0a85f75c4a684a3eb3e592379b6241ebe8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:37:03 +0000
+Subject: [PATCH] =?UTF-8?q?[daveey]=20lifecycle=20guard:=20peel=20`functio?=
+ =?UTF-8?q?n=20NAME=20{=20=E2=80=A6=20}`=20so=20its=20body's=20scripts=20a?=
+ =?UTF-8?q?re=20scanned?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Inside the supervised gateway, with x.sh = `#!/bin/sh\nhermes gateway restart`,
+`function f { ./x.sh; }; f` was ALLOWED by gateway_lifecycle_block while
+`f() { ./x.sh; }; f` was refused (review 5891610282 on PR #2228, pre-existing).
+
+Five whys:
+1. Why allowed? The referenced-script walk never opened ./x.sh.
+2. Why not? Its segment is ['function', 'f', '{', './x.sh']: the walk read `function`
+   as the command.
+3. Why was `{` not peeled? _peel_command_keywords (added by #2228) only peels leading
+   reserved words, and `function` was not one, so `{` was never reached.
+4. Why did `f() {` work? The `(` `)` tokens split the segment, leaving ['{', './x.sh'],
+   which `{` peeling already handled; `function f() {` hits the same split.
+5. Why missed? #2228 handled `coproc NAME {` but not the other reserved word that
+   takes a NAME before a compound command.
+
+Fix: add `function` to _COMMAND_PREFIX_KEYWORDS and skip the NAME after it (any word:
+bash accepts names like `f-x.y`). The peeled view is additive (the segment as written
+is still read), so every walk that reads _command_segment_views gains it: shell
+scripts, Python interpreter runs, sh -c / env -S / su -c payloads, launchctl submit.
+
+Tests (tests/cron/test_lifecycle_guard_reserved_words.py): RED on base 10 failed
+(function f {…}, f-x.y, nested in if/then, time inside the body, python3 runner,
+bash -c / env -S / su -c payloads, launchctl submit, unscannable fail-closed);
+GREEN 72 passed. `function f() {…}` / `function f () {…}` pin the already-working
+split form; `echo function f x.sh` and `function f { echo x.sh; }` stay inert.
+---
+ cron/lifecycle_guard.py                           | 11 ++++++++---
+ tests/cron/test_lifecycle_guard_reserved_words.py | 15 +++++++++++++++
+ 2 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index ea5baa5eb9..ba2c8b2a52 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -986,9 +986,10 @@ def contains_launchctl_submit_command(command: str) -> bool:
+ 
+ 
+ # Reserved words that may precede a simple command in the same segment (`if hermes-sync`,
+-# `then x`, `! x`, `time -p x`, `{ x; }`, `coproc x`); `fi`/`done`/`}` close a list and run nothing.
++# `then x`, `! x`, `time -p x`, `{ x; }`, `coproc x`, `function f { x; }`); `fi`/`done`/`}` close
++# a list and run nothing.
+ _COMMAND_PREFIX_KEYWORDS = frozenset({
+-    "if", "then", "elif", "else", "while", "until", "do", "!", "time", "{", "coproc",
++    "if", "then", "elif", "else", "while", "until", "do", "!", "time", "{", "coproc", "function",
+ })
+ _MAX_EXECUTES_NAMED_DEPTH = 4
+ _SHELL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+@@ -996,7 +997,7 @@ _SHELL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ 
+ def _peel_command_keywords(segment: list[str]) -> list[str]:
+     """*segment* without its leading reserved words (and ``time``'s ``-p``/``--``, and the NAME of
+-    ``coproc NAME { … }``)."""
++    ``coproc NAME { … }`` and ``function NAME { … }``)."""
+     index = 0
+     while index < len(segment) and segment[index] in _COMMAND_PREFIX_KEYWORDS:
+         word = segment[index]
+@@ -1007,6 +1008,10 @@ def _peel_command_keywords(segment: list[str]) -> list[str]:
+         elif (word == "coproc" and index + 1 < len(segment) and segment[index + 1] == "{"
+               and _SHELL_NAME.fullmatch(segment[index])):
+             index += 1
++        elif word == "function" and index < len(segment):
++            # The NAME after `function` is never a command, and bash accepts names `_SHELL_NAME`
++            # rejects (`function f-x.y { … }`), so skip any word. `function f() {` splits at `(`.
++            index += 1
+     return segment[index:]
+ 
+ 
+diff --git a/tests/cron/test_lifecycle_guard_reserved_words.py b/tests/cron/test_lifecycle_guard_reserved_words.py
+index 3217864337..86885fa9bc 100644
+--- a/tests/cron/test_lifecycle_guard_reserved_words.py
++++ b/tests/cron/test_lifecycle_guard_reserved_words.py
+@@ -68,6 +68,13 @@ _KEYWORD_TEMPLATES = [
+     "coproc {p}",
+     "coproc {{ {p}; }}",
+     "coproc NAME {{ {p}; }}",
++    # `function NAME [()] { … }` defines a function the next segment may call.
++    "function f {{ {p}; }}; f",
++    "function f() {{ {p}; }}; f",
++    "function f () {{ {p}; }}; f",
++    "function f-x.y {{ {p}; }}; f-x.y",
++    "if true; then function f {{ {p}; }}; f; fi",
++    "function f {{ time {p}; }}; f",
+     # The external time(1), also reached through `command`.
+     "/usr/bin/time {p}",
+     "/usr/bin/time -f %e -o /dev/null {p}",
+@@ -87,6 +94,7 @@ def test_script_behind_a_reserved_word_is_scanned(script, template):
+     "while false; do timeout 5 python3 {p}; done",
+     "{{ python3 {p}; }}",
+     "/usr/bin/time python3 {p}",
++    "function f {{ python3 {p}; }}; f",
+ ])
+ def test_interpreter_run_behind_a_reserved_word_is_scanned(runner, template):
+     assert scan_gateway_lifecycle(template.format(p=runner)) == (True, None)
+@@ -99,6 +107,9 @@ def test_interpreter_run_behind_a_reserved_word_is_scanned(runner, template):
+     "time env -S {q}",
+     "then su -c {q}",
+     "/usr/bin/time bash -c {q}",
++    "function f {{ bash -c {q}; }}; f",
++    "function f {{ env -S {q}; }}; f",
++    "function f {{ su -c {q}; }}; f",
+ ])
+ def test_shell_payload_behind_a_reserved_word_is_scanned(script, template):
+     assert scan_gateway_lifecycle(template.format(q=shlex.quote(script))) == (True, None)
+@@ -110,6 +121,7 @@ def test_shell_payload_behind_a_reserved_word_is_scanned(script, template):
+     "! launchctl bootstrap gui/501 /tmp/x.plist",
+     "{ launchctl submit -l x -- /bin/true; }",
+     "/usr/bin/time launchctl submit -l x -- /bin/true",
++    "function f { launchctl submit -l x -- /bin/true; }; f",
+ ])
+ def test_launchctl_submit_behind_a_reserved_word_is_detected(command):
+     assert contains_launchctl_submit_command(command)
+@@ -122,6 +134,7 @@ def test_launchctl_submit_behind_a_reserved_word_is_detected(command):
+     "if true; then {p}; fi",
+     "{{ {p}; }}",
+     "while false; do {p}; done",
++    "function f {{ {p}; }}; f",
+ ])
+ def test_unscannable_script_behind_a_reserved_word_fails_closed(tmp_path, monkeypatch, template):
+     monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINES", 50)
+@@ -142,6 +155,8 @@ def test_unscannable_script_behind_a_reserved_word_fails_closed(tmp_path, monkey
+     "time echo {p}",
+     "if true; then echo {p}; fi",
+     "{{ cat {p}; }}",
++    "echo function f {p}",
++    "function f {{ echo {p}; }}; f",
+ ])
+ def test_reserved_word_does_not_turn_a_mention_into_a_run(script, template):
+     assert scan_gateway_lifecycle(template.format(p=script)) == (False, None)
+-- 
+2.43.0
+

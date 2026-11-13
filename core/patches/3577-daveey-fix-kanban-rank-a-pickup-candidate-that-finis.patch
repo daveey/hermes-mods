@@ -1,0 +1,121 @@
+From 346b6b7b348c7de73cf2f158714c0657c04ed611 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:15:11 +0000
+Subject: [PATCH] [daveey] fix(kanban): rank a pickup candidate that finished
+ between replica reads by its own row
+
+Self-heal defect kanban-67815e0024. The worker-node pickup path lists
+candidates() on its replica connection, then order_with_remote_waiters opens a
+fresh replica connection. A card finished between the two reads is filtered out
+of the ranker's tasks map, so rank() raised KeyError at tasks[tid] and the whole
+cross-gateway ordering fell back to local order (hub agent.log 2026-11-13
+03:20:06 PT: KeyError 't_01a1d49f1cfa33ee').
+
+Fix: rank() uses tasks.get(tid, row), so a vanished candidate ranks by the row
+it was listed with. priority/created_at are read through _field(), which
+returns 0 when the column is absent. The vanished row is NOT seeded into tasks
+(its rows must carry status for the child-graph filter). Genuine replica read
+failures still log the warning and fall back.
+
+Proof:
+- RED on main 2e73a605a8: test_candidate_finished_between_reads_keeps_its_own_priority
+  fails with KeyError 't_a' and order [t_b, t_a].
+- GREEN: test_kanban_pickup_priority.py + test_kanban_worker_node.py, 68 passed.
+- Mutant (except branch of _field never matches) killed by
+  test_vanished_candidate_without_rank_columns_ranks_as_zero.
+- scripts/check --only health: ok.
+---
+ hermes_cli/kanban_dispatch_priority.py        | 18 +++++++--
+ .../hermes_cli/test_kanban_pickup_priority.py | 37 +++++++++++++++++++
+ 2 files changed, 52 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_dispatch_priority.py b/hermes_cli/kanban_dispatch_priority.py
+index 8173e61b49..7002c613cb 100644
+--- a/hermes_cli/kanban_dispatch_priority.py
++++ b/hermes_cli/kanban_dispatch_priority.py
+@@ -22,6 +22,14 @@ def order_with_remote_waiters(conn: sqlite3.Connection, rows: list[sqlite3.Row])
+         return rows
+ 
+ 
++def _field(row, key: str):
++    """``row[key] or 0``, and 0 when the row has no such column."""
++    try:
++        return row[key] or 0
++    except (IndexError, KeyError):
++        return 0
++
++
+ def _order_with_remote_waiters(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_worker_node as wn
+@@ -51,8 +59,12 @@ def _order_with_remote_waiters(conn: sqlite3.Connection, rows: list[sqlite3.Row]
+ 
+     def rank(row):
+         tid = row["id"]
+-        task = tasks[tid]
+-        priority = task["priority"] or 0
++        # A candidate listed from an earlier replica snapshot may be done in
++        # this one (filtered out of ``tasks``): rank it by its own row. Not
++        # seeded into ``tasks``, whose rows must carry ``status`` for the
++        # child-graph filter above. [daveey]
++        task = tasks.get(tid, row)
++        priority = _field(task, "priority")
+         pending = list(children[tid])
+         seen = {tid}
+         while pending:
+@@ -62,6 +74,6 @@ def _order_with_remote_waiters(conn: sqlite3.Connection, rows: list[sqlite3.Row]
+             seen.add(child)
+             priority = max(priority, tasks[child]["priority"] or 0)
+             pending.extend(children[child] - seen)
+-        return -min(PRIORITY_CAP, priority), -bool(children[tid]), task["created_at"]
++        return -min(PRIORITY_CAP, priority), -bool(children[tid]), _field(task, "created_at")
+ 
+     return sorted(rows, key=rank)
+diff --git a/tests/hermes_cli/test_kanban_pickup_priority.py b/tests/hermes_cli/test_kanban_pickup_priority.py
+index 962a406150..3532346e6d 100644
+--- a/tests/hermes_cli/test_kanban_pickup_priority.py
++++ b/tests/hermes_cli/test_kanban_pickup_priority.py
+@@ -189,3 +189,40 @@ def test_malformed_replica_priority_preserves_local_order(graph):
+     remote.execute("UPDATE tasks SET priority='invalid' WHERE id='waiter'")
+     remote.commit()
+     assert _order(local) == ["local", "foreign"]
++
++
++def test_candidate_finished_between_reads_keeps_its_own_priority(graph, caplog):
++    """A pickup candidate read from one replica snapshot can be done in the next.
++
++    The pickup path lists candidates on its own replica connection, then the
++    ranker opens a fresh one; a card finished in between must still rank by
++    the row it was listed with instead of aborting the whole ordering.
++    """
++    _, remote = graph
++    remote.executemany("INSERT INTO tasks VALUES (?, ?, 'ready', ?)", [("t_a", 5, 10), ("t_b", 0, 11)])
++    remote.commit()
++    rows = remote.execute("SELECT * FROM tasks WHERE id IN ('t_a', 't_b') ORDER BY priority ASC").fetchall()
++    remote.execute("UPDATE tasks SET status='done' WHERE id='t_a'")
++    remote.commit()
++    local = sqlite3.connect(":memory:")
++    local.row_factory = sqlite3.Row
++    local.executescript("CREATE TABLE tasks (id TEXT PRIMARY KEY, priority INTEGER, status TEXT, created_at INTEGER);"
++                        "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);")
++    with caplog.at_level("WARNING", logger=priority.__name__):
++        ordered = priority.order_with_remote_waiters(local, rows)
++    assert [r["id"] for r in ordered] == ["t_a", "t_b"]
++    assert "could not read replica priority graph" not in caplog.text
++    local.close()
++
++
++def test_vanished_candidate_without_rank_columns_ranks_as_zero(graph, caplog):
++    """A listed row lacking priority/created_at ranks as 0 rather than aborting the ordering."""
++    local, remote = graph
++    remote.execute("INSERT INTO tasks VALUES ('gone', 7, 'done', 5)")
++    remote.commit()
++    rows = local.execute("SELECT id FROM tasks WHERE id='local'").fetchall()
++    rows += remote.execute("SELECT id FROM tasks WHERE id='gone'").fetchall()
++    with caplog.at_level("WARNING", logger=priority.__name__):
++        ordered = priority.order_with_remote_waiters(local, rows)
++    assert [r["id"] for r in ordered] == ["local", "gone"]
++    assert "could not read replica priority graph" not in caplog.text
+-- 
+2.43.0
+

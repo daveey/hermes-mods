@@ -1,0 +1,406 @@
+From b64666b21f1c175b985207a06b952ec7b117c399 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:53:47 +0000
+Subject: [PATCH] [daveey] fix(update-pause): one pause-note prefix; a
+ transient owner-forward failure keeps the backoff
+
+Follow-up to PR #2167 review 5890829579 (t_01a1d4d34f148c5a), card t_01a1d4d9966a5a40.
+
+1. One prefix. tui_gateway.session_history now imports update_pause.PAUSE_REPLAY_NOTE_PREFIX
+   (update_pause loads only the stdlib) instead of keeping its own copy. The gateway's auto-continue
+   note recognition moves to gateway/run_auto_continue_noise.py (re-exported from gateway.run; keeps
+   run.py under its FILE_LINES cap) with a named _PAUSE_REPLAY_NOTE_PREFIX instead of an inline
+   literal. It stays literal so the gateway never imports tui_gateway at load;
+   tests/gateway/test_auto_continue_note_prefixes.py pins the gateway prefixes to the tui ones and runs
+   _strip_auto_continue_noise on real pause_note(...) output: plain, later-turns, queued, chain
+   (pauses >= 2), unknown-old, and with a job report + carried note trailing the request.
+2. _paused_turn_to_ledger_owner: a forward the owner turned away before queuing anything for a
+   passing reason (OwnerUnavailable such as "did not admit it", runtime_draining / stale_epoch /
+   admission_conflict / queue_full refusals, an OSError dial failure) no longer retires the pause:
+   it returns False, so the caller's 30 s backoff retries the forward, up to OWNER_FORWARD_TRIES (3)
+   per pause; then it is retired with the attempt count logged. OwnerNotRunning, definitive refusals
+   (permission_denied, profile_mismatch, not_found, runtime_retired, invalid_params) and unexpected
+   errors still retire at once; OwnerUnconfirmed is never retried (it may already be queued).
+3. pause_note: drop the redundant `paused_at is not None` (stale implies it).
+
+Tests: RED on the PR #2167 head (new tests: 6 failed + 1 import error), GREEN here; 32 related files
+(update_pause*, auto_continue, turn_marker, owner_forward, session_history, gateway stripper users):
+416 passed.
+---
+ gateway/run.py                                | 25 +-----
+ gateway/run_auto_continue_noise.py            | 34 +++++++
+ .../test_auto_continue_note_prefixes.py       | 55 ++++++++++++
+ .../test_update_pause_ledger_owner.py         | 88 +++++++++++++++++--
+ tui_gateway/session_auto_continue.py          | 41 ++++++++-
+ tui_gateway/session_history.py                |  7 +-
+ tui_gateway/update_pause.py                   |  4 +-
+ 7 files changed, 221 insertions(+), 33 deletions(-)
+ create mode 100644 gateway/run_auto_continue_noise.py
+ create mode 100644 tests/gateway/test_auto_continue_note_prefixes.py
+
+diff --git a/gateway/run.py b/gateway/run.py
+index 8bc7609f9b..582528016f 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1391,27 +1391,10 @@ _AUTO_APPEND_MEDIA_TOOL_NAMES = {"text_to_speech", "text_to_speech_tool", "image
+ from agent.replay_cleanup import canonicalize_replay_history
+ 
+ 
+-_AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn"
+-_AUTO_CONTINUE_FALLBACK_PREFIX = "[System note: A new message"
+-
+-
+-def _is_auto_continue_noise(content: Any) -> bool:
+-    """Return True if this user-message content is a gateway-injected auto-continue note (never replay it)."""
+-    return isinstance(content, str) and content.startswith(  # + tui_gateway.update_pause.PAUSE_REPLAY_NOTE_PREFIX
+-        (_AUTO_CONTINUE_NOTE_PREFIX, _AUTO_CONTINUE_FALLBACK_PREFIX, "[System note: A turn of yours paused for a"))
+-
+-
+-def _strip_auto_continue_noise(content: Any) -> Any:
+-    """Strip leading persisted auto-continue notes from user text; the trailing real question is preserved."""
+-    if not _is_auto_continue_noise(content):
+-        return content
+-    text = str(content)
+-    while _is_auto_continue_noise(text):
+-        end = text.find("]")
+-        if end < 0:
+-            return ""
+-        text = text[end + 1 :].lstrip()
+-    return text
++# Auto-continue note recognition (re-exported: callers and tests import these names from gateway.run).
++from gateway.run_auto_continue_noise import (
++    _AUTO_CONTINUE_FALLBACK_PREFIX, _AUTO_CONTINUE_NOTE_PREFIX, _PAUSE_REPLAY_NOTE_PREFIX, _is_auto_continue_noise,
++    _strip_auto_continue_noise)
+ 
+ # Tools whose deliverable is a JSON payload with a local-file path field rather than a literal ``MEDIA:`` tag.
+ _JSON_MEDIA_TOOL_PATH_FIELDS = ("host_image", "image", "agent_visible_image")
+diff --git a/gateway/run_auto_continue_noise.py b/gateway/run_auto_continue_noise.py
+new file mode 100644
+index 0000000000..b187a6eeb5
+--- /dev/null
++++ b/gateway/run_auto_continue_noise.py
+@@ -0,0 +1,34 @@
++"""Auto-continue notes the gateway injected into a chat: recognised so they are never replayed as user text.
++
++Moved out of ``gateway/run.py`` (FILE_LINES cap). ``_PAUSE_REPLAY_NOTE_PREFIX`` is the opening of
++``tui_gateway.update_pause.PAUSE_REPLAY_NOTE_PREFIX`` (a paused Desktop request forwarded to this gateway's FIFO,
++t_01a1d4920ce3cbf4). It stays a literal so the gateway never imports tui_gateway at load;
++tests/gateway/test_auto_continue_note_prefixes.py pins it, and the stripper, to real ``pause_note`` output.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++_AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn"
++_AUTO_CONTINUE_FALLBACK_PREFIX = "[System note: A new message"
++_PAUSE_REPLAY_NOTE_PREFIX = "[System note: A turn of yours paused for a"
++
++
++def _is_auto_continue_noise(content: Any) -> bool:
++    """Return True if this user-message content is a gateway-injected auto-continue note (never replay it)."""
++    return isinstance(content, str) and content.startswith(
++        (_AUTO_CONTINUE_NOTE_PREFIX, _AUTO_CONTINUE_FALLBACK_PREFIX, _PAUSE_REPLAY_NOTE_PREFIX))
++
++
++def _strip_auto_continue_noise(content: Any) -> Any:
++    """Strip leading persisted auto-continue notes from user text; the trailing real question is preserved."""
++    if not _is_auto_continue_noise(content):
++        return content
++    text = str(content)
++    while _is_auto_continue_noise(text):
++        end = text.find("]")
++        if end < 0:
++            return ""
++        text = text[end + 1 :].lstrip()
++    return text
+diff --git a/tests/gateway/test_auto_continue_note_prefixes.py b/tests/gateway/test_auto_continue_note_prefixes.py
+new file mode 100644
+index 0000000000..22f6cfa45c
+--- /dev/null
++++ b/tests/gateway/test_auto_continue_note_prefixes.py
+@@ -0,0 +1,55 @@
++"""[daveey] The gateway's auto-continue note prefixes stay pinned to the notes Desktop actually writes.
++
++A core-update pause in a gateway-owned chat is forwarded to the gateway's FIFO with
++``tui_gateway.update_pause.pause_note(...)`` (t_01a1d4920ce3cbf4). The gateway keeps its own literal prefixes
++(``gateway.run`` never imports tui_gateway at load), so a reworded note would otherwise be replayed as a real user
++message. These tests run the gateway's stripper on real ``pause_note`` output instead of a copied literal.
++"""
++from __future__ import annotations
++
++import pytest
++
++from gateway.run import (_AUTO_CONTINUE_NOTE_PREFIX, _PAUSE_REPLAY_NOTE_PREFIX, _is_auto_continue_noise,
++                         _strip_auto_continue_noise)
++from tui_gateway import session_history
++from tui_gateway import update_pause as up
++
++PROMPT = "[Kanban notice] t_01a1d3efb167bf46 done"
++
++
++def test_gateway_prefixes_open_the_tui_notes():
++    assert up.PAUSE_REPLAY_NOTE_PREFIX.startswith(_PAUSE_REPLAY_NOTE_PREFIX)
++    assert session_history._AUTO_CONTINUE_NOTE_PREFIX.startswith(_AUTO_CONTINUE_NOTE_PREFIX)
++    assert session_history._PAUSE_REPLAY_NOTE_PREFIX is up.PAUSE_REPLAY_NOTE_PREFIX  # one definition
++
++
++@pytest.fixture()
++def clock(monkeypatch):
++    monkeypatch.setattr(up, "_now", lambda: 10_000.0)
++    return 10_000.0
++
++
++@pytest.mark.parametrize("variant", ["plain", "later_turns", "queued", "chain", "unknown_old"])
++def test_gateway_strips_every_pause_note_down_to_the_request(clock, variant):
++    kwargs = {"plain": {},
++              "later_turns": {"paused_at": clock - 600, "later_turns": 2},
++              "queued": {"paused_at": clock - 30, "queued": True},
++              "chain": {"paused_at": clock - 3600, "queued": True, "pauses": 3, "later_turns": 1},
++              "unknown_old": {"paused_at": clock - 2 * 3600, "later_turns": None}}[variant]
++    note = up.pause_note(PROMPT, **kwargs)
++    if variant == "plain":
++        assert note.startswith(session_history._AUTO_CONTINUE_NOTE_PREFIX)
++    else:
++        assert note.startswith(up.PAUSE_REPLAY_NOTE_PREFIX)
++    if variant == "chain":
++        assert "This request is not new" in note
++    assert _is_auto_continue_noise(note)
++    assert _strip_auto_continue_noise(note) == PROMPT
++    assert session_history._legacy_display_kind("user", note) == "auto_continue"
++
++
++def test_stripper_keeps_trailing_job_report_and_carried_note(clock):
++    jobs = [{"session_id": "proc_1", "command": "sleep 1", "started_at": clock - 60}]
++    note = up.pause_note(PROMPT, jobs, carried=True, paused_at=clock - 600, later_turns=1)
++    stripped = _strip_auto_continue_noise(note)
++    assert stripped.startswith(PROMPT) and stripped.endswith(up.CARRIED_TURN_NOTE)
+diff --git a/tests/tui_gateway/test_update_pause_ledger_owner.py b/tests/tui_gateway/test_update_pause_ledger_owner.py
+index ca1cd5a4cd..fd22cc68e4 100644
+--- a/tests/tui_gateway/test_update_pause_ledger_owner.py
++++ b/tests/tui_gateway/test_update_pause_ledger_owner.py
+@@ -10,8 +10,9 @@ interrupted mid-run", quoting the 2 h old notice that a later turn had already h
+ Contract pinned here:
+ - A paused continuation refused by the gateway's ledger goes to the owner's FIFO exactly once (no legacy turn), and
+   the pause is retired here, within one watcher poll of the window's end plus the kickoff (build wait, admit
+-  receipt). Work no running gateway will finish, or an owner that does not take it, retires the pause with a
+-  logged reason instead of waiting out the freshness window.
++  receipt). Work no running gateway will finish, or an owner that definitively refuses it, retires the pause with a
++  logged reason instead of waiting out the freshness window; an owner that turns it away for a passing reason
++  (nothing queued) keeps the 30 s backoff, up to OWNER_FORWARD_TRIES forwards per pause.
+ - "window ended without an update" is logged once per pause, however many watchers re-arm on it.
+ - A continuation that runs after later turns ran over the pause never says the previous turn was interrupted: it
+   names when the pause happened and that later turns ran since.
+@@ -143,15 +144,18 @@ def test_forwarded_continuation_is_never_worded_as_the_previous_turn(env, monkey
+     assert _legacy_display_kind("user", note) == "auto_continue"  # the owner persists it untyped
+ 
+ 
+-@pytest.mark.parametrize("failure", ["unknown", "not_running", "unavailable", "unconfirmed"])
++@pytest.mark.parametrize("failure", ["unknown", "not_running", "unconfirmed", "permission_denied", "bug"])
+ def test_owner_that_will_not_run_it_retires_the_pause_with_a_reason(env, monkeypatch, caplog, failure):
+     caplog.set_level(logging.INFO)
+     if failure == "unknown":
+         env.ledger["status"] = "unknown"  # only Discard resolves an outcome-unknown admission
+     else:
++        from hermes_cli.gateway_client import GatewayRPCError
+         exc = {"not_running": owner_forward.OwnerNotRunning("no gateway serves this home"),
+-               "unavailable": owner_forward.OwnerUnavailable("queue_full"),
+-               "unconfirmed": owner_forward.OwnerUnconfirmed("the gateway did not confirm it in time")}[failure]
++               "unconfirmed": owner_forward.OwnerUnconfirmed("the gateway did not confirm it in time"),
++               # A refusal that names the request itself: no later forward of the same request clears it.
++               "permission_denied": GatewayRPCError("permission_denied", data={"reason": "permission_denied"}),
++               "bug": KeyError("admission_id")}[failure]
+ 
+         def refuse(sid, s, text, **kw):
+             raise exc
+@@ -167,6 +171,80 @@ def test_owner_that_will_not_run_it_retires_the_pause_with_a_reason(env, monkeyp
+     assert "Paused request" in retired[0].getMessage()
+ 
+ 
++def _transient(kind):
++    from hermes_cli.gateway_client import GatewayRPCError
++    return {"not_admitted": owner_forward.OwnerUnavailable("the gateway did not admit it"),
++            "queue_full": GatewayRPCError("queue_full", data={"reason": "queue_full"}),
++            "draining": GatewayRPCError("runtime_draining", data={"reason": "runtime_draining"}),
++            "dial": ConnectionRefusedError(111, "Connection refused")}[kind]
++
++
++@pytest.mark.parametrize("kind", ["not_admitted", "queue_full", "draining", "dial"])
++def test_transient_forward_failure_keeps_the_backoff_then_retires_after_the_cap(env, monkeypatch, caplog, kind):
++    """PR #2167 review: an owner that turned the forward away for a passing reason (nothing queued there) keeps the
++    pause and the 30 s backoff, so the next poll forwards again; only OWNER_FORWARD_TRIES such failures retire it."""
++    caplog.set_level(logging.INFO)
++    tries = []
++
++    def refuse(sid, s, text, **kw):
++        tries.append(text)
++        raise _transient(kind)
++    monkeypatch.setattr(owner_forward, "forward_prompt", refuse)
++    session = _session(env.home)
++
++    for attempt in range(1, server.OWNER_FORWARD_TRIES):
++        server._maybe_schedule_auto_continue("sid", session, "chat")
++        assert len(tries) == attempt and env.ran == []
++        assert read_turn_marker(env.home, "chat") is not None, "a transient owner failure retired the pause"
++        assert session["_auto_continue_retry_after"] > time.monotonic() + 20.0
++        assert not session.get("_auto_continue_scheduled") and not session.get("running")
++        assert f"retrying after the 30s backoff (attempt {attempt}/{server.OWNER_FORWARD_TRIES})" in caplog.text
++        server._maybe_schedule_auto_continue("sid", session, "chat")  # inside the backoff: no forward
++        assert len(tries) == attempt
++        session["_auto_continue_retry_after"] = 0.0  # the backoff passed
++
++    server._maybe_schedule_auto_continue("sid", session, "chat")
++
++    assert len(tries) == server.OWNER_FORWARD_TRIES and env.ran == []
++    assert read_turn_marker(env.home, "chat") is None
++    retired = [r for r in caplog.records if "retired the paused turn of chat" in r.getMessage()]
++    assert len(retired) == 1 and f"({server.OWNER_FORWARD_TRIES} attempts)" in retired[0].getMessage()
++
++
++def test_transient_forward_failure_then_success_hands_over_once(env, monkeypatch, caplog):
++    caplog.set_level(logging.INFO)
++    answers = [_transient("not_admitted"), {"admission_id": "adm-2"}]
++
++    def forward(sid, s, text, **kw):
++        answer = answers.pop(0)
++        if isinstance(answer, BaseException):
++            raise answer
++        env.forwarded.append(text)
++        return answer
++    monkeypatch.setattr(owner_forward, "forward_prompt", forward)
++    session = _session(env.home)
++
++    server._maybe_schedule_auto_continue("sid", session, "chat")
++    assert env.forwarded == [] and read_turn_marker(env.home, "chat") is not None
++    session["_auto_continue_retry_after"] = 0.0
++    server._maybe_schedule_auto_continue("sid", session, "chat")
++
++    assert len(env.forwarded) == 1 and env.ran == [] and answers == []
++    assert read_turn_marker(env.home, "chat") is None
++    assert "queued in the FIFO of the gateway that owns the chat (admission adm-2)" in caplog.text
++
++
++def test_a_new_pause_gets_a_fresh_forward_budget(env, monkeypatch):
++    def refuse(sid, s, text, **kw):
++        raise _transient("not_admitted")
++    monkeypatch.setattr(owner_forward, "forward_prompt", refuse)
++    session = _session(env.home)
++    session["_owner_forward_failures"] = (("chat", 0.0, 0.0, 1), server.OWNER_FORWARD_TRIES)  # an older pause's
++    server._maybe_schedule_auto_continue("sid", session, "chat")
++    assert read_turn_marker(env.home, "chat") is not None
++    assert session["_owner_forward_failures"][1] == 1
++
++
+ def test_other_owner_refusals_keep_the_existing_backoff(env, monkeypatch):
+     """A sibling backend mid-turn (no ledger status) still backs off and keeps the marker, as before."""
+     monkeypatch.setattr(server, "_ensure_active_session_slot",
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 7a24167301..96e7ad72bc 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -385,7 +385,12 @@ def _paused_turn_to_ledger_owner(sid: str, session: dict, session_key: str, mark
+     2-3 min for 87 min while the gateway ran 9 turns. One owner, one FIFO (owner_forward): forwardable work gets
+     the continuation queued behind it in the owner's FIFO, which runs it exactly once; work no running gateway will
+     finish (``unknown``, no owner) retires the pause with the reason logged. Either way the marker goes.
+-    False for any other refusal (a sibling backend mid-turn): the caller's backoff applies, as before."""
++    False for any other refusal (a sibling backend mid-turn): the caller's backoff applies, as before.
++    A forward the owner refused before queuing anything for a passing reason (``_owner_forward_transient``: it
++    did not admit it, draining, queue full, a dropped dial) also returns False, so the 30 s backoff retries it,
++    up to OWNER_FORWARD_TRIES forwards per pause; then, and on a definitive refusal (no owner running, permission,
++    profile, not found), the pause is retired with the reason logged. An unconfirmed forward is never retried:
++    it may already be queued there, and a resend would run it twice."""
+     status = getattr(refusal, "ledger_status", None)
+     if status is None:
+         return False
+@@ -408,8 +413,20 @@ def _paused_turn_to_ledger_owner(sid: str, session: dict, session_key: str, mark
+         retire_paused_turn(session, session_key, marker, "went to the gateway that owns the chat, which did not "
+                            "confirm it in time (it may be queued there)")
+         return True
+-    except Exception as exc:  # health: allow BLE001 -- every owner failure is the same named, logged retirement
++    except Exception as exc:  # health: allow BLE001 -- transient: bounded backoff; anything else: logged retirement
+         why = str(exc) if isinstance(exc, owner_forward.OwnerUnavailable) else type(exc).__name__
++        if _owner_forward_transient(exc):
++            pause_id = (session_key, marker.get("started_at"), marker.get("paused_at"), marker.get("pauses"))
++            with session["history_lock"]:
++                last = session.get("_owner_forward_failures")
++                count = last[1] + 1 if isinstance(last, tuple) and last[0] == pause_id else 1
++                session["_owner_forward_failures"] = (pause_id, count)
++            if count < OWNER_FORWARD_TRIES:
++                logger.warning("core-update pause: the gateway that owns %s did not take the continuation (%s); "
++                               "retrying after the 30s backoff (attempt %d/%d)", session_key, why, count,
++                               OWNER_FORWARD_TRIES)
++                return False
++            why = f"{why} ({count} attempts)"
+         retire_paused_turn(session, session_key, marker, f"the gateway owns the chat ({status} work in its ledger) "
+                            f"and did not take the continuation: {why}")
+         return True
+@@ -418,6 +435,26 @@ def _paused_turn_to_ledger_owner(sid: str, session: dict, session_key: str, mark
+     return True
+ 
+ 
++# [daveey] Forwards of one pause's continuation the owner turned away for a passing reason before it is retired.
++OWNER_FORWARD_TRIES = 3
++# Owner refusals (``data.reason``, raised before its durable write) that a later forward may clear.
++_TRANSIENT_OWNER_REFUSALS = frozenset({"runtime_draining", "stale_epoch", "admission_conflict", "queue_full"})
++
++
++def _owner_forward_transient(exc: BaseException) -> bool:
++    """[daveey] Whether a failed forward is worth another try after the backoff: nothing was queued there (never
++    ``OwnerUnconfirmed``), and the owner may take it later (not ``OwnerNotRunning``; not a refusal that names the
++    request itself, such as ``permission_denied``, ``profile_mismatch``, ``not_found`` or ``runtime_retired``)."""
++    from hermes_cli.gateway_client import GatewayRPCError
++    from tui_gateway import owner_forward
++    if isinstance(exc, (owner_forward.OwnerNotRunning, owner_forward.OwnerUnconfirmed)):
++        return False
++    if isinstance(exc, GatewayRPCError):
++        reason = exc.data.get("reason", str(exc)) if isinstance(exc.data, dict) else str(exc)
++        return reason in _TRANSIENT_OWNER_REFUSALS
++    return isinstance(exc, (owner_forward.OwnerUnavailable, OSError))
++
++
+ _KICKOFF_MARKER_INPUTS = ("_auto_continue_attempt", "_auto_continue_prompt", "_auto_continue_pauses",
+                           "_auto_continue_killed_jobs")
+ # Re-arms of the pause watcher for one pause whose continuation keeps being refused: each re-arm is a fresh
+diff --git a/tui_gateway/session_history.py b/tui_gateway/session_history.py
+index e77aef6bca..7472f30046 100644
+--- a/tui_gateway/session_history.py
++++ b/tui_gateway/session_history.py
+@@ -7,6 +7,8 @@ import re
+ 
+ from .method_ctx import bind_module
+ from agent.prompt_builder import STEER_DISPLAY_KIND
++# [daveey] The note's producer owns the prefix; update_pause loads only the stdlib, so this import is cheap.
++from tui_gateway.update_pause import PAUSE_REPLAY_NOTE_PREFIX as _PAUSE_REPLAY_NOTE_PREFIX
+ 
+ # Discord routing note (gateway/run_inbound.py::discord_triggering_note) persisted as user
+ # ``content`` by gateways before the authored-text fix; presentation-only heal for those rows.
+@@ -259,9 +261,8 @@ def _expand_skill_invocation_for_replay(text: str, task_id: str) -> str:
+ # Opening of the crash-recovery note synthesized by _auto_continue_note; matched (not just built) for
+ # rows persisted before display typing existed and for the messaging gateway's twin note.
+ _AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
+-# [daveey] update_pause.PAUSE_REPLAY_NOTE_PREFIX: a paused request continued after later turns ran over it, or
+-# forwarded to the gateway that owns the chat (which persists it untyped).
+-_PAUSE_REPLAY_NOTE_PREFIX = "[System note: A turn of yours paused for a Hermes update"
++# [daveey] A paused request continued after later turns ran over it, or forwarded to the gateway that owns the chat
++# (which persists it untyped): update_pause.PAUSE_REPLAY_NOTE_PREFIX, imported at the top (one definition).
+ 
+ 
+ def _legacy_display_kind(role: str, text: str) -> str | None:
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 0d2ac62e3d..e8ab0b8ff7 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -534,8 +534,8 @@ def pause_note(prompt: str, killed_jobs: list | None = None, *, carried: bool =
+     prompt, which earlier continuations already worked on, so the note says so instead of presenting it as new."""
+     stale = paused_at is not None and (queued or bool(later_turns) or (
+         later_turns is None and _now() - float(paused_at) > STALE_NOTE_AFTER_S))
+-    if stale and paused_at is not None:
+-        at = float(paused_at)
++    if stale:
++        at = float(paused_at)  # type: ignore[arg-type]  # stale implies a pause stamp
+         since = (f"{later_turns} later turn{'s' if later_turns != 1 else ''} ran in this chat since" if later_turns
+                  else "it was queued behind other turns in this chat, which may have run first" if queued
+                  else "other turns may have run in this chat since")
+-- 
+2.43.0
+

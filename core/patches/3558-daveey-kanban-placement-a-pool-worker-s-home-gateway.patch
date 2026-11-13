@@ -1,0 +1,1078 @@
+From 4348229dc58408e141c8814dab52dc0b4bcf94df Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:42:31 +0000
+Subject: [PATCH] [daveey] kanban placement: a pool worker's
+ home-gateway-marker hit joins the pool queue unless it holds the card's state
+
+On a Linux pool worker (the t_01a1d2662553185d gateway test: readable Board registry entry, `linux`, not the hub,
+a live pool label), a home-gateway-marker hit no longer keeps a card on its creating worker by itself. Each hit is
+classified (HOME_MARKER_CLASSES):
+
+- worktree path: kept only when a named root exists here and is dirty or has unpushed commits
+  (kanban_move_pool.tree_state(refresh=False, remote_timeout<=5): ls-remote only, <=5 trees in one 5 s budget,
+  errors/timeouts/non-git roots keep); otherwise queues with no extra label.
+- state path: kept only when a named ~/.hermes/kanban/{workspaces,evidence,attachments}/<x> or cache/scratch/<x>
+  exists here; any other state path queues with capability:hub-write.
+- 'this host' and operator extra_home_markers: kept.
+- (b) hub/fleet (hermes-sync, on the hub, kanban.db, cron, systemctl, ...): queue + capability:hub-write.
+- (c) launchd: queue + capability:tailnet-exec. (d) ssh, token-broker: queue.
+
+Any keep hit keeps the card (why prefix "home gateway marker:" unchanged, plus a note naming what this worker
+holds); otherwise runs_on = [pool label, *sorted(class labels | coordination labels | sibling local-group labels)],
+with QUEUED_WHY + " (home gateway marker <hit> not bound to <gateway>)" and a per-class note. As for local markers
+(cfc3d681ce), the queue happens only when one live machine holds the whole label set; otherwise the local keep
+stands and the audit records gateway-test-failed. The created event
+gets an optional `home_marker` {decision, class, hit} record (also `gateway-test-failed` when a non-hub worker
+could not test its gateway). portability() stays probe-free (new home_markers=False flag); the published-worktree
+exemption still runs first. All three front doors (tool, CLI, direct create) share the decision.
+
+Reverses one assertion: t_01a1d2662553185d's control "systemctl restart x on w2 -> unchanged" now expects
+[pool:worker, capability:hub-write] (spec case (c)). The pool-worker fixture now carries the live label set
+(hub-write, tailnet-exec, token-broker), so cfc3d681ce's _no_live_tailnet_pool_worker strips tailnet-exec
+explicitly to keep its premise; its assertions are unchanged.
+
+Proof: RED 19 failed / 62 passed on base 141bcec62a (new pool_queue cases); after the rebase onto 87b1e0cbbe the
+unclaimable-audit case was RED first too. Head (tree a705d72040): 27 placement/move/worker/hub-admission files
+1397 passed (base 87b1e0cbbe 1365; pool_queue +31, published_worktree +1, others unchanged); 27 mutants incl. the
+six spec mutations, all killed; scripts/check 19 ok.
+
+Card: t_01a1d2856e5fec44 (spec t_01a1d27970ab4bca).
+---
+ hermes_cli/kanban_home_marker_placement.py    | 253 +++++++++++++
+ hermes_cli/kanban_move_pool.py                |  24 +-
+ hermes_cli/kanban_placement.py                |  31 +-
+ hermes_cli/kanban_placement_diagnostics.py    |  46 ++-
+ hermes_cli/kanban_published_worktree.py       |   6 +
+ hermes_cli/kanban_worker_placement.py         |  42 ++-
+ tests/hermes_cli/test_kanban_pool_queue.py    | 347 +++++++++++++++++-
+ .../test_kanban_published_worktree.py         |  10 +
+ tools/kanban_tools_placement.py               |   4 +
+ 9 files changed, 718 insertions(+), 45 deletions(-)
+ create mode 100644 hermes_cli/kanban_home_marker_placement.py
+
+diff --git a/hermes_cli/kanban_home_marker_placement.py b/hermes_cli/kanban_home_marker_placement.py
+new file mode 100644
+index 0000000000..6ead41cb6a
+--- /dev/null
++++ b/hermes_cli/kanban_home_marker_placement.py
+@@ -0,0 +1,253 @@
++"""Home-gateway markers on a pool worker: queue for the pool unless this worker holds the card's own state. [daveey]
++
++A home-gateway marker (:data:`hermes_cli.kanban_placement.HOME_GATEWAY_MARKERS`) keeps a card on the gateway that
++creates it, because the text names something only that gateway has. On a pool worker that was rarely true: in the
++24 h to 11-13 01:06Z, 473 worker-created cards hit one and only their creating worker could claim them (workers pick
++up only ``runs_on`` cards), while every pool worker reaches hub and fleet state with ``hub-admin``
++(``capability:hub-write``) and carries ssh and token-broker. t_01a1d2856e5fec44 classifies each hit
++(:data:`~hermes_cli.kanban_placement.HOME_MARKER_CLASSES`): the card stays only when this worker holds its unpublished
++state (a named tree here that is dirty or has unpushed commits, a named Kanban/scratch artifact that exists here),
++when it says 'this host' (the creating worker), or for an operator ``extra_home_markers`` pattern. Every other hit
++queues it, with :data:`~hermes_cli.kanban_placement.HOME_CLASS_LABELS`.
++
++The probes are bounded and fail toward keep: at most :data:`MAX_TREES` trees under one :data:`PROBE_BUDGET_S`
++budget, ``ls-remote`` only (no fetch), and one ``exists()`` per named artifact. They run only from
++:func:`hermes_cli.kanban_worker_placement.queue_decision` on a pool worker; ``portability()`` stays probe-free. The
++result is kept for the rest of the create (:func:`recorded`) so the created event's ``home_marker`` audit reports the
++decision that placed the card, without probing again.
++"""
++from __future__ import annotations
++
++import re
++import subprocess
++import time
++from pathlib import Path
++
++PROBE_BUDGET_S = 5.0
++MAX_TREES = 5
++_HOME = r"(?:~|/home/[^/\s]+)"
++# Whole worktree roots only: a subpath names the same tree.
++_WT_ROOT = re.compile(_HOME + r"/code/_wt(?:-[\w-]+)?/[\w-]+(?:\.[\w-]+)*")
++_DOT_WT_ROOT = re.compile(_HOME + r"/(?:[^/\s`'\"]+/)*\.worktrees/[\w-]+(?:\.[\w-]+)*")
++_CLAUDE_WT_ROOT = re.compile(r"(?:~|/)[^\s`'\"]*/\.claude/worktrees/[\w-]+(?:\.[\w-]+)*")
++_STATE = re.compile(_HOME + r"/\.hermes/[^\s`'\"<>()\[\]]*")
++# This worker's own unpublished files: a card's workspace, evidence or attachments, or a scratch file.
++_ARTIFACT = re.compile(r"/\.hermes/(kanban/(?:workspaces|evidence|attachments)|cache/scratch)/([^/\s]+)")
++
++KEEP_TAIL = ("Push the branch, or attach the files with kanban_attach and drop the path, to let any pool worker "
++             "run it.")
++NOTES = {
++    "b": ("{hit} names hub or fleet state; every pool worker reaches it with hub-admin (capability:hub-write), so "
++          "this card joins the pool instead of waiting for {gateway}."),
++    "c": "{hit} is Mac work; it joins the pool with capability:tailnet-exec, so the run reaches the Mac with "
++         "tailnet_exec/ssh.",
++    "d": "{hit} is a tool every pool worker carries.",
++    "path": "{hit} is not unpublished state on {gateway} (absent here, or clean and pushed).",
++}
++
++
++def _local_path(raw: str) -> Path:
++    """``raw`` on this host: ``~`` and ``/home/<this user>`` expand against ``Path.home()``."""
++    if raw.startswith("~/"):
++        return Path.home() / raw[2:]
++    m = re.match(r"/home/([^/]+)/(.*)", raw)
++    if m and m.group(1) == Path.home().name:
++        return Path.home() / m.group(2)
++    return Path(raw)
++
++
++def _clean(raw: str) -> str:
++    return raw.rstrip(".,;:")
++
++
++class _Probe:
++    """One create's probe budget: :data:`MAX_TREES` trees under :data:`PROBE_BUDGET_S` seconds."""
++
++    def __init__(self):
++        self.deadline = time.monotonic() + PROBE_BUDGET_S
++        self.trees = 0
++
++    def tree(self, raw: str):
++        """``(keep evidence or None)`` for the worktree root ``raw``; None means it may queue."""
++        from hermes_cli import kanban_move_pool as kmp
++        path = _local_path(raw)
++        if not path.exists():
++            return None
++        remaining = self.deadline - time.monotonic()
++        if self.trees >= MAX_TREES or remaining <= 0:
++            return f"{path} exists here and was not checked in the probe budget"
++        self.trees += 1
++        if not kmp._is_tree(path):
++            return f"{path} exists only on this worker"
++        try:
++            return kmp.tree_state([str(path)], refresh=False, budget=remaining)
++        except (OSError, subprocess.SubprocessError, ValueError) as exc:
++            return f"{path} could not be checked ({type(exc).__name__})"
++
++
++def _operator(pattern, match, gateway, probe):
++    # an operator extra_home_markers pattern (or an unclassified built-in) fails toward keep
++    yield "keep", "operator", match.group(0), (), "operator marker"
++
++
++def _this_host(pattern, match, gateway, probe):
++    yield "keep", "a-this-host", match.group(0), (), "'this host' names this worker"
++
++
++def _reach(cls):
++    """Classes (b), (c), (d): queue with the class's reach label, if any."""
++    def verdict(pattern, match, gateway, probe):
++        from hermes_cli import kanban_placement as kp
++        hit = match.group(0)
++        label = kp.HOME_CLASS_LABELS.get(cls)
++        yield "queue", cls, hit, (label,) if label else (), NOTES[cls].format(hit=repr(hit), gateway=gateway)
++    return verdict
++
++
++def _worktree(pattern, match, gateway, probe):
++    from hermes_cli import kanban_placement as kp
++    roots = _WT_ROOT if pattern == kp.HOST_WORKTREE_PATH else None
++    found = ([_clean(m.group(0)) for m in roots.finditer(match.string)] if roots else
++             [_clean(m.group(0)) for rx in (_DOT_WT_ROOT, _CLAUDE_WT_ROOT) for m in rx.finditer(match.string)])
++    for root in dict.fromkeys(found) or [match.group(0)]:
++        state = probe.tree(root) if root in found else None
++        if state:
++            yield "keep", "a-worktree", root, (), state
++        else:
++            yield "queue", "worktree-not-here", root, (), NOTES["path"].format(hit=root, gateway=gateway)
++
++
++def _state_path(pattern, match, gateway, probe):
++    from hermes_cli import kanban_placement as kp
++    paths = [p for p in (_clean(m.group(0)) for m in _STATE.finditer(match.string))
++             if re.match(kp.HERMES_STATE_PATH, p)]
++    for raw in dict.fromkeys(paths) or [match.group(0)]:
++        if art := _ARTIFACT.search(raw):
++            # health: allow HX001 -- the card text names ~/.hermes literally; probe that same path on this worker
++            if (Path.home() / ".hermes" / art.group(1) / art.group(2)).exists():
++                yield "keep", "a-artifact", raw, (), f"{raw} exists only on this worker"
++            else:
++                yield ("queue", "artifact-not-here", raw, (kp.HOME_CLASS_LABELS["b"],),
++                       NOTES["path"].format(hit=raw, gateway=gateway))
++        else:
++            yield ("queue", "b", raw, (kp.HOME_CLASS_LABELS["b"],),
++                   NOTES["b"].format(hit=repr(raw), gateway=gateway))
++
++
++_VERDICTS = {"a": _this_host, "b": _reach("b"), "c": _reach("c"), "d": _reach("d"),
++             "worktree": _worktree, "state-path": _state_path}
++
++
++def _verdicts(pattern: str, match: re.Match, gateway: str, probe: _Probe):
++    """Yield ``(decision, class, hit, labels, sentence-or-evidence)`` for one hit."""
++    from hermes_cli import kanban_placement as kp
++    handler = _VERDICTS.get(kp.HOME_MARKER_CLASSES.get(pattern) or "", _operator)
++    yield from handler(pattern, match, gateway, probe)
++
++
++def classify(args: dict, cfg, gateway: str):
++    """``{decision, labels, note, class, hit}`` for the card's home-gateway-marker hits on pool worker ``gateway``,
++    or None when it has none. Any keep hit keeps the card; it queues only when every hit queues, with the union of
++    their labels and one note sentence per class. Reused for the rest of the create. [daveey]"""
++    from hermes_cli.kanban_placement_diagnostics import home_marker_hits
++    cache = _cache()
++    key = (gateway, *_key(args))
++    if cache is not None and key in cache:
++        return cache[key]
++    hits = home_marker_hits(args, cfg)
++    result = None
++    if hits:
++        probe = _Probe()
++        verdicts = [v for pattern, match in hits for v in _verdicts(pattern, match, gateway, probe)]
++        keeps = [v for v in verdicts if v[0] == "keep"]
++        if keeps:
++            _, cls, hit, _, evidence = keeps[0]
++            result = {"decision": "keep", "labels": set(), "class": cls, "hit": hit,
++                      "note": f"kept on {gateway}: {evidence}. {KEEP_TAIL}"}
++        else:
++            notes = {}
++            for _, cls, _, _, sentence in verdicts:
++                notes.setdefault(cls, sentence)
++            result = {"decision": "queue", "labels": {label for v in verdicts for label in v[3]},
++                      "class": verdicts[0][1], "hit": verdicts[0][2], "note": " ".join(notes.values())}
++    if cache is not None:
++        cache[key] = result
++        if result is not None:
++            remember(args, {"decision": result["decision"], "class": result["class"], "hit": result["hit"]})
++    return result
++
++
++def _key(args: dict):
++    return str(args.get("title") or ""), str(args.get("body") or "")
++
++
++def _cache():
++    from hermes_cli.kanban_published_worktree import create_observation
++    obs = create_observation()
++    return None if obs is None else obs.setdefault("home_marker_classify", {})
++
++
++def remember(args: dict, record: dict) -> None:
++    """Keep the ``home_marker`` audit record for this create (no-op outside a create's observation)."""
++    from hermes_cli.kanban_published_worktree import create_observation
++    obs = create_observation()
++    if obs is not None:
++        obs.setdefault("home_marker", {})[_key(args)] = record
++
++
++def recorded(args: dict):
++    """The ``home_marker`` audit record this create's placement wrote for ``args``, or None."""
++    from hermes_cli.kanban_published_worktree import create_observation
++    return ((create_observation() or {}).get("home_marker") or {}).get(_key(args))
++
++
++def unclaimable(args: dict) -> None:
++    """The queue result found no live machine holding its whole label set, so the local keep stands: record that as
++    ``gateway-test-failed`` (no live label), not as the queue it would have been. A keep never reaches here."""
++    if (record := recorded(args)) is not None:
++        remember(args, {"decision": "keep", "class": "gateway-test-failed", "hit": record["hit"]})
++
++
++HOME_WHY = " (home gateway marker {hit} not bound to {gateway})"
++
++
++def pool_worker_markers(args: dict, cfg, gateway: str, reason: str, live):
++    """What a pool worker does with a card whose ``portable_reason`` is ``reason`` (a local or home-gateway marker).
++
++    None leaves the legacy keep: the gateway test failed (not a Linux non-hub Board machine, or ``live()`` finds no
++    unheld machine with the pool label), another portability reason keeps the card, or an operator local marker
++    hit. ``{"keep": <decision>}`` keeps it here with a ``note`` naming what this worker holds. Otherwise
++    ``{labels, note, why}``: the card queues with these extra labels (t_01a1d2662553185d local markers,
++    t_01a1d2856e5fec44 home markers). [daveey]"""
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli import kanban_worker_placement as kwp
++    from hermes_cli.kanban_placement_diagnostics import home_marker_hits, portability
++
++    if not kp.linux_pool_gateway(gateway, cfg) or not live():
++        if reason == "home gateway marker" and not _is_hub(gateway, cfg) and (hits := home_marker_hits(args, cfg)):
++            remember(args, {"decision": "keep", "class": "gateway-test-failed", "hit": hits[0][1].group(0)})
++        return None
++    if portability(args, cfg, local_markers=False, home_markers=False)[0]:
++        return None
++    local = kwp.unmet_markers(args, cfg)
++    if reason == "local marker" and local is None:
++        return None  # an operator local marker
++    home = classify(args, cfg, gateway)
++    if home is not None and home["decision"] == "keep":
++        return {"keep": {"where": "local", "why": f"home gateway marker: mentions {home['hit']!r}",
++                         "note": home["note"]}}
++    labels, notes, why = set(), [], ""
++    if local is not None:
++        labels |= local["labels"]
++        notes.append(local["note"])
++        why += kwp.UNMET_WHY.format(hit=local["hit"], gateway=gateway)
++    if home is not None:
++        labels |= home["labels"]
++        notes.append(home["note"])
++        why += HOME_WHY.format(hit=repr(home["hit"]), gateway=gateway)
++    return {"labels": labels, "note": " ".join(notes), "why": why}
++
++
++def _is_hub(gateway, cfg) -> bool:
++    from hermes_cli.kanban_hub_admission_placement import is_hub
++    return bool(gateway) and is_hub(gateway, cfg or {})
+diff --git a/hermes_cli/kanban_move_pool.py b/hermes_cli/kanban_move_pool.py
+index 911b4955b9..31a297761b 100644
+--- a/hermes_cli/kanban_move_pool.py
++++ b/hermes_cli/kanban_move_pool.py
+@@ -128,7 +128,8 @@ _MAX_ANCESTRY_CHECKS = 50
+ _MAX_REFRESHES = 5
+ 
+ 
+-def pushed_on_remote(tree: str, *, budget: Optional[Callable[[float], float]] = None) -> bool:
++def pushed_on_remote(tree: str, *, budget: Optional[Callable[[float], float]] = None,
++                     refresh: bool = True) -> bool:
+     """Whether a tree the local refs call unpushed has HEAD on a remote branch after all. Fails toward False.
+ 
+     ``git push https://github.com/<o>/<r>.git HEAD:wt/x`` (a URL, not the remote's name: the HTTPS-credential push
+@@ -137,7 +138,8 @@ def pushed_on_remote(tree: str, *, budget: Optional[Callable[[float], float]] =
+     its worker (11-12: t_01a1d0a1eaa00371 sat ready on ``machine:worker-2`` while worker-2 was on a Board hold).
+     So ask the remote: HEAD is a remote branch tip, or a stale tracking ref HEAD builds on, once refreshed from
+     the remote, contains HEAD. Every git call draws its timeout from ``budget`` (:mod:`hermes_cli.git_budget`); a
+-    spent budget raises ``GitUnchecked`` (no verdict) rather than answering False ("unpushed")."""
++    spent budget raises ``GitUnchecked`` (no verdict) rather than answering False ("unpushed"). ``refresh=False``
++    (a create's bounded probe) asks only whether HEAD is a remote branch tip: no ancestry checks, no fetch."""
+     from functools import partial
+     from hermes_cli.git_budget import GitUnchecked, ensure_left, timeout_for
+     from hermes_cli.worktree_ops import _git_out, _worktree_has_unpushed_commits
+@@ -166,6 +168,10 @@ def pushed_on_remote(tree: str, *, budget: Optional[Callable[[float], float]] =
+             listing = git_out(["ls-remote", "--heads", remote], tree, timeout=t(_REMOTE_TIMEOUT))
+             if not listing:
+                 continue
++            if not refresh:
++                if any(line.partition("\t")[0] == head for line in listing.splitlines()):
++                    return True
++                continue
+             tracked = dict(line.split(" ", 1)[::-1] for line in (git_out(
+                 ["for-each-ref", "--format=%(objectname) %(refname)", f"refs/remotes/{remote}"], tree, timeout=t(10))
+                 or "").splitlines() if " " in line)
+@@ -188,12 +194,12 @@ def pushed_on_remote(tree: str, *, budget: Optional[Callable[[float], float]] =
+                 fallback.append(candidate)
+         # Spend the bounded refresh budget on this branch's likely destinations first,
+         # not the first five alphabetic heads of a large remote.
+-        refresh = sorted(stale + fallback, key=lambda c: (
++        fetches = sorted(stale + fallback, key=lambda c: (
+             (c[0], c[1]) not in preferred, c[1] != branch,
+         ))[:_MAX_REFRESHES]
+-        for remote, ref, tracking in refresh:
++        for remote, ref, tracking in fetches:
+             git_out(["fetch", "--no-tags", "-q", remote, f"+{ref}:{tracking}"], tree, timeout=t(_REMOTE_TIMEOUT))
+-        return bool(refresh) and not _worktree_has_unpushed_commits(tree, timeout=10, budget=budget)
++        return bool(fetches) and not _worktree_has_unpushed_commits(tree, timeout=10, budget=budget)
+     except GitUnchecked:
+         raise
+     except subprocess.TimeoutExpired:
+@@ -228,10 +234,12 @@ def _clock() -> float:
+     return time.monotonic()
+ 
+ 
+-def tree_state(trees: Iterable[str], *, budget: float = STATE_BUDGET_S) -> Optional[str]:
++def tree_state(trees: Iterable[str], *, budget: float = STATE_BUDGET_S,
++               refresh: bool = True) -> Optional[str]:
+     """``dirty worktree <p>`` / ``unpushed commits in <p>`` for the first tree with state, else None. Git runs at
+     most ``budget`` seconds in all (per-call timeouts shrink to the time left); a tree it could not check (budget
+-    spent, git timed out) reads ``unchecked worktree <p> (<cause>)``, which callers treat as state (fail safe)."""
++    spent, git timed out) reads ``unchecked worktree <p> (<cause>)``, which callers treat as state (fail safe).
++    ``refresh`` goes to :func:`pushed_on_remote` (a create probes with ``refresh=False`` and a short ``budget``)."""
+     from hermes_cli.git_budget import BUDGET_SPENT, GitUnchecked, deadline_budget
+     from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+     timeouts = deadline_budget(budget, clock=lambda: _clock())
+@@ -242,7 +250,7 @@ def tree_state(trees: Iterable[str], *, budget: float = STATE_BUDGET_S) -> Optio
+             if _worktree_is_dirty(tree, tree, timeout=10, budget=timeouts):
+                 return f"{_DIRTY}{tree}"
+             if (_worktree_has_unpushed_commits(tree, timeout=10, budget=timeouts)
+-                    and not pushed_on_remote(tree, budget=timeouts)):
++                    and not pushed_on_remote(tree, budget=timeouts, refresh=refresh)):
+                 return f"{_UNPUSHED}{tree}"
+         except GitUnchecked as exc:
+             cause = f"git checks of the card's trees took over {budget:g}s" if str(exc) == BUDGET_SPENT else str(exc)
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 1e3dfe010c..463964d21e 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -527,9 +527,15 @@ def builtin_marker_groups(args: dict, cfg: Optional[dict] = None) -> Optional[di
+ 
+ def markers_unmeetable_here(self_gw: Optional[str], cfg: Optional[dict], machines: Optional[dict] = None) -> bool:
+     """True when this gateway is a Linux Board machine other than the hub: no built-in local marker can be met here
+-    better than by any pool worker (see :data:`LOCAL_MARKER_GROUPS`). Reads the attested registry labels, not
+-    ``sys.platform`` (Linux CI simulates the MacBook gateway); an unreadable registry or no entry for this gateway
+-    is False, which keeps today's local keep. [daveey]"""
++    better than by any pool worker (see :data:`LOCAL_MARKER_GROUPS`). See :func:`linux_pool_gateway`. [daveey]"""
++    return linux_pool_gateway(self_gw, cfg, machines)
++
++
++def linux_pool_gateway(self_gw: Optional[str], cfg: Optional[dict], machines: Optional[dict] = None) -> bool:
++    """True when this gateway is a Linux Board machine other than the hub (a pool worker): the gateway test both
++    local markers (:func:`markers_unmeetable_here`) and home-gateway markers (:data:`HOME_MARKER_CLASSES`) use.
++    Reads the attested registry labels, not ``sys.platform`` (Linux CI simulates the MacBook gateway); an
++    unreadable registry or no entry for this gateway is False, which keeps today's local keep. [daveey]"""
+     from hermes_cli.kanban_hub_admission_placement import is_hub
+     if not self_gw or is_hub(self_gw, cfg or {}):
+         return False
+@@ -587,6 +593,25 @@ HOME_GATEWAY_MARKERS = (
+     r"\bjournalctl\b", r"\bthis host\b",
+     r"\brestart(ing)? (the )?gateway\b", r"\bhermes config (set|edit|unset)\b",
+ )
++# On a pool worker (:func:`linux_pool_gateway`) a home-gateway marker no longer keeps a card by itself
++# (t_01a1d2856e5fec44): in 24 h to 11-13, 473 worker-created cards hit one and only their creator could claim them,
++# though every pool worker reaches hub state with ``hub-admin`` (``capability:hub-write``). Each marker has a class
++# (a test enforces it): ``worktree`` and ``state-path`` are probed on this worker
++# (:mod:`hermes_cli.kanban_home_marker_placement`): only a named tree here that is dirty or unpushed, or a named
++# Kanban/scratch artifact that exists here, keeps the card. ``a`` ('this host' names the creating worker) keeps it.
++# ``b`` (hub or fleet state), ``c`` (Mac work) and ``d`` (a tool every pool worker carries) queue it for the pool,
++# with :data:`HOME_CLASS_LABELS`. Operator ``extra_home_markers`` still keep it.
++HOME_MARKER_CLASSES = {
++    HOST_WORKTREE_PATH: "worktree", LOCAL_WORKTREE_PATH: "worktree", HERMES_STATE_PATH: "state-path",
++    r"\bthis host\b": "a",
++    **dict.fromkeys((HUB_CLI_COMMAND, r"\bkanban\.db\b", r"\bcron ?(job|jobs|tab)?\b", r"\bhermes-sync\b",
++                     r"\bon the hub\b", r"\bthe hub's\b", r"\bgateway (restart|config|service)\b", r"\bsystemctl\b",
++                     r"\bjournalctl\b", r"\brestart(ing)? (the )?gateway\b", r"\bhermes config (set|edit|unset)\b"),
++                    "b"),
++    r"\blaunchd\b": "c",
++    r"\bssh\b": "d", r"\btoken-broker\b": "d",
++}
++HOME_CLASS_LABELS = {"b": "capability:hub-write", "c": "capability:tailnet-exec"}
+ 
+ 
+ # The note :func:`remote_body` appends when another gateway places a card here. It lists the origin's own
+diff --git a/hermes_cli/kanban_placement_diagnostics.py b/hermes_cli/kanban_placement_diagnostics.py
+index 85e68422da..0eb4592325 100644
+--- a/hermes_cli/kanban_placement_diagnostics.py
++++ b/hermes_cli/kanban_placement_diagnostics.py
+@@ -4,18 +4,19 @@ from __future__ import annotations
+ import re
+ 
+ 
+-def portability(args: dict, cfg=None, *, local_markers: bool = True) -> tuple[str | None, str | None]:
++def portability(args: dict, cfg=None, *, local_markers: bool = True,
++                home_markers: bool = True) -> tuple[str | None, str | None]:
+     """Return the stable reason and its actual marker evidence in one classifier pass.
+ 
+     Keep ordering and exemptions identical for admission and diagnostics. In particular,
+     never rescan raw text for an explanation after evidence/coordination filtering.
+     ``local_markers=False`` skips only the local-marker step (a pool worker re-checks a card whose built-in markers
+-    it cannot meet: every other reason still applies, in the same order). [daveey]
++    it cannot meet: every other reason still applies, in the same order). ``home_markers=False`` likewise skips only
++    the home-gateway-marker step, which a pool worker classifies itself (:func:`home_marker_hits`). [daveey]
+     """
+     from hermes_cli import kanban_placement as p
+     from hermes_cli import kanban_placement_coordination as coordination
+     from hermes_cli.kanban_carried_evidence import without_carried_inputs
+-    from hermes_cli.kanban_published_worktree import without_published_worktrees
+ 
+     c = p._Cfg(p.config() if cfg is None else cfg)
+     if reason := p.structural_reason(args, c.raw):
+@@ -33,24 +34,49 @@ def portability(args: dict, cfg=None, *, local_markers: bool = True) -> tuple[st
+     from hermes_cli import kanban_mandatory_pin as mandatory
+     if (pin := mandatory.requirements(args)) and not coordination.attested(coordination.destinations(c.raw), pin):
+         return mandatory.REASON, None  # an old-core pool member would not refuse a pin it cannot serve
++    if home_markers and (hit := next(_home_hits(full, reqs, c), None)):
++        return "home gateway marker", f"mentions {hit[1].group(0)!r}"
++    return None, None
++
++
++def _home_hits(full: str, reqs: list, c):
++    """Every home-gateway-marker hit of ``full`` in scan order, as ``(pattern, match)``; an operator
++    ``extra_home_markers`` hit has pattern ``"operator"``. The worktree-path probe runs last, and only when that
++    path is named: it avoids filesystem/network probes when a cheap marker already pins the card."""
++    from hermes_cli import kanban_placement as p
++    from hermes_cli import kanban_placement_coordination as coordination
++    from hermes_cli.kanban_published_worktree import without_published_worktrees
++
+     marker_full = coordination.access_text(coordination.marker_text(full), c.raw, requires=reqs)
+     extra = c.raw.get("extra_home_markers")
+     exemptible = (p.HUB_CLI_COMMAND, r"\btoken-broker\b", r"\bssh\b", r"\bon the hub\b", r"\bthe hub's\b",
+                   r"\bjournalctl\b", r"\bkanban\.db\b")
+-    pats = [(rx, marker_full if rx in exemptible else full)
++    pats = [(rx, rx, marker_full if rx in exemptible else full)
+             for rx in p.HOME_GATEWAY_MARKERS if rx != p.HOST_WORKTREE_PATH]
+-    pats += [(rx, full) for rx in extra] if isinstance(extra, list) else []
+-    for rx, text in pats:
++    pats += [(rx, "operator", full) for rx in extra] if isinstance(extra, list) else []
++    for rx, name, text in pats:
+         try:
+             if match := re.search(rx, text, re.IGNORECASE):
+-                return "home gateway marker", f"mentions {match.group(0)!r}"
++                yield name, match
+         except re.error:
+             continue
+-    # Avoid filesystem/network probes when a cheap marker already pins the card.
+     if re.search(p.HOST_WORKTREE_PATH, full, re.IGNORECASE):
+         if match := re.search(p.HOST_WORKTREE_PATH, without_published_worktrees(full), re.IGNORECASE):
+-            return "home gateway marker", f"mentions {match.group(0)!r}"
+-    return None, None
++            yield p.HOST_WORKTREE_PATH, match
++
++
++def home_marker_hits(args: dict, cfg=None) -> list:
++    """ALL home-gateway-marker hits of ``args`` as ``(pattern, match)``, over the same texts :func:`portability`
++    scans (evidence, carried inputs and published worktrees removed); ``pattern`` is ``"operator"`` for an
++    ``extra_home_markers`` hit. The match's ``.string`` is the text it was found in. [daveey]"""
++    from hermes_cli import kanban_placement as p
++    from hermes_cli.kanban_carried_evidence import without_carried_inputs
++
++    c = p._Cfg(p.config() if cfg is None else cfg)
++    reqs = args.get("requires") or []
++    reqs = [reqs] if isinstance(reqs, str) else list(reqs)
++    title, body = p.marker_work_text(args.get("title")), p.marker_work_text(args.get("body"))
++    return list(_home_hits(without_carried_inputs(f"{title}\n{body}", c.raw), reqs, c))
+ 
+ 
+ def local_why(args: dict, cfg=None, *, fallback="no placement route for this gateway") -> str:
+diff --git a/hermes_cli/kanban_published_worktree.py b/hermes_cli/kanban_published_worktree.py
+index 1442199da7..4653cdcc6f 100644
+--- a/hermes_cli/kanban_published_worktree.py
++++ b/hermes_cli/kanban_published_worktree.py
+@@ -36,6 +36,12 @@ def publication_scope(fn):
+     return wrapped
+ 
+ 
++def create_observation() -> dict | None:
++    """The current create's shared observation dict (None outside :func:`publication_scope`): other bounded
++    create-time probes keep their results here, for the rest of that create only. [daveey]"""
++    return _observation.get()
++
++
+ def without_published_worktrees(text: str) -> str:
+     """Remove only verified roots, within one shared three-second probe budget.
+ 
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 85d3834173..1a15c5d53f 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -80,16 +80,15 @@ def _hit_name(why):
+     return why.removeprefix("mentions ")
+ 
+ 
+-def unmet_markers(args, cfg, gateway):
+-    """``{labels, note, hit}`` when this gateway cannot meet any of the card's local markers better than the pool and
+-    nothing else keeps the card here; else None (t_01a1d2662553185d). [daveey]"""
++def unmet_markers(args, cfg):
++    """``{labels, note, hit}`` for the card's built-in local markers, which a pool worker cannot meet better than
++    the pool; None when it has none or any hit is an operator pattern (t_01a1d2662553185d). The gateway test and
++    every other keep are the caller's (:func:`hermes_cli.kanban_home_marker_placement.pool_worker_markers`).
++    [daveey]"""
+     from hermes_cli import kanban_placement as placement
+-    from hermes_cli.kanban_placement_diagnostics import portability
+ 
+     groups = placement.builtin_marker_groups(args, cfg)
+-    if not groups or not placement.markers_unmeetable_here(gateway, cfg):
+-        return None
+-    if portability(args, cfg, local_markers=False)[0]:
++    if not groups:
+         return None
+     labels, notes = set(), []
+     for group, why in groups.items():
+@@ -108,11 +107,13 @@ def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+     card while another has free slots. None (legacy routing applies) for a pin, an explicit ``runs_on``,
+     non-portable work, or when no active, unheld machine carries the label. Courier and origin-bound creates queue
+     too: chat ownership pins storage, not execution (t_01a1d0571c2f07d6). On a pool worker a built-in local-marker
+-    hit queues too, with its group's labels and a ``note`` (:func:`unmet_markers`). Either way the card queues only
+-    when one active, unheld machine holds the whole label set (queue, group and coordination labels), judged by
++    hit, and a home-gateway-marker hit this worker holds no state for, queue too, with their labels and a ``note``
++    (:func:`hermes_cli.kanban_home_marker_placement.pool_worker_markers`). Either way the card queues only when one
++    active, unheld machine holds the whole label set (queue, marker and coordination labels), judged by
+     ``machine_ok`` (given the label tuple) or the registry; else the local keep stands. The registry counts only
+     machines seen within ``FRESH_S`` (:func:`kanban_placement.label_machines`), so during a Board outage the card
+-    stays local once the last good snapshot ages out, instead of queueing on ``pool:worker``. [daveey]
++    stays local once the last good snapshot ages out, instead of queueing on ``pool:worker``. A home-marker keep
++    there is returned as ``{"where": "local", "why": "home gateway marker: ...", "note": ...}``. [daveey]
+     """
+     from hermes_cli import kanban_placement as placement
+     from hermes_cli import kanban_placement_coordination as coordination
+@@ -122,10 +123,16 @@ def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+         return None
+     unmet = None
+     reason = placement.portable_reason(args, cfg)
+-    if reason == "local marker":
+-        unmet = unmet_markers(args, cfg, gateway)
++    if reason in ("local marker", "home gateway marker"):
++        from hermes_cli.kanban_home_marker_placement import pool_worker_markers
++        # An injected machine_ok seam is the one liveness source and judges the whole label set below; only the
++        # registry path checks the bare queue label first (the gateway test).
++        unmet = pool_worker_markers(args, cfg, gateway, reason,
++                                    lambda: machine_ok is not None or placement._machine_picks_up(label))
+         if unmet is None:
+             return None
++        if unmet.get("keep"):
++            return unmet["keep"]
+     elif reason:
+         return None
+     extra = coordination.required_labels(args, cfg)
+@@ -137,11 +144,14 @@ def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+     # One liveness source for the whole set, marker hit or not: an active, unheld pickup machine must hold every
+     # label, else nobody could claim the card and today's local keep stands. The machine_ok seam sees the set.
+     if not (machine_ok or placement._machine_picks_up)(label if len(runs_on) == 1 else tuple(runs_on)):
++        if unmet is not None:
++            from hermes_cli.kanban_home_marker_placement import unclaimable
++            unclaimable(args)  # a home-marker queue record (if any) becomes gateway-test-failed
+         return None
+     if unmet is None:
+         return {"where": "local", "runs_on": runs_on, "why": QUEUED_WHY.format(label=label)}
+     return {"where": "local", "runs_on": runs_on, "note": unmet["note"],
+-            "why": QUEUED_WHY.format(label=label) + UNMET_WHY.format(hit=unmet["hit"], gateway=gateway)}
++            "why": QUEUED_WHY.format(label=label) + unmet["why"]}
+ 
+ 
+ def creation_decision(args, cfg, gateway, pin, origin_intent, machine_ok=None, queue=True):
+@@ -181,7 +191,11 @@ def creation_audit(args, cfg=None):
+     intent = "explicit" if explicit else "auto"
+     try:
+         cfg = placement.config() if cfg is None else cfg
+-        return {"portable_reason": placement.portable_reason(args, cfg), "placement_intent": intent}
++        audit = {"portable_reason": placement.portable_reason(args, cfg), "placement_intent": intent}
++        from hermes_cli.kanban_home_marker_placement import recorded
++        if (home := recorded(args)) is not None:  # how a pool worker resolved its home-marker hits
++            audit["home_marker"] = home
++        return audit
+     except Exception:  # health: allow BLE001 -- an audit field never blocks a create
+         logger.warning("portable_reason audit failed", exc_info=True)
+         return {"portable_reason": "audit failed", "placement_intent": intent}
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index aa32233529..f5428e6054 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -27,8 +27,12 @@ from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, WORKER, Gate
+ 
+ POOL = "pool:worker"
+ CFG = {"worker_queue": {HUB: POOL}}
+-W1 = {**MACHINES[WORKER], "labels": ["linux", POOL]}
+-W2 = {**MACHINES[WORKER], "name": "worker-2", "labels": ["linux", POOL]}
++TAILNET = "capability:tailnet-exec"
++HUB_WRITE = "capability:hub-write"
++# The live pool workers' labels (Board registry, 11-13): every one reaches the hub, the Macs and token-broker.
++LIVE = ["linux", POOL, HUB_WRITE, TAILNET, "capability:token-broker"]
++W1 = {**MACHINES[WORKER], "labels": LIVE}
++W2 = {**MACHINES[WORKER], "name": "worker-2", "labels": LIVE}
+ 
+ 
+ def _machines(*, held=()):
+@@ -841,7 +845,6 @@ def test_a_callers_runs_on_beats_a_queued_landing(monkeypatch):
+ # runs_on cards). No Board machine a card can lease runs macOS, so the creator was never better than the pool.
+ # Observed: t_01a1d2434cf3676c, and t_01a1d2662553185d itself (its spec names Chrome).
+ 
+-TAILNET = "capability:tailnet-exec"
+ SHIP_TITLE = "Independent exact-head review PR #1789 @370a13d80c (core-wt ship review required)"
+ SHIP_BODY = (
+     "Independent exact-head review of https://github.com/example-org/hermes/pull/1789 at "
+@@ -856,10 +859,8 @@ SHIP_BODY = (
+     '"reviewed_pr": "https://github.com/example-org/hermes/pull/1789"}\n')
+ 
+ 
+-def _pool_machines():
+-    w1 = {**W1, "labels": ["linux", POOL, TAILNET]}
+-    w2 = {**W2, "labels": ["linux", POOL, TAILNET]}
+-    return {m["name"]: m for m in (MACHINES[HUB], w1, w2, MACHINES["macbook"])}
++def _pool_machines(*, held=()):
++    return {m["name"]: {**m, "hold": m["name"] in held} for m in (MACHINES[HUB], W1, W2, MACHINES["macbook"])}
+ 
+ 
+ def _on(monkeypatch, gateway, cfg, machines):
+@@ -933,7 +934,8 @@ def test_direct_create_task_of_a_keychain_card_on_a_pool_worker_joins_the_pool(o
+ 
+ 
+ def _no_live_tailnet_pool_worker(kind):
+-    machines = _machines()  # worker-1/2: linux + pool:worker, no tailnet attestation
++    # worker-1/2: linux + pool:worker, no tailnet attestation (the live-set fixture labels minus TAILNET)
++    machines = {name: {**m, "labels": [x for x in m["labels"] if x != TAILNET]} for name, m in _machines().items()}
+     if kind == "held":
+         machines["worker-1"] = {**machines["worker-1"], "labels": ["linux", POOL, TAILNET], "hold": True}
+     elif kind == "split":  # a live machine has the tailnet label but not the queue label
+@@ -959,7 +961,8 @@ POOLS_CFG = {**CFG, "worker_pools": {HUB: ["worker-5"]}}
+ 
+ 
+ def _hub_write_registry(kind):
+-    machines = _machines()  # worker-1/2: linux + pool:worker, no hub-write attestation
++    # worker-1/2: linux + pool:worker, no hub-write attestation (the live-set fixture labels minus HUB_WRITE)
++    machines = {name: {**m, "labels": [x for x in m["labels"] if x != HUB_WRITE]} for name, m in _machines().items()}
+     machines["worker-5"] = {**W1, "name": "worker-5", "labels": ["linux", HUB_WRITE]}  # no queue label
+     if kind == "held":
+         machines["worker-1"] = {**machines["worker-1"], "labels": ["linux", POOL, HUB_WRITE], "hold": True}
+@@ -1010,6 +1013,23 @@ def test_machine_ok_seam_judges_the_whole_label_set_on_both_paths(w2, monkeypatc
+     assert wp.queue_decision(keychain, w2_cfg, "worker-2", "", machine_ok=lambda _labels: False) is None
+ 
+ 
++# The seam stays the one liveness source on the home-marker path too: with every registry pool member held, an
++# injected machine_ok that sees a joint holder still queues the card (no separate bare-label registry check).
++def test_machine_ok_seam_alone_judges_liveness_for_a_home_marker_card(w2, monkeypatch):
++    from hermes_cli import kanban_worker_placement as wp
++    seen = []
++
++    def ok(labels):
++        seen.append(labels)
++        return True
++    w2_cfg = {"worker_queue": {"worker-2": POOL}}
++    _on(monkeypatch, "worker-2", w2_cfg, _machines(held=("worker-1", "worker-2")))
++    card = {"title": "Fix the hermes-sync drain window parse"}
++    out = wp.queue_decision(card, w2_cfg, "worker-2", "", machine_ok=ok)
++    assert out is not None and out["runs_on"] == [POOL, HUB_WRITE] and seen == [(POOL, HUB_WRITE)], (out, seen)
++    assert wp.queue_decision(card, w2_cfg, "worker-2", "", machine_ok=lambda _labels: False) is None
++
++
+ def test_every_built_in_local_marker_has_a_group():
+     assert set(kp.DEFAULT_LOCAL_MARKERS) | set(kp.DEFAULT_LOCAL_SKILL_MARKERS) <= set(kp.LOCAL_MARKER_GROUPS)
+     assert set(kp.LOCAL_MARKER_GROUPS.values()) <= {"mac", "desktop", "browser", "sso", "context"}
+@@ -1062,11 +1082,318 @@ def test_pool_worker_keeps_an_operator_marker(w2, monkeypatch, cfg, title):
+ 
+ 
+ @pytest.mark.parametrize("card", [
+-    {"title": "systemctl " + "restart x"},
++    # "systemctl restart x" was a keep here until t_01a1d2856e5fec44: a home-gateway marker on a pool worker now
++    # joins the pool with capability:hub-write (test_systemctl_on_a_pool_worker_joins_the_pool_with_hub_write).
+     {"title": "rotate the CI token in the Keychain", "placement": "local"},
+     {"title": "rotate the CI token in the Keychain", "workspace_kind": "dir", "workspace_path": "/srv/x"},
++    {"title": "fix the hermes-sync drain", "placement": "local"},
++    {"title": "fix the hermes-sync drain", "workspace_kind": "dir", "workspace_path": "/srv/x"},
+ ])
+ def test_pool_worker_leaves_other_keeps_unchanged(on_w2, card):
+     from tools import kanban_tools as kt
+     out = json.loads(kt._handle_create({"assignee": "default", "requires": [], **card}))
+     assert out.get("task_id") and _runs_on(on_w2.conn, out["task_id"]) is None, out
++
++
++# --- home-gateway markers on a pool worker (t_01a1d2856e5fec44) -------------------------------------------------
++# 11-13: in 24 h, 473 worker-created cards hit a home-gateway marker (a ~/.hermes path, a _wt path, hermes-sync,
++# "on the hub", cron, ssh, ...) and stayed local rows only their creating worker could claim. Observed:
++# t_01a1d264e2d198d5 ('on the hub', worker-4), t_01a1ce17ce25fbc7 (_wt path, worker-2), t_01a1d259636f336f
++# (~/.hermes/kanban path, worker-5). Every pool worker reaches hub state with hub-admin (capability:hub-write), so
++# only this worker's own unpushed tree or files, 'this host' and operator markers keep a card on its creator.
++
++def _home_marker(conn, tid):
++    return _created(conn, tid).get("home_marker")
++
++
++def _queued(conn, out, labels):
++    assert out.get("ok"), out
++    assert _runs_on(conn, out["task_id"]) == sorted([POOL, *labels]), out
++    assert out["placement"]["runs_on"] == [POOL, *sorted(labels)], out
++    assert out["placement"]["why"].startswith("portable: queued for any machine labelled pool:worker"), out
++    assert "(home gateway marker " in out["placement"]["why"], out
++    assert out["placement"].get("note") == out.get("note") and out.get("note"), out
++    card = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (out["task_id"],)).fetchone())
++    assert wn.eligible(card, "worker-1", _pool_machines()) is None  # any pool worker may claim it
++    assert _created(conn, out["task_id"])["portable_reason"] == "home gateway marker"  # the audit stays truthful
++    return out
++
++
++def _kept(conn, out):
++    assert out.get("ok") and _runs_on(conn, out["task_id"]) is None, out
++    assert out["placement"]["why"].startswith("home gateway marker: "), out
++    assert out.get("note", "").startswith("kept on worker-2: "), out
++    assert out["placement"].get("note") == out["note"], out
++    assert _home_marker(conn, out["task_id"])["decision"] == "keep", out
++    return out
++
++
++def test_a_hermes_sync_card_from_a_pool_worker_joins_the_pool_with_hub_write(on_w2):  # (a)
++    out = _queued(on_w2.conn, _create(title="Fix the hermes-sync drain window parse"), [HUB_WRITE])
++    assert "hub-admin" in out["note"] and "worker-2" in out["note"], out
++    assert _home_marker(on_w2.conn, out["task_id"]) == {"decision": "queue", "class": "b", "hit": "hermes-sync"}
++
++
++def test_an_on_the_hub_kanban_db_card_from_a_pool_worker_joins_the_pool_with_hub_write(on_w2):  # (b)
++    _queued(on_w2.conn, _create(title="Investigate the stall on the hub; read the hub kanban.db"), [HUB_WRITE])
++
++
++def test_systemctl_on_a_pool_worker_joins_the_pool_with_hub_write(on_w2):  # (c), reverses the sibling's control
++    _queued(on_w2.conn, _create(title="systemctl " + "restart x"), [HUB_WRITE])
++
++
++def test_an_ssh_card_from_a_pool_worker_joins_the_pool_with_no_extra_label(on_w2):  # (d)
++    out = _queued(on_w2.conn, _create(title="use ssh to pull the CI box log"), [])
++    assert "every pool worker carries" in out["note"], out
++    assert _home_marker(on_w2.conn, out["task_id"])["class"] == "d"
++
++
++def test_a_review_naming_a_clean_pushed_wt_tree_joins_the_pool(on_w2, tmp_path):  # (e)
++    tree = _pushed_clone(tmp_path, tmp_path / "code" / "_wt" / "pool-card")
++    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tree, capture_output=True, text=True,
++                          check=True).stdout.strip()
++    out = _queued(on_w2.conn, _create(
++        title="Independent exact-head review PR #1900",
++        body=(f"Review https://github.com/example-org/hermes/pull/1900 at {head}.\n"
++              "The implementer's tree is ~/code/_wt/pool-card (read-only; fetch the PR head into your own tree).")),
++        [])
++    assert "~/code/_wt/pool-card is not unpublished state on worker-2" in out["note"], out
++    assert _home_marker(on_w2.conn, out["task_id"])["class"] == "worktree-not-here"
++
++
++def test_a_wt_path_absent_on_this_worker_joins_the_pool(on_w2):  # (f)
++    _queued(on_w2.conn, _create(title="Re-run the tests in ~/code/_wt/gone"), [])
++
++
++def test_an_evidence_path_absent_on_this_worker_joins_the_pool_with_hub_write(on_w2):  # (g)
++    out = _queued(on_w2.conn, _create(title="read ~/.hermes/kanban/evidence/t_0000000000000001/report.md"),
++                  [HUB_WRITE])
++    assert _home_marker(on_w2.conn, out["task_id"])["class"] == "artifact-not-here"
++
++
++def test_cli_create_of_a_hermes_sync_card_on_a_pool_worker_joins_the_pool(on_w2):  # (h)
++    from hermes_cli import kanban as kcli
++    out = kcli.run_slash('create "fix the hermes-sync drain" --assignee default --json')
++    assert _runs_on(on_w2.conn, json.loads(out)["id"]) == sorted([POOL, HUB_WRITE]), out
++
++
++def test_direct_create_task_of_a_hermes_sync_card_on_a_pool_worker_joins_the_pool(on_w2):
++    tid = kb.create_task(on_w2.conn, title="fix the hermes-sync drain", assignee="default", requires=[])
++    assert _runs_on(on_w2.conn, tid) == sorted([POOL, HUB_WRITE])
++
++
++def test_a_keychain_and_systemctl_card_carries_both_reach_labels(on_w2):  # (i)
++    out = _create(title="rotate the Keychain token, then restart it via systemctl")
++    assert _runs_on(on_w2.conn, out["task_id"]) == sorted([POOL, HUB_WRITE, TAILNET]), out
++    assert "tailnet_exec" in out["note"] and "hub-admin" in out["note"], out
++
++
++def test_every_home_gateway_marker_has_a_class():
++    assert set(kp.HOME_MARKER_CLASSES) == set(kp.HOME_GATEWAY_MARKERS)
++    assert set(kp.HOME_MARKER_CLASSES.values()) <= {"worktree", "state-path", "a", "b", "c", "d"}
++    assert kp.HOME_MARKER_CLASSES[r"\bthis host\b"] == "a"
++    assert kp.HOME_CLASS_LABELS == {"b": HUB_WRITE, "c": TAILNET}
++
++
++def test_home_marker_hits_lists_every_hit_and_tags_operator_patterns():
++    from hermes_cli.kanban_placement_diagnostics import home_marker_hits
++    hits = home_marker_hits({"title": "on the hub, fix the grafana panel via ssh"},
++                            {"extra_home_markers": [r"\bgrafana\b"]})
++    assert [(p, m.group(0)) for p, m in hits] == [
++        (r"\bon the hub\b", "on the hub"), (r"\bssh\b", "ssh"), ("operator", "grafana")]
++
++
++# Controls: unchanged before and after.
++
++# What a MacBook (routed to the hub) decides for a home-gateway marker at base 141bcec62a: home markers bind only a
++# routeless gateway, so it routes to the hub. This card changes no routed gateway.
++MACBOOK_HOME_DECISION = {"where": "hub", "why": "no local-only need"}
++
++
++def test_hub_hermes_sync_card_still_asks_the_admission_judge(hub, judge):
++    from tools import kanban_tools as kt
++    _registry()
++    out = json.loads(kt._handle_create({"title": "fix hermes-sync on the hub", "assignee": "default",
++                                        "requires": []}))
++    assert out.get("task_id") and len(judge.calls) == 1, out
++    assert "home_marker" not in _created(hub.conn, out["task_id"])  # the hub is not a worker gateway
++
++
++def test_macbook_hermes_sync_card_is_unchanged(w2, monkeypatch):
++    _on(monkeypatch, "macbook", {"route": {"macbook": HUB}, "worker_queue": {"macbook": POOL}}, _pool_machines())
++    d = kp.decide({"title": "fix hermes-sync on the hub"}, live=lambda _t: None, carries=True)
++    assert d == MACBOOK_HOME_DECISION, d
++
++
++def test_pool_worker_keeps_a_home_marker_card_when_the_registry_is_unreadable(w2, monkeypatch):
++    _on(monkeypatch, "worker-2", {"worker_queue": {"worker-2": POOL}}, _pool_machines())
++
++    def down():
++        raise OSError("board unreachable")
++    wn.set_registry_fetch(down)
++    out = _create(title="fix the hermes-sync drain")
++    assert _runs_on(w2.conn, out["task_id"]) is None, out
++    assert out["placement"]["why"].startswith("home gateway marker: "), out
++    # The live check lists these: a worker kept a home-marker card only because it could not test its gateway.
++    assert _home_marker(w2.conn, out["task_id"]) == {
++        "decision": "keep", "class": "gateway-test-failed", "hit": "hermes-sync"}
++
++
++def test_pool_worker_keeps_a_home_marker_card_when_every_pool_member_is_held(w2, monkeypatch):
++    _on(monkeypatch, "worker-2", {"worker_queue": {"worker-2": POOL}},
++        _pool_machines(held=("worker-1", "worker-2")))
++    out = _create(title="fix the hermes-sync drain")
++    assert _runs_on(w2.conn, out["task_id"]) is None, out
++    assert out["placement"]["why"].startswith("home gateway marker: "), out
++    assert _home_marker(w2.conn, out["task_id"])["class"] == "gateway-test-failed"
++
++
++def test_pool_worker_keeps_a_home_marker_card_no_live_machine_can_claim(w2, monkeypatch):
++    """No live pool member attests capability:hub-write: the (b) card keeps the legacy local keep (cfc3d681ce), and
++    its audit says the gateway could not queue it, not that it queued."""
++    machines = {name: {**m, "labels": [x for x in m["labels"] if x != HUB_WRITE]} for name, m in _machines().items()}
++    _on(monkeypatch, "worker-2", {"worker_queue": {"worker-2": POOL}}, machines)
++    out = _create(title="fix the hermes-sync drain")
++    assert _runs_on(w2.conn, out["task_id"]) is None, out
++    assert out["placement"]["why"].startswith("home gateway marker: "), out
++    assert _home_marker(w2.conn, out["task_id"]) == {
++        "decision": "keep", "class": "gateway-test-failed", "hit": "hermes-sync"}
++
++
++def test_a_marker_card_another_reason_keeps_stays_kept(on_w2):
++    """A pool worker re-checks every other portability reason: an unattested mandatory model pin still keeps a
++    Keychain card here (no pool member carries capability:mandatory-model-pin)."""
++    out = _create(title="rotate the CI token in the Keychain", model="claude-opus-5-5", provider="anthropic",
++                  pin_mandatory=True)
++    assert _runs_on(on_w2.conn, out["task_id"]) is None, out
++
++
++def test_a_marker_card_stays_kept_when_one_pool_member_lacks_the_pin_label(w2, monkeypatch):
++    """worker-1 alone attests the mandatory pin: one live machine holds the whole label set (cfc3d681ce), but the
++    pin is unattested across the pool (every eligible member must carry it), so the card must still stay here."""
++    from hermes_cli.kanban_mandatory_pin import LABEL
++    machines = _pool_machines()
++    machines["worker-1"] = {**machines["worker-1"], "labels": [*LIVE, LABEL]}
++    _on(monkeypatch, "worker-2", {"worker_queue": {"worker-2": POOL}}, machines)
++    out = _create(title="rotate the CI token in the Keychain", model="claude-opus-5-5", provider="anthropic",
++                  pin_mandatory=True)
++    assert _runs_on(w2.conn, out["task_id"]) is None, out
++
++
++def test_a_worker_keeps_a_card_naming_a_non_git_directory_under_wt(on_w2, tmp_path):
++    """A named ``_wt`` root that exists here but is not a git tree fails toward keep."""
++    (tmp_path / "code" / "_wt" / "plain").mkdir(parents=True)
++    out = _kept(on_w2.conn, _create(title="copy the logs out of ~/code/_wt/plain"))
++    assert f"{tmp_path / 'code' / '_wt' / 'plain'} exists only on this worker" in out["note"], out
++
++
++def test_a_worker_keeps_a_card_naming_more_trees_than_the_probe_budget(on_w2, tmp_path):
++    """Only MAX_TREES trees are probed per create; a further existing tree is kept, never assumed pushed."""
++    from hermes_cli import kanban_home_marker_placement as khm
++    names = [f"t{i}" for i in range(khm.MAX_TREES + 1)]
++    for name in names:
++        _pushed_clone(tmp_path, tmp_path / "code" / "_wt" / name)
++    out = _kept(on_w2.conn, _create(title="compare " + ", ".join(f"~/code/_wt/{n}" for n in names)))
++    assert "was not checked in the probe budget" in out["note"], out
++
++
++def test_a_create_probe_bounds_every_git_call_by_its_budget(on_w2, tmp_path, monkeypatch):
++    """The create's tree probe hands its remaining PROBE_BUDGET_S to ``tree_state``: every git call it makes
++    (dirty, unpushed, ls-remote) times out within that budget, not the move guard's longer default."""
++    from hermes_cli import kanban_home_marker_placement as khm, worktree_ops
++    tree = _pushed_clone(tmp_path, tmp_path / "code" / "_wt" / "bounded")
++    _commit(tree, "b.txt")
++    original, timeouts = worktree_ops._git_out, []
++
++    def observe(args, cwd, **kwargs):
++        timeouts.append((args[0], kwargs.get("timeout")))
++        return original(args, cwd, **kwargs)
++    monkeypatch.setattr(worktree_ops, "_git_out", observe)
++    out = _kept(on_w2.conn, _create(title="finish the fix in ~/code/_wt/bounded"))
++    assert f"unpushed commits in {tree}" in out["note"], out
++    assert "ls-remote" in [c for c, _ in timeouts], timeouts
++    assert all(t is not None and 0 < t <= khm.PROBE_BUDGET_S for _, t in timeouts), timeouts
++
++
++def test_a_worker_resolves_its_own_home_spelled_out(on_w2, tmp_path):
++    """``/home/<this user>/...`` names this worker's home just like ``~``."""
++    tree = _pushed_clone(tmp_path, tmp_path / "code" / "_wt" / "spelled")
++    _commit(tree, "b.txt")
++    out = _kept(on_w2.conn, _create(title=f"finish the fix in /home/{tmp_path.name}/code/_wt/spelled"))
++    assert f"unpushed commits in {tree}" in out["note"], out
++
++
++@pytest.mark.parametrize("state", ["unpushed", "dirty"])
++def test_a_worker_keeps_a_card_naming_its_own_unpublished_tree(on_w2, tmp_path, state):
++    tree = _pushed_clone(tmp_path, tmp_path / "code" / "_wt" / "held-card")
++    if state == "unpushed":
++        _commit(tree, "b.txt")
++    else:
++        (tree / "wip.txt").write_text("not committed\n")
++    out = _kept(on_w2.conn, _create(title="finish the parser fix in ~/code/_wt/held-card"))
++    word = "unpushed commits in" if state == "unpushed" else "dirty worktree"
++    assert f"{word} {tree}" in out["note"], out
++    assert _home_marker(on_w2.conn, out["task_id"])["class"] == "a-worktree"
++
++
++def test_a_worker_keeps_a_card_naming_its_own_artifact(on_w2, tmp_path):
++    log = tmp_path / ".hermes" / "kanban" / "workspaces" / "t_0000000000000002" / "log.txt"
++    log.parent.mkdir(parents=True)
++    log.write_text("x\n")
++    out = _kept(on_w2.conn, _create(title="read ~/.hermes/kanban/workspaces/t_0000000000000002/log.txt"))
++    assert "exists only on this worker" in out["note"], out
++    assert _home_marker(on_w2.conn, out["task_id"])["class"] == "a-artifact"
++
++
++def test_a_worker_keeps_a_this_host_card(on_w2):
++    out = _kept(on_w2.conn, _create(title="apply the next hermes update on this host"))
++    assert "'this host' names this worker" in out["note"], out
++    assert _home_marker(on_w2.conn, out["task_id"])["class"] == "a-this-host"
++
++
++def test_a_worker_keeps_an_operator_home_marker(w2, monkeypatch):
++    _on(monkeypatch, "worker-2", {"worker_queue": {"worker-2": POOL}, "extra_home_markers": [r"\bgrafana\b"]},
++        _pool_machines())
++    out = _kept(w2.conn, _create(title="fix the grafana panel"))
++    assert "operator marker" in out["note"], out
++
++
++def test_a_hub_hit_with_an_unpushed_tree_stays_kept(on_w2, tmp_path):
++    """Every hit decides, not the first: 'on the hub' alone would queue."""
++    tree = _pushed_clone(tmp_path, tmp_path / "code" / "_wt" / "mixed")
++    _commit(tree, "b.txt")
++    out = _kept(on_w2.conn, _create(title="on the hub, finish the fix in ~/code/_wt/mixed"))
++    assert _home_marker(on_w2.conn, out["task_id"])["class"] == "a-worktree"
++
++
++def test_an_explicit_runs_on_beats_a_home_marker(on_w2):
++    out = _create(title="fix the hermes-sync drain", runs_on=["machine:worker-1"])
++    assert _runs_on(on_w2.conn, out["task_id"]) == ["machine:worker-1"], out
++
++
++def test_tree_state_without_refresh_never_fetches(tmp_path, monkeypatch):
++    """Creation probes a named tree with ``refresh=False``: only ``ls-remote``, no fetch. Park and move keep the
++    default (``refresh=True``), which refreshes a stale tracking ref (test_url_push_moved_tip_...)."""
++    from hermes_cli import kanban_move_pool as kmp, worktree_ops
++    tree = _pushed_clone(tmp_path, tmp_path / "norefresh")
++    _git(tree, "fetch", "-q", "origin")
++    _commit(tree, "b.txt")
++    other = tmp_path / "norefresh-other"
++    _git(tmp_path, "clone", "-q", "-b", "wt/x", str(tmp_path / "norefresh-remote.git"), str(other))
++    _git(tree, "push", "-q", str(tmp_path / "norefresh-remote.git"), "HEAD:refs/heads/wt/x")  # by URL
++    _commit(other, "advanced.txt")
++    _git(other, "pull", "-q", "--rebase", "origin", "wt/x")
++    _git(other, "push", "-q", "origin", "HEAD:refs/heads/wt/x")  # the remote moved past HEAD
++    original, calls = worktree_ops._git_out, []
++
++    def observe(args, cwd, **kwargs):
++        calls.append((args[0], kwargs.get("timeout")))
++        return original(args, cwd, **kwargs)
++    monkeypatch.setattr(worktree_ops, "_git_out", observe)
++    assert kmp.tree_state([str(tree)], refresh=False, budget=5) == f"unpushed commits in {tree}"
++    # every git call, ls-remote included, ends inside the create's budget (main's deadline shrinks the timeouts)
++    assert "fetch" not in [c for c, _ in calls] and "ls-remote" in [c for c, _ in calls], calls
++    assert all(t is not None and 0 < t <= 5 for _, t in calls), calls
++    calls.clear()
++    assert kmp.tree_state([str(tree)]) is None  # the default refresh finds HEAD on the moved branch
++    assert "fetch" in [c for c, _ in calls], calls
+diff --git a/tests/hermes_cli/test_kanban_published_worktree.py b/tests/hermes_cli/test_kanban_published_worktree.py
+index f35a61f5ec..6ead2ff6f8 100644
+--- a/tests/hermes_cli/test_kanban_published_worktree.py
++++ b/tests/hermes_cli/test_kanban_published_worktree.py
+@@ -171,6 +171,16 @@ def test_expired_budget_fails_closed(published):
+     assert not pw._published(published[0], 0, 'unused')
+ 
+ 
++def test_home_marker_hits_skip_a_published_worktree(published):
++    """A pool worker classifies every home-marker hit (t_01a1d2856e5fec44): a published root is not one of them,
++    so the exemption still runs first and another hit ('on the hub') alone decides the card."""
++    from hermes_cli.kanban_placement_diagnostics import home_marker_hits
++    head = git(published[0], 'rev-parse', 'HEAD')
++    body = (f'On the hub, continue in ~/code/_wt/fix.\n'
++            f'Fetch https://github.com/example/project branch wt/fix and check out {head}.')
++    assert [m.group(0) for _, m in home_marker_hits({'title': 'Fix parser', 'body': body}, {})] == ['On the hub']
++
++
+ def test_structural_host_requirements_stay_local(published):
+     assert reason('~/code/_wt/fix', workspace_kind='dir') == 'host workspace'
+     assert reason('~/code/_wt/fix', requires=['host_repo']) == 'uncarried requirement'
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index f9104d8f7a..c393efd601 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -167,6 +167,8 @@ def _local_placement(kp, view: dict, decision: dict, *, machine_ok, note_local_p
+     if why.startswith("local marker"):
+         return {"where": "local", "why": why, "remedy": kp.marker_remedy(why, None, view)}
+     placement = {"where": "local", "why": why}
++    if decision.get("note"):  # a pool worker's home-marker keep: what it holds, and how to free the card
++        placement["note"] = decision["note"]
+     if note_local_pin and why == kp.PINNED_LOCAL_WHY:
+         # Unpinned means placement omitted: an explicit 'auto' would also drop a skill marker (marker_skills).
+         unpinned = kp.decide({k: v for k, v in view.items() if k != "placement"}, machine_ok=machine_ok)
+@@ -228,6 +230,8 @@ def _marker_placement_fields(conn, new_tid: str, marker_placement: Optional[dict
+         out["remedy"] = marker_placement["remedy"]
+     if marker_placement.get("note"):
+         out["note"] = marker_placement["note"]  # a local pin on a card with no local need
++        if marker_placement["why"].startswith("home gateway marker"):
++            out["placement"]["note"] = marker_placement["note"]  # a pool worker's home-marker keep
+     return out
+ 
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,171 @@
+From e72c6a42c75b31f4b4169ce3bee055c1b99e006e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:10:20 +0000
+Subject: [PATCH] [daveey] ci: review_status emit reports a scan that wrote no
+ verdict as "did not run", not clean
+
+Follow-up to the #2293 review (review 5892366788). After #2293 a supply-chain
+scan that cannot diff the PR exits 2 and writes no `found=`. The job goes red,
+but the "Emit review_status (supply-chain scan)" and "(dependency bounds)"
+steps still run (`always() && outcome != 'skipped'`), get `FOUND=''`, and
+`review_status.py emit` published `[]`, so the live PR comment showed the
+same thing as a clean scan and never said the scan had not run.
+
+Why (five whys):
+1. The comment looked clean: emit published `[]`.
+2. emit published `[]`: it treated every flag value other than `true` as a
+   pass, so unset/empty (no verdict) was indistinguishable from `false`.
+3. Unset was possible: the scan step fails closed by writing no `found=`, and
+   the emit step runs after a failed scan on purpose (to publish its status).
+4. Nothing distinguished "scan said no" from "scan never answered".
+
+Fix: `emit` now treats only `true` (report) and `false` (`[]`) as verdicts.
+Any other value, unset or empty included, publishes one action_required
+result, "The <check> did not run", saying the PR was not checked and pointing
+at the failing step in the job log. Each Finding gains a `check` label for
+that title. The prompt-surface and lockfile emits run only after their
+producer step succeeded (which always writes `changed=`), so they are
+unaffected; the workflow is unchanged.
+
+Proof:
+- tests/ci/test_repo_guard_checks.py: new
+  test_emit_reports_a_check_that_wrote_no_verdict_as_not_run (both scans x
+  FOUND unset / empty / `TRUE`) and
+  test_a_scan_with_no_verdict_survives_the_supply_chain_merge (emit -> merge,
+  as repo-guards.yml runs them).
+- RED on main's review_status.py: 7 failed, 18 passed.
+- GREEN: 25 passed; tests/ci/test_live_comment.py passes.
+---
+ scripts/ci/review_status.py        | 36 ++++++++++++++++++++++++------
+ tests/ci/test_repo_guard_checks.py | 30 +++++++++++++++++++++++++
+ 2 files changed, 59 insertions(+), 7 deletions(-)
+
+diff --git a/scripts/ci/review_status.py b/scripts/ci/review_status.py
+index 1d0bf3bb8c..e5a302f7e1 100755
+--- a/scripts/ci/review_status.py
++++ b/scripts/ci/review_status.py
+@@ -10,7 +10,10 @@ the ``review-status-<artifact>`` artifact.
+     python3 scripts/ci/review_status.py merge <artifact> ENV...   # concatenate env-held lists
+ 
+ ``emit`` publishes one ``action_required`` result, carrying the check's report file as its
+-detail, when the check's flag variable is ``true``, and ``[]`` otherwise.
++detail, when the check's flag variable is ``true``, and ``[]`` when it is ``false``. Any other
++value, unset or empty included, means the step that judges the PR wrote no verdict (it failed,
++e.g. git could not diff the PR), so ``emit`` publishes an ``action_required`` "did not run"
++result: an empty status would read as a clean check in the live PR comment.
+ """
+ 
+ from __future__ import annotations
+@@ -60,6 +63,7 @@ class Finding:
+     title: str
+     summary: str
+     how_to_fix: str
++    check: str  # what produced the flag, named in the "did not run" result's title
+     compact: bool = False
+ 
+ 
+@@ -69,36 +73,54 @@ FINDINGS = {
+         "Prompt surface changed",
+         "This PR changes the system prompt or tool schemas every session sends.",
+         "Read the rendered change below (full text under tests/fixtures/prompt_surface/ "
+-        "in the Files tab). Merging needs a hermes-agent-core approval."),
++        "in the Files tab). Merging needs a hermes-agent-core approval.",
++        "prompt-surface diff"),
+     "lockfile-diff": Finding(
+         "CHANGED", "lockfile-diff.md", "lockfile-diff", "lockfile-diff",
+         "JS lockfiles",
+         "Locked JS dependency versions changed.",
+         "Verify the version changes are expected. Lockfile changes need a hermes-agent-core review.",
+-        compact=True),
++        "lockfile diff", compact=True),
+     # No artifact: the merge subcommand combines these two into the supply-chain artifact.
+     "supply-chain-scan": Finding(
+         "FOUND", "supply-chain-findings.md", None, "supply chain",
+         "Critical supply chain risk",
+         "Critical supply chain risk patterns detected in this PR.",
+         "Review the flagged code carefully. If it is a false positive, narrow the pattern in "
+-        "scripts/ci/scan_supply_chain.py."),
++        "scripts/ci/scan_supply_chain.py.",
++        "supply-chain pattern scan"),
+     "dependency-bounds": Finding(
+         "FOUND", "supply-chain-unbounded.txt", None, "supply chain",
+         "Unbounded PyPI dependencies",
+         "This PR adds PyPI dependencies without upper bounds.",
+         'Add a `<next_major` upper bound, e.g. `"package>=1.2.0,<2"`. '
+-        "See CONTRIBUTING.md dependency pinning policy."),
++        "See CONTRIBUTING.md dependency pinning policy.",
++        "dependency-bounds scan"),
+ }
+ 
+ 
++def did_not_run(finding: Finding, flag: str | None) -> list[dict]:
++    """The result for a check whose step wrote no ``true``/``false`` verdict."""
++    value = "unset" if flag is None else f"`{flag}`" if flag else "empty"
++    return action_required(
++        finding.source, f"The {finding.check} did not run",
++        f"The step that runs the {finding.check} wrote no verdict ({finding.flag_env} is {value}), "
++        "so this PR was not checked. This is not a clean result.",
++        "See the failing step in the job log (for a supply-chain scan: git could not diff the PR), "
++        "fix the cause and rerun the job.")
++
++
+ def emit(check: str) -> None:
+     finding = FINDINGS[check]
+-    status: list[dict] = []
+-    if os.environ.get(finding.flag_env, "") == "true":
++    flag = os.environ.get(finding.flag_env)
++    if flag == "true":
+         detail = Path(os.environ["RUNNER_TEMP"], finding.report).read_text(encoding="utf-8-sig")
+         status = action_required(finding.source, finding.title, finding.summary,
+                                  finding.how_to_fix, detail)
++    elif flag == "false":
++        status = []
++    else:
++        status = did_not_run(finding, flag)
+     publish(status, finding.artifact, compact=finding.compact)
+ 
+ 
+diff --git a/tests/ci/test_repo_guard_checks.py b/tests/ci/test_repo_guard_checks.py
+index b797757ef8..4466356dcd 100644
+--- a/tests/ci/test_repo_guard_checks.py
++++ b/tests/ci/test_repo_guard_checks.py
+@@ -283,6 +283,36 @@ def test_emit_publishes_the_report_only_when_the_flag_is_true(repo, step):
+     assert status["results"][0]["detail"] == '"loose>=2.1"\n'
+ 
+ 
++@pytest.mark.parametrize(("check", "title"), [
++    ("supply-chain-scan", "The supply-chain pattern scan did not run"),
++    ("dependency-bounds", "The dependency-bounds scan did not run"),
++])
++@pytest.mark.parametrize(("found", "shown"), [(None, "unset"), ("", "empty"), ("TRUE", "`TRUE`")])
++def test_emit_reports_a_check_that_wrote_no_verdict_as_not_run(repo, step, check, title, found, shown):
++    """A failed scan writes no found=, so the workflow hands emit FOUND='': that is no clean scan."""
++    env = {} if found is None else {"FOUND": found}
++    assert step.run(repo, "review_status.py", "emit", check, **env).returncode == 0
++    assert step.review_status() == [{"source": "supply chain", "results": [{
++        "kind": "action_required", "title": title,
++        "summary": f"The step that runs the {title.removeprefix('The ').removesuffix(' did not run')} "
++                   f"wrote no verdict (FOUND is {shown}), so this PR was not checked. "
++                   "This is not a clean result.",
++        "how_to_fix": "See the failing step in the job log (for a supply-chain scan: git could not "
++                      "diff the PR), fix the cause and rerun the job."}]}]
++
++
++def test_a_scan_with_no_verdict_survives_the_supply_chain_merge(repo, step):
++    """Emit then merge, as repo-guards.yml runs them, with the patterns scan's FOUND empty."""
++    step.run(repo, "review_status.py", "emit", "supply-chain-scan", FOUND="")
++    scan_status = step.outputs()["review_status"]
++    step.output.unlink()
++    step.run(repo, "review_status.py", "emit", "dependency-bounds", FOUND="false")
++    step.run(repo, "review_status.py", "merge", "supply-chain", "SCAN", "DEPS",
++             SCAN=scan_status, DEPS=step.outputs()["review_status"])
++    [status] = step.artifact("supply-chain")
++    assert [r["title"] for r in status["results"]] == ["The supply-chain pattern scan did not run"]
++
++
+ def test_merge_concatenates_the_supply_chain_statuses_and_skips_malformed_ones(repo, step):
+     one = json.dumps([{"source": "supply chain", "results": []}])
+     step.run(repo, "review_status.py", "merge", "supply-chain", "SCAN", "DEPS", "BAD",
+-- 
+2.43.0
+

@@ -1,0 +1,175 @@
+From f599af434359c9add1240922bf0520895b7814fa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:22:18 +0000
+Subject: [PATCH] [daveey] tui_gateway: the legacy turn refusal reads every
+ ledger row, non-forwardable first
+
+Follow-up to PR #2117 review 5890229371 (card t_01a1d4bb88d62f33). Nits 2-4 (LINEAGE_LIMIT single source, the
+signature change-detector, the >LINEAGE_LIMIT superset note) landed in cd40d134de (PR #2189); this carries the one
+remaining behavioral nit plus the docstring that describes it.
+
+1. Sibling masked read (behavioral). session_lifecycle._canonical_ledger_refusal read the chat's ledger with
+   _CANONICAL_PENDING_SQL (UNION ALL ... LIMIT 1, no ORDER BY) into refusal.ledger_status, and
+   owner_forward.forwardable forwards prompt.submit whenever that status is forwardable. A `queued` row beside an
+   `unknown` admission on the same id answered `queued`, so a typed prompt was forwarded past the unknown barrier.
+   New kanban_leg_custody.ledger_status(conn, sid) reads every non-terminal row (_LINEAGE_PENDING_SQL) and orders
+   them non-forwardable first, then by name; the refusal and lineage_ledger_status both use it.
+   _CANONICAL_PENDING_SQL stays for existence checks only (_end_unless_ledger_busy), commented as such.
+   RED on origin/main: test_a_queued_row_beside_an_unknown_admission_never_forwards_past_it[unknown_first|
+   queued_first] read 'queued' (both row orders), GREEN with the fix.
+2. Docstring. lineage_ledger_status describes the per-id ledger_status order (non-forwardable first), keeping
+   #2189's "alphabetically first" wording for the forwardable fallback and its LINEAGE_LIMIT superset note.
+   Behavior of lineage_ledger_status unchanged.
+---
+ .../test_legacy_submit_forwards_to_owner.py   | 27 +++++++++++++
+ tui_gateway/kanban_leg_custody.py             | 38 ++++++++++++-------
+ tui_gateway/session_lifecycle.py              | 15 +++++---
+ 3 files changed, 62 insertions(+), 18 deletions(-)
+
+diff --git a/tests/tui_gateway/test_legacy_submit_forwards_to_owner.py b/tests/tui_gateway/test_legacy_submit_forwards_to_owner.py
+index d87d83e9c9..2619f64488 100644
+--- a/tests/tui_gateway/test_legacy_submit_forwards_to_owner.py
++++ b/tests/tui_gateway/test_legacy_submit_forwards_to_owner.py
+@@ -158,6 +158,33 @@ def test_outcome_unknown_work_is_still_refused_and_never_forwarded(monkeypatch,
+         db.close()
+ 
+ 
++@pytest.mark.parametrize("unknown_row", [0, 1], ids=["unknown_first", "queued_first"])
++def test_a_queued_row_beside_an_unknown_admission_never_forwards_past_it(monkeypatch, tmp_path, unknown_row):
++    """One id with a ``queued`` and an ``unknown`` admission, in either row order. The refusal read one arbitrary
++    row (``_CANONICAL_PENDING_SQL``'s ``LIMIT 1``), so a ``queued`` row first answered ``queued`` and the prompt was
++    forwarded past the ``unknown`` barrier (review 5890229371 nit 1). Every row is read, non-forwardable first."""
++    db = SessionDB(db_path=tmp_path / "state.db")
++    sid, key, turns, _emitted = _legacy(monkeypatch, db)
++    try:
++        db.create_session(key, "test")
++        epoch = begin_runtime_epoch(db, instance_id="gateway")
++        rows = [admit_session_input(db, epoch=epoch, principal_id="bot", session_id=key, request_id=f"dm-{i}",
++                                    payload={"text": f"m{i}"})["admission_id"] for i in range(2)]
++        db._execute_write(lambda conn: conn.execute(
++            "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (rows[unknown_row],)))
++        assert sorted(r["status"] for r in list_session_admissions(db, session_id=key)) == ["queued", "unknown"]
++        refusal = server._canonical_ledger_refusal(server._sessions[sid])
++        assert refusal.ledger_status == "unknown"
++        _owner(monkeypatch, db, key, epoch)
++        reply = server.handle_request({"id": "p", "method": "prompt.submit",
++                                       "params": {"session_id": sid, "text": "hi"}})
++        assert reply["error"]["code"] == 4090 and reply["error"]["data"] == {"reason": "SESSION_NOT_OWNED"}
++        assert len(list_session_admissions(db, session_id=key)) == 2 and turns == []
++    finally:
++        server._sessions.pop(sid, None)
++        db.close()
++
++
+ def test_a_closed_desktop_session_releases_its_relay_without_an_owner_frame(monkeypatch):
+     """The relay re-checked ``_finalized`` only when an owner frame arrived, so a closed Desktop session
+     held the relay thread and its owner socket until the owner's next frame (up to RELAY_TIMEOUT_S)."""
+diff --git a/tui_gateway/kanban_leg_custody.py b/tui_gateway/kanban_leg_custody.py
+index 5735f8de5d..95332c1b4e 100644
+--- a/tui_gateway/kanban_leg_custody.py
++++ b/tui_gateway/kanban_leg_custody.py
+@@ -138,7 +138,7 @@ def legacy_gateway_owns(session: dict, session_lineage, session_db, now: Optiona
+ 
+ # Every non-terminal ledger row of one id: ``session_lifecycle._CANONICAL_PENDING_SQL`` without its ``LIMIT 1``. That
+ # answers with one arbitrary row, so a ``queued`` row could mask an ``unknown`` admission on the same id (review
+-# 5889497938 nit 1).
++# 5889497938 nit 1). Read through :func:`ledger_status`, which orders the rows.
+ _LINEAGE_PENDING_SQL = """SELECT status FROM session_admissions WHERE target_session_id=? AND status!='terminal'
+     UNION ALL SELECT status FROM worker_executions WHERE session_id=? AND status!='terminal'"""
+ 
+@@ -173,25 +173,37 @@ def with_parents(conn, ids) -> tuple:
+     return tuple(out)
+ 
+ 
++def ledger_status(conn, sid) -> Optional[str]:
++    """The gateway ledger's answer for one id: every non-terminal row is read (``_LINEAGE_PENDING_SQL``) and a
++    status outside ``owner_forward.FORWARDABLE_LEDGER_STATES`` (an ``unknown`` admission) answers before any
++    forwardable one, ties by name, so a ``queued`` row never masks an ``unknown`` one in either insertion order.
++    None when the id has no non-terminal row. Both the legacy turn refusal
++    (``session_lifecycle._canonical_ledger_refusal``, which ``prompt.submit`` forwards on) and
++    :func:`lineage_ledger_status` read it (review 5890229371 nit 1)."""
++    from tui_gateway.owner_forward import FORWARDABLE_LEDGER_STATES
++    statuses = [str(row[0]) for row in conn.execute(_LINEAGE_PENDING_SQL, (sid, sid))]
++    return min(statuses, key=lambda s: (s in FORWARDABLE_LEDGER_STATES, s), default=None)
++
++
+ def lineage_ledger_status(conn, ids) -> Optional[str]:
+     """The gateway ledger's answer for a chat's lineage ``ids``: the one rule this backend's hand-back and the
+     gateway's claim (``gateway.kanban_tui_owner._gateway_holds_work``) both read, so the two cannot disagree on
+     which row counts (review 5888998970 nit 1: the tip ``queued`` and the root ``unknown`` answered ``queued``
+-    key-first here and ``unknown`` sorted there). Order-independent: every non-terminal row of every id is read,
+-    and any one outside ``owner_forward.FORWARDABLE_LEDGER_STATES`` (an ``unknown`` admission, even beside a
+-    ``queued`` row on the same id) answers with its status, which owns nothing, so this backend keeps the chat;
+-    else the alphabetically first status (deterministic; the forwardable states have no order among themselves)
+-    of the first id in sorted order that has one; None when no id has a non-terminal row. The gateway passes its
+-    ids through :func:`with_parents`, so both legs read the same lineage up to ``LINEAGE_LIMIT`` hops (beyond it
+-    the gateway reads a superset; see :func:`with_parents`)."""
++    key-first here and ``unknown`` sorted there). Order-independent: each id answers by :func:`ledger_status`
++    (every non-terminal row read, a non-forwardable status first), and the first id in sorted order whose answer
++    is outside ``owner_forward.FORWARDABLE_LEDGER_STATES`` (an ``unknown`` admission, even beside a ``queued`` row
++    on the same id) answers with it, which owns nothing, so this backend keeps the chat; else the first id in sorted
++    order with a row answers with its alphabetically first status (deterministic; the forwardable states have no
++    order among themselves); None when no id has a non-terminal row. The gateway passes its ids through
++    :func:`with_parents`, so both legs read the same lineage up to ``LINEAGE_LIMIT`` hops (beyond it the gateway
++    reads a superset; see :func:`with_parents`)."""
+     from tui_gateway.owner_forward import FORWARDABLE_LEDGER_STATES
+     first = None
+     for sid in sorted({str(s) for s in ids if s}):
+-        statuses = sorted(str(row[0]) for row in conn.execute(_LINEAGE_PENDING_SQL, (sid, sid)))
+-        blocked = [s for s in statuses if s not in FORWARDABLE_LEDGER_STATES]
+-        if blocked:
+-            return blocked[0]
+-        first = first or (statuses[0] if statuses else None)
++        status = ledger_status(conn, sid)
++        if status is not None and status not in FORWARDABLE_LEDGER_STATES:
++            return status
++        first = first or status
+     return first
+ 
+ 
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index de4e7aafde..af9988f964 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -180,6 +180,8 @@ def _ensure_active_session_slot(sid: str, session: dict, *, allow_takeover: bool
+     return limit_message
+ 
+ 
++# Whether an id has a non-terminal ledger row (existence only: ``LIMIT 1`` returns an arbitrary row, so a status is
++# read through ``kanban_leg_custody.ledger_status``).
+ _CANONICAL_PENDING_SQL = """SELECT status FROM session_admissions WHERE target_session_id=? AND status!='terminal'
+     UNION ALL SELECT status FROM worker_executions WHERE session_id=? AND status!='terminal' LIMIT 1"""
+ 
+@@ -237,21 +239,24 @@ def _canonical_ledger_refusal(session: dict):
+             read_ctx = getattr(db, "_read_ctx", None)
+             if read_ctx is None:
+                 return None
++            from tui_gateway.kanban_leg_custody import ledger_status
+             with read_ctx() as conn:
+-                row = next(iter(conn.execute(_CANONICAL_PENDING_SQL, (key, key))), None)
++                # Every row, non-forwardable first: one arbitrary row (``LIMIT 1``) let a ``queued`` row beside
++                # an ``unknown`` admission forward past it (review 5890229371 nit 1).
++                status = ledger_status(conn, key)
+     except sqlite3.Error:
+         logger.warning("canonical ledger read failed for %s", key, exc_info=True)
+         return ActiveSessionRefusal(_SESSION_OWNERSHIP_UNAVAILABLE, SESSION_COORDINATION_UNAVAILABLE)
+-    if row is None:
++    if status is None:
+         return None
+-    logger.info("Refusing legacy turn for %s: canonical ledger holds %s work", key, row[0])
++    logger.info("Refusing legacy turn for %s: canonical ledger holds %s work", key, status)
+     refusal = ActiveSessionRefusal(
+-        f"Session {key} has {'outcome-unknown' if row[0] == 'unknown' else 'pending'} work in the gateway's "
++        f"Session {key} has {'outcome-unknown' if status == 'unknown' else 'pending'} work in the gateway's "
+         "durable queue. Resume it through the gateway (hermes chat --resume, Desktop or the TUI) to "
+         "resolve it; nothing was run here.", SESSION_NOT_OWNED)
+     # prompt.submit forwards a typed prompt to the owner's FIFO for work that ends on its own
+     # (tui_gateway/owner_forward.py); an ``unknown`` admission is never forwarded past.
+-    refusal.ledger_status = row[0]
++    refusal.ledger_status = status
+     return refusal
+ 
+ 
+-- 
+2.43.0
+

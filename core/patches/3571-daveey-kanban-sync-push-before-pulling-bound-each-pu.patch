@@ -1,0 +1,1325 @@
+From fb5ac40c82cb24db5781eec9a490bc7d9dfd1033 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:46:08 +0000
+Subject: [PATCH] [daveey] kanban sync: push before pulling, bound each pull,
+ one puller per board, alarm on outbox age
+
+laptop-1 2026-11-12 (t_01a1d36ddcea59fe): after ~10 h asleep the live cursor was ~75k changes
+behind. pull() read until more=false and a round pushed only after its pulls, so 1747 local edits
+(oldest 9 h, attempts=0) never left the outbox; the Board kept MacBook cards scheduled.
+
+- A round now sends (push + resolve_rejections) before its pulls as well as after. The pre-pull
+  send stops at the first task_runs row: run rows are last-write-wins on the Board, and a pending
+  startup sent before the pull could overwrite an end the Board already holds.
+- pull() reads at most PULL_PAGE_BUDGET (20) pages per database per round and returns Pulled
+  (an int with .more/.busy). A round ending its budget still repairs, refreshes remote parents,
+  pushes, resolves and reevaluates; the loop reruns that board without the poll wait.
+  lag.pull_done/mark_pulled are stamped only when the pull reached the feed head.
+- One replica puller per board per host: _pull_replica takes board_sync_lock without waiting and
+  returns busy instead of pulling (sync diff compares the replica as-is; reconcile refuses).
+- dispatch_tick: its live pull holds the same lock (skipped while a round holds it), and a pull
+  that runs out of its 2 s budget keeps its pages and still reevaluates on a fresh budget, so
+  worker-first cards are reserved while a backlog drains.
+- Detection: `sync status` prints oldest_pending_age_s; the sync loop WARNs when an unanswered op
+  is older than 10 min after a good round; the dispatcher tick files one card per incident.
+- publish_pickup_if_changed moved to kanban_sync_pickup_publish (re-exported) for the file cap.
+---
+ gateway/kanban_watchers.py                    |   2 +
+ hermes_cli/kanban_sync_backlog.py             |  56 +++
+ hermes_cli/kanban_sync_cli.py                 |  19 +-
+ hermes_cli/kanban_sync_client.py              | 163 +++----
+ hermes_cli/kanban_sync_outbox_age.py          | 196 +++++++++
+ hermes_cli/kanban_sync_pickup_publish.py      |  53 +++
+ hermes_cli/kanban_worker_placement.py         |  51 ++-
+ .../test_kanban_sync_feed_apply_credit.py     |   4 +-
+ .../hermes_cli/test_kanban_sync_own_writes.py |   3 +-
+ .../test_kanban_sync_partition_repair.py      |   4 +
+ .../test_kanban_sync_push_starvation.py       | 405 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_sync_run_rows.py |   5 +-
+ 12 files changed, 867 insertions(+), 94 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_backlog.py
+ create mode 100644 hermes_cli/kanban_sync_outbox_age.py
+ create mode 100644 hermes_cli/kanban_sync_pickup_publish.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_push_starvation.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 7c149ebd33..ba8458d49b 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -435,6 +435,8 @@ class GatewayKanbanWatchersMixin:
+                                      else 0)
+                     from hermes_cli import kanban_hub_cpu_alert  # one card per stale-advisory incident [daveey]
+                     await _to_thread_process_service(kanban_hub_cpu_alert.check)
++                    from hermes_cli import kanban_sync_outbox_age  # one card per stalled-outbox incident [daveey]
++                    await _to_thread_process_service(kanban_sync_outbox_age.check)
+                     now = int(time.time())
+                     # Only an ungated tick can be "stuck": an estop or drain hold spawns 0 on purpose.
+                     if gate is None and bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
+diff --git a/hermes_cli/kanban_sync_backlog.py b/hermes_cli/kanban_sync_backlog.py
+new file mode 100644
+index 0000000000..204156515b
+--- /dev/null
++++ b/hermes_cli/kanban_sync_backlog.py
+@@ -0,0 +1,56 @@
++"""A bounded feed pull per sync round, and the boards whose backlog the loop drains next. [daveey]
++
++Incident (2026-11-12, laptop-1, t_01a1d36ddcea59fe): after the Mac slept ~10 h the live cursor was ~75k changes
++behind. ``pull()`` read pages until the feed said ``more=false``, and a round pushed its outbox only after its pulls,
++so on a host that applies ~4 changes/s against a Board producing ~2.3/s the round never reached its push: 1747 local
++edits (oldest 9 h) sat in the outbox with ``attempts=0`` while the Board kept MacBook cards ``scheduled``.
++
++Now a round pushes before it pulls (``_sync_board_locked``), each ``pull`` reads at most :data:`PULL_PAGE_BUDGET`
++pages per database, and a round that stops with ``more`` still true is recorded here so the sync loop reselects
++that board at once, without the poll wait: the backlog drains over consecutive rounds, each of which pushes.
++"""
++from __future__ import annotations
++
++import threading
++from pathlib import Path
++from typing import Iterable
++
++PULL_PAGE_BUDGET = 20  # 20 pages x 500 changes = 10k changes per database per round
++
++_LOCK = threading.Lock()
++_BEHIND: set[str] = set()  # live board paths whose last round stopped before the feed head
++
++
++class Pulled(int):
++    """The number of feed changes read (an ``int``, as before), plus whether the pull stopped at its page budget
++    with the head not reached (``more``) or did not run because a sync round held the board (``busy``)."""
++
++    more: bool
++    busy: bool
++
++    def __new__(cls, n: int = 0, *, more: bool = False, busy: bool = False) -> Pulled:
++        out = super().__new__(cls, int(n))
++        out.more, out.busy = bool(more), bool(busy)
++        return out
++
++
++def note(path: Path, more: bool) -> None:
++    """Record whether this round left the board behind the feed head."""
++    key = str(path)
++    with _LOCK:
++        if more:
++            _BEHIND.add(key)
++        else:
++            _BEHIND.discard(key)
++
++
++def due(boards: Iterable[tuple[str, Path]]) -> list[tuple[str, Path]]:
++    """The boards to run again now: their last round stopped at the page budget."""
++    with _LOCK:
++        return [(slug, path) for slug, path in boards if str(path) in _BEHIND]
++
++
++def reset() -> None:
++    """Tests: forget every board."""
++    with _LOCK:
++        _BEHIND.clear()
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index 2ee45862de..6aef22b104 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -87,17 +87,26 @@ def _import(args: argparse.Namespace) -> int:
+ def _diff(args: argparse.Namespace) -> int:
+     slug = _board(args)
+     ident = ksc.load_identity()
++    # Refresh first, before opening the replica: a rebuild replaces its file. Only when no sync round holds the
++    # board (one replica puller per board per host); a busy round's replica is compared as it stands.
++    refresh_error = None
++    pulled = ksc.Pulled()
++    try:
++        pulled = ksc._pull_replica(slug, ksc.Hub(ident), ident.gateway, _path(slug))
++    except (ksc.HubError, ksc.Resync, OSError) as exc:
++        refresh_error = str(exc)
++    else:
++        if pulled.more:
++            refresh_error = (f"the replica is still behind the feed head after {ksc.PULL_PAGE_BUDGET} pages; the "
++                             "sync loop is catching up, rerun later")
+     live = kbc.connect(_path(slug))
+     shadow = ksc.open_shadow(slug, ident.gateway)
+     try:
+-        refresh_error = None
+-        try:  # compare against the service's current state, not the replica's last round
+-            ksc.pull(shadow, ksc.Hub(ident), slug, observers=False)
+-        except (ksc.HubError, ksc.Resync, OSError) as exc:
+-            refresh_error = str(exc)
+         report = ksc.diff(live, shadow, ident.gateway)
+         if refresh_error is not None:
+             report.update(clean=False, unavailable=True, refresh_error=refresh_error)
++        elif pulled.busy:
++            report["refresh_skipped"] = "a sync round holds the board; compared against its replica as it stands"
+     finally:
+         live.close()
+         shadow.close()
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 92f6a1bc5c..9e6783fa16 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -36,12 +36,15 @@ import urllib.error
+ import urllib.parse
+ import urllib.request
+ from contextlib import ExitStack, contextmanager
+-from dataclasses import dataclass, field
++from dataclasses import astuple, dataclass, field
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Mapping, Optional
+ 
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_replica_lag as lag  # pushed rows the replica holds only after its next pull
++from hermes_cli import kanban_sync_backlog as backlog  # page budget per pull; boards the loop reruns at once
++from hermes_cli import kanban_sync_outbox_age as outbox_age  # oldest pending op: status, WARNING, defect card
++from hermes_cli.kanban_sync_backlog import PULL_PAGE_BUDGET, Pulled
+ from hermes_cli import kanban_sync_timing as sync_timing  # off unless kanban.sync.diagnostics.timing_until arms it
+ from hermes_cli.kanban_sync_connections import connection, connection_scope, invalidate
+ from hermes_cli.kanban_sync_hub_routes import HubRoutesMixin
+@@ -53,6 +56,7 @@ from hermes_cli.kanban_sync_repair_window import (  # shared per-board repair-wi
+ )
+ from hermes_cli.kanban_sync_own_writes import credited, reset as reset_own_writes, take as take_credited
+ from hermes_cli.kanban_sync_links_inputs import ledger_slices, links_signature
++from hermes_cli.kanban_sync_pickup_publish import publish_pickup_if_changed, reset_published_pickup  # moved out, re-exported
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -664,8 +668,12 @@ class PushResult:
+ 
+ 
+ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primary: bool,
+-         max_batches: int = MAX_BATCHES_PER_ROUND) -> PushResult:
+-    """Drain pending outbox rows in FIFO batches. A transport failure leaves them pending (retried next round)."""
++         max_batches: int = MAX_BATCHES_PER_ROUND, before_pull: bool = False) -> PushResult:
++    """Drain pending outbox rows in FIFO batches. A transport failure leaves them pending (retried next round).
++
++    ``before_pull`` (the send a round makes before its pulls, t_01a1d36ddcea59fe) stops at the first run row: a run
++    row is sent whole and the Board keeps the last write, so a pending startup sent before this round's pull could
++    overwrite an end the Board already holds (``_local_row_is_newer`` lets that end land locally first)."""
+     from hermes_cli.kanban_db_connect import write_txn
+     refuse_if_schema_ahead(conn)  # an older core would strip the newer columns; the ops stay pending [daveey]
+     out = PushResult()
+@@ -673,6 +681,8 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+         rows = [dict(r) for r in conn.execute(
+             "SELECT * FROM kanban_sync_outbox WHERE state = 'pending' AND (retry_after IS NULL OR retry_after <= ?) "
+             "ORDER BY created_at, rowid LIMIT ?", (int(time.time()), PUSH_BATCH))]
++        run_at = next((i for i, r in enumerate(rows) if r["table_name"] == "task_runs"), None) if before_pull else None
++        rows = rows if run_at is None else rows[:run_at]  # FIFO order is kept: nothing after the run row goes first
+         if not rows:
+             break
+         with write_txn(conn):
+@@ -837,14 +847,18 @@ def _child_task(conn: sqlite3.Connection, table: str, uid: str) -> Optional[str]
+ 
+ 
+ def pull(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool,
+-         partition: Optional[str] = None) -> int:
+-    """Apply every feed page after this file's cursor. Returns the number of changes read. On a board with an
+-    outbox (primary), fields with an unanswered local edit are not overwritten; ``partition`` (a gateway name)
+-    keeps only that gateway's cards. [daveey]"""
++         partition: Optional[str] = None, max_pages: Optional[int] = PULL_PAGE_BUDGET) -> Pulled:
++    """Apply the feed pages after this file's cursor, at most ``max_pages`` (None: to the head). Returns the number
++    of changes read; its ``more`` is true when the budget ran out before the head. On a board with an outbox
++    (primary), fields with an unanswered local edit are not overwritten; ``partition`` (a gateway name) keeps only
++    that gateway's cards. [daveey]"""
+     from hermes_cli.kanban_sync_stop import checkpoint
+-    total = 0
++    total = pages = 0
+     cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
+     while True:
++        if max_pages is not None and pages >= max_pages:
++            return Pulled(total, more=True)  # unbounded, a backlog starved the round's push for hours
++        pages += 1
+         checkpoint()
+         page = hub.changes(board, cursor)
+         checkpoint()
+@@ -857,7 +871,7 @@ def pull(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool,
+             # An idle poll: no change, same cursor. The apply would only rewrite ``applying`` and ``cursor`` to
+             # the values they hold, a write transaction (WAL frame, fsync, observer wake) every round on every
+             # board for nothing. [daveey]
+-            return total
++            return Pulled(total)
+         # [daveey] The pre-filter above can miss a local edit committed after it read the outbox (a claim in
+         # flight): ``local_pending_wins`` checks again inside the apply transaction.
+         sync.apply_remote_changes(conn, changes, new_cursor=nxt, board=board, observers=observers,
+@@ -865,7 +879,7 @@ def pull(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool,
+         total += len(page.get("changes", []))
+         cursor = nxt
+         if not page.get("more"):
+-            return total
++            return Pulled(total)
+ 
+ 
+ def _applying(conn: sqlite3.Connection) -> bool:
+@@ -914,6 +928,7 @@ class RoundResult:
+     repaired: dict[str, list[str]] = field(default_factory=dict)  # cards re-pushed by repair_divergence
+     rejection_resolutions: list[dict] = field(default_factory=list)
+     repair_deferred: bool = False  # a replica-only change waits for the repair window (see ``decide``)
++    behind: bool = False  # a pull stopped at its page budget: the loop runs this board again at once
+ 
+ 
+ def open_shadow(slug: str, gateway: str) -> sqlite3.Connection:
+@@ -928,7 +943,7 @@ def open_shadow(slug: str, gateway: str) -> sqlite3.Connection:
+ 
+ 
+ @contextmanager
+-def _pulled_replica(slug: str, hub: Hub, gateway: str):
++def _pulled_replica(slug: str, hub: Hub, gateway: str, max_pages: Optional[int] = PULL_PAGE_BUDGET):
+     """Borrow the pulled replica for this round; retention rebuilds discard the old handle."""
+     path = shadow_path(slug)
+     with ExitStack() as stack:
+@@ -936,7 +951,7 @@ def _pulled_replica(slug: str, hub: Hub, gateway: str):
+         rebuilt = False
+         generation = lag.pull_started(path)  # done only below: a failed pull leaves this gateway's pushes lagging
+         try:
+-            pulled = pull(replica, hub, slug, observers=False)
++            pulled = pull(replica, hub, slug, observers=False, max_pages=max_pages)
+         except Resync:
+             _log.warning("kanban sync: %s replica cursor below the retention floor; rebuilding from a snapshot", slug)
+             stack.close()
+@@ -944,21 +959,43 @@ def _pulled_replica(slug: str, hub: Hub, gateway: str):
+             path.unlink(missing_ok=True)
+             replica = stack.enter_context(connection(path, lambda: open_shadow(slug, gateway)))
+             rebuilt = True
+-            pulled = resync(replica, hub, slug, observers=False)
+-        lag.pull_done(path, generation)
+-        try:  # readers derive the replica's staleness from this (kanban_chat_links); a failed stamp only ages it
+-            sync.mark_pulled(replica)
+-        except sqlite3.Error as exc:
+-            _log.warning("kanban sync: %s replica pull not stamped (%s)", slug, exc)
++            pulled = Pulled(resync(replica, hub, slug, observers=False))
++        if not pulled.more:  # both mean "holds everything up to the feed head", not "a page was read"
++            lag.pull_done(path, generation)
++            try:  # readers derive the replica's staleness from this (kanban_chat_links); a failed stamp only ages it
++                sync.mark_pulled(replica)
++            except sqlite3.Error as exc:
++                _log.warning("kanban sync: %s replica pull not stamped (%s)", slug, exc)
+         from hermes_cli.kanban_sync_attachments import transfer_pending
+         transfer_pending(replica, hub, slug)
+         yield replica, pulled, rebuilt
+ 
+ 
+-def _pull_replica(slug: str, hub: Hub, gateway: str) -> int:
+-    """Pull the whole replica for standalone callers that do not run repairs."""
+-    with _pulled_replica(slug, hub, gateway) as (_, pulled, _rebuilt):
+-        return pulled
++def _pull_replica(slug: str, hub: Hub, gateway: str, live_path: Optional[Path] = None,
++                  max_pages: Optional[int] = PULL_PAGE_BUDGET) -> Pulled:
++    """Pull the replica for standalone callers that do not run repairs, only while no sync round holds the board:
++    one replica puller per board per host (a ``sync diff`` beside the gateway once wrote the cursor backwards,
++    t_01a1d36ddcea59fe). A busy round returns ``busy`` without pulling; the caller reads the replica as-is.
++    ``live_path`` defaults to the board's configured file."""
++    from hermes_cli.kanban_sync_guard import SyncRoundBusy, board_sync_lock
++    if live_path is None:
++        live_path = dict(board_paths()).get(slug)
++    with ExitStack() as stack:
++        try:
++            if live_path is not None:
++                stack.enter_context(board_sync_lock(Path(live_path)))
++        except SyncRoundBusy:
++            return Pulled(busy=True)
++        with _pulled_replica(slug, hub, gateway, max_pages) as (_, pulled, _rebuilt):
++            return pulled
++
++
++def _replica_at_head(slug: str, hub: Hub, gateway: str, live_path: Path) -> None:
++    """Pull the replica to the feed head (reconcile reads tombstones from it). A sync round holding the board
++    raises :class:`SyncRoundBusy`: a reconcile against a replica another puller is moving would be unsound."""
++    from hermes_cli.kanban_sync_guard import SyncRoundBusy
++    if _pull_replica(slug, hub, gateway, live_path, max_pages=None).busy:
++        raise SyncRoundBusy("a kanban sync round holds this board; rerun the reconcile after it finishes")
+ 
+ 
+ def sync_board(slug: str, path: Path, hub: Hub, gateway: str) -> RoundResult:
+@@ -975,6 +1012,7 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+     # Dropped first, so a round that fails or finds nothing to repair never leaves a stale deferral that would
+     # make the sync loop reselect this board without waiting; a deferring round sets it again.
+     _REPAIR_DEFERRED.pop(str(path), None)
++    backlog.note(path, False)  # likewise: only a round that completes behind the head reruns at once
+     with connection(path, lambda: _connect(path)) as live:
+         mode = sync.board_mode(live)
+         result = RoundResult(board=slug, mode=mode)
+@@ -982,13 +1020,18 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+             return result
+         refuse_if_schema_ahead(live)  # before pull/repair: an older core must not act on a newer board [daveey]
+         ensure_identity(live, slug, gateway)
++        # Send before pulling as well as after: a pull backlog never holds local edits back (9 h, t_01a1d36ddcea59fe).
++        # Safe: the Board merges on base_version + field HLC, an acked task's sync_version fences off older feed
++        # copies of it, and rejections are resolved here as after the pulls.
++        _send(live, hub, slug, gateway, mode, result)
+         with _pulled_replica(slug, hub, gateway) as (replica, pulled, rebuilt):
+             result.pulled = pulled
++            result.behind = pulled.more
+             applies: Optional[list] = []  # credited revision steps (kanban_sync_own_writes); None = a rebuild
+             if mode == "primary":
+                 try:
+                     with credited(live):
+-                        pull(live, hub, slug, observers=True, partition=gateway)
++                        result.behind |= pull(live, hub, slug, observers=True, partition=gateway).more
+                 except Resync:
+                     _log.warning("kanban sync: %s live cursor below the retention floor; rebuilding from a snapshot", slug)
+                     applies = None
+@@ -1035,59 +1078,27 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+                 heal_clobbered_completions(live)
+                 from hermes_cli.kanban_sync_divergence import heal_running_over_ended_run
+                 heal_running_over_ended_run(live)
+-        with credited(live):  # acknowledgements and the Board's merged rows: sync bookkeeping, not local edits
+-            result.push = push(live, hub, slug, gateway, primary=mode == "primary")
+-        from hermes_cli.kanban_sync_attachments import transfer_pending
+-        transfer_pending(live, hub, slug)
+-        from hermes_cli.kanban_sync_rejections import resolve_rejections
+-        result.rejection_resolutions = resolve_rejections(live, hub, slug)
++        _send(live, hub, slug, gateway, mode, result, attachments=True)
+         if mode == "primary":
+             from hermes_cli.kanban_worker_placement import reevaluate
+             with credited(live):  # reservation observations and the feed pull after them
+                 reevaluate(live, hub, slug, gateway)
++        backlog.note(path, result.behind)
+         return result
+ 
+ 
+-_UNPUBLISHED = object()
+-_PICKUP_STATE: dict[str, Any] = {"value": _UNPUBLISHED, "retry_at": 0.0}
+-_PICKUP_UNSUPPORTED_S = 600.0
+-
+-
+-def reset_published_pickup() -> None:
+-    """Tests: forget the last posted pickup so the next round posts again."""
+-    _PICKUP_STATE["value"] = _UNPUBLISHED
+-    _PICKUP_STATE["retry_at"] = 0.0
+-
+-
+-def publish_pickup_if_changed(hub: Any, *, now: Optional[float] = None) -> bool:
+-    """Post :func:`hermes_cli.kanban_worker_node.pickup_mode` (None → null) once per sync round, and only when it
+-    changed. A failed post is retried next round. An older Board (404/405) stays quiet for 10 minutes. Never
+-    raises into the sync loop. A hub without ``report_pickup`` (test fakes) is a no-op."""
+-    from hermes_cli.kanban_worker_node import pickup_mode
+-    mode = pickup_mode()
+-    if _PICKUP_STATE["value"] == mode:
+-        return False
+-    clock = time.monotonic() if now is None else now
+-    if clock < float(_PICKUP_STATE["retry_at"]):
+-        return False
+-    poster = getattr(hub, "report_pickup", None)
+-    if poster is None:
+-        return False
+-    try:
+-        poster(mode)
+-    except HubError as exc:
+-        if exc.status in (404, 405):
+-            _PICKUP_STATE["retry_at"] = clock + _PICKUP_UNSUPPORTED_S
+-            _log.info("kanban sync: board has no pickup route yet (%s); retrying later", exc.status)
+-        else:
+-            _log.warning("kanban sync: pickup publish failed (%s)", exc)
+-        return False
+-    except OSError as exc:
+-        _log.warning("kanban sync: pickup publish failed (%s)", exc)
+-        return False
+-    _PICKUP_STATE["value"] = mode
+-    _PICKUP_STATE["retry_at"] = 0.0
+-    return True
++def _send(live: sqlite3.Connection, hub: Hub, slug: str, gateway: str, mode: str, result: RoundResult, *,
++          attachments: bool = False) -> None:
++    """Push the outbox and resolve rejections, adding to ``result`` (a round does this before and after pulling;
++    ``attachments`` marks the send after them)."""
++    with credited(live):  # acknowledgements and the Board's merged rows: sync bookkeeping, not local edits
++        pushed = push(live, hub, slug, gateway, primary=mode == "primary", before_pull=not attachments) or PushResult()
++    result.push = pushed if result.push is None else PushResult(*map(sum, zip(astuple(result.push), astuple(pushed))))
++    if attachments:
++        from hermes_cli.kanban_sync_attachments import transfer_pending
++        transfer_pending(live, hub, slug)
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    result.rejection_resolutions += resolve_rejections(live, hub, slug)
+ 
+ 
+ def sync_all_once(hub: Optional[Hub] = None, *,
+@@ -1409,6 +1420,8 @@ def reset_board_watch() -> None:
+     _WATCH.reset()
+     reset_repair_window()
+     reset_own_writes()
++    backlog.reset()
++    outbox_age.reset()
+     _LINKS_DONE.clear()
+ 
+ 
+@@ -1522,6 +1535,8 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+                     watchers[slug].start()
+             selected = sync_timing.select(work.select, boards, time.monotonic(), outbox_pending)
+             selected += [b for b in deferred_repairs_due(boards, _repair_clock()) if b not in selected]
++            selected += [b for b in backlog.due(boards) if b not in selected]  # a pull backlog drains round by round
++            outbox_age.round_started()
+             results = sync_all_once(hub, boards=selected)
+             ahead = [r for r in results if (r.error or "").startswith("SchemaAhead")]
+             if ahead:
+@@ -1534,10 +1549,11 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+                 if r.push and (r.push.sent or r.push.rejected):
+                     _log.info("kanban sync: %s %s pulled=%d pushed=%d rejected=%d", r.board, r.mode, r.pulled,
+                               r.push.sent, r.push.rejected)
++            outbox_age.after_round(results, boards)  # WARNING: an unsent edit older than 10 min after a good round
+             if time.monotonic() >= next_links and links.request(boards):  # busy: ask again next iteration
+                 next_links = time.monotonic() + LINKS_EVERY_S
+             sync_timing.report(sender.loop_report)
+-            remaining = max(0.0, work.deadline - time.monotonic())
++            remaining = 0.0 if backlog.due(boards) else max(0.0, work.deadline - time.monotonic())
+             deferred_due = next_deferred_repair(boards)
+             if deferred_due is not None:
+                 remaining = min(remaining, max(0.0, deferred_due - _repair_clock()))
+@@ -1664,7 +1680,7 @@ def reconcile(slug: str, path: Optional[Path] = None, hub: Optional[Hub] = None)
+         # its snapshot is compared, or the row would be "restored" here), then refresh the replica: rows the
+         # service deleted on purpose (its event GC of done cards, deletes) come back as tombstones there.
+         push(live, hub, slug, ident.gateway, primary=mode == "primary")
+-        _pull_replica(slug, hub, ident.gateway)
++        _replica_at_head(slug, hub, ident.gateway, Path(path))
+         shadow = open_shadow(slug, ident.gateway)
+         try:
+             tombstoned: dict[str, set[str]] = {}
+@@ -1709,7 +1725,7 @@ def reconcile(slug: str, path: Optional[Path] = None, hub: Optional[Hub] = None)
+         queued = import_board(live, only=missing)
+         queued.pop("cleared_rejected", None)
+         pushed = push(live, hub, slug, ident.gateway, primary=mode == "primary")
+-        _pull_replica(slug, hub, ident.gateway)
++        _replica_at_head(slug, hub, ident.gateway, Path(path))
+         shadow = open_shadow(slug, ident.gateway)
+         try:
+             report = diff(live, shadow, ident.gateway)
+@@ -1737,7 +1753,8 @@ def status(conn: sqlite3.Connection) -> dict[str, Any]:
+     mode = sync.board_mode(conn)
+     out = {"mode": mode, "board_id": st.get("board_id"), "gateway": st.get("gateway_id"),
+            "cursor": st.get("cursor"), "pending": counts.get("pending", 0), "rejected": counts.get("rejected", 0),
+-           "last_error": last_error}
++           "oldest_pending_age_s": round(age) if st and (age := outbox_age.oldest_pending_age_s(conn)) is not None
++           else None, "last_error": last_error}
+     if mode != "off":
+         # A refused start writes no outbox row, so ``last_error`` alone read a stalled board as healthy. [daveey]
+         from hermes_cli import kanban_sync_runstate as runstate
+diff --git a/hermes_cli/kanban_sync_outbox_age.py b/hermes_cli/kanban_sync_outbox_age.py
+new file mode 100644
+index 0000000000..0cef319529
+--- /dev/null
++++ b/hermes_cli/kanban_sync_outbox_age.py
+@@ -0,0 +1,196 @@
++"""How long local edits wait in a synced board's outbox, and the alarms on it. [daveey]
++
++Incident (2026-11-12, laptop-1, t_01a1d36ddcea59fe): 1747 local edits waited up to 9 h in the outbox, every one
++with ``attempts=0``, because the sync round was stuck draining a pull backlog before its push. ``sync status``
++showed only a count, nothing alerted, and the stall surfaced only as downstream "ready with no worker" notices.
++
++Three readers of one number, the age of the oldest pending op:
++
++- ``hermes kanban sync status`` prints it (``oldest_pending_age_s``; every pending row).
++- The sync loop logs a WARNING (:func:`after_round`, at most once per :data:`STALE_S` per board) when a round
++  succeeded and an unanswered op is still older than :data:`STALE_S`.
++- The dispatcher tick (:func:`check`) files ONE card per incident on the default board when the same op is that old
++  and this process's sync loop is not failing (its last round succeeded, or a round has run for over
++  :data:`STALE_S`, which is the stuck-round shape of the incident). The incident ends when the op is answered; the
++  next one comments on the open card (at most hourly) or opens a new card once that card is done.
++
++"Unanswered" = pending with no ``retry_after``: the Board never told us to wait. A row the Board deferred
++(``storage_error``, ``depends_on_rejected``) retries on its own backoff and logs its own reason; counting it would
++alarm on a Board-side wait, not on a push that never runs.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import threading
++import time
++from pathlib import Path
++from typing import Any, Callable, Iterable, Optional
++
++log = logging.getLogger(__name__)
++
++STALE_S = 600.0
++CHECK_EVERY_S = 60.0
++KEY = "kanban-sync-outbox-stalled"
++AUTHOR = "kanban-sync-outbox"
++_COMMENT_EVERY = 3600
++
++_LOCK = threading.Lock()
++_LAST_OK: dict[str, bool] = {}  # board slug -> this process's last completed round for it succeeded
++_ROUND_STARTED: list[Optional[float]] = [None]  # monotonic start of the loop's round in progress
++_WARNED_AT: dict[str, float] = {}
++_FILED: set[str] = set()
++_NEXT_CHECK: list[float] = [0.0]
++
++
++def oldest_pending_age_s(conn: sqlite3.Connection, *, unanswered: bool = False,
++                         now: Optional[float] = None) -> Optional[float]:
++    """Seconds since the oldest pending outbox op was queued (None: no pending op). ``unanswered`` counts only ops
++    the Board never deferred."""
++    sql = "SELECT MIN(created_at) FROM kanban_sync_outbox WHERE state = 'pending'"
++    row = conn.execute(sql + (" AND retry_after IS NULL" if unanswered else "")).fetchone()
++    if not row or row[0] is None:
++        return None
++    return max(0.0, (time.time() if now is None else now) - float(row[0]) / 1000)  # created_at is in ms
++
++
++def _age(path: Path) -> Optional[float]:
++    from hermes_cli import kanban_db_connect as kbc
++    if not Path(path).exists():
++        return None  # never create a board file just to read its outbox
++    try:
++        with kbc.connect_closing(path) as conn:
++            return oldest_pending_age_s(conn, unanswered=True)
++    except (sqlite3.Error, OSError):
++        return None
++
++
++def round_started(mono: Callable[[], float] = time.monotonic) -> None:
++    """The sync loop starts a round (the dispatcher can then tell a round stuck for an hour from an idle loop)."""
++    with _LOCK:
++        _ROUND_STARTED[0] = mono()
++
++
++def after_round(results: Iterable[Any], boards: Iterable[tuple[str, Path]], *,
++                mono: Callable[[], float] = time.monotonic, age: Callable[[Path], Optional[float]] = _age) -> list[str]:
++    """Record each board's round outcome and WARN when a good round left an unanswered op older than
++    :data:`STALE_S`. Returns the boards warned about. Never raises."""
++    warned: list[str] = []
++    try:
++        paths = dict(boards)
++        with _LOCK:
++            _ROUND_STARTED[0] = None
++            for r in results:
++                _LAST_OK[r.board] = not r.error
++        for r in results:
++            if r.error or r.board not in paths:
++                continue
++            seconds = age(paths[r.board])
++            if seconds is None or seconds < STALE_S:
++                _WARNED_AT.pop(r.board, None)
++                continue
++            now = mono()
++            if now - _WARNED_AT.get(r.board, now - STALE_S) < STALE_S:
++                continue
++            _WARNED_AT[r.board] = now
++            warned.append(r.board)
++            log.warning("kanban sync: %s: a local edit has waited %.0f s in the outbox although this round succeeded "
++                        "(the Board has not seen it; `hermes kanban sync status` shows the outbox)", r.board, seconds)
++    except Exception:  # health: allow BLE001 -- an alarm must never stop the sync loop
++        log.warning("kanban sync: outbox age check failed", exc_info=True)
++    return warned
++
++
++def _loop_healthy(slug: str, now: float) -> bool:
++    with _LOCK:
++        started = _ROUND_STARTED[0]
++        return _LAST_OK.get(slug) is True or (started is not None and now - started >= STALE_S)
++
++
++def check(*, mono: Callable[[], float] = time.monotonic, file_fn: Optional[Callable[[str, str], Optional[str]]] = None,
++          boards: Optional[list[tuple[str, Path]]] = None,
++          age: Callable[[Path], Optional[float]] = _age) -> list[str]:
++    """One dispatcher-tick observation (at most every :data:`CHECK_EVERY_S`). Returns the card ids it filed or
++    commented. Never raises."""
++    try:
++        now = mono()
++        if now < _NEXT_CHECK[0]:
++            return []
++        _NEXT_CHECK[0] = now + CHECK_EVERY_S
++        if boards is None:
++            from hermes_cli import kanban_db_sync as sync
++            if not sync.sync_enabled():
++                return []
++            from hermes_cli import kanban_sync_client as ksc
++            boards = ksc.board_paths()
++        out = []
++        for slug, path in boards:
++            seconds = age(path) if _loop_healthy(slug, now) else None
++            if seconds is None or seconds < STALE_S:
++                _FILED.discard(slug)  # answered (or the loop is failing, which other alarms cover): incident over
++                continue
++            if slug in _FILED:
++                continue
++            _FILED.add(slug)
++            tid = (file_fn or report)(slug, f"board `{slug}`: the oldest unanswered outbox op is {seconds / 60:.0f} "
++                                            f"min old while this host's sync loop is not failing")
++            if tid:
++                out.append(tid)
++        return out
++    except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
++        log.warning("kanban: sync outbox age check failed", exc_info=True)
++        return []
++
++
++def report(slug: str, detail: str) -> Optional[str]:
++    """Open or comment the stalled-outbox card on the default board. Best effort: never raises."""
++    try:
++        from hermes_cli import kanban_db as kb
++        from hermes_cli import kanban_db_connect as kbc
++        with kbc.connect_closing(kb.kanban_home() / "kanban.db") as conn:
++            return _report(conn, slug, detail)
++    except Exception:  # health: allow BLE001 -- runs on the dispatcher tick
++        log.warning("kanban: could not file the stalled sync outbox card (%s)", detail, exc_info=True)
++        return None
++
++
++def _report(conn: sqlite3.Connection, slug: str, detail: str) -> str:
++    from hermes_cli import kanban_db as kb
++    log.warning("kanban sync: outbox stalled: %s", detail)
++    key = f"{KEY}:{slug}"
++    row = conn.execute(
++        "SELECT id, status FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
++        "ORDER BY status IN ('done', 'failed', 'cancelled'), created_at DESC, rowid DESC LIMIT 1", (key,),
++    ).fetchone()
++    if row and row[1] not in ("done", "failed", "cancelled"):
++        recent = conn.execute("SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? AND created_at >= ? LIMIT 1",
++                              (row[0], AUTHOR, int(time.time()) - _COMMENT_EVERY)).fetchone()
++        if not recent:
++            kb.add_comment(conn, row[0], AUTHOR, f"Again: {detail}")
++        return row[0]
++    body = (
++        "A local edit on this host has waited over 10 minutes in the Kanban sync outbox, so the Board (and every "
++        "worker leasing from it) has not seen it, although the sync loop is not failing.\n\n"
++        f"{detail}\n\n"
++        "Check: `hermes kanban sync status` (cursor, pending, oldest_pending_age_s) and agent.log `kanban sync:` "
++        "lines. A round pushes before and after its pulls and reads at most 20 feed pages per database "
++        "(`hermes_cli/kanban_sync_backlog.py`), so an old op means push is not reached or not accepted. Done when "
++        "the op is answered and the cause is fixed (precedent: t_01a1d36ddcea59fe)."
++    )
++    tid = kb.create_task(conn, title=f"Kanban sync: {slug} outbox holds a local edit unsent for over 10 min",
++                         body=body, assignee="default", created_by=AUTHOR, priority=50,
++                         idempotency_key=None if row else key)
++    if row:  # the previous card is finished: the key now names this one (newest wins)
++        with kb.write_txn(conn, allow_nested=True):
++            conn.execute("UPDATE tasks SET idempotency_key = ? WHERE id = ?", (key, tid))
++    return tid
++
++
++def reset() -> None:
++    """Tests: forget every observation."""
++    with _LOCK:
++        _LAST_OK.clear()
++        _ROUND_STARTED[0] = None
++    _WARNED_AT.clear()
++    _FILED.clear()
++    _NEXT_CHECK[0] = 0.0
+diff --git a/hermes_cli/kanban_sync_pickup_publish.py b/hermes_cli/kanban_sync_pickup_publish.py
+new file mode 100644
+index 0000000000..d5bac1c7c8
+--- /dev/null
++++ b/hermes_cli/kanban_sync_pickup_publish.py
+@@ -0,0 +1,53 @@
++"""Publish this machine's worker pickup mode to the Board once per sync round, only when it changed. [daveey]
++
++Moved out of ``kanban_sync_client`` (re-exported there) to keep that file under its size cap.
++"""
++from __future__ import annotations
++
++import logging
++import time
++from typing import Any, Optional
++
++_log = logging.getLogger("hermes_cli.kanban_sync_client")  # the sync loop's own logger, as before the move
++
++_UNPUBLISHED = object()
++_PICKUP_STATE: dict[str, Any] = {"value": _UNPUBLISHED, "retry_at": 0.0}
++_PICKUP_UNSUPPORTED_S = 600.0
++
++
++def reset_published_pickup() -> None:
++    """Tests: forget the last posted pickup so the next round posts again."""
++    _PICKUP_STATE["value"] = _UNPUBLISHED
++    _PICKUP_STATE["retry_at"] = 0.0
++
++
++def publish_pickup_if_changed(hub: Any, *, now: Optional[float] = None) -> bool:
++    """Post :func:`hermes_cli.kanban_worker_node.pickup_mode` (None → null) once per sync round, and only when it
++    changed. A failed post is retried next round. An older Board (404/405) stays quiet for 10 minutes. Never
++    raises into the sync loop. A hub without ``report_pickup`` (test fakes) is a no-op."""
++    from hermes_cli.kanban_sync_client import HubError
++    from hermes_cli.kanban_worker_node import pickup_mode
++    mode = pickup_mode()
++    if _PICKUP_STATE["value"] == mode:
++        return False
++    clock = time.monotonic() if now is None else now
++    if clock < float(_PICKUP_STATE["retry_at"]):
++        return False
++    poster = getattr(hub, "report_pickup", None)
++    if poster is None:
++        return False
++    try:
++        poster(mode)
++    except HubError as exc:
++        if exc.status in (404, 405):
++            _PICKUP_STATE["retry_at"] = clock + _PICKUP_UNSUPPORTED_S
++            _log.info("kanban sync: board has no pickup route yet (%s); retrying later", exc.status)
++        else:
++            _log.warning("kanban sync: pickup publish failed (%s)", exc)
++        return False
++    except OSError as exc:
++        _log.warning("kanban sync: pickup publish failed (%s)", exc)
++        return False
++    _PICKUP_STATE["value"] = mode
++    _PICKUP_STATE["retry_at"] = 0.0
++    return True
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 1a15c5d53f..80215689df 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -6,6 +6,7 @@ import logging
+ import math
+ import sqlite3
+ import time
++from contextlib import ExitStack
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -346,11 +347,12 @@ def local_refusals(conn, status):
+     return {row["id"]: reason for row in rows if (reason := execution_refusal(conn, row))}
+ 
+ 
+-def reevaluate(conn, hub, board, gateway, *, cfg=None):
++def reevaluate(conn, hub, board, gateway, *, cfg=None, may_pull=True):
+     """Reserve acknowledged origin-owned ready work, then read authoritative feed.
+ 
+     No lease (even apparently expired) is moved here. A lost reply is retried with
+     the same revision; a successful reply is never itself permission to execute.
++    ``may_pull=False`` (a sync round holds the board and pulls this file) reads no feed here.
+     """
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_placement as placement
+@@ -371,7 +373,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+ 
+     attempted = 0
+     last = None
+-    pulled = []  # at most one feed pull per tick for not_claimable pickups (shared network budget)
++    pulled = [] if may_pull else [True]  # at most one feed pull per tick for not_claimable pickups (shared budget)
+     # Every reserve below is made from this pre-loop copy, so a refusal is judged against it even after an in-loop
+     # pull moved a later row on: the refused row (fence) and the reservation it was waiting on.
+     before = {r["id"]: (queue.snapshot(conn, r["id"]), _reserved_machine(queue, conn, r["id"])) for r in rows}
+@@ -452,7 +454,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None):
+             with write_txn(conn):
+                 conn.execute("UPDATE kanban_sync_state SET worker_reserve_cursor=? WHERE board_id=? AND gateway_id=?",
+                              (last, board, gateway))
+-    if attempted:
++    if attempted and may_pull:
+         client.pull(conn, hub, board, observers=True, partition=gateway)
+     return attempted
+ 
+@@ -634,17 +636,42 @@ def dispatch_tick(conn):
+         ident = client.load_identity()
+         if ident.gateway != state.get("gateway_id"):
+             return
+-        hub = client.Hub(ident, timeout=DISPATCH_NETWORK_BUDGET_S,
+-                         deadline=time.monotonic() + DISPATCH_NETWORK_BUDGET_S)
+         from hermes_cli import kanban_queue_reason as queue
+-        try:
+-            client.pull(conn, hub, state["board_id"], observers=True, partition=ident.gateway)
+-        except (client.HubError, client.SyncUnavailable, client.Resync, OSError) as exc:
+-            queue.try_record(queue.record_pull_error, conn, ident.gateway, error=exc)
+-            return
+-        queue.clear_pull_streaks(ident.gateway)  # a feed-pull failure streak is no longer consecutive
+-        reevaluate(conn, hub, state["board_id"], ident.gateway, cfg=cfg)
++        with ExitStack() as stack:
++            # One live puller per board (t_01a1d36ddcea59fe): a sync round holding the board pulls this file, so
++            # the tick reserves from it as it stands. The Board judges every reserve at its acknowledged revision.
++            own = _hold_board(stack, sync._db_key(conn))
++            hub = _tick_hub(client, ident)
++            if own:
++                try:
++                    client.pull(conn, hub, state["board_id"], observers=True, partition=ident.gateway)
++                except TimeoutError:  # BoardBudgetExhausted or a page slower than the budget
++                    # A backlog outlasts the budget (a 500-change page took 4.5 s on laptop-1): the pages applied
++                    # stay, and reservation still runs on a fresh budget instead of waiting for the full catch-up.
++                    hub = _tick_hub(client, ident)
++                except (client.HubError, client.SyncUnavailable, client.Resync, OSError) as exc:
++                    queue.try_record(queue.record_pull_error, conn, ident.gateway, error=exc)
++                    return
++                else:
++                    queue.clear_pull_streaks(ident.gateway)  # a feed-pull failure streak is no longer consecutive
++            reevaluate(conn, hub, state["board_id"], ident.gateway, cfg=cfg, may_pull=own)
+     except (client.HubError, client.SyncUnavailable, client.Resync, OSError):
+         # Offline origin cannot remove the queue fence or manufacture an assignment.
+         return
+ 
++
++def _tick_hub(client, ident):
++    return client.Hub(ident, timeout=DISPATCH_NETWORK_BUDGET_S, deadline=time.monotonic() + DISPATCH_NETWORK_BUDGET_S)
++
++
++def _hold_board(stack, path) -> bool:
++    """Take the board's sync lock for this tick without waiting; False when a sync round holds it."""
++    from pathlib import Path
++    from hermes_cli.kanban_sync_guard import SyncRoundBusy, board_sync_lock
++    if path is None:
++        return True  # an in-memory board: nothing else pulls it
++    try:
++        stack.enter_context(board_sync_lock(Path(path)))
++    except SyncRoundBusy:
++        return False
++    return True
+diff --git a/tests/hermes_cli/test_kanban_sync_feed_apply_credit.py b/tests/hermes_cli/test_kanban_sync_feed_apply_credit.py
+index 663ba20082..8d4f36d6e6 100644
+--- a/tests/hermes_cli/test_kanban_sync_feed_apply_credit.py
++++ b/tests/hermes_cli/test_kanban_sync_feed_apply_credit.py
+@@ -250,7 +250,9 @@ def test_a_push_ack_after_the_inputs_read_is_credited(live, svc, kanban_home, mo
+         live.execute("UPDATE tasks SET title = 'pushed' WHERE id = ?", (child,))
+     clock[0] += 1
+     assert not _round(kanban_home, svc).repair_deferred
+-    assert marks[-1][2] >= 1 and marks[-1][1] != marks[-1][0], f"the push must ack and move the revision: {marks}"
++    # The round pushes before its pulls (t_01a1d36ddcea59fe) and again after them: whichever sent it must ack.
++    assert any(sent >= 1 and after != before for before, after, sent in marks), \
++        f"the push must ack and move the revision: {marks}"
+     assert calls["repair_divergence"] == 1, calls
+     # An apply-only round after the pushing round: the ack is credited, so it defers.
+     clock[0] += 1
+diff --git a/tests/hermes_cli/test_kanban_sync_own_writes.py b/tests/hermes_cli/test_kanban_sync_own_writes.py
+index 98dacf6a6b..f9ef46f280 100644
+--- a/tests/hermes_cli/test_kanban_sync_own_writes.py
++++ b/tests/hermes_cli/test_kanban_sync_own_writes.py
+@@ -117,7 +117,8 @@ def test_another_connections_write_during_the_round_still_repairs(live, svc, kan
+     done = []
+ 
+     def push_and_race(conn, *a, **k):
+-        if not done:
++        # On the round's send after its inputs read (it also sends before its pulls, t_01a1d36ddcea59fe).
++        if not done and not k.get("before_pull"):
+             done.append(1)
+             credit._uncaptured_edit(live, child, "raced")
+         return real_push(conn, *a, **k)
+diff --git a/tests/hermes_cli/test_kanban_sync_partition_repair.py b/tests/hermes_cli/test_kanban_sync_partition_repair.py
+index 1384e572ce..5b6347a524 100644
+--- a/tests/hermes_cli/test_kanban_sync_partition_repair.py
++++ b/tests/hermes_cli/test_kanban_sync_partition_repair.py
+@@ -25,6 +25,10 @@ def _consumed_link(live, svc, kanban_home, monkeypatch):
+         ksc._pull_replica(BOARD, svc.hub(ME), ME)
+         ksc.pull(live, svc.hub(ME), BOARD, observers=False, partition=ME)
+     assert not live.execute("SELECT 1 FROM task_links WHERE child_id = ?", (child,)).fetchone()
++    # The next round runs the full pass: these tests pin what it heals, not when. (It used to be due only by
++    # accident: the child's own feed echo stepped the live revision outside the round. A round now pushes before it
++    # pulls, so that echo lands inside the creating round, t_01a1d36ddcea59fe.)
++    monkeypatch.setattr(ksc, "REPLICA_REPAIR_MIN_S", 0.0)
+     return child
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_push_starvation.py b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+new file mode 100644
+index 0000000000..8c6f67df6f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+@@ -0,0 +1,405 @@
++"""A pull backlog never starves the outbox (t_01a1d36ddcea59fe, laptop-1 2026-11-12: 1747 local edits waited 9 h).
++
++A round pushes before and after its pulls, each pull reads at most ``PULL_PAGE_BUDGET`` pages per database, a round
++that stops behind the feed head is rerun at once, one process pulls a board's files at a time, and the age of the
++oldest pending op is shown and alarmed on. The Board is the in-memory fake (``kanban_sync_fake_board``) served one
++change per feed page, so a 60-change backlog is 60 pages.
++"""
++from __future__ import annotations
++
++import logging
++import time
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_backlog as backlog
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_outbox_age as outbox_age
++from hermes_cli import kanban_worker_placement as wp
++from hermes_cli.kanban_sync_guard import board_sync_lock
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli import test_kanban_worker_reserve_client as reserve_fixtures
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, OTHER, BOARD = "macbook", "mini", "default"
++BACKLOG_PAGES = 60
++
++conn = reserve_fixtures.conn  # a primary board as gateway "hub" (dispatch_tick tests)
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService()
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    c = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(c, BOARD, ME)
++    sync.set_mode(c, "primary")
++    try:
++        yield c
++    finally:
++        c.close()
++
++
++class PagedHub:
++    """The fake Board's hub for one gateway, serving ONE change per feed page and logging the call order."""
++
++    def __init__(self, svc, gateway, log):
++        self._inner, self.log = svc.hub(gateway), log
++        self.ident = self._inner.ident
++
++    def __getattr__(self, name):
++        return getattr(self._inner, name)
++
++    def changes(self, board, since, limit=500):
++        self.log.append(("changes", since))
++        return self._inner.changes(board, since, limit=1)
++
++    def ops(self, board, ops):
++        self.log.append(("ops", [op["uid"] for op in ops]))
++        return self._inner.ops(board, ops)
++
++
++def _other_creates(svc, n):
++    hub = svc.hub(OTHER)
++    for i in range(n):
++        hub.ops(BOARD, [{"client_op_id": f"other-{i}", "op": "upsert", "table": "tasks", "uid": f"t_other{i:03d}",
++                         "hlc": f"{1:013d}-0000-{OTHER}", "fields": {"title": f"o{i}", "status": "ready",
++                                                                     "created_at": 1}}])
++
++
++def _round(kanban_home, hub):
++    return ksc.sync_board(BOARD, kanban_home / "kanban.db", hub, ME)
++
++
++def _replica_state():
++    with kbc.connect_closing(ksc.shadow_path(BOARD)) as shadow:
++        st = sync.sync_state(shadow) or {}
++        return st.get("cursor"), shadow.execute("SELECT pulled_at FROM kanban_sync_state").fetchone()[0]
++
++
++# --- push before pull (RED on main: the op went out only after all 120 pages) ----------------------------------
++
++def test_a_pending_op_is_sent_before_the_second_backlog_page(live, svc, kanban_home):
++    _other_creates(svc, BACKLOG_PAGES)
++    tid = kb.create_task(live, title="local edit")
++    log: list = []
++    result = _round(kanban_home, PagedHub(svc, ME, log))
++    assert result.error is None
++    pages = [i for i, (kind, _) in enumerate(log) if kind == "changes"]
++    sent = [i for i, (kind, uids) in enumerate(log) if kind == "ops" and tid in uids]
++    assert sent and len(pages) >= 2
++    assert sent[0] < pages[1], log[:5]
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["title"] == "local edit"
++
++
++def test_the_backlog_drains_over_rounds_and_pulled_at_marks_only_the_head(live, svc, kanban_home):
++    _other_creates(svc, BACKLOG_PAGES)
++    log: list = []
++    hub = PagedHub(svc, ME, log)
++    first = _round(kanban_home, hub)
++    # 20 pages each for the replica and the live file, then the round ended anyway.
++    assert first.behind and first.pulled == backlog.PULL_PAGE_BUDGET
++    assert sum(1 for kind, _ in log if kind == "changes") == 2 * backlog.PULL_PAGE_BUDGET
++    cursor, pulled_at = _replica_state()
++    assert cursor == backlog.PULL_PAGE_BUDGET and pulled_at is None  # not at the head: never stamped
++    path = kanban_home / "kanban.db"
++    assert backlog.due([(BOARD, path)]) == [(BOARD, path)]
++    rounds = 1
++    while _round(kanban_home, hub).behind:
++        rounds += 1
++        assert rounds < 10
++    cursor, pulled_at = _replica_state()
++    assert cursor == svc.board(BOARD)["seq"] and pulled_at is not None
++    assert backlog.due([(BOARD, path)]) == []
++    assert sync.sync_state(live)["cursor"] == svc.board(BOARD)["seq"]
++
++
++# --- the fence: a pushed status survives the older copies still in the backlog --------------------------------
++
++def test_a_pushed_status_survives_older_versions_of_its_row_in_the_backlog(live, svc, kanban_home):
++    tid = kb.create_task(live, title="mine", assignee="worker")
++    assert _round(kanban_home, svc.hub(ME)).error is None
++    # Another gateway edits the card (an older Board version than our coming push), then a backlog piles up.
++    svc.hub(OTHER).ops(BOARD, [{"client_op_id": "other-prio", "op": "upsert", "table": "tasks", "uid": tid,
++                                "hlc": f"{time.time_ns() // 1_000_000 - 60_000:013d}-0000-{OTHER}",
++                                "fields": {"priority": 7, "status": "todo"}}])
++    _other_creates(svc, BACKLOG_PAGES)
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
++    hub = PagedHub(svc, ME, [])
++    _round(kanban_home, hub)
++    acked = live.execute("SELECT sync_version FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++    assert acked == svc.board(BOARD)["rows"]["tasks"][tid]["version"]
++    assert kb.get_task(live, tid).status == "blocked"
++    while _round(kanban_home, hub).behind:
++        pass
++    task = kb.get_task(live, tid)
++    assert task.status == "blocked"  # the older feed copies (status todo) were fenced off
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["status"] == "blocked"
++
++
++# --- a budget-ended round still finishes ---------------------------------------------------------------------
++
++def test_a_round_ending_its_page_budget_still_pushes_resolves_refreshes_and_reevaluates(live, svc, kanban_home,
++                                                                                      monkeypatch):
++    _other_creates(svc, BACKLOG_PAGES)
++    calls: list = []
++    real_push = ksc.push
++
++    def push(*a, **kw):
++        calls.append("push")
++        return real_push(*a, **kw)
++    monkeypatch.setattr(ksc, "push", push)
++    from hermes_cli import kanban_sync_rejections
++    real_resolve = kanban_sync_rejections.resolve_rejections
++    monkeypatch.setattr(kanban_sync_rejections, "resolve_rejections",
++                        lambda *a, **kw: calls.append("resolve") or real_resolve(*a, **kw))
++    real_refresh = sync.refresh_remote_parents
++    monkeypatch.setattr(sync, "refresh_remote_parents", lambda *a, **kw: calls.append("refresh") or real_refresh(*a, **kw))
++    monkeypatch.setattr(wp, "reevaluate", lambda *a, **kw: calls.append("reevaluate") or 0)
++    log: list = []
++    hub = PagedHub(svc, ME, log)
++    real_changes = hub.changes
++    hub.changes = lambda *a, **kw: calls.append("page") or real_changes(*a, **kw)
++    result = _round(kanban_home, hub)
++    assert result.behind and result.error is None
++    pages = [i for i, c in enumerate(calls) if c == "page"]
++    after = calls[pages[-1] + 1:]
++    assert calls[:2] == ["push", "resolve"]  # before the pulls
++    assert ["refresh", "push", "resolve", "reevaluate"] == [c for c in after if c != "page"]
++
++
++def test_the_loop_reruns_a_board_left_behind_without_the_poll_wait(monkeypatch, tmp_path):
++    monkeypatch.chdir(tmp_path)
++    boards = [("one", Path("one")), ("two", Path("two"))]
++    rounds: list = [[]]
++    waits: list = []
++    monkeypatch.setattr(ksc, "load_identity", lambda: ksc.Identity("https://example.com", "test", "gateway"))
++    monkeypatch.setattr(ksc, "board_paths", lambda: boards)
++    monkeypatch.setattr(ksc.sync, "set_lease_client", lambda _: None)
++    monkeypatch.setattr(ksc, "publish_pickup_if_changed", lambda _: None)
++    monkeypatch.setattr(ksc, "reconcile_links", lambda *a, **kw: None)
++    monkeypatch.setattr(ksc, "outbox_pending", lambda paths: False)
++    clock = [100.0]
++    monkeypatch.setattr(ksc, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None))
++    from hermes_cli import machine_metrics
++    monkeypatch.setattr(machine_metrics, "Reporter",
++                        lambda _: SimpleNamespace(report_due=lambda: None, pending_wake_in=lambda: None))
++
++    class Thread:
++        def __init__(self, **kw):
++            pass
++
++        def start(self):
++            pass
++
++        def is_alive(self):
++            return True
++
++    import threading
++    monkeypatch.setattr(ksc, "threading", SimpleNamespace(Thread=Thread, Event=threading.Event))
++    monkeypatch.setattr(ksc, "FeedWatcher", lambda *a, **kw: SimpleNamespace(run=lambda: None))
++    behind_rounds = {"one": 2}  # "one" stops at its page budget twice, then reaches the head
++
++    def sync_board(slug, path, *args):
++        rounds[-1].append(slug)
++        left = behind_rounds.get(slug, 0)
++        behind_rounds[slug] = max(0, left - 1)
++        backlog.note(path, left > 0)
++        return ksc.RoundResult(board=slug, mode="primary", behind=left > 0)
++    monkeypatch.setattr(ksc, "sync_board", sync_board)
++
++    def wait(fn, wake, paths, remaining, keep_running):
++        waits.append(remaining)
++        clock[0] += 1  # far less than the 30 s poll period: only a rerun selects a board
++        rounds.append([])
++        return "period"
++    monkeypatch.setattr(ksc.sync_timing, "wait", wait)
++    ksc.run_forever(lambda: len(rounds) < 5, interval=30)
++    assert rounds[:4] == [["one", "two"], ["one"], ["one"], []]
++    assert waits[:3] == [0.0, 0.0, pytest.approx(28.0)]  # back on the 30 s period once the head is reached
++
++
++# --- one replica puller per board per host --------------------------------------------------------------------
++
++def test_a_second_replica_puller_leaves_the_cursor_alone_while_a_round_holds_the_board(live, svc, kanban_home):
++    _other_creates(svc, 3)
++    assert _round(kanban_home, svc.hub(ME)).error is None
++    before, _ = _replica_state()
++    _other_creates(svc, 5)
++    with board_sync_lock(kanban_home / "kanban.db"):  # a round in progress
++        pulled = ksc._pull_replica(BOARD, svc.hub(ME), ME, kanban_home / "kanban.db")
++    assert pulled.busy and pulled == 0
++    assert _replica_state()[0] == before
++    pulled = ksc._pull_replica(BOARD, svc.hub(ME), ME, kanban_home / "kanban.db")  # free: it pulls
++    assert not pulled.busy and _replica_state()[0] == svc.board(BOARD)["seq"]
++
++
++def test_sync_diff_compares_the_replica_as_is_while_a_round_holds_the_board(live, svc, kanban_home, monkeypatch,
++                                                                            capsys):
++    import argparse
++    import json
++    from hermes_cli import kanban_sync_cli
++    assert _round(kanban_home, svc.hub(ME)).error is None
++    before, _ = _replica_state()
++    _other_creates(svc, 4)
++    monkeypatch.setattr(ksc, "load_identity", lambda: svc.hub(ME).ident)
++    monkeypatch.setattr(ksc, "Hub", lambda ident: svc.hub(ME))
++    with board_sync_lock(kanban_home / "kanban.db"):
++        kanban_sync_cli._diff(argparse.Namespace(board=BOARD, json=True))
++    report = json.loads(capsys.readouterr().out)
++    assert "refresh_skipped" in report and not report.get("unavailable")
++    assert _replica_state()[0] == before
++
++
++# --- the dispatcher tick: reservation is not held behind the backlog (scope addition 5/6) ---------------------
++
++def _tick_setup(monkeypatch, hub):
++    monkeypatch.setattr(ksc, "load_identity", lambda: ksc.Identity("http://unused", "synthetic", "hub"))
++    monkeypatch.setattr(ksc, "Hub", lambda *a, **kw: hub)
++    from hermes_cli import kanban_placement
++    monkeypatch.setattr(kanban_placement, "config", lambda: {"worker_pools": {"hub": ["worker-1"]}})
++
++
++def _backlog_pages(conn_, *, exhaust_after=None):
++    """An endless backlog: every page has one change and ``more``; optionally the budget dies after N pages."""
++    served = []
++
++    def changes(board, since, limit=500):
++        if exhaust_after is not None and len(served) >= exhaust_after:
++            raise ksc.BoardBudgetExhausted("Board request budget exhausted")
++        served.append(since)
++        return {"changes": [], "next": since + 500, "head": 10 ** 9, "more": True}
++    return changes, served
++
++
++@pytest.mark.parametrize("exhaust_after", [1, None], ids=["budget-exhausted", "page-budget"])
++def test_a_worker_first_card_is_reserved_on_the_first_tick_despite_a_backlog(conn, monkeypatch, exhaust_after):
++    tid = reserve_fixtures.acknowledged(conn)
++    hub = Mock()
++    hub.changes, served = _backlog_pages(conn, exhaust_after=exhaust_after)
++    hub.reserve.return_value = {"state": "assigned", "machine": "worker-1", "reservation_id": "r1",
++                                "expires_at": None, "reason": None}
++    _tick_setup(monkeypatch, hub)
++    wp.dispatch_tick(conn)
++    assert hub.reserve.call_count == 1
++    assert hub.reserve.call_args.kwargs["task_id"] == tid
++    assert len(served) <= 2 * backlog.PULL_PAGE_BUDGET  # the tick's pull and the post-reserve pull, each bounded
++    assert len(served) < BACKLOG_PAGES
++
++
++def test_the_tick_neither_pulls_nor_reads_the_feed_while_a_round_holds_the_board(conn, monkeypatch):
++    reserve_fixtures.acknowledged(conn)
++    hub = Mock()
++    hub.reserve.return_value = {"state": "assigned", "machine": "worker-1"}
++    _tick_setup(monkeypatch, hub)
++    pulls = []
++    monkeypatch.setattr(ksc, "pull", lambda *a, **kw: pulls.append(kw))
++    with board_sync_lock(Path(sync._db_key(conn))):
++        wp.dispatch_tick(conn)
++    assert pulls == [] and hub.reserve.call_count == 1
++
++
++# --- detection -----------------------------------------------------------------------------------------------
++
++def _age_rows(c, *, minutes, retry_after=None):
++    with kbc.write_txn(c):
++        c.execute("UPDATE kanban_sync_outbox SET created_at = ?, retry_after = ?",
++                  (int((time.time() - minutes * 60) * 1000), retry_after))
++
++
++def test_sync_status_prints_the_age_of_the_oldest_pending_op(live):
++    assert ksc.status(live)["oldest_pending_age_s"] is None or live.execute(
++        "SELECT COUNT(*) FROM kanban_sync_outbox WHERE state='pending'").fetchone()[0]
++    kb.create_task(live, title="waiting")
++    _age_rows(live, minutes=540)
++    age = ksc.status(live)["oldest_pending_age_s"]
++    assert 540 * 60 - 5 <= age <= 540 * 60 + 5
++
++
++def test_a_good_round_with_an_old_unanswered_op_warns_once_per_window(live, kanban_home, caplog):
++    path = kanban_home / "kanban.db"
++    kb.create_task(live, title="stuck")
++    _age_rows(live, minutes=11)
++    ok = [ksc.RoundResult(board=BOARD, mode="primary")]
++    clock = [1000.0]
++    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_sync_outbox_age"):
++        assert outbox_age.after_round(ok, [(BOARD, path)], mono=lambda: clock[0]) == [BOARD]
++        clock[0] += 60
++        assert outbox_age.after_round(ok, [(BOARD, path)], mono=lambda: clock[0]) == []  # rate-limited
++        failed = [ksc.RoundResult(board=BOARD, mode="?", error="OSError: offline")]
++        clock[0] += 900
++        assert outbox_age.after_round(failed, [(BOARD, path)], mono=lambda: clock[0]) == []  # offline: no claim
++    assert sum("waited" in r.message for r in caplog.records) == 1
++    _age_rows(live, minutes=11, retry_after=int(time.time()) + 60)  # the Board deferred it: its own retry
++    assert outbox_age.after_round(ok, [(BOARD, path)], mono=lambda: clock[0] + 9999) == []
++
++
++def test_the_dispatcher_files_one_card_per_stalled_outbox_incident(live, kanban_home):
++    path = kanban_home / "kanban.db"
++    kb.create_task(live, title="stuck")
++    _age_rows(live, minutes=30)
++    boards = [(BOARD, path)]
++    clock = [0.0]
++    filed: list = []
++
++    def file_fn(slug, detail):
++        filed.append(detail)
++        return f"t_card{len(filed)}"
++
++    def tick():
++        clock[0] += outbox_age.CHECK_EVERY_S
++        return outbox_age.check(mono=lambda: clock[0], file_fn=file_fn, boards=boards)
++
++    assert tick() == []  # no round has completed in this process: nothing known about the loop
++    outbox_age.after_round([ksc.RoundResult(board=BOARD, mode="primary")], boards)
++    assert tick() == ["t_card1"]
++    assert tick() == []  # the same incident files once
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox")
++    assert tick() == []  # answered: the incident ends
++    kb.create_task(live, title="stuck again")
++    _age_rows(live, minutes=30)
++    assert tick() == ["t_card2"]
++    assert "30 min" in filed[0]
++
++
++def test_a_round_stuck_past_the_window_counts_as_a_live_loop(live, kanban_home):
++    """The incident's own shape: a round that never ends (its last completed round had failed)."""
++    path = kanban_home / "kanban.db"
++    kb.create_task(live, title="stuck")
++    _age_rows(live, minutes=30)
++    boards = [(BOARD, path)]
++    outbox_age.after_round([ksc.RoundResult(board=BOARD, mode="?", error="URLError")], boards)
++    outbox_age.round_started(mono=lambda: 0.0)
++    filed = []
++    assert outbox_age.check(mono=lambda: 300.0, file_fn=lambda s, d: filed.append(d), boards=boards) == []
++    outbox_age.reset()
++    outbox_age.round_started(mono=lambda: 0.0)
++    outbox_age.check(mono=lambda: outbox_age.STALE_S + 1, file_fn=lambda s, d: filed.append(d) or "t_x",
++                     boards=boards)
++    assert len(filed) == 1
++
++
++def test_report_opens_one_card_then_comments(live, kanban_home):
++    first = outbox_age.report(BOARD, "board `default`: 30 min")
++    again = outbox_age.report(BOARD, "board `default`: 40 min")
++    assert first and first == again
++    with kbc.connect_closing(kanban_home / "kanban.db") as c:
++        row = c.execute("SELECT title, idempotency_key FROM tasks WHERE id = ?", (first,)).fetchone()
++    assert row[1] == f"{outbox_age.KEY}:{BOARD}" and "outbox" in row[0]
+diff --git a/tests/hermes_cli/test_kanban_sync_run_rows.py b/tests/hermes_cli/test_kanban_sync_run_rows.py
+index a4488bd451..30cd1c6f88 100644
+--- a/tests/hermes_cli/test_kanban_sync_run_rows.py
++++ b/tests/hermes_cli/test_kanban_sync_run_rows.py
+@@ -255,11 +255,12 @@ def test_the_dispatcher_closes_a_dangling_run_and_the_board_follows(live, kanban
+     is no longer its card's current run is closed once it is old enough to have settled."""
+     tid, uid = _claimed(live, kanban_home, svc, "dangling")
+     _round(kanban_home, svc)
+-    # What the race left on every host: the card moved on, the run row did not.
++    _live_tid, live_uid = _claimed(live, kanban_home, svc, "live run")  # a current run must never be touched
++    # What the race left on every host: the card moved on, the run row did not. Made after the last round: a round
++    # pushes before it pulls (t_01a1d36ddcea59fe), so the Board's lease release would end the run properly first.
+     with kbc.write_txn(live):
+         live.execute("UPDATE tasks SET status = 'blocked', claim_lock = NULL, claim_expires = NULL, "
+                      "current_run_id = NULL WHERE id = ?", (tid,))
+-    _live_tid, live_uid = _claimed(live, kanban_home, svc, "live run")  # a current run must never be touched
+     young = kb.create_task(live, title="young", assignee="worker")
+     with kbc.write_txn(live):
+         live.execute("INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'running', ?)",
+-- 
+2.43.0
+

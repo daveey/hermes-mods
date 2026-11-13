@@ -1,0 +1,185 @@
+From 17a87436c7fb77a222917a4f6978597b1b46ef4f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:56:30 +0000
+Subject: [PATCH] [daveey] held-default stall: a stale or draining machine is
+ not a default-card taker
+
+PR #2264 review 5892044674 (nit 1, t_01a1d5278ec3d702): `others_take_default` counted any active,
+non-explicit-pickup machine that passed `kanban_worker_node.eligible` as able to copy a held machine's
+default-placement card. It never checked `last_seen` freshness or `metrics.drain_active`, which
+`alarm_placement` checks through `_ready_now`. A stale or draining non-explicit machine claims nothing, yet it
+suppressed the held-default stall alarm for a card no one could take (fail-open). No live registry machine has
+non-explicit pickup today, so nothing was affected yet.
+
+Fix: factor `kanban_pickup_stall._live` (not draining, last_seen within FRESH_SECONDS) out of `_ready_now`, and
+make `others_take_default` require it, with `now_ms` passed from `stranded` (keyword-only, so no caller can skip
+it). The free-slot part of `_ready_now` is deliberately not applied: a full machine still copies the card and runs
+it when a slot frees, so it is a taker.
+
+Tests (tests/hermes_cli/test_kanban_pickup_stall_held.py):
+- new test_a_stale_or_draining_default_taker_does_not_silence_the_alarm[stale|draining]: held worker-6 with its
+  own ready default card, worker-1 on `pickup: all` but stale (last_seen FRESH_SECONDS+60 s before the sweep) or
+  drain_active -> the alarm files. RED on main cd40d134de (both fail), GREEN after.
+- test_t3_no_alarm_when_another_machine_can_claim_the_card now stamps last_seen at the simulated sweep time
+  (fresh, not draining) -> still no alarm.
+- All 9 suites importing kanban_pickup_stall*: 228 passed; scripts/check --base origin/main: 19 checks ok.
+---
+ hermes_cli/kanban_pickup_stall.py             | 12 ++++--
+ hermes_cli/kanban_pickup_stall_held.py        | 31 +++++++++------
+ .../test_kanban_pickup_stall_held.py          | 38 ++++++++++++++++---
+ 3 files changed, 62 insertions(+), 19 deletions(-)
+
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index ee98787686..d3ab73a53d 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -287,12 +287,18 @@ def _can_host(name: str, entry: Optional[Mapping[str, Any]], own: str, need: set
+                                                     or HUB_ACCESS in wn.effective_labels(entry, name))
+ 
+ 
+-def _ready_now(entry: Mapping[str, Any], now_ms: int) -> bool:
+-    """Not draining, seen recently and (when the registry says) a free card slot."""
++def _live(entry: Mapping[str, Any], now_ms: int) -> bool:
++    """Not draining and seen within :data:`FRESH_SECONDS` (also the held-default taker test:
++    :func:`hermes_cli.kanban_pickup_stall_held.others_take_default`)."""
+     if (entry.get("metrics") or {}).get("drain_active"):
+         return False
+     seen = entry.get("last_seen")
+-    if isinstance(seen, (int, float)) and not isinstance(seen, bool) and now_ms - seen > FRESH_SECONDS * 1000:
++    return not (isinstance(seen, (int, float)) and not isinstance(seen, bool) and now_ms - seen > FRESH_SECONDS * 1000)
++
++
++def _ready_now(entry: Mapping[str, Any], now_ms: int) -> bool:
++    """:func:`_live` and (when the registry says) a free card slot."""
++    if not _live(entry, now_ms):
+         return False
+     free = _free_slots(entry)
+     return free is None or free > 0
+diff --git a/hermes_cli/kanban_pickup_stall_held.py b/hermes_cli/kanban_pickup_stall_held.py
+index aabf5639d1..bb72ab7c4a 100644
+--- a/hermes_cli/kanban_pickup_stall_held.py
++++ b/hermes_cli/kanban_pickup_stall_held.py
+@@ -9,14 +9,15 @@ land-lane ticket held behind it, until an operator moved it to the pool by hand.
+ 
+ This covers the creator's side. On every dispatcher sweep of a held machine M, a card on M's own board that is
+ ``ready``, unclaimed, default placement (``runs_on`` NULL), created on M, with a ``scratch`` workspace, is stranded when
+-no other machine would copy it: no active, unheld machine with non-explicit pickup passes
+-:func:`hermes_cli.kanban_worker_node.eligible` for it. A card held by a dispatcher respawn guard does not count (it
+-would wait anyway). When such a card has waited past ``kanban.sync.pickup_stall_seconds`` (default 600 s) since both
+-its ``ready_since`` and the hold's start, ONE host-wide alarm (key ``pickup-stall:<M>:held-default:``) lists every such
+-card, placed on another machine by :func:`hermes_cli.kanban_pickup_stall.alarm_placement`. Its run may re-place exactly
+-the listed cards to the pool queue (:mod:`hermes_cli.kanban_pickup_stall_repin`). A rollout-hold card should already
+-have been moved by hub-worker-core-rollout within one 5-minute pass, so the alarm is the backstop when that move did
+-not happen. A ``dir``/``worktree`` card runs only where its workspace is, so it is never listed: no move can help it.
++no other machine would copy it: no active, unheld, live (not draining, recently seen) machine with non-explicit
++pickup passes :func:`hermes_cli.kanban_worker_node.eligible` for it. A card held by a dispatcher respawn guard does
++not count (it would wait anyway). When such a card has waited past ``kanban.sync.pickup_stall_seconds`` (default
++600 s) since both its ``ready_since`` and the hold's start, ONE host-wide alarm (key ``pickup-stall:<M>:held-default:``)
++lists every such card, placed on another machine by :func:`hermes_cli.kanban_pickup_stall.alarm_placement`. Its run
++may re-place exactly the listed cards to the pool queue (:mod:`hermes_cli.kanban_pickup_stall_repin`). A rollout-hold
++card should already have been moved by hub-worker-core-rollout within one 5-minute pass, so the alarm is the backstop
++when that move did not happen. A ``dir``/``worktree`` card runs only where its workspace is, so it is never listed: no
++move can help it.
+ """
+ from __future__ import annotations
+ 
+@@ -29,14 +30,22 @@ SLUG = "held-default"
+ _BOUND = ("dir", "worktree")
+ 
+ 
+-def others_take_default(card: Mapping[str, Any], own: str, machines: Mapping[str, Mapping[str, Any]]) -> list[str]:
++def others_take_default(card: Mapping[str, Any], own: str, machines: Mapping[str, Mapping[str, Any]], *,
++                        now_ms: int) -> list[str]:
+     """Machines other than ``own`` whose pickup would copy default-placement ``card`` now: active, pickup on and
+-    not ``explicit`` (explicit copies only cards with ``runs_on``), and :func:`kanban_worker_node.eligible`."""
++    not ``explicit`` (explicit copies only cards with ``runs_on``), live (not draining, ``last_seen`` fresh:
++    :func:`kanban_pickup_stall._live`, as :func:`kanban_pickup_stall.alarm_placement` checks) and
++    :func:`kanban_worker_node.eligible`. A stale or draining machine claims nothing, so counting it would silence
++    the alarm for a card no one can take. A full machine still counts: it copies the card and runs it when a slot
++    frees."""
++    from hermes_cli import kanban_pickup_stall as kps
+     from hermes_cli import kanban_worker_node as wn
+     out = []
+     for name, entry in machines.items():
+         if name == own or not entry or entry.get("state", "active") != "active" or not wn.advertises_pickup(entry):
+             continue
++        if not kps._live(entry, now_ms):
++            continue
+         if str(entry.get("pickup")).strip().lower() == "explicit":
+             continue
+         if wn.eligible(card, name, machines) is None:
+@@ -74,7 +83,7 @@ def stranded(conn, own: str, machines: Optional[Mapping[str, Mapping[str, Any]]]
+         if now_ms - since <= stall_s * 1000:
+             continue
+         card = {**dict(row), "created_on": row["created_on"] or own}
+-        if others_take_default(card, own, machines):
++        if others_take_default(card, own, machines, now_ms=now_ms):
+             continue
+         if kph.board_hold(conn, row) is not None:
+             continue  # a respawn guard holds it: it would wait on any machine
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_held.py b/tests/hermes_cli/test_kanban_pickup_stall_held.py
+index d959d9406f..effd0178ef 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_held.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_held.py
+@@ -54,9 +54,15 @@ def pair(tmp_path, monkeypatch):
+     held = support.Gateway(tmp_path, HELD, svc, monkeypatch, pickup="explicit")
+     free = support.Gateway(tmp_path, FREE, svc, monkeypatch, pickup="explicit")
+ 
+-    def registry(machines):
++    def registry(machines, *, seen_ms=None):
++        """Serve ``machines``, stamped seen now (or at ``seen_ms``: a sweep at a simulated time sees the registry
++        as fresh only when ``last_seen`` is near that time)."""
+         monkeypatch.setattr(support, "MACHINES", machines)
+-        wn.set_registry_fetch(lambda: {"me": None, "machines": support.seen_now(machines.values())})
++        if seen_ms is None:
++            wn.set_registry_fetch(lambda: {"me": None, "machines": support.seen_now(machines.values())})
++        else:
++            wn.set_registry_fetch(lambda: {"me": None, "machines": [{"last_seen": seen_ms, **m}
++                                                                    for m in machines.values()]})
+ 
+     yield held, free, t0, registry
+     for g in (held, free):
+@@ -138,15 +144,37 @@ def test_t3_one_alarm_after_the_threshold_for_a_default_card_only_the_held_creat
+ 
+ def test_t3_no_alarm_when_another_machine_can_claim_the_card(pair):
+     held, _free, t0, registry = pair
++    from hermes_cli import kanban_pickup_stall as kps
++    later = t0 + kps.stall_seconds() + 60
+     registry(_machines(t0, free_pickup="all"))  # worker-1 copies default-placement cards: not stranded
+     _own_card(held)
+     held.enter()
+-    registry(_machines(t0, free_pickup="all"))
+-    from hermes_cli import kanban_pickup_stall as kps
+-    assert kps.sweep(held.conn, now=t0 + kps.stall_seconds() + 60) == []
++    registry(_machines(t0, free_pickup="all"), seen_ms=int(later * 1000))  # fresh at the sweep, not draining
++    assert kps.sweep(held.conn, now=later) == []
+     assert not _repairs(held.conn)
+ 
+ 
++@pytest.mark.parametrize("dead", ["stale", "draining"])
++def test_a_stale_or_draining_default_taker_does_not_silence_the_alarm(pair, dead):
++    """PR #2264 review 5892044674: a non-explicit machine that claims nothing (last_seen older than
++    ``kanban_pickup_stall.FRESH_SECONDS``, or ``metrics.drain_active``) is not a taker, as ``alarm_placement``
++    judges it; counting it left a card no one could claim without an alarm."""
++    held, _free, t0, registry = pair
++    from hermes_cli import kanban_pickup_stall as kps
++    later = t0 + kps.stall_seconds() + 60
++    tid = _own_card(held)
++    held.enter()
++    machines = _machines(t0, free_pickup="all")
++    if dead == "stale":
++        machines[FREE]["last_seen"] = int((later - kps.FRESH_SECONDS - 60) * 1000)
++    else:
++        machines[FREE]["metrics"] = {**machines[FREE]["metrics"], "drain_active": True}
++    registry(machines, seen_ms=int(later * 1000))
++    [alarm_id] = kps.sweep(held.conn, now=later)
++    [alarm] = _repairs(held.conn)
++    assert alarm["id"] == alarm_id and f"- {tid} (" in alarm["body"]
++
++
+ def test_no_alarm_once_the_card_left_default_placement_or_the_hold_ended(pair):
+     held, _free, t0, registry = pair
+     tid = _own_card(held)
+-- 
+2.43.0
+

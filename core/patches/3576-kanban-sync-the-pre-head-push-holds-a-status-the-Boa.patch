@@ -1,0 +1,249 @@
+From c472301902d5d8601723ea060e56c3a979400568 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:17:39 +0000
+Subject: [PATCH] kanban sync: the pre-head push holds a status the Board has
+ as done (stale wake)
+
+Required CI on 71d46e0099 failed test_kanban_stale_wake_terminal::
+test_a_wake_pushed_after_a_remote_completion_does_not_reopen_the_board_card
+(#1958's acceptance): the push before the pull sent a local wake's
+status=ready for a card the Board had completed in a page this host had not
+pulled, so #1958's push strip (which needs the completion locally) never saw
+it, and the send-time HLC reopened the card on the Board.
+
+While a round is before the feed head (before its pulls, and after them when
+the page budget left it behind) a task row whose live status is not
+running/terminal, on a card the Board has acknowledged, is checked against the
+Board's own row (row_evidence, one read per card per push). A done/archived
+row there, or no answer, skips that card's rows until a pull reaches the head
+and the strip judges them; other cards' rows still go (a wake on a live card
+is still sent before page 2). Run rows keep their FIFO stop.
+
+hold_runs -> before_head (it now holds more than run rows); the selection
+moved to kanban_sync_backlog.sendable_before_head.
+
+Test: test_a_wake_on_a_card_the_board_completed_waits_for_the_head_while_a_live_one_goes_first
+(RED on 71d46e0099, GREEN here); #1958's suite is green unchanged.
+---
+ hermes_cli/kanban_sync_backlog.py             | 21 ++++++++++
+ hermes_cli/kanban_sync_client.py              | 32 ++++++++--------
+ hermes_cli/kanban_sync_outbox_age.py          |  2 +-
+ hermes_cli/kanban_terminal_guard.py           | 27 +++++++++++++
+ .../test_kanban_sync_push_starvation.py       | 38 +++++++++++++++++++
+ 5 files changed, 104 insertions(+), 16 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_backlog.py b/hermes_cli/kanban_sync_backlog.py
+index b692d7cfbc..a210cc5d09 100644
+--- a/hermes_cli/kanban_sync_backlog.py
++++ b/hermes_cli/kanban_sync_backlog.py
+@@ -21,6 +21,27 @@ BUSY_RETRY_S = 0.5  # a round skipped because a dispatcher tick held the board (
+ RECONCILE_BUSY_WAIT_S = 600.0  # a reconcile waits this long in all for rounds holding the board between its chunks
+ _sleep = time.sleep  # tests
+ 
++
++def sendable_before_head(conn: Any, hub: Any, board: str, rows: list[dict], seen: dict) -> tuple[list[dict], bool]:
++    """The outbox rows a push may send while this file has not pulled to the feed head (``push(before_head=True)``),
++    and whether it stopped: the first run row ends the batch (FIFO kept: a run row is sent whole and the Board keeps
++    the last write, so it waits for any end in an unread page). A task row with a live ``status`` whose Board row is
++    done/archived (``kanban_terminal_guard.board_may_hold_terminal``) is skipped with every later row of that card;
++    other cards' rows still go, so one stale wake holds back no one else's edits."""
++    from hermes_cli.kanban_terminal_guard import board_may_hold_terminal
++    out: list[dict] = []
++    skipped: set[tuple[str, str]] = set()
++    for r in rows:
++        if r["table_name"] == "task_runs":
++            return out, True
++        key = (r["table_name"], r["row_uid"])
++        if key in skipped or board_may_hold_terminal(conn, hub, board, r, seen):
++            skipped.add(key)
++            continue
++        out.append(r)
++    return out, False
++
++
+ _LOCK = threading.Lock()
+ _BEHIND: set[str] = set()  # live board paths whose last round stopped before the feed head
+ 
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 7927389249..b8772a2486 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -668,22 +668,24 @@ class PushResult:
+ 
+ 
+ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primary: bool,
+-         max_batches: int = MAX_BATCHES_PER_ROUND, hold_runs: bool = False) -> PushResult:
++         max_batches: int = MAX_BATCHES_PER_ROUND, before_head: bool = False) -> PushResult:
+     """Drain pending outbox rows in FIFO batches. A transport failure leaves them pending (retried next round).
+ 
+-    ``hold_runs`` stops at the first run row (t_01a1d36ddcea59fe). A round sets it before its pulls, and after them
+-    while it stopped behind the feed head: a run row is sent whole and the Board keeps the last write, so a pending
+-    startup sent before the pull reached the head could overwrite an end the Board already holds in an unread page
+-    (``_local_row_is_newer`` lets that end land locally first)."""
++    ``before_head`` (t_01a1d36ddcea59fe): a round sets it before its pulls, and after them while it stopped behind the
++    feed head. It stops at the first run row (sent whole, the Board keeps the last write, so a pending startup could
++    overwrite an end the Board holds in an unread page; ``_local_row_is_newer`` lets that end land locally first),
++    and skips a card whose live ``status`` the Board's row has as done/archived (a stale wake: the strip below judges
++    it once the completion is pulled). See ``kanban_sync_backlog.sendable_before_head``."""
+     from hermes_cli.kanban_db_connect import write_txn
+     refuse_if_schema_ahead(conn)  # an older core would strip the newer columns; the ops stay pending [daveey]
+-    out = PushResult()
++    out, seen = PushResult(), {}
+     for _ in range(max_batches):
+-        rows = [dict(r) for r in conn.execute(
++        rows = selected = [dict(r) for r in conn.execute(
+             "SELECT * FROM kanban_sync_outbox WHERE state = 'pending' AND (retry_after IS NULL OR retry_after <= ?) "
+             "ORDER BY created_at, rowid LIMIT ?", (int(time.time()), PUSH_BATCH))]
+-        run_at = next((i for i, r in enumerate(rows) if r["table_name"] == "task_runs"), None) if hold_runs else None
+-        rows = rows if run_at is None else rows[:run_at]  # FIFO order is kept: nothing after the run row goes first
++        stopped = False
++        if before_head:
++            rows, stopped = backlog.sendable_before_head(conn, hub, board, selected, seen)
+         if not rows:
+             break
+         with write_txn(conn):
+@@ -757,7 +759,7 @@ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primar
+         if authoritative:
+             cursor = (sync.sync_state(conn) or {}).get("cursor", 0)
+             sync.apply_remote_changes(conn, authoritative, new_cursor=cursor, board=board)
+-        if out.deferred or len(rows) < PUSH_BATCH:  # deferred rows retry next round, not in a hot loop
++        if out.deferred or stopped or len(selected) < PUSH_BATCH:  # deferred rows retry next round, not in a hot loop
+             break
+     return out
+ 
+@@ -1017,7 +1019,7 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+         # Send before pulling as well as after: a pull backlog never holds local edits back (9 h, t_01a1d36ddcea59fe).
+         # Safe: the Board merges on base_version + field HLC, an acked task's sync_version fences off older feed
+         # copies of it, and rejections are resolved here as after the pulls.
+-        _send(live, hub, slug, gateway, mode, result, after_pull=False, hold_runs=True)
++        _send(live, hub, slug, gateway, mode, result, after_pull=False, before_head=True)
+         with _pulled_replica(slug, hub, gateway) as (replica, pulled, rebuilt):
+             result.pulled = pulled
+             result.behind = pulled.more
+@@ -1073,7 +1075,7 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+                 heal_clobbered_completions(live)
+                 heal_running_over_ended_run(live)
+         # Still behind the head: the Board may hold a run's end in a page not read yet, so run rows wait.
+-        _send(live, hub, slug, gateway, mode, result, after_pull=True, hold_runs=result.behind)
++        _send(live, hub, slug, gateway, mode, result, after_pull=True, before_head=result.behind)
+         if mode == "primary":
+             from hermes_cli.kanban_worker_placement import reevaluate
+             with credited(live):  # reservation observations and the feed pull after them
+@@ -1083,11 +1085,11 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+ 
+ 
+ def _send(live: sqlite3.Connection, hub: Hub, slug: str, gateway: str, mode: str, result: RoundResult, *,
+-          after_pull: bool, hold_runs: bool) -> None:
++          after_pull: bool, before_head: bool) -> None:
+     """Push the outbox and resolve rejections, adding to ``result``. A round does this before its pulls and after
+-    them (``after_pull``, which also transfers attachments); for ``hold_runs`` see :func:`push`."""
++    them (``after_pull``, which also transfers attachments); for ``before_head`` see :func:`push`."""
+     with credited(live):  # acknowledgements and the Board's merged rows: sync bookkeeping, not local edits
+-        pushed = push(live, hub, slug, gateway, primary=mode == "primary", hold_runs=hold_runs)
++        pushed = push(live, hub, slug, gateway, primary=mode == "primary", before_head=before_head)
+     result.push = pushed if result.push is None else PushResult(*map(sum, zip(astuple(result.push), astuple(pushed))))
+     if after_pull:
+         from hermes_cli.kanban_sync_attachments import transfer_pending
+diff --git a/hermes_cli/kanban_sync_outbox_age.py b/hermes_cli/kanban_sync_outbox_age.py
+index b52efa8254..b87915c9ff 100644
+--- a/hermes_cli/kanban_sync_outbox_age.py
++++ b/hermes_cli/kanban_sync_outbox_age.py
+@@ -47,7 +47,7 @@ def oldest_pending_age_s(conn: sqlite3.Connection, *, unanswered: bool = False,
+                          now: Optional[float] = None) -> Optional[float]:
+     """Seconds since the oldest pending outbox op was queued (None: no pending op). ``unanswered`` counts only ops
+     the Board never deferred; ``held_runs`` leaves out run rows, which a round behind the feed head holds back on
+-    purpose (``push(hold_runs=...)``)."""
++    purpose (``push(before_head=...)``)."""
+     sql = "SELECT MIN(created_at) FROM kanban_sync_outbox WHERE state = 'pending'"
+     sql += " AND retry_after IS NULL" if unanswered else ""
+     sql += " AND table_name != 'task_runs'" if held_runs else ""
+diff --git a/hermes_cli/kanban_terminal_guard.py b/hermes_cli/kanban_terminal_guard.py
+index 53d7ea1d84..489044e914 100644
+--- a/hermes_cli/kanban_terminal_guard.py
++++ b/hermes_cli/kanban_terminal_guard.py
+@@ -183,6 +183,33 @@ def strip_stale_push(conn: sqlite3.Connection, op: dict) -> dict:
+     return {**op, "fields": {k: v for k, v in fields.items() if k != "status"}}
+ 
+ 
++def board_may_hold_terminal(conn: sqlite3.Connection, hub: Any, board: str, row: dict, seen: dict) -> bool:
++    """The push before the feed head (t_01a1d36ddcea59fe): True when this outbox row must wait for the pull.
++
++    :func:`strip_stale_push` only sees a completion this file already pulled. A round pushes before its pulls, and
++    while a page budget leaves it behind the head, so a live ``status`` on an acknowledged card is checked against
++    the Board's own row first: a done/archived row there (or no answer) holds it until a pull reaches the head and
++    the strip can judge it. ``seen`` caches one Board read per card per push."""
++    if row.get("table_name") != "tasks" or row.get("op") != "upsert":
++        return False
++    status = _payload(row.get("fields")).get("status")
++    if not isinstance(status, str) or status in TERMINAL_STATUSES or status == "running":
++        return False
++    acked = conn.execute("SELECT sync_version FROM tasks WHERE id = ?", (row["row_uid"],)).fetchone()
++    reader = getattr(hub, "row_evidence", None)
++    if acked is None or acked[0] is None or reader is None:  # a create has no Board copy to reopen
++        return False
++    uid = row["row_uid"]
++    if uid not in seen:
++        from hermes_cli.kanban_sync_client import HubError
++        try:
++            board_row = reader(board, "tasks", uid).get("row") or {}
++            seen[uid] = board_row.get("status") in TERMINAL_STATUSES
++        except (HubError, OSError, ValueError, AttributeError):
++            seen[uid] = True  # unknown: wait for the pull, which the strip can judge
++    return seen[uid]
++
++
+ # --- feed apply ---------------------------------------------------------------------------------------------------
+ 
+ def enforce_after_apply(conn: sqlite3.Connection, left_terminal: Iterable[tuple[str, str]],
+diff --git a/tests/hermes_cli/test_kanban_sync_push_starvation.py b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+index 64efc8ffe3..af047e352b 100644
+--- a/tests/hermes_cli/test_kanban_sync_push_starvation.py
++++ b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+@@ -194,6 +194,44 @@ def test_a_round_left_behind_holds_a_pending_run_start_over_the_boards_end(kanba
+         c.close()
+ 
+ 
++def test_a_wake_on_a_card_the_board_completed_waits_for_the_head_while_a_live_one_goes_first(live, svc, kanban_home):
++    """CI on 71d46e0099: the pre-pull send pushed a stale wake (``status=ready``) for a card the Board had completed
++    in a page not pulled yet, so #1958's push strip never saw the completion and the Board reopened the card. A
++    status whose Board row is done waits for the pull to reach the head; a wake on a live card still goes first."""
++    stale = kb.create_task(live, title="done elsewhere", assignee="worker")
++    woke = kb.create_task(live, title="still parked", assignee="worker")
++    with kbc.write_txn(live):  # both parked, and the Board knows it
++        live.execute("UPDATE tasks SET status = 'scheduled' WHERE id IN (?, ?)", (stale, woke))
++    assert _round(kanban_home, svc.hub(ME)).error is None
++    assert svc.board(BOARD)["rows"]["tasks"][woke]["status"] == "scheduled"
++    _other_creates(svc, BACKLOG_PAGES)  # the completion lands after the backlog: in a page round 1 does not reach
++    now = time.time_ns() // 1_000_000
++    svc.hub(OTHER).ops(BOARD, [
++        {"client_op_id": "w1-done", "op": "upsert", "table": "tasks", "uid": stale,
++         "hlc": f"{now:013d}-0000-{OTHER}", "fields": {"status": "done", "completed_at": int(time.time())}},
++        {"client_op_id": "w1-ev", "op": "upsert", "table": "task_events", "uid": sync.uuid7(),
++         "hlc": f"{now + 1:013d}-0000-{OTHER}",
++         "fields": {"task_id": stale, "kind": "completed", "payload": "{}", "created_at": int(time.time())}}])
++    assert svc.board(BOARD)["rows"]["tasks"][stale]["status"] == "done"
++    with kbc.write_txn(live):  # both local wakes, minted before this host pulled the completion
++        live.execute("UPDATE tasks SET status = 'ready' WHERE id IN (?, ?)", (stale, woke))
++    log: list = []
++    hub = PagedHub(svc, ME, log)
++    assert _round(kanban_home, hub).behind
++    pages = [i for i, (kind, _) in enumerate(log) if kind == "changes"]
++    sent = [i for i, (kind, uids) in enumerate(log) if kind == "ops" and woke in uids]
++    assert sent and sent[0] < pages[1]  # the live card's wake did not wait for the backlog
++    assert not any(kind == "ops" and stale in uids for kind, uids in log)  # the Board's done row held it
++    rows = svc.board(BOARD)["rows"]["tasks"]
++    assert rows[stale]["status"] == "done" and rows[woke]["status"] == "ready"
++    while _round(kanban_home, hub).behind:
++        assert svc.board(BOARD)["rows"]["tasks"][stale]["status"] == "done"
++    _round(kanban_home, hub)
++    assert svc.board(BOARD)["rows"]["tasks"][stale]["status"] == "done"
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE row_uid = ? AND state = 'pending'",
++                            (stale,)).fetchone()  # stripped and sent at the head, not left pending
++
++
+ # --- a budget-ended round still finishes ---------------------------------------------------------------------
+ 
+ def test_a_round_ending_its_page_budget_still_pushes_resolves_refreshes_and_reevaluates(live, svc, kanban_home,
+-- 
+2.43.0
+

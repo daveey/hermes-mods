@@ -1,0 +1,192 @@
+From d57d48475a790875fd33b7090c921eb5d2e1047a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:33:08 +0000
+Subject: [PATCH] [daveey] Darwin holder scan: warn on failing background
+ refreshes; drop dead stale-guard length check
+
+Follow-up to #1929 (stale-while-revalidate for the Darwin deleted-WAL holder scan), from review
+t_01a1d48f9fcd05a7's two non-blocking points.
+
+1. `_darwin_clean_servable_stale` checked `len(cached) > 2`; every writer of `_darwin_clean_until`
+   stores the 3-tuple `(until, key, recorded_at)`, so the check was dead. Dropped.
+2. Since #1929 a refresh-only `_DarwinFdScan` pass (one no caller blocked on) that ended expired or
+   with `scan.error` was silent: before it, the blocking open logged the timeout or re-raised. Such
+   a pass now logs one warning per watched base, rate-limited to once per base per 60 s
+   (`_DARWIN_FD_REFRESH_WARN_INTERVAL_SECONDS`), so up to the 300 s stale window of failing
+   background refreshes leaves a trace. "Refresh-only" is tracked as `blocked_on` (any caller ever
+   waited), not `waiters == 0` at the end: a blocking caller that gave up at its budget already
+   logged its own timeout, and the pass ending later must not log it again. The line is logged
+   before `done` is set.
+
+Proof: tests/hermes_state/test_darwin_fd_scan_stale_while_revalidate.py (injected slow/raising
+libproc, runs on any OS). RED on origin/main code (attribute stubbed): the expiry and error tests
+fail `0 == 1` warnings. GREEN: 8 passed. tests/hermes_state + the 3 hermes_cli importers:
+2260 passed (test_hermes_state.py timed out at 300 s under 16-way load in that run; alone 296
+passed). scripts/check --base origin/main: ok.
+---
+ hermes_state_dbfile.py                        | 33 ++++++++-
+ ...t_darwin_fd_scan_stale_while_revalidate.py | 69 +++++++++++++++++++
+ 2 files changed, 101 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_state_dbfile.py b/hermes_state_dbfile.py
+index 056ef8e865..7f8f2464ca 100644
+--- a/hermes_state_dbfile.py
++++ b/hermes_state_dbfile.py
+@@ -344,6 +344,11 @@ _DARWIN_FD_CLEAN_TTL_SECONDS = 30.0
+ _DARWIN_FD_STALE_CLEAN_MAX_SECONDS = 300.0
+ # ``base -> (valid until, key, recorded at)``, all monotonic seconds except the key.
+ _darwin_clean_until: dict[str, tuple[float, tuple, float]] = {}
++# [daveey] A refresh-only pass (no caller blocked on it) that ends expired or with an error logs one
++# warning per base per this many seconds, so up to the 300 s stale window of failing background
++# refreshes is not silent. ``base -> monotonic time of the last such warning``.
++_DARWIN_FD_REFRESH_WARN_INTERVAL_SECONDS = 60.0
++_darwin_refresh_warned: dict[str, float] = {}
+ 
+ 
+ def _darwin_libproc():
+@@ -541,10 +546,22 @@ def _darwin_clean_servable_stale(base: str, key: tuple) -> bool:
+     """[daveey] Whether an expired clean verdict for *base* may still be served: same key, and the
+     pass that produced it is younger than ``_DARWIN_FD_STALE_CLEAN_MAX_SECONDS``."""
+     cached = _darwin_clean_until.get(base)
+-    return (cached is not None and cached[1] == key and len(cached) > 2
++    return (cached is not None and cached[1] == key
+             and time.monotonic() - cached[2] < _DARWIN_FD_STALE_CLEAN_MAX_SECONDS)
+ 
+ 
++def _due_refresh_warnings(bases: list[str]) -> list[str]:
++    """[daveey] The *bases* not warned about in the last ``_DARWIN_FD_REFRESH_WARN_INTERVAL_SECONDS``,
++    marked as warned now. Caller holds ``_DARWIN_SCAN_LOCK``."""
++    now = time.monotonic()
++    due = [base for base in bases
++           if base not in _darwin_refresh_warned
++           or now - _darwin_refresh_warned[base] >= _DARWIN_FD_REFRESH_WARN_INTERVAL_SECONDS]
++    for base in due:
++        _darwin_refresh_warned[base] = now
++    return due
++
++
+ class _DarwinFdScan:
+     """One libproc pass, shared by every caller that arrives while it runs.
+ 
+@@ -559,6 +576,9 @@ class _DarwinFdScan:
+         self.error: BaseException | None = None
+         self.expired = False
+         self.waiters = 0
++        # [daveey] Whether any caller ever blocked on this pass: such a caller logs the timeout or
++        # re-raises the error itself, even if it gave up before the pass ended.
++        self.blocked_on = False
+         # ``base -> (key, watched)`` of every caller that joined; a clean verdict for each is
+         # recorded before this pass stops being in flight (see :meth:`run`). ``taken`` is the
+         # wall clock each caller read just before taking its key (:func:`_clean_key_settled`).
+@@ -582,6 +602,16 @@ class _DarwinFdScan:
+             with _DARWIN_SCAN_LOCK:
+                 if _DARWIN_SCAN_IN_FLIGHT is self:
+                     _DARWIN_SCAN_IN_FLIGHT = None
++                warn = (not self.blocked_on and (self.expired or self.error is not None)
++                        and _due_refresh_warnings(list(self.watchers)))
++            for base in warn or ():  # before ``done``: a waiter that wakes sees the line logged
++                logger.warning(
++                    "background deleted-WAL holder refresh for %s %s; still serving its stale "
++                    "clean verdict",
++                    base,
++                    f"failed: {self.error!r}" if self.error is not None
++                    else f"timed out after {_DARWIN_FD_SCAN_TIMEOUT_SECONDS:.1f}s",
++                )
+             self.done.set()
+ 
+     def _judge_watchers(self) -> None:
+@@ -678,6 +708,7 @@ def _join_darwin_fd_scan(base: str | None = None, key: tuple | None = None,
+         if scan is None or scan is _DARWIN_SCAN_CACHED:
+             return scan
+         scan.waiters += 1
++        scan.blocked_on = True
+     try:
+         # ponytail: a kernel-blocked proc_pidfdinfo cannot be interrupted, so that one thread
+         # may outlive us; it is the only one, and it dies with the process.
+diff --git a/tests/hermes_state/test_darwin_fd_scan_stale_while_revalidate.py b/tests/hermes_state/test_darwin_fd_scan_stale_while_revalidate.py
+index 5abb3ab0c7..8cbd7a0184 100644
+--- a/tests/hermes_state/test_darwin_fd_scan_stale_while_revalidate.py
++++ b/tests/hermes_state/test_darwin_fd_scan_stale_while_revalidate.py
+@@ -11,6 +11,7 @@ libproc is faked with a slow pass, so these run on every platform.
+ from __future__ import annotations
+ 
+ import ctypes
++import logging
+ import os
+ import struct
+ import threading
+@@ -182,3 +183,71 @@ def test_no_prior_verdict_blocks(monkeypatch, tmp_path):
+ 
+     assert result == []
+     assert elapsed >= SLOW_PASS * 0.9
++
++
++def _refresh_failure_warnings(caplog):
++    return [r for r in caplog.records
++            if r.levelno == logging.WARNING and "background deleted-WAL holder refresh" in r.getMessage()]
++
++
++def test_no_waiter_pass_that_expires_logs_one_rate_limited_warning(monkeypatch, tmp_path, caplog):
++    """(e) A refresh-only pass (no blocking waiter) that outruns its budget leaves one warning per
++    base per ``_DARWIN_FD_REFRESH_WARN_INTERVAL_SECONDS``, so failing background refreshes over the
++    300 s stale window are not silent; a second failing pass inside the interval adds none."""
++    db, base = _db_with_sidecars(tmp_path)
++    monkeypatch.setattr(dbfile, "_DARWIN_FD_SCAN_TIMEOUT_SECONDS", 0.1)
++    monkeypatch.setattr(dbfile, "_darwin_refresh_warned", {})
++    lib = _SlowLibproc(0.3)  # longer than the budget: the pass ends expired
++    monkeypatch.setattr(dbfile, "_darwin_libproc", lambda: lib)
++    _plant_clean_verdict(base, age=60)
++    caplog.set_level(logging.WARNING, logger="hermes_state")
++
++    for _ in range(2):
++        assert _iter_darwin_sidecar_holders(db) == []  # served stale, never blocked
++        scan = dbfile._DARWIN_SCAN_IN_FLIGHT
++        assert scan is not None, "no refresh pass was started"
++        assert scan.done.wait(GUARD)
++        assert scan.expired and scan.waiters == 0
++
++    assert lib.passes == 2
++    warnings = _refresh_failure_warnings(caplog)
++    assert len(warnings) == 1, [r.getMessage() for r in warnings]
++    assert base in warnings[0].getMessage()
++
++
++def test_no_waiter_pass_that_errors_logs_a_warning(monkeypatch, tmp_path, caplog):
++    """(f) A refresh-only pass whose scan raises logs the error instead of dropping it."""
++    db, base = _db_with_sidecars(tmp_path)
++    monkeypatch.setattr(dbfile, "_darwin_refresh_warned", {})
++
++    def _boom():
++        raise OSError("libproc unavailable")
++
++    monkeypatch.setattr(dbfile, "_darwin_libproc", _boom)
++    _plant_clean_verdict(base, age=60)
++    caplog.set_level(logging.WARNING, logger="hermes_state")
++
++    assert _iter_darwin_sidecar_holders(db) == []
++    _wait_refresh()
++
++    warnings = _refresh_failure_warnings(caplog)
++    assert len(warnings) == 1
++    assert "libproc unavailable" in warnings[0].getMessage()
++
++
++def test_blocking_waiter_pass_does_not_log_the_refresh_warning(monkeypatch, tmp_path, caplog):
++    """A pass a caller blocked on already logged its timeout (or raised) at that caller, even when
++    the caller gave up before the pass ended."""
++    db, _base = _db_with_sidecars(tmp_path)
++    monkeypatch.setattr(dbfile, "_DARWIN_FD_SCAN_TIMEOUT_SECONDS", 0.1)
++    monkeypatch.setattr(dbfile, "_darwin_refresh_warned", {})
++    lib = _SlowLibproc(0.3)
++    monkeypatch.setattr(dbfile, "_darwin_libproc", lambda: lib)
++    caplog.set_level(logging.WARNING, logger="hermes_state")
++
++    assert _iter_darwin_sidecar_holders(db) == []  # no prior verdict: blocks, then times out
++    scan = dbfile._DARWIN_SCAN_IN_FLIGHT
++    if scan is not None:
++        assert scan.done.wait(GUARD)
++
++    assert _refresh_failure_warnings(caplog) == []
+-- 
+2.43.0
+

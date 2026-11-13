@@ -1,0 +1,165 @@
+From f14c135d42e94b14a636d67be67a0407ad8e9922 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:52:30 +0000
+Subject: [PATCH] [daveey] fix(owner-forward): a receipt naming an admission is
+ unconfirmed, never a resendable "did not admit it"
+
+PR #2265 review (t_01a1d52389d67d1f, review 5892083689), point 1 (behaviour): the owner's
+prompt.submit receipt carries status queued/started/terminal, but AdmissionReceipt.status also
+allows "unknown". A receipt outside the confirmed states raised OwnerUnavailable("the gateway did
+not admit it") even when it named an admission_id, and #2265 made that error transient: the paused
+continuation would be forwarded again under a fresh submission_id, queueing a second copy behind a
+durable row the owner already holds. The Desktop submit path said "Nothing was sent. Send it again"
+for the same receipt.
+
+Now a receipt that names an admission but no confirmed state raises OwnerUnconfirmed (never
+retried; the pause retires with "it may be queued there", the Desktop gets
+SESSION_OWNER_UNCONFIRMED). Only a receipt naming no admission stays the transient "did not admit
+it". Today's SessionAuthority._receipt reports the freshly inserted row, so this was latent.
+
+Point 2 (wording): the docstring and WARNING said the 30 s backoff "retries" the forward. It only
+gates the next try, which the next resume, boot sweep or refused-turn retry makes; the WARNING now
+says "kept for a later try after the 30s backoff".
+
+Tests: new test_a_receipt_naming_an_admission_is_never_resent drives the real forward_prompt and
+relay (fake owner discovery/socket only). RED without the owner_forward change (the admission-named
+receipt was forwarded again), GREEN with it. 30 related files (update_pause*, auto_continue,
+owner-forward consumers, gateway prefix pin): 424 passed. scripts/check --base origin/main: 19 ok.
+---
+ .../test_update_pause_ledger_owner.py         | 46 ++++++++++++++++++-
+ tui_gateway/owner_forward.py                  | 10 +++-
+ tui_gateway/session_auto_continue.py          | 12 +++--
+ 3 files changed, 60 insertions(+), 8 deletions(-)
+
+diff --git a/tests/tui_gateway/test_update_pause_ledger_owner.py b/tests/tui_gateway/test_update_pause_ledger_owner.py
+index fd22cc68e4..148e711bb5 100644
+--- a/tests/tui_gateway/test_update_pause_ledger_owner.py
++++ b/tests/tui_gateway/test_update_pause_ledger_owner.py
+@@ -36,6 +36,7 @@ from tui_gateway.turn_marker import mark_turn_paused, read_turn_marker, record_t
+ CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True, "freshness_minutes": 240,
+                                      "max_attempts": 2}}}
+ PROMPT = "[Kanban notice] t_01a1d3efb167bf46 done"
++REAL_FORWARD = owner_forward.forward_prompt  # the env fixture replaces it; receipt tests drive it
+ 
+ 
+ class _InlineThread:
+@@ -198,7 +199,7 @@ def test_transient_forward_failure_keeps_the_backoff_then_retires_after_the_cap(
+         assert read_turn_marker(env.home, "chat") is not None, "a transient owner failure retired the pause"
+         assert session["_auto_continue_retry_after"] > time.monotonic() + 20.0
+         assert not session.get("_auto_continue_scheduled") and not session.get("running")
+-        assert f"retrying after the 30s backoff (attempt {attempt}/{server.OWNER_FORWARD_TRIES})" in caplog.text
++        assert f"kept for a later try after the 30s backoff (attempt {attempt}/{server.OWNER_FORWARD_TRIES})" in caplog.text
+         server._maybe_schedule_auto_continue("sid", session, "chat")  # inside the backoff: no forward
+         assert len(tries) == attempt
+         session["_auto_continue_retry_after"] = 0.0  # the backoff passed
+@@ -234,6 +235,49 @@ def test_transient_forward_failure_then_success_hands_over_once(env, monkeypatch
+     assert "queued in the FIFO of the gateway that owns the chat (admission adm-2)" in caplog.text
+ 
+ 
++@pytest.mark.parametrize("receipt, retried", [({"admission_id": "adm-9", "status": "unknown"}, False),
++                                               ({"status": "unknown"}, True)])
++def test_a_receipt_naming_an_admission_is_never_resent(env, monkeypatch, caplog, receipt, retried):
++    """PR #2265 review: an owner receipt outside queued/started/terminal that still names an admission_id proves a
++    durable row there (AdmissionReceipt.status allows 'unknown'); a resend carries a fresh submission_id and would
++    queue a second copy. So it is unconfirmed (retired at once), and only a receipt naming no admission is the
++    transient 'did not admit it'. Real forward_prompt and relay; only the owner's discovery and socket are fakes."""
++    import contextlib
++    caplog.set_level(logging.INFO)
++    submits = []
++
++    class _Owner:
++        events = None
++
++        async def rpc(self, method, **params):
++            if method == "session.resume":
++                return {"session_id": "chat"}
++            submits.append(params["submission_id"])
++            return dict(receipt)
++
++    @contextlib.asynccontextmanager
++    async def connect(_home, _endpoint):
++        yield _Owner()
++    monkeypatch.setattr(owner_forward, "forward_prompt", REAL_FORWARD)
++    monkeypatch.setattr(owner_forward, "discover_owner", lambda _home: "ready-owner")
++    monkeypatch.setattr(owner_forward, "connect_owner", connect)
++    session = _session(env.home)
++
++    server._maybe_schedule_auto_continue("sid", session, "chat")
++
++    assert len(submits) == 1 and env.ran == []
++    if retried:
++        assert read_turn_marker(env.home, "chat") is not None
++        assert "did not admit it" in caplog.text and "kept for a later try" in caplog.text
++    else:
++        assert read_turn_marker(env.home, "chat") is None
++        retired = [r for r in caplog.records if "retired the paused turn of chat" in r.getMessage()]
++        assert len(retired) == 1 and "may be queued there" in retired[0].getMessage()
++        session["_auto_continue_retry_after"] = 0.0
++        server._maybe_schedule_auto_continue("sid", session, "chat")
++        assert len(submits) == 1, "a forward the owner recorded was sent again"
++
++
+ def test_a_new_pause_gets_a_fresh_forward_budget(env, monkeypatch):
+     def refuse(sid, s, text, **kw):
+         raise _transient("not_admitted")
+diff --git a/tui_gateway/owner_forward.py b/tui_gateway/owner_forward.py
+index 17ffecb418..64dfe5979f 100644
+--- a/tui_gateway/owner_forward.py
++++ b/tui_gateway/owner_forward.py
+@@ -146,7 +146,12 @@ class _Relay:
+                 self.admitted.set_result(receipt)
+                 return
+             admission_id = receipt.get("admission_id")
+-            if not isinstance(admission_id, str) or receipt.get("status") not in ("queued", "started", "terminal"):
++            if receipt.get("status") not in ("queued", "started", "terminal"):
++                if isinstance(admission_id, str):  # a named admission is a durable row there: a resend doubles it
++                    raise OwnerUnconfirmed(f"the gateway recorded it (admission {admission_id}) but did not "
++                                           f"confirm it queued (status {receipt.get('status')!r})")
++                raise OwnerUnavailable("the gateway did not admit it")
++            if not isinstance(admission_id, str):
+                 raise OwnerUnavailable("the gateway did not admit it")
+             self.admitted.set_result(receipt)
+             logger.info("forwarded Desktop prompt for %s to the owner FIFO: admission=%s",
+@@ -237,7 +242,8 @@ def forward_prompt(sid: str, session: dict, text: str, *, emit=None, home: Path
+ 
+     Raises ``OwnerNotRunning`` when no gateway serves the home, ``OwnerUnavailable`` (or the
+     client's refusal) when the owner did not take it, and ``OwnerUnconfirmed`` when the prompt may
+-    be queued there: the receipt timed out, or the owner was lost or failed after the request was sent."""
++    be queued there: the receipt timed out, named an admission in no confirmed state, or the owner was lost
++    or failed after the request was sent."""
+     from tui_gateway import server
+     key = str(session.get("session_key") or "")
+     if not key:
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 96e7ad72bc..fb330ccd14 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -387,10 +387,12 @@ def _paused_turn_to_ledger_owner(sid: str, session: dict, session_key: str, mark
+     finish (``unknown``, no owner) retires the pause with the reason logged. Either way the marker goes.
+     False for any other refusal (a sibling backend mid-turn): the caller's backoff applies, as before.
+     A forward the owner refused before queuing anything for a passing reason (``_owner_forward_transient``: it
+-    did not admit it, draining, queue full, a dropped dial) also returns False, so the 30 s backoff retries it,
+-    up to OWNER_FORWARD_TRIES forwards per pause; then, and on a definitive refusal (no owner running, permission,
+-    profile, not found), the pause is retired with the reason logged. An unconfirmed forward is never retried:
+-    it may already be queued there, and a resend would run it twice."""
++    did not admit it, draining, queue full, a dropped dial) also returns False and keeps the pause: the 30 s
++    backoff only gates the next try, which the next resume, boot sweep or refused-turn retry makes (nothing
++    polls), up to OWNER_FORWARD_TRIES forwards per pause; then, and on a definitive refusal (no owner running,
++    permission, profile, not found), the pause is retired with the reason logged. An unconfirmed forward
++    (including a receipt naming an admission in no confirmed state) is never retried: it may already be queued
++    there, and a resend would run it twice."""
+     status = getattr(refusal, "ledger_status", None)
+     if status is None:
+         return False
+@@ -423,7 +425,7 @@ def _paused_turn_to_ledger_owner(sid: str, session: dict, session_key: str, mark
+                 session["_owner_forward_failures"] = (pause_id, count)
+             if count < OWNER_FORWARD_TRIES:
+                 logger.warning("core-update pause: the gateway that owns %s did not take the continuation (%s); "
+-                               "retrying after the 30s backoff (attempt %d/%d)", session_key, why, count,
++                               "kept for a later try after the 30s backoff (attempt %d/%d)", session_key, why, count,
+                                OWNER_FORWARD_TRIES)
+                 return False
+             why = f"{why} ({count} attempts)"
+-- 
+2.43.0
+

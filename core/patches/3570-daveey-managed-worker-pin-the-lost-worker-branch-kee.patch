@@ -1,0 +1,69 @@
+From 8258bb7f5f10692353eb2ae1fb3c786f8aaa1b7a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:19:10 +0000
+Subject: [PATCH] [daveey] managed worker: pin the lost-worker branch keeping
+ ManagedExecutionUnknown when close() raises
+
+489c6652ef88 runs execute_managed's finally close through close_quietly, but its tests
+cover only the finished-turn path. The mini bb-dev occurrence (defect gateway-68129b876d,
+2026-11-12 21:03 PT) was the lost-worker branch: _settle_lost marked the admission
+unknown, then BrokenPipeError from close() replaced ManagedExecutionUnknown, so the drain
+ran the ordinary failed settlement and raised RuntimeStoreError: stale_generation.
+
+Tests only. The new test drives a real child that says hello and then sends a bogus frame
+(the lost-worker raise after reservation) while ManagedWorker.close raises BrokenPipeError.
+It asserts that ManagedExecutionUnknown propagates and that the admission row is unknown.
+
+Proof:
+- RED on 489c6652ef88^ (d495dccb3f), test file copied in: fails with BrokenPipeError.
+- GREEN on main: tests/gateway/test_managed_worker_drain.py 11 passed.
+- Mutant: on main, the finally's close_quietly reverted to a bare close fails the test with
+  BrokenPipeError.
+- scripts/check --base origin/main: 19 checks ok.
+---
+ tests/gateway/test_managed_worker_drain.py | 32 ++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/tests/gateway/test_managed_worker_drain.py b/tests/gateway/test_managed_worker_drain.py
+index 5490a8a557..dfbbbeca19 100644
+--- a/tests/gateway/test_managed_worker_drain.py
++++ b/tests/gateway/test_managed_worker_drain.py
+@@ -205,3 +205,35 @@ async def test_restart_loss_is_booked_when_worker_teardown_raises(monkeypatch):
+     cleanup = await r.close_and_book_restart_loss(object(), policy, SimpleNamespace(stop_cause='restart', close=close))
+     assert booked == [policy]
+     cleanup()  # the caller's finally must not close the same child again
++
++
++@pytest.mark.platforms("linux")
++def test_lost_worker_stays_unknown_when_worker_teardown_raises(tmp_path, monkeypatch):
++    """A lost worker settled ``unknown`` must raise ManagedExecutionUnknown even when its close
++    raises: a BrokenPipeError out of the finally would send the drain down the ordinary
++    Exception->failed settlement on an admission already marked unknown (stale_generation)."""
++    import asyncio
++    from gateway import session_managed_worker as managed
++    from tests.gateway.test_managed_worker_unknown_status import _authority_with_a_lost_worker
++    authority, ref, policy, claim, _published, db = _authority_with_a_lost_worker(tmp_path, monkeypatch)
++    real_close = managed.ManagedWorker.close
++    closed = []
++
++    def close_then_break(self):
++        real_close(self)
++        closed.append(self)
++        raise BrokenPipeError(32, 'Broken pipe')
++    monkeypatch.setattr(managed.ManagedWorker, 'close', close_then_break)
++
++    async def scenario():
++        row = await claim()
++        authority._stamp_claim(ref, authority.sessions['s'], row)
++        with pytest.raises(managed.ManagedExecutionUnknown):
++            async with asyncio.timeout(30):
++                await managed.execute_managed(authority, ref, row, policy)
++        return row
++    with db:
++        row = asyncio.run(scenario())
++        status = db._read_one('SELECT status FROM session_admissions WHERE admission_id=?', (row['admission_id'],))[0]
++    assert status == 'unknown', 'the lost worker never reached its unknown settlement'
++    assert closed, 'the worker was never torn down'
+-- 
+2.43.0
+
