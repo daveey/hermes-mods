@@ -35,7 +35,9 @@ Graphite merge queue (e.g. softmax-universe/softmax) pushes a squash `… (#N)` 
 `ready` still waits on unresolved review threads, which the script's `gh pr view` fields omit; a Graphite queue
 label just sits on such a PR ("will be added once it meets the requirements"). List them:
 `gh api graphql -f query='{repository(owner:"O",name:"R"){pullRequest(number:N){reviewThreads(first:50){nodes{id isResolved comments(first:1){nodes{author{login} body}}}}}}}'`.
-The user requires each one fixed or refuted in its thread, bots included: reply with the
+Nits written in a review's body (no inline comment) open no thread, so that query misses them: also read
+`gh api repos/O/R/pulls/N/reviews --jq '.[] | select(.body != "") | {id, state, body}'` and answer each in a PR
+comment that quotes it. The user requires each one fixed or refuted in its thread, bots included: reply with the
 `addPullRequestReviewThreadReply` mutation, then `resolveReviewThread`. A fix push dismisses the approval, so
 re-request the reviewer yourself (`gh api -X POST repos/O/R/pulls/N/requested_reviewers -f 'reviewers[]=<login>'`)
 instead of blocking on it.
