@@ -121,7 +121,10 @@ def limit_named(request: dict) -> str | None:
     choices = request.get("choices")
     labels = [c["label"] for c in choices
               if isinstance(c, dict) and isinstance(c.get("label"), str)] if isinstance(choices, list) else []
-    risk_text = "\n".join(_NO_RISK.sub(" ", " " + part) for part in [*fields, *labels])
+    # Do not parse quotation scope. Any quote marker makes this field literal,
+    # including multi-sentence quotes and unmatched quotes (conservative fallback).
+    risk_text = "\n".join(part if any(q in part for q in "\"'`‘’“”") else
+                          _NO_RISK.sub(" ", " " + part) for part in [*fields, *labels])
     for name, rx in _LIMITS:
         parts = [risk_text] if name in {"credential", "other_people"} else [text, *labels]
         if any(rx.search(part) for part in parts):
