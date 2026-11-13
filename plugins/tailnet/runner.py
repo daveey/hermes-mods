@@ -260,6 +260,14 @@ def get_stat_command(remote):
             f"size=$(stat -c '%s' {remote}); }} && printf '%s\\n' \"$size\"")
 
 
+class PreflightRefused(Exception):
+    """The get's remote size probe ran over ssh and refused the copy (ssh_rc: the probe's ssh exit code)."""
+
+    def __init__(self, message, ssh_rc, ssh_stderr=""):
+        super().__init__(message)
+        self.ssh_rc, self.ssh_stderr = ssh_rc, ssh_stderr
+
+
 def preflight_get(job, keyfile, env):
     probe = dict(job, mode="exec", command=get_stat_command(job["remote"]))
     p = subprocess.run(build(probe, keyfile, True), capture_output=True, text=True,
@@ -267,7 +275,8 @@ def preflight_get(job, keyfile, env):
                        stdin=subprocess.DEVNULL)
     value = p.stdout.strip()
     if p.returncode or not re.fullmatch(r"[0-9]{1,10}", value) or int(value) > job["max_bytes"]:
-        raise ValueError("tailnet workload policy: remote size preflight failed (regular file within size limit required)")
+        raise PreflightRefused("tailnet workload policy: remote size preflight failed (regular file within size"
+                               " limit required)", p.returncode, p.stderr or "")
 
 
 def main():
@@ -303,7 +312,7 @@ def main():
         if job["mode"] == "put" and os.path.getsize(job["local"]) > int(job.get("max_bytes") or 0):
             raise ValueError("file too large")
         copy_started = False
-        local_failure = False
+        local_failure = preflight_failure = False
         try:
             if job.get("_bounded_get"):
                 preflight_get(job, kf, env)
@@ -318,6 +327,14 @@ def main():
             p = subprocess.run(build(job, kf, isolated), capture_output=True, text=True, errors="replace",
                                timeout=int(job.get("timeout") or 120), env=env, stdin=subprocess.DEVNULL)
             rc, out, err = p.returncode, p.stdout, p.stderr
+        except PreflightRefused as exc:
+            # ssh ran (the size probe), so this is never a local failure. A probe whose ssh could not connect
+            # (255) reads like any unreachable host; otherwise the remote file was refused: failure "preflight".
+            rc, out, err = 255, "", f"{type(exc).__name__}: {exc}"
+            if exc.ssh_rc == 255:
+                err += "; ssh: " + exc.ssh_stderr.strip()[-500:]
+            else:
+                preflight_failure = True
         except subprocess.TimeoutExpired as exc:
             rc, out, err = 124, (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or ""), "timed out"
         except Exception as exc:
@@ -338,6 +355,8 @@ def main():
               "seconds": round(time.time() - t0, 1)}
     if local_failure:
         result["failure"] = "local"
+    elif preflight_failure:
+        result["failure"] = "preflight"
     print(json.dumps(result))
 
 

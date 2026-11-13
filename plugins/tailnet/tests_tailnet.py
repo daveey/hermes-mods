@@ -874,6 +874,20 @@ def test_preflight_failure_preserves_previous_download(workload):
     assert Path(job["local"]).read_bytes() == b"previous"
 
 
+@pytest.mark.parametrize("stat_rc,failure", [("1", "preflight"), ("0", "preflight"), ("255", None)])
+def test_a_get_refused_by_its_size_preflight_is_not_labelled_a_local_failure(workload, stat_rc, failure):
+    # ssh ran the size probe, so "local" (ssh never ran) would be wrong. A refused file says "preflight"; a probe
+    # whose ssh could not connect (255) carries no label, like any unreachable host.
+    job = get_job(workload)
+    workload.monkeypatch.setenv("FAKE_STAT_RC", stat_rc)
+    if stat_rc == "0":
+        workload.monkeypatch.setenv("FAKE_STAT", "garbage")
+    result = direct_runner(workload, job)
+    assert result["rc"] == 255 and "remote size preflight failed" in result["stderr"]
+    assert result.get("failure") == failure
+    assert [x["prog"] for x in workload.ssh_log()] == ["ssh"]
+
+
 @pytest.mark.parametrize("kind", ["file", "directory", "symlink", "fifo", "missing"])
 def test_stat_command_actual_shell(tmp_path, kind):
     import importlib.util
