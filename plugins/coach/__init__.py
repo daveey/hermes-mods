@@ -215,7 +215,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                           prev or _last_assistant(conversation_history), platform, parent_session_id,
                           list(coach.loop_state(session_id).get("last_log") or []),
                           (turn_at - last_seen) if isinstance(last_seen, (int, float)) else None, turn_at,
-                          _request_scope(conversation_history, user_message))
+                          _request_scope(conversation_history, user_message), str(_.get("input_origin") or ""))
             loop_hint = _fix_loop(session_id, user_message, turn)
             relay_hint = _relay_repeat(session_id, user_message, platform, parent_session_id)
             plain_hint = _status_plain(session_id, user_message, platform, parent_session_id)
@@ -759,17 +759,25 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         return None if selfheal_llm else sh.confirm_judge()
 
     def _selfheal_complaint(session_id, user_message, prev, platform="", parent_session_id="", tool_log=None,
-                            gap_s=None, turn_at=None, scope=""):
+                            gap_s=None, turn_at=None, scope="", input_origin=""):
         # Every judged turn leaves a `selfheal_judged` row (outcome, score, stages, error), and a failure anywhere
         # in here is a row too: a week-long judge outage once looked exactly like "no complaints" (plugin-89461de0ed).
         sh, trace, started = None, {}, time.time()
         try:
             sh = _load("self_heal")
-            if not sh.user_facing(platform, parent_session_id):
-                why = sh.skip_reason(platform, parent_session_id) if hasattr(sh, "skip_reason") else None
+            # core's pre_llm_call `input_origin` ("agent" for an agent script's or agent-created chat, "human", or
+            # "" on an older core): an agent's steering turn is no complaint (agent-d925f95adc).
+            origin = {"input_origin": input_origin} if input_origin else {}
+            if not sh.user_facing(platform, parent_session_id, **origin):
+                why = sh.skip_reason(platform, parent_session_id, **origin) if hasattr(sh, "skip_reason") else None
                 if why:
                     store.log({"event": "selfheal_judged", "session_id": session_id, "platform": platform,
                                "outcome": "skipped", "why": why})
+                return
+            why = sh.agent_session(session_id) if hasattr(sh, "agent_session") else None
+            if why:  # older core (no origin): this host's state.db row is hidden or scratch
+                store.log({"event": "selfheal_judged", "session_id": session_id, "platform": platform,
+                           "outcome": "skipped", "why": why})
                 return
             if turn_at is not None and sh.is_pause_note(user_message):
                 # The coach file was last written when the paused turn STARTED (turn start/end only): time the pause
@@ -802,10 +810,14 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             except Exception:
                 pass
 
-    def _selfheal_admission(session_id, reply, platform="", parent_session_id="", tool_log=None, ask=""):
+    def _selfheal_admission(session_id, reply, platform="", parent_session_id="", tool_log=None, ask="",
+                            input_origin=""):
         try:
             sh = _load("self_heal")
-            if not sh.user_facing(platform, parent_session_id):
+            if not sh.user_facing(platform, parent_session_id,
+                                  **({"input_origin": input_origin} if input_origin else {})):
+                return
+            if hasattr(sh, "agent_session") and sh.agent_session(session_id):
                 return
             hit = sh.detect_admission(reply, llm=selfheal_llm, threshold=sh.audit_threshold(), tool_log=tool_log,
                                       ask=ask,
@@ -863,7 +875,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 ask, log_lines = coach.turn_context(session_id)
                 log_lines = list(log_lines or [])[-30:]
                 _selfheal_run(_selfheal_admission, session_id, assistant_response, platform, parent_session_id,
-                              log_lines, ask)
+                              log_lines, ask, str(_.get("input_origin") or ""))
                 coach.turn_end(session_id, assistant_response)
                 coach.loop_state(session_id)["last_ask"] = coach.turn_context(session_id)[0][:1500]
                 loop = {k: v for k, v in coach.loop_state(session_id).items() if k not in ("diff_reviewed", "outcome_nudge")}

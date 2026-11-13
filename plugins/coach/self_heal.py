@@ -1302,15 +1302,55 @@ def log_judged(store, trace: dict, session_id: str, platform: str = "", started:
                    "error": ex.get("error"), "raised": bool(ex.get("raised"))})
 
 
-def skip_reason(platform: str = "", parent_session_id: str = "") -> Optional[str]:
+def skip_reason(platform: str = "", parent_session_id: str = "", input_origin: str = "") -> Optional[str]:
     """Why user_facing() is False for a turn on a user platform, when that is worth a row: a leaked
-    HERMES_KANBAN_TASK in a chat process would mute every chat silently. None = log nothing (automated platforms
+    HERMES_KANBAN_TASK in a chat process would mute every chat silently, and an agent-driven turn
+    (`input_origin="agent"`) is the proof that the agent_input guard fired. None = log nothing (automated platforms
     and subagents are normal skips)."""
     if (platform or "").lower() in ("cron", "kanban", "webhook", "batch") or parent_session_id:
         return None
+    if str(input_origin or "").lower() == "agent":
+        return "agent_input"
     if os.environ.get("HERMES_KANBAN_TASK"):
         return "kanban_env"
     return None
+
+
+AGENT_SESSION_SOURCES = ("scratch",)
+
+
+def agent_session(session_id: str, home: Optional[Path] = None) -> Optional[str]:
+    """'agent_session' when this host's state.db row says an agent drives the chat: `hidden=1` (core creates every
+    `/api/ws?client=agent` chat hidden, tui_gateway/methods_session.py `pending_hidden`) or source `scratch`. The
+    fallback for a core that passes no `input_origin` to pre_llm_call (agent-d925f95adc: a Kanban worker's throwaway
+    Desktop proof chat was judged as David's complaint). None when the row is visible, absent or unreadable
+    (fail-open: judged as before)."""
+    if not session_id:
+        return None
+    import sqlite3
+    path = hermes_home(home) / "state.db"
+    if not path.is_file():
+        return None
+    try:
+        db = _ro_state(path)
+        try:
+            row = db.execute("SELECT hidden, source FROM sessions WHERE id=?", (session_id,)).fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    hidden, source = row
+    if hidden or str(source or "").lower() in AGENT_SESSION_SOURCES:
+        return "agent_session"
+    return None
+
+
+def agent_input_defect(d: dict) -> bool:
+    """A lane payload from an agent-driven turn: `input_origin` agent, or a digest/session marked hidden. Hosts on
+    older coach code still forward these; the lane drops them (selfheal_skip why=agent_input)."""
+    return str((d or {}).get("input_origin") or "").lower() == "agent" or (d or {}).get("hidden") is True
 
 
 _MODEL_TL = threading.local()  # the model the last aux judge call on this thread resolved to (note_model)
@@ -1439,12 +1479,16 @@ def confirm_judge() -> Optional[Callable[[str, str], str]]:
     return judge
 
 
-def user_facing(platform: str = "", parent_session_id: str = "") -> bool:
-    """Only the user's own chats: not cron runs, subagents (their 'user' is the parent agent) or Kanban workers
-    (their first message is a card body written by an agent)."""
+def user_facing(platform: str = "", parent_session_id: str = "", input_origin: str = "") -> bool:
+    """Only the user's own chats: not cron runs, subagents (their 'user' is the parent agent), Kanban workers
+    (their first message is a card body written by an agent) or turns core marks `input_origin="agent"` (an agent
+    script driving a Desktop chat over /api/ws?client=agent, an agent-created or hidden submit). An unknown origin
+    ("", older core) is judged; agent_session() covers that case from state.db."""
     if (platform or "").lower() in ("cron", "kanban", "webhook", "batch"):
         return False
     if parent_session_id or os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+    if str(input_origin or "").lower() == "agent":
         return False
     return True
 
@@ -1557,6 +1601,12 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
     stop = {k: hit[k] for k in ("stop_cause", "stop_evidence", "stop_host") if k in hit}
     stop.update({k: hit[k] for k in ("stages", "stage1_p", "stage1_kind", "judge_model", "confirm_model",
                                      "threshold", "prompt_sha") if k in hit})  # which stage filed it, on which model
+    if hit.get("source") in ("complaint", "admission") and agent_session(session_id):
+        # A backend still on an older coach __init__ judges agent-driven chats; nothing is recorded or filed for them
+        # (agent-d925f95adc). Guard refusals and machine signals are defects whoever hit them: not gated here.
+        store.log({"event": "selfheal_skip", "mode": m, "fingerprint": hit["fingerprint"], "why": "agent_session",
+                   "session_id": session_id})
+        return None
     if probe_session(session_id, ask):
         rec = {"event": "selfheal_detect", "mode": m, "session_id": session_id, "source": hit["source"],
                "p": hit["p_defect"], "component": hit["component"], "symptom": hit["symptom"],
@@ -4450,6 +4500,10 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
         store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": "probe",
                    "session_id": d.get("session_id")})
         return {"action": "skip", "why": "probe"}
+    if agent_input_defect(d):  # an agent-driven turn forwarded by a host on older code (agent-d925f95adc)
+        store.log({"event": "selfheal_skip", "mode": m, "fingerprint": fp, "why": "agent_input",
+                   "session_id": d.get("session_id"), "host": d.get("host")})
+        return {"action": "skip", "why": "agent_input"}
     if synthetic_user_row(d):  # queued before the classifier knew this tag: withdraw, never file (agent-b3f86b6bb7)
         closed_lane = _close_synthetic_lane(store, fp, now) if m == "live" else None
         store.log({"event": "selfheal_withdrawn", "mode": m, "fingerprint": fp, "why": "synthetic_tag",
@@ -5804,6 +5858,14 @@ def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Opti
         skip = len(at_since) if skip is None else skip  # legacy bare timestamp: everything at it was scanned
         new = at_since[skip:] + [t for t in turns if t["t"] > since]
         if not new:
+            continue
+        if dg.get("hidden") is True:
+            # A hidden chat is agent-driven (core creates /api/ws?client=agent chats hidden): its user turns are an
+            # agent's steering, not David's complaints (agent-d925f95adc). Advance the cursor; one row per batch.
+            store.log({"event": "selfheal_skip", "mode": m, "why": "agent_input", "session_id": dg.get("id") or f.stem,
+                       "host": dg.get("host") or f.parts[-3], "turns": len(new)})
+            last = new[-1]["t"]
+            cursor[rel] = [last, sum(1 for t in new if t["t"] == last) + (skip if last == since else 0)]
             continue
         done = []  # turns actually scanned; the cursor only advances over these, so a spent limit loses nothing
         for t in new:
