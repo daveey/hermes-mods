@@ -1,0 +1,610 @@
+From 6bc34a231ff64a89cda30e23a978ac323e6d0893 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:27:09 +0000
+Subject: [PATCH] [daveey] lifecycle guard: read uv value options,
+ leading/glued `<`, cat's stdin and piped groups
+
+Review 5892368091 on #2233 found commands the lifecycle guard still allowed although they
+run a file that restarts the gateway. Base allowed them too, so none is a regression:
+
+1. `_UV_VALUE_OPTIONS` lacked `-w` (short `--with`), `--upgrade-group`, the `--*-package`
+   value options and the hidden `--python-preference`. `uv run -w requests f.py` read
+   `requests` as the command and never opened f.py. The tables now follow `uv help run`
+   (uv 0.13.7): value options and flags, with short clusters read like getopt (`-qw x`).
+   An option neither table knows is read both ways, flag first (the old reading), then
+   taking a value, and every reading's command is scanned. So `uv run --new-opt v f.py`
+   and `uv --new-global v run f.py` fail closed. `uv run -` (program on stdin, verified
+   with uv 0.13.7) now scans its stdin and pipe feeds. The uv argv reader moved to
+   cron/lifecycle_guard_uv.py so lifecycle_guard.py stays under its line cap.
+2. Stdin feeds the segment walk missed:
+   - leading redirection `< f.py python3`, `sudo < f.sh bash`;
+   - glued redirection `python3<f.py`, `bash<f.sh` (`<` is not a control char);
+   - `cat < f.py | python3` (cat's own stdin was dropped);
+   - `cat f.py | (python3)`, `| (true; bash)`, `| { true; bash; }` (the `(` reset the
+     pipe feed; a group's commands all inherit its stdin).
+   `_command_segment_views` adds a view with command-position redirections moved to the
+   end (a shell applies them wherever they appear). Like the keyword-peeled view, it only
+   adds a reading. Only the command word is split at a glued `<`/`>`; arguments are never
+   split, so `bash -c 'python3<f.py'` keeps its payload whole for the recursive scan.
+   `_iter_segment_contexts` keeps a stack of the feed each `(`/`{` group inherited.
+
+Proof:
+- tests/cron/test_lifecycle_guard_stdin_feeds.py at base 0d81fe01f8 (#2233 head): 50
+  failed, 23 passed. Every must-refuse case is red there except three already-correct
+  controls (`uv run -wrequests`, `uv run --with=requests`, `cat f.py | { python3; }`), and
+  every mention/data case is green. At this head all 73 pass, and
+  test_lifecycle_guard_interpreter_runners.py (mention/data guards included) stays green.
+- Mutants (sdlc-review mutants.py, 27 edits over every added condition): 26 killed; the one
+  first survivor (alternate index past the end) is now killed by a unit test. Removed one
+  redundant branch and one dead guard that left equivalent mutants.
+- scripts/run_tests.sh tests/cron/ plus the heredoc background guard, the approval parity,
+  hermes-sync hint, execute_code deadline and gateway restart/lifecycle guard suites:
+  2868 passed, 0 failed, 2 skipped.
+---
+ cron/lifecycle_guard.py                       | 173 ++++++++++-----
+ cron/lifecycle_guard_uv.py                    |  91 ++++++++
+ .../cron/test_lifecycle_guard_stdin_feeds.py  | 199 ++++++++++++++++++
+ 3 files changed, 410 insertions(+), 53 deletions(-)
+ create mode 100644 cron/lifecycle_guard_uv.py
+ create mode 100644 tests/cron/test_lifecycle_guard_stdin_feeds.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index cea23e5685..f49dfd1777 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -19,6 +19,9 @@ import sys
+ from pathlib import Path
+ from typing import Callable, Iterator, Optional
+ 
++# How `uv [global options] run [options] <command>` reads its argv.
++from cron.lifecycle_guard_uv import _uv_run_command_indices
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -355,17 +358,6 @@ _TRANSPARENT_PREFIX_OPERANDS = {"timeout": 1}
+ 
+ _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+ 
+-# `uv [global options] run [options] <command>` runs <command> (a `.py` file through Python).
+-_UV_VALUE_OPTIONS = frozenset({
+-    "--directory", "--project", "--config-file", "--cache-dir", "--color", "-p", "--python",
+-    "--with", "--with-editable", "--with-requirements", "--env-file", "--package", "--extra",
+-    "--group", "--no-group", "--only-group", "--index", "--default-index", "-i", "--index-url",
+-    "--extra-index-url", "-f", "--find-links", "--index-strategy", "--keyring-provider",
+-    "--resolution", "--prerelease", "--fork-strategy", "--exclude-newer", "-C",
+-    "--config-setting", "--link-mode", "-P", "--upgrade-package", "--reinstall-package",
+-    "--refresh-package", "--no-binary-package", "--no-build-package", "--python-platform",
+-    "--allow-insecure-host", "--no-extra",
+-})
+ # Python program runners whose file operand (or stdin) is scanned as Python source.
+ _PYTHON_RUNNER_RE = re.compile(r"^(?:pythonw?|pypy)(?:\d+(?:\.\d+)*)?(?:\.exe)?$|^py(?:\.exe)?$")
+ _PYTHON_SOURCE_SUFFIXES = (".py", ".pyw")
+@@ -843,28 +835,47 @@ def _session_aliases_shadow_consumers(session_aliases: Optional[frozenset[str]])
+                for name in session_aliases)
+ 
+ 
++_CONTROL_OPERATOR = re.compile(r"\|\||&&|\|&|;;|[;&|()]")
++
++
+ def _iter_segment_contexts(command: str) -> Iterator[tuple[list[str], bool, list[str]]]:
+     """``(segment, call_argument, piped_files)``: whether the segment is the argument list of a
+     call (the segment right after a ``(`` that follows an ordinary word), and the files a ``cat``
+-    pipes into its stdin (``cat f.sh | bash``)."""
++    pipes into its stdin (``cat f.sh | bash``). A group a pipe feeds (``cat f | (true; bash)``,
++    ``| { …; }``) passes the feed to every command in it, as the shell does."""
+     for tokens in _iter_command_token_lists(command):
+         segment: list[str] = []
+         call_argument = False
+         previous: Optional[list[str]] = None
+-        piped = False
++        feed: list[str] = []
++        # The feed each open `(`/`{` group inherited: every command in it reads that stdin.
++        groups: list[list[str]] = []
+         for token in tokens:
+             if token and set(token) <= _CONTROL_CHARS:
+                 next_is_call = token == "(" and bool(segment) and _opens_call_arguments(segment)
+                 if segment:
+-                    yield segment, call_argument, _cat_operands(previous) if piped else []
++                    yield segment, call_argument, feed
++                    if segment[0] == "{":
++                        groups.append(feed)
+                     previous = segment
+                     segment = []
+-                piped = token in ("|", "|&")
++                for operator in _CONTROL_OPERATOR.findall(token):
++                    if operator in ("|", "|&"):
++                        feed = _cat_operands(previous)
++                    elif operator == "(":
++                        groups.append(feed)
++                    else:
++                        if operator == ")" and groups:
++                            groups.pop()
++                        feed = groups[-1] if groups else []
+                 call_argument = next_is_call
+                 continue
++            if not segment and token == "}" and groups:
++                groups.pop()
++                feed = groups[-1] if groups else []
+             segment.append(token)
+         if segment:
+-            yield segment, call_argument, _cat_operands(previous) if piped else []
++            yield segment, call_argument, feed
+ 
+ 
+ def _iter_positioned_command_segments(command: str) -> Iterator[tuple[list[str], bool]]:
+@@ -933,20 +944,22 @@ def _executed_command_index(segment: list[str]) -> Optional[int]:
+ def _peel_uv_run(segment: list[str], index: int) -> Optional[int]:
+     """Index of the command ``uv [opts] run [opts] <command>`` runs (may be ``len(segment)``);
+     ``None`` when *index* is not such a ``uv`` (``uv pip ...``, ``uv tool run``)."""
+-    index += 1
+-    seen_run = False
+-    while index < len(segment):
+-        token = segment[index]
+-        if token.startswith("-"):
+-            index += 2 if token in _UV_VALUE_OPTIONS else 1
+-        elif seen_run:
+-            return index
+-        elif token == "run":
+-            seen_run = True
+-            index += 1
+-        else:
+-            return None
+-    return index if seen_run else None
++    indices = _uv_run_command_indices(segment, index)
++    return indices[0] if indices else None
++
++
++def _uv_alternate_command_indices(segment: list[str]) -> list[int]:
++    """Commands a ``uv run`` in *segment* may run besides the one ``_peel_uv_run`` picks (an
++    unknown option read as taking a value), each peeled through further wrappers."""
++    alternates: list[int] = []
++    for position, token in enumerate(segment):
++        if _executable_name(token) != "uv":
++            continue
++        for candidate in _uv_run_command_indices(segment, position)[1:]:
++            peeled = _peel_transparent_prefixes(segment, candidate)
++            if peeled < len(segment) and peeled not in alternates:
++                alternates.append(peeled)
++    return alternates
+ 
+ 
+ def _runs_under_uv(segment: list[str], index: int) -> bool:
+@@ -977,12 +990,13 @@ def _split_redirections(arguments: list[str]) -> tuple[list[str], list[str]]:
+ 
+ 
+ def _cat_operands(segment: Optional[list[str]]) -> list[str]:
+-    """Files a ``cat`` segment writes to its stdout (its stdout piped on to a program reader)."""
++    """Files a ``cat`` segment writes to its stdout (its stdout piped on to a program reader),
++    its own stdin included (``cat < f.py | python3``, ``cat - < f.py``)."""
+     for view in _command_segment_views(segment) if segment else []:
+         index = _executed_command_index(view)
+         if index is not None and _executable_name(view[index]) == "cat":
+-            arguments, _ = _split_redirections(view[index + 1 :])
+-            return [argument for argument in arguments if not argument.startswith("-")]
++            arguments, stdin = _split_redirections(view[index + 1 :])
++            return [argument for argument in arguments if not argument.startswith("-")] + stdin
+     return []
+ 
+ 
+@@ -1035,12 +1049,59 @@ def _peel_external_time(segment: list[str], index: int) -> int:
+ 
+ 
+ def _command_segment_views(segment: list[str]) -> list[list[str]]:
+-    """*segment* as written, then without its leading reserved words when it has any. Callers
+-    read every view, so peeling only ever ADDS a reference. Without the peeled view `time ./x.sh`,
+-    `if true; then ./x.sh; fi` and `{ ./x.sh; }` read the keyword as the command and never open
+-    ``./x.sh``."""
++    """*segment* as written, then without its leading reserved words when it has any, then each
++    of those with its command-position redirections moved to the end (see
++    ``_hoist_command_redirections``). Callers read every view, so peeling only ever ADDS a
++    reference. Without the peeled view `time ./x.sh`, `if true; then ./x.sh; fi` and
++    `{ ./x.sh; }` read the keyword as the command and never open ``./x.sh``; without the hoisted
++    one `< f.sh bash` and `bash<f.sh` read the redirection as the command.
++    """
+     peeled = segment[_peel_reserved_words(segment):]
+-    return [segment, peeled] if peeled and len(peeled) != len(segment) else [segment]
++    views = [segment, peeled] if peeled and len(peeled) != len(segment) else [segment]
++    for view in list(views):
++        hoisted = _hoist_command_redirections(view)
++        if hoisted != view and hoisted not in views:
++            views.append(hoisted)
++    return views
++
++
++def _hoist_command_redirections(segment: list[str]) -> list[str]:
++    """*segment* with each redirection that sits where the command word is read (before it, or
++    glued to it: `< f.py python3`, `sudo < f.sh bash`, `python3<f.py`) moved to the end, where the
++    stdin scan reads it. A shell applies a simple command's redirections wherever they appear,
++    so this is the same command. Only the command position is split: an argument such as
++    ``bash -c 'python3<f.py'`` may be quoted program text, and its payload is re-scanned whole."""
++    tokens = list(segment)
++    moved: list[str] = []
++    for _ in range(len(segment)):
++        index = _command_token_index(tokens)
++        if index is None:
++            break
++        index = _peel_transparent_prefixes(tokens, index)
++        if index >= len(tokens):
++            break
++        word = tokens[index]
++        width = _redirection_width(word)
++        if not width:
++            # `python3<f.py`: a word is the command up to its first `<`/`>`.
++            glued = min((p for p in (word.find("<"), word.find(">")) if p >= 0), default=-1)
++            if glued < 0:
++                break
++            tokens[index: index + 1] = [word[:glued], word[glued:]]
++            index += 1
++            width = _redirection_width(tokens[index])
++        moved.extend(tokens[index: index + width])
++        del tokens[index: index + width]
++    return tokens + moved
++
++
++def _redirection_width(word: str) -> int:
++    """Words a redirection starting at *word* spans: 1 with a glued target (``<f``), 2 when the
++    target is the next word (``< f``), 0 when *word* is not a redirection."""
++    match = _REDIRECTION.match(word)
++    if match is None:
++        return 0
++    return 1 if match.group(3) else 2
+ 
+ 
+ def _iter_command_segment_views(command: str) -> Iterator[list[str]]:
+@@ -1341,10 +1402,11 @@ def _iter_referenced_shell_scripts(
+             yield from _references_at(view, index, cwd, piped)
+             peeled = _peel_transparent_prefixes(view, index)
+             # `uv run x.py` runs Python: the interpreter scan reads it, never the shell walk (#77131).
+-            if peeled != index and not (
+-                    peeled < len(view) and view[peeled].endswith(_PYTHON_SOURCE_SUFFIXES)
+-                    and _runs_under_uv(view, peeled)):
+-                yield from _references_at(view, peeled, cwd, piped)
++            for target in [peeled, *_uv_alternate_command_indices(view)]:
++                if target != index and not (
++                        target < len(view) and view[target].endswith(_PYTHON_SOURCE_SUFFIXES)
++                        and _runs_under_uv(view, target)):
++                    yield from _references_at(view, target, cwd, piped)
+ 
+ 
+ # CPython short options that take a value (glued `-Wignore` or the next token), and the ones after
+@@ -1387,18 +1449,23 @@ def _iter_python_interpreter_scripts(command: str, *, cwd: Optional[str] = None)
+     interpreter is never itself a wrapper, so only the executed command is read."""
+     for raw_segment, _, piped in _iter_segment_contexts(command):
+         for segment in _command_segment_views(raw_segment):
+-            index = _executed_command_index(segment)
+-            if index is None:
+-                continue
+-            if segment[index].endswith(_PYTHON_SOURCE_SUFFIXES) and _runs_under_uv(segment, index):
+-                yield from _resolved_or_nothing(segment[index], cwd)
+-                continue
+-            if not _PYTHON_RUNNER_RE.match(_executable_name(segment[index]).lower()):
++            primary = _executed_command_index(segment)
++            if primary is None:
+                 continue
+-            arguments, stdin = _split_redirections(segment[index + 1 :])
+-            operand = _python_script_operand(arguments)
+-            for source in (stdin or piped) if operand == "-" else [operand] if operand else []:
+-                yield from _resolved_or_nothing(source, cwd)
++            for index in [primary, *_uv_alternate_command_indices(segment)]:
++                under_uv = _runs_under_uv(segment, index)
++                if segment[index].endswith(_PYTHON_SOURCE_SUFFIXES) and under_uv:
++                    yield from _resolved_or_nothing(segment[index], cwd)
++                    continue
++                # `uv run -` runs the Python program on its stdin.
++                stdin_program = segment[index] == "-" and under_uv
++                if not stdin_program and not _PYTHON_RUNNER_RE.match(
++                        _executable_name(segment[index]).lower()):
++                    continue
++                arguments, stdin = _split_redirections(segment[index + 1 :])
++                operand = "-" if stdin_program else _python_script_operand(arguments)
++                for source in (stdin or piped) if operand == "-" else [operand] if operand else []:
++                    yield from _resolved_or_nothing(source, cwd)
+ 
+ 
+ def _python_source_is_unsafe(text: str, budget: _LifecycleScanBudget) -> bool:
+diff --git a/cron/lifecycle_guard_uv.py b/cron/lifecycle_guard_uv.py
+new file mode 100644
+index 0000000000..45eac45544
+--- /dev/null
++++ b/cron/lifecycle_guard_uv.py
+@@ -0,0 +1,91 @@
++"""How ``uv [global options] run [options] <command>`` reads its argv, for the lifecycle guard.
++
++A value option read as the command hides the script that actually runs (``uv run -w requests
++f.py``), so the value table follows ``uv help run`` (uv 0.13.7) and an option in neither table
++is read both ways (fail closed).
++"""
++
++from __future__ import annotations
++
++# Every option `uv help run` (uv 0.13.7) shows with a `<VALUE>`, plus the hidden
++# `--python-preference`.
++_UV_VALUE_OPTIONS = frozenset({
++    "--directory", "--project", "--config-file", "--cache-dir", "--color", "-p", "--python",
++    "-w", "--with", "--with-editable", "--with-requirements", "--env-file", "--package",
++    "--extra", "--no-extra", "--group", "--no-group", "--only-group", "--no-editable-package",
++    "--index", "--default-index", "-i", "--index-url", "--extra-index-url", "-f",
++    "--find-links", "--index-strategy", "--keyring-provider", "-P", "--upgrade-package",
++    "--upgrade-group", "--resolution", "--prerelease", "--prerelease-package",
++    "--fork-strategy", "--exclude-newer", "--exclude-newer-package", "--no-sources-package",
++    "--reinstall-package", "--link-mode", "-C", "--config-setting", "--config-settings-package",
++    "--no-build-isolation-package", "--no-build-package", "--no-binary-package",
++    "--refresh-package", "--python-platform", "--allow-insecure-host", "--python-preference",
++})
++# `uv help run` flags that take no value.
++_UV_FLAG_OPTIONS = frozenset({
++    "--all-extras", "--no-dev", "--only-dev", "--no-default-groups", "--all-groups", "-m",
++    "--module", "--no-editable", "--exact", "--no-env-file", "--isolated", "--active",
++    "--no-sync", "--locked", "--frozen", "-s", "--script", "--gui-script", "--all-packages",
++    "--no-project", "--no-index", "-U", "--upgrade", "--no-sources", "--reinstall",
++    "--compile-bytecode", "--no-build-isolation", "--no-build", "--no-binary",
++    "--require-build-hashes", "--no-require-build-hashes", "-n", "--no-cache", "--refresh",
++    "--managed-python", "--no-managed-python", "--no-python-downloads", "-q", "--quiet", "-v",
++    "--verbose", "--system-certs", "--offline", "--no-progress", "--no-config", "-h", "--help",
++    "--native-tls", "--preview", "--no-preview",
++})
++# Bound on the argv readings one `uv` explores (each unknown option doubles them).
++_MAX_UV_RUN_READINGS = 16
++
++
++def _uv_option_arity(token: str) -> str:
++    """``"value"`` when a ``uv`` option *token* consumes the next word, ``"flag"`` when it does
++    not, ``"unknown"`` when neither table says (it may be either)."""
++    if token.startswith("--"):
++        if "=" in token:
++            return "flag"
++        if token in _UV_VALUE_OPTIONS:
++            return "value"
++        return "flag" if token in _UV_FLAG_OPTIONS else "unknown"
++    # A short cluster reads like getopt: `-qw` ends in `-w` (takes the next word); in `-wfoo`
++    # the value is glued.
++    for position, char in enumerate(token[1:], start=1):
++        option = "-" + char
++        if option in _UV_VALUE_OPTIONS:
++            return "value" if position == len(token) - 1 else "flag"
++        if option not in _UV_FLAG_OPTIONS:
++            return "unknown"
++    return "flag"
++
++
++def _uv_run_command_indices(segment: list[str], index: int) -> list[int]:
++    """Every index ``uv [opts] run [opts] <command>`` at *index* may run (each may be
++    ``len(segment)``), the reading that takes unknown options as flags first; empty when it is
++    not such a ``uv`` (``uv pip ...``, ``uv tool run``). An option neither table knows is read
++    both ways, so a value the guard does not know about never hides the command (fail closed).
++    """
++    results: list[int] = []
++    pending = [(index + 1, False)]
++    readings = 0
++    while pending and readings < _MAX_UV_RUN_READINGS:
++        readings += 1
++        position, seen_run = pending.pop()
++        while position < len(segment):
++            token = segment[position]
++            if token == "--" and seen_run:
++                position += 1
++                break
++            if token.startswith("-") and token != "-":
++                arity = _uv_option_arity(token)
++                if arity == "unknown":
++                    pending.append((position + 2, seen_run))
++                position += 2 if arity == "value" else 1
++            elif seen_run:
++                break
++            elif token == "run":
++                seen_run = True
++                position += 1
++            else:
++                break
++        if seen_run and position not in results:
++            results.append(position)
++    return results
+diff --git a/tests/cron/test_lifecycle_guard_stdin_feeds.py b/tests/cron/test_lifecycle_guard_stdin_feeds.py
+new file mode 100644
+index 0000000000..f4f4436ed3
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_stdin_feeds.py
+@@ -0,0 +1,199 @@
++"""Fail-open gaps left after the ``uv run`` / stdin-feed scan (PR #2233 review 5892368091).
++
++1. ``uv run`` options that take a value but were not in ``_UV_VALUE_OPTIONS`` (``-w``,
++   ``--upgrade-group``, the ``--*-package`` family, ``--python-preference``) made the value read
++   as the command, so the ``.py`` that ran was never opened. An option the table does not know
++   also scans a ``.py`` right after it (fail closed).
++2. Stdin feeds the segment walk did not see: a leading redirection (``< f.py python3``), one
++   glued to the command word (``python3<f.py``), ``cat``'s own stdin (``cat < f.py | python3``)
++   and a pipe into a group (``cat f.py | (python3)``, ``| { …; }``).
++"""
++
++from __future__ import annotations
++
++import shlex
++
++import pytest
++
++from cron import lifecycle_guard
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++# Assembled so this file's own text never carries the literal command.
++LIFECYCLE = " ".join(["hermes", "gateway", "re" + "start"])
++
++
++@pytest.fixture
++def files(tmp_path) -> dict[str, str]:
++    sh = tmp_path / "restart.sh"
++    sh.write_text(f"#!/bin/sh\necho hi\n{LIFECYCLE}\n", encoding="utf-8")
++    sh.chmod(0o755)
++    py = tmp_path / "runner.py"
++    py.write_text(f"import os\nos.system({LIFECYCLE!r})\n", encoding="utf-8")
++    clean = tmp_path / "clean.py"
++    clean.write_text("import sys\nprint(sys.stdin.read())\n", encoding="utf-8")
++    clean_sh = tmp_path / "clean.sh"
++    clean_sh.write_text("echo ok\n", encoding="utf-8")
++    return {name: shlex.quote(str(path)) for name, path in
++            {"sh": sh, "py": py, "clean": clean, "clean_sh": clean_sh, "dir": tmp_path}.items()}
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        "uv run -w requests {py}",
++        "uv run -w requests -w rich {py}",
++        "uv run --upgrade-group dev {py}",
++        "uv run --config-settings-package pkg:k=v {py}",
++        "uv run --exclude-newer-package pkg=2024-01-01 {py}",
++        "uv run --no-build-isolation-package pkg {py}",
++        "uv run --no-editable-package pkg {py}",
++        "uv run --no-sources-package pkg {py}",
++        "uv run --prerelease-package pkg {py}",
++        "uv run --python-preference managed {py}",
++        "uv --python-preference managed run {py}",
++        "uv run -w requests python {py}",
++        "uv run -qw requests {py}",
++        "uv run -wrequests {py}",
++        "uv run --with=requests {py}",
++        "uv run -w requests sudo python3 {py}",
++        # An option the table does not know: the `.py` after it is scanned too (fail closed).
++        "uv run --some-future-option value {py}",
++        "uv --some-future-global value run {py}",
++        "uv run --some-future-option value bash {sh}",
++        "uv run --some-future-option value sudo python3 {py}",
++        # `uv run -` runs the Python program on its stdin.
++        "uv run - < {py}",
++        "uv run --no-project - < {py}",
++        "cat {py} | uv run -",
++        "< {py} uv run -",
++    ],
++)
++def test_uv_run_value_options_do_not_hide_the_script(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (True, None)
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        # Leading redirection: the command word comes after it.
++        "< {py} python3",
++        "<{py} python3",
++        "0< {py} python3",
++        "< {sh} bash",
++        "FOO=1 < {py} python3",
++        "> /dev/null < {sh} bash",
++        "sudo < {sh} bash",
++        "if < {sh} bash; then :; fi",
++        # Redirection glued to the command word (`<` is not a control character).
++        "python3<{py}",
++        "bash<{sh}",
++        "sudo bash<{sh}",
++        "FOO=1 python3<{py}",
++        "bash -c 'python3<{py}'",
++        # cat's own stdin is what it writes to the pipe.
++        "cat < {py} | python3",
++        "cat - < {py} | python3",
++        "< {py} cat | python3",
++        "cat < {sh} | bash",
++        # A pipe into a group feeds every command in it.
++        "cat {py} | (python3)",
++        "cat {py} |(python3)",
++        "cat {sh} | (bash)",
++        "cat {sh} | (true; bash)",
++        "cat {sh} | (true && (bash))",
++        "cat {py} | {{ python3; }}",
++        "cat {sh} | {{ true; bash; }}",
++        # `}` closes the group only in command position; `echo }` prints it.
++        "cat {sh} | {{ true; echo }}; bash; }}",
++    ],
++)
++def test_hidden_stdin_feeds_are_scanned(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (True, None)
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        "uv run -w requests {clean}",
++        "uv run - < {clean}",
++        "uv run -w requests - 2> {py}",
++        "uv run --python-preference managed {clean}",
++        "uv run --some-future-option {py}-not-there pytest",
++        "uv run --some-future-option value",
++        "< {py} python3 {clean}",
++        "< {py} cat",
++        "python3<{clean}",
++        "cat {py} | (python3 {clean})",
++        "(cat {py}); (python3 {clean})",
++        "(cat {py}); python3",
++        "(cat {py} | grep x); bash {clean_sh}",
++        "cat {sh} | (grep restart)",
++        "cat {sh} | (true); bash",
++        "cat {sh} | {{ grep x; }}; bash",
++        "cat {sh} | (grep x) && bash",
++        "bash -c 'cat<{sh}'",
++        "echo '<' {sh}",
++        "grep -c '<' {py}",
++    ],
++)
++def test_mentions_and_data_stay_allowed(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (False, None)
++
++
++def _uv_module():
++    # Imported per test so the scan cases above still run (and fail one by one) on a base
++    # that predates the module.
++    from cron import lifecycle_guard_uv
++
++    return lifecycle_guard_uv
++
++
++def test_uv_value_options_cover_uv_help_run():
++    """Every value option ``uv help run`` (uv 0.13.7) lists, plus the hidden
++    ``--python-preference``."""
++    lifecycle_guard_uv = _uv_module()
++    for option in ("-w", "--with", "--upgrade-group", "--config-settings-package",
++                   "--exclude-newer-package", "--no-build-isolation-package",
++                   "--no-editable-package", "--no-sources-package", "--prerelease-package",
++                   "--python-preference", "--no-binary-package", "--no-build-package"):
++        assert option in lifecycle_guard_uv._UV_VALUE_OPTIONS, option
++    # Flags never consume the command.
++    for flag in ("-m", "--module", "-s", "--script", "--no-project", "-q", "--isolated"):
++        assert flag not in lifecycle_guard_uv._UV_VALUE_OPTIONS, flag
++
++
++def test_uv_option_arity():
++    arity = _uv_module()._uv_option_arity
++    assert arity("-w") == arity("--with") == arity("-qw") == "value"
++    assert arity("--with=x") == arity("-wx") == arity("-qv") == arity("--no-project") == "flag"
++    assert arity("--frobnicate") == arity("-Z") == arity("-qZ") == "unknown"
++
++
++def test_uv_run_readings():
++    indices = _uv_module()._uv_run_command_indices
++    # Unknown options are read as flags first (the old reading), then as taking a value.
++    assert indices(["uv", "run", "--frob", "x", "f.py"], 0) == [3, 4]
++    assert indices(["uv", "--frob", "x", "run", "f.py"], 0) == [4]
++    assert indices(["uv", "run", "--", "-x.py"], 0) == [3]
++    assert indices(["uv", "pip", "install", "f.py"], 0) == []
++    # `pip` may be the unknown option's value, so that reading still finds the run.
++    assert indices(["uv", "--frob", "pip", "run", "f.py"], 0) == [4]
++    assert indices(["uv", "-q", "pip", "run", "f.py"], 0) == []
++    # Bounded: a run of unknown options does not explode.
++    assert len(indices(["uv", "run", *(["--frob"] * 40), "f.py"], 0)) <= 16
++    # A reading that runs off the end is no alternate command.
++    alternates = lifecycle_guard._uv_alternate_command_indices
++    assert alternates(["uv", "run", "--frob", "value"]) == []
++    assert alternates(["uv", "run", "--frob", "x", "sudo", "f.py"]) == [5]
++
++
++def test_hoisted_redirection_keeps_arguments():
++    hoist = lifecycle_guard._hoist_command_redirections
++    assert hoist(["<", "f.py", "python3"]) == ["python3", "<", "f.py"]
++    assert hoist(["A=1", "<f", "bash", "-x"]) == ["A=1", "bash", "-x", "<f"]
++    assert hoist(["python3<f.py", "-u"]) == ["python3", "-u", "<f.py"]
++    assert hoist(["sudo", "<", "f.sh", "bash"]) == ["sudo", "bash", "<", "f.sh"]
++    # Arguments are never split: a glued `<` there may be quoted program text.
++    assert hoist(["bash", "-c", "python3<f.py"]) == ["bash", "-c", "python3<f.py"]
++    assert hoist(["echo", "<", "x"]) == ["echo", "<", "x"]
++    assert hoist(["<"]) == ["<"]
+-- 
+2.43.0
+

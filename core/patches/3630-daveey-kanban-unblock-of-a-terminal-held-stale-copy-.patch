@@ -1,0 +1,348 @@
+From 42fdbb08b9b677cf60ff7b982ff76fd1f58a38f6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:26:19 +0000
+Subject: [PATCH] [daveey] kanban: unblock of a terminal-held stale copy names
+ `reopen`, which now revives it; un-walrus unblock_task
+
+Follow-up to PR #2186 review 5891019707 (two non-blocking nits).
+
+Nit 1: `unblock_task` refuses a blocked/scheduled/triage row whose event log holds the card done/archived
+(`kanban_terminal_guard.unblock_held`), on the human paths too. The CLI then printed
+`cannot unblock <id> (not blocked/scheduled?)`, which misleads: the row does read blocked/scheduled. And the
+suggested remedy did not work either: `hermes kanban reopen` refused the same row ("status is 'scheduled', not
+'done'; use unblock/reopen-review"), a loop with no exit.
+
+- `kanban_terminal_guard.stale_hold` (read-only) and `unblock_refusal`: the text for that refusal, naming the
+  terminal event; a held-done copy points at `hermes kanban reopen <id> --reason <why>`, an archived one says
+  nothing revives it.
+- CLI `kanban unblock`, the operator-call `unblock` refusal and the dashboard (single PATCH and bulk drag to
+  `ready`) print it, falling back to their old text when no hold applies.
+- `kanban_db_operator.reopen_done_task` also accepts a blocked/scheduled/triage row held done (`stale_hold`):
+  the same reopen (re-gated landing status, descendant invalidation, `reopened` event with
+  `previous_status: done` plus `stale_row_status`). A live row is still refused.
+
+Nit 2: `unblock_task` binds `held` on its own line inside `with write_txn(conn):`, then opens
+`reason_comment`. Order unchanged: evaluated in the write txn, before `precondition` and before the
+reason-comment savepoint. Two lines reflowed to keep kanban_db.py at its FILE_LINES cap; plugin_api.py stays
+at 2000 lines (`_open_parent_refusal` renamed `_refusal_detail`, which now covers both refusals).
+
+Tests (tests/hermes_cli/test_kanban_stale_wake_terminal.py): CLI unblock of a stale copy prints the reopen
+hint and `kanban reopen` revives it; a not-held card keeps the generic message and reopen still refuses a live
+row; an archived copy's text names no reopen and the dashboard echoes it. RED on main (the stale-copy and
+archived tests fail; the generic-message control passes), GREEN here; 14 related files, 462 tests pass; scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban.py                          |  4 +-
+ hermes_cli/kanban_db.py                       | 68 +++++++++----------
+ hermes_cli/kanban_db_operator.py              | 14 ++--
+ hermes_cli/kanban_operator_call.py            |  4 +-
+ hermes_cli/kanban_parser.py                   |  3 +-
+ hermes_cli/kanban_terminal_guard.py           | 19 ++++++
+ plugins/kanban/dashboard/plugin_api.py        | 18 ++---
+ .../test_kanban_stale_wake_terminal.py        | 52 ++++++++++++++
+ 8 files changed, 131 insertions(+), 51 deletions(-)
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 86f3e56518..32d65e5b49 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1498,8 +1498,10 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
+         if rc:
+             return rc
+         op = _commented(reason, author, "UNBLOCK", lambda tid, comment: kb.unblock_task(conn, tid, comment=comment, event_extra={"actor": cli_actor()}))
++        from hermes_cli.kanban_terminal_guard import unblock_refusal
+         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
+-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)", conn=conn)
++                           lambda tid: (unblock_refusal(conn, tid)
++                                        or f"cannot unblock {tid} (not blocked/scheduled?)"), conn=conn)
+ 
+ 
+ def _cmd_request_review(args: argparse.Namespace) -> int:
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index c8cc310c95..3ea7ec5d25 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3355,41 +3355,39 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *, comment: Optional[tu
+     from hermes_cli.kanban_reason_comment import reason_comment
+     from hermes_cli.kanban_terminal_guard import unblock_held
+     now = int(time.time())
+-    # ``held`` is decided before the comment's savepoint opens: a rollback to it would drop the note.
+-    with write_txn(conn), reason_comment(conn, task_id, None if (held := unblock_held(conn, task_id)) else comment) \
+-            as noted:
+-        if held or precondition is not None and precondition(conn):
+-            return False
+-        resume_status = (_resume_status_from_events(conn, task_id)
+-                         if _task_status(conn, task_id) in ("blocked", "triage") else "ready")
+-        _reclaim_dangling_run(
+-            conn, task_id, statuses=("blocked", "scheduled", "triage"), now=now,
+-            note="invariant recovery on unblock",
+-        )
+-        # Re-gate on parent completion before restoring the source phase.
+-        landing_status = _landing_status_after_parents(conn, task_id)
+-        new_status = "review" if landing_status == "ready" and resume_status == "review" else landing_status
+-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
+-        # resetting them is the amnesia that let cron-unblock <-> re-block loop
+-        # unbounded; only complete_task clears them. ``consecutive_failures``
+-        # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
+-        # is a fresh start for the retry budget.
+-        cur = conn.execute(
+-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+-            "consecutive_failures = 0, last_failure_error = NULL, human_request = NULL "
+-            "WHERE id = ? AND status IN ('blocked', 'scheduled', 'triage')", (new_status, task_id),
+-        )
+-        if cur.rowcount != 1:
+-            return False
+-        payload = (
+-            {"status": new_status, "resume_status": resume_status}
+-            if new_status != "ready" or resume_status != "ready"
+-            else None
+-        )
+-        if event_extra:
+-            payload = {**(payload or {}), **event_extra}
+-        _append_event(conn, task_id, "unblocked", payload)
+-        return noted.keep(True)
++    # ``held`` is decided in the write txn, before ``precondition`` and the comment savepoint (its rollback drops notes).
++    with write_txn(conn):
++        held = unblock_held(conn, task_id)
++        with reason_comment(conn, task_id, None if held else comment) as noted:
++            if held or precondition is not None and precondition(conn):
++                return False
++            resume_status = (_resume_status_from_events(conn, task_id)
++                             if _task_status(conn, task_id) in ("blocked", "triage") else "ready")
++            _reclaim_dangling_run(
++                conn, task_id, statuses=("blocked", "scheduled", "triage"), now=now,
++                note="invariant recovery on unblock",
++            )
++            # Re-gate on parent completion before restoring the source phase.
++            landing_status = _landing_status_after_parents(conn, task_id)
++            new_status = "review" if landing_status == "ready" and resume_status == "review" else landing_status
++            # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
++            # resetting them is the amnesia that let cron-unblock <-> re-block loop
++            # unbounded; only complete_task clears them. ``consecutive_failures``
++            # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
++            # is a fresh start for the retry budget.
++            cur = conn.execute(
++                "UPDATE tasks SET status = ?, current_run_id = NULL, "
++                "consecutive_failures = 0, last_failure_error = NULL, human_request = NULL "
++                "WHERE id = ? AND status IN ('blocked', 'scheduled', 'triage')", (new_status, task_id),
++            )
++            if cur.rowcount != 1:
++                return False
++            payload = ({"status": new_status, "resume_status": resume_status}
++                       if new_status != "ready" or resume_status != "ready" else None)
++            if event_extra:
++                payload = {**(payload or {}), **event_extra}
++            _append_event(conn, task_id, "unblocked", payload)
++            return noted.keep(True)
+ 
+ 
+ def invalidate_descendants_for_parent_reopen(
+diff --git a/hermes_cli/kanban_db_operator.py b/hermes_cli/kanban_db_operator.py
+index 7e3b215f64..5850076d8d 100644
+--- a/hermes_cli/kanban_db_operator.py
++++ b/hermes_cli/kanban_db_operator.py
+@@ -128,7 +128,8 @@ def reopen_done_task(
+ ) -> Optional[str]:
+     """Operator reopen: ``done`` -> ``ready`` (``todo`` while a parent is open,
+     the same re-gate unblock uses), ``completed_at`` cleared, the breaker reset.
+-    Refuses (returns ``None``) any other status or an unknown id. Appends a
++    Refuses (returns ``None``) any other status or an unknown id, except a
++    blocked/scheduled/triage row the event log holds done (``kanban_terminal_guard.stale_hold``). Appends a
+     ``reopened`` event with ``reason`` and ``actor`` plus a ``REOPENED:`` comment,
+     and invalidates done/ready/running descendants through
+     :func:`invalidate_descendants_for_parent_reopen` (every done-reopen surface
+@@ -137,20 +138,25 @@ def reopen_done_task(
+     actor = (actor or "").strip() or "operator"
+     if not reason:
+         raise KanbanEditRefused("reopen requires a reason")
++    from hermes_cli.kanban_terminal_guard import stale_hold
+     with _kb.write_txn(conn):
+-        if _kb._task_status(conn, task_id) != "done":
++        # A blocked/scheduled/triage row held done by its event log (a stale copy; ``unblock_task`` refuses it and
++        # points here) is reopened too: otherwise no verb revives it.
++        previous = _kb._task_status(conn, task_id)
++        if previous != "done" and (stale_hold(conn, task_id) or {}).get("status") != "done":
+             return None
+         new_status = _kb._landing_status_after_parents(conn, task_id)
+         cur = conn.execute(
+             "UPDATE tasks SET status = ?, completed_at = NULL, current_run_id = NULL, "
+             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+-            "consecutive_failures = 0, human_request = NULL WHERE id = ? AND status = 'done'",
+-            (new_status, task_id),
++            "consecutive_failures = 0, human_request = NULL WHERE id = ? AND status = ?",
++            (new_status, task_id, previous),
+         )
+         if cur.rowcount != 1:
+             return None
+         _kb._append_event(conn, task_id, "reopened", {
+             "reason": reason[:2000], "actor": actor, "previous_status": "done", "status": new_status,
++            **({"stale_row_status": previous} if previous != "done" else {}),
+         })
+         # add_comment (nested) stamps the ``commented`` provenance: an operator note naming the PR is FYI to
+         # active_pr, not a fresh publication that would hold the reopen it records. [daveey]
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index 2cd3971bd6..27ba567260 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -684,7 +684,9 @@ def _apply(conn: sqlite3.Connection, payload: dict, own: str) -> tuple[str, Opti
+                 kb._append_event(conn, target, "missing_parent_requeue", {
+                     "by": extra["repair_task_id"], "repair_card": extra["repair_task_id"], "target": target,
+                     "operator_request_uid": uid})
+-        return ("applied", None) if ok else ("refused", f"cannot unblock {target} (state changed)")
++        from hermes_cli.kanban_terminal_guard import unblock_refusal
++        return ("applied", None) if ok else ("refused", unblock_refusal(conn, target)
++                                             or f"cannot unblock {target} (state changed)")
+     if action == "move":
+         if _marker(conn, target, km.MOVED_EVENT, uid) or _marker(conn, target, MOVE_MARK, uid):
+             return "already_applied", None
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 04a1f4f9f0..153aa76c48 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -524,7 +524,8 @@ _SPECS = [
+     _cmd("reopen", [
+         _TASK_ID,
+         _arg("--reason", required=True, help="Why the done task is reopened (event + comment)"),
+-    ], help="Reopen a done task: done -> ready (todo while a parent is open); refuses other states"),
++    ], help="Reopen a done task: done -> ready (todo while a parent is open); refuses other states, "
++            "except a stale blocked/scheduled copy of a done card"),
+     _cmd("block", [
+         _HUMAN_REQUEST,
+         _arg("--metadata-only", action="store_true",
+diff --git a/hermes_cli/kanban_terminal_guard.py b/hermes_cli/kanban_terminal_guard.py
+index 489044e914..57a913f6e0 100644
+--- a/hermes_cli/kanban_terminal_guard.py
++++ b/hermes_cli/kanban_terminal_guard.py
+@@ -149,6 +149,25 @@ def unblock_held(conn: sqlite3.Connection, task_id: str) -> bool:
+     return row is not None and row[0] in _UNBLOCKABLE and skip_wake(conn, task_id, "unblocked")
+ 
+ 
++def stale_hold(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    """Read-only: the terminal hold of a row that still reads blocked/scheduled/triage (a stale copy), else None."""
++    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    return terminal_hold(conn, task_id) if row is not None and row[0] in _UNBLOCKABLE else None
++
++
++def unblock_refusal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    """The user-facing text for an unblock ``unblock_held`` refused (CLI, dashboard, operator call), else None:
++    the row does read blocked/scheduled, so a bare "not blocked/scheduled?" would mislead. A held-done copy is
++    revived by ``reopen`` (``kanban_db_operator.reopen_done_task`` accepts it); nothing revives an archived card."""
++    hold = stale_hold(conn, task_id)
++    if hold is None:
++        return None
++    head = f"cannot unblock {task_id}: its {hold['kind']} event holds it {hold['status']} (this row is a stale copy)"
++    if hold["status"] == "done":
++        return f"{head}; use `hermes kanban reopen {task_id} --reason <why>` to revive it"
++    return f"{head}; an archived card is not revived by unblock or reopen"
++
++
+ def push_status_is_stale(conn: sqlite3.Connection, task_id: str, status: Any) -> Optional[dict]:
+     """The push: the terminal event a task row's live ``status`` must lose to, or None to send it.
+ 
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index da9bb7ecd1..676c23e5f1 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -31,7 +31,7 @@ from fastapi import (
+ from fastapi.responses import FileResponse, Response
+ from pydantic import BaseModel, Field
+ 
+-from hermes_cli import kanban_db
++from hermes_cli import kanban_db, kanban_terminal_guard as ktg
+ from hermes_cli import kanban_review_contract as _review_contract  # a dashboard "done" is never a worker run
+ from hermes_cli import kanban_workflow
+ from hermes_cli.web_read_coalescing import coalesced_read
+@@ -758,15 +758,15 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
+     if blockers:
+         names = ", ".join(f"{p['title']!r} ({p['id']}, status={p['status']})" for p in blockers)
+         raise _conflict(f"Cannot move to 'ready': blocked by parent(s) not done — {names}")
+-    raise _conflict(_open_parent_refusal(conn, task_id, s) or f"status transition to {s!r} not valid from current state")
++    raise _conflict(_refusal_detail(conn, task_id, s) or f"status transition to {s!r} not valid from current state")
+ 
+ 
+-def _open_parent_refusal(conn, task_id: str, s: str) -> Optional[str]:
+-    """complete_task/request_review return bare False for a dependency refusal too;
+-    for a refused ``done``/``review`` name the open parents instead of the generic text."""
+-    if s not in ("done", "review"):
+-        return None
+-    blockers = kanban_db.unsatisfied_parents(conn, task_id)
++def _refusal_detail(conn, task_id: str, s: str) -> Optional[str]:
++    """Why a move was refused, past the generic text: a drag to ``ready`` ``unblock_task`` refused for a stale copy of
++    a done/archived card (``kanban_terminal_guard``), or a ``done``/``review`` with open parents (bare False too)."""
++    if s == "ready":
++        return ktg.unblock_refusal(conn, task_id)
++    blockers = kanban_db.unsatisfied_parents(conn, task_id) if s in ("done", "review") else []
+     if not blockers:
+         return None
+     detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
+@@ -972,7 +972,7 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
+     if payload.status is not None and not payload.archive:
+         s = payload.status
+         if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
+-            entry.update(ok=False, error=_open_parent_refusal(conn, tid, s) or f"transition to {s!r} refused")
++            entry.update(ok=False, error=_refusal_detail(conn, tid, s) or f"transition to {s!r} refused")
+     if payload.assignee is not None:
+         try:
+             ok = (kanban_db.reassign_task(conn, tid, payload.assignee or None, reclaim_first=True) if payload.reclaim_first
+diff --git a/tests/hermes_cli/test_kanban_stale_wake_terminal.py b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+index 9afbe6e295..90cf8e36be 100644
+--- a/tests/hermes_cli/test_kanban_stale_wake_terminal.py
++++ b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+@@ -564,3 +564,55 @@ def test_unblock_of_a_done_row_is_refused_without_a_note(board):
+     assert kb.unblock_task(board, tid) is False
+     assert _status(board, tid) == "done"
+     assert _ignored(board, tid) == []
++
++
++# PR #2186 review 5891019707 nit 1: the human paths printed "cannot unblock <id> (not blocked/scheduled?)" for a row
++# that does read blocked/scheduled, and ``reopen`` refused the stale row ("status is 'scheduled', not 'done'").
++
++def _cli(*args):
++    import argparse
++    from hermes_cli import kanban
++    from hermes_cli.kanban_parser import build_parser
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers())
++    return kanban.kanban_command(parser.parse_args(["kanban", *args]))
++
++
++@pytest.fixture
++def human(monkeypatch):
++    from hermes_cli import kanban
++    for key in (*kanban._AGENT_ENV_MARKERS, "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_TASK"):
++        monkeypatch.delenv(key, raising=False)
++
++
++def test_cli_unblock_of_a_stale_copy_points_at_reopen_and_reopen_revives_it(board, human, capsys):
++    tid = _parked(board)
++    _stale_scheduled_copy_of_a_done_card(board, tid)
++    assert _cli("unblock", tid) == 1
++    err = capsys.readouterr().err
++    assert f"cannot unblock {tid}: its completed event holds it done" in err
++    assert f"hermes kanban reopen {tid} --reason" in err
++    assert "not blocked/scheduled?" not in err
++    assert _cli("reopen", tid, "--reason", "more work") == 0
++    assert _status(board, tid) == "ready"
++    assert ktg.terminal_hold(board, tid) is None
++    reopened = [e for e in kb.list_events(board, tid) if e.kind == "reopened"][-1].payload
++    assert (reopened["previous_status"], reopened["stale_row_status"]) == ("done", "scheduled")
++
++
++def test_cli_unblock_of_a_card_that_is_not_held_keeps_the_generic_message(board, human, capsys):
++    tid = kb.create_task(board, title="t", assignee="worker")                      # ready: nothing to unblock
++    assert _cli("unblock", tid) == 1
++    assert f"cannot unblock {tid} (not blocked/scheduled?)" in capsys.readouterr().err
++    assert _cli("reopen", tid, "--reason", "x") == 1                              # reopen still refuses a live row
++
++
++def test_unblock_refusal_of_an_archived_copy_names_no_reopen_and_the_dashboard_echoes_it(board):
++    from plugins.kanban.dashboard import plugin_api
++    tid = _parked(board)
++    with kb.write_txn(board):
++        kb._append_event(board, tid, "archived", {})
++    text = ktg.unblock_refusal(board, tid)
++    assert text.startswith(f"cannot unblock {tid}: its archived event holds it archived")
++    assert "reopen `" not in text and "not revived" in text
++    assert plugin_api._refusal_detail(board, tid, "ready") == text
+-- 
+2.43.0
+

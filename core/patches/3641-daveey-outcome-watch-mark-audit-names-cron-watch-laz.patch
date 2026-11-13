@@ -1,0 +1,395 @@
+From 450a7a4c522c677fcfb20932b35d8ae8e95d83b8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:24:36 +0000
+Subject: [PATCH] [daveey] outcome watch mark: audit names cron+watch, lazy
+ watch read, dated far wake, card titles
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-up nits from the PR #2049 exact-head reviews (GH 5889672918, 5891307272; card t_01a1d487e7253c82):
+
+1. outcome-audit: a done chat that owns a cron AND watches a card reported only
+   done_owns_cron (the watch branch was an `elif`). It now reports every reason that
+   applies, joined (`done_owns_cron+done_watching`), with both item lists in `on`, so
+   the audit matches the tooltip. Single-reason rows are unchanged.
+2. _derive_current read the crons and watches (every board + the cron store) before the
+   declared-waiting and card_read_failed returns, which discard them. Both are now read
+   after those returns.
+3. Desktop wake label: 'Wed 09:00' is ambiguous past a week, so a wake more than 6 days
+   out reads 'Wed Nov 25 09:00'.
+4. Desktop tooltip leads with the watched card's title: 'verify the re-run limit
+   (t_watch1, wakes Wed 09:00)'; an untitled card keeps 't_… (wakes …)'.
+5. kanban_watch._read_chat_watches swallowed every sqlite3.Error on the subscriber query,
+   so a locked/busy board read silently as "no subscriber watches". It now checks that
+   kanban_notify_subs exists and lets other errors reach the caller's guard, which logs
+   them (_guarded in the outcome, the audit's warning).
+
+RED -> GREEN: tests/tools/test_kanban_watch_park.py (3 new tests failed before, pass
+after; plus a legacy-board test), apps/desktop session-outcome.test.ts (3 failed before)
+and session-row-stripe.test.tsx. The desktop tests now pin the clock so the
+weekday/date label is deterministic.
+
+Undo: git revert this commit.
+---
+ .../chat/sidebar/session-row-stripe.test.tsx  | 16 +++-
+ .../desktop/src/i18n/en_session_row_status.ts | 23 +++++-
+ .../src/i18n/types_session_row_status.ts      |  4 +-
+ apps/desktop/src/lib/session-outcome.test.ts  | 27 ++++++-
+ apps/desktop/src/lib/session-outcome.ts       |  2 +-
+ hermes_cli/kanban_watch.py                    |  6 +-
+ hermes_cli/sessions_cmd_outcome.py            | 38 ++++++----
+ hermes_state_outcome.py                       |  7 +-
+ tests/tools/test_kanban_watch_park.py         | 74 +++++++++++++++++++
+ 9 files changed, 162 insertions(+), 35 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-stripe.test.tsx b/apps/desktop/src/app/chat/sidebar/session-row-stripe.test.tsx
+index 04e0353844..3445fbd0e8 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row-stripe.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row-stripe.test.tsx
+@@ -1,5 +1,5 @@
+ import { act, cleanup, render, renderHook } from '@testing-library/react'
+-import { afterEach, expect, it } from 'vitest'
++import { afterEach, expect, it, vi } from 'vitest'
+ 
+ import { createClientSessionState } from '@/lib/chat-runtime'
+ import { $queuedPromptsBySession } from '@/store/composer-queue'
+@@ -166,6 +166,7 @@ it('a row that is not needs-input does not re-render when a prompt moves', () =>
+ // [daveey] self-heal desktop-e6cce5965c: a done chat still watching a card drew the same plain green as "all done".
+ // It keeps the green, adds the eye glyph and names the pending check on hover.
+ it('a done chat that still watches a card draws the eye glyph and names the check', () => {
++  vi.useFakeTimers({ now: new Date(2026, 10, 13, 12, 0), toFake: ['Date'] })
+   const eta = new Date(2026, 10, 18, 9, 0).getTime() / 1000
+ 
+   const session = row('watch-chat', {
+@@ -178,10 +179,17 @@ it('a done chat that still watches a card draws the eye glyph and names the chec
+     }
+   } as Partial<SessionInfo>)
+ 
+-  const { container } = render(<SessionRowStatusStripe outcomePainted session={session} statusStripe="done" />)
++  try {
++    const { container } = render(<SessionRowStatusStripe outcomePainted session={session} statusStripe="done" />)
+ 
+-  expect(container.querySelector('[data-testid="stripe-watch"]')).not.toBeNull()
+-  expect(stripe(container)?.getAttribute('aria-label')).toBe('Fix landed.\nStill watching: t_watch1 (wakes Wed 09:00)')
++    expect(container.querySelector('[data-testid="stripe-watch"]')).not.toBeNull()
++    // [daveey] PR #2049 review: the card's title leads, with its id kept for lookup.
++    expect(stripe(container)?.getAttribute('aria-label')).toBe(
++      'Fix landed.\nStill watching: verify the re-run limit (t_watch1, wakes Wed 09:00)'
++    )
++  } finally {
++    vi.useRealTimers()
++  }
+ })
+ 
+ it('a plain done chat draws no watch glyph', () => {
+diff --git a/apps/desktop/src/i18n/en_session_row_status.ts b/apps/desktop/src/i18n/en_session_row_status.ts
+index 91cfb98c8b..3e28c2c1c8 100644
+--- a/apps/desktop/src/i18n/en_session_row_status.ts
++++ b/apps/desktop/src/i18n/en_session_row_status.ts
+@@ -12,13 +12,29 @@ const UNRESOLVED_REASONS: Readonly<Record<string, string>> = {
+ }
+ 
+ const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const
++const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const
+ const pad2 = (n: number) => String(n).padStart(2, '0')
++// A weekday names one day only within the coming week; past that the label carries the date.
++const WEEKDAY_ONLY_S = 6 * 24 * 3600
+ 
+-/** Local `Wed 09:00` for an epoch-seconds wake time (a watch is often days out, so the weekday matters). */
++/** Local `Wed 09:00` for an epoch-seconds wake time (a watch is often days out, so the weekday matters);
++ *  `Wed Nov 25 09:00` when it is more than 6 days out, where a weekday alone is ambiguous. */
+ const wakeLabel = (eta: number): string => {
+   const date = new Date(eta * 1000)
++  const day = eta - Date.now() / 1000 > WEEKDAY_ONLY_S ? ` ${MONTHS[date.getMonth()]} ${date.getDate()}` : ''
+ 
+-  return `${WEEKDAYS[date.getDay()]} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`
++  return `${WEEKDAYS[date.getDay()]}${day} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`
++}
++
++/** `title (t_…, wakes …)`: the card's title, when it has one, with the id kept for lookup. */
++const watchLabel = (card: { id: string; label?: string; eta?: number }): string => {
++  const wake = card.eta === undefined ? '' : `wakes ${wakeLabel(card.eta)}`
++
++  if (card.label && card.label !== card.id) {
++    return `${card.label} (${wake ? `${card.id}, ${wake}` : card.id})`
++  }
++
++  return wake ? `${card.id} (${wake})` : card.id
+ }
+ 
+ // [daveey] Sidebar row status copy (kanban + process badges, outcome stripe tooltips), spread into en.ts.
+@@ -35,8 +51,7 @@ export const enSessionRowStatus = {
+     `${count} ${count === 1 ? 'card has' : 'cards have'} stalled: waiting over 2 h on something only an agent can do, with nothing producing it`,
+   outcomeDone: 'Done',
+   outcomeCrons: names => `Keeps running: ${names.join(', ')}`,
+-  outcomeWatches: cards =>
+-    `Still watching: ${cards.map(card => (card.eta === undefined ? card.id : `${card.id} (wakes ${wakeLabel(card.eta)})`)).join(', ')}`,
++  outcomeWatches: cards => `Still watching: ${cards.map(watchLabel).join(', ')}`,
+   outcomeDecision: 'Waiting on your decision',
+   outcomeMuted: 'Muted',
+   outcomeRunning: 'Running',
+diff --git a/apps/desktop/src/i18n/types_session_row_status.ts b/apps/desktop/src/i18n/types_session_row_status.ts
+index fba9b7dcc2..9f2079d929 100644
+--- a/apps/desktop/src/i18n/types_session_row_status.ts
++++ b/apps/desktop/src/i18n/types_session_row_status.ts
+@@ -7,8 +7,8 @@ export interface SessionRowStatusCopy {
+   kanbanUnknown: (count: number) => string
+   outcomeDone: string
+   outcomeCrons: (names: string[]) => string
+-  /** [daveey] Cards a done chat still watches; `eta` = wake time in epoch seconds, when known. */
+-  outcomeWatches: (cards: { id: string; eta?: number }[]) => string
++  /** [daveey] Cards a done chat still watches; `label` = card title, `eta` = wake time in epoch seconds, when known. */
++  outcomeWatches: (cards: { id: string; label?: string; eta?: number }[]) => string
+   outcomeDecision: string
+   outcomeMuted: string
+   outcomeRunning: string
+diff --git a/apps/desktop/src/lib/session-outcome.test.ts b/apps/desktop/src/lib/session-outcome.test.ts
+index a62edaccda..8e930f2280 100644
+--- a/apps/desktop/src/lib/session-outcome.test.ts
++++ b/apps/desktop/src/lib/session-outcome.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, it } from 'vitest'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { TRANSLATIONS } from '@/i18n/catalog'
+ import { type SessionDotState, sessionStatusStripe } from '@/store/session-dot-state'
+@@ -447,16 +447,35 @@ describe('a finished chat that still watches a card', () => {
+     watches: [{ kind: 'card', id: 't_watch1', label: 'verify the re-run limit', state: 'watching', eta }]
+   }
+ 
+-  it('stays green and names the pending check with its wake time', () => {
++  beforeEach(() => {
++    vi.useFakeTimers({ now: new Date(2026, 10, 13, 12, 0) })
++  })
++
++  afterEach(() => {
++    vi.useRealTimers()
++  })
++
++  it('stays green and names the pending check (title and id) with its wake time', () => {
+     expect(outcomeStripe(outcome)).toBe('done')
+     expect(outcomeHasWatches(outcome)).toBe(true)
+-    expect(outcomeTooltip(outcome, r)).toBe(`Fix landed.\nStill watching: t_watch1 (wakes Wed 09:00)`)
++    expect(outcomeTooltip(outcome, r)).toBe(
++      `Fix landed.\nStill watching: verify the re-run limit (t_watch1, wakes Wed 09:00)`
++    )
+   })
+ 
+   it('names crons and watches together', () => {
+     const both: SessionOutcome = { ...outcome, crons: [{ kind: 'cron', id: 'j1', label: 'sweep' }] }
+     expect(outcomeTooltip(both, r)).toBe(
+-      `Fix landed.\nKeeps running: sweep\nStill watching: t_watch1 (wakes Wed 09:00)`
++      `Fix landed.\nKeeps running: sweep\nStill watching: verify the re-run limit (t_watch1, wakes Wed 09:00)`
++    )
++  })
++
++  // [daveey] PR #2049 review: a weekday alone is ambiguous past a week, so a far wake carries its date.
++  it('dates a wake more than 6 days out', () => {
++    const far = new Date(2026, 10, 25, 9, 0).getTime() / 1000
++    const watches: SessionOutcome['watches'] = [{ kind: 'card', id: 't_watch1', state: 'watching', eta: far }]
++    expect(outcomeTooltip({ ...outcome, watches }, r)).toBe(
++      `Fix landed.\nStill watching: t_watch1 (wakes Wed Nov 25 09:00)`
+     )
+   })
+ 
+diff --git a/apps/desktop/src/lib/session-outcome.ts b/apps/desktop/src/lib/session-outcome.ts
+index 17277f5f73..69c748b0c7 100644
+--- a/apps/desktop/src/lib/session-outcome.ts
++++ b/apps/desktop/src/lib/session-outcome.ts
+@@ -120,7 +120,7 @@ const workflowTooltip = (outcome: null | SessionOutcome | undefined, r: RowCopy)
+       const names = (outcome.crons ?? []).map(job => job.label || job.id)
+ 
+       const watches = outcomeHasWatches(outcome)
+-        ? (outcome.watches ?? []).map(card => ({ id: card.id, eta: validEta(card.eta) }))
++        ? (outcome.watches ?? []).map(card => ({ id: card.id, label: card.label, eta: validEta(card.eta) }))
+         : []
+ 
+       const summary = outcome.summary?.trim() || r.outcomeDone
+diff --git a/hermes_cli/kanban_watch.py b/hermes_cli/kanban_watch.py
+index 908ad748ab..33523f07b5 100644
+--- a/hermes_cli/kanban_watch.py
++++ b/hermes_cli/kanban_watch.py
+@@ -116,13 +116,13 @@ def _read_chat_watches(conn: sqlite3.Connection, ids: list[str], counted_sub: st
+     for tid, title in conn.execute(
+             f"SELECT t.id, t.title FROM tasks t WHERE t.session_id IN ({ph}) AND {watch_park_sql('t')}", ids):
+         found[tid] = title
+-    try:
++    # A board that predates notify subscriptions has no table. Any other read error (locked, busy) propagates to
++    # the caller's guard, which logs it, instead of silently reading as "no subscriber watches".
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kanban_notify_subs'").fetchone():
+         for tid, title in conn.execute(
+                 f"SELECT t.id, t.title FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
+                 f"WHERE s.platform = 'tui' AND {counted_sub} AND s.chat_id IN ({ph}) AND {watch_park_sql('t')}", ids):
+             found.setdefault(tid, title)
+-    except sqlite3.Error:  # board predates notify subscriptions
+-        pass
+     out = []
+     for tid, title in found.items():
+         wake = (_last_scheduled(conn, tid) or {}).get("wake_at")
+diff --git a/hermes_cli/sessions_cmd_outcome.py b/hermes_cli/sessions_cmd_outcome.py
+index 4edee3bf52..bfef246753 100644
+--- a/hermes_cli/sessions_cmd_outcome.py
++++ b/hermes_cli/sessions_cmd_outcome.py
+@@ -115,6 +115,24 @@ def sidebar_rows(db, limit: int = AUDIT_DEFAULT_LIMIT) -> list[dict[str, Any]]:
+                                  include_pinned=True, compact_rows=True)
+ 
+ 
++def _done_named(ids: list[str], sid: str, cron_items, watch_items) -> list[tuple[str, list[dict]]]:
++    """``[(reason, items)]`` for what a done chat still names: the crons it owns, then the cards it watches. Both
++    read live, so a stored outcome older than the cron or the park shows. [daveey] A watch-parked card is a check
++    still pending on a green chat (self-heal desktop-e6cce5965c)."""
++    out = []
++    crons = cron_items(ids)
++    if crons:
++        out.append(("done_owns_cron", crons))
++    try:
++        watches = watch_items(ids)
++    except (sqlite3.Error, OSError):  # an unreadable board is not a watch; the row keeps its other reasons
++        logging.getLogger(__name__).warning("outcome-audit: watch read failed for %s", sid, exc_info=True)
++        watches = []
++    if watches:
++        out.append(("done_watching", watches))
++    return out
++
++
+ def audit_rows(db, *, refresh: bool = False, limit: int = AUDIT_DEFAULT_LIMIT) -> list[dict[str, Any]]:
+     """``{id, title, kind, reason, age_h, on, items}`` per sidebar row (``age_h`` = hours since last activity)."""
+     from hermes_state_outcome import _cron_items, _lineage_ids, _watch_items, refresh_outcome
+@@ -125,20 +143,12 @@ def audit_rows(db, *, refresh: bool = False, limit: int = AUDIT_DEFAULT_LIMIT) -
+     for row in sidebar_rows(db, limit):
+         outcome = refresh_outcome(row["id"], "manual", db=db) if refresh else row.get("outcome")
+         outcome = outcome or {}
+-        done = outcome.get("kind") == "done"
+-        crons = _cron_items(_lineage_ids(db, row["id"])) if done else []
+-        if crons:
+-            outcome = {**outcome, "reason": "done_owns_cron", "on": crons}
+-        elif done:
+-            # [daveey] A done chat whose card is parked as a watch: green, with a check still pending on that card
+-            # (self-heal desktop-e6cce5965c). Read live, like the crons, so a stored outcome older than the park shows.
+-            try:
+-                watches = _watch_items(_lineage_ids(db, row["id"]))
+-            except (sqlite3.Error, OSError):  # an unreadable board is not a watch; the row keeps its stored reason
+-                logging.getLogger(__name__).warning("outcome-audit: watch read failed for %s", row["id"], exc_info=True)
+-                watches = []
+-            if watches:
+-                outcome = {**outcome, "reason": "done_watching", "on": watches}
++        named = _done_named(_lineage_ids(db, row["id"]), row["id"], _cron_items, _watch_items) \
++            if outcome.get("kind") == "done" else []
++        if named:
++            # [daveey] Every reason that applies, joined (``done_owns_cron+done_watching``), so the audit matches the
++            # tooltip, which names both (PR #2049 review).
++            outcome = {**outcome, "reason": "+".join(r for r, _ in named), "on": [i for _, its in named for i in its]}
+         last = row.get("last_active") or row.get("started_at") or now
+         out.append({"id": row["id"], "title": row.get("title") or row.get("preview") or "",
+                     "kind": outcome.get("kind"), "reason": outcome.get("reason"),
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 5ae572119e..36769515aa 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -753,9 +753,6 @@ def _derive_current(db: Any, sid: str, *, ignore_live_turn: bool = False,
+         "lost subagents", sid, lambda: _lost_subagent_items(db, ids, _lineage_accounted_at(db, ids)), [])
+     if lost_subagents:
+         return _outcome("unresolved", now, reason="subagent_lost", on=lost_subagents, **carry)
+-    crons = _guarded("cron", sid, lambda: _cron_items(ids), [])
+-    watches = _guarded("watches", sid, lambda: _watch_items(ids), [])
+-    named = {**({"crons": crons} if crons else {}), **({"watches": watches} if watches else {})}
+     if holds and declared and declared.get("kind") == "waiting":
+         return {k: v for k, v in declared.items() if k not in _NAMED_KEYS}
+     if card_read_failed:
+@@ -764,6 +761,10 @@ def _derive_current(db: Any, sid: str, *, ignore_live_turn: bool = False,
+         if stored and stored.get("kind") in ("waiting", "decision"):
+             return stored
+         return _outcome("unresolved", now, reason="card_read_failed", **carry)
++    # [daveey] Read only once a done is possible: both scan every board/cron store, and the returns above drop them.
++    crons = _guarded("cron", sid, lambda: _cron_items(ids), [])
++    watches = _guarded("watches", sid, lambda: _watch_items(ids), [])
++    named = {**({"crons": crons} if crons else {}), **({"watches": watches} if watches else {})}
+     if holds and declared and declared.get("kind") == "done":
+         return {**{k: v for k, v in declared.items() if k not in _NAMED_KEYS}, **named}
+     if not tail:
+diff --git a/tests/tools/test_kanban_watch_park.py b/tests/tools/test_kanban_watch_park.py
+index 00bbb5b8c4..56670edd7b 100644
+--- a/tests/tools/test_kanban_watch_park.py
++++ b/tests/tools/test_kanban_watch_park.py
+@@ -208,3 +208,77 @@ def test_plain_scheduled_card_is_a_wait_not_a_watch(board, tmp_path):
+     db.close()
+     assert out["kind"] == "waiting", out
+     assert not out.get("watches"), out
++
++
++# [daveey] PR #2049 review nits (t_01a1d487e7253c82).
++def test_audit_names_cron_and_watch_together(board, tmp_path, monkeypatch):
++    """A done chat that owns a cron AND watches a card: the audit names both, like the tooltip does."""
++    import hermes_state_outcome as outcomes
++    tid = _chat_card(board)
++    _schedule(tid, 72, watch=True)
++    cron = {"kind": "cron", "id": "j1", "label": "sweep"}
++    monkeypatch.setattr(outcomes, "_cron_items", lambda ids: [cron])
++    db, _ = _chat_outcome(tmp_path)
++    try:
++        from hermes_cli.sessions_cmd_outcome import audit_rows
++        row = next(r for r in audit_rows(db) if r["id"] == CHAT)
++        assert row["reason"] == "done_owns_cron+done_watching", row
++        assert [i["id"] for i in row["on"]] == ["j1", tid], row
++    finally:
++        db.close()
++
++
++def test_declared_waiting_does_not_scan_boards_for_watches(board, tmp_path, monkeypatch):
++    """A holding waiting declaration returns before ``named`` is used, so the boards are not scanned for it."""
++    import hermes_state_outcome as outcomes
++    from hermes_state import SessionDB
++    calls = []
++    monkeypatch.setattr(outcomes, "_watch_items", lambda ids: calls.append(ids) or [])
++    monkeypatch.setattr(outcomes, "_cron_items", lambda ids: calls.append(ids) or [])
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        db.create_session(CHAT, source="desktop")
++        outcomes.declare_outcome(CHAT, {"kind": "waiting", "on": [{"kind": "time", "id": "14:00"}]}, db=db)
++        out = outcomes.refresh_outcome(CHAT, "manual", db=db)
++        assert out["kind"] == "waiting", out
++        assert calls == [], calls
++    finally:
++        db.close()
++
++
++class _SubsQueryFails:
++    """A board connection whose subscriber query fails with ``error`` (everything else runs for real)."""
++
++    def __init__(self, conn, error):
++        self._conn, self._error = conn, error
++
++    def execute(self, sql, *args):
++        if "kanban_notify_subs" in sql and "JOIN" in sql:
++            raise self._error
++        return self._conn.execute(sql, *args)
++
++
++def test_locked_board_is_not_silently_read_as_no_subscriber_watches(board):
++    """A busy/locked board must surface (the outcome guards and logs it), not read as "no watches"."""
++    import sqlite3
++
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_watch as kw
++    with kbc.connect() as conn:
++        with pytest.raises(sqlite3.OperationalError, match="locked"):
++            kw._read_chat_watches(_SubsQueryFails(conn, sqlite3.OperationalError("database is locked")),
++                                  [CHAT], "1=1")
++
++
++def test_board_without_notify_subs_reads_created_watches(board):
++    """A board that predates notify subscriptions still names the watches the chat created."""
++    import sqlite3
++
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_watch as kw
++    tid = _chat_card(board)
++    _schedule(tid, 72, watch=True)
++    with kbc.connect() as conn:
++        conn.execute("ALTER TABLE kanban_notify_subs RENAME TO legacy_subs_gone")
++        rows = kw._read_chat_watches(_SubsQueryFails(conn, sqlite3.OperationalError("no such table")), [CHAT], "1=1")
++    assert [r["id"] for r in rows] == [tid]
+-- 
+2.43.0
+

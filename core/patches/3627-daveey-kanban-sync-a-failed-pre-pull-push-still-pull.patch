@@ -1,0 +1,772 @@
+From 74a7bce2057910373f9a400771f993f09e8bc263 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:06:32 +0000
+Subject: [PATCH] [daveey] kanban sync: a failed pre-pull push still pulls;
+ outbox alarm ages only sendable ops; repin pulls under the board lock; sync
+ diff moves nothing
+
+Follow-ups to PR #1934 (push before pull) from its exact-head reviews 5888384602 and 5892044920
+(card t_01a1d41c2612ebc0).
+
+1. A transport error (HubError/OSError) on the push before the pulls no longer skips them. With the
+   Board's /ops down and /changes up the replica pulled 0 of 3 remote rows; now the pulls run, the
+   send after them retries, and its failure fails the round (a board still behind is noted for an
+   immediate rerun before re-raising).
+2. Outbox-age alarm while behind the feed head ages exactly what push(before_head=True) would send:
+   kanban_sync_outbox_age.sendable_age_s runs kanban_sync_backlog.sendable_before_head over push's own
+   selection, with the latest round's Board reads and no Board call of its own. The FIFO tail after the
+   first pending task_runs row and stale wakes held for cards the Board completed no longer WARN or
+   file the stalled-outbox card during a long catch-up; a sendable op still alarms.
+3. kanban_worker_repin pulls the live board only under board_sync_lock, taken without waiting (as
+   dispatch_tick): while a round holds it the read-back reports pending (the round applies the row) and a
+   CAS retry re-checks the file and CASes again only at a newer revision. When the bounded pull stops at
+   its page budget before the repinned row, a targeted row_evidence read applies the card's Board row like
+   a push's merged row (cursor unchanged), so a >20-page backlog still confirms the CAS (and a conflict
+   retry sees the newest revision).
+4. `sync diff` refreshes the replica as a diagnostic: no rebuild on Resync (reported as refresh_error,
+   as before #1934) and no attachment transfers.
+5. One Board read (row_evidence) per card per round: both sends share the round's cache, so a behind
+   round reads N held cards N times, not 2N; the send after the pulls at the head reads none. The send
+   before the pulls must still read: only its pull can tell an at-head round (the incident slept from
+   the head).
+6. sendable_before_head docstring: a held row holds that card's later tasks rows (key is table + uid).
+
+Tests: tests/hermes_cli/test_kanban_sync_round_followups.py, 13 tests, 11 RED on origin/main
+(behavioural assertions), all GREEN. 151 test files importing the touched modules (all
+test_kanban_sync*.py included): 3269 passed, 0 failed. scripts/check --base origin/main: ok.
+---
+ hermes_cli/kanban_sync_backlog.py             |  22 +-
+ hermes_cli/kanban_sync_cli.py                 |   7 +-
+ hermes_cli/kanban_sync_client.py              |  48 ++-
+ hermes_cli/kanban_sync_outbox_age.py          |  40 +-
+ hermes_cli/kanban_worker_repin.py             |  65 +++-
+ .../test_kanban_sync_round_followups.py       | 350 ++++++++++++++++++
+ 6 files changed, 495 insertions(+), 37 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_sync_round_followups.py
+
+diff --git a/hermes_cli/kanban_sync_backlog.py b/hermes_cli/kanban_sync_backlog.py
+index a210cc5d09..a4002e3440 100644
+--- a/hermes_cli/kanban_sync_backlog.py
++++ b/hermes_cli/kanban_sync_backlog.py
+@@ -26,8 +26,9 @@ def sendable_before_head(conn: Any, hub: Any, board: str, rows: list[dict], seen
+     """The outbox rows a push may send while this file has not pulled to the feed head (``push(before_head=True)``),
+     and whether it stopped: the first run row ends the batch (FIFO kept: a run row is sent whole and the Board keeps
+     the last write, so it waits for any end in an unread page). A task row with a live ``status`` whose Board row is
+-    done/archived (``kanban_terminal_guard.board_may_hold_terminal``) is skipped with every later row of that card;
+-    other cards' rows still go, so one stale wake holds back no one else's edits."""
++    done/archived (``kanban_terminal_guard.board_may_hold_terminal``) is skipped with that card's later ``tasks``
++    rows (the key is the table and row uid); other rows still go, so one stale wake holds back no one else's edits.
++    The outbox-age alarm applies this same rule (``kanban_sync_outbox_age``), so it never ages a row held here."""
+     from hermes_cli.kanban_terminal_guard import board_may_hold_terminal
+     out: list[dict] = []
+     skipped: set[tuple[str, str]] = set()
+@@ -44,6 +45,22 @@ def sendable_before_head(conn: Any, hub: Any, board: str, rows: list[dict], seen
+ 
+ _LOCK = threading.Lock()
+ _BEHIND: set[str] = set()  # live board paths whose last round stopped before the feed head
++_EVIDENCE: dict[str, dict] = {}  # live board path -> its latest round's Board reads ({card id: may hold terminal})
++
++
++def round_evidence(path: Path) -> dict:
++    """A fresh Board-read cache for this round, shared by its sends before and after the pulls, so a card is read
++    at most once per round (``board_may_hold_terminal``). The outbox-age alarm reads the latest one back."""
++    seen: dict = {}
++    with _LOCK:
++        _EVIDENCE[str(path)] = seen
++    return seen
++
++
++def evidence(path: Path) -> dict:
++    """A copy of the latest round's Board reads for this board (empty before any round)."""
++    with _LOCK:
++        return dict(_EVIDENCE.get(str(path)) or {})
+ 
+ 
+ class Pulled(int):
+@@ -104,3 +121,4 @@ def reset() -> None:
+     """Tests: forget every board."""
+     with _LOCK:
+         _BEHIND.clear()
++        _EVIDENCE.clear()
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index 6aef22b104..b004cbba9f 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -87,12 +87,13 @@ def _import(args: argparse.Namespace) -> int:
+ def _diff(args: argparse.Namespace) -> int:
+     slug = _board(args)
+     ident = ksc.load_identity()
+-    # Refresh first, before opening the replica: a rebuild replaces its file. Only when no sync round holds the
+-    # board (one replica puller per board per host); a busy round's replica is compared as it stands.
++    # Refresh first, before opening the replica. Only when no sync round holds the board (one replica puller per
++    # board per host); a busy round's replica is compared as it stands. A diagnostic: it never rebuilds the replica
++    # (a Resync is reported as refresh_error) and never transfers attachments (t_01a1d41c2612ebc0).
+     refresh_error = None
+     pulled = ksc.Pulled()
+     try:
+-        pulled = ksc._pull_replica(slug, ksc.Hub(ident), ident.gateway, _path(slug))
++        pulled = ksc._pull_replica(slug, ksc.Hub(ident), ident.gateway, _path(slug), diagnostic=True)
+     except (ksc.HubError, ksc.Resync, OSError) as exc:
+         refresh_error = str(exc)
+     else:
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index f086670ead..92dbfc6086 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -668,17 +668,19 @@ class PushResult:
+ 
+ 
+ def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primary: bool,
+-         max_batches: int = MAX_BATCHES_PER_ROUND, before_head: bool = False) -> PushResult:
++         max_batches: int = MAX_BATCHES_PER_ROUND, before_head: bool = False,
++         seen: Optional[dict] = None) -> PushResult:
+     """Drain pending outbox rows in FIFO batches. A transport failure leaves them pending (retried next round).
+ 
+     ``before_head`` (t_01a1d36ddcea59fe): a round sets it before its pulls, and after them while it stopped behind the
+     feed head. It stops at the first run row (sent whole, the Board keeps the last write, so a pending startup could
+     overwrite an end the Board holds in an unread page; ``_local_row_is_newer`` lets that end land locally first),
+     and skips a card whose live ``status`` the Board's row has as done/archived (a stale wake: the strip below judges
+-    it once the completion is pulled). See ``kanban_sync_backlog.sendable_before_head``."""
++    it once the completion is pulled). See ``kanban_sync_backlog.sendable_before_head``; ``seen`` is its Board-read
++    cache (one per round, shared by both sends)."""
+     from hermes_cli.kanban_db_connect import write_txn
+     refuse_if_schema_ahead(conn)  # an older core would strip the newer columns; the ops stay pending [daveey]
+-    out, seen = PushResult(), {}
++    out, seen = PushResult(), {} if seen is None else seen
+     for _ in range(max_batches):
+         rows = selected = [dict(r) for r in conn.execute(
+             "SELECT * FROM kanban_sync_outbox WHERE state = 'pending' AND (retry_after IS NULL OR retry_after <= ?) "
+@@ -947,8 +949,10 @@ def open_shadow(slug: str, gateway: str) -> sqlite3.Connection:
+ 
+ 
+ @contextmanager
+-def _pulled_replica(slug: str, hub: Hub, gateway: str, max_pages: Optional[int] = PULL_PAGE_BUDGET):
+-    """Borrow the pulled replica for this round; retention rebuilds discard the old handle."""
++def _pulled_replica(slug: str, hub: Hub, gateway: str, max_pages: Optional[int] = PULL_PAGE_BUDGET, *,
++                    diagnostic: bool = False):
++    """Borrow the pulled replica for this round; retention rebuilds discard the old handle. ``diagnostic``
++    (``sync diff``) neither rebuilds on Resync (it raises) nor transfers attachments."""
+     path = shadow_path(slug)
+     with ExitStack() as stack:
+         replica = stack.enter_context(connection(path, lambda: open_shadow(slug, gateway)))
+@@ -957,6 +961,8 @@ def _pulled_replica(slug: str, hub: Hub, gateway: str, max_pages: Optional[int]
+         try:
+             pulled = pull(replica, hub, slug, observers=False, max_pages=max_pages)
+         except Resync:
++            if diagnostic:
++                raise
+             _log.warning("kanban sync: %s replica cursor below the retention floor; rebuilding from a snapshot", slug)
+             stack.close()
+             invalidate(path)  # must close the pooled descriptor BEFORE unlinking its database
+@@ -970,17 +976,18 @@ def _pulled_replica(slug: str, hub: Hub, gateway: str, max_pages: Optional[int]
+                 sync.mark_pulled(replica)
+             except sqlite3.Error as exc:
+                 _log.warning("kanban sync: %s replica pull not stamped (%s)", slug, exc)
+-        from hermes_cli.kanban_sync_attachments import transfer_pending
+-        transfer_pending(replica, hub, slug)
++        if not diagnostic:
++            from hermes_cli.kanban_sync_attachments import transfer_pending
++            transfer_pending(replica, hub, slug)
+         yield replica, pulled, rebuilt
+ 
+ 
+ def _pull_replica(slug: str, hub: Hub, gateway: str, live_path: Optional[Path] = None,
+-                  max_pages: Optional[int] = PULL_PAGE_BUDGET) -> Pulled:
++                  max_pages: Optional[int] = PULL_PAGE_BUDGET, *, diagnostic: bool = False) -> Pulled:
+     """Pull the replica for standalone callers that do not run repairs, only while no sync round holds the board:
+     one replica puller per board per host (a ``sync diff`` beside the gateway once wrote the cursor backwards,
+     t_01a1d36ddcea59fe). A busy round returns ``busy`` without pulling; the caller reads the replica as-is.
+-    ``live_path`` defaults to the board's configured file."""
++    ``live_path`` defaults to the board's configured file; ``diagnostic``: see :func:`_pulled_replica`."""
+     from hermes_cli.kanban_sync_guard import SyncRoundBusy, board_sync_lock
+     if live_path is None:
+         live_path = dict(board_paths()).get(slug)
+@@ -990,7 +997,7 @@ def _pull_replica(slug: str, hub: Hub, gateway: str, live_path: Optional[Path] =
+                 stack.enter_context(board_sync_lock(Path(live_path)))
+         except SyncRoundBusy:
+             return Pulled(busy=True)
+-        with _pulled_replica(slug, hub, gateway, max_pages) as (_, pulled, _rebuilt):
++        with _pulled_replica(slug, hub, gateway, max_pages, diagnostic=diagnostic) as (_, pulled, _rebuilt):
+             return pulled
+ 
+ 
+@@ -1018,8 +1025,15 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+         ensure_identity(live, slug, gateway)
+         # Send before pulling as well as after: a pull backlog never holds local edits back (9 h, t_01a1d36ddcea59fe).
+         # Safe: the Board merges on base_version + field HLC, an acked task's sync_version fences off older feed
+-        # copies of it, and rejections are resolved here as after the pulls.
+-        _send(live, hub, slug, gateway, mode, result, after_pull=False, before_head=True)
++        # copies of it, and rejections are resolved here as after the pulls. A failed send never stops the pulls
++        # (an /ops outage with /changes up left the replica unpulled, t_01a1d41c2612ebc0): the send after them
++        # retries, and its failure fails the round. One Board read per card per round serves both sends; the one
++        # before the pulls must read: only its pull can tell an at-head round (the incident slept from the head).
++        evidence = backlog.round_evidence(path)
++        try:
++            _send(live, hub, slug, gateway, mode, result, after_pull=False, before_head=True, seen=evidence)
++        except (HubError, OSError) as exc:
++            _log.info("kanban sync: %s push before the pull failed (%s); pulling anyway", slug, exc)
+         with _pulled_replica(slug, hub, gateway) as (replica, pulled, rebuilt):
+             result.pulled = pulled
+             result.behind = pulled.more
+@@ -1075,7 +1089,11 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+                 heal_clobbered_completions(live)
+                 heal_running_over_ended_run(live)
+         # Still behind the head: the Board may hold a run's end in a page not read yet, so run rows wait.
+-        _send(live, hub, slug, gateway, mode, result, after_pull=True, before_head=result.behind)
++        try:
++            _send(live, hub, slug, gateway, mode, result, after_pull=True, before_head=result.behind, seen=evidence)
++        except (HubError, OSError):
++            backlog.note(path, result.behind)  # the pulls landed: a board still behind reruns at once
++            raise
+         if mode == "primary":
+             from hermes_cli.kanban_worker_placement import reevaluate
+             with credited(live):  # reservation observations and the feed pull after them
+@@ -1085,11 +1103,11 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+ 
+ 
+ def _send(live: sqlite3.Connection, hub: Hub, slug: str, gateway: str, mode: str, result: RoundResult, *,
+-          after_pull: bool, before_head: bool) -> None:
++          after_pull: bool, before_head: bool, seen: Optional[dict] = None) -> None:
+     """Push the outbox and resolve rejections, adding to ``result``. A round does this before its pulls and after
+     them (``after_pull``, which also transfers attachments); for ``before_head`` see :func:`push`."""
+     with credited(live):  # acknowledgements and the Board's merged rows: sync bookkeeping, not local edits
+-        pushed = push(live, hub, slug, gateway, primary=mode == "primary", before_head=before_head)
++        pushed = push(live, hub, slug, gateway, primary=mode == "primary", before_head=before_head, seen=seen)
+     result.push = pushed if result.push is None else PushResult(*map(sum, zip(astuple(result.push), astuple(pushed))))
+     if after_pull:
+         from hermes_cli.kanban_sync_attachments import transfer_pending
+diff --git a/hermes_cli/kanban_sync_outbox_age.py b/hermes_cli/kanban_sync_outbox_age.py
+index b87915c9ff..ef8bf28e5a 100644
+--- a/hermes_cli/kanban_sync_outbox_age.py
++++ b/hermes_cli/kanban_sync_outbox_age.py
+@@ -43,18 +43,40 @@ _FILED: set[str] = set()
+ _NEXT_CHECK: list[float] = [0.0]
+ 
+ 
+-def oldest_pending_age_s(conn: sqlite3.Connection, *, unanswered: bool = False, held_runs: bool = False,
++def oldest_pending_age_s(conn: sqlite3.Connection, *, unanswered: bool = False,
+                          now: Optional[float] = None) -> Optional[float]:
+     """Seconds since the oldest pending outbox op was queued (None: no pending op). ``unanswered`` counts only ops
+-    the Board never deferred; ``held_runs`` leaves out run rows, which a round behind the feed head holds back on
+-    purpose (``push(before_head=...)``)."""
++    the Board never deferred."""
+     sql = "SELECT MIN(created_at) FROM kanban_sync_outbox WHERE state = 'pending'"
+     sql += " AND retry_after IS NULL" if unanswered else ""
+-    sql += " AND table_name != 'task_runs'" if held_runs else ""
+     row = conn.execute(sql).fetchone()
+-    if not row or row[0] is None:
+-        return None
+-    return max(0.0, (time.time() if now is None else now) - float(row[0]) / 1000)  # created_at is in ms
++    return None if not row or row[0] is None else _since(row[0], now)
++
++
++def _since(created_ms: Any, now: Optional[float] = None) -> float:
++    return max(0.0, (time.time() if now is None else now) - float(created_ms) / 1000)  # created_at is in ms
++
++
++class _NoBoardReads:
++    """The alarm never calls the Board: a card the round did not read counts as sendable (``row_evidence`` -> {})."""
++
++    def row_evidence(self, *_a: Any) -> dict:
++        return {}
++
++
++def sendable_age_s(conn: sqlite3.Connection, path: Path, now: Optional[float] = None) -> Optional[float]:
++    """While a board is behind the feed head: the age of the oldest unanswered op among exactly the ops the push
++    before the head would send (``kanban_sync_backlog.sendable_before_head``, with the latest round's Board reads).
++    Held ops (from the first pending run row on, a stale wake on a card the Board completed) wait on purpose for the
++    head, possibly over a long catch-up: they age the alarm again once the board reaches it. (t_01a1d41c2612ebc0)"""
++    from hermes_cli import kanban_sync_backlog as backlog
++    conn.row_factory = sqlite3.Row
++    rows = [dict(r) for r in conn.execute(
++        "SELECT * FROM kanban_sync_outbox WHERE state = 'pending' AND (retry_after IS NULL OR retry_after <= ?) "
++        "ORDER BY created_at, rowid", (int(time.time()),))]  # push's own selection and order
++    sendable, _ = backlog.sendable_before_head(conn, _NoBoardReads(), "", rows, backlog.evidence(path))
++    ages = [r["created_at"] for r in sendable if r["retry_after"] is None]
++    return _since(min(ages), now) if ages else None
+ 
+ 
+ def _age(path: Path) -> Optional[float]:
+@@ -64,7 +86,9 @@ def _age(path: Path) -> Optional[float]:
+         return None  # never create a board file just to read its outbox
+     try:
+         with kbc.connect_closing(path) as conn:
+-            return oldest_pending_age_s(conn, unanswered=True, held_runs=backlog.behind(path))
++            if backlog.behind(path):
++                return sendable_age_s(conn, path)
++            return oldest_pending_age_s(conn, unanswered=True)
+     except (sqlite3.Error, OSError):
+         return None
+ 
+diff --git a/hermes_cli/kanban_worker_repin.py b/hermes_cli/kanban_worker_repin.py
+index 550395afbe..5746aba2e0 100644
+--- a/hermes_cli/kanban_worker_repin.py
++++ b/hermes_cli/kanban_worker_repin.py
+@@ -20,8 +20,9 @@ Scope (everything else refuses and writes nothing):
+ * the board is a Board primary, its ``sync_version`` is acknowledged and no task edit is pending in the outbox;
+ * the Hub identity used is this board's own gateway.
+ 
+-The local row is never edited here. After the Board answers, the authoritative feed is pulled; until that readback
+-lands the local policy stays as it was. Refusals leave this local copy intact; a lost reply has unknown Board outcome. A pull failure
++The local row is never edited here. After the Board answers, the authoritative feed is pulled (bounded, plus a targeted
++read of the card when a backlog stops the pull short of it), only while no sync round holds the board (a round that
++does applies it instead); until that readback lands the local policy stays as it was. Refusals leave this local copy intact; a lost reply has unknown Board outcome. A pull failure
+ after a successful repin is reported as committed with readback pending (the normal sync loop applies it), not as a
+ failed move. No network call runs inside a DB transaction, and nothing here runs on a timer.
+ """
+@@ -151,6 +152,35 @@ def eligibility(conn: sqlite3.Connection, task_id: str, labels: list[str]) -> di
+             "labels": labels, "matches": matches, "status": row["status"]}
+ 
+ 
++def _refresh(conn: sqlite3.Connection, hub: Any, board: str, me: str, task_id: str) -> bool:
++    """Read the Board's newest copy of the card into this file: one bounded feed pull, then, when the pull stopped
++    at its page budget with the head not reached, the card's own row by targeted read (``row_evidence``), applied
++    like a push's merged row (the cursor stays). Only while no sync round holds the board: one live puller per board
++    per host (t_01a1d41c2612ebc0). False = a round holds it and nothing was read (that round pulls the file)."""
++    from contextlib import ExitStack
++    from pathlib import Path
++
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_sync_guard import SyncRoundBusy, board_sync_lock
++    path = sync._db_key(conn)
++    with ExitStack() as stack:
++        if path is not None:  # an in-memory board: nothing else pulls it
++            try:
++                stack.enter_context(board_sync_lock(Path(path)))
++            except SyncRoundBusy:
++                return False
++        pulled = client.pull(conn, hub, board, observers=True, partition=me)
++        reader = getattr(hub, "row_evidence", None)
++        if getattr(pulled, "more", False) and reader is not None:
++            row = (reader(board, "tasks", task_id) or {}).get("row")
++            if isinstance(row, dict) and row.get("uid") == task_id:
++                cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
++                sync.apply_remote_changes(conn, [client._row_change("tasks", row)], new_cursor=cursor, board=board,
++                                          local_pending_wins=True)
++    return True
++
++
+ def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], reason: str, *,
+                     hub: Any = None, event_extra: Optional[dict] = None) -> dict[str, Any]:
+     """Board CAS repin + authoritative pull. Result keys match ``move_queued`` plus ``repinned``,
+@@ -193,14 +223,18 @@ def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], r
+                 return conflict
+             # A queued policy card's Board row is rewritten by every reservation reply, so the local revision is
+             # often a step behind. Read the newest row, re-check every precondition on it, and CAS again: never a
+-            # blind write over an edit this copy has not seen.
++            # blind write over an edit this copy has not seen. A sync round holding the board pulls this file
++            # itself: re-check what it has read so far, and CAS again only at a newer revision.
+             try:
+-                client.pull(conn, hub, board, observers=True, partition=me)
+-            except (client.HubError, client.Resync, client.SyncUnavailable, OSError):
++                refreshed = _refresh(conn, hub, board, me, task_id)
++            except (client.HubError, client.Resync, client.SyncUnavailable, OSError, ValueError):
+                 return conflict
++            revision = pre["revision"]
+             pre = eligibility(conn, task_id, labels)
+             if not pre.get("ok"):
+                 return pre
++            if not refreshed and pre["revision"] == revision:
++                return conflict
+         except (OSError, client.Resync) as exc:
+             return _unknown(type(exc).__name__)
+     version = reply.get("version") if isinstance(reply, dict) else None
+@@ -219,21 +253,34 @@ def repin_to_origin(conn: sqlite3.Connection, task_id: str, labels: list[str], r
+ 
+     out = {"ok": True, "runs_on": pre["labels"], "matches": pre["matches"], "move_no": move_no, "status": pre["status"],
+            REPINNED_EVENT_FLAG: True, "board_version": version, "readback": "pending"}
++    return _read_back(conn, hub, board, me, task_id, pre["labels"], out)
++
++
++def _read_back(conn: sqlite3.Connection, hub: Any, board: str, me: str, task_id: str, labels: list[str],
++               out: dict[str, Any]) -> dict[str, Any]:
++    """After the Board committed: read its row back (``_refresh``) and mark ``readback`` confirmed when the local
++    copy shows the pin with the policy cleared."""
++    from hermes_cli import kanban_sync_client as client
++    version = out["board_version"]
+     try:
+-        client.pull(conn, hub, board, observers=True, partition=me)
+-    except (client.HubError, client.Resync, client.SyncUnavailable, OSError) as exc:
++        refreshed = _refresh(conn, hub, board, me, task_id)
++    except (client.HubError, client.Resync, client.SyncUnavailable, OSError, ValueError) as exc:
+         out["note"] = (f"the Board committed the repin (revision {version}); reading it back failed "
+                        f"({type(exc).__name__}), so the local copy still shows the policy until the next sync")
+         return out
++    if not refreshed:
++        out["note"] = (f"the Board committed the repin (revision {version}); a sync round holds the board and "
++                       "applies it to the local copy")
+     row = conn.execute("SELECT status, placement_policy, runs_on FROM tasks WHERE id = ?", (task_id,)).fetchone()
+     try:
+         local = json.loads(row["runs_on"]) if row and row["runs_on"] else None
+     except (TypeError, ValueError):
+         local = None
+-    if row is not None and row["placement_policy"] is None and local == pre["labels"]:
++    if row is not None and row["placement_policy"] is None and local == labels:
+         out["readback"] = "confirmed"
+         out["status"] = row["status"]
+-    else:
++        out.pop("note", None)
++    elif refreshed:
+         out["note"] = (f"the Board committed the repin (revision {version}); the local copy has not caught up yet "
+                        "and updates on the next sync")
+     return out
+diff --git a/tests/hermes_cli/test_kanban_sync_round_followups.py b/tests/hermes_cli/test_kanban_sync_round_followups.py
+new file mode 100644
+index 0000000000..1db83507b8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_round_followups.py
+@@ -0,0 +1,350 @@
++"""Follow-ups to the push-before-pull round (PR #1934 reviews, t_01a1d41c2612ebc0).
++
++1. A transport failure on the push before the pulls never stops the pulls.
++2. The outbox-age alarm ages only what the push before the head would send (the FIFO cut at the first pending run
++   row, and a stale wake held for a card the Board completed), so a long catch-up never alarms on held ops.
++3. ``kanban_worker_repin`` pulls the live board only under ``board_sync_lock``, and confirms its CAS by a targeted
++   read when a backlog stops the bounded read-back short of the repinned row.
++4. ``sync diff`` neither rebuilds the replica nor transfers attachments.
++5. One Board read per card per round, shared by both sends.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import logging
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_sync_backlog as backlog
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_outbox_age as outbox_age
++from hermes_cli import kanban_worker_placement as wp
++from hermes_cli.kanban_sync_guard import board_sync_lock
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli import test_kanban_sync_push_starvation as starvation
++from tests.hermes_cli import test_kanban_worker_repin as repin_fixtures
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_sync_push_starvation import (BACKLOG_PAGES, BOARD, ME, OTHER, PagedHub,
++                                                               _other_creates, _round)
++from tests.hermes_cli.test_kanban_worker_node import HUB
++
++kanban_home, svc, live = starvation.kanban_home, starvation.svc, starvation.live
++gws = repin_fixtures.gws
++
++
++@pytest.fixture(autouse=True)
++def _fresh_loop_state():
++    backlog.reset()
++    outbox_age.reset()
++    yield
++    backlog.reset()
++    outbox_age.reset()
++
++
++def _replica_tasks():
++    with kbc.connect_closing(ksc.shadow_path(BOARD)) as shadow:
++        return {r[0] for r in shadow.execute("SELECT id FROM tasks")}
++
++
++# --- 1. a failed push before the pulls does not stop them ----------------------------------------------------------
++
++class OpsDown(PagedHub):
++    """The Board's /ops answers 503 (``fail`` times, or always) while /changes keeps working."""
++
++    def __init__(self, svc_, gateway, log, fail=None):
++        super().__init__(svc_, gateway, log)
++        self.fail = fail
++
++    def ops(self, board, ops):
++        if self.fail is None or self.fail > 0:
++            self.fail = None if self.fail is None else self.fail - 1
++            self.log.append(("ops-503", [op["uid"] for op in ops]))
++            raise ksc.HubError(503, "service unavailable")
++        return super().ops(board, ops)
++
++
++def test_an_ops_outage_still_pulls_every_remote_row_and_the_round_reports_the_push_error(live, svc, kanban_home):
++    assert _round(kanban_home, svc.hub(ME)).error is None
++    _other_creates(svc, 3)
++    kb.create_task(live, title="local edit")
++    log: list = []
++    with pytest.raises(ksc.HubError):
++        _round(kanban_home, OpsDown(svc, ME, log))
++    assert {f"t_other{i:03d}" for i in range(3)} <= _replica_tasks()  # RED before: 0 of 3, no /changes call
++    assert any(kind == "changes" for kind, _ in log)
++    results = ksc.sync_all_once(OpsDown(svc, ME, []), boards=[(BOARD, kanban_home / "kanban.db")])
++    assert results[0].error and "HubError" in results[0].error
++
++
++def test_a_push_that_fails_once_before_the_pulls_is_sent_by_the_push_after_them(live, svc, kanban_home):
++    tid = kb.create_task(live, title="local edit")
++    _other_creates(svc, 3)
++    log: list = []
++    result = _round(kanban_home, OpsDown(svc, ME, log, fail=1))
++    assert result.error is None and log[0][0] == "ops-503"
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["title"] == "local edit"
++    assert {f"t_other{i:03d}" for i in range(3)} <= _replica_tasks()
++
++
++# --- 2. the outbox-age alarm under the before-head holds ------------------------------------------------------------
++
++def _age_pending(c, minutes):
++    with kbc.write_txn(c):  # one timestamp for every pending row: FIFO order is kept by rowid
++        c.execute("UPDATE kanban_sync_outbox SET created_at = ? WHERE state = 'pending'",
++                  (int((time.time() - minutes * 60) * 1000),))
++
++
++class _Alarm:
++    """Both alarm readers after each round: the sync loop's WARNING and the dispatcher tick's card."""
++
++    def __init__(self, path):
++        self.boards, self.clock, self.filed = [(BOARD, path)], [0.0], []
++
++    def after(self, result):
++        warned = outbox_age.after_round([result], self.boards)
++        self.clock[0] += outbox_age.CHECK_EVERY_S
++        filed = outbox_age.check(mono=lambda: self.clock[0], file_fn=lambda s, d: self.filed.append(d) or "t_x",
++                                 boards=self.boards)
++        return warned + filed
++
++
++def test_a_catch_up_never_alarms_on_ops_held_behind_a_pending_run_row(kanban_home, caplog):
++    """A pending run start, then a later task edit, both older than STALE_S, over a multi-round catch-up: the push
++    before the head holds both (FIFO cut), so no WARNING and no card; at the head both go and nothing stays stale."""
++    from tests.hermes_cli import test_kanban_sync_run_rows as run_rows
++    svc_ = FakeService(lease_runs=True)
++    support.write_sync_config(kanban_home, True)
++    c = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(c, BOARD, ME)
++    sync.set_mode(c, "primary")
++    previous = sync.set_lease_client(ksc.HubLeaseClient(svc_.hub(ME)))
++    path = kanban_home / "kanban.db"
++    try:
++        _tid, uid = run_rows._claimed(c, kanban_home, svc_, "claimed while asleep")
++        later = kb.create_task(c, title="edited after the claim")
++        rows = [r[0] for r in c.execute("SELECT table_name FROM kanban_sync_outbox WHERE state = 'pending' "
++                                        "ORDER BY created_at, rowid")]
++        assert "task_runs" in rows and rows.index("task_runs") < len(rows) - 1, rows
++        _other_creates(svc_, BACKLOG_PAGES)
++        _age_pending(c, minutes=30)
++        alarm = _Alarm(path)
++        hub = PagedHub(svc_, ME, [])
++        rounds = 0
++        with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_sync_outbox_age"):
++            while (result := _round(kanban_home, hub)).behind:
++                rounds += 1
++                assert result.error is None
++                assert alarm.after(result) == [], f"round {rounds}: alarmed on held ops"
++            assert rounds >= 2  # a multi-round catch-up
++            assert alarm.after(result) == []
++        assert not [r for r in caplog.records if "waited" in r.getMessage()] and alarm.filed == []
++        assert c.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state = 'pending'").fetchone()[0] == 0
++        assert outbox_age._age(path) is None
++        assert svc_.board(BOARD)["rows"]["tasks"][later]["title"] == "edited after the claim"
++        assert uid in svc_.board(BOARD)["rows"]["task_runs"]
++    finally:
++        sync.set_lease_client(previous)
++        c.close()
++
++
++def _stale_wakes(live_, svc_, kanban_home_, n):
++    """``n`` cards the Board completed in a page the next round does not reach, each with a local wake pending."""
++    cards = [kb.create_task(live_, title=f"done elsewhere {i}", assignee="worker") for i in range(n)]
++    with kbc.write_txn(live_):
++        live_.execute(f"UPDATE tasks SET status = 'scheduled' WHERE id IN ({','.join('?' * n)})", cards)
++    assert _round(kanban_home_, svc_.hub(ME)).error is None
++    _other_creates(svc_, BACKLOG_PAGES)
++    now = time.time_ns() // 1_000_000
++    ops = []
++    for i, tid in enumerate(cards):
++        ops += [{"client_op_id": f"done-{tid}", "op": "upsert", "table": "tasks", "uid": tid,
++                 "hlc": f"{now + 2 * i:013d}-0000-{OTHER}",
++                 "fields": {"status": "done", "completed_at": int(time.time())}},
++                {"client_op_id": f"ev-{tid}", "op": "upsert", "table": "task_events", "uid": sync.uuid7(),
++                 "hlc": f"{now + 2 * i + 1:013d}-0000-{OTHER}",
++                 "fields": {"task_id": tid, "kind": "completed", "payload": "{}", "created_at": int(time.time())}}]
++    svc_.hub(OTHER).ops(BOARD, ops)
++    with kbc.write_txn(live_):
++        live_.execute(f"UPDATE tasks SET status = 'ready' WHERE id IN ({','.join('?' * n)})", cards)
++    return cards
++
++
++def test_a_held_stale_wake_never_alarms_during_the_catch_up(live, svc, kanban_home, caplog):
++    path = kanban_home / "kanban.db"
++    [stale] = _stale_wakes(live, svc, kanban_home, 1)
++    alarm = _Alarm(path)
++    hub = PagedHub(svc, ME, [])
++    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_sync_outbox_age"):
++        result = _round(kanban_home, hub)
++        assert result.behind
++        _age_pending(live, minutes=30)  # the held wake is now far older than STALE_S
++        assert alarm.after(result) == []
++        while (result := _round(kanban_home, hub)).behind:
++            _age_pending(live, minutes=30)
++            assert alarm.after(result) == []
++        assert alarm.after(result) == []
++    assert not [r for r in caplog.records if "waited" in r.getMessage()] and alarm.filed == []
++    assert svc.board(BOARD)["rows"]["tasks"][stale]["status"] == "done"
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name = 'tasks' AND row_uid = ? "
++                            "AND state = 'pending'", (stale,)).fetchone()  # stripped and sent at the head
++    assert (outbox_age._age(path) or 0.0) < outbox_age.STALE_S  # only this round's own fresh bookkeeping, if any
++
++
++def test_a_sendable_op_still_alarms_while_behind(live, kanban_home):
++    """The hold is exact, not a blanket: an op the push before the head would send ages the alarm while behind."""
++    path = kanban_home / "kanban.db"
++    kb.create_task(live, title="sendable but stuck")
++    _age_pending(live, minutes=30)
++    backlog.note(path, True)
++    assert outbox_age._age(path) == pytest.approx(30 * 60, abs=5)
++
++
++# --- 5. one Board read per card per round ---------------------------------------------------------------------------
++
++class CountingHub(PagedHub):
++    def __init__(self, svc_, gateway, log):
++        super().__init__(svc_, gateway, log)
++        self.reads: list = []
++
++    def row_evidence(self, board, table, uid):
++        self.reads.append(uid)
++        return self._inner.row_evidence(board, table, uid)
++
++
++def test_a_behind_round_reads_each_held_card_from_the_board_once(live, svc, kanban_home):
++    cards = _stale_wakes(live, svc, kanban_home, 3)
++    hub = CountingHub(svc, ME, [])
++    assert _round(kanban_home, hub).behind
++    assert sorted(hub.reads) == sorted(cards)  # RED before: 6, the send after the pulls read them again
++    assert backlog.evidence(kanban_home / "kanban.db") == {tid: True for tid in cards}
++
++
++def test_the_send_after_the_pulls_at_the_head_reads_nothing(live, svc, kanban_home, monkeypatch):
++    """The push before the pulls must read (only its pull tells an at-head round); the one after them at the
++    head never does, so an at-head round reads each card at most once."""
++    stale = kb.create_task(live, title="t", assignee="worker")
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'scheduled' WHERE id = ?", (stale,))
++    assert _round(kanban_home, svc.hub(ME)).error is None
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (stale,))
++    hub = CountingHub(svc, ME, [])
++    sends: list = []
++    real_send = ksc._send
++    monkeypatch.setattr(ksc, "_send", lambda *a, **kw: sends.append((kw["after_pull"], len(hub.reads)))
++                        or real_send(*a, **kw))
++    assert not _round(kanban_home, hub).behind
++    assert hub.reads == [stale] and sends == [(False, 0), (True, 1)]
++
++
++# --- 3. repin: one live puller per board, and a capped read-back still confirms --------------------------------------
++
++def _cursor(conn_):
++    return int((sync.sync_state(conn_) or {}).get("cursor") or 0)
++
++
++def _foreign_changes(svc_, n):
++    b = svc_.board(BOARD)
++    for i in range(n):
++        svc_._put(b, "tasks", f"t_foreign{i:03d}", {"title": f"f{i}", "status": "ready", "created_on": "worker-1",
++                                                     "created_at": 1},
++                  "worker-1", None, f"{1_000 + i:013d}-0000-worker-1")
++
++
++def test_repin_never_pulls_the_live_board_while_a_round_holds_it(gws, svc):
++    origin, _ = gws
++    tid, _ = repin_fixtures._policy_card(origin)
++    _foreign_changes(svc, 3)
++    before = _cursor(origin.conn)
++    with board_sync_lock(Path(sync._db_key(origin.conn))):
++        res = km.move_queued(origin.conn, tid, runs_on=["machine:hub"], reason="x",
++                             hub=repin_fixtures.RepinHub(svc, HUB))
++        assert _cursor(origin.conn) == before  # RED before: the read-back pulled under the round
++    assert res["ok"] and res["readback"] == "pending" and "sync round holds" in res["note"], res
++    assert svc.board(BOARD)["rows"]["tasks"][tid]["placement_policy"] is None
++    origin.round()
++    assert repin_fixtures._local(origin.conn, tid) == (None, ["machine:hub"], "ready")
++
++
++class PagedRepinHub(repin_fixtures.RepinHub):
++    """One feed change per page, so a few dozen Board writes outrun the read-back's page budget."""
++
++    def changes(self, board, since, limit=500):
++        return super().changes(board, since, limit=1)
++
++
++def test_repin_behind_a_backlog_longer_than_the_page_budget_still_confirms_its_cas(gws, svc):
++    origin, _ = gws
++    tid, _ = repin_fixtures._policy_card(origin)
++    _foreign_changes(svc, backlog.PULL_PAGE_BUDGET + 10)
++    res = km.move_queued(origin.conn, tid, runs_on=["machine:hub"], reason="x", hub=PagedRepinHub(svc, HUB))
++    assert res["ok"] and res["readback"] == "confirmed", res  # RED before: pending, the row was past page 20
++    assert repin_fixtures._local(origin.conn, tid) == (None, ["machine:hub"], "ready")
++    assert _cursor(origin.conn) < svc.board(BOARD)["seq"]  # the cursor kept its bounded pull, not the targeted read
++
++
++def test_repin_conflict_behind_a_backlog_reads_the_newest_row_and_cas_again(gws, svc):
++    origin, _ = gws
++    tid, _ = repin_fixtures._policy_card(origin)
++    _foreign_changes(svc, backlog.PULL_PAGE_BUDGET + 10)
++    b = svc.board(BOARD)
++    svc._put(b, "tasks", tid, {"priority": 3}, "worker-1", None, f"{9_999_999_999_996:013d}-0000-x")  # unseen edit
++    hub = PagedRepinHub(svc, HUB)
++    res = km.move_queued(origin.conn, tid, runs_on=["machine:hub"], reason="x", hub=hub)
++    assert res.get("ok") is True and len(hub.repins) == 2, res
++    assert hub.repins[1]["expected_revision"] > hub.repins[0]["expected_revision"]
++
++
++def test_repin_conflict_while_a_round_holds_the_board_does_not_cas_blind(gws, svc):
++    origin, _ = gws
++    tid, _ = repin_fixtures._policy_card(origin)
++    b = svc.board(BOARD)
++    svc._put(b, "tasks", tid, {"priority": 3}, "worker-1", None, f"{9_999_999_999_996:013d}-0000-x")  # unseen edit
++    hub = repin_fixtures.RepinHub(svc, HUB)
++    with board_sync_lock(Path(sync._db_key(origin.conn))):
++        res = km.move_queued(origin.conn, tid, runs_on=["machine:hub"], reason="x", hub=hub)
++    assert res["reason_code"] == "revision_conflict" and len(hub.repins) == 1, res
++    assert b["rows"]["tasks"][tid]["placement_policy"] == wp.POLICY
++
++
++# --- 4. sync diff is a diagnostic ------------------------------------------------------------------------------------
++
++def _diff(svc_, kanban_home_, monkeypatch, capsys, hub):
++    from hermes_cli import kanban_sync_cli
++    monkeypatch.setattr(ksc, "load_identity", lambda: svc_.hub(ME).ident)
++    monkeypatch.setattr(ksc, "Hub", lambda ident: hub)
++    code = kanban_sync_cli._diff(argparse.Namespace(board=BOARD, json=True))
++    return code, json.loads(capsys.readouterr().out)
++
++
++def test_sync_diff_never_transfers_attachments(live, svc, kanban_home, monkeypatch, capsys):
++    from hermes_cli import kanban_sync_attachments
++    assert _round(kanban_home, svc.hub(ME)).error is None
++    transfers: list = []
++    monkeypatch.setattr(kanban_sync_attachments, "transfer_pending", lambda *a, **kw: transfers.append(a))
++    _other_creates(svc, 2)
++    _code, report = _diff(svc, kanban_home, monkeypatch, capsys, svc.hub(ME))
++    assert transfers == [] and not report.get("unavailable"), report
++    _round(kanban_home, svc.hub(ME))
++    assert transfers  # the sync round still transfers
++
++
++def test_sync_diff_reports_a_resync_instead_of_rebuilding_the_replica(live, svc, kanban_home, monkeypatch, capsys):
++    assert _round(kanban_home, svc.hub(ME)).error is None
++    replica = ksc.shadow_path(BOARD)
++    inode = replica.stat().st_ino
++    hub = svc.hub(ME)
++
++    def changes(board, since, limit=500):
++        raise ksc.Resync("cursor below the retention floor")
++    hub.changes = changes
++    code, report = _diff(svc, kanban_home, monkeypatch, capsys, hub)
++    assert code == 1 and report["unavailable"] and "retention floor" in report["refresh_error"], report
++    assert replica.stat().st_ino == inode  # RED before: unlinked and rebuilt from a snapshot
+-- 
+2.43.0
+

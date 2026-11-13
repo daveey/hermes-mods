@@ -1,0 +1,617 @@
+From 93e9a44e67689be783d13becc93cffd7ba39cf43 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:42:11 +0000
+Subject: [PATCH] [daveey] kanban: a park awaiting a card on another gateway
+ re-probes when that card's status change reaches the replica
+
+A park on `hermes kanban wait-check task <id>` or awaiting={kind: card, ref: <id>} was re-probed only every
+check_every (default 900 s), so PR #2277's owner slept ~10 min after its exact-head review approved on worker-1,
+holding the land lane (t_01a1d57d2d295afd). The replica pull now reports its applied status changes
+(ApplyResult/Pulled.status_changed); the sync round hands them to kanban_awaited_card_wake.expedite, which makes
+the probe of every scheduled park naming a changed card due now and wakes the dispatcher. The probe stays the
+judge (--from/--until unchanged; an unmet change costs one probe), no periodic polling is added, and the
+wake-check tick logs one awaited_card_done_park_lag WARNING for a park still asleep 2 min after its awaited card
+finished.
+---
+ hermes_cli/kanban_awaited_card_wake.py        | 144 ++++++++
+ hermes_cli/kanban_db_sync.py                  |   5 +
+ hermes_cli/kanban_sync_backlog.py             |   8 +-
+ hermes_cli/kanban_sync_client.py              |  21 +-
+ hermes_cli/kanban_wake_check.py               |   2 +
+ .../test_kanban_awaited_card_wake.py          | 315 ++++++++++++++++++
+ 6 files changed, 483 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/kanban_awaited_card_wake.py
+ create mode 100644 tests/hermes_cli/test_kanban_awaited_card_wake.py
+
+diff --git a/hermes_cli/kanban_awaited_card_wake.py b/hermes_cli/kanban_awaited_card_wake.py
+new file mode 100644
+index 0000000000..3f3bf27d0a
+--- /dev/null
++++ b/hermes_cli/kanban_awaited_card_wake.py
+@@ -0,0 +1,144 @@
++"""A park waiting on a card re-probes when that card's status change reaches this gateway's replica. [daveey]
++
++Incident (2026-11-13, t_01a1d57d2d295afd): PR #2277's owner t_01a1d4de561d5236 parked on
++``hermes kanban wait-check task t_01a1d5749bb06b1f`` (``awaiting`` kind=card, check_every 900). The review card
++completed on worker-1 at 07:14 PST; the owner's next probe was due 07:24, so it sat ``scheduled`` holding the land
++lane until an operator woke it at 07:17. A same-board wait is a parent link and promotes at once
++(``refresh_remote_parents``); a wait on a card another gateway owns was polled only every ``check_every``.
++
++Now each sync round hands the replica pull's status changes here (``Pulled.status_changed``). A scheduled park
++whose wake_check is ``wait-check task <id>`` or whose ``awaiting`` is ``{kind: card, ref: <id>}`` for a changed
++card gets its probe due now and the dispatcher is woken, so the probe runs on the next tick (seconds) instead of up
++to ``check_every`` later. The probe stays the judge: an unmet change (``--from``, an ``--until`` that excludes it)
++reads "not yet" and the probe goes back to its cadence, so each status change costs at most one probe per park.
++Nothing here polls: no status change, no work (hub-load design t_01a1d563324d7e8e).
++
++Detection: when an awaited card reached done/archived and its park is still ``scheduled`` more than
++``LAG_WARN_SECONDS`` later, the wake-check tick logs one ``awaited_card_done_park_lag`` WARNING (``report_lag``).
++"""
++from __future__ import annotations
++
++import logging
++import re
++import sqlite3
++import threading
++import time
++from typing import Mapping, Optional
++
++logger = logging.getLogger(__name__)
++
++LAG_WARN_SECONDS = 120
++_MAX_WATCHED = 1000  # in-memory lag records; the oldest are dropped past this
++_WAIT_CHECK_TASK = re.compile(r"\bwait-check\b[^;&|\n]*?\btask\s+(t_[0-9a-f]{8,16})\b")
++_FINISHED = ("done", "archived")
++_LOCK = threading.Lock()
++# (board db path, waiting card) -> (awaited card, its status, when this gateway applied it)
++_WATCH: dict[tuple[str, str], tuple[str, str, float]] = {}
++
++
++def named_cards(conn: sqlite3.Connection, task_id: str, cmd: Optional[str]) -> set[str]:
++    """The cards a park waits on: its ``wait-check task <id>`` probe and its ``awaiting`` card ref."""
++    from hermes_cli.kanban_awaiting import _TASK_ID, _latest_park
++
++    refs = set(_WAIT_CHECK_TASK.findall(cmd or ""))
++    awaiting, _reason = _latest_park(conn, task_id)
++    if isinstance(awaiting, dict) and awaiting.get("kind") == "card":
++        ref = str(awaiting.get("ref") or "")
++        if _TASK_ID.fullmatch(ref):
++            refs.add(ref)
++    refs.discard(task_id)
++    return refs
++
++
++def _db_key(conn: sqlite3.Connection) -> str:
++    from hermes_cli import kanban_db_connect as kbc
++    return str(kbc._main_db_file(conn) or "")
++
++
++def expedite(live: sqlite3.Connection, changed: Mapping[str, str], *, now: Optional[float] = None) -> list[str]:
++    """Make due now the wake probe of every scheduled park on ``live`` that names a card in ``changed``
++    ({card id: new status}, this round's replica apply). Returns the waiting cards whose probe moved earlier and
++    wakes the dispatcher for them. Never raises: a failure leaves the probe on its own cadence."""
++    if not changed:
++        return []
++    try:
++        return _expedite(live, changed, time.time() if now is None else float(now))
++    except (sqlite3.Error, ValueError, TypeError):
++        logger.warning("kanban awaited-card wake: could not re-check the parks naming %d changed card(s)",
++                       len(changed), exc_info=True)
++        return []
++
++
++def _expedite(live: sqlite3.Connection, changed: Mapping[str, str], now: float) -> list[str]:
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_db_connect import write_txn
++
++    try:
++        rows = live.execute(
++            "SELECT w.task_id, w.cmd FROM task_wake_checks w JOIN tasks t ON t.id = w.task_id "
++            "WHERE t.status = 'scheduled' AND w.purpose IS NOT 'ask_resolved'").fetchall()
++    except sqlite3.OperationalError:  # a board without the probe table (older schema): nothing parks on probes
++        return []
++    hits = []
++    for task_id, cmd in rows:
++        refs = sorted(named_cards(live, task_id, cmd) & set(changed))
++        if refs:
++            hits.append((task_id, cmd, refs[0]))
++    if not hits:
++        return []
++    key, due, moved = _db_key(live), int(now), []
++    with write_txn(live):
++        for task_id, cmd, ref in hits:
++            cur = live.execute(
++                "UPDATE task_wake_checks SET next_at = ? WHERE task_id = ? AND cmd = ? AND next_at > ? "
++                "AND purpose IS NOT 'ask_resolved' AND EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = "
++                "'scheduled')", (due, task_id, cmd, due, task_id))
++            if cur.rowcount:
++                moved.append(task_id)
++                logger.info("kanban awaited-card wake: %s re-probes now: awaited card %s is %s", task_id, ref,
++                            changed[ref])
++    _remember(key, hits, changed, now)
++    if moved:
++        sync.wake_dispatcher()
++    return moved
++
++
++def _remember(key: str, hits: list, changed: Mapping[str, str], now: float) -> None:
++    with _LOCK:
++        for task_id, _cmd, ref in hits:
++            if changed[ref] in _FINISHED:
++                _WATCH.setdefault((key, task_id), (ref, changed[ref], now))
++            else:
++                _WATCH.pop((key, task_id), None)
++        while len(_WATCH) > _MAX_WATCHED:
++            _WATCH.pop(next(iter(_WATCH)))
++
++
++def report_lag(conn: sqlite3.Connection, *, now: Optional[float] = None) -> list[str]:
++    """Log one WARNING per park still ``scheduled`` ``LAG_WARN_SECONDS`` after its awaited card finished (seen by
++    ``expedite``), then forget it; a park that left ``scheduled`` is forgotten silently. Returns the warned cards.
++    Reads only the parks ``expedite`` recorded, so it costs nothing while no awaited card finishes."""
++    key = _db_key(conn)
++    now = time.time() if now is None else float(now)
++    with _LOCK:
++        mine = [(tid, v) for (k, tid), v in _WATCH.items() if k == key]
++    warned = []
++    for task_id, (ref, status, seen) in mine:
++        try:
++            row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        except sqlite3.Error:
++            return warned
++        if row is not None and row[0] == "scheduled" and now - seen < LAG_WARN_SECONDS:
++            continue
++        with _LOCK:
++            _WATCH.pop((key, task_id), None)
++        if row is not None and row[0] == "scheduled":
++            warned.append(task_id)
++            logger.warning("awaited_card_done_park_lag task=%s awaited=%s lag_s=%d (awaited card %s, park still "
++                           "scheduled: its wake_check does not see it)", task_id, ref, int(now - seen), status)
++    return warned
++
++
++def _reset_for_tests() -> None:
++    with _LOCK:
++        _WATCH.clear()
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index b458993a2d..539b48b29e 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1260,6 +1260,9 @@ class ApplyResult:
+     # (``kanban_terminal_guard.enforce_after_apply``, run at the end of the page in the same transaction).
+     left_terminal: list[tuple[str, str]] = field(default_factory=list)
+     reopened: set[str] = field(default_factory=set)
++    # [daveey] Every card whose status this page changed, with the new status (a shadow copy too: it fires no
++    # observers, but the sync client re-probes the parks that name these cards, ``kanban_awaited_card_wake``).
++    status_changed: dict[str, str] = field(default_factory=dict)
+ 
+ 
+ def _repair_revision(conn: sqlite3.Connection) -> Optional[int]:
+@@ -1450,6 +1453,8 @@ def _mirror_lease(conn: sqlite3.Connection, task_id: str, holder: Optional[str],
+ def _collect_task_observers(ch: RemoteChange, new_status: Optional[str], changed: set[str],
+                             result: ApplyResult) -> None:
+     kwargs = {"remote": True, "origin_gateway": ch.origin_gateway}
++    if "status" in changed and new_status:
++        result.status_changed[ch.uid] = new_status
+     if "status" in changed and new_status in _STATUS_HOOKS:
+         result.hooks.append((_STATUS_HOOKS[new_status], ch.uid, kwargs))
+     if "status" in changed and new_status in _CLAIMABLE:
+diff --git a/hermes_cli/kanban_sync_backlog.py b/hermes_cli/kanban_sync_backlog.py
+index a4002e3440..b54277b230 100644
+--- a/hermes_cli/kanban_sync_backlog.py
++++ b/hermes_cli/kanban_sync_backlog.py
+@@ -65,14 +65,18 @@ def evidence(path: Path) -> dict:
+ 
+ class Pulled(int):
+     """The number of feed changes read (an ``int``, as before), plus whether the pull stopped at its page budget
+-    with the head not reached (``more``) or did not run because a sync round held the board (``busy``)."""
++    with the head not reached (``more``) or did not run because a sync round held the board (``busy``), and
++    ``status_changed`` ({card id: new status}: every status change the pull applied, last one wins)."""
+ 
+     more: bool
+     busy: bool
++    status_changed: dict
+ 
+-    def __new__(cls, n: int = 0, *, more: bool = False, busy: bool = False) -> Pulled:
++    def __new__(cls, n: int = 0, *, more: bool = False, busy: bool = False,
++                status_changed: Any = None) -> Pulled:
+         out = super().__new__(cls, int(n))
+         out.more, out.busy = bool(more), bool(busy)
++        out.status_changed = dict(status_changed or {})
+         return out
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 92dbfc6086..b1ff683724 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -859,10 +859,11 @@ def pull(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool,
+     that gateway's cards. [daveey]"""
+     from hermes_cli.kanban_sync_stop import checkpoint
+     total = pages = 0
++    changed: dict[str, str] = {}  # status changes applied, for the parks that name those cards
+     cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
+     while True:
+         if max_pages is not None and pages >= max_pages:
+-            return Pulled(total, more=True)  # unbounded, a backlog starved the round's push for hours
++            return Pulled(total, more=True, status_changed=changed)  # unbounded, a backlog starved the round's push for hours
+         pages += 1
+         checkpoint()
+         page = hub.changes(board, cursor)
+@@ -872,23 +873,21 @@ def pull(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool,
+             changes = own_partition(conn, changes, partition)
+         changes = without_pending(changes, pending_task_fields(conn))
+         nxt = int(page.get("next", cursor))
+-        if not page.get("changes") and nxt == cursor and not page.get("more") and not _applying(conn):
++        if (not page.get("changes") and nxt == cursor and not page.get("more")
++                and not (sync.sync_state(conn) or {}).get("applying")):
+             # An idle poll: no change, same cursor. The apply would only rewrite ``applying`` and ``cursor`` to
+             # the values they hold, a write transaction (WAL frame, fsync, observer wake) every round on every
+             # board for nothing. [daveey]
+-            return Pulled(total)
++            return Pulled(total, status_changed=changed)
+         # [daveey] The pre-filter above can miss a local edit committed after it read the outbox (a claim in
+         # flight): ``local_pending_wins`` checks again inside the apply transaction.
+-        sync.apply_remote_changes(conn, changes, new_cursor=nxt, board=board, observers=observers,
+-                                  local_pending_wins=True)
++        applied = sync.apply_remote_changes(conn, changes, new_cursor=nxt, board=board, observers=observers,
++                                            local_pending_wins=True)
++        changed.update(getattr(applied, "status_changed", None) or {})
+         total += len(page.get("changes", []))
+         cursor = nxt
+         if not page.get("more"):
+-            return Pulled(total)
+-
+-
+-def _applying(conn: sqlite3.Connection) -> bool:
+-    return bool((sync.sync_state(conn) or {}).get("applying"))
++            return Pulled(total, status_changed=changed)
+ 
+ 
+ def resync(conn: sqlite3.Connection, hub: Hub, board: str, *, observers: bool, partition: Optional[str] = None) -> int:
+@@ -1037,6 +1036,8 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+         with _pulled_replica(slug, hub, gateway) as (replica, pulled, rebuilt):
+             result.pulled = pulled
+             result.behind = pulled.more
++            from hermes_cli.kanban_awaited_card_wake import expedite
++            expedite(live, pulled.status_changed)  # a park naming a card the pull moved re-probes now [daveey]
+             applies: Optional[list] = []  # credited revision steps (kanban_sync_own_writes); None = a rebuild
+             if mode == "primary":
+                 try:
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index abdf5f69ff..bc401d8426 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -1001,6 +1001,8 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+         restore_missing_checks(conn, now=ts)  # [daveey] a park whose probe never reached this board
+         from hermes_cli import kanban_ask_resolved as kar
+         kar.reconcile(conn, now=ts)  # [daveey] an ask's probe row follows its stored ask; a lost one is restored
++        from hermes_cli.kanban_awaited_card_wake import report_lag
++        report_lag(conn, now=ts)  # [daveey] a park still asleep 2 min after its awaited card finished: one WARNING
+         due = conn.execute(
+             "SELECT w.task_id, w.cmd, w.every, w.generation, w.purpose FROM task_wake_checks w "
+             f"JOIN tasks t ON t.id = w.task_id WHERE {_LIVE_ROW} AND w.next_at <= ? ORDER BY w.next_at",
+diff --git a/tests/hermes_cli/test_kanban_awaited_card_wake.py b/tests/hermes_cli/test_kanban_awaited_card_wake.py
+new file mode 100644
+index 0000000000..33d424e0e3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_awaited_card_wake.py
+@@ -0,0 +1,315 @@
++"""A park waiting on a card another gateway owns re-probes when that card's status change reaches this gateway's
++replica, not up to ``check_every`` later (t_01a1d57d2d295afd). [daveey]
++
++PR #2277's owner (worker-5) parked on ``hermes kanban wait-check task <review>`` with check_every 900; the review
++completed on worker-1 at 07:14 PST and the owner slept until an operator woke it at 07:17 (next probe 07:24).
++"""
++from __future__ import annotations
++
++import argparse
++import contextlib
++import io
++import os
++import shlex
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_awaited_card_wake as acw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, OTHER, BOARD = "worker-5", "worker-1", "default"
++REVIEW = "t_01a1d5749bb06b1f"
++UNRELATED = "t_0000000000000abc"
++EVERY = 900
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    acw._reset_for_tests()
++    yield home
++    kwc._shutdown_for_tests()
++    acw._reset_for_tests()
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True)
++
++
++@pytest.fixture
++def live(kanban_home, svc):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    sync.set_mode(conn, "primary")
++    previous = sync.set_lease_client(ksc.HubLeaseClient(svc.hub(ME)))
++    try:
++        yield conn
++    finally:
++        sync.set_lease_client(previous)
++        conn.close()
++
++
++@pytest.fixture
++def probes(monkeypatch):
++    """Run each ``hermes kanban wait-check`` probe in-process (the real ``kanban_wait_check.run`` with the probe
++    env the dispatcher builds) and count runs per waiting card."""
++    from hermes_cli import kanban_wait_check as kwait
++
++    runs: dict[str, int] = {}
++    lock = threading.Lock()
++    parser = argparse.ArgumentParser()
++    parser.add_argument("check")
++    parser.add_argument("target")
++    for flag in ("--gateway", "--board", "--until"):
++        parser.add_argument(flag, default=None)
++    parser.add_argument("--from", dest="since", default=None)
++
++    def run_probe(key, cmd, cwd, env):
++        argv = shlex.split(cmd)
++        assert argv[:3] == ["hermes", "kanban", "wait-check"], cmd
++        with lock:
++            runs[env["HERMES_KANBAN_TASK"]] = runs.get(env["HERMES_KANBAN_TASK"], 0) + 1
++            saved = {k: os.environ.get(k) for k in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB",
++                                                    "HERMES_KANBAN_WAKE_PROBE")}
++            os.environ.update({k: env[k] for k in saved})
++            out = io.StringIO()
++            try:
++                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
++                    rc = kwait.run(parser.parse_args(argv[3:]))
++            finally:
++                for k, v in saved.items():
++                    if v is None:
++                        os.environ.pop(k, None)
++                    else:
++                        os.environ[k] = v
++        return rc, out.getvalue()
++
++    monkeypatch.setattr(kwc, "_run_probe", run_probe)
++    return runs
++
++
++def _round(kanban_home, svc):
++    return ksc.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
++
++
++_HLC = [0]
++
++
++def _other(svc, tid, fields):
++    """worker-1 writes its own card on the Board (it never exists in worker-5's live board)."""
++    _HLC[0] = max(_HLC[0] + 1, time.time_ns() // 1_000_000 + 1000)  # strictly increasing HLC millis
++    res = svc.hub(OTHER).ops(BOARD, [{
++        "client_op_id": f"other-{tid}-{_HLC[0]}", "op": "upsert", "table": "tasks", "uid": tid,
++        "hlc": f"{_HLC[0]:013d}-0000-{OTHER}",
++        "fields": {"title": tid, "created_at": 1, **fields}}])
++    assert res["results"][0]["status"] == "applied", res
++
++
++def _park(live, cmd, *, awaiting=None):
++    tid = kb.create_task(live, title="PR #2277 owner", assignee="worker")
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++    assert kb.claim_task(live, tid, claimer="worker") is not None
++    assert kb.schedule_task(live, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting on the review",
++                            wake_check=cmd, check_every=EVERY, awaiting=awaiting)
++    return tid
++
++
++def _next_at(live, tid):
++    state = kwc.get_state(live, tid)
++    assert state is not None
++    return state["next_at"]
++
++
++def _status(live, tid):
++    return kb.get_task(live, tid).status
++
++
++def _setup(live, svc, kanban_home, probes, cmd, *, review_status="running", awaiting=None):
++    """The review card exists on worker-1 and in worker-5's replica; the owner parks and runs its first probe."""
++    _other(svc, REVIEW, {"status": review_status})
++    _round(kanban_home, svc)
++    owner = _park(live, cmd, awaiting=awaiting)
++    t0 = int(time.time())
++    kwc.run_due_wake_checks(live, now=t0, wait=True)
++    assert _status(live, owner) == "scheduled" and probes[owner] == 1
++    assert _next_at(live, owner) == t0 + EVERY
++    sync.consume_dispatcher_wake()
++    return owner, t0
++
++
++# --- a. the review's completion wakes the owner without check_every elapsing ---------------------------------
++
++@pytest.mark.parametrize("awaiting", [None, {"kind": "card", "ref": REVIEW, "gateway": OTHER,
++                                              "why": "exact-head review of PR #2277"}])
++def test_review_done_on_another_gateway_wakes_the_owner_within_a_minute(live, svc, kanban_home, probes, awaiting,
++                                                                        monkeypatch):
++    from hermes_cli import kanban_awaiting as ka
++    # The park-time confirmation of the remote producer (kanban_schedule runs `wait-check --gateway` for it).
++    monkeypatch.setitem(ka._REMOTE_CONFIRMED, (OTHER, REVIEW), (time.monotonic(), f"{REVIEW} running"))
++    owner, t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW}", awaiting=awaiting)
++    _other(svc, REVIEW, {"status": "done"})  # 07:14 PST: the review completes on worker-1
++    _round(kanban_home, svc)  # worker-5's replica applies it
++    assert sync.consume_dispatcher_wake()  # the dispatcher tick runs now, not at its next interval
++    assert _next_at(live, owner) <= t0 + 60  # before the fix: t0 + 900
++    kwc.run_due_wake_checks(live, now=t0 + 60, wait=True)
++    assert _status(live, owner) == "ready"
++    met = [e for e in kb.list_events(live, owner) if e.kind == "condition_met"]
++    assert met and f"{REVIEW} done" in met[-1].payload["output"]
++
++
++def test_awaiting_card_ref_alone_names_the_card(live, kanban_home):
++    """A park whose own probe does not name the card still counts its ``awaiting`` card ref."""
++    owner = kb.create_task(live, title="owner", assignee="worker")
++    with kb.write_txn(live):
++        kb._append_event(live, owner, "scheduled", {"awaiting": {"kind": "card", "ref": REVIEW}})
++    assert acw.named_cards(live, owner, "test -f /x") == {REVIEW}
++    assert acw.named_cards(live, owner, f"hermes kanban wait-check task {UNRELATED} --gateway hub") == {
++        REVIEW, UNRELATED}
++    assert acw.named_cards(live, owner, f"hermes kanban wait-check task {owner}") == {REVIEW}  # never itself
++
++
++# --- b. no status change of the awaited card: exactly the probes of today ------------------------------------
++
++def test_no_change_of_the_awaited_card_adds_no_probe_over_30_minutes(live, svc, kanban_home, probes):
++    owner, t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW}")
++    _other(svc, UNRELATED, {"status": "ready"})
++    for minute in range(1, 31):
++        # Other cards keep moving on the Board, and the awaited card gets non-status edits.
++        _other(svc, UNRELATED, {"status": ("running", "review", "done")[minute % 3]})
++        _other(svc, REVIEW, {"title": f"review, edit {minute}"})
++        _round(kanban_home, svc)
++        kwc.run_due_wake_checks(live, now=t0 + 60 * minute, wait=True)
++        assert _status(live, owner) == "scheduled"
++    assert probes[owner] == 3  # t0, t0+900, t0+1800: the check_every cadence alone, as on main
++
++
++# --- c. --from and unmet changes ------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("since", ["blocked", "review", "triage"])
++def test_from_status_still_reads_not_yet_and_an_unmet_change_probes_at_most_once(
++        live, svc, kanban_home, probes, since):
++    cmd = f"hermes kanban wait-check task {REVIEW} --from {since}"
++    owner, t0 = _setup(live, svc, kanban_home, probes, cmd, review_status=since)
++    _other(svc, REVIEW, {"status": "running"})  # an intermediate change that is not met
++    _round(kanban_home, svc)
++    _round(kanban_home, svc)  # a second round with no further change
++    kwc.run_due_wake_checks(live, now=t0 + 30, wait=True)
++    kwc.run_due_wake_checks(live, now=t0 + 90, wait=True)
++    assert _status(live, owner) == "scheduled" and probes[owner] == 2  # one extra probe, then back on cadence
++    assert _next_at(live, owner) == t0 + 30 + EVERY
++    _other(svc, REVIEW, {"status": since})  # back in the --from status: still "unchanged since park"
++    _round(kanban_home, svc)
++    kwc.run_due_wake_checks(live, now=t0 + 120, wait=True)
++    assert _status(live, owner) == "scheduled" and probes[owner] == 3
++    _other(svc, REVIEW, {"status": "done"})
++    _round(kanban_home, svc)
++    kwc.run_due_wake_checks(live, now=t0 + 150, wait=True)
++    assert _status(live, owner) == "ready"
++
++
++# --- e. detection: a park still asleep after its awaited card finished ---------------------------------------
++
++def test_lag_warning_fires_once_for_a_park_that_cannot_see_the_done_card_and_never_after_a_wake(
++        live, svc, kanban_home, probes, caplog):
++    caplog.set_level("WARNING", logger=acw.__name__)
++    blind = f"hermes kanban wait-check task {REVIEW} --until review"  # done is not met for this probe
++    owner, _t0 = _setup(live, svc, kanban_home, probes, blind)
++    _other(svc, REVIEW, {"status": "done"})
++    _round(kanban_home, svc)
++    seen = time.time()
++    kwc.run_due_wake_checks(live, now=int(seen) + 30, wait=True)
++    assert _status(live, owner) == "scheduled" and probes[owner] == 2
++
++    def lags():
++        return [r.getMessage() for r in caplog.records if "awaited_card_done_park_lag" in r.getMessage()]
++
++    assert acw.report_lag(live, now=seen + acw.LAG_WARN_SECONDS - 5) == [] and not lags()
++    kwc.run_due_wake_checks(live, now=int(seen) + acw.LAG_WARN_SECONDS + 2, wait=True)
++    [line] = lags()
++    assert f"task={owner} awaited={REVIEW} lag_s=" in line
++    kwc.run_due_wake_checks(live, now=int(seen) + acw.LAG_WARN_SECONDS + 60, wait=True)
++    assert len(lags()) == 1  # once
++
++
++def test_no_lag_warning_once_the_park_woke(live, svc, kanban_home, probes, caplog):
++    caplog.set_level("WARNING", logger=acw.__name__)
++    owner, _t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW}")
++    _other(svc, REVIEW, {"status": "done"})
++    _round(kanban_home, svc)
++    seen = time.time()
++    kwc.run_due_wake_checks(live, now=int(seen) + 5, wait=True)
++    assert _status(live, owner) == "ready"
++    assert acw.report_lag(live, now=seen + 10 * acw.LAG_WARN_SECONDS) == []
++    assert not [r for r in caplog.records if "awaited_card_done_park_lag" in r.getMessage()]
++
++
++def test_expedite_never_raises_and_ignores_cards_no_park_names(live):
++    assert acw.expedite(live, {}) == []
++    assert acw.expedite(live, {UNRELATED: "done"}) == []
++    assert not sync.consume_dispatcher_wake()
++
++
++def _local_park(live, monkeypatch):
++    from hermes_cli import kanban_awaiting as ka
++    monkeypatch.setitem(ka._REMOTE_CONFIRMED, (OTHER, REVIEW), (time.monotonic(), f"{REVIEW} running"))
++    owner = _park(live, f"hermes kanban wait-check task {REVIEW}",
++                  awaiting={"kind": "card", "ref": REVIEW, "gateway": OTHER, "why": "review"})
++    with kb.write_txn(live):
++        live.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id = ?", (int(time.time()) + EVERY, owner))
++    sync.consume_dispatcher_wake()
++    return owner
++
++
++def test_a_probe_already_due_is_left_alone_and_wakes_nothing(live, monkeypatch):
++    owner = _local_park(live, monkeypatch)
++    due = int(time.time()) - 5
++    with kb.write_txn(live):
++        live.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id = ?", (due, owner))
++    assert acw.expedite(live, {REVIEW: "done"}) == []
++    assert _next_at(live, owner) == due and not sync.consume_dispatcher_wake()
++
++
++def test_a_park_that_left_scheduled_meanwhile_is_not_touched(live, monkeypatch):
++    """The parks are read outside the write txn: one that wakes before the update keeps its row as it is."""
++    owner = _local_park(live, monkeypatch)
++    before = _next_at(live, owner)
++    real = acw.named_cards
++
++    def woke_meanwhile(conn, task_id, cmd):
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
++        return real(conn, task_id, cmd)
++
++    monkeypatch.setattr(acw, "named_cards", woke_meanwhile)
++    assert acw.expedite(live, {REVIEW: "done"}) == []
++    assert _next_at(live, owner) == before and not sync.consume_dispatcher_wake()
++
++
++def test_a_reopened_awaited_card_drops_its_lag_record(live, monkeypatch):
++    owner = _local_park(live, monkeypatch)
++    now = time.time()
++    assert acw.expedite(live, {REVIEW: "done"}, now=now) == [owner]
++    with kb.write_txn(live):  # the probe ran and went back on cadence, the card reopened on worker-1
++        live.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id = ?", (int(now) + EVERY, owner))
++    assert acw.expedite(live, {REVIEW: "running"}, now=now + 1) == [owner]
++    assert acw.report_lag(live, now=now + 10 * acw.LAG_WARN_SECONDS) == []
++
++
++def test_lag_records_are_bounded(live, monkeypatch):
++    owner = _local_park(live, monkeypatch)
++    monkeypatch.setattr(acw, "_MAX_WATCHED", 1)
++    acw._WATCH[("elsewhere", "t_0000000000000001")] = (REVIEW, "done", 0.0)
++    acw.expedite(live, {REVIEW: "done"}, now=time.time())
++    assert list(acw._WATCH) == [(acw._db_key(live), owner)]
+-- 
+2.43.0
+

@@ -1,0 +1,387 @@
+From b3745e62d5032dae7c94f802cbf22d34af850c4f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:25:11 +0000
+Subject: [PATCH] [daveey] kanban queue reason: candidate load flaps are not
+ new observations
+
+A ready worker-first card waiting for pickup got a worker-placement comment
+and a worker_queue_reason event almost every 10 s (t_01a1d5386cb55abf: 79 in
+18 min; 181 placement comments in 24 h on one board). The Board's reserve
+reply kept the same code and reservation; only a candidate's load_threshold /
+max_card_runs_reached (and reserved_capacity_held / last_seen_invalid)
+flipped, and _signature() kept every candidate's reasons, so each flip was a
+"change".
+
+_record now writes an event + comment only when the meaning changes:
+- the state code / state / lifecycle changes (reserved -> board_error ->
+  no_live_candidate, return to origin, a new run),
+- whether any candidate is eligible flips (all ineligible, or one back),
+- a candidate gains or loses a structural reason (missing_labels,
+  capability, draining, liveness, any unknown reason).
+VOLATILE_REASONS (load_threshold, memory_threshold, max_card_runs_reached,
+reserved_capacity_held, last_seen_invalid) write at most one event + comment
+per card per REFRESH_MS (10 min), and only for a picture different from the
+last event. A reservation handed to another worker is an event without a
+comment: kanban_pickup_stall reads these events as "seen not pinned here"
+sightings, and the comment text would repeat the last one.
+
+A volatile-only observation replaces an origin-local row
+(kanban_queue_latest, created on first use, never synced), so latest() and
+kanban show's queue: line stay the newest observation; a replica (no table)
+reads the last event as before.
+
+Proof:
+- RED on main: tests/hermes_cli/test_kanban_queue_reason_flaps.py, 120
+  reserved observations flapping volatile reasons every 10 s for 20 min ->
+  120 comments, 120 events.
+- GREEN: <= 3 comments and 3 events; latest() returns the newest
+  observation; code change, all-ineligible, missing_labels and origin
+  still comment at once.
+- Replay of the real worker_queue_reason payloads from this board:
+  t_01a1d5386cb55abf 140 observations / 41 min -> 39 comments, 75 events;
+  t_01a1d54acc8c8e54 49 / 21 min -> 13 comments, 20 events. The rest are
+  code flips (reserved <-> admission_limits/mixed), kept immediate.
+
+Card: t_01a1d54acc8c8e54
+---
+ hermes_cli/kanban_queue_reason.py             | 103 ++++++++++-
+ .../test_kanban_queue_reason_flaps.py         | 166 ++++++++++++++++++
+ 2 files changed, 260 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_queue_reason_flaps.py
+
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index e1666096b2..98f5db98ed 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -5,6 +5,7 @@ import json
+ import logging
+ import math
+ import re
++import sqlite3
+ import threading
+ import time
+ from datetime import UTC, datetime
+@@ -66,21 +67,52 @@ def normalize(reply):
+ 
+ 
+ def _stored(conn, task_id):
++    """The last recorded transition (event)."""
+     # Origin timestamps travel with the payload; replica-local insertion IDs do not.
+     rows = conn.execute(
+         "SELECT payload FROM task_events WHERE task_id=? AND kind=? AND json_valid(payload) "
+         "ORDER BY COALESCE(json_extract(payload, '$.recorded_at_ms'), created_at * 1000) DESC, "
+         "payload DESC LIMIT 1", (task_id, EVENT)).fetchall()
++    return _loads(rows[0][0]) if rows else None
++
++
++def _loads(text):
+     try:
+-        value = json.loads(rows[0][0]) if rows else None
++        value = json.loads(text)
+         return value if isinstance(value, dict) else None
+     except (TypeError, ValueError):
+         return None
+ 
+ 
+-def latest(conn, task_id):
+-    """Read the last transition, qualifying it against current task lifecycle state."""
++# A volatile-only change (see ``VOLATILE_REASONS``) is no transition: it replaces this origin-local row instead of
++# appending an event and a comment, so ``latest()`` stays the newest observation. No row = the event is newest.
++# Local only (never synced): a replica's ``latest()`` is the origin's last transition, as before.
++LATEST_TABLE = "kanban_queue_latest"
++
++
++def _newest(conn, task_id):
++    """The newest observation: the local volatile-only one when it postdates the last transition."""
+     value = _stored(conn, task_id)
++    try:
++        row = conn.execute(f"SELECT payload FROM {LATEST_TABLE} WHERE task_id=?", (task_id,)).fetchone()
++    except sqlite3.OperationalError as exc:
++        if "no such table" not in str(exc):
++            raise
++        return value  # nothing newer than the event was ever stored here (a replica, or no flap yet)
++    local = _loads(row[0]) if row else None
++    if local is None or (value is not None and not (_ms_of(local) > _ms_of(value))):
++        return value
++    return local
++
++
++def _ms_of(value) -> float:
++    ms = value.get("recorded_at_ms")
++    return float(ms) if _number(ms) else 0.0
++
++
++def latest(conn, task_id):
++    """Read the newest observation, qualifying it against current task lifecycle state."""
++    value = _newest(conn, task_id)
+     if value is None:
+         return None
+     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+@@ -137,6 +169,52 @@ def _signature(value):
+     return signature
+ 
+ 
++# Admission reasons the Board re-samples on every reserve (load, run caps, a held reservation slot, a heartbeat
++# sample): they flip between ~10 s replies with no change in what the card waits for. t_01a1d5386cb55abf (11-13) got
++# 79 comments in 18 min from these flips alone. Anything else (missing labels, capability, draining, liveness, an
++# unknown reason) is structural and still a transition.
++VOLATILE_REASONS = frozenset({"load_threshold", "memory_threshold", "max_card_runs_reached",
++                              "reserved_capacity_held", "last_seen_invalid"})
++# At most one volatile-only event + comment per card per this window, and only for a different picture.
++REFRESH_MS = 600_000
++
++
++def _meaning(value):
++    """``_signature`` without volatile reasons or the reserved machine: what the card waits for.
++
++    Whether any candidate is eligible stays in it, so all candidates going ineligible (or one coming back) is a
++    transition even when only volatile reasons caused it."""
++    signature = _signature(value)
++    candidates = signature.get("candidates") or []
++    signature["eligible"] = any(not c.get("reasons") for c in candidates)
++    signature["candidates"] = [{**c, "reasons": [r for r in c.get("reasons") or [] if r not in VOLATILE_REASONS]}
++                               for c in candidates]
++    if value.get("state") == "assigned":
++        signature.pop("machine", None)
++        if "lifecycle" in signature:
++            signature["lifecycle"] = {**signature["lifecycle"], "runs_on": None}
++    return signature
++
++
++def _reserved(value):
++    return value.get("machine") if value.get("state") == "assigned" else None
++
++
++def _write(previous, value, now_ms):
++    """``(event, comment)`` for an observation that differs from the last transition ``previous``.
++
++    A reservation handed to another worker is an event without a comment: pickup-stall reads the events as "seen
++    not pinned here" sightings (``kanban_pickup_stall._seen_unpinned_here_ms``), and the thread text would only
++    repeat the last comment."""
++    if previous is None or _meaning(previous) != _meaning(value):
++        return True, True
++    if _reserved(previous) != _reserved(value):
++        return True, False
++    if now_ms - _ms_of(previous) >= REFRESH_MS and _signature(previous) != _signature(value):
++        return True, True
++    return False, False
++
++
+ def _stamp(ms):
+     try:
+         return datetime.fromtimestamp(ms / 1000, UTC).isoformat().replace("+00:00", "Z")
+@@ -214,11 +292,11 @@ def _owned_row(conn, task_id, gateway, fence):
+ 
+ 
+ def _record(conn, task_id, gateway, value, *, fence=None, comment=True):
+-    """Append one change-only observation and its thread comment.
++    """Append one change-only observation and its thread comment, or store a volatile-only one (``_write``).
+ 
+     ``fence`` (from ``snapshot``) checks the row the Board request was made from instead of the current one: a
+     refusal answered against that row stays recorded after a feed pull moved the row on, exactly as it was before
+-    the placement tick learned to pull on ``not_claimable``.
++    the placement tick learned to pull on ``not_claimable``. Returns whether an event was appended.
+     """
+     from hermes_cli import kanban_db as kb
+ 
+@@ -227,14 +305,21 @@ def _record(conn, task_id, gateway, value, *, fence=None, comment=True):
+         if row is None:
+             return False
+         value = {**value, "lifecycle": fence["lifecycle"] if fence is not None else _lifecycle(conn, task_id, row)}
+-        previous = _stored(conn, task_id)
+-        if previous and _signature(previous) == _signature(value):
++        newest = _newest(conn, task_id)
++        if newest and _signature(newest) == _signature(value):
+             return False
+-        previous_ms = (previous or {}).get("recorded_at_ms", 0)
++        previous_ms = (newest or {}).get("recorded_at_ms", 0)
+         recorded_ms = max(int(time.time() * 1000), int(previous_ms) + 1 if _number(previous_ms) else 0)
+         value = {**value, "recorded_at_ms": recorded_ms}
++        event, commented = _write(_stored(conn, task_id), value, recorded_ms)
++        if not event:
++            conn.execute(f"CREATE TABLE IF NOT EXISTS {LATEST_TABLE} (task_id TEXT PRIMARY KEY "
++                         "REFERENCES tasks(id) ON DELETE CASCADE, payload TEXT NOT NULL)")
++            conn.execute(f"INSERT OR REPLACE INTO {LATEST_TABLE} (task_id, payload) VALUES (?, ?)",
++                         (task_id, json.dumps(value, ensure_ascii=False)))
++            return False
+         kb._append_event(conn, task_id, EVENT, value)
+-        if comment:  # a card no pool worker can run gets the owner's repin notice as its thread comment instead
++        if comment and commented:  # a card no pool worker can run gets the owner's repin notice as its comment
+             kb.add_comment(conn, task_id, "worker-placement", describe(value), origin_gateway=gateway)
+         return True
+ 
+diff --git a/tests/hermes_cli/test_kanban_queue_reason_flaps.py b/tests/hermes_cli/test_kanban_queue_reason_flaps.py
+new file mode 100644
+index 0000000000..fbbbb86d54
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_queue_reason_flaps.py
+@@ -0,0 +1,166 @@
++"""Candidate load flaps are not new queue observations (t_01a1d54acc8c8e54).
++
++On 11-13 a ready worker-first card waiting for pickup (t_01a1d5386cb55abf) got 79 ``worker-placement`` comments and
++79 ``worker_queue_reason`` events in 18 min: the Board's reserve reply came back every ~10 s with the same code and
++reservation, and only a candidate's ``load_threshold`` / ``max_card_runs_reached`` flipped. A flap still updates the
++stored latest observation (``latest()``, the ``queue:`` line of ``kanban show``); it writes at most one event and
++comment per ``REFRESH_MS``. A change of meaning (state code, eligibility, a structural reason, origin) still writes
++at once.
++"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_queue_reason as qr
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++
++conn = fixtures.conn
++
++T0 = 1_794_579_000.0
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    now = [T0]
++    monkeypatch.setattr(qr.time, "time", lambda: now[0])
++    return now
++
++
++def assigned(at, candidates, code="reserved", machine="worker-2"):
++    return {"state": "assigned", "machine": machine,
++            "observation": {"version": 1, "code": code, "observed_at_ms": at, "candidates": candidates}}
++
++
++def queued(at, candidates, code):
++    return {"state": "queued", "machine": None,
++            "observation": {"version": 1, "code": code, "observed_at_ms": at, "candidates": candidates}}
++
++
++# The flips seen on t_01a1d5386cb55abf at 14:17:40-14:18:42Z: worker-2 stays eligible throughout.
++FLAPS = [
++    {"worker-3": [], "worker-4": ["load_threshold"]},
++    {"worker-3": ["max_card_runs_reached"], "worker-4": ["load_threshold", "max_card_runs_reached"]},
++    {"worker-3": ["load_threshold"], "worker-4": []},
++    {"worker-3": [], "worker-4": ["max_card_runs_reached"]},
++]
++
++
++def flap(i):
++    return [{"machine": "worker-2", "reasons": []},
++            *({"machine": m, "reasons": r} for m, r in FLAPS[i % len(FLAPS)].items())]
++
++
++def counts(conn, tid):
++    events = conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind=?", (tid, qr.EVENT)).fetchone()[0]
++    return len(kb.list_comments(conn, tid)), events
++
++
++def test_volatile_flaps_every_10s_for_20_min_write_at_most_one_per_10_min(conn, clock):
++    tid = fixtures.acknowledged(conn)
++    last = None
++    for i in range(120):  # every 10 s for 20 minutes
++        clock[0] = T0 + 10 * i
++        last = assigned(int(clock[0] * 1000), flap(i))
++        qr.record_reply(conn, tid, "hub", last)
++    comments, events = counts(conn, tid)
++    print(f"20 min of 10 s volatile flaps: {comments} comments, {events} events")
++    assert comments <= 3 and events <= 3
++    assert comments == events  # every written event has its comment
++    newest = qr.latest(conn, tid)
++    assert newest["observed_at_ms"] == last["observation"]["observed_at_ms"]
++    assert newest["candidates"] == qr.normalize(last)["candidates"]
++    assert newest["current"] is True
++    assert qr.describe(newest).endswith(qr._stamp(last["observation"]["observed_at_ms"]))
++
++
++def test_refresh_needs_a_different_volatile_picture(conn, clock):
++    """After the refresh window a flap that ends where the last comment was writes nothing new."""
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", assigned(1, flap(0)))
++    clock[0] = T0 + 30
++    qr.record_reply(conn, tid, "hub", assigned(2, flap(1)))
++    clock[0] = T0 + qr.REFRESH_MS / 1000 + 60
++    assert not qr.record_reply(conn, tid, "hub", assigned(3, flap(0)))  # same picture as the one commented
++    assert counts(conn, tid) == (1, 1)
++    assert qr.latest(conn, tid)["observed_at_ms"] == 3
++    clock[0] += 10
++    assert qr.record_reply(conn, tid, "hub", assigned(4, flap(2)))
++    assert counts(conn, tid) == (2, 2)
++
++
++def test_state_code_changes_still_comment_at_once(conn, clock):
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", assigned(1, flap(0)))
++    clock[0] += 5
++    qr.record_reply(conn, tid, "hub", assigned(2, flap(1)))  # volatile only: stored, no comment
++    clock[0] += 5
++    assert qr.record_error(conn, tid, "hub", status=400)
++    clock[0] += 5
++    assert qr.record_reply(conn, tid, "hub", queued(4, [{"machine": "worker-2", "reasons": ["last_seen_stale"]}],
++                                                    "no_live_candidate"))
++    bodies = [c.body for c in kb.list_comments(conn, tid)]
++    assert len(bodies) == 3
++    assert bodies[1].startswith("Board observation failed") and bodies[2].startswith("No live candidate")
++    assert qr.latest(conn, tid)["code"] == "no_live_candidate"
++
++
++def test_all_candidates_becoming_ineligible_comments_at_once(conn, clock):
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", assigned(1, flap(0)))
++    clock[0] += 10
++    none_eligible = [{"machine": m, "reasons": ["load_threshold"]} for m in ("worker-2", "worker-3", "worker-4")]
++    assert qr.record_reply(conn, tid, "hub", assigned(2, none_eligible))
++    assert counts(conn, tid) == (2, 2)
++    clock[0] += 10
++    assert qr.record_reply(conn, tid, "hub", assigned(3, flap(0)))  # and back
++    assert counts(conn, tid) == (3, 3)
++
++
++def test_gaining_or_losing_a_structural_reason_comments_at_once(conn, clock):
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", assigned(1, flap(0)))
++    clock[0] += 10
++    gained = flap(0)
++    gained[1] = {"machine": "worker-3", "reasons": ["missing_labels"], "missing_labels": ["skill:five-whys"]}
++    assert qr.record_reply(conn, tid, "hub", assigned(2, gained))
++    assert "missing skill:five-whys" in kb.list_comments(conn, tid)[-1].body
++    clock[0] += 10
++    draining = flap(0)
++    draining[2] = {"machine": "worker-4", "reasons": ["draining", "load_threshold"]}
++    gained[2] = draining[2]
++    assert qr.record_reply(conn, tid, "hub", assigned(3, gained))
++    clock[0] += 10
++    assert qr.record_reply(conn, tid, "hub", assigned(4, flap(0)))  # both lost
++    assert counts(conn, tid) == (4, 4)
++
++
++def test_return_to_origin_comments_at_once(conn, clock):
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", assigned(1, flap(0)))
++    clock[0] += 10
++    origin = {"state": "origin", "machine": "hub", "reason": "no pool worker can run it: missing git",
++              "observation": {"version": 1, "code": "no_eligible_worker", "observed_at_ms": 2,
++                              "candidates": flap(1)}}
++    assert qr.record_reply(conn, tid, "hub", origin)
++    assert counts(conn, tid) == (2, 2)
++    assert kb.list_comments(conn, tid)[-1].body.startswith("Returned to origin hub")
++    assert qr.latest(conn, tid)["state"] == "origin"
++
++
++def test_a_new_reserved_worker_is_an_event_without_a_comment(conn, clock):
++    """pickup-stall reads the origin's events as "seen not pinned here" sightings, so a reservation handed to another
++    worker stays in the event log; its text would repeat the last comment, so it posts none."""
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", assigned(1, flap(0)))
++    clock[0] += 10
++    assert qr.record_reply(conn, tid, "hub", assigned(2, flap(0), machine="worker-3"))
++    assert counts(conn, tid) == (1, 2)
++    assert qr.latest(conn, tid)["machine"] == "worker-3"
++
++
++def test_latest_without_the_local_table_reads_events(conn):
++    """A replica (or an origin before its first flap) has no side table: latest() is the last event."""
++    tid = fixtures.acknowledged(conn)
++    conn.execute(f"DROP TABLE IF EXISTS {qr.LATEST_TABLE}")
++    qr.record_reply(conn, tid, "hub", assigned(1, flap(0)))
++    conn.execute(f"DROP TABLE IF EXISTS {qr.LATEST_TABLE}")
++    assert qr.latest(conn, tid)["observed_at_ms"] == 1
+-- 
+2.43.0
+

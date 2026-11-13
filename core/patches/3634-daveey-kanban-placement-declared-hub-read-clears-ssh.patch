@@ -1,0 +1,214 @@
+From 0f1c8edd901c3fdf512b5a9136d15581f37bc941 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:16:54 +0000
+Subject: [PATCH] [daveey] kanban placement: declared hub:read clears `ssh
+ hermes-hub <read>` and ~/.hermes paths under hub-read roots
+
+A card that declares requires: [hub:read], with every destination attesting
+capability:hub-read, now also drops from the marker scan:
+- `ssh hermes-hub <sub>` for hub-read's subcommands (cat tail head ls grep sqlite
+  status journal units git help); a bare ssh or ssh <other host> still pins;
+- ~/.hermes/<p> and /home/<u>/.hermes/<p> whose <p> is under
+  kanban.placement.hub_read_roots (unset or malformed = nothing cleared).
+Only the path token goes, so a write verb elsewhere (restart the gateway,
+systemctl, hermes config set) still pins. Undeclared cards and claim_refusal
+are unchanged. Kanban t_01a1cf7175102c70.
+---
+ hermes_cli/kanban_placement_coordination.py   | 52 ++++++++++
+ hermes_cli/kanban_placement_diagnostics.py    |  5 +-
+ .../hermes_cli/test_kanban_hub_read_roots.py  | 94 +++++++++++++++++++
+ 3 files changed, 150 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_hub_read_roots.py
+
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index ca177e461c..8e620822e6 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -93,6 +93,55 @@ _ACCESS = (
+ )
+ 
+ 
++# hub-read's subcommands (hub ``~/.hermes/bin/hub-read``): ``ssh hermes-hub <sub>`` runs that restricted reader,
++# not a shell. A bare ``ssh``, ``ssh hermes-hub <anything else>`` and ``ssh <other host>`` keep pinning.
++HUB_READ_SUBCOMMANDS = ("cat", "tail", "head", "ls", "grep", "sqlite", "status", "journal", "units", "git", "help")
++_HUB_READ_SSH = re.compile(r"\bssh[ \t]+hermes-hub[ \t]+(?:" + "|".join(HUB_READ_SUBCOMMANDS) + r")(?![\w-])",
++                           re.IGNORECASE)
++# A Hermes state path (same roots as ``kanban_placement.HERMES_STATE_PATH``) up to the next space, quote or bracket.
++_STATE_PATH = re.compile(r"(?:~|/home/[^/\s]+)/\.hermes/([^\s`'\"<>()\[\]{},;|]*)")
++
++
++def hub_read_roots(cfg) -> tuple:
++    """``kanban.placement.hub_read_roots`` as segment tuples (paths relative to ``~/.hermes``); () when unset.
++
++    Fails closed: a malformed list, or an absolute, empty or ``.``/``..`` entry, clears nothing."""
++    roots = cfg.get("hub_read_roots") if isinstance(cfg, dict) else None
++    if not isinstance(roots, list):
++        return ()
++    out = []
++    for root in roots:
++        segs = tuple(root.strip().rstrip("/").split("/")) if isinstance(root, str) else ()
++        if segs and not root.strip().startswith("/") and all(s not in ("", ".", "..") for s in segs):
++            out.append(segs)
++    return tuple(out)
++
++
++def _under_roots(path: str, roots) -> bool:
++    segs = path.rstrip(".:!?").rstrip("/").split("/")
++    if any(s in ("", ".", "..") for s in segs):
++        return False
++    return any(tuple(segs[:len(r)]) == r for r in roots)
++
++
++def without_read_paths(text, cfg, *, target=None, requires=None):
++    """``text`` minus ``~/.hermes/<p>`` paths under :func:`hub_read_roots`, for a declared and attested ``hub:read``.
++
++    Only the path token goes, so a marker that merely names the file being read (``hermes-sync`` in
++    ``~/.hermes/logs/hermes-sync.log``, ``cron`` in ``~/.hermes/cron/...``) stops pinning, while every marker outside
++    it (a write verb such as ``restart the gateway`` or ``systemctl``) still pins. [daveey] t_01a1cf7175102c70"""
++    roots = hub_read_roots(cfg)
++    if not roots or "hub:read" not in set(requires or []):
++        return text
++    if not attested(destinations(cfg, target), access_requirements(requires)):
++        return text
++    return _strip_read_paths(text, roots)
++
++
++def _strip_read_paths(text, roots):
++    return _STATE_PATH.sub(lambda m: "" if _under_roots(m.group(1), roots) else m.group(0), text)
++
++
+ def requirements(text):
+     """Return required labels and an unsupported-action refusal, without changing text."""
+     labels = set()
+@@ -238,6 +287,9 @@ def access_text(text, cfg, *, target=None, requires=None):
+     labels = access_requirements(declared)
+     if not labels or not attested(destinations(cfg, target), labels):
+         return text
++    if "hub:read" in declared:
++        # The restricted reader's own invocation, and reads under its roots (``kanban.placement.hub_read_roots``).
++        text = _strip_read_paths(_HUB_READ_SSH.sub("", text), hub_read_roots(cfg))
+     for rx, needed in _ACCESS:
+         if declared & needed:
+             text = rx.sub("", text)
+diff --git a/hermes_cli/kanban_placement_diagnostics.py b/hermes_cli/kanban_placement_diagnostics.py
+index 0eb4592325..6170a5d7f1 100644
+--- a/hermes_cli/kanban_placement_diagnostics.py
++++ b/hermes_cli/kanban_placement_diagnostics.py
+@@ -48,10 +48,13 @@ def _home_hits(full: str, reqs: list, c):
+     from hermes_cli.kanban_published_worktree import without_published_worktrees
+ 
+     marker_full = coordination.access_text(coordination.marker_text(full), c.raw, requires=reqs)
++    # Other markers read the whole text minus only the hub-read-root paths a declared, attested hub:read clears
++    # (HERMES_STATE_PATH included: never marker_text's output, which drops ``token-broker`` from a path).
++    read_full = coordination.without_read_paths(full, c.raw, requires=reqs)
+     extra = c.raw.get("extra_home_markers")
+     exemptible = (p.HUB_CLI_COMMAND, r"\btoken-broker\b", r"\bssh\b", r"\bon the hub\b", r"\bthe hub's\b",
+                   r"\bjournalctl\b", r"\bkanban\.db\b")
+-    pats = [(rx, rx, marker_full if rx in exemptible else full)
++    pats = [(rx, rx, marker_full if rx in exemptible else read_full)
+             for rx in p.HOME_GATEWAY_MARKERS if rx != p.HOST_WORKTREE_PATH]
+     pats += [(rx, "operator", full) for rx in extra] if isinstance(extra, list) else []
+     for rx, name, text in pats:
+diff --git a/tests/hermes_cli/test_kanban_hub_read_roots.py b/tests/hermes_cli/test_kanban_hub_read_roots.py
+new file mode 100644
+index 0000000000..4e3ca0e602
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hub_read_roots.py
+@@ -0,0 +1,94 @@
++"""A declared, attested ``hub:read`` clears hub-read's own reads: ``ssh hermes-hub <sub>`` and paths under its roots."""
++import pytest
++
++from hermes_cli import kanban_placement as kp
++from hermes_cli import kanban_placement_coordination as coord
++from tests.hermes_cli import test_kanban_coordination_placement as helpers
++
++fleet = helpers.fleet
++
++ROOTS = ["logs", "cron", "kanban", "cache/core-update", "core-update", "cache/hermes-sync", "cache/delegation",
++         "config.yaml", "coach", "user-steps", "inbox"]
++STEP = "Step 1: ssh hermes-hub grep X ~/.hermes/logs/hermes-sync.log and report the matches."
++
++
++@pytest.fixture(autouse=True)
++def _board_maps_access(monkeypatch):
++    monkeypatch.setattr(coord, "BOARD_PLACEABLE_ACCESS", frozenset(coord.ACCESS_LABELS))
++
++
++@pytest.fixture
++def attested(fleet):
++    cfg, entry, machines = fleet
++    entry["labels"].append("capability:hub-read")
++    cfg["hub_read_roots"] = list(ROOTS)
++    return cfg, entry, machines
++
++
++def reason(body, cfg, requires=("hub:read",)):
++    return kp.portable_reason({"title": "Check the sync log", "body": body, "requires": list(requires)}, cfg)
++
++
++def test_declared_read_step_is_portable(attested):
++    cfg, _, _ = attested
++    assert reason(STEP, cfg) is None
++
++
++@pytest.mark.parametrize("body", [
++    "ssh hermes-hub cat /home/ubuntu/.hermes/config.yaml",
++    "ssh hermes-hub tail ~/.hermes/cron/output/x.log",
++    "ssh hermes-hub ls ~/.hermes/cache/core-update/",
++    "ssh hermes-hub sqlite kanban 'select 1'",
++    "read `~/.hermes/kanban/boards/x/kanban.db`.",
++])
++def test_other_hub_read_shapes_are_portable(attested, body):
++    cfg, _, _ = attested
++    assert reason(body, cfg) is None
++
++
++def test_undeclared_card_still_pins(attested):
++    cfg, _, _ = attested
++    assert reason(STEP, cfg, requires=()) == "home gateway marker"
++
++
++def test_pool_without_label_still_pins(attested):
++    cfg, entry, _ = attested
++    entry["labels"].remove("capability:hub-read")
++    assert reason(STEP, cfg) is not None
++
++
++def test_unset_roots_fail_closed(attested):
++    cfg, _, _ = attested
++    del cfg["hub_read_roots"]
++    assert reason(STEP, cfg) == "home gateway marker"
++    assert reason("ssh hermes-hub grep X", cfg) is None  # the reader invocation alone needs no roots
++
++
++@pytest.mark.parametrize("roots", ["logs", ["/"], [".."], ["logs/../state"], [""], [None]])
++def test_malformed_roots_clear_nothing(attested, roots):
++    cfg, _, _ = attested
++    cfg["hub_read_roots"] = roots
++    assert reason(STEP, cfg) == "home gateway marker"
++
++
++@pytest.mark.parametrize("body", [
++    "ssh hermes-hub cat ~/.hermes/state/x",
++    "ssh hermes-hub cat ~/.hermes/logs/../state.db",
++    "ssh hermes-hub cat ~/.hermes/logsx/y",
++    "ssh mini grep X ~/.hermes/logs/hermes-sync.log",
++    "ssh hermes-hub sudo reboot",
++    "ssh hermes-hub grep X ~/.hermes/logs/hermes-sync.log, then restart the gateway",
++    "ssh hermes-hub grep X ~/.hermes/logs/hermes-sync.log, then systemctl restart hermes-sync",
++    "ssh hermes-hub cat ~/.hermes/config.yaml and hermes config set kanban.x 1",
++])
++def test_controls_still_pin(attested, body):
++    cfg, _, _ = attested
++    assert reason(body, cfg) == "home gateway marker"
++
++
++def test_claim_refusal_unchanged(attested):
++    _, entry, _ = attested
++    card = {"placement_policy": "worker-first-v1", "title": "t", "body": STEP, "requires": ["hub:read"]}
++    assert coord.claim_refusal(card, "worker") is None
++    entry["labels"].remove("capability:hub-read")
++    assert coord.claim_refusal(card, "worker") == coord.REASON
+-- 
+2.43.0
+

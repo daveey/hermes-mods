@@ -1,0 +1,862 @@
+From be32bf4baf49fcdfd45336ac8707546fc528625c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:09:40 +0000
+Subject: [PATCH] [daveey] kanban sync: one card per incident when a board's
+ replica stays behind the feed head or its loop stalls
+
+Card t_01a1d3df5e5d0757. 2026-11-12: three stale replicas raised no alarm.
+- hermes-hub: the default loop slowed from a round a minute to one every 15-28 min from ~17:27 PT; the
+  replica's pulled_at stayed at 02:06:53 UTC past 02:39 and hub cards did not promote (t_01a1d2cc49634a78).
+- laptop-1: ~75k changes behind for hours after a sleep, until ~22:30 PT (t_01a1d36ddcea59fe), found only
+  through false parent_missing blocks and wrong "ready with no worker" notices.
+- laptop-1 23:53:44 PT: `kanban sync: default not synced: this core does not declare columns ...`
+  (SchemaAhead), then no more rounds; four cards waiting on done remote parents froze.
+
+Why: nothing watched replica freshness itself. pulled_at had only consumers, and since #1931 those consumers
+wait silently on a stale replica (a DEBUG/INFO trace). #1934's outbox alarm skips a failing loop "which other
+alarms cover", and no such alarm existed. Root: no component owned replica freshness; the gate tests assert the
+gate defers, none that a long deferral surfaces.
+
+Fix: hermes_cli/kanban_sync_replica_age.py, run by kanban_sync_outbox_age.check on the dispatcher tick (outside
+the sync loop, so a dead, stuck or given-up loop is seen too).
+- Per board in mode primary/shadow: (replica pulled_at, monotonic time first seen). A missing or unreadable
+  replica is a stamp that has not advanced. No advance for REPLICA_STALE_S = 1200 s of monotonic time (2x
+  FRESH_SECONDS) opens an incident: ONE card through the outbox card's report path (comment at most hourly on
+  an open card, a new card once it is done). Monotonic time stands still while a Mac sleeps.
+- The stamp advancing ends the incident (one INFO line). One INFO telemetry line per board per hour.
+- The card names host + gateway, board, the replica stamp in PT, awake minutes, the last round's outcome
+  (behind / failed: <error> / no sync round since T), the loop's recorded stop (.sync-state.json: a give-up
+  names its refusal), pending outbox ops, the running core sha, and every local card waiting on a remote
+  parent with that parent's Board status (row_evidence, 15 s budget; the local mirror when unreachable), with
+  the stuck-card-recovery.md item 3 brief (precedent t_01a1d42acdce8e23).
+- after_round feeds each round's outcome to the check; report() takes key/author/title/body; the outbox
+  check's comment now cites this check instead of "no alarm covers a failing loop yet".
+- Detached/unsynced boards never file; an exception inside the check is logged and never reaches the tick.
+
+Tests (tests/hermes_cli/test_kanban_sync_replica_age.py, fake mono + wall clocks), RED on a stub (13 failed,
+4 never-file passed), GREEN 17/17: rounds behind 21 min, URLError rounds, dead loop, no/unreadable replica,
+5 h wall jump in 1 awake min, close + comment + new card after done, detached, unsynced, exception, tick
+wiring, card contents, frozen children (Board done / mirror fallback), and replays: hub slow rounds fires
+18:27 PT; MacBook 75k backlog after a 10 h sleep fires 18:20 PT (20 awake min after 08:00), one card through
+22:30; MacBook SchemaAhead give-up fires 00:13 PT naming the refusal and core sha. Sync suites: 58 files,
+1357 passed.
+---
+ hermes_cli/kanban_sync_outbox_age.py          |  51 ++-
+ hermes_cli/kanban_sync_replica_age.py         | 293 ++++++++++++++
+ .../test_kanban_sync_replica_age.py           | 371 ++++++++++++++++++
+ 3 files changed, 698 insertions(+), 17 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_replica_age.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_replica_age.py
+
+diff --git a/hermes_cli/kanban_sync_outbox_age.py b/hermes_cli/kanban_sync_outbox_age.py
+index ef8bf28e5a..f28beb8d28 100644
+--- a/hermes_cli/kanban_sync_outbox_age.py
++++ b/hermes_cli/kanban_sync_outbox_age.py
+@@ -12,7 +12,8 @@ Three readers of one number, the age of the oldest pending op:
+ - The dispatcher tick (:func:`check`) files ONE card per incident on the default board when the same op is that old
+   and this process's sync loop is not failing (its last round succeeded, or a round has run for over
+   :data:`STALE_S`, which is the stuck-round shape of the incident). The incident ends when the op is answered; the
+-  next one comments on the open card (at most hourly) or opens a new card once that card is done.
++  next one comments on the open card (at most hourly) or opens a new card once that card is done. A failing, stalled
++  or stopped loop is the replica-freshness check's (``kanban_sync_replica_age``), which the same tick runs next.
+ 
+ "Unanswered" = pending with no ``retry_after``: the Board never told us to wait. A row the Board deferred
+ (``storage_error``, ``depends_on_rejected``) retries on its own backoff and logs its own reason; counting it would
+@@ -27,6 +28,8 @@ import time
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Optional
+ 
++from hermes_cli import kanban_sync_replica_age as replica_age  # the same tick's replica-freshness alarm
++
+ log = logging.getLogger(__name__)
+ 
+ STALE_S = 600.0
+@@ -106,10 +109,12 @@ def after_round(results: Iterable[Any], boards: Iterable[tuple[str, Path]], *,
+     warned: list[str] = []
+     try:
+         paths = dict(boards)
++        results = list(results)
+         with _LOCK:
+             _ROUND_STARTED[0] = None
+             for r in results:
+                 _LAST_OK[r.board] = not r.error
++        replica_age.note_round(results, mono=mono)  # the replica-freshness card names the last round's outcome
+         for r in results:
+             if r.error or r.board not in paths:
+                 continue
+@@ -138,8 +143,8 @@ def _loop_healthy(slug: str, now: float) -> bool:
+ def check(*, mono: Callable[[], float] = time.monotonic, file_fn: Optional[Callable[[str, str], Optional[str]]] = None,
+           boards: Optional[list[tuple[str, Path]]] = None,
+           age: Callable[[Path], Optional[float]] = _age) -> list[str]:
+-    """One dispatcher-tick observation (at most every :data:`CHECK_EVERY_S`). Returns the card ids it filed or
+-    commented. Never raises."""
++    """One dispatcher-tick observation (at most every :data:`CHECK_EVERY_S`): the outbox, then each replica's
++    freshness (``kanban_sync_replica_age.check``). Returns the card ids filed or commented. Never raises."""
+     try:
+         now = mono()
+         if now < _NEXT_CHECK[0]:
+@@ -151,12 +156,20 @@ def check(*, mono: Callable[[], float] = time.monotonic, file_fn: Optional[Calla
+                 return []
+             from hermes_cli import kanban_sync_client as ksc
+             boards = ksc.board_paths()
++    except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
++        log.warning("kanban: sync outbox age check failed", exc_info=True)
++        return []
++    return _check_outbox(boards, now, file_fn, age) + replica_age.check(boards, now=now)
++
++
++def _check_outbox(boards: list[tuple[str, Path]], now: float, file_fn, age) -> list[str]:
++    try:
+         out = []
+         for slug, path in boards:
+             seconds = age(path) if _loop_healthy(slug, now) else None
+             if seconds is None or seconds < STALE_S:
+-                # Answered, or the loop is failing: incident over. No alarm covers a failing loop yet;
+-                # t_01a1d3df5e5d0757 adds a replica-freshness check here.
++                # Answered, or the loop is failing: incident over here. A failing, stalled or stopped loop is
++                # alarmed by the replica-freshness check (kanban_sync_replica_age.check, run right after this).
+                 _FILED.discard(slug)
+                 continue
+             if slug in _FILED:
+@@ -172,33 +185,36 @@ def check(*, mono: Callable[[], float] = time.monotonic, file_fn: Optional[Calla
+         return []
+ 
+ 
+-def report(slug: str, detail: str) -> Optional[str]:
+-    """Open or comment the stalled-outbox card on the default board. Best effort: never raises."""
++def report(slug: str, detail: str, *, key: str = KEY, author: str = AUTHOR, title: Optional[str] = None,
++           body: Optional[str] = None, what: str = "outbox stalled") -> Optional[str]:
++    """Open or comment the stalled-outbox card on the default board (or, with ``key``/``author``/``title``/
++    ``body``, another alarm's card on the same one-card-per-incident path). Best effort: never raises."""
+     try:
+         from hermes_cli import kanban_db as kb
+         from hermes_cli import kanban_db_connect as kbc
++        log.warning("kanban sync: %s: %s", what, detail)
+         with kbc.connect_closing(kb.kanban_home() / "kanban.db") as conn:
+-            return _report(conn, slug, detail)
++            return _report(conn, slug, detail, key=key, author=author, title=title, body=body)
+     except Exception:  # health: allow BLE001 -- runs on the dispatcher tick
+-        log.warning("kanban: could not file the stalled sync outbox card (%s)", detail, exc_info=True)
++        log.warning("kanban: could not file the %s card (%s)", what, detail, exc_info=True)
+         return None
+ 
+ 
+-def _report(conn: sqlite3.Connection, slug: str, detail: str) -> str:
++def _report(conn: sqlite3.Connection, slug: str, detail: str, *, key: str = KEY, author: str = AUTHOR,
++            title: Optional[str] = None, body: Optional[str] = None) -> str:
+     from hermes_cli import kanban_db as kb
+-    log.warning("kanban sync: outbox stalled: %s", detail)
+-    key = f"{KEY}:{slug}"
++    key = f"{key}:{slug}"
+     row = conn.execute(
+         "SELECT id, status FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+         "ORDER BY status IN ('done', 'failed', 'cancelled'), created_at DESC, rowid DESC LIMIT 1", (key,),
+     ).fetchone()
+     if row and row[1] not in ("done", "failed", "cancelled"):
+         recent = conn.execute("SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? AND created_at >= ? LIMIT 1",
+-                              (row[0], AUTHOR, int(time.time()) - _COMMENT_EVERY)).fetchone()
++                              (row[0], author, int(time.time()) - _COMMENT_EVERY)).fetchone()
+         if not recent:
+-            kb.add_comment(conn, row[0], AUTHOR, f"Again: {detail}")
++            kb.add_comment(conn, row[0], author, f"Again: {detail}")
+         return row[0]
+-    body = (
++    body = body or (
+         "A local edit on this host has waited over 10 minutes in the Kanban sync outbox, so the Board (and every "
+         "worker leasing from it) has not seen it, although the sync loop is not failing.\n\n"
+         f"{detail}\n\n"
+@@ -207,8 +223,8 @@ def _report(conn: sqlite3.Connection, slug: str, detail: str) -> str:
+         "(`hermes_cli/kanban_sync_backlog.py`), so an old op means push is not reached or not accepted. Done when "
+         "the op is answered and the cause is fixed (precedent: t_01a1d36ddcea59fe)."
+     )
+-    tid = kb.create_task(conn, title=f"Kanban sync: {slug} outbox holds a local edit unsent for over 10 min",
+-                         body=body, assignee="default", created_by=AUTHOR, priority=50,
++    tid = kb.create_task(conn, title=title or f"Kanban sync: {slug} outbox holds a local edit unsent for over 10 min",
++                         body=body, assignee="default", created_by=author, priority=50,
+                          idempotency_key=None if row else key)
+     if row:  # the previous card is finished: the key now names this one (newest wins)
+         with kb.write_txn(conn, allow_nested=True):
+@@ -224,3 +240,4 @@ def reset() -> None:
+     _WARNED_AT.clear()
+     _FILED.clear()
+     _NEXT_CHECK[0] = 0.0
++    replica_age.reset()
+diff --git a/hermes_cli/kanban_sync_replica_age.py b/hermes_cli/kanban_sync_replica_age.py
+new file mode 100644
+index 0000000000..5974ab37f2
+--- /dev/null
++++ b/hermes_cli/kanban_sync_replica_age.py
+@@ -0,0 +1,293 @@
++"""Is each synced board's replica reaching the feed head? One card per incident when it stops. [daveey]
++
++Incidents (2026-11-12, t_01a1d3df5e5d0757): on hermes-hub the default sync loop slowed from a round a minute to one
++every 15-28 min and the replica's ``pulled_at`` stayed at 02:06:53 UTC past 02:39, so hub cards did not promote; on
++laptop-1 the replica sat ~75k changes behind for hours after a sleep; at 23:53:44 PT the same MacBook's loop refused
++a newer core's schema (SchemaAhead) and ran no more rounds. Each was found by someone chasing a symptom: no component
++watched the replica itself, and since #1931 the consumers that used to misfire on a stale replica wait silently.
++
++:func:`check` runs on the dispatcher tick from ``kanban_sync_outbox_age.check``, outside the sync loop, so it sees a
++dead or stuck loop too. Per board in mode ``primary`` or ``shadow`` it keeps ``(stamp, monotonic time first seen)``
++for the replica's ``pulled_at`` (``_pulled_replica`` stamps it only when a pull reached the feed head). A missing or
++unreadable replica counts as a stamp that has not advanced. When the stamp has not advanced for
++:data:`REPLICA_STALE_S` of monotonic time an incident opens and files ONE card through the outbox alarm's report
++path (comment at most hourly on an open card, a new card once it is done). Monotonic time stands still while a Mac
++sleeps, so a laptop's sleep never counts. The incident ends (one INFO line) when the stamp advances.
++
++One check covers every shape: rounds ending behind, rounds failing, no rounds at all (a dead loop or a give-up),
++and a missing replica. The card names the host, board, stamp (PT), awake minutes, the last round's outcome, the
++loop's recorded stop, the pending outbox, the running core and the cards frozen behind a remote parent.
++"""
++from __future__ import annotations
++
++import logging
++import socket
++import sqlite3
++import threading
++import time
++from dataclasses import dataclass
++from datetime import datetime
++from pathlib import Path
++from typing import Any, Callable, Iterable, Optional
++
++log = logging.getLogger(__name__)
++
++# Twice kanban_replica_freshness.FRESH_SECONDS (600): the missing-parent gate's own freshness bound.
++REPLICA_STALE_S = 1200.0
++# No completed round for this long reads as "no sync round since ...".
++NO_ROUND_S = 300.0
++TELEMETRY_EVERY_S = 3600.0
++KEY = "kanban-sync-replica-stale"
++AUTHOR = "kanban-sync-replica"
++_FROZEN_CAP = 25
++_PT = "America/Los_Angeles"
++
++
++@dataclass
++class _Seen:
++    stamp: Optional[float]  # the replica's last pulled_at (None: no readable replica yet)
++    since: float  # monotonic time the stamp was first seen (or the first observation)
++    open: bool = False  # an incident is open (its card filed)
++
++
++@dataclass
++class _Round:
++    mono: float
++    wall: float
++    error: Optional[str]
++    behind: bool
++
++
++_LOCK = threading.Lock()
++_SEEN: dict[str, _Seen] = {}
++_ROUNDS: dict[str, _Round] = {}
++_TELEMETRY_AT: dict[str, float] = {}
++
++
++def note_round(results: Iterable[Any], *, mono: Callable[[], float] = time.monotonic,
++               wall: Callable[[], float] = time.time) -> None:
++    """The sync loop completed a round (``kanban_sync_outbox_age.after_round``): remember each board's outcome."""
++    with _LOCK:
++        for r in results:
++            _ROUNDS[r.board] = _Round(mono(), wall(), r.error, bool(r.behind))
++
++
++def _pt(at: Optional[float]) -> str:
++    if at is None:
++        return "?"
++    from zoneinfo import ZoneInfo
++    return datetime.fromtimestamp(at, ZoneInfo(_PT)).strftime("%Y-%m-%d %H:%M:%S %Z")
++
++
++def _mode(path: Path) -> Optional[str]:
++    """The live board's sync mode for this process (``off`` when detached, unselected or sync disabled)."""
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_sync as sync
++    if not Path(path).exists():
++        return None  # never create a board file just to judge it
++    with kbc.connect_closing(path) as conn:
++        return sync.board_mode(conn)
++
++
++def _stamp(slug: str) -> Optional[float]:
++    """The replica's ``pulled_at`` (None: no replica, unreadable, or never stamped at the head)."""
++    from hermes_cli import kanban_sync_client as ksc
++    path = ksc.shadow_path(slug)
++    if not path.exists():
++        return None
++    try:
++        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
++        try:
++            row = conn.execute("SELECT pulled_at FROM kanban_sync_state LIMIT 1").fetchone()
++        finally:
++            conn.close()
++    except (sqlite3.Error, OSError):
++        return None
++    return float(row[0]) if row and type(row[0]) in (int, float) else None
++
++
++def _core_sha() -> Optional[str]:
++    from hermes_cli.boot_bootstrap import read_git_head
++    from hermes_cli.kanban_schema_owner import running_core
++    head = read_git_head(running_core())
++    return head[:12] if head else None
++
++
++def check(boards: list[tuple[str, Path]], *, now: float, wall: Callable[[], float] = time.time,
++          file_fn: Optional[Callable[[str, str, str], Optional[str]]] = None,
++          board_status: Optional[Callable[[str, list[str]], dict[str, str]]] = None) -> list[str]:
++    """One observation of every board (``now``: monotonic). Returns the card ids it filed or commented. Never
++    raises."""
++    out: list[str] = []
++    for slug, path in boards:
++        try:
++            tid = _check_board(slug, path, now, wall, file_fn or report, board_status or _board_status)
++            if tid:
++                out.append(tid)
++        except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
++            log.warning("kanban sync: replica freshness check failed for %s", slug, exc_info=True)
++    return out
++
++
++def _check_board(slug: str, path: Path, now: float, wall: Callable[[], float], file_fn, board_status) -> Optional[str]:
++    if _mode(path) not in ("primary", "shadow"):
++        with _LOCK:
++            _SEEN.pop(slug, None)  # detached or unsynced: nothing to judge, and a later attach starts afresh
++        return None
++    stamp = _stamp(slug)
++    with _LOCK:
++        seen = _SEEN.get(slug)
++        if seen is None or (stamp is not None and (seen.stamp is None or stamp > seen.stamp)):
++            if seen is not None and seen.open:
++                log.info("kanban sync: %s replica reached the feed head again at %s after %.0f awake min; "
++                         "incident over", slug, _pt(stamp), (now - seen.since) / 60)
++            seen = _SEEN[slug] = _Seen(stamp, now)
++        elapsed = now - seen.since
++        due = elapsed >= REPLICA_STALE_S and not seen.open
++        if due:
++            seen.open = True
++        rnd = _ROUNDS.get(slug)
++    _telemetry(slug, seen, elapsed, now)
++    if not due:
++        return None
++    detail = _detail(slug, path, seen, elapsed, rnd, now, wall())
++    return file_fn(slug, detail, _body(slug, path, detail, board_status))
++
++
++def _telemetry(slug: str, seen: _Seen, elapsed: float, now: float) -> None:
++    """One INFO line per board per hour: the live proof that the check runs and what it sees."""
++    last = _TELEMETRY_AT.get(slug)
++    if last is not None and now - last < TELEMETRY_EVERY_S:
++        return
++    _TELEMETRY_AT[slug] = now
++    log.info("kanban sync: replica freshness %s: stamp %s, not advanced for %.0f awake s (alarm at %.0f s), "
++             "incident %s", slug, _pt(seen.stamp) if seen.stamp else "none", elapsed, REPLICA_STALE_S,
++             "open" if seen.open else "none")
++
++
++def _outcome(rnd: Optional[_Round], now: float, first_seen_wall: float) -> str:
++    if rnd is None:
++        return f"no sync round since {_pt(first_seen_wall)} (none completed in this process)"
++    what = (f"failed: {rnd.error}" if rnd.error else
++            "ended behind the feed head (page budget)" if rnd.behind else "reached the feed head")
++    if now - rnd.mono >= NO_ROUND_S:
++        return f"no sync round since {_pt(rnd.wall)} (that round {what})"
++    return f"last round {what}"
++
++
++def _pending(path: Path) -> Optional[int]:
++    from hermes_cli import kanban_db_connect as kbc
++    try:
++        with kbc.connect_closing(path) as conn:
++            return int(conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state = 'pending'").fetchone()[0])
++    except (sqlite3.Error, OSError):
++        return None
++
++
++def _gateway(path: Path) -> str:
++    """The board's own sync identity (``kanban_sync_state.gateway_id``), else the configured gateway."""
++    from hermes_cli import kanban_db_connect as kbc
++    try:
++        with kbc.connect_closing(path) as conn:
++            row = conn.execute("SELECT gateway_id FROM kanban_sync_state LIMIT 1").fetchone()
++        if row and row[0]:
++            return str(row[0])
++        from hermes_cli import kanban_db_sync as sync
++        return str(sync.sync_config().get("gateway") or "?")
++    except Exception:  # health: allow BLE001 -- a name for the card, never a reason to skip it
++        return "?"
++
++
++def _detail(slug: str, path: Path, seen: _Seen, elapsed: float, rnd: Optional[_Round], now: float,
++            wall_now: float) -> str:
++    from hermes_cli import kanban_sync_runstate as runstate
++    stamp = (f"replica last at the feed head {_pt(seen.stamp)}" if seen.stamp is not None
++             else "no readable replica (sync-shadow) on disk")
++    parts = [f"host {socket.gethostname()} (gateway {_gateway(path)}), board `{slug}`: {stamp}",
++             f"not at the feed head for {elapsed / 60:.0f} awake min (bound {REPLICA_STALE_S / 60:.0f})",
++             _outcome(rnd, now, wall_now - elapsed)]
++    down = runstate._read(runstate.path())
++    if down and down.get("running") is False:
++        parts.append(runstate.describe(down))
++    pending = _pending(path)
++    parts.append(f"pending outbox ops: {'?' if pending is None else pending}")
++    parts.append(f"core {_core_sha() or '?'}")
++    return "; ".join(parts)
++
++
++def frozen_children(path: Path) -> list[tuple[str, str, str, Optional[str]]]:
++    """``(child, child status, remote parent, mirrored status)`` for every local card waiting on a parent that is
++    not a local card: nothing promotes it while this host's sync is stopped (stuck-card-recovery.md item 3)."""
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_sync as sync
++    with kbc.connect_closing(path) as conn:
++        mirror = sync.has_remote_parents(conn)
++        sql = ("SELECT c.id, c.status, l.parent_id, " + ("m.status" if mirror else "NULL") +
++               " FROM task_links l JOIN tasks c ON c.id = l.child_id LEFT JOIN tasks p ON p.id = l.parent_id " +
++               (f"LEFT JOIN {sync.REMOTE_PARENTS_TABLE} m ON m.parent_id = l.parent_id " if mirror else "") +
++               "WHERE p.id IS NULL AND c.status IN ('todo', 'blocked') ORDER BY c.id, l.parent_id LIMIT ?")
++        return [tuple(r) for r in conn.execute(sql, (_FROZEN_CAP,))]
++
++
++def _board_status(board: str, ids: list[str]) -> dict[str, str]:
++    """Each parent's status on the Board itself (never the stale replica), within a 15 s total budget."""
++    from hermes_cli import kanban_sync_client as ksc
++    hub = ksc.Hub(ksc.load_identity(), timeout=5.0, deadline=time.monotonic() + 15.0)
++    out: dict[str, str] = {}
++    try:
++        for pid in ids:
++            row = (hub.row_evidence(board, "tasks", pid) or {}).get("row")
++            if isinstance(row, dict) and row.get("status"):
++                out[pid] = str(row["status"])
++    finally:
++        hub.close()
++    return out
++
++
++def _body(slug: str, path: Path, detail: str, board_status) -> str:
++    frozen: list = []
++    try:
++        frozen = frozen_children(path)
++    except (sqlite3.Error, OSError):
++        log.debug("kanban sync: cannot list frozen children on %s", slug, exc_info=True)
++    lines = []
++    if frozen:
++        try:
++            on_board: Optional[dict[str, str]] = board_status(slug, sorted({p for _c, _s, p, _m in frozen}))
++        except Exception:  # health: allow BLE001 -- an unreachable Board falls back to the mirror
++            on_board = None
++        for child, status, parent, mirrored in frozen:
++            if on_board is not None and parent in on_board:
++                where = f"Board status: {on_board[parent]}"
++            else:
++                where = f"{mirrored or 'unknown'} (local mirror, may be stale)"
++            lines.append(f"- `{child}` ({status}) waits on remote parent `{parent}`: {where}")
++    frozen_text = ("Cards homed here that wait on a remote parent (nothing promotes them while this replica is "
++                   "stale; after 10 min the home may block them parent_missing). Re-place each card's next step on "
++                   "a worker, following kanban-orchestrator references/stuck-card-recovery.md item 3 (precedent: "
++                   "t_01a1d42acdce8e23):\n" + "\n".join(lines) if lines else
++                   "No card homed here waits on a remote parent.")
++    return (
++        "This host's replica of a synced board has not reached the Board's feed head for over 20 awake minutes, "
++        "so remote parents, missing-parent checks and ready notices read an old copy (and since #1931 they wait "
++        "silently instead of misfiring).\n\n"
++        f"{detail}\n\n{frozen_text}\n\n"
++        "Check: `hermes kanban sync status` (cursor, pending, last_error) and agent.log `kanban sync:` lines; "
++        "`.sync-state.json` beside the board records a loop that gave up. Done when the replica reaches the head "
++        "again and the cause is fixed (precedents: t_01a1d2cc49634a78, t_01a1d36ddcea59fe)."
++    )
++
++
++def report(slug: str, detail: str, body: str) -> Optional[str]:
++    """Open or comment the stale-replica card on the default board. Best effort: never raises."""
++    from hermes_cli import kanban_sync_outbox_age as outbox_age
++    return outbox_age.report(slug, detail, key=KEY, author=AUTHOR, body=body, what="replica stale",
++                             title=f"Kanban sync: {slug} replica has not reached the feed head for 20+ awake min")
++
++
++def reset() -> None:
++    """Tests: forget every observation."""
++    with _LOCK:
++        _SEEN.clear()
++        _ROUNDS.clear()
++    _TELEMETRY_AT.clear()
+diff --git a/tests/hermes_cli/test_kanban_sync_replica_age.py b/tests/hermes_cli/test_kanban_sync_replica_age.py
+new file mode 100644
+index 0000000000..b1f06e6fc3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_replica_age.py
+@@ -0,0 +1,371 @@
++"""The replica-freshness alarm (t_01a1d3df5e5d0757): a synced board whose replica stays behind the feed head, or
++whose sync loop stalls, fails or stops, files ONE card per incident in awake (monotonic) time.
++
++Every test drives fake clocks: ``mono`` (awake time; it does not move while a Mac sleeps) and ``wall``. The loop's
++round outcomes are fed through ``outbox_age.after_round`` exactly as ``run_forever`` does; the replica's
++``pulled_at`` stamp is written into the real ``sync-shadow`` copy, as ``_pulled_replica`` stamps it at the feed head.
++"""
++from __future__ import annotations
++
++import logging
++from datetime import datetime
++from zoneinfo import ZoneInfo
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_outbox_age as outbox_age
++from hermes_cli import kanban_sync_replica_age as replica_age
++from hermes_cli import kanban_sync_runstate as runstate
++from tests.hermes_cli import kanban_sync_support as support
++
++ME, BOARD = "macbook", "default"
++PT = ZoneInfo("America/Los_Angeles")
++MIN = 60.0
++
++
++def _pt(text: str) -> float:
++    """``2026-11-12 17:27:00`` Pacific -> epoch seconds."""
++    return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=PT).timestamp()
++
++
++@pytest.fixture(autouse=True)
++def _fresh():
++    outbox_age.reset()
++    yield
++    outbox_age.reset()
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setattr(replica_age, "_core_sha", lambda: "2cc7101849aa")
++    return home
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    c = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(c, BOARD, ME)
++    sync.set_mode(c, "primary")
++    try:
++        yield c
++    finally:
++        c.close()
++
++
++def _stamp(at: float) -> None:
++    """The replica reached the feed head at ``at`` (``kanban_db_sync.mark_pulled``)."""
++    replica = ksc.open_shadow(BOARD, ME)
++    try:
++        sync.mark_pulled(replica, at)
++    finally:
++        replica.close()
++
++
++class Host:
++    """One gateway's clocks, its sync loop's rounds and its dispatcher's checks (every ``CHECK_EVERY_S``)."""
++
++    def __init__(self, kanban_home, wall: float, *, file_fn=None, board_status=None):
++        self.boards = [(BOARD, kanban_home / "kanban.db")]
++        self.mono, self.wall = 1000.0, wall
++        self.cards: list[tuple[float, str, str]] = []  # (wall, detail, body) per card filed
++        self.file_fn = file_fn or self._file
++        self.board_status = board_status or (lambda board, ids: {})
++
++    def _file(self, slug, detail, body):
++        self.cards.append((self.wall, detail, body))
++        return f"t_card{len(self.cards)}"
++
++    def check(self):
++        return replica_age.check(self.boards, now=self.mono, wall=lambda: self.wall, file_fn=self.file_fn,
++                                 board_status=self.board_status)
++
++    def round(self, *, behind=False, error=None, head=False):
++        """One completed sync round; ``head``: it reached the feed head (stamps the replica)."""
++        if head:
++            _stamp(self.wall)
++        outbox_age.after_round([ksc.RoundResult(board=BOARD, mode="primary", behind=behind, error=error)],
++                               self.boards, mono=lambda: self.mono, age=lambda _p: None)
++        replica_age.note_round([ksc.RoundResult(board=BOARD, mode="primary", behind=behind, error=error)],
++                               mono=lambda: self.mono, wall=lambda: self.wall)
++
++    def run(self, seconds: float, *, every: float = MIN, each=None):
++        """Advance awake time ``seconds``, running ``each()`` (a round) and a check once per ``every``."""
++        end = self.mono + seconds
++        while self.mono + every <= end + 1e-9:
++            self.mono += every
++            self.wall += every
++            if each:
++                each()
++            self.check()
++
++    def sleep(self, seconds: float):
++        self.wall += seconds  # monotonic time stands still while the machine sleeps
++
++
++# --- the four ways a replica stays stale --------------------------------------------------------------------------
++
++def test_rounds_ending_behind_for_21_awake_minutes_file_exactly_one_card(live, kanban_home):
++    host = Host(kanban_home, _pt("2026-11-12 18:00:00"))
++    _stamp(host.wall)
++    host.check()
++    host.run(19 * MIN, each=lambda: host.round(behind=True))
++    assert host.cards == []  # under the 20-minute bound
++    host.run(2 * MIN, each=lambda: host.round(behind=True))
++    assert len(host.cards) == 1
++    detail = host.cards[0][1]
++    assert "behind" in detail and "18:00:00 PST" in detail and "default" in detail
++    host.run(60 * MIN, each=lambda: host.round(behind=True))
++    assert len(host.cards) == 1  # the same incident files once
++
++
++def test_rounds_failing_with_urlerror_file_one_card_naming_the_last_error(live, kanban_home):
++    host = Host(kanban_home, _pt("2026-11-12 18:00:00"))
++    _stamp(host.wall)
++    host.check()
++    host.run(21 * MIN, each=lambda: host.round(error="URLError: <urlopen error [Errno 51] Network is unreachable>"))
++    assert len(host.cards) == 1
++    assert "URLError: <urlopen error [Errno 51] Network is unreachable>" in host.cards[0][1]
++    assert "failed" in host.cards[0][1]
++
++
++def test_a_loop_that_runs_no_rounds_files_one_card(live, kanban_home):
++    host = Host(kanban_home, _pt("2026-11-12 18:00:00"))
++    _stamp(host.wall)
++    host.round(head=True)
++    host.check()
++    host.run(21 * MIN)  # dead loop: checks only
++    assert len(host.cards) == 1
++    assert "no sync round since 2026-11-12 18:00:00 PST" in host.cards[0][1]
++
++
++def test_a_synced_board_without_a_readable_replica_files_one_card(live, kanban_home):
++    host = Host(kanban_home, _pt("2026-11-12 18:00:00"))
++    assert not ksc.shadow_path(BOARD).exists()
++    host.check()
++    host.run(21 * MIN, each=lambda: host.round(error="HubError: 503 Service Unavailable"))
++    assert len(host.cards) == 1
++    assert "no readable replica" in host.cards[0][1]
++
++
++def test_an_unreadable_replica_counts_as_missing(live, kanban_home):
++    host = Host(kanban_home, _pt("2026-11-12 18:00:00"))
++    path = ksc.shadow_path(BOARD)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_bytes(b"not a database" * 100)
++    host.check()
++    host.run(21 * MIN)
++    assert len(host.cards) == 1 and "no readable replica" in host.cards[0][1]
++
++
++# --- sleep, recovery, scope -----------------------------------------------------------------------------------------
++
++def test_sleep_never_counts(live, kanban_home):
++    """The wall clock jumps 5 h while awake time moves 1 minute, the replica behind the whole time."""
++    host = Host(kanban_home, _pt("2026-11-12 08:00:00"))
++    _stamp(host.wall)
++    host.check()
++    host.sleep(5 * 3600)
++    host.run(1 * MIN, each=lambda: host.round(behind=True))
++    assert host.cards == []
++
++
++def test_the_stamp_advancing_ends_the_incident_then_the_next_comments_or_opens_a_new_card(live, kanban_home, caplog):
++    host = Host(kanban_home, _pt("2026-11-12 18:00:00"), file_fn=replica_age.report)
++    _stamp(host.wall)
++    host.check()
++    host.run(21 * MIN, each=lambda: host.round(behind=True))
++    first = live.execute("SELECT id, title, idempotency_key FROM tasks WHERE created_by = ?",
++                         (replica_age.AUTHOR,)).fetchall()
++    assert len(first) == 1 and first[0][2] == f"{replica_age.KEY}:{BOARD}"
++    with caplog.at_level(logging.INFO, logger="hermes_cli.kanban_sync_replica_age"):
++        host.run(1 * MIN, each=lambda: host.round(head=True))
++    assert [r for r in caplog.records if r.levelno == logging.INFO and "reached the feed head" in r.getMessage()]
++    # A second incident while that card is open: a comment on it, no new card.
++    host.run(21 * MIN, each=lambda: host.round(behind=True))
++    rows = live.execute("SELECT id FROM tasks WHERE created_by = ?", (replica_age.AUTHOR,)).fetchall()
++    assert [r[0] for r in rows] == [first[0][0]]
++    comments = live.execute("SELECT body FROM task_comments WHERE task_id = ? AND author = ?",
++                            (first[0][0], replica_age.AUTHOR)).fetchall()
++    assert len(comments) == 1 and comments[0][0].startswith("Again:")
++    # A third incident after that card is done: a new card, which the key now names.
++    host.run(1 * MIN, each=lambda: host.round(head=True))
++    kb.complete_task(live, first[0][0], summary="fixed")
++    host.run(21 * MIN, each=lambda: host.round(behind=True))
++    rows = live.execute("SELECT id, idempotency_key FROM tasks WHERE created_by = ? ORDER BY created_at, rowid",
++                        (replica_age.AUTHOR,)).fetchall()
++    assert len(rows) == 2 and rows[1][1] == f"{replica_age.KEY}:{BOARD}"
++
++
++def test_a_detached_board_never_files(live, kanban_home):
++    sync.set_mode(live, "off")
++    host = Host(kanban_home, _pt("2026-11-12 18:00:00"))
++    _stamp(host.wall - 3600)
++    host.run(90 * MIN)
++    assert host.cards == []
++
++
++def test_an_unsynced_board_never_files(kanban_home):
++    support.write_sync_config(kanban_home, False)
++    c = kbc.connect(kanban_home / "kanban.db")
++    c.close()
++    host = Host(kanban_home, _pt("2026-11-12 18:00:00"))
++    host.run(90 * MIN)
++    assert host.cards == []
++    # and through the dispatcher's entry point, which reads the host's board list itself
++    assert outbox_age.check(mono=lambda: 1e6) == []
++
++
++def test_an_exception_in_the_check_never_breaks_the_dispatcher_tick(live, kanban_home, monkeypatch):
++    def boom(*_a, **_k):
++        raise RuntimeError("replica read exploded")
++    monkeypatch.setattr(replica_age, "_stamp", boom)
++    boards = [(BOARD, kanban_home / "kanban.db")]
++    assert replica_age.check(boards, now=5000.0) == []
++    assert outbox_age.check(mono=lambda: 9000.0, boards=boards, age=lambda _p: None) == []
++
++
++def test_the_dispatcher_tick_runs_the_replica_check(live, kanban_home, monkeypatch):
++    seen = []
++    monkeypatch.setattr(replica_age, "check", lambda boards, **kw: seen.append((boards, kw["now"])) or ["t_r"])
++    boards = [(BOARD, kanban_home / "kanban.db")]
++    assert outbox_age.check(mono=lambda: 7000.0, boards=boards, age=lambda _p: None) == ["t_r"]
++    assert seen == [(boards, 7000.0)]
++
++
++def test_the_card_names_host_board_stamp_minutes_outcome_outbox_and_status_command(live, kanban_home):
++    kb.create_task(live, title="unsent")  # pending outbox ops
++    pending = live.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state = 'pending'").fetchone()[0]
++    assert pending >= 1
++    host = Host(kanban_home, _pt("2026-11-12 18:00:00"))
++    _stamp(host.wall)
++    host.check()
++    host.run(21 * MIN, each=lambda: host.round(behind=True))
++    (_at, detail, body), = host.cards
++    import socket
++    assert socket.gethostname() in detail and ME in detail
++    assert "2026-11-12 18:00:00 PST" in detail
++    assert "20 awake min" in detail
++    assert f"pending outbox ops: {pending}" in detail
++    assert "`hermes kanban sync status`" in body
++    assert "2cc7101849aa" in detail  # the core this gateway runs
++
++
++def test_the_card_lists_frozen_children_of_remote_parents_with_their_board_status(live, kanban_home):
++    child = kb.create_task(live, title="rework after review")
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (child,))
++        live.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", ("t_remote_review", child))
++    asked = []
++
++    def board_status(board, ids):
++        asked.append((board, sorted(ids)))
++        return {"t_remote_review": "done"}
++
++    host = Host(kanban_home, _pt("2026-11-12 23:53:44"), board_status=board_status)
++    _stamp(host.wall)
++    host.check()
++    host.run(21 * MIN)
++    (_at, _detail, body), = host.cards
++    assert asked == [(BOARD, ["t_remote_review"])]
++    assert child in body and "t_remote_review" in body and "Board status: done" in body
++    assert "stuck-card-recovery.md" in body and "item 3" in body and "t_01a1d42acdce8e23" in body
++
++
++def test_an_unreachable_board_lists_the_local_mirror_status_instead(live, kanban_home):
++    child = kb.create_task(live, title="rework")
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (child,))
++        live.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", ("t_remote_review", child))
++        live.execute(f"INSERT INTO {sync.REMOTE_PARENTS_TABLE} (parent_id, status, refreshed_at) VALUES (?, ?, 0)",
++                     ("t_remote_review", "running"))
++
++    def board_status(board, ids):
++        raise OSError("Board unreachable")
++
++    host = Host(kanban_home, _pt("2026-11-12 23:53:44"), board_status=board_status)
++    _stamp(host.wall)
++    host.check()
++    host.run(21 * MIN)
++    (_at, _detail, body), = host.cards
++    assert child in body and "running (local mirror" in body
++
++
++# --- replays of the 2026-11-12 incidents ---------------------------------------------------------------------------
++
++def _fired(host):
++    return [datetime.fromtimestamp(at, PT).strftime("%H:%M PT") for at, _d, _b in host.cards]
++
++
++def test_replay_hub_slow_rounds_1112(live, kanban_home, capsys):
++    """hermes-hub: rounds about every minute until 17:27 PT, then every 15-28 min; the replica's stamp stayed at
++    18:06:53 PT (02:06:53 UTC) through at least 18:39 PT. One card for the incident."""
++    host = Host(kanban_home, _pt("2026-11-12 17:00:00"))
++    host.round(head=True)
++    host.check()
++    host.run(27 * MIN, each=lambda: host.round(head=True))  # healthy until 17:27
++    # Slow phase: a round 15-28 min apart; each at-head round stamps, then rounds end behind from 18:06:53.
++    plan = [("17:42:30", True), ("17:59:10", True), ("18:06:53", True), ("18:21:40", False), ("18:39:05", False),
++            ("19:04:00", False), ("19:20:30", True)]
++    for at, head in plan:
++        target = _pt(f"2026-11-12 {at}")
++        host.run(target - host.wall - (target - host.wall) % MIN)
++        step = target - host.wall
++        host.mono += step
++        host.wall += step
++        host.round(head=head, behind=not head)
++        host.check()
++    print("hub replay fired at:", _fired(host))
++    assert len(host.cards) == 1
++    assert _fired(host) == ["18:27 PT"]
++    assert "18:06:53 PST" in host.cards[0][1]
++
++
++def test_replay_macbook_75k_backlog_after_sleep_1112(live, kanban_home, capsys):
++    """laptop-1: asleep ~10 h, woke ~75k changes behind; rounds ran back to back, each ending behind its page budget,
++    until about 22:30 PT. One card, 20 awake minutes after the last time at the head; the 10 h asleep never count."""
++    host = Host(kanban_home, _pt("2026-11-12 07:58:00"))
++    host.round(head=True)
++    host.check()
++    host.run(2 * MIN, each=lambda: host.round(head=True))  # 08:00: last round at the head before the lid closes
++    host.sleep(10 * 3600)  # 18:00 PT wake
++    host.run(4.5 * 3600, each=lambda: host.round(behind=True))  # 22:30
++    print("MacBook backlog replay fired at:", _fired(host))
++    assert len(host.cards) == 1
++    assert _fired(host) == ["18:20 PT"]
++    assert "2026-11-12 08:00:00 PST" in host.cards[0][1] and "behind" in host.cards[0][1]
++    host.run(1 * MIN, each=lambda: host.round(head=True))
++    host.run(3 * 3600, each=lambda: host.round(head=True))
++    assert len(host.cards) == 1  # back at the head: no second card
++
++
++SCHEMA_AHEAD = ("SchemaAhead: this core does not declare columns a newer core added (task_events: origin_gateway; "
++                "task_runs: admission_class, admission_origin, admission_pool; tasks: admission_class, "
++                "admission_frees, admission_origin, review_required); refusing to sync until this host updates")
++
++
++def test_replay_macbook_schema_skew_refusal_1112(live, kanban_home, capsys):
++    """laptop-1 23:53:44 PT: `kanban sync: default not synced: this core does not declare columns ...`, then the
++    loop gave the sync role up and ran no more rounds. One card naming the refusal and the core sha."""
++    host = Host(kanban_home, _pt("2026-11-12 23:30:00"))
++    host.round(head=True)
++    host.check()
++    host.run(23 * MIN, each=lambda: host.round(head=True))  # 23:53
++    step = _pt("2026-11-12 23:53:44") - host.wall
++    host.mono += step
++    host.wall += step
++    host.round(error=SCHEMA_AHEAD)  # the refusing round
++    runstate.record_down("gave up the sync role: board default: " + SCHEMA_AHEAD.split(": ", 1)[1])
++    host.run(60 * MIN)  # no rounds at all after the give-up
++    print("MacBook schema-skew replay fired at:", _fired(host))
++    assert len(host.cards) == 1
++    assert _fired(host) == ["00:13 PT"]
++    detail = host.cards[0][1]
++    assert "refusing to sync" in detail and "origin_gateway" in detail
++    assert "gave up the sync role" in detail
++    assert "2cc7101849aa" in detail
+-- 
+2.43.0
+

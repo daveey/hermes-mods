@@ -1,0 +1,150 @@
+From 51840264ae18964531f1c02c945bbb44adeaaaa1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:17:39 +0000
+Subject: [PATCH] [daveey] workspace_source: clone proof works on pool workers
+ and the hub
+
+Rollout of workspace_source v1 (t_01a1cc30806b0e62) found two host-level walls
+that made every clone proof fail, so no card could ever become portable:
+
+1. Every pool worker carries install-push-route's global
+   `url.https://github.com/.pushInsteadOf git@github.com:`. prove_clone read
+   `git config --get-regexp ^url\.` across ALL scopes and refused any rule as
+   `origin_rewritten`, even though that rule cannot touch an https origin.
+   Probed on hermes-worker-2 and hermes-worker-8: the rule is present.
+   Now: a url.* rule in the clone's own (local) config still refuses; a
+   global/system rule refuses only when it changes this origin's fetch URL
+   (`ls-remote --get-url`) or push URL (`remote get-url --push`, which
+   expands insteadOf/pushInsteadOf). The publish push already runs isolated
+   from global config and pushes to the verified URL.
+
+2. The GitHub id lookup ran a bare `gh api`. The hub's gateway and its card
+   runs have no gh login and no GH_TOKEN ("You are not logged into any GitHub
+   hosts"; probed in a hub card process environ), so no hub clone ever
+   proved and every hub-held card stayed `retained`. It now uses
+   dispatcher_gh_argv() (the home's kanban.pr_acceptance.gh_command_prefix
+   broker wrapper + resolved gh), the same route the PR-acceptance gate and
+   the dispatcher's PR-state read use. Any failure still fails closed
+   (origin_unreachable). Timeout 15 s -> 30 s for the broker vend.
+
+Tests (tests/hermes_cli/test_kanban_source_resolver.py), RED on base 3/3:
+- test_global_push_rewrite_that_misses_origin_passes
+- test_github_repo_uses_dispatcher_gh_argv
+- test_github_repo_without_gh_argv_fails_closed
+Guards (pass before and after): test_global_rewrite_of_origin_refused
+[pushInsteadOf|insteadOf]; existing test_origin_rewrite_refused unchanged.
+GREEN: resolver + publish + workspace_source + pr_repo_aliases, 141+113 pass.
+---
+ hermes_cli/kanban_source_clones.py            | 25 ++++++++---
+ .../hermes_cli/test_kanban_source_resolver.py | 43 +++++++++++++++++++
+ 2 files changed, 62 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_source_clones.py b/hermes_cli/kanban_source_clones.py
+index 38a20e82d3..5841170a2f 100644
+--- a/hermes_cli/kanban_source_clones.py
++++ b/hermes_cli/kanban_source_clones.py
+@@ -2,7 +2,8 @@
+ v3 S5). Only runs when ``kanban.workspace_source.enabled`` (refused until the protocol is complete, so inert).
+ 
+ A clone is proven when all hold: the path is a repo root; the raw ``remote.origin.url`` canonicalizes to a GitHub URL;
+-``ls-remote --get-url origin`` returns the same URL and there is no ``pushurl`` and no ``url.*`` rewrite; ``ls-remote
++``ls-remote --get-url origin`` and ``remote get-url --push origin`` return the same URL, there is no ``pushurl``
++and the clone's own config has no ``url.*`` rule (a global one must leave both URLs unchanged); ``ls-remote
+ origin HEAD`` succeeds in BatchMode within 5 s; the GitHub API id for the canonical name matches (renames follow the
+ id: matching is always by id). The id is cached per clone for 6 h in ``<kanban home>/source-proof.json``.
+ """
+@@ -59,9 +60,15 @@ def git(path: str | Path, *args: str, timeout: float = 30, check: bool = True) -
+ 
+ def github_repo(full_name: str) -> dict:
+     """``{id, full_name}`` from ``GET /repos/{owner}/{name}`` (follows renames) via the gh CLI and its broker token.
+-    Raises on any failure: no API access means no proof (fail closed)."""
+-    out = subprocess.run(["gh", "api", f"repos/{full_name}", "--jq", "{id: .id, full_name: .full_name}"],
+-                         capture_output=True, text=True, encoding="utf-8", timeout=15, check=True)
++    Raises on any failure: no API access means no proof (fail closed).
++
++    The argv is the dispatcher's (:func:`hermes_cli.kanban_gh_argv.dispatcher_gh_argv`: the home's
++    ``kanban.pr_acceptance.gh_command_prefix`` broker wrapper + a resolved ``gh``). The hub's gateway and its card
++    runs have no ambient ``gh`` login or GH_TOKEN, so a bare ``gh api`` failed there and no hub clone ever proved:
++    every hub-held card stayed ``retained`` (t_01a1cc30806b0e62 rollout)."""
++    from hermes_cli.kanban_gh_argv import dispatcher_gh_argv
++    argv = [*dispatcher_gh_argv(), "api", f"repos/{full_name}", "--jq", "{id: .id, full_name: .full_name}"]
++    out = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", timeout=30, check=True)
+     data = json.loads(out.stdout)
+     if not isinstance(data.get("id"), int) or not isinstance(data.get("full_name"), str):
+         raise ValueError(f"unexpected GitHub API answer for {full_name}")
+@@ -127,10 +134,16 @@ def prove_clone(key: str, path: str, *, expected_id: Optional[int] = None,
+     if full_name is None:
+         raise ProofFailed("wrong_repo", f"origin {raw or '(none)'} is not a GitHub repository")
+     effective = git(root, "ls-remote", "--get-url", "origin", check=False).stdout.strip()
++    push_effective = git(root, "remote", "get-url", "--push", "origin", check=False).stdout.strip()
+     pushurl = git(root, "config", "--get-all", "remote.origin.pushurl", check=False).stdout.strip()
+-    rewrites = git(root, "config", "--get-regexp", r"^url\.", check=False).stdout.strip()
+-    if effective != raw or pushurl or rewrites:
++    # Any url.* rule in the clone's OWN config refuses. A global/system rule counts only when it changes this
++    # origin's fetch or push URL (both expanded above): every pool worker carries install-push-route's
++    # ``url.https://github.com/.pushInsteadOf git@github.com:``, which never touches an https origin, and refusing
++    # it made no worker prove a clone (t_01a1cc30806b0e62 rollout).
++    rewrites = git(root, "config", "--local", "--get-regexp", r"^url\.", check=False).stdout.strip()
++    if effective != raw or push_effective != raw or pushurl or rewrites:
+         raise ProofFailed("origin_rewritten", f"origin {raw} resolves to {effective or '?'}"
++                          + (f", pushes to {push_effective or '?'}" if push_effective != raw else "")
+                           + (f", pushurl {pushurl}" if pushurl else "") + (" (url.* rewrite set)" if rewrites else ""))
+     try:
+         git(root, "ls-remote", "origin", "HEAD", timeout=LS_REMOTE_TIMEOUT_S)
+diff --git a/tests/hermes_cli/test_kanban_source_resolver.py b/tests/hermes_cli/test_kanban_source_resolver.py
+index 08095a3854..a925d4009e 100644
+--- a/tests/hermes_cli/test_kanban_source_resolver.py
++++ b/tests/hermes_cli/test_kanban_source_resolver.py
+@@ -256,6 +256,49 @@ def test_origin_rewrite_refused(world, rewrite):
+         assert err.code == "origin_rewritten"
+ 
+ 
++def test_global_push_rewrite_that_misses_origin_passes(world):
++    """Every pool worker has install-push-route's global ``url.https://github.com/.pushInsteadOf git@github.com:``.
++    It cannot touch this origin, so the clone proves (it refused as ``origin_rewritten`` on every worker)."""
++    conn, cfg = use_home(world, "worker-2")
++    git(world.tmp, "config", "--global", "url.https://github.com/.pushInsteadOf", "git@github.com:")
++    out = resolve(world, conn, cfg, snap(world))
++    assert out.mode == "materialized"
++
++
++@pytest.mark.parametrize("key", ["pushInsteadOf", "insteadOf"])
++def test_global_rewrite_of_origin_refused(world, key):
++    """A global rule that DOES change this origin's push or fetch URL still refuses."""
++    conn, cfg = use_home(world, "worker-2")
++    git(world.tmp, "config", "--global", f"url.{world.tmp / 'fork.git'}.{key}", str(world.origin))
++    err = refusal(lambda: resolve(world, conn, cfg, snap(world)))
++    assert (err.code, err.scope) == ("origin_rewritten", "host")
++
++
++def test_github_repo_uses_dispatcher_gh_argv(monkeypatch):
++    """The id lookup runs under the home's gh_command_prefix (the hub's gh has no login or GH_TOKEN)."""
++    from hermes_cli import kanban_gh_argv
++    seen = []
++    monkeypatch.setattr(kanban_gh_argv, "dispatcher_gh_argv", lambda: ["/opt/broker", "exec", "--", "/bin/gh"])
++
++    def run(argv, **kw):
++        seen.append(argv)
++        return SimpleNamespace(stdout='{"id": 42, "full_name": "acme/widget"}')
++    monkeypatch.setattr(kcl.subprocess, "run", run)
++    assert kcl.github_repo("acme/widget") == {"id": 42, "full_name": "acme/widget"}
++    assert seen == [["/opt/broker", "exec", "--", "/bin/gh", "api", "repos/acme/widget", "--jq",
++                     "{id: .id, full_name: .full_name}"]]
++
++
++def test_github_repo_without_gh_argv_fails_closed(monkeypatch):
++    from hermes_cli import kanban_gh_argv
++
++    def unavailable():
++        raise kanban_gh_argv.GhArgvUnavailable("kanban.pr_acceptance.gh_command_prefix is unreadable or invalid")
++    monkeypatch.setattr(kanban_gh_argv, "dispatcher_gh_argv", unavailable)
++    with pytest.raises(kanban_gh_argv.GhArgvUnavailable):
++        kcl.github_repo("acme/widget")
++
++
+ def test_wrong_repo_clone_refused(world):
+     conn, cfg = use_home(world, "worker-2")
+     world.monkeypatch.setattr(kcl, "github_repo", lambda full_name: {"id": 7, "full_name": full_name})
+-- 
+2.43.0
+

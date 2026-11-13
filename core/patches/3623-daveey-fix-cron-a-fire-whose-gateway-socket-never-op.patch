@@ -1,0 +1,403 @@
+From 66a2b43d55408ba57943cab7ce99b1990ecdcf38 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:26:18 +0000
+Subject: [PATCH] [daveey] fix(cron): a fire whose gateway socket never opened
+ is held, not booked FAILED
+
+run_canonical_job booked a fire FAILED when connect_gateway could not open the
+WebSocket (GatewayClientError 'Gateway connection failed; no local fallback',
+raised from an OSError/TimeoutError) although nothing was submitted and no
+admission journal existed. hermes-hub 2026-11-13 05:20 UTC: a core-update drain
+released 31 deferred cron jobs, the gateway loop stalled ~4 s, and three jobs
+(6b4342ad83d9 and two others) were booked FAILED.
+
+A dial failure before submit now raises CronFireNotAdmitted('unreachable',
+'connect_failed'), so a scheduled fire is held and its slot stays due. The hold
+count lives in last_fire_error.connect_holds; after CONNECT_HOLD_LIMIT (3)
+consecutive dial-failure holds the next one is booked FAILED as before, so a
+gateway that stays unreachable still alerts. Owner refusals, not-ready verdicts,
+local client refusals and any failure after submit are unchanged.
+
+release_unadmitted_fire moves from cron/jobs.py to cron/unadmitted_fire.py
+(offsets the file-size ratchet; sole caller updated).
+---
+ cron/jobs.py                                  |  33 ----
+ cron/scheduler_authority.py                   |  34 +++-
+ cron/unadmitted_fire.py                       |  62 ++++++
+ .../test_cron_connect_failure_not_admitted.py | 184 ++++++++++++++++++
+ 4 files changed, 277 insertions(+), 36 deletions(-)
+ create mode 100644 cron/unadmitted_fire.py
+ create mode 100644 tests/cron/test_cron_connect_failure_not_admitted.py
+
+diff --git a/cron/jobs.py b/cron/jobs.py
+index ff5a20f83d..73b2c3397c 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -2407,39 +2407,6 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
+     return _with_job(job_id, apply, False)
+ 
+ 
+-def release_unadmitted_fire(
+-    job_id: str, slot: Optional[str], detail: str, *, expected_fire_owner: Optional[str] = None,
+-) -> bool:
+-    """[daveey] Hand back a scheduled fire the gateway never admitted (draining for an update,
+-    starting, absent): ``next_run_at`` returns to *slot* so the next ready tick fires it, the fire
+-    claim, pending slot and run claim are dropped, a finite one-shot's ``claim_dispatch`` bump is
+-    undone, and ``last_fire_error`` records why. ``last_status``/``failure_streak``/``last_run_at``
+-    are left alone: nothing ran. Fenced on *expected_fire_owner*: a claim another fire took since
+-    is not ours to release. True iff released."""
+-    def apply(jobs, _i, job):
+-        claim = job.get("fire_claim")
+-        if expected_fire_owner is not None and (not isinstance(claim, dict)
+-                                                or claim.get("by") != expected_fire_owner):
+-            return False
+-        kind = job.get("schedule", {}).get("kind")
+-        if slot and kind in {"cron", "interval"}:
+-            job["next_run_at"] = slot
+-        repeat = job.get("repeat") or {}
+-        times = repeat.get("times")
+-        if (kind == "once" and isinstance(times, int) and times > 0
+-                and not extra_fire.is_extra(job) and int(repeat.get("completed") or 0) > 0):
+-            repeat["completed"] = int(repeat["completed"]) - 1
+-        job["fire_claim"] = None
+-        job.pop("pending_slot", None)
+-        if job.get("run_claim") is not None:
+-            job["run_claim"] = None
+-        job["last_fire_error"] = {"at": _hermes_now().isoformat(), "detail": str(detail or "")[:500]}
+-        save_jobs(jobs)
+-        return True
+-
+-    return _with_job(job_id, apply, False)
+-
+-
+ # Failure kinds that never reached the agent: a later gate tick may clear a streak made only of them.
+ _PRE_AGENT_ERROR_KINDS = ("fire", "gate")
+ # ``last_failure.kind`` of a run its owner gateway's shutdown/restart stopped (shutdown_interrupted).
+diff --git a/cron/scheduler_authority.py b/cron/scheduler_authority.py
+index bdb4052f42..34caa36d0d 100644
+--- a/cron/scheduler_authority.py
++++ b/cron/scheduler_authority.py
+@@ -11,7 +11,8 @@ class CronExecutionUnknown(RuntimeError):
+ 
+ class CronFireNotAdmitted(RuntimeError):
+     """[daveey] No ready owner was reached and nothing was submitted (the gateway is draining for an
+-    update, starting, or absent): a scheduled fire is held and stays due, never booked as a failed
++    update, starting, absent, or its socket could not be opened): a scheduled fire is held and stays
++    due, never booked as a failed
+     run. Raised only before admission; a refusal after submit stays a definite failure."""
+ 
+     def __init__(self, message, state, reason_code=None):
+@@ -21,6 +22,24 @@ class CronFireNotAdmitted(RuntimeError):
+ 
+ # GatewayUnavailableError states that mean "not ready yet", not "this owner refuses the job".
+ _NOT_READY_STATES = frozenset({'draining', 'starting', 'absent'})
++# Consecutive dial-failure holds of one job before the next one is booked FAILED.
++CONNECT_HOLD_LIMIT = 3
++
++
++def _dial_failed(exc):
++    """The gateway socket could not be opened: a plain client error raised from a socket
++    error/timeout. Owner refusals (``GatewayRPCError``), not-ready verdicts
++    (``GatewayUnavailableError``) and local client refusals (bad URL, protocol mismatch) are not."""
++    from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError, GatewayUnavailableError
++    return (isinstance(exc, GatewayClientError)
++            and not isinstance(exc, (GatewayRPCError, GatewayUnavailableError))
++            and isinstance(exc.__cause__, (OSError, TimeoutError)))
++
++
++def _connect_holds_left(job_id):
++    from cron.jobs import get_job
++    from cron.unadmitted_fire import connect_holds
++    return connect_holds(get_job(job_id)) < CONNECT_HOLD_LIMIT
+ 
+ 
+ def settle_unbooked_fire(job, exc, fire_owner, execution_id):
+@@ -41,9 +60,10 @@ def settle_unbooked_fire(job, exc, fire_owner, execution_id):
+         return True
+     if isinstance(exc, CronFireNotAdmitted) and job.get('_scheduled_instant'):
+         from cron.executions import finish_execution
+-        from cron.jobs import release_unadmitted_fire
++        from cron.unadmitted_fire import release_unadmitted_fire
+         released = release_unadmitted_fire(
+-            job['id'], job['_scheduled_instant'], str(exc), expected_fire_owner=fire_owner or None)
++            job['id'], job['_scheduled_instant'], str(exc), expected_fire_owner=fire_owner or None,
++            reason_code=exc.reason_code)
+         finish_execution(execution_id, success=False, error=str(exc), delivery_outcome='suppressed')
+         log.warning('Cron %s held (%s): %s', job['id'],
+                     'slot stays due' if released else 'claim moved on', exc)
+@@ -320,6 +340,14 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
+             raise CronFireNotAdmitted(
+                 f'Not admitted: the gateway is {reason}; the fire stays due: {exc}',
+                 exc.state, exc.reason_code) from exc
++        if _dial_failed(exc) and _connect_holds_left(job['id']):
++            # The socket never opened (a stalled or restarting owner loop): nothing was submitted,
++            # so the fire is held like a not-ready gateway. After CONNECT_HOLD_LIMIT consecutive
++            # holds it is booked FAILED below, so a gateway that stays unreachable still alerts.
++            from cron.unadmitted_fire import CONNECT_FAILED
++            raise CronFireNotAdmitted(
++                f'Not admitted: the gateway could not be reached ({CONNECT_FAILED}); the fire stays due: {exc}',
++                'unreachable', CONNECT_FAILED) from exc
+         error = f'{type(exc).__name__}: {exc}'
+         job['_fire_error'] = True  # nothing was submitted: a fire/infra failure, not an agent verdict
+         return False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error
+diff --git a/cron/unadmitted_fire.py b/cron/unadmitted_fire.py
+new file mode 100644
+index 0000000000..10d0fa3afb
+--- /dev/null
++++ b/cron/unadmitted_fire.py
+@@ -0,0 +1,62 @@
++"""[daveey] Hand back a scheduled fire the gateway never admitted, counting dial-failure holds.
++
++A fire is held (not booked) when nothing was submitted: the gateway was draining, starting or
++absent, or its socket could not be opened at all (``connect_failed``). A dial failure is the one
++hold that can also mean "the gateway is dead", so consecutive ``connect_failed`` holds are
++counted in ``last_fire_error.connect_holds``; ``cron.scheduler_authority`` books the fire FAILED
++once ``CONNECT_HOLD_LIMIT`` holds have passed. Any other hold restarts the count, and a successful
++run clears ``last_fire_error`` (``cron.jobs._record_run_outcome``).
++"""
++from __future__ import annotations
++
++from typing import Any, Optional
++
++CONNECT_FAILED = "connect_failed"
++
++
++def connect_holds(job: Optional[dict[str, Any]]) -> int:
++    """Consecutive dial-failure holds recorded on *job*'s stored record."""
++    stamp = (job or {}).get("last_fire_error")
++    count = stamp.get("connect_holds") if isinstance(stamp, dict) else None
++    return count if isinstance(count, int) and count > 0 else 0
++
++
++def release_unadmitted_fire(
++    job_id: str, slot: Optional[str], detail: str, *, expected_fire_owner: Optional[str] = None,
++    reason_code: Optional[str] = None,
++) -> bool:
++    """Hand back a scheduled fire the gateway never admitted: ``next_run_at`` returns to *slot* so
++    the next ready tick fires it, the fire claim, pending slot and run claim are dropped, a finite
++    one-shot's ``claim_dispatch`` bump is undone, and ``last_fire_error`` records why (with the
++    dial-failure hold count when *reason_code* is ``connect_failed``).
++    ``last_status``/``failure_streak``/``last_run_at`` are left alone: nothing ran. Fenced on
++    *expected_fire_owner*: a claim another fire took since is not ours to release. True iff
++    released."""
++    from cron import extra_fire
++    from cron.jobs import _hermes_now, _with_job, save_jobs
++
++    def apply(jobs, _i, job):
++        claim = job.get("fire_claim")
++        if expected_fire_owner is not None and (not isinstance(claim, dict)
++                                                or claim.get("by") != expected_fire_owner):
++            return False
++        kind = job.get("schedule", {}).get("kind")
++        if slot and kind in {"cron", "interval"}:
++            job["next_run_at"] = slot
++        repeat = job.get("repeat") or {}
++        times = repeat.get("times")
++        if (kind == "once" and isinstance(times, int) and times > 0
++                and not extra_fire.is_extra(job) and int(repeat.get("completed") or 0) > 0):
++            repeat["completed"] = int(repeat["completed"]) - 1
++        job["fire_claim"] = None
++        job.pop("pending_slot", None)
++        if job.get("run_claim") is not None:
++            job["run_claim"] = None
++        stamp: dict[str, Any] = {"at": _hermes_now().isoformat(), "detail": str(detail or "")[:500]}
++        if reason_code == CONNECT_FAILED:
++            stamp["connect_holds"] = connect_holds(job) + 1
++        job["last_fire_error"] = stamp
++        save_jobs(jobs)
++        return True
++
++    return _with_job(job_id, apply, False)
+diff --git a/tests/cron/test_cron_connect_failure_not_admitted.py b/tests/cron/test_cron_connect_failure_not_admitted.py
+new file mode 100644
+index 0000000000..9d50d05d42
+--- /dev/null
++++ b/tests/cron/test_cron_connect_failure_not_admitted.py
+@@ -0,0 +1,184 @@
++"""A fire whose gateway socket never opened was not admitted: it is held, not booked FAILED. [daveey]
++
++hermes-hub 2026-11-13 05:20 UTC (cron 6b4342ad83d9 and two siblings): a core-update drain released
++31 deferred cron jobs at once, the gateway's event loop stalled ~4 s back to back, and the job's
++worker could not open its WebSocket within ``connect_gateway``'s 10 s open timeout
++(``Gateway connection failed; no local fallback``). Nothing was submitted and no admission journal
++existed, yet ``run_canonical_job`` booked the fire FAILED. A dial failure before submit now holds
++the fire (the slot stays due) for up to ``CONNECT_HOLD_LIMIT`` consecutive fires; the next one is
++booked FAILED as before, so a gateway that stays unreachable still surfaces.
++"""
++from contextlib import asynccontextmanager
++from datetime import timedelta
++
++import pytest
++
++import cron.jobs as J
++import cron.scheduler as S
++from cron import scheduler_authority, scheduler_gateway_gate
++
++
++@pytest.fixture
++def cron_home(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    (home / "cron").mkdir(parents=True)
++    (home / "scripts").mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.delenv("HERMES_TUI_GATEWAY_URL", raising=False)
++    monkeypatch.setattr(J, "HERMES_DIR", home)
++    monkeypatch.setattr(J, "CRON_DIR", home / "cron")
++    monkeypatch.setattr(J, "JOBS_FILE", home / "cron" / "jobs.json")
++    monkeypatch.setattr(J, "OUTPUT_DIR", home / "cron" / "output")
++    monkeypatch.setattr(S, "_hermes_home", home)
++    monkeypatch.setattr(S, "_sweep_mcp_orphans", lambda: None)
++    monkeypatch.setattr("gateway.session_cron.owner_for_home", lambda home: None)
++    # The gate's probe said ready; the dial then failed (the live race).
++    monkeypatch.setattr(scheduler_gateway_gate, "refuse_agent_jobs_without_gateway", lambda due, **_kw: due)
++    S._running_job_ids.clear()
++    return home
++
++
++def _due_agent_job():
++    job = J.create_job(prompt="summarise inbox", schedule="every 10m", name="watcher", deliver="local")
++    stored = J.load_jobs()
++    slot = (J._hermes_now() - timedelta(minutes=1)).replace(microsecond=0).isoformat()
++    next(r for r in stored if r["id"] == job["id"])["next_run_at"] = slot
++    J.save_jobs(stored)
++    return job["id"], slot
++
++
++def _stored(job_id):
++    return next(j for j in J.load_jobs() if j["id"] == job_id)
++
++
++def _outputs(job_id):
++    out = J.OUTPUT_DIR / job_id
++    return list(out.iterdir()) if out.exists() else []
++
++
++def _journals(home):
++    return list((home / "cron" / "admissions").glob("*.json"))
++
++
++def _dial_failure():
++    """The exact error ``connect_gateway`` raises when the WebSocket open times out."""
++    from hermes_cli.gateway_client import GatewayClientError
++    try:
++        try:
++            raise TimeoutError("timed out during opening handshake")
++        except TimeoutError as cause:
++            raise GatewayClientError("Gateway connection failed; no local fallback") from cause
++    except GatewayClientError as exc:
++        return exc
++
++
++def _connect_raising(monkeypatch, make_exc):
++    from hermes_cli import gateway_client
++    dials = []
++
++    @asynccontextmanager
++    async def connect(*_a, **_k):
++        dials.append(1)
++        raise make_exc()
++        yield
++
++    monkeypatch.setattr(gateway_client, "connect_gateway", connect)
++    return dials
++
++
++def _assert_held(home, job_id, slot):
++    stored = _stored(job_id)
++    assert stored["last_run_at"] is None and stored["last_status"] is None
++    assert int(stored.get("failure_streak") or 0) == 0
++    assert stored["next_run_at"] == slot, "the slot stays due: it fires on the next tick"
++    assert stored.get("fire_claim") is None and "pending_slot" not in stored
++    assert "connect_failed" in stored["last_fire_error"]["detail"]
++    assert not _outputs(job_id), "no FAILED output document for a fire that never reached the gateway"
++    assert not _journals(home), "nothing was submitted"
++
++
++def test_dial_failure_before_submit_holds_the_fire(cron_home, monkeypatch):
++    """The live failure: before the fix this tick booked the fire FAILED (streak 1, FAILED doc)."""
++    dials = _connect_raising(monkeypatch, _dial_failure)
++    job_id, slot = _due_agent_job()
++
++    S.tick(verbose=False)
++
++    assert dials, "the fire reached connect_gateway"
++    _assert_held(cron_home, job_id, slot)
++
++
++def test_run_canonical_job_raises_not_admitted_and_leaves_fire_error_unset(cron_home, monkeypatch):
++    _connect_raising(monkeypatch, _dial_failure)
++    job = {"id": "job"}
++    with pytest.raises(scheduler_authority.CronFireNotAdmitted) as info:
++        scheduler_authority.run_canonical_job(job, execution_id="fire")
++    assert (info.value.state, info.value.reason_code) == ("unreachable", "connect_failed")
++    assert "_fire_error" not in job
++    assert not _journals(cron_home)
++
++
++def test_client_error_without_a_transport_cause_still_fails(cron_home, monkeypatch):
++    """Only a dial that failed at the socket is held; a local client refusal (bad explicit URL,
++    protocol mismatch) is not a not-ready gateway and keeps failing loudly."""
++    from hermes_cli.gateway_client import GatewayClientError
++    _connect_raising(monkeypatch, lambda: GatewayClientError("Gateway protocol mismatch; update/restart required"))
++    job_id, _slot = _due_agent_job()
++
++    S.tick(verbose=False)
++
++    stored = _stored(job_id)
++    assert stored["last_status"] == "error" and stored["failure_streak"] == 1
++
++
++def test_transport_loss_after_submit_stays_unknown_never_held(cron_home, monkeypatch):
++    """Once a submit may have reached the owner, a lost socket is uncertainty, not a hold."""
++    from cron import observer_reconnect
++    from hermes_cli import gateway_client
++
++    class Peer:
++        async def rpc(self, method, **params):
++            raise _dial_failure()
++
++    @asynccontextmanager
++    async def connect(*_a, **_k):
++        yield Peer()
++
++    monkeypatch.setattr(observer_reconnect, "RECONNECT_SECONDS", 0.0)
++    monkeypatch.setattr(gateway_client, "connect_gateway", connect)
++    with pytest.raises(scheduler_authority.CronExecutionUnknown):
++        scheduler_authority.run_canonical_job({"id": "job"}, execution_id="fire")
++    assert _journals(cron_home), "the possibly-admitted identity is kept for reconciliation"
++
++
++def test_dial_failure_past_the_hold_limit_is_booked_failed(cron_home, monkeypatch):
++    """Detection guard: a gateway that stays unreachable is still one FAILED run and alert."""
++    _connect_raising(monkeypatch, _dial_failure)
++    job_id, slot = _due_agent_job()
++
++    for _ in range(scheduler_authority.CONNECT_HOLD_LIMIT):
++        S.tick(verbose=False)
++        _assert_held(cron_home, job_id, slot)
++
++    S.tick(verbose=False)
++
++    stored = _stored(job_id)
++    assert stored["last_status"] == "error" and stored["failure_streak"] == 1
++    assert "Gateway connection failed" in stored["last_error"]
++    assert _outputs(job_id), "the FAILED run writes its output document"
++
++
++def test_a_successful_run_resets_the_hold_count(cron_home, monkeypatch):
++    _connect_raising(monkeypatch, _dial_failure)
++    job_id, slot = _due_agent_job()
++    for _ in range(scheduler_authority.CONNECT_HOLD_LIMIT):
++        S.tick(verbose=False)
++    J.mark_job_run(job_id, True)
++    stored = J.load_jobs()
++    next(r for r in stored if r["id"] == job_id)["next_run_at"] = slot
++    J.save_jobs(stored)
++
++    S.tick(verbose=False)
++
++    assert int(_stored(job_id).get("failure_streak") or 0) == 0
++    assert _stored(job_id)["next_run_at"] == slot, "a fresh outage gets its own holds"
+-- 
+2.43.0
+

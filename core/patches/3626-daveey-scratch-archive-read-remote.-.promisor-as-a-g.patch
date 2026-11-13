@@ -1,0 +1,123 @@
+From fb1f92a81804428f111e448a7a93cac564c16bed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 14:41:08 +0000
+Subject: [PATCH] [daveey] scratch archive: read remote.*.promisor as a git
+ bool (empty `promisor =` is not a promisor)
+
+Follow-up to PR #2242 review 5892161597 (card t_01a1d5393de5cd94).
+
+Why: `_is_partial_clone` parsed `git config --get-regexp` output with
+`line.split()[-1]`. For an empty value (`promisor =`, which git reads as
+bool false) that token is the key name itself, so the repo counted as a
+promisor. A full clone with that config and a genuinely missing HEAD blob
+was then archived with the missing object recorded in remote_base.json
+instead of being refused (fail-open against the PR's own rule).
+
+Fix: read `remote.*.promisor` with `git config --null --type=bool
+--get-regexp` and count only `true`; a value git cannot parse as a bool
+makes the config read fail, which refuses the archive (tree kept).
+`extensions.partialClone` names the promisor remote (not a bool), so a
+non-empty value counts.
+
+Tests (tests/hermes_cli/test_kanban_scratch_archive_partial_clone.py):
+- full clone + `remote.origin.promisor` = "" / "No" / "0" + deleted
+  loose HEAD blob -> ArchiveRefused ("" was RED on main).
+- `_is_partial_clone` bool table: true/yes/1, extensions.partialClone
+  "origin" -> True; empty extensions.partialClone -> False (RED on main).
+- unparseable `promisor = maybe` -> ArchiveRefused (RED on main).
+
+Not done: the optional `_missing_objects` changed-paths-only walk (perf
+only; out of scope).
+---
+ hermes_cli/kanban_scratch_archive.py          | 15 ++++++---
+ ...st_kanban_scratch_archive_partial_clone.py | 33 ++++++++++++++++++-
+ 2 files changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_scratch_archive.py b/hermes_cli/kanban_scratch_archive.py
+index 8fbe267208..1dc6055355 100644
+--- a/hermes_cli/kanban_scratch_archive.py
++++ b/hermes_cli/kanban_scratch_archive.py
+@@ -187,11 +187,18 @@ def _text(proc: subprocess.CompletedProcess) -> str:
+ 
+ 
+ def _is_partial_clone(repo: Path, env: dict[str, str]) -> bool:
+-    """Whether *repo* has a promisor remote (objects it may lack are promised, not lost)."""
+-    proc = _git(repo, env, "config", "--get-regexp", r"^(remote\..*\.promisor|extensions\.partialclone)$",
++    """Whether *repo* has a promisor remote (objects it may lack are promised, not lost).
++
++    Read with git's own semantics: ``remote.<name>.promisor`` is a bool (an empty
++    ``promisor =`` is false; a value git cannot parse refuses), and
++    ``extensions.partialClone`` names the promisor remote, so only a non-empty
++    name counts. Anything else is a full clone, whose missing objects refuse.
++    """
++    proc = _git(repo, env, "config", "--null", "--type=bool", "--get-regexp", r"^remote\..*\.promisor$",
+                 ok=(0, 1))
+-    return any(line.split()[-1].lower() not in ("false", "no", "off", "0")
+-               for line in _text(proc).splitlines())
++    if any(entry.rpartition("\n")[2] == "true" for entry in _text(proc).split("\0") if entry):
++        return True
++    return bool(_text(_git(repo, env, "config", "--get", "extensions.partialclone", ok=(0, 1))))
+ 
+ 
+ def _raw_changes(repo: Path, env: dict[str, str], base: str) -> list[dict]:
+diff --git a/tests/hermes_cli/test_kanban_scratch_archive_partial_clone.py b/tests/hermes_cli/test_kanban_scratch_archive_partial_clone.py
+index e39aaa8294..456b580405 100644
+--- a/tests/hermes_cli/test_kanban_scratch_archive_partial_clone.py
++++ b/tests/hermes_cli/test_kanban_scratch_archive_partial_clone.py
+@@ -130,7 +130,8 @@ def test_complete_blobless_clone_archives_like_a_full_one(board, promisor, tmp_p
+     assert not (dest / "remote_base.json").exists()
+ 
+ 
+-@pytest.mark.parametrize("promisor_value", [None, "false"])
++# "" is `promisor =`, which git reads as bool false; "No" checks case-insensitive bool parsing.
++@pytest.mark.parametrize("promisor_value", [None, "false", "", "No", "0"])
+ def test_missing_object_in_a_full_clone_still_refuses(board, tmp_path, promisor_value):
+     from hermes_cli import kanban_scratch_archive as sa
+ 
+@@ -139,6 +140,7 @@ def test_missing_object_in_a_full_clone_still_refuses(board, tmp_path, promisor_
+     _run("init", "-q", cwd=repo)
+     if promisor_value is not None:  # a remote explicitly NOT a promisor vouches for nothing
+         _run("config", "remote.origin.promisor", promisor_value, cwd=repo)
++        assert not sa._is_partial_clone(repo, sa._env(repo))
+     (repo / "f.txt").write_text("base\n")
+     _run("add", ".", cwd=repo)
+     _run("commit", "-q", "-m", "c", cwd=repo)
+@@ -166,6 +168,35 @@ def test_unborn_partial_clone_archives_its_files(board, tmp_path):
+     assert "remote_base_count" not in meta
+ 
+ 
++@pytest.mark.parametrize("key,value,expected", [
++    ("remote.origin.promisor", "true", True),
++    ("remote.origin.promisor", "yes", True),
++    ("remote.origin.promisor", "1", True),
++    ("extensions.partialClone", "origin", True),  # names the promisor remote: not a bool
++    ("extensions.partialClone", "", False),
++])
++def test_is_partial_clone_reads_git_bool_semantics(board, tmp_path, key, value, expected):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    repo = tmp_path / "r"
++    repo.mkdir()
++    _run("init", "-q", cwd=repo)
++    assert not sa._is_partial_clone(repo, sa._env(repo))
++    _run("config", key, value, cwd=repo)
++    assert sa._is_partial_clone(repo, sa._env(repo)) is expected
++
++
++def test_unparseable_promisor_value_refuses(board, tmp_path):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    repo = tmp_path / "r"
++    repo.mkdir()
++    _run("init", "-q", cwd=repo)
++    _run("config", "remote.origin.promisor", "maybe", cwd=repo)  # git itself rejects this as a bool
++    with pytest.raises(sa.ArchiveRefused):
++        sa._is_partial_clone(repo, sa._env(repo))
++
++
+ def test_archive_git_never_reaches_the_network(board, tmp_path):
+     from hermes_cli import kanban_scratch_archive as sa
+ 
+-- 
+2.43.0
+

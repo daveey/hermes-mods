@@ -1,0 +1,168 @@
+From f8d5675fb01f0d52da8f840489121d593a67e39d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:25:28 +0000
+Subject: [PATCH] [daveey] update pause requeue: a stopped head's cancel that
+ committed before raising settles; document the post-commit Stop window
+
+t_01a1d4cc43b7ac4a, the three non-blocking points of review 5890626978 of PR #2173, redone against main after
+#2173 landed as 129a8e34216 (its first commit was superseded by ea4f9dc74e5, so the names moved).
+
+1. `_stopped_after_requeue` cancel-failure path. On main the comment already states the real behaviour (the row
+   stays queued and runs once after the hold) and no `cancel_obligations` entry exists any more, so nothing leaks.
+   Decision: no retry loop. `db._execute_write` already retries a locked/busy writer within its write patience, so
+   what reaches the handler is not transient, or its commit is unknown (an IOERR at COMMIT). For that last case the
+   handler now reads the row back: a cancel that committed settles as cancelled (waiter answered, media released)
+   instead of leaving the waiter hanging on a terminal row. Otherwise it logs ERROR that the row stays queued.
+   New test, parametrized: before-commit (row queued, latch cleared, waiter unanswered, one attempt, the notice runs
+   exactly once after the hold) and commit-then-raise (settled cancelled, waiter answered, never runs again).
+2. `requeue_unstarted` docstring documents the one Stop window left, between the write's commit and the coroutine
+   resuming: `interrupt_update` then reads the row queued and returns False, so its caller is told the turn does not
+   stop and the notice runs once after the hold. No await separates the `stopped` read from clearing the claim.
+3. Superseded: tests/gateway/test_update_pause_started_notifier_head.py never reached main. Main's bound-steer test
+   (tests/gateway/test_update_hold_claimed_wake.py::test_a_steer_committed_while_the_wake_waited_on_the_lease_goes_back_with_it,
+   d495dccb3fe) already drives the real `prompt.steer_queued` RPC into a BufferedAgent; it fakes no `_transfers`.
+
+Tests: tests/gateway/test_update_requeue_stop_race.py: commit-then-raise is RED on origin/main's
+session_update_pause.py (waiter never answered) and GREEN here; before-commit passes on both (characterizes
+main's behaviour); 3 passed. The 21 test files that import session_update_pause / requeue_unstarted: 152 passed. scripts/check --base origin/main: ok.
+---
+ gateway/session_update_pause.py               | 26 +++++--
+ .../gateway/test_update_requeue_stop_race.py  | 74 +++++++++++++++++++
+ 2 files changed, 94 insertions(+), 6 deletions(-)
+
+diff --git a/gateway/session_update_pause.py b/gateway/session_update_pause.py
+index 4f65624c85..a21af657d5 100644
+--- a/gateway/session_update_pause.py
++++ b/gateway/session_update_pause.py
+@@ -166,7 +166,12 @@ async def requeue_unstarted(authority, live, ref, row):
+ 
+     [daveey] t_01a1d4a0ecd9bd54: a Stop that ``interrupt_update`` latched while the write ran (it found the claim
+     still started and told its caller the turn stops) cancels the re-queued row instead of letting the notice run
+-    after the hold (``_stopped_after_requeue``)."""
++    after the hold (``_stopped_after_requeue``).
++
++    [daveey] t_01a1d4cc43b7ac4a: one Stop window is left, between the write's commit and this coroutine resuming.
++    It is benign: ``interrupt_update`` then reads the row queued, not started, and returns False, so its caller is
++    told the turn does not stop and the notice runs once after the hold, as for a Stop after this function returns.
++    No await separates the ``stopped`` read below from clearing the claim, so a latch is never dropped unread."""
+     from gateway.session_runtime_workers import tracked_write, persist_work_count
+     from gateway.session_settlement_recovery import _transfers
+     from hermes_state_runtime import RuntimeStoreError
+@@ -214,7 +219,7 @@ async def _stopped_after_requeue(authority, ref, row):
+     row queued (not started) and is refused, as for any queued row."""
+     from gateway.session_ingress_media import release_admission_media
+     from gateway.session_runtime_workers import tracked_write, persist_work_count
+-    from hermes_state_runtime import cancel_session_input
++    from hermes_state_runtime import cancel_session_input, get_session_admission
+     admission_id, sid = row['admission_id'], ref.session_id
+     authority.update_stops.discard(admission_id)
+     if authority.pending_stops.get(sid) == row['generation']:
+@@ -224,10 +229,19 @@ async def _stopped_after_requeue(authority, ref, row):
+         cancelled = await tracked_write(authority, partial(cancel_session_input, authority.db,
+                                                            epoch=authority.epoch, admission_id=admission_id))
+     except Exception:
+-        # Nothing retries this: the row stays queued and runs once after the hold. Fail loud, never silent.
+-        logging.getLogger(__name__).exception('Update requeue: cancelling stopped %s failed; it stays queued and '
+-                                              'runs after the hold', admission_id)
+-        cancelled = None
++        # [daveey] t_01a1d4cc43b7ac4a: no retry here, since the store already retries a locked or busy writer
++        # within its write patience. What reaches this point is not transient, or its commit is unknown (an
++        # IOERR at COMMIT), so read the row back. A cancel that committed settles below. Otherwise the row stays
++        # queued and runs once after the hold. Fail loud, never silent.
++        logging.getLogger(__name__).exception('Update requeue: cancelling stopped %s failed', admission_id)
++        try:
++            cancelled = await asyncio.to_thread(get_session_admission, authority.db, admission_id=admission_id)
++        except Exception:
++            logging.getLogger(__name__).exception('Update requeue: reading stopped %s back failed', admission_id)
++            cancelled = None
++        if cancelled is None or (cancelled['status'], cancelled['outcome']) != ('terminal', 'cancelled'):
++            logging.getLogger(__name__).error('Update requeue: stopped %s stays queued and runs after the hold',
++                                              admission_id)
+     if cancelled is not None and (cancelled['status'], cancelled['outcome']) == ('terminal', 'cancelled'):
+         authority._settle_cancelled(ref, admission_id)
+         await asyncio.to_thread(release_admission_media, authority.db, admission_id)
+diff --git a/tests/gateway/test_update_requeue_stop_race.py b/tests/gateway/test_update_requeue_stop_race.py
+index d5e3eba1b7..8e3db3659c 100644
+--- a/tests/gateway/test_update_requeue_stop_race.py
++++ b/tests/gateway/test_update_requeue_stop_race.py
+@@ -87,3 +87,77 @@ async def test_stop_latched_during_the_requeue_write_cancels_the_head_and_clears
+         finally:
+             held[0] = False
+             await _stop_session(authority)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('failure', ['before-commit', 'commit-then-raise'])
++async def test_a_failed_cancel_of_the_stopped_head_runs_it_once_after_the_hold_or_settles_a_committed_one(
++        tmp_path, monkeypatch, failure):
++    """[daveey] t_01a1d4cc43b7ac4a (review 5890626978 of PR #2173): the cancel-failure path of
++    ``_stopped_after_requeue``. Nothing retries the cancel (the store already retries a busy writer). A cancel that
++    never committed leaves the row queued, with no latch left and its waiter unanswered, and the notice runs exactly
++    once after the hold. A cancel whose commit landed before the raise is read back and settles as cancelled."""
++    import hermes_state_runtime
++    import hermes_state_update_pause
++    from gateway import session_finite, session_notifier_drain
++    from gateway.session_runtime_workers import mutation_tasks
++    from gateway.session_update_pause import interrupt_update
++    from hermes_state_runtime import admit_session_input, get_session_admission
++    db, authority = _authority(tmp_path, monkeypatch)
++    held, calls, stops, attempts = [False], [], [], []
++    monkeypatch.setattr(session_notifier_drain, 'held', lambda: held[0])
++    loop = asyncio.get_running_loop()
++    original = hermes_state_update_pause.requeue_unstarted_input
++
++    def racing_write(*args, **kwargs):
++        stops.append(asyncio.run_coroutine_threadsafe(interrupt_update(authority, REF, kwargs['generation']), loop))
++        deadline = time.monotonic() + 5
++        while kwargs['admission_id'] not in authority.update_stops and time.monotonic() < deadline:
++            time.sleep(0.01)
++        assert kwargs['admission_id'] in authority.update_stops, 'the Stop never latched'
++        return original(*args, **kwargs)
++    monkeypatch.setattr(hermes_state_update_pause, 'requeue_unstarted_input', racing_write)
++    original_cancel = hermes_state_runtime.cancel_session_input
++
++    def failing_cancel(*args, **kwargs):
++        attempts.append(kwargs['admission_id'])
++        if failure == 'commit-then-raise':
++            original_cancel(*args, **kwargs)
++        raise OSError('disk I/O error')
++    monkeypatch.setattr(hermes_state_runtime, 'cancel_session_input', failing_cancel)
++
++    async def execute(owner, ref, row):
++        calls.append(row)
++        if len(calls) == 1:
++            held[0] = True
++            _yielded(owner, row)
++        return 'answered'
++    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
++    identity = json.dumps(['kanban-wake', 'route', f'cancel-{failure}'])
++    with db:
++        head = admit_session_input(db, epoch=authority.epoch, session_id='s', principal_id='automation:route',
++                                   request_id=identity, payload=wake_payload(identity, local=True))
++        waiter = authority.waiters.setdefault(head['admission_id'], loop.create_future())
++        authority._schedule(REF)
++        try:
++            await _until(lambda: stops and stops[0].done())
++            await _until(lambda: attempts and not mutation_tasks(authority))
++            assert attempts == [head['admission_id']]  # one attempt: no retry loop
++            assert head['admission_id'] not in authority.update_stops and not authority.pending_stops
++            row = get_session_admission(db, admission_id=head['admission_id'])
++            assert row is not None
++            if failure == 'commit-then-raise':
++                assert (row['status'], row['outcome']) == ('terminal', 'cancelled'), row
++                assert await asyncio.wait_for(waiter, 5) is None
++            else:
++                assert (row['status'], row['outcome']) == ('queued', None), row
++                assert not waiter.done(), 'the waiter stays with the queued row'
++            held[0] = False
++            authority.sessions['s'].claim_changed.set()
++            expected = 1 if failure == 'commit-then-raise' else 2  # yielded once, then (if still queued) ran once
++            await _until(lambda: len(calls) >= expected and not mutation_tasks(authority))
++            assert [c['admission_id'] for c in calls] == [head['admission_id']] * expected
++            assert not authority.update_stops and not authority.pending_stops
++        finally:
++            held[0] = False
++            await _stop_session(authority)
+-- 
+2.43.0
+

@@ -1,0 +1,95 @@
+From 41172c947304742cd4470c1473564a77202414ed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 15:09:15 +0000
+Subject: [PATCH] [daveey] fix(cron): a manual fire whose dial failed is booked
+ FAILED, not held
+
+Review of PR #2320 (t_01a1d56010774bee): the connect_failed hold also caught manual fires
+(trigger_job / hermes cron run). settle_unbooked_fire holds only scheduled fires, so a manual
+one took the crash path: last_error_kind 'agent', no FAILED output doc, a traceback, and a
+last_error claiming the fire stays due. The hold now requires job['_scheduled_instant'].
+
+Proof: test_manual_run_dial_failure_is_booked_failed fails with the guard dropped (mutant) and
+passes with it; test_another_hold_restarts_the_connect_hold_count covers the docstring claim
+that a non-dial hold restarts connect_holds.
+---
+ cron/scheduler_authority.py                   |  5 ++-
+ .../test_cron_connect_failure_not_admitted.py | 38 ++++++++++++++++++-
+ 2 files changed, 40 insertions(+), 3 deletions(-)
+
+diff --git a/cron/scheduler_authority.py b/cron/scheduler_authority.py
+index 34caa36d0d..a3110d8443 100644
+--- a/cron/scheduler_authority.py
++++ b/cron/scheduler_authority.py
+@@ -340,9 +340,10 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
+             raise CronFireNotAdmitted(
+                 f'Not admitted: the gateway is {reason}; the fire stays due: {exc}',
+                 exc.state, exc.reason_code) from exc
+-        if _dial_failed(exc) and _connect_holds_left(job['id']):
++        if job.get('_scheduled_instant') and _dial_failed(exc) and _connect_holds_left(job['id']):
+             # The socket never opened (a stalled or restarting owner loop): nothing was submitted,
+-            # so the fire is held like a not-ready gateway. After CONNECT_HOLD_LIMIT consecutive
++            # so a scheduled fire is held like a not-ready gateway (a manual run has no slot to keep
++            # due and fails loudly). After CONNECT_HOLD_LIMIT consecutive
+             # holds it is booked FAILED below, so a gateway that stays unreachable still alerts.
+             from cron.unadmitted_fire import CONNECT_FAILED
+             raise CronFireNotAdmitted(
+diff --git a/tests/cron/test_cron_connect_failure_not_admitted.py b/tests/cron/test_cron_connect_failure_not_admitted.py
+index 9d50d05d42..a532b236d6 100644
+--- a/tests/cron/test_cron_connect_failure_not_admitted.py
++++ b/tests/cron/test_cron_connect_failure_not_admitted.py
+@@ -110,7 +110,7 @@ def test_dial_failure_before_submit_holds_the_fire(cron_home, monkeypatch):
+ 
+ def test_run_canonical_job_raises_not_admitted_and_leaves_fire_error_unset(cron_home, monkeypatch):
+     _connect_raising(monkeypatch, _dial_failure)
+-    job = {"id": "job"}
++    job = {"id": "job", "_scheduled_instant": "2026-11-13T05:20:00+00:00"}
+     with pytest.raises(scheduler_authority.CronFireNotAdmitted) as info:
+         scheduler_authority.run_canonical_job(job, execution_id="fire")
+     assert (info.value.state, info.value.reason_code) == ("unreachable", "connect_failed")
+@@ -118,6 +118,42 @@ def test_run_canonical_job_raises_not_admitted_and_leaves_fire_error_unset(cron_
+     assert not _journals(cron_home)
+ 
+ 
++def test_manual_run_dial_failure_is_booked_failed(cron_home, monkeypatch):
++    """A manual fire (``hermes cron run``) has no slot to hold: a dial failure books it FAILED as a
++    fire error with its output document, never the not-admitted crash path."""
++    dials = _connect_raising(monkeypatch, _dial_failure)
++    job_id, _slot = _due_agent_job()
++    stored = J.load_jobs()
++    later = (J._hermes_now() + timedelta(hours=1)).isoformat()
++    next(r for r in stored if r["id"] == job_id)["next_run_at"] = later
++    J.save_jobs(stored)
++    J.trigger_job(job_id)
++
++    S.tick(verbose=False)
++
++    assert dials, "the manual fire reached connect_gateway"
++    stored = _stored(job_id)
++    assert stored["last_status"] == "error" and stored["last_error_kind"] == "fire"
++    assert "stays due" not in stored["last_error"]
++    assert _outputs(job_id), "the FAILED run writes its output document"
++
++
++def test_another_hold_restarts_the_connect_hold_count(cron_home, monkeypatch):
++    """A not-ready hold between dial failures starts a fresh run of CONNECT_HOLD_LIMIT holds."""
++    from hermes_cli.gateway_client import GatewayUnavailableError
++    job_id, slot = _due_agent_job()
++    _connect_raising(monkeypatch, _dial_failure)
++    for _ in range(scheduler_authority.CONNECT_HOLD_LIMIT - 1):
++        S.tick(verbose=False)
++    _connect_raising(monkeypatch, lambda: GatewayUnavailableError("draining", "draining"))
++    S.tick(verbose=False)
++    _connect_raising(monkeypatch, _dial_failure)
++    for _ in range(scheduler_authority.CONNECT_HOLD_LIMIT):
++        S.tick(verbose=False)
++        assert _stored(job_id)["next_run_at"] == slot
++        assert int(_stored(job_id).get("failure_streak") or 0) == 0
++
++
+ def test_client_error_without_a_transport_cause_still_fails(cron_home, monkeypatch):
+     """Only a dial that failed at the socket is held; a local client refusal (bad explicit URL,
+     protocol mismatch) is not a not-ready gateway and keeps failing loudly."""
+-- 
+2.43.0
+
