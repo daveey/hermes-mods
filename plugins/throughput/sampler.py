@@ -468,8 +468,10 @@ class Sampler:
         msnap = dict(prev_m)
         msnap.update(mnew)
         rows = len(snap_f)
-        for d, reread in changed.items():  # in place: an incremental db's dict is not shared with anything else
-            base = snap.setdefault(d, {})
+        for d, reread in changed.items():
+            # Copy the db's map before mutating: ``snap`` shares per-db dicts with the published baseline
+            # (``self._snap``), which must stay untouched until persistence succeeds.
+            base = snap[d] = dict(snap.get(d, {}))
             for sid, v in reread.items():
                 if v is None:
                     base.pop(sid, None)
@@ -479,7 +481,7 @@ class Sampler:
                 base[sid] = v
             rows += len(reread)
         for d, reread in mchanged.items():
-            mbase = msnap.setdefault(d, {})
+            mbase = msnap[d] = dict(msnap.get(d, {}))  # per-sid values are replaced, never mutated
             for sid, cur_m in reread.items():
                 add_models(mbase.get(sid, {}), cur_m)
                 if cur_m:
