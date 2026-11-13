@@ -605,11 +605,62 @@ def _open_board_status(cid: str, ar) -> Optional[str]:
     return None
 
 
+def _call_groups(lines: list) -> list:
+    """The turn log as one list per call: its `->` line, then the `<-` lines that follow it."""
+    groups: list = []
+    for l in lines:
+        s = (l or "").lstrip()
+        if s.startswith("->"):
+            groups.append([l or ""])
+        elif groups and s.startswith("<-"):
+            groups[-1].append(l or "")
+    return groups
+
+
+def _group_ids(group: list) -> list:
+    """Card ids a call named: its `->` line plus its `<- CARDS read` line (agent_rules.card_read_line)."""
+    out: list = []
+    for l in group:
+        s = l.lstrip()
+        if s.startswith("->") or s.startswith(_CARDS_READ):
+            out.extend(c for c in NAMED_CARD_RE.findall(l) if c not in out)
+    return out
+
+
+_CARDS_READ = "<- CARDS read:"
+# agent-b9a5074a0c (round 2): a close-out listed merged and closed PRs (#1698 "was closed", #2174 "merged") before its
+# last paragraph, "Two items are still in progress ... #2220 ... #1934". Searching board bodies for every PR in the
+# ending filled the lookup with unrelated open cards that mention an old PR in passing. Only the PRs in the ending's
+# last block (blank-line separated: a paragraph with its bullets) that names a PR and reads as still open are searched.
+_PR_OPEN_RE = re.compile(r"\b(?:still|in[ -]progress|open|waiting|pending|landing|running|queued|working|"
+                         r"picked (?:it )?up|on it|being|in review|under review|rework|blocked|not (?:yet )?merged)\b",
+                         re.I)
+
+
+def open_part_pr_ids(reply_tail: str) -> list[str]:
+    """PRs (unquoted) in the reply ending's last PR-naming block that reads as still open (else its last PR-naming
+    block), closest to the end first."""
+    tail = reply_tail or ""
+    blocks, pos = [], 0
+    for part in re.split(r"(\n\s*\n)", tail):
+        if part.strip() and not re.fullmatch(r"\n\s*\n", part):
+            prs = [m.group(1) for m in PR_REF_RE.finditer(part) if not _in_dquotes(tail, pos + m.start())]
+            if prs:
+                blocks.append((part, prs))
+        pos += len(part)
+    if not blocks:
+        return []
+    pick = next((b for b in reversed(blocks) if _PR_OPEN_RE.search(b[0])), blocks[-1])
+    return list(dict.fromkeys(reversed(pick[1])))
+
+
 def pr_owner_card_ids(reply_tail: str, tool_log: Optional[list] = None) -> list[str]:
     """Open cards (not done/archived) standing for the PRs a reply ending names when it names no card id, at most
-    NAMED_CARD_MAX: (a) card ids in this turn's calls that name one of the PRs, or (no such call) that read a board db
-    (kanban.db, sync-shadow/*.db); (b) open cards on this host's boards and replicas whose title or body names the PR.
-    [] when the ending names a card id or no PR, and on any read failure (fail-open)."""
+    NAMED_CARD_MAX: (a) card ids this turn's calls that name one of the PRs named, in their `->` line or `<- CARDS
+    read` line, or (none) those of the calls that read a board db (kanban.db, sync-shadow/*.db); then (b), for the
+    still-open PRs (open_part_pr_ids) no (a) call covered, open cards on this host's boards and replicas whose title
+    names the PR, then those whose body does. [] when the ending names a card id or no PR, and on any read failure
+    (fail-open)."""
     try:
         tail = reply_tail or ""
         if NAMED_CARD_RE.search(tail):
@@ -618,35 +669,48 @@ def pr_owner_card_ids(reply_tail: str, tool_log: Optional[list] = None) -> list[
         if not prs:
             return []
         ar = _cache.load_sibling(_HERE, "agent_rules")
-        pats = [_pr_text_re(n) for n in prs]
-        lines = [l or "" for l in (tool_log or [])]
-        cand: list[str] = []
+        groups = _call_groups(list(tool_log or []))
         cpats = [_pr_call_re(n) for n in prs]
-        named = [l for l in lines if l.lstrip().startswith("->") and any(p.search(l) for p in cpats)]
-        reads = named or [l for l in lines if l.lstrip().startswith("->") and _BOARD_READ_RE.search(l)]
-        for l in reads:
-            for cid in NAMED_CARD_RE.findall(l):
-                if cid not in cand:
-                    cand.append(cid)
-        out = [c for c in cand if (_open_board_status(c, ar) or "").lower() not in ("", *CLOSED_CARD_STATUSES)]
+        named = [g for g in groups if any(p.search(l) for l in g for p in cpats if not l.lstrip().startswith("<- OK"))]
+        reads = [g for g in named if _group_ids(g)] or [
+            g for g in groups if any(_BOARD_READ_RE.search(l) for l in g if not l.lstrip().startswith("<- OK"))]
+        out: list[str] = []
+        covered: set = set()
+        for g in reads:
+            got = [c for c in _group_ids(g)
+                   if c not in out and (_open_board_status(c, ar) or "").lower() not in ("", *CLOSED_CARD_STATUSES)]
+            out.extend(got)
+            if got and g in named:
+                text = "\n".join(g)
+                covered.update(n for n in prs if re.search(r"(?<![\w.])" + re.escape(n) + r"\b", text))
+        search = [n for n in open_part_pr_ids(tail) if n not in covered]
+        if not search or len(out) >= NAMED_CARD_MAX:
+            return out[:NAMED_CARD_MAX]
+        title_hits: list[str] = []
+        body_hits: list[str] = []
         for path in list(ar.board_dbs()) + list(ar.shadow_dbs()):
-            if len(out) >= NAMED_CARD_MAX:
-                break
             try:
                 conn = ar._board_connect(path)
                 try:
-                    for n, p in zip(prs, pats):
+                    for n in search:
+                        p = _pr_text_re(n)
                         rows = conn.execute(
                             "select id, coalesce(title,''), coalesce(body,'') from tasks where status not in "
                             "('done','archived') and (title like ? or body like ?) order by created_at desc limit 50",
                             (f"%{n}%", f"%{n}%")).fetchall()
                         for cid, title, body in rows:
-                            if cid not in out and p.search(f"{title}\n{body}"):
-                                out.append(str(cid))
+                            cid = str(cid)
+                            if p.search(title):
+                                title_hits.append(cid)
+                            elif p.search(body):
+                                body_hits.append(cid)
                 finally:
                     conn.close()
             except Exception:
                 continue
+        for cid in title_hits + body_hits:
+            if cid not in out:
+                out.append(cid)
         return out[:NAMED_CARD_MAX]
     except Exception:
         return []

@@ -2624,6 +2624,41 @@ def pr_read_lines(arg: str, cap: int = TURN_LOG_ARG_CAP) -> list[str]:
     return out
 
 
+# agent-b9a5074a0c (round 2): a close-out's owner read named "PRs 2220 and 1934" in its first 140 chars, but the two
+# card ids and the kanban.db / sync-shadow/default.db paths came after TURN_LOG_ARG_CAP, and a call's result is never
+# logged, so the PR-owner lookup (reply_check.pr_owner_card_ids) saw no card ids at all. A terminal / execute_code call
+# whose full argument reads a board db or names card ids gets one `   <- CARDS read: <ids> [(<dbs>)]` line with the ids
+# in the full argument and, when the call succeeded, in its result (at most CARD_READ_MAX). It is not an `<- OK` status
+# line: the judges' owner state still comes from an owner read or the coach's own board read.
+CARD_READ_PREFIX = "<- CARDS read:"
+CARD_READ_MAX = 8
+_CARD_READ_ID_RE = re.compile(r"\bt_[0-9a-f]{8,}\b")
+_CARD_READ_DB_RE = re.compile(r"kanban\.db\b|sync-shadow/")
+_CARD_READ_RESULT_SCAN = 20000
+
+
+def card_read_line(arg: str, result: Any = None, ok: bool = True, cap: int = TURN_LOG_ARG_CAP) -> Optional[str]:
+    """The `   <- CARDS read: ...` line for a call whose full `arg` reads a board db or names card ids, when the
+    `->` line's first `cap` chars do not already show every id and db it names; None otherwise."""
+    if not isinstance(arg, str):
+        return None
+    dbs = list(dict.fromkeys(m.group(0) for m in _CARD_READ_DB_RE.finditer(arg)))
+    ids = list(dict.fromkeys(_CARD_READ_ID_RE.findall(arg)))
+    if not dbs and not ids:
+        return None
+    if ok and result is not None:
+        try:
+            text = result if isinstance(result, str) else json.dumps(result, default=str)
+        except Exception:
+            text = str(result)
+        ids += [c for c in dict.fromkeys(_CARD_READ_ID_RE.findall(text[:_CARD_READ_RESULT_SCAN])) if c not in ids]
+    shown = arg[:cap]
+    if not ids or (all(c in shown for c in ids) and all(d in shown for d in dbs)):
+        return None
+    line = f"   {CARD_READ_PREFIX} {' '.join(ids[:CARD_READ_MAX])}"
+    return line + (f" ({', '.join(dbs)})" if dbs else "")
+
+
 def rich_tool_line(tool: str, args: dict, arg: str = "") -> str:
     """One tool-log line with the arguments that show what the agent started or handed off."""
     try:
@@ -4252,6 +4287,14 @@ class AgentCoach:
             s.setdefault("turn_rich", deque(maxlen=60)).append(go_line)
         if is_kanban_call(tool, args):  # sticky across turns until the next Kanban call answers
             s["kanban_db_down"] = bool(failed(tool, result, status) and KANBAN_DB_DOWN.search(str(result)))
+        if tool in ("terminal", "execute_code"):  # card ids past the arg cap (agent-b9a5074a0c); last, so the
+            try:                                   # status line stays right after its `->` line
+                cards = card_read_line(arg, result, ok=not failed(tool, result, status))
+            except Exception:
+                cards = None
+            if cards:
+                s["turn_log"].append(cards)
+                s.setdefault("turn_rich", deque(maxlen=60)).append(cards)
 
     def _observe_rules(self, s: dict, sid: str, tool: str, args: dict, result: Any, status: Optional[str],
                        now: float, duration_ms: int = 0, error_type: Optional[str] = None,

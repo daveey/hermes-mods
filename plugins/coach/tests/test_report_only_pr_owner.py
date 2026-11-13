@@ -9,14 +9,21 @@ only PRs. Now a reply ending that names PRs and no card id resolves them to card
 this turn's calls that name the PR or read a board db, plus open cards whose title or body names the PR, so the
 judges get `<- BOARD` lines. report_only_scored logs owner_pr_ids / owner_pr_resolved.
 
-The tool-log line and reply below are reconstructed from the incident report (the hub transcript is not readable
-from a worker node); the card ids, PR numbers, statuses and times are the incident's.
+The first tests' reply is reconstructed from the incident report; their tool-log line goes through the real
+AgentCoach._log_call. Round 2 (the replay tests at the bottom): the 0b4ec3eb fix still missed the real turn. The
+turn's read call named "PRs 2220 and 1934" in its first 140 chars, but the card ids and board paths came later, past
+_log_call's TURN_LOG_ARG_CAP, and its result was never logged, so the lookup saw no ids and fell to the board search,
+which matched an unrelated scheduled card whose body mentioned #1934. fixtures/pr_owner_closeout_turn.json holds the
+real calls, results, ask and revised reply (state.db msgs 1269165-1269201, repo slug and login scrubbed).
 """
 import importlib.util
+import json
 import sqlite3
+from collections import deque
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "pr_owner_closeout_turn.json"
 
 
 def _mod(name):
@@ -40,10 +47,27 @@ REPLY = (
     "Two items are still in progress, and both have a worker on them now (checked 13:03 UTC): PR #2220 (the "
     "lease-refusal fix) is landing on worker-2, and PR #1934 (the scheduler follow-up) is being reworked on "
     "worker-6. Nothing else needs you.")
-TOOL_LOG = [
-    f"-> terminal(sqlite3 -readonly ~/.hermes/kanban.db \"select id,status,claim_lock,datetime(claim_expires,"
-    f"'unixepoch') from tasks where id in ('{C2220}','{C1934}')\")",
-]
+def _tool_log(calls):
+    """The turn log exactly as the coach writes it: each (tool, args, result) through AgentCoach._log_call."""
+    coach = rules.AgentCoach(signals=None)
+    s = {"turn_log": deque(maxlen=200), "turn_rich": deque(maxlen=200)}
+    for tool, args, result in calls:
+        coach._log_call(s, tool, args, result, None)
+    return list(s["turn_log"])
+
+
+REAL = json.loads(FIXTURE.read_text())
+
+
+def _real_log(calls=None):
+    """The real turn's log (both calls), built inside each test once its boards are set: _log_call's owner-line
+    helpers read the boards, and the coach suite refuses a read of this host's real board."""
+    return _tool_log([(c["tool"], c["args"], c["result"]) for c in (calls or REAL["calls"])])
+
+
+def _old_log():
+    """The incident's owner read alone (msgs 1269188/1269194): raw sqlite through shell variables, no `<- OK`."""
+    return _real_log(REAL["calls"][1:])
 
 SCHEMA = """
 create table tasks (id text primary key, title text, body text, status text, created_at integer,
@@ -87,10 +111,10 @@ def _incident_board(tmp_path, monkeypatch, extra=()):
 # ── the incident: PR numbers resolve to their live cards ────────────────────────────────────────────────────────
 def test_pr_only_closeout_gets_board_lines_for_both_owner_cards(tmp_path, monkeypatch):
     _incident_board(tmp_path, monkeypatch)
-    lines = rc.named_card_facts(REPLY, TOOL_LOG, now=NOW)
+    lines = rc.named_card_facts(REPLY, _old_log(), now=NOW)
     got = {cid for cid in (C2220, C1934) for line in lines if f"<- BOARD task={cid} status=running" in line}
     assert got == {C2220, C1934}, lines
-    assert rc.owner_source(REPLY, TOOL_LOG) != "none"
+    assert rc.owner_source(REPLY, _old_log()) != "none"
 
 
 def test_pr_ids_and_resolution_found_from_titles_alone(tmp_path, monkeypatch):
@@ -134,8 +158,8 @@ def test_done_card_naming_the_pr_is_not_an_owner(tmp_path, monkeypatch):
 def test_reply_naming_a_card_id_is_unchanged(tmp_path, monkeypatch):
     _incident_board(tmp_path, monkeypatch)
     reply = f"PR #2220 is landing on worker-2; card {C2220} owns it."
-    assert rc.tail_card_ids(reply, TOOL_LOG) == ([C2220], False)
-    assert rc.pr_owner_card_ids(reply[-1500:], TOOL_LOG) == []
+    assert rc.tail_card_ids(reply, _old_log()) == ([C2220], False)
+    assert rc.pr_owner_card_ids(reply[-1500:], _old_log()) == []
 
 
 def test_pr_lookup_caps_at_named_card_max(tmp_path, monkeypatch):
@@ -147,7 +171,7 @@ def test_pr_lookup_caps_at_named_card_max(tmp_path, monkeypatch):
 # ── detection: report_only_scored says which PRs it saw and how many owners it found ───────────────────────────
 def test_report_only_scored_logs_pr_telemetry(tmp_path, monkeypatch):
     _incident_board(tmp_path, monkeypatch)
-    assert rc.owner_pr_telemetry(REPLY, TOOL_LOG) == {"owner_pr_ids": ["2220", "1934"], "owner_pr_resolved": 2}
+    assert rc.owner_pr_telemetry(REPLY, _old_log()) == {"owner_pr_ids": ["2220", "1934"], "owner_pr_resolved": 2}
     assert rc.owner_pr_telemetry("PR #9999 is landing.", []) == {"owner_pr_ids": ["9999"], "owner_pr_resolved": 0}
     assert rc.owner_pr_telemetry(f"Card {C2220} owns PR #2220.", []) == {}
     assert rc.owner_pr_telemetry("Nothing left.", []) == {}
@@ -161,10 +185,88 @@ def test_report_only_scored_row_carries_pr_fields_and_board_owner(tmp_path, monk
     rows = []
     verdict = json.dumps({"handoff": 0, "confirm": 0, "unverified": 0, "unwatched": 0, "report_only": 0.9,
                           "evidence": "no owner shown"})
-    rc.check(REPLY, "[Kanban notice] close-out", TOOL_LOG, lambda s, p: verdict,
+    rc.check(REPLY, "[Kanban notice] close-out", _old_log(), lambda s, p: verdict,
              thresholds={"report_only": 0.7}, confirm=lambda: (0.2, "x"), confirm_floor=0.5,
              audit=rows.append, card_status=lambda c: "running", only=["report_only"])
     scored = [r for r in rows if r.get("event") == "report_only_scored"]
     assert scored, rows
     assert scored[0]["owner_pr_ids"] == ["2220", "1934"] and scored[0]["owner_pr_resolved"] == 2, scored
     assert scored[0]["owner_source"] == "board", scored
+
+
+# ── round 2: the real turn, replayed through _log_call (state.db msgs 1269165-1269201) ──────────────────────────
+DECOY = "t_01a1d3df5e5d0757"          # open, scheduled; its body mentions #1934 in passing
+T_REPLY = 1794575036.0                # 13:03:56Z, the revised reply
+
+
+def _real_boards(tmp_path, monkeypatch):
+    """The hub board (#1934's owner, claimed by worker-6 at 12:59:19, plus the decoy) and its sync-shadow replica of
+    the default board (#2220's owner, claimed by worker-2 at 13:03:34). Neither owner's title or body names its PR."""
+    db = _board(tmp_path / "kanban.db", [
+        (C1934, "Rework the scheduler follow-up after review", "Address the review comments.", "running",
+         T_REPLY - 277),
+        (DECOY, "Weekly sync-health digest", "Context: the sync work in #1934 and #1882.", "scheduled", None)])
+    shadow = _board(tmp_path / "default.db", [
+        (C2220, "Land the lease-refusal comment cleanup", "Review and merge once CI is green.", "running",
+         T_REPLY - 22)])
+    monkeypatch.setenv("COACH_BOARD_DBS", db)
+    monkeypatch.setenv("COACH_SHADOW_DBS", shadow)
+
+
+def test_real_turn_log_carries_the_card_ids_past_the_arg_cap(tmp_path, monkeypatch):
+    _real_boards(tmp_path, monkeypatch)
+    log = _real_log()
+    reads = [l for l in log if l.lstrip().startswith("<- CARDS read:")]
+    assert len(reads) == 1, log
+    assert C2220 in reads[0] and C1934 in reads[0], reads
+    call = next(l for l in log if "PRs 2220 and 1934" in l)
+    assert C2220 not in call  # the `->` line itself is still capped
+    assert not any(l.lstrip().startswith("<- CARDS") for l in log[:log.index(call)])  # PR-only first read
+
+
+def test_real_closeout_resolves_exactly_the_two_owners(tmp_path, monkeypatch):
+    _real_boards(tmp_path, monkeypatch)
+    log = _real_log()
+    reply, ask = REAL["reply"], REAL["ask"]
+    ids, fallback = rc.tail_card_ids(reply, log, ask)
+    assert set(ids) == {C2220, C1934} and DECOY not in ids and fallback is True, ids
+    lines = rc.named_card_facts(reply, log, now=T_REPLY, user_ask=ask)
+    got = {cid for cid in (C2220, C1934, DECOY) for l in lines if f"<- BOARD task={cid} " in l}
+    assert got == {C2220, C1934}, lines
+    assert all("status=running" in l for l in lines), lines
+    assert rc.owner_source(reply, log, user_ask=ask) == "replica"
+    assert rc.owner_pr_telemetry(reply, log)["owner_pr_resolved"] == 2
+
+
+def test_board_search_skips_prs_the_reply_lists_as_merged_or_closed(tmp_path, monkeypatch):
+    db = _board(tmp_path / "kanban.db", [
+        ("t_01a1d3df5e5d07aa", "Follow-up on PR #1698", "", "ready", None),
+        ("t_01a1d3df5e5d07ab", "Follow-up on PR #2174", "", "ready", None),
+        (C1934, "Rework PR #1934", "", "running", T_REPLY - 277)])
+    monkeypatch.setenv("COACH_BOARD_DBS", db)
+    monkeypatch.setenv("COACH_SHADOW_DBS", "")
+    assert rc.pr_owner_card_ids(REAL["reply"][-1500:], []) == [C1934]
+
+
+def test_board_search_prefers_a_title_naming_the_pr_over_a_body_mention(tmp_path, monkeypatch):
+    extra = [(f"t_01a1d3df5e5d0{i:03x}", f"Unrelated chore {i}", "mentions PR #2220 in passing", "ready", None)
+             for i in range(6)]
+    db = _board(tmp_path / "kanban.db", [*extra, (C2220, "Land PR #2220", "", "running", T_REPLY - 22)])
+    monkeypatch.setenv("COACH_BOARD_DBS", db)
+    monkeypatch.setenv("COACH_SHADOW_DBS", "")
+    assert rc.pr_owner_card_ids("Still in progress: PR #2220 is landing.", [])[0] == C2220
+
+
+def test_card_read_line_only_for_board_reads_or_card_ids():
+    log = _tool_log([("terminal", {"command": "ls -la " + "x" * 200}, '{"output": "t_01a1d3df5e5d0aaa"}'),
+                     ("terminal", {"command": "true; " + "y" * 200 + " sqlite3 ~/.hermes/kanban.db 'select id'"},
+                      '{"output": "t_01a1d3df5e5d0bbb", "exit_code": 0}'),
+                     ("terminal", {"command": "z" * 200 + f" hermes kanban show {C2220}"},
+                      '{"error": "boom", "exit_code": 1}')])
+    cards = [l for l in log if l.lstrip().startswith("<- CARDS")]
+    assert len(cards) == 2, log
+    assert "t_01a1d3df5e5d0bbb" in cards[0] and "kanban.db" in cards[0]
+    assert C2220 in cards[1]
+    # status lines still sit right after their call (restart_deferral / card_closed read line i+1)
+    i = next(i for i, l in enumerate(log) if l.startswith("-> terminal(zzz"))
+    assert log[i + 1].lstrip().startswith("<- ERROR"), log
