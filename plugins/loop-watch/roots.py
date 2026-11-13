@@ -520,12 +520,17 @@ def scan(*, clock=time.monotonic, top=TOP, deadline_s=DEADLINE_S, modules=None):
     del everything, frontier
     chunk = obj = None
     order = sorted(range(len(w.labels)), key=w.sizes.__getitem__, reverse=True)[:top]
+    # A comprehension capturing w creates a cell before get_objects() on Python 3.11.
+    # That cell would expose the census's own walk/bitmap to its heap snapshot.
+    rows = []
+    for i in order:
+        rows.append([w.labels[i], w.sizes[i], w.counts[i]])
     return dict(schema=1, kind="roots_census", status="ok", truncated=w.truncated,
                 labels_truncated=w.labels_truncated, bytes=total,
                 module_bytes=w.phases[0], frame_bytes=w.phases[1], code_bytes=w.phases[2],
                 instance_bytes=w.phases[3], unowned_bytes=w.phases[4], objects=sum(w.counts),
                 gc_objects=gc_objects, roots=roots, owners=len(w.labels), bitmap_bytes=len(w.pages) * 8192,
-                top=[[w.labels[i], w.sizes[i], w.counts[i]] for i in order], seconds=round(clock() - started, 3))
+                top=rows, seconds=round(clock() - started, 3))
 
 
 def safe_scan():
