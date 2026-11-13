@@ -374,10 +374,48 @@ class TestAll(unittest.TestCase):
         import json
         with patch('sys.platform', 'linux'), patch.dict(os.environ, {'HERMES_MODS_PYTHON': ''}), \
                 patch('subprocess.check_output', return_value=json.dumps([str(production), '-I'])) as command:
+            # No committed venv answer (the probe output is not a path): keep the launcher's interpreter.
             self.assertEqual(runner['select_python'](core), (str(production), False))
-            command.assert_called_once_with([str(launcher), '--print-runtime-command'], text=True, timeout=30)
+            self.assertEqual(command.call_args_list[0].args[0], [str(launcher), '--print-runtime-command'])
         with patch('sys.platform', 'linux'), patch('subprocess.check_output', return_value='invalid json'):
             self.assertIsNone(runner['production_python'](core))
+
+    def test_linux_store_python_selects_committed_venv(self):
+        # Regression: the launcher execs PM's bare store Python, whose packages live in the venv
+        # committed under the real home. Suites isolate HOME, so running them on the store Python
+        # makes core bootstrap exit ("no dependency environment is committed"). Select the venv.
+        runner = runpy.run_path(str(RUNNER))
+        core = self.root / 'core'
+        launcher = core / '.hermes/bin/hermes'
+        launcher.parent.mkdir(parents=True)
+        launcher.touch()
+        store = self.root / 'tools/python-3.14/bin/python3'
+        venv_python = self.root / 'installs/k/environments/g/venv/bin/python'
+        for p in (store, venv_python):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.touch()
+        import json
+
+        def answer(argv, **kwargs):
+            if argv == [str(launcher), '--print-runtime-command']:
+                return json.dumps([str(store), '-I', '-c', 'boot'])
+            self.assertEqual(argv[:3], [str(store), '-I', '-c'])
+            self.assertEqual(argv[4], str(core))
+            return f'{venv_python}\n'
+
+        with patch('sys.platform', 'linux'), patch.dict(os.environ, {'HERMES_MODS_PYTHON': ''}), \
+                patch('subprocess.check_output', side_effect=answer):
+            self.assertEqual(runner['select_python'](core), (str(venv_python), False))
+        # Nothing committed (empty answer), a vanished venv, or a failing probe: the store Python stays.
+        for result in ('\n', f'{self.root}/missing/bin/python\n', subprocess.CalledProcessError(1, 'x')):
+            def fallback(argv, result=result, **kwargs):
+                if argv[0] == str(launcher):
+                    return json.dumps([str(store)])
+                if isinstance(result, Exception):
+                    raise result
+                return result
+            with patch('sys.platform', 'linux'), patch('subprocess.check_output', side_effect=fallback):
+                self.assertEqual(runner['production_python'](core), str(store))
 
     def test_fallback_warning_in_header_and_final_summary(self):
         import contextlib
