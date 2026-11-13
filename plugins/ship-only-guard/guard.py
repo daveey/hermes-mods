@@ -268,6 +268,102 @@ def _approval_refusal(number, data):
             "changes, then rerun the same merge command. A review of an earlier head does not count.")
 
 
+# Base drift under the PR's CI (t_01a1d6201140c966). `pull_request` runs test the merge ref against the PR's
+# recorded baseRefOid; a state commit landing on the same paths after that is never tested with the PR. #2491
+# (CI on base 3a55357793) was rebase-merged onto 5f0478a3dc, which carried #2487's adc4b89b37 changing
+# hosts/mini-1/bb-tuner/bb_tuner_feed.py, and state went red at 21c2ccf5a8.
+_COMPARE_COMMITS_CAP = 250   # GitHub's compare lists at most 250 commits per page
+_COMPARE_FILES_CAP = 300     # ... and at most 300 files
+_PR_FILES_CAP = 100          # gh pr view --json files reads one page of 100
+_WORKFLOWS = ".github/workflows/"
+_CHURN_SUBJECT = re.compile(r"^(?:sync: |Merge |skills: edits from )")
+
+
+def _path_area(path):
+    """The directory an edit lands in, cut to its top 3 segments. A repo-root file or one in a flat top-level
+    dir (`tests/`, `docs/`: dozens of unrelated modules) is its own area, or every state PR would collide."""
+    parts = str(path).strip("/").split("/")
+    return "/".join(parts[:-1][:3]) if len(parts) > 2 else "/".join(parts)
+
+
+def _base_drift_refusal(number, repo, data, cwd, env):
+    """Refusal text when state moved, since the base the PR's CI tested, on the PR's own areas; else None.
+
+    Overlap: a base-delta file and a PR file in the same top-3-segment directory, or any base-delta file
+    under .github/workflows/. Churn elsewhere (hermes-sync `sync:` commits under other hosts/<host>/ or
+    home/skills/...) never refuses. An unreadable, truncated or non-linear compare fails closed."""
+    head = str(data.get("headRefOid") or "")
+    base = data.get("baseRefOid")
+
+    def closed(why):
+        return (f"[ship-only-guard] Refused state merge of PR #{number}: {why}, so a state commit that landed on "
+                "this PR's paths after its CI ran cannot be ruled out. Rerun the same merge command once "
+                f"`gh pr view {number} --json baseRefOid,files` and `gh api repos/{repo}/compare/<baseRefOid>...state` "
+                "read cleanly.")
+
+    if not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base):
+        return closed("its baseRefOid (the base its CI merge ref was built from) is missing")
+    files = data.get("files")
+    if not isinstance(files, list) or not files or len(files) >= _PR_FILES_CAP or not all(
+            isinstance(f, dict) and isinstance(f.get("path"), str) and f["path"] for f in files):
+        return closed("its changed-file list is missing, empty or possibly capped at 100")
+    probe_env = dict(env)
+    probe_env["GH_PROMPT_DISABLED"] = "1"
+    try:
+        p = subprocess.run(["gh", "api", f"repos/{repo}/compare/{base}...state"],
+                           cwd=cwd, env=probe_env, capture_output=True, text=True, timeout=15)
+        if p.returncode != 0:
+            return closed(f"the compare {base[:10]}...state failed (exit {p.returncode})")
+        cmp = json.loads(p.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return closed(f"the compare {base[:10]}...state could not be read")
+    if not isinstance(cmp, dict):
+        return closed("the compare response is not an object")
+    total, commits, changed = cmp.get("total_commits"), cmp.get("commits"), cmp.get("files")
+    if (not isinstance(total, int) or isinstance(total, bool) or not isinstance(commits, list)
+            or not isinstance(changed, list) or cmp.get("status") not in ("ahead", "identical")
+            or cmp.get("behind_by") not in (0, None)):
+        return closed("the compare lacks total_commits/commits/files or the PR base is not an ancestor of state")
+    if total >= _COMPARE_COMMITS_CAP or len(commits) != total or len(changed) >= _COMPARE_FILES_CAP:
+        return closed(f"the compare is possibly truncated ({total} commits, {len(changed)} files)")
+    if not all(isinstance(f, dict) and isinstance(f.get("filename"), str) for f in changed) or not all(
+            isinstance(c, dict) and isinstance(c.get("sha"), str) for c in commits):
+        return closed("the compare lists a file or commit without a name")
+    if not total:
+        return None
+    pr_areas = {_path_area(f["path"]) for f in files}
+    hits = []
+    for f in changed:
+        for name in (f["filename"], f.get("previous_filename")):
+            if isinstance(name, str) and name and (name.startswith(_WORKFLOWS) or _path_area(name) in pr_areas):
+                hits.append(name)
+    if not hits:
+        return None
+    hits = sorted(set(hits))
+
+    def subject(c):
+        msg = c.get("commit", {}).get("message") if isinstance(c.get("commit"), dict) else ""
+        return (str(msg or "").splitlines() or [""])[0]
+
+    # The compare aggregates files, so a per-commit attribution needs more requests: list the content commits
+    # (not hermes-sync/skills churn or merges) first, the churn count after.
+    work = [c for c in commits if not _CHURN_SUBJECT.match(subject(c))]
+    churn = len(commits) - len(work)
+    named = "; ".join(f"{c['sha'][:10]} {subject(c)[:70]}" for c in work[:8])
+    if len(work) > 8:
+        named += f"; +{len(work) - 8} more"
+    if churn:
+        named += f" (+{churn} sync/merge commit(s))"
+    shown = ", ".join(hits[:6]) + (f", +{len(hits) - 6} more" if len(hits) > 6 else "")
+    return (f"[ship-only-guard] Refused state merge of PR #{number}: its CI tested base {base[:10]}, and "
+            f"{total} state commit(s) landed since then; together they change this PR's areas ({shown}). No check ran "
+            f"on that combination (#2491 turned state red this way). Base commits since {base[:10]}: {named}. "
+            f"Run `gh api -X PUT repos/{repo}/pulls/{number}/update-branch -f expected_head_sha={head}`, wait "
+            "for green CI on the new head, then rerun the merge with --match-head-commit <new head>. The guard "
+            "re-checks exact-head approval on the new head: confirm `git patch-id --stable` of the PR diff is "
+            "unchanged and get the review confirmed for that sha.")
+
+
 def _state_merge(words, repo, cwd, env):
     """Narrow state-only exception, never a general non-main merge allowance.
 
@@ -278,8 +374,11 @@ def _state_merge(words, repo, cwd, env):
     review whose body raises a non-blocking point ("nit", "non-blocking", un-negated)
     has no later non-bot PR comment marked <!-- hermes-review-reply -->: reply before
     you merge, and refuses unless the latest non-bot verdict on the exact head approves
-    (`_approval_refusal`). Unreadable reviews/comments refuse. It is not an atomic base
-    lock (gh only offers an atomic head fence).
+    (`_approval_refusal`). Unreadable reviews/comments refuse. Last, one bounded
+    compare of the PR's baseRefOid...state refuses when state moved on the PR's own
+    areas after its CI built the merge ref (`_base_drift_refusal`). It is still not an
+    atomic base lock (gh only offers an atomic head fence): a commit landing between
+    this read and the merge is not seen.
     """
     # Accept explicit numeric PR and repo only; avoid gh's implicit current PR,
     # URL/repo precedence, aliases, unknown options, auto-merge or admin override.
@@ -308,7 +407,7 @@ def _state_merge(words, repo, cwd, env):
             or not options.get("--rebase")
             or not re.fullmatch(r"[0-9a-f]{40}", options.get("--match-head-commit", ""))):
         return False
-    fields = "number,url,state,baseRefName,headRefOid,statusCheckRollup,reviews,comments"
+    fields = "number,url,state,baseRefName,baseRefOid,headRefOid,statusCheckRollup,reviews,comments,files"
     probe_env = dict(env)
     probe_env["GH_PROMPT_DISABLED"] = "1"
     try:
@@ -336,7 +435,8 @@ def _state_merge(words, repo, cwd, env):
             c.get("__typename") == "StatusContext" and c.get("state") == "SUCCESS"
         ) for c in checks):
             return False
-        return _review_reply_refusal(args[0], data) or _approval_refusal(args[0], data) or True
+        return (_review_reply_refusal(args[0], data) or _approval_refusal(args[0], data)
+                or _base_drift_refusal(args[0], repo, data, cwd, env) or True)
     except (OSError, ValueError, TypeError, subprocess.SubprocessError):
         return False
 

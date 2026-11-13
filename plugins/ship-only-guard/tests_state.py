@@ -18,20 +18,31 @@ APPROVAL = {"id": "PRR_x", "author": {"login": "you"}, "authorAssociation": "MEM
             "body": f"Independent exact-head review @ {SHA}: approve"}
 
 
+BASE = "3" * 40
+
+
 def payload(**updates):
-    return {"number": 12, "state": "OPEN", "baseRefName": "state", "headRefOid": SHA,
+    return {"number": 12, "state": "OPEN", "baseRefName": "state", "headRefOid": SHA, "baseRefOid": BASE,
             "url": "https://github.com/example/protected/pull/12", "reviews": [APPROVAL], "comments": [],
+            "files": [{"path": "hosts/mini-1/bb-tuner/tests/test_bb_tuner_feed.py"}],
             "statusCheckRollup": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}], **updates}
+
+
+IDENTICAL = {"status": "identical", "ahead_by": 0, "behind_by": 0, "total_commits": 0, "commits": [], "files": []}
 
 
 def check(argv=CMD):
     return g.check_argv(argv, repos={"example/protected"}, env={"GH_REPO": "example/protected"})
 
 
-def probe(monkeypatch, data):
+def probe(monkeypatch, data, compare=IDENTICAL):
+    """gh pr view answers `data`; gh api compare answers `compare` (a dict, or a (returncode, stdout) pair)."""
     calls = []
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
+        if argv[:2] == ["gh", "api"]:
+            rc, out = compare if isinstance(compare, tuple) else (0, json.dumps(compare))
+            return SimpleNamespace(returncode=rc, stdout=out)
         return SimpleNamespace(returncode=0, stdout=json.dumps(data))
     monkeypatch.setattr(g.subprocess, "run", run)
     return calls
@@ -40,10 +51,122 @@ def probe(monkeypatch, data):
 def test_state_exact_head_allowed(monkeypatch):
     calls = probe(monkeypatch, payload())
     assert check() is None
-    assert len(calls) == 1
+    assert len(calls) == 2
     argv, kw = calls[0]
     assert argv[:6] == ["gh", "pr", "view", "12", "--repo", "example/protected"]
+    assert {"baseRefOid", "files"} <= set(argv[-1].split(","))
     assert kw["timeout"] <= 20 and not kw.get("shell")
+    argv, kw = calls[1]
+    assert argv == ["gh", "api", f"repos/example/protected/compare/{BASE}...state"]
+    assert kw["timeout"] <= 20 and not kw.get("shell")
+
+
+# Base drift under CI (t_01a1d6201140c966): #2491's CI tested base 3a55357793; adc4b89b37 (#2487) then changed
+# bb_tuner_feed.py on state, #2491 was rebase-merged without a check on the combination, and state went red.
+def commit(sha, subject):
+    return {"sha": sha, "commit": {"message": subject + "\n\nbody"}}
+
+
+def delta(files, commits):
+    return {"status": "ahead", "ahead_by": len(commits), "behind_by": 0, "total_commits": len(commits),
+            "commits": commits, "files": [{"filename": f, "status": "modified", "previous_filename": None}
+                                          for f in files]}
+
+
+ADC = "adc4b89b37" + "0" * 30
+SYNC_MBP = commit("09e03625ba" + "0" * 30, "sync: laptop-1 2026-11-13 09:56")
+MERGE = commit("39166c2038" + "0" * 30, "Merge remote-tracking branch 'origin/state' into state")
+PR2491 = payload(baseRefOid="3a5535779373cac2a8f154abe1ed0157ff16c27e")
+
+
+def test_replay_pr2491_base_moved_on_its_paths_refused(monkeypatch):
+    calls = probe(monkeypatch, PR2491, delta(
+        ["hosts/mini-1/bb-tuner/bb_tuner_feed.py", "hosts/laptop-1/cron/jobs.json"],
+        [SYNC_MBP, MERGE, commit(ADC, "bb-tuner feed: nous-1 token push off unless config nous_push is true")]))
+    why = check()
+    assert why and "adc4b89b37" in why and "update-branch" in why
+    assert f"repos/example/protected/pulls/12/update-branch -f expected_head_sha={SHA}" in why
+    assert "hosts/mini-1/bb-tuner/bb_tuner_feed.py" in why and "jobs.json" not in why
+    assert calls[1][0][-1] == "repos/example/protected/compare/3a5535779373cac2a8f154abe1ed0157ff16c27e...state"
+
+
+def test_unrelated_sync_churn_allowed(monkeypatch):
+    probe(monkeypatch, payload(), delta(
+        ["hosts/laptop-1/cron/jobs.json", "hosts/laptop-1/mods-loaded.json",
+         "home/skills/devops/ci-runner-disk-recovery/references/org-runner-pools.md",
+         "hosts/mini-1/mods-loaded.json"],
+        [SYNC_MBP, MERGE, commit("125d853553" + "0" * 30, "skills: edits from hermes-worker-7")]))
+    assert check() is None
+
+
+def test_base_is_state_tip_allowed(monkeypatch):
+    probe(monkeypatch, payload(), IDENTICAL)
+    assert check() is None
+
+
+def test_workflow_change_on_base_refused(monkeypatch):
+    probe(monkeypatch, payload(), delta([".github/workflows/x.yml"], [commit("b" * 40, "ci: tweak x")]))
+    why = check()
+    assert why and ".github/workflows/x.yml" in why and "bbbbbbbbbb" in why
+
+
+def test_root_and_same_area_overlap_refused(monkeypatch):
+    # Same top-3 directory, different file; the same flat-dir file on both sides.
+    probe(monkeypatch, payload(files=[{"path": "hosts/mini-1/bb-tuner/x.py"}]),
+          delta(["hosts/mini-1/bb-tuner/tests/deep/y.py"], [commit("c" * 40, "bb-tuner: y")]))
+    assert "cccccccccc" in check()
+    probe(monkeypatch, payload(files=[{"path": "home/bin/tool"}]), delta(["home/bin/other.json"], [commit("c" * 40, "x")]))
+    assert check()
+    probe(monkeypatch, payload(files=[{"path": "tests/test_a.py"}]), delta(["tests/test_a.py"], [commit("c" * 40, "a")]))
+    assert check()
+    probe(monkeypatch, payload(files=[{"path": "hermes-sync"}]), delta(["hermes-sync"], [commit("c" * 40, "s")]))
+    assert check()
+    # A parent directory is a different area: hosts/mini-1/ churn does not hold a bb-tuner PR.
+    probe(monkeypatch, payload(), delta(["hosts/mini-1/cron/jobs.json"], [commit("c" * 40, "sync: mini-1")]))
+    assert check() is None
+    # Flat top-level dirs and the repo root compare by file: other test modules / root files do not hold it
+    # (live, 2026-11-13: open PRs 2507 and 2508 were held only by other tests/test_*.py modules).
+    probe(monkeypatch, payload(files=[{"path": "tests/test_a.py"}, {"path": "README.md"}]),
+          delta(["tests/test_b.py", "docs/x.md", "hermes-sync"], [commit("c" * 40, "b")]))
+    assert check() is None
+
+
+def test_renamed_from_pr_area_refused(monkeypatch):
+    moved = delta(["elsewhere/z.py"], [commit("d" * 40, "move")])
+    moved["files"][0]["previous_filename"] = "hosts/mini-1/bb-tuner/z.py"
+    probe(monkeypatch, payload(), moved)
+    assert check()
+
+
+@pytest.mark.parametrize("compare", [
+    (1, ""), (0, "not json"), (0, "[]"),
+    {k: v for k, v in delta([], []).items() if k != "files"},
+    {k: v for k, v in delta([], []).items() if k != "commits"},
+    {k: v for k, v in delta([], []).items() if k != "total_commits"},
+    dict(delta([], []), total_commits=250),
+    dict(delta([], [commit("e" * 40, "x")]), total_commits=2),
+    dict(delta(["home/x/y/%d.md" % i for i in range(300)], [commit("e" * 40, "x")])),
+    dict(delta([], []), status="diverged", behind_by=3),
+])
+def test_unreadable_or_truncated_compare_refused(monkeypatch, compare):
+    probe(monkeypatch, payload(), compare)
+    why = check()
+    assert why and "cannot be ruled out" in why
+
+
+@pytest.mark.parametrize("updates", [
+    {"baseRefOid": None}, {"baseRefOid": "3a55357793"}, {"files": None}, {"files": []},
+    {"files": [{"path": "a/%d" % i} for i in range(100)]}, {"files": [{"additions": 1}]},
+])
+def test_missing_base_or_files_refused_without_compare(monkeypatch, updates):
+    data = payload(**updates)
+    for key, value in updates.items():
+        if value is None:
+            del data[key]
+    calls = probe(monkeypatch, data)
+    why = check()
+    assert why and "cannot be ruled out" in why
+    assert len(calls) == 1
 
 
 def test_state_without_exact_head_approval_refused(monkeypatch):

@@ -247,12 +247,17 @@ def comment(body, at="2026-11-13T15:22:00Z", login="you", association="MEMBER", 
 
 def state_check(monkeypatch, data, argv=STATE_CMD):
     calls = []
+    # The base-drift compare (tests_state.py) sees the base the PR's CI tested is the state tip.
+    data = {"baseRefOid": "3" * 40, "files": [{"path": "tests/test_x.py"}], **data}
     def run(cmd, **kwargs):
         calls.append(cmd)
+        if cmd[:2] == ["gh", "api"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(
+                {"status": "identical", "behind_by": 0, "total_commits": 0, "commits": [], "files": []}))
         return SimpleNamespace(returncode=0, stdout=json.dumps(data))
     monkeypatch.setattr(g.subprocess, "run", run)
     why = g.check_argv(argv, repos={"example/protected"}, env={"GH_REPO": "example/protected"})
-    assert len(calls) == 1 and "reviews" in calls[0][-1].split(",") and "comments" in calls[0][-1].split(",")
+    assert 1 <= len(calls) <= 2 and "reviews" in calls[0][-1].split(",") and "comments" in calls[0][-1].split(",")
     return why
 
 

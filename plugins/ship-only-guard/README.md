@@ -2,7 +2,8 @@
 
 A public, stdlib-only command guard that routes landing through a repository's
 trusted ship workflow for core main, with a narrow state-branch preflight below.
-It does not merge or push. State preflight makes one bounded read-only GitHub request.
+It does not merge or push. State preflight makes two bounded read-only GitHub
+requests (the PR view and one base compare).
 
 ## Configuration
 
@@ -99,6 +100,27 @@ main/other base, changed head, pending/failed/skipped/neutral checks, a possibly
 truncated rollup, unreadable reviews/comments, an unanswered review point and a
 missing exact-head approval fail closed. This is not a blanket non-main exemption.
 
+**Base drift under CI.** A `pull_request` run tests the merge ref against the
+PR's recorded `baseRefOid`, not the `state` tip at merge time. After the checks
+above pass, the guard reads `gh api repos/OWNER/REPO/compare/<baseRefOid>...state`
+(fixed argv, 15-second timeout) and refuses when a file changed on `state` since
+that base shares an area with a PR file: the same directory cut to its top three
+segments (`hosts/<host>/bb-tuner/`, `home/bin/`), the same file for a repo-root
+file or one directly in a top-level dir (`tests/test_x.py`, `docs/x.md`, whose
+dozens of unrelated modules would otherwise hold every PR), or any
+`.github/workflows/` file. Renames count both paths. Churn elsewhere (`sync:`
+commits under other `hosts/<host>/`, `home/skills/…`) does not refuse. The
+refusal names the overlapping files and the base commits (content commits first;
+the compare does not attribute files per commit) and asks for
+`gh api -X PUT repos/OWNER/REPO/pulls/N/update-branch -f expected_head_sha=<head>`,
+green CI on the new head and a rerun; the exact-head approval check then applies
+to the new head. A missing/malformed `baseRefOid`, a missing, empty or 100-entry
+(possibly capped) `files` list, a failed or unparsable compare, missing
+`total_commits`/`commits`/`files`, 250+ commits, 300+ files, or a base that is
+not an ancestor of `state` fail closed. Why: #2491's CI tested base 3a55357793;
+#2487 (adc4b89b37) then changed `bb_tuner_feed.py` in the same directory, #2491
+was rebase-merged without a check on the combination and state went red.
+
 **Gate boundary:** this guard checks that an exact-head approval record exists;
 it does not authenticate that its author was independent (every agent posts as
 the same GitHub account), and it does not prove coverage of required-but-absent
@@ -106,8 +128,8 @@ CI. Those remain the landing owner's mandatory gates, just as for existing state
 pushes. Passing this preflight alone
 is NOT approval to land. Main still requires `hermes-core-wt ship`; merge API
 endpoints remain blocked. Do not set a trusted marker for state landing.
-The head fence is atomic at GitHub; the base read is only a preflight, not an
-atomic base lock. Do not retarget a PR during landing; use server-side branch
+The head fence is atomic at GitHub; the base reads are only a preflight, not an
+atomic base lock: a commit landing between the compare and the merge is not seen. Do not retarget a PR during landing; use server-side branch
 protection against concurrent main retargeting.
 
 To validate the route without changing the PR, run `guard.py --gh-args` with the
@@ -117,6 +139,7 @@ and verify postmerge CI and deployment separately.
 
 `tests_state.py` covers allowed and refused preflights, malformed/unreadable
 responses, transport failures, head/base changes, CI states, bounded rollups,
+base drift under CI (the #2491 replay, sync churn, workflows, truncated compares),
 strict flags and terminal/Python/tool entry points. No test merges a live PR.
 
 ## Upstream-sync landing (main, merge commit)
