@@ -322,8 +322,107 @@ def _task_cols(c: sqlite3.Connection) -> set[str]:
         return set()
 
 
+# Core's chat projection: the cards ``hermes kanban chat-tasks`` and the Desktop task panel list for a chat,
+# including cards it placed on OTHER gateways (owner-qualified rows from the synced replica / origin ledger). This
+# Mac's board files never hold those, so without it the live list missed most cards placement=auto creates.
+_CORE_ACTIVITY = "hermes_cli.kanban_session_activity"
+REMOTE_TIMEOUT_S = 2.0  # runs in every turn's pre-LLM hook: a slow or hung projection degrades to local-only
+_remote_busy = threading.Lock()  # held while a projection read runs; a hung read never stacks a second one
+
+
+def _core_projection():
+    """(core ``session_tasks``, statuses) or None on an older core / failed import."""
+    import importlib
+    try:
+        mod = importlib.import_module(_CORE_ACTIVITY)
+    except Exception:  # noqa: BLE001 -- no core, a broken core, or a pre-projection core: local-only
+        return None
+    fn = getattr(mod, "session_tasks", None)
+    if not callable(fn):
+        return None
+    listed = getattr(mod, "LISTED_STATUSES", None) or ("todo", "ready", "running", "scheduled", "review",
+                                                        "blocked", "triage")
+    return fn, tuple(dict.fromkeys(tuple(listed) + ("done", "archived")))  # what `chat-tasks` lists
+
+
+def _hr_dict(value: Any) -> dict | None:
+    if isinstance(value, (bytes, str)) and value:
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {"action": str(value)}
+    return value if isinstance(value, dict) else None
+
+
+def _board_path(board: Any) -> Path | None:
+    root = home()
+    p = root / "kanban.db" if board in ("", "default", None) else root / "kanban" / "boards" / str(board) / "kanban.db"
+    return p if p.is_file() else None
+
+
+def projected_cards(session_id: str, timeout: float | None = None) -> list[dict] | None:
+    """This chat's cards (its compression lineage) from core's projection, shaped like ``linked_cards`` rows;
+    None when it cannot be read (no/older core, an error, or no answer within ``REMOTE_TIMEOUT_S``)."""
+    probe = _core_projection()
+    if probe is None:
+        return None
+    fn, statuses = probe
+    if not _remote_busy.acquire(blocking=False):
+        log_event("linked_remote_unavailable", session=session_id, reason="previous read still running")
+        return None
+    box: dict[str, Any] = {}
+    ids = answer_lineage(session_id)
+
+    def run() -> None:
+        try:
+            try:
+                box["rows"] = fn(ids, statuses, stale_ok=True)
+            except TypeError:  # a core whose session_tasks predates stale_ok
+                box["rows"] = fn(ids, statuses)
+        except BaseException as exc:  # noqa: BLE001 -- any failure means local-only, never a broken turn
+            box["err"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            _remote_busy.release()
+    t = threading.Thread(target=run, name="ask-gate-linked-remote", daemon=True)
+    t.start()
+    t.join(REMOTE_TIMEOUT_S if timeout is None else timeout)
+    rows = box.get("rows")
+    if t.is_alive() or not isinstance(rows, list):
+        log_event("linked_remote_unavailable", session=session_id,
+                  reason="timeout" if t.is_alive() else box.get("err") or "no rows")
+        return None
+    out = []
+    for r in rows:
+        if not isinstance(r, dict) or not is_card_id(r.get("id")):
+            continue
+        remote = bool(r.get("remote"))
+        out.append({"id": r["id"], "title": r.get("title"), "status": r.get("status"),
+                    "assignee": r.get("assignee"), "created": r.get("created_at"),
+                    "completed": r.get("completed_at"),
+                    "db": None if remote else (str(p) if (p := _board_path(r.get("board"))) else None),
+                    "block_kind": r.get("block_kind"), "human_request": _hr_dict(r.get("human_request")),
+                    "notice_only": False, "remote": remote, "key": r.get("key") if remote else None,
+                    "stale": bool(r.get("stale")) if remote else False})
+    return out
+
+
+def _needs_person(card: dict) -> bool:
+    status = card.get("status")
+    if status in _FINAL or status == "unknown":  # unknown = core's done-but-unreleased obligation
+        return False
+    return status in ("blocked", "review") or bool(card.get("human_request"))
+
+
 def linked_cards(session_id: str, limit: int = 15, db_paths: list[Path] | None = None) -> list[dict]:
-    """Cards created by this chat or notifying it (kanban_notify_subs), newest first.
+    """Cards created by this chat or notifying it, newest first (see ``linked_state``)."""
+    return linked_state(session_id, limit, db_paths)[0]
+
+
+def linked_state(session_id: str, limit: int = 15, db_paths: list[Path] | None = None) -> tuple[list[dict], bool]:
+    """(cards, complete). Cards created by this chat or notifying it (kanban_notify_subs), newest first, plus the
+    cards core's chat projection lists for it on other gateways (``projected_cards``). ``complete`` is False when
+    that projection could not be read: the list then holds this gateway's cards only. Explicit ``db_paths`` read
+    exactly those boards (complete by the caller's choice).
 
     The ``limit`` newest cards, plus every open card that needs a person (blocked, in review, or carrying a
     human_request) however old: in a long chat the oldest cards drop out of a recency list first, and those are
@@ -331,7 +430,7 @@ def linked_cards(session_id: str, limit: int = 15, db_paths: list[Path] | None =
     non-pinned cards; a pinned card is never cut."""
     out: list[dict] = []
     if not session_id:
-        return out
+        return out, True
     for p in db_paths if db_paths is not None else boards():
         try:
             c = _ro(p)
@@ -374,16 +473,27 @@ def linked_cards(session_id: str, limit: int = 15, db_paths: list[Path] | None =
                 out.append({"id": r[0], "title": r[1], "status": r[2], "assignee": r[3],
                             "created": r[4], "completed": r[5], "db": str(p), "block_kind": r[6],
                             "human_request": hr if isinstance(hr, dict) else None, "pinned": r[0] in pin_ids,
-                            "notice_only": r[0] in untracked})
+                            "notice_only": r[0] in untracked, "remote": False, "key": None, "stale": False})
             c.close()
         except sqlite3.Error:
             continue
+    complete = True
+    if db_paths is None:
+        projected = projected_cards(session_id)
+        if projected is None:
+            complete = False
+        else:  # local rows win: they carry the board path, the notice-only mark and the recency window
+            have = {x["id"] for x in out}
+            for x in projected:
+                if x["id"] not in have:
+                    have.add(x["id"])
+                    out.append({**x, "pinned": _needs_person(x)})
     seen: set[str] = set()
     out = [x for x in sorted(out, key=lambda x: (not x["pinned"], -(x.get("created") or 0)))
            if not (x["id"] in seen or seen.add(x["id"]))]
     pins = [x for x in out if x["pinned"]]
     rest = [x for x in out if not x["pinned"]][:max(0, min(limit, LINKED_CAP - len(pins)))]
-    return sorted(pins + rest, key=lambda x: x.get("created") or 0, reverse=True)
+    return sorted(pins + rest, key=lambda x: x.get("created") or 0, reverse=True), complete
 
 
 def waiting_on_david(cards: list[dict]) -> list[dict]:
@@ -499,6 +609,12 @@ def hub_replica(gateway: str, timeout: float = 8) -> list[dict] | None:
     return data if isinstance(data, list) else None
 
 
+def card_ref(card: dict) -> str:
+    """The card's id; a card owned by another gateway is owner-qualified (``gateway/profile/board/id``), so the
+    agent knows it is not on this gateway's board."""
+    return str(card.get("key") or card["id"]) if card.get("remote") else str(card["id"])
+
+
 def render_cards(cards: list[dict], replica=None) -> str:
     """One line per card; a card whose copy was forwarded to another gateway gets `-> gw:id <live status>`.
     ``replica(gateway)`` returns that gateway's task dicts (default: the hub replica); None = unreachable."""
@@ -507,7 +623,9 @@ def render_cards(cards: list[dict], replica=None) -> str:
     lines = []
     for c in cards:
         when = f", completed {fmt_ts(c['completed'])}" if c.get("completed") else ""
-        line = f"- {c['id']} [{c['status']}{when}] {str(c.get('title') or '')[:90]}"
+        line = f"- {card_ref(c)} [{c['status']}{when}] {str(c.get('title') or '')[:90]}"
+        if c.get("stale"):
+            line += " (replica stale: kanban_show it before relying on this status)"
         pc = placed_copy(c["db"], c["id"]) if c.get("db") else None
         if pc:
             gw = pc["gateway"]
@@ -567,7 +685,7 @@ def newer_waiting_comment(card: dict, session_id: str) -> str:
 
 
 def l1_block(session_id: str, ledger: "Ledger | None", db_paths: list[Path] | None = None) -> str | None:
-    cards = linked_cards(session_id, db_paths=db_paths)
+    cards, complete = linked_state(session_id, db_paths=db_paths)
     answered = ledger.relevant(session_id, limit=8) if ledger else []
     stopped = ledger.workflow_stopped(session_id) if ledger else False
     if not cards and not answered and not stopped:
@@ -579,11 +697,14 @@ def l1_block(session_id: str, ledger: "Ledger | None", db_paths: list[Path] | No
                      "request action, or reopen it. Only an explicit current-workflow resume can lift this state; "
                      "resuming does not grant approvals or clear retired account/action records.")
     if cards:
-        parts.append("Cards linked to this chat:\n" + render_cards(cards))
+        head = "Cards linked to this chat" + ("" if complete else (
+            " (local cards only: the cards this chat placed on other gateways could not be read just now, so this "
+            "list and the waiting list below may be incomplete; `hermes kanban chat-tasks <chat>` lists them all)"))
+        parts.append(head + ":\n" + render_cards(cards))
     waiting = waiting_on_david(cards)
     if waiting:
         parts.append("Waiting on David now:\n" + "\n".join(
-            f"- {x['id']}: {card_ask(x)}{newer_waiting_comment(x, session_id)}" for x in waiting))
+            f"- {card_ref(x)}: {card_ask(x)}{newer_waiting_comment(x, session_id)}" for x in waiting))
     if answered:
         parts.append("Asks David has already answered or dismissed (do not ask these again):\n" + "\n".join(
             f"- {a['topic'][:120]} -> {a['answer'][:120]} ({fmt_ts(a['ts'])})" for a in answered))

@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,11 @@ def gate(tmp_path, monkeypatch):
     for k in ("HERMES_KANBAN_TASK", "ASK_GATE_OFF"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("ASK_GATE_NO_PREWARM", "1")
+    # Core's chat projection (other gateways' cards of a chat): empty by default, so no test reads a real core's
+    # replica or ledger; tests/test_l1_remote_cards.py installs its own fake.
+    projection = types.ModuleType("hermes_cli.kanban_session_activity")
+    projection.session_tasks = lambda session_ids, statuses=(), *, stale_ok=False: []
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_session_activity", projection)
     mod = _load()
     monkeypatch.setattr(mod.core, "capability_sheet", lambda *a, **k: SHEET)
 
