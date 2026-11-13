@@ -27,8 +27,9 @@ MISMATCH = "Request no longer matches its frozen server binding"
 # of CPU and ~100 connection opens per poll on the hub with no blocked ask at all. Now:
 #   * every board / state.db / action-store read goes through a kept read-only connection (``_kept``), and
 #   * a pass first reads the key of its inputs (``Mirror._key``): the board rows it reads (blocked asks, bound
-#     cards, their lifecycle-event id and local subscribers), the action store's commit counter, the sessions
-#     table's shape, the owner, the board set and the fenced-core gate. An unchanged key skips the pass.
+#     cards, their lifecycle-event id and local subscribers), the action store's commit counter, the
+#     relevant sessions (including custom-source local subscribers) and the user-session table shape, the
+#     owner, the board set and the fenced-core gate. An unchanged key skips the pass.
 # A pass runs in full anyway when its key cannot be read, after a pass that deferred or rejected anything, when a
 # resolver is injected (no key covers it), and at least every FULL_EVERY_S. That ceiling is the P1 fallback: a
 # change the key does not see (a compression parent ended after its child was created) is picked up that late.
@@ -526,8 +527,7 @@ class Mirror:
                     entry.memo = {k: v for k, v in entry.memo.items() if k[1:3] == (entry.gen, version)}
                     entry.memo[memo_key] = bound
                 parts.append(("store", entry.gen, version))
-            with _kept(self.core._state_db()) as c:
-                parts.append(tuple(c.execute("SELECT MAX(rowid), COUNT(*) FROM sessions").fetchone()))
+            session_ids = set()
             for board, path in sorted(self.boards.items()):
                 ids = [t for b, t in bound if b == board]
                 held = []
@@ -541,7 +541,19 @@ class Mirror:
                         digest = self._board_digest(c, ids)
                         entry.memo = {k: v for k, v in entry.memo.items() if k[1:3] == (entry.gen, version)}
                         entry.memo[memo_key] = digest
-                parts.append((board, digest))
+                parts.append((board, digest[0]))
+                session_ids.update(digest[1])
+            with _kept(self.core._state_db()) as c:
+                # Unrelated worker sessions cannot affect an ask. Keep the user-session
+                # shape (including new user owners) and exact rows for every creating
+                # session/local subscriber, even custom-source legacy subscribers.
+                parts.append(tuple(c.execute(
+                    "SELECT MAX(rowid), COUNT(*) FROM sessions "
+                    "WHERE source IN ('desktop','cli','tui','web')").fetchone()))
+                parts.append([tuple(r) for r in c.execute(
+                    "SELECT id,parent_session_id,end_reason,source FROM sessions "
+                    "WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id",
+                    (json.dumps(sorted(session_ids)),))])
             return _digest(parts)
         except (sqlite3.Error, OSError, ValueError, TypeError):
             return None
@@ -566,7 +578,12 @@ class Mirror:
                 (json.dumps([r[0] for r in rows]),))]
         except sqlite3.OperationalError:
             subs = None  # _snapshot reads no subscribers then either
-        return _digest([rows, subs])
+        positions = [x for x in ("id", "status", "idempotency_key", "human_request", "session_id", "title")
+                     if x in have]
+        session_ids = {r[positions.index("session_id")] for r in rows
+                       if "session_id" in positions and r[positions.index("session_id")]}
+        session_ids.update(r[1] for r in (subs or []) if r[1])
+        return _digest([rows, subs]), tuple(sorted(session_ids))
 
     def _reconcile(self, owner, fenced):
         """One full pass. False when anything was deferred (the next pass must not be skipped)."""
@@ -595,6 +612,7 @@ class Mirror:
                         if request is not None:
                             self._publish(owner, board, snap, request)
                 except self.core.ActionError as exc:
+                    clean = False
                     # A malformed legacy ask or conflicting identity must not hide
                     # unrelated cards. Never adopt a different request as authority.
                     logging.getLogger("user-steps").warning(

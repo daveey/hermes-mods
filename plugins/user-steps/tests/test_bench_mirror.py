@@ -74,9 +74,11 @@ def replay(k, clock, card_l, run):
                 c.execute("INSERT INTO sessions VALUES (?, NULL, NULL, 'kanban', 0)", (f's-{run}-{t}',))
         if t % BOUND_EVERY == BOUND_EVERY - 1:
             with sqlite3.connect(k.path) as c:
-                c.execute("INSERT INTO task_comments(task_id,author,body) VALUES (?, 'worker', 'progress')",
-                          (f't_ask{(t // BOUND_EVERY) % ASKS}',))
-                c.execute("INSERT INTO task_events(task_id,kind) VALUES (?, 'commented')", (f't_ask{(t // BOUND_EVERY) % ASKS}',))
+                task_id = f't_ask{(t // BOUND_EVERY) % ASKS}'
+                request = json.loads(c.execute("SELECT human_request FROM tasks WHERE id=?", (task_id,)).fetchone()[0])
+                request['scope'] = f'updated ask {run}-{t}'
+                c.execute("UPDATE tasks SET human_request=? WHERE id=?", (json.dumps(request), task_id))
+                c.execute("INSERT INTO task_events(task_id,kind) VALUES (?, 'blocked')", (task_id,))
         if t % POLL_EVERY:
             continue
         start = time.thread_time()
