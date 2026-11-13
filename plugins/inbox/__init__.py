@@ -170,6 +170,7 @@ def handle_post(args: dict, **context) -> str:
             args.get("title", ""), args.get("body", ""), args.get("accept_prompt", ""),
             key=args.get("key"), poster=args.get("poster") or poster, cwd=args.get("cwd"), inherited_cwd=cwd, prompt_label=args.get("prompt_label"),
             type=args.get("type"), fields=args.get("fields"), ask=args.get("ask"),
+            origin_session=context.get("session_id"),
         )
         result["posted"] = True
         return json.dumps(result)

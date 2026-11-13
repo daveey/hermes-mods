@@ -285,7 +285,7 @@ and the Desktop half opens such items with an owner route for that profile.
 
 ## Data
 
-The sidecar `<HERMES_HOME>/inbox/inbox.db` (`items`: session_id, key, title, poster, accept_prompt, created/updated, state, plus `type, fields_json, actions_json, outcome, outcome_value, resolved_at, outcome_task`, added by an idempotent migration on open) records which sessions are inbox messages and holds their metadata. Visibility is derived from the session row, so archiving or un-hiding the session another way is respected.
+The sidecar `<HERMES_HOME>/inbox/inbox.db` (`items`: session_id, key, title, poster, accept_prompt, created/updated, state, plus `type, fields_json, actions_json, outcome, outcome_value, resolved_at, outcome_task, cwd_explicit, ask_json, origin_session`, added by an idempotent migration on open) records which sessions are inbox messages and holds their metadata. `origin_session` is the chat that posted the card: `Inbox.post(origin_session=...)`, the `inbox_post` tool's session, else the per-command `HERMES_SESSION_ID` a terminal command (`hermes inbox post`, a script importing the store) inherits; NULL for cron/no-chat posters and legacy rows, and a refresh keeps the first value. user-steps reads it to tell which chat owns a reply-draft card. Visibility is derived from the session row, so archiving or un-hiding the session another way is respected.
 
 ## Tests
 

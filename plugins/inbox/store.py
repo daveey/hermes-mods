@@ -297,7 +297,10 @@ CREATE TABLE IF NOT EXISTS key_releases (
 # Added with card types; ALTERed into older sidecars on open (idempotent).
 _COLUMNS = (("type", "TEXT"), ("fields_json", "TEXT"), ("actions_json", "TEXT"), ("outcome", "TEXT"),
             ("outcome_value", "TEXT"), ("resolved_at", "REAL"), ("resolved_by", "TEXT"), ("outcome_task", "TEXT"),
-            ("cwd_explicit", "INTEGER"), ("ask_json", "TEXT"))  # NULL = legacy/unknown
+            ("cwd_explicit", "INTEGER"), ("ask_json", "TEXT"),
+            # The chat that posted the card (tool call session or the terminal's HERMES_SESSION_ID). Consumers
+            # (user-steps) use it to know which chat owns a reply-draft card. NULL = cron/no chat/legacy.
+            ("origin_session", "TEXT"))  # NULL = legacy/unknown
 # Not "types.py": a sibling named like the stdlib module shadows it whenever this dir is on sys.path.
 _TYPES = Path(__file__).resolve().parent / "card_types.py"
 
@@ -516,8 +519,11 @@ class Inbox:
              model: Optional[str] = None, prompt_label: Optional[str] = None,
              type: Optional[str] = None, fields: Optional[dict] = None,
              inherited_cwd: Optional[str] = None, if_absent: bool = False,
-             expected: Any = _UNSET, ask: Optional[dict] = None) -> dict[str, Any]:
-        """``cwd`` is an explicit caller choice and always wins; ``inherited_cwd`` is the posting
+             expected: Any = _UNSET, ask: Optional[dict] = None,
+             origin_session: Optional[str] = None) -> dict[str, Any]:
+        """``origin_session`` is the posting chat (default: the per-command ``HERMES_SESSION_ID`` a terminal
+        command inherits); a refresh keeps the first one.
+        ``cwd`` is an explicit caller choice and always wins; ``inherited_cwd`` is the posting
         session's own cwd, which social cards replace with this host's `pr` project folder.
         New cards persist cwd_explicit (including explicit home); reposts retain original provenance."""
         policy = policy_module()
@@ -564,6 +570,7 @@ class Inbox:
         # new card with buttons, never a follow-up note in the old chat.
         decision = any(x["kind"] in ("resolve", "task") for x in snap["actions"])
         now = self.clock()
+        origin = str(origin_session or os.environ.get("HERMES_SESSION_ID") or "").strip()[:200] or None
         if if_absent or expected is not _UNSET:
             if not key or (if_absent and expected is not _UNSET):
                 raise ValueError("conditional post needs a key and exactly one condition")
@@ -575,7 +582,7 @@ class Inbox:
                 title=title, body=body, accept_prompt=accept_prompt, key=key, poster=poster, named=named,
                 cwd=cwd, inherited_cwd=inherited_cwd, model=model, prompt_label=prompt_label,
                 snap=snap, fvals=fvals, legacy=legacy, now=now,
-                if_absent=if_absent, expected=expected, ask=ask)
+                if_absent=if_absent, expected=expected, ask=ask, origin=origin)
         with _lock:
             side = self._side()
             db = self._sessions()
@@ -588,9 +595,10 @@ class Inbox:
                             else _typed_update_text(body, snap, fvals, now, sid))
                     db.append_message(sid, "assistant", text)
                     side.execute("UPDATE items SET title=?, poster=COALESCE(?, poster), accept_prompt=?, "
-                                 "updated_at=?, type=?, fields_json=?, actions_json=?, ask_json=? WHERE session_id=?",
+                                 "updated_at=?, type=?, fields_json=?, actions_json=?, ask_json=?, "
+                                 "origin_session=COALESCE(origin_session, ?) WHERE session_id=?",
                                  (title, poster, accept_prompt, now, tname, fjson, ajson,
-                                  json.dumps(ask) if ask else None, sid))
+                                  json.dumps(ask) if ask else None, origin, sid))
                     side.commit()
                     _set_title(db, sid, title)
                     db.set_session_read(sid, False)
@@ -635,9 +643,10 @@ class Inbox:
                 _set_title(db, sid, title)
                 db.set_session_read(sid, False)
                 side.execute("INSERT INTO items(session_id,key,title,poster,accept_prompt,created_at,updated_at,state,"
-                             "type,fields_json,actions_json,cwd_explicit,ask_json) VALUES (?,?,?,?,?,?,?, 'open',?,?,?,?,?)",
+                             "type,fields_json,actions_json,cwd_explicit,ask_json,origin_session) "
+                             "VALUES (?,?,?,?,?,?,?, 'open',?,?,?,?,?,?)",
                              (sid, key, title, poster, accept_prompt, now, now, tname, fjson, ajson, cwd_explicit,
-                              json.dumps(ask) if ask else None))
+                              json.dumps(ask) if ask else None, origin))
                 side.commit()
                 self._enforce_cap(side, db)
                 return {"session_id": sid, "updated": False}
@@ -751,7 +760,7 @@ class Inbox:
 
     def _conditional_post(self, *, title, body, accept_prompt, key, poster, cwd, named=None,
                           inherited_cwd, model, prompt_label, snap, fvals, legacy, now,
-                          if_absent, expected, ask):
+                          if_absent, expected, ask, origin=None):
         with self._atomic() as (conn, db):
             self._check_junk_mute(conn, poster, key, title, body)
             current = self._snapshot(conn, key)
@@ -788,19 +797,20 @@ class Inbox:
                                              cwd=routed or str(Path.home()))
                 conn.execute("UPDATE sessions SET hidden=1 WHERE id=?", (sid,))
                 conn.execute("INSERT INTO inbox.items(session_id,key,title,poster,accept_prompt,"
-                             "created_at,updated_at,state,type,fields_json,actions_json,cwd_explicit,ask_json) "
-                             "VALUES (?,?,?,?,?,?,?,'open',?,?,?,?,?)",
+                             "created_at,updated_at,state,type,fields_json,actions_json,cwd_explicit,ask_json,"
+                             "origin_session) VALUES (?,?,?,?,?,?,?,'open',?,?,?,?,?,?)",
                              (sid, key, title, poster, accept_prompt, now, now, snap["name"],
                               json.dumps(fvals), json.dumps(snap), int(cwd is not None),
-                              json.dumps(ask) if ask else None))
+                              json.dumps(ask) if ask else None, origin))
                 text = (_post_text(title, body, accept_prompt, poster, prompt_label) if legacy else
                         _typed_post_text(title, body, poster, snap, fvals, sid))
             else:
                 sid = current["session_id"]
                 conn.execute("UPDATE inbox.items SET title=?,poster=COALESCE(?,poster),accept_prompt=?,"
-                             "updated_at=?,type=?,fields_json=?,actions_json=?,ask_json=? WHERE session_id=?",
+                             "updated_at=?,type=?,fields_json=?,actions_json=?,ask_json=?,"
+                             "origin_session=COALESCE(origin_session,?) WHERE session_id=?",
                              (title, poster, accept_prompt, now, snap["name"], json.dumps(fvals),
-                              json.dumps(snap), json.dumps(ask) if ask else None, sid))
+                              json.dumps(snap), json.dumps(ask) if ask else None, origin, sid))
                 text = (_update_text(body, accept_prompt, now, prompt_label) if legacy else
                         _typed_update_text(body, snap, fvals, now, sid))
             db._check_transcript_write_guards(conn, sid, None, reject_active_turn_lease=True)
