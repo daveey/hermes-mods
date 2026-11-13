@@ -104,7 +104,7 @@ class WakeLog:
     def _conn(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         c = sqlite3.connect(self.path, timeout=10, isolation_level=None)
-        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA journal_mode=WAL").fetchone()
         c.executescript(_SCHEMA)
         return c
 

@@ -31,7 +31,7 @@ class Store:
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
-            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('PRAGMA journal_mode=WAL').fetchone()
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS workflows (
                     workflow_id TEXT PRIMARY KEY, team_id TEXT NOT NULL,

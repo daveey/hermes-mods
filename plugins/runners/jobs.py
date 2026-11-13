@@ -361,7 +361,7 @@ class JobDomain:
     # ---- plumbing
     def _db(self):
         db = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
-        db.execute('PRAGMA journal_mode=WAL')
+        db.execute('PRAGMA journal_mode=WAL').fetchone()
         return _Closing(db)
 
     def owner(self):

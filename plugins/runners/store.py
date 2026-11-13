@@ -102,7 +102,7 @@ class Store:
                             self.connection.backup(backup)
                         os.chmod(self.backup_path, 0o600)
                     self._migrate(version)
-                self.connection.execute('PRAGMA journal_mode=WAL')
+                self.connection.execute('PRAGMA journal_mode=WAL').fetchone()
                 self.connection.execute('PRAGMA synchronous=FULL')
                 self.connection.execute('PRAGMA foreign_keys=ON')
                 os.chmod(self.path, 0o600)

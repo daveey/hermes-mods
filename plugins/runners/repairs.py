@@ -132,7 +132,7 @@ class RepairService:
         self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
-            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('PRAGMA journal_mode=WAL').fetchone()
             db.executescript(_SCHEMA)
             if 'absent_since' not in {r[1] for r in db.execute('PRAGMA table_info(repair_domain_records)')}:
                 try:

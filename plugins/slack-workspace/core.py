@@ -164,7 +164,7 @@ class Store:
 
     def _conn(self) -> sqlite3.Connection:
         c = sqlite3.connect(self.db_path, timeout=10)
-        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA journal_mode=WAL").fetchone()
         c.row_factory = sqlite3.Row
         return c
 

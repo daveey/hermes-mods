@@ -2276,7 +2276,7 @@ class ActionStore:
         c = sqlite3.connect(self.path, timeout=min(self.timeout, 2))
         try:
             if c.execute('PRAGMA journal_mode').fetchone()[0] != 'wal':
-                c.execute('PRAGMA journal_mode=WAL')
+                c.execute('PRAGMA journal_mode=WAL').fetchone()
         except sqlite3.OperationalError as exc:
             logging.getLogger('user-steps').warning('user-steps: could not switch %s to WAL yet: %s', self.path, exc)
         finally:

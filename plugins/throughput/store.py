@@ -10,10 +10,11 @@ covered instead of being lost.
 """
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 RETENTION_S = 8 * 24 * 3600
 SPREAD_MAX_MIN = 5  # a gap of up to this many minutes is spread evenly; longer gaps are stored as missing
@@ -90,12 +91,21 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         with self._conn() as c:
+            # WAL is persistent in the db file: set it once, and read the row it returns. An unread row leaves the
+            # statement active until its cursor is freed, and a COMMIT on that connection then fails with
+            # "SQL statements in progress".
+            c.execute("PRAGMA journal_mode=WAL").fetchone()
             c.executescript(SCHEMA)
 
-    def _conn(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _conn(self) -> Iterator[sqlite3.Connection]:
+        """A fresh connection for one transaction: committed (or rolled back) and closed on exit."""
         c = sqlite3.connect(str(self.path), timeout=10)
-        c.execute("PRAGMA journal_mode=WAL")
-        return c
+        try:
+            with c:
+                yield c
+        finally:
+            c.close()
 
     # --- writes -------------------------------------------------------------------------------------
     def put(self, gateway: str, metric: str, rows: Iterable[tuple[int, Optional[float]]], *, replace: bool = True):

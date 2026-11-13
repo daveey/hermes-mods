@@ -258,7 +258,7 @@ class Ledger:
 
     def _db(self):
         db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
-        db.execute('PRAGMA journal_mode=WAL')
+        db.execute('PRAGMA journal_mode=WAL').fetchone()
         db.execute('PRAGMA synchronous=FULL')
         return _Closing(db)
 

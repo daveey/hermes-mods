@@ -1230,7 +1230,7 @@ class Ledger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         c = sqlite3.connect(self.path, timeout=10, isolation_level=None)
         c.row_factory = sqlite3.Row
-        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA journal_mode=WAL").fetchone()
         c.executescript(_SCHEMA)
         have = _cols(c, "waiting")
         for col, ddl in _MIGRATE:

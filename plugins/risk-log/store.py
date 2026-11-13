@@ -86,7 +86,7 @@ def connect(path: Optional[Path] = None, timeout: float = 2.0) -> sqlite3.Connec
         os.chmod(path, 0o600)
     db = sqlite3.connect(str(path), timeout=timeout, isolation_level=None, check_same_thread=False)
     db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA journal_mode=WAL").fetchone()
     db.executescript(SCHEMA)
     for suffix in ("-wal", "-shm"):
         side = Path(str(path) + suffix)

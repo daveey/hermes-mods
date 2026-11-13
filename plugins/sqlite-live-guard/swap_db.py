@@ -280,7 +280,7 @@ def _snapshot(replacement, staged):
                 if time.monotonic() > deadline:
                     raise Refusal('replacement backup snapshot timed out')
             src.backup(dst, pages=256, progress=progress)
-            dst.execute('PRAGMA journal_mode=DELETE')
+            dst.execute('PRAGMA journal_mode=DELETE').fetchone()
     os.chmod(staged, 0o600)
     _validate(staged)
 
