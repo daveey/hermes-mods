@@ -174,7 +174,7 @@ def test_done_cron_lifecycle_against_real_core(real, tmp_path, keep, corrupt):
 def test_gate_against_real_core(real, monkeypatch):
     so, plugin = real
     # A live turn marker would make plain derive say "running"; the gate must look past it.
-    monkeypatch.setattr(so, "_live_turn", lambda db, sid: True)
+    monkeypatch.setattr(so, "_live_turn", lambda db, sid, *_: True)  # core added `concluding`
     assert so.derive_outcome("chat")["kind"] == "running"
     # it reads the temp state.db: the seeded user row is the tail when no reply is pending
     assert so.derive_outcome("chat", ignore_live_turn=True)["reason"] == "interrupted"
