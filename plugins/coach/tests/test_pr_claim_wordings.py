@@ -172,3 +172,76 @@ def test_live_outcome_logs_new_claim(tmp_path, monkeypatch):
                                                                                      "pr_state_claim")
     # no second nudge: the revision was let through
     assert len([r for r in rows if r["event"] == "reply_nudge"]) == 1
+
+
+# ── survivors of the e4b832b6 mutation check (sweep-2039 D) ──────────────────────────────────────────────────────
+
+def test_hedge_conjunction_negatives():
+    """after/before/as soon as/confirm put the claim in a condition or a plan, not a present-state report."""
+    for reply in ("I'll merge it after PR #1806 is approved and its checks pass.",
+                  "Nothing ships before PR #1806 is approved.",
+                  "I'll land mine as soon as PR #1806 is approved.",
+                  "Then I will confirm PR #1806 is approved."):
+        assert rc.pr_state_claim(reply, NO_READ_LOG) is None, reply
+
+
+MF_REVISION = "It merges right after PR #1806. That one is approved."
+
+
+def test_outcome_nudged_rule_still_failing_keeps_its_evidence_and_reports_the_other_rule():
+    """The nudged rule (merge_forecast) still fires on the revision and the revision adds a PR-state claim: new_claim
+    names the OTHER rule, and the outcome keeps the nudged rule's own evidence."""
+    res = rc.nudge_outcome("merge_forecast", MF_REVISION, "when does it land?", NO_READ_LOG, _no_judge)
+    assert res["resolved"] is False
+    assert res["new_claim"] == {"rule": "pr_state_claim", "evidence": "That one is approved."}
+    assert res["evidence"] == "It merges right after PR #1806."
+
+
+REPORT_ONLY_REVISION = ("I haven't fixed that; the card I named, t_01a195df6ca256eb, covers it. "
+                        "PR #1806 is approved and its checks pass.")
+
+
+def test_outcome_new_claim_clears_report_only_unconfirmed():
+    """report_only's second opinion unavailable -> _rule_outcome says unconfirmed (never filed); a stale PR claim in
+    the same revision makes it a confirmed failure, so the unconfirmed flag must go."""
+    log = ["-> kanban_show({\"task_id\": \"t_01a195df6ca256eb\"})"]
+
+    def screen(system, prompt):
+        return json.dumps({k: 0 for k in rc.RULES} | {"report_only": 0.88, "evidence": "leaves a gap"})
+    base = rc._rule_outcome("report_only", REPORT_ONLY_REVISION, "is it fixed?", log, screen, threshold=0.7,
+                            confirm=lambda: None)
+    assert base.get("unconfirmed") is True and base["resolved"] is None  # the precondition
+    res = rc.nudge_outcome("report_only", REPORT_ONLY_REVISION, "is it fixed?", log, screen, threshold=0.7,
+                           confirm=lambda: None)
+    assert res["resolved"] is False and "unconfirmed" not in res
+    assert res["new_claim"]["rule"] == "pr_state_claim"
+
+
+def test_live_outcome_respects_disabled_pr_rules(tmp_path, monkeypatch):
+    """A host whose coach rules exclude merge_forecast/pr_state_claim gets no new_claim on outcomes."""
+    mod = load("coach_init_pr_claim_wordings_off", ROOT / "__init__.py")
+    c = mod._load("core")
+    rcm = mod._load("reply_check")
+    z = {k: 0 for k in rcm.RULES}
+    verdicts = [{**z, "confirm": 0.9, "evidence": "asks permission"}, {**z, "confirm": 0.1, "evidence": "ok"}]
+    calls = []
+
+    def judge(s, p):
+        calls.append(p)
+        return json.dumps(verdicts[min(len(calls), len(verdicts)) - 1])
+    monkeypatch.setattr(rcm, "aux_judge", judge)
+    monkeypatch.setenv("COACH_SYSTEM_ONE", "off")
+    monkeypatch.setenv("COACH_STALLED_GOAL", "0")
+    monkeypatch.setenv("COACH_REPLY_RULES", "confirm")
+    root = tmp_path / "coach"
+    _, hooks = mod.build(store=c.Store(root=root), checkout=None)
+    sid = "20261111_091916_d2d36b"
+    hooks["pre_llm_call"](session_id=sid, user_message="is the slow start fixed?", platform="desktop")
+    out = hooks["pre_verify"](session_id=sid, platform="desktop", attempt=0,
+                              final_response="I found the slow path. Want me to fix it?")
+    assert out and out["action"] == "continue"
+    assert hooks["pre_verify"](session_id=sid, platform="desktop", attempt=1, final_response=REVISED_REPLY) is None
+    rows = [json.loads(l) for l in (root / "log.jsonl").read_text().splitlines()]
+    outs = [r for r in rows if r["event"] == "reply_nudge_outcome"]
+    assert len(outs) == 1 and outs[0]["rule"] == "confirm" and outs[0]["resolved"] is True
+    assert [r for r in rows if r["event"] == "reply_nudge_outcome_new_claim"] == []
