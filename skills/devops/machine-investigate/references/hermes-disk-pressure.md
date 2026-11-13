@@ -35,6 +35,10 @@ Read when a Hermes host (not a Mac) is low on disk, including the "Low disk · /
   `~/.hermes/archive/scratch/<board>/` (recursive rm is blocked headless; moving into a task-named
   `cache/scratch` dir lets the 24 h prune drop them). Don't bypass the guard via `systemd-run`.
 
+- **Reaching worker-N from another worker:** there is no direct ssh key. Use `ssh hub-admin 'ssh -o BatchMode=yes hermes-worker-N <cmd>'`. Headless runs block `python3 -c`, heredocs and `sudo -n`, so write the script to a local file and pipe it in: `ssh hub-admin 'ssh hermes-worker-N python3 -' < script.py`.
+- **Read the pass log before blaming a producer.** If `removed` is `[]` and `reclaimed_count` counts only expired archives, while refusals show `archive_exceeds_budget` at about 5 MiB/s, then the archiver is CPU-starved (Nice=10 under load). It is not a new writer. Done trees full of regenerable caches (fake-home `tools/python-3.*`, `installs/*/environments`, venvs, node_modules, `__pycache__`, uv) are the bulk. Until the reclaimer prunes them itself (card t_01a1d342b83eb2cd / PR #1889), run a manual prune: worker-4 `~/.hermes/kanban/evidence/worker-disk-t_01a1d638ce42daab/prune_regenerable.py`, dry-run first. It freed 44.8 GiB from 198 trees. It skips trees with a live cwd, a mount inside, an archive or `.partial` in progress, or a status that is non-terminal in any DB.
+- A repeating `prior_archive_evidence` task id plus `upload:recovery_intent` refusals means stale detach intents (see above). They also waste the oversize slot, so quarantine them first.
+
 ## Producers the existing GC misses
 
 - **Test-run homes in `cache/scratch`** (for example `coach-collection-*`, ~400 MB each). A conftest that uses a
