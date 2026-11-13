@@ -94,6 +94,39 @@ def test_watch_park_is_not_open_work_but_stays_listed(gate, board, monkeypatch):
     assert not gate.core.waiting_on_david(cards)
 
 
+def test_watch_park_with_human_request_is_never_pinned(gate, board, monkeypatch):
+    """A watch park that still carries a human_request is no pinned ask: core ANDs the not-watch predicate over the
+    whole open-work expression, so pinning it would take a LINKED_CAP slot and put ``more_open`` one off
+    chat-tasks (review 5893091490)."""
+    n = gate.core.LINKED_CAP + 2
+    opens = _fill(gate, board, n)
+    watch = _card(board, "re-check the deploy after the soak", 500.0)  # oldest: outside any recency window
+    assert _schedule(watch, watch=True).get("watch") is True
+    db = board.kanban_db_path()
+    hr = {"action": "Approve the deploy in this chat. Unblock = ship; archive = drop.", "why_human": "approval",
+          "interaction": "approval", "scope": "deploy", "evidence": "soak log"}
+    c = sqlite3.connect(db)
+    c.execute("update tasks set human_request = ? where id = ?", (json.dumps(hr), watch))
+    c.commit()
+    c.close()
+    core_open = _core_open(board, monkeypatch)
+    assert core_open == set(opens), "core leaves a watch park out of open work, human_request or not"
+
+    cards, complete = gate.core.linked_state(CHAT, db_paths=[db])
+    assert complete
+    listed = {x["id"]: x for x in cards}
+    assert watch in listed and listed[watch]["watch"] is True and not listed[watch]["pinned"]
+    assert listed[watch]["human_request"]  # read, but not a pin
+    assert watch not in {x["id"] for x in gate.core.waiting_on_david(cards)}
+    open_listed = [x for x in cards if gate.core._is_open(x)]
+    assert len(open_listed) == gate.core.LINKED_CAP
+    assert cards.more_open == len(core_open) - len(open_listed) == n - gate.core.LINKED_CAP
+    block = gate.core.l1_block(CHAT, None, db_paths=[db])
+    line = next(x for x in block.splitlines() if watch in x)
+    assert WATCH_MARK in line
+    assert f"{n - gate.core.LINKED_CAP} more open cards" in block
+
+
 def test_plain_scheduled_card_still_counts_as_open(gate, board, monkeypatch):
     n = gate.core.LINKED_CAP + 2
     opens = _fill(gate, board, n)

@@ -480,8 +480,8 @@ def linked_state(session_id: str, limit: int = 15, db_paths: list[Path] | None =
 
     The ``limit`` newest cards, plus every open card that needs a person (blocked, in review, or carrying a
     human_request) however old: in a long chat the oldest cards drop out of a recency list first, and those are
-    the ones blocked on David (self-heal agent-d9399023fc). Total capped at LINKED_CAP by dropping the oldest
-    non-pinned cards; a pinned card is never cut."""
+    the ones blocked on David (self-heal agent-d9399023fc). Total capped at LINKED_CAP (watch parks are listed
+    outside the cap) by dropping the oldest non-pinned cards; a pinned card is never cut."""
     out: list[dict] = []
     if not session_id:
         return out, True
