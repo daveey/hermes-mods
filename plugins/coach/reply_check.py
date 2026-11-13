@@ -383,6 +383,27 @@ def owner_probe_live(reply: str, tool_log: Optional[list] = None, user_ask: str 
     return out
 
 
+# agent-93c5dbebae: telemetry only (report_only_scored.owner_wake_pending): the reply names a scheduled card whose
+# owner line shows a timed wake due within 24 h (`wake=in(...)`) or just due (`wake=due(...)`, inside the
+# dispatcher's slack). `wake=overdue` / `wake=later` are not pending. The judges read the fact through BOARD_OWNER.
+_WAKE_PENDING_RE = re.compile(r"task=(?:[\w,]*?)(t_[0-9a-zA-Z_]+)\b[^|]*?\bwake=(?:in|due)\(")
+
+
+def owner_wake_pending(reply: str, tool_log: Optional[list] = None, user_ask: str = "") -> list[str]:
+    """Card ids the reply (or, when it names none, the user's ask) names whose owner line in `tool_log` shows a
+    pending timed wake. Empty when none."""
+    named = set(NAMED_CARD_RE.findall(reply or "")) or set(NAMED_CARD_RE.findall(user_ask or ""))
+    out: list[str] = []
+    for line in tool_log or []:
+        s = (line or "").lstrip()
+        if not (s.startswith("<- OK") or s.startswith("<- BOARD")):
+            continue
+        for m in _WAKE_PENDING_RE.finditer(s):
+            if m.group(1) in named and m.group(1) not in out:
+                out.append(m.group(1))
+    return out
+
+
 # agent-61b50f34ae: the ids (card, PR, commit) of the reply paragraph a verdict quotes, logged on reply_nudge and
 # reply_nudge_outcome so the self-heal collector (signals.same_item) can tell a paraphrase of the nudged item from a
 # different one: a judge quotes ~20 words and rarely repeats the nudge's wording, but both paragraphs name the card.
@@ -2853,8 +2874,14 @@ BOARD_OWNER = ("A `<- BOARD task=...` line (in COACH'S OWN BOARD READ) is the co
                "started owner too, however old its last event, when the message names the non-agent producer it "
                "waits on (an install, an updater, a release or deploy, CI, a clock or date): the dispatcher re-runs "
                "the probe and wakes the card the moment the condition holds, which is the wait the Kanban protocol "
-               "prescribes. `probe=stale(...)` (the probe stopped running or is broken), a scheduled card with no "
-               "`probe=` fact and no such parent, or a live probe waiting on agent work nobody is doing, is not. "
+               "prescribes. A scheduled card whose line shows `wake=in(...)` (a timed wake from kanban_continue or a "
+               "timed kanban_schedule, due within 24 h) or `wake=due(...)` (due minutes ago, inside the dispatcher's "
+               "tick) is a started owner too when the message names the wake time or says the card wakes, resumes or "
+               "picks the work up then: the dispatcher wakes it on that clock. `wake=overdue(...)` (it should have "
+               "woken long ago and is still scheduled) or `wake=later(...)` (over 24 h out) is not. "
+               "`probe=stale(...)` (the probe stopped running or is broken), a scheduled card with no "
+               "`probe=` or `wake=` fact and no such parent, or a live probe waiting on agent work nobody is doing, is "
+               "not. "
                "A turn whose only action on a ready or todo card is a comment saying what holds it gets that credit "
                "only for the first such comment within 30 min of the card entering the queue (ready_for= under 30m "
                "and stall_notes=0): with ready_for= 30m or more and claimed=never, or stall_notes= 1 or more, the "
@@ -4150,6 +4177,8 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
                    "threshold": th_ro, "passing": v["report_only"] >= th_ro and not suppressed,
                    "owner_fresh_ready": bool(fresh_ready_owner(reply, tool_log)),
                    "owner_probe_live": bool(owner_probe_live(reply, list(tool_log or []) + list(
+                       named_board), user_ask)),
+                   "owner_wake_pending": bool(owner_wake_pending(reply, list(tool_log or []) + list(
                        named_board), user_ask)),
                    "owner_source": owner_source(reply, tool_log, board=named_board, user_ask=user_ask),
                    **owner_pr_telemetry(reply, tool_log),

@@ -3368,6 +3368,7 @@ def _card_facts_in(card_id: str, now: float, paths: list, replica: bool) -> Opti
             waits.sort(key=lambda w: (rank.get(w[1], len(rank)), w[2] if w[2] is not None else 1e18))
             run_state = str(run[0]) if run and run[0] else None
             probe = _wake_probe(conn, card_id, now) if str(row[0]) == "scheduled" else None
+            wake = _timed_wake(conn, card_id, now) if str(row[0]) == "scheduled" else None
             home = None
             if replica:
                 try:
@@ -3391,7 +3392,7 @@ def _card_facts_in(card_id: str, now: float, paths: list, replica: bool) -> Opti
                     "claimed_at": _ts(cl[0]) if cl and cl[0] else None,
                     "last_kind": str(ev[0]) if ev else None, "last_at": _ts(ev[1]) if ev else None,
                     "run": run_state, "run_failed": bool(run_state and _FAILED_RUN_RE.search(run_state)),
-                    "waits_on": waits[:BOARD_MAX_PARENTS], "probe": probe, "db": str(path),
+                    "waits_on": waits[:BOARD_MAX_PARENTS], "probe": probe, "wake": wake, "db": str(path),
                     "replica": replica, "home": home}
         except Exception:
             continue
@@ -3450,12 +3451,73 @@ def probe_text(facts: dict) -> str:
     return f"probe={'live' if p.get('live') else 'stale'}(" + " ".join(b for b in bits if b) + ")"
 
 
+# agent-93c5dbebae: the protocol's other wait is a timed wake (kanban_continue(resume_after_seconds=N), or a
+# kanban_schedule timed park). The dispatcher wakes the card at the `wake_at` its parking event (`continued` /
+# `scheduled`) carries; without that fact a card due in 12 min looked like a dead park. Core reads the same payload
+# with kanban_continuation.pending_wake_payload; the coach falls back to reading `wake_at` itself when core is absent.
+# A wake more than WAKE_HORIZON_S ahead is `later`, one past due by under PROBE_SLACK_S is `due` (the dispatcher's
+# tick), and one past due by more is `overdue`: the card should have woken and didn't.
+WAKE_HORIZON_S = 24 * 3600
+_PARK_EVENT_KINDS = ("continued", "scheduled")
+
+
+def _pending_wake_payload(kind: str, payload: Any) -> Optional[dict]:
+    try:
+        from hermes_cli.kanban_continuation import pending_wake_payload
+        return pending_wake_payload(kind, payload)
+    except Exception:
+        pass
+    if kind not in _PARK_EVENT_KINDS:
+        return None
+    d = payload if isinstance(payload, dict) else _as_dict(payload)
+    return d if isinstance(d, dict) and isinstance(d.get("wake_at"), (int, float)) else None
+
+
+def _timed_wake(conn, card_id: str, now: float) -> Optional[dict]:
+    """{at_s, due_in_s, kind: continue|clock} from the parking event that holds a scheduled card, or None."""
+    try:
+        ev = conn.execute("select kind, payload from task_events where task_id=? and created_at<=? and kind in "
+                          f"({','.join('?' * len(_PARK_EVENT_KINDS))}) order by id desc limit 1",
+                          (card_id, now, *_PARK_EVENT_KINDS)).fetchone()
+    except Exception:
+        return None
+    if not ev:
+        return None
+    p = _pending_wake_payload(str(ev[0]), ev[1])
+    if not p:
+        return None
+    at = float(p["wake_at"])
+    at = int(at) if at == int(at) else at
+    return {"at_s": at, "due_in_s": int(round(at - now)), "kind": "continue" if ev[0] == "continued" else "clock"}
+
+
+def wake_text(facts: dict) -> str:
+    """`wake=in(12m kind=continue)` / `wake=due(3m ago kind=clock)` / `wake=overdue(2h kind=..)` /
+    `wake=later(3d kind=..)`, or "" without a timed wake."""
+    w = facts.get("wake") if isinstance(facts, dict) else None
+    if not w or not isinstance(w.get("due_in_s"), (int, float)):
+        return ""
+    d, k = w["due_in_s"], f"kind={w.get('kind') or '?'}"
+    if d > WAKE_HORIZON_S:
+        return f"wake=later({_ago(d)} {k})"
+    if d >= 0:
+        return f"wake=in({_ago(d)} {k})"
+    if -d <= PROBE_SLACK_S:
+        return f"wake=due({_ago(-d)} ago {k})"
+    return f"wake=overdue({_ago(-d)} {k})"
+
+
+def _wait_text(facts: dict) -> str:
+    return " ".join(t for t in (probe_text(facts), wake_text(facts)) if t)
+
+
 def _card_probe_text(card_id: str, now: float) -> str:
+    """The scheduled card's wait facts (wake probe and timed wake) from this host's boards, "" without any."""
     try:
         facts = board_card_facts(card_id, now=now)
     except Exception:
         return ""
-    return probe_text(facts) if facts else ""
+    return _wait_text(facts) if facts else ""
 
 
 def _waits_text(facts: dict) -> str:
@@ -3484,7 +3546,7 @@ def board_fact_line(facts: dict, now: Optional[float] = None) -> str:
     qp = queue_position_text(facts)
     if qp:
         parts.append(qp)
-    pr = probe_text(facts)
+    pr = _wait_text(facts)
     if pr:
         parts.append(pr)
     w = _waits_text(facts)
@@ -3512,8 +3574,8 @@ def _with_board_facts(body: str, cards: list, now: float) -> str:
         return body
     add = (f"last={facts.get('last_kind')} @ {time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(facts['last_at']))} "
            f"({_ago(now - facts['last_at'])} ago)")
-    if probe_text(facts):
-        add += " " + probe_text(facts)
+    if _wait_text(facts):
+        add += " " + _wait_text(facts)
     if facts["status"] in ("todo", "ready", "scheduled", "blocked", "triage") and facts.get("waits_on"):
         add += " " + _waits_text(facts)
     head, sep, rows = body.partition(" rows: ")
