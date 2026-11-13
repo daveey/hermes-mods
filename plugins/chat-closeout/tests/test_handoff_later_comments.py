@@ -25,7 +25,7 @@ DECISION = "David explicitly selected Close scoped: accept the narrowed scope; n
 OLD = "Worker note before the run ended: starting fallback chain replay."
 
 
-def _board(tmp_path, comments=(), runs=((100, 200, HANDOFF),), completed_at=200):
+def _board(tmp_path, comments=(), runs=((100, 200, HANDOFF),), completed_at: 'int | None' = 200, status='archived'):
     db = tmp_path / 'kanban.db'
     c = sqlite3.connect(db)
     c.execute("CREATE TABLE tasks (id TEXT, status TEXT, title TEXT, block_kind TEXT, completed_at INTEGER, "
@@ -34,8 +34,8 @@ def _board(tmp_path, comments=(), runs=((100, 200, HANDOFF),), completed_at=200)
               "started_at INTEGER, ended_at INTEGER, summary TEXT)")
     c.execute("CREATE TABLE task_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
               "author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL)")
-    c.execute("INSERT INTO tasks VALUES ('t_7e2ee45c', 'archived', 'Model balancing incident', NULL, ?, ?, NULL)",
-              (completed_at, None if runs else HANDOFF))
+    c.execute("INSERT INTO tasks VALUES ('t_7e2ee45c', ?, 'Model balancing incident', NULL, ?, ?, NULL)",
+              (status, completed_at, None if runs else HANDOFF))
     for started, ended, summary in runs:
         c.execute("INSERT INTO task_runs (task_id, status, started_at, ended_at, summary) VALUES (?,?,?,?,?)",
                   ('t_7e2ee45c', 'done', started, ended, summary))
@@ -112,3 +112,43 @@ def test_detection_line_logged_per_prompt(tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger='chat_closeout'):
         _prompt(db)
     assert any('closeout_later_comments n=1' in r.getMessage() for r in caplog.records)
+
+
+# t_01a1d6cdfa497d94: pins for mutants of 8e23ae92 that survived every chat-closeout test.
+GUIDANCE = "supersedes what the handoff left open"
+
+
+def test_blocked_card_anchors_on_its_run_end_not_completed_at(tmp_path):
+    # Blocked: completed_at is NULL; the handoff is the run summary that ended at 200. Anchoring on completed_at
+    # alone gives no anchor, and the decision would vanish.
+    db = _board(tmp_path, status='blocked', completed_at=None,
+                comments=[('default', OLD, 150), ('default', DECISION, 300)])
+    lines = _later_lines(_prompt(db))
+    assert len(lines) == 1 and DECISION in lines[0], lines
+
+
+def test_decision_is_ranked_in_before_the_cut(tmp_path):
+    # The decision is neither among the 2 oldest nor the newest: rank, cut to MAX_LATER_COMMENTS, then order.
+    db = _board(tmp_path, comments=[('worker', 'chatter 300', 300), ('worker', 'chatter 310', 310),
+                                    ('default', DECISION, 320), ('worker', 'chatter 330', 330)])
+    lines = _later_lines(_prompt(db))
+    assert len(lines) == 2, lines
+    assert DECISION in lines[0] and 'chatter 330' in lines[1], lines
+
+
+def test_guidance_line_prints_iff_a_later_line_prints(tmp_path):
+    (tmp_path / 'a').mkdir()
+    (tmp_path / 'b').mkdir()
+    with_later = _prompt(_board(tmp_path / 'a', comments=[('default', DECISION, 300)]))
+    without = _prompt(_board(tmp_path / 'b', comments=[('default', OLD, 150)]))
+    assert _later_lines(with_later) and GUIDANCE in with_later
+    assert not _later_lines(without) and GUIDANCE not in without
+
+
+def test_blank_later_comment_neither_prints_nor_takes_a_slot(tmp_path):
+    db = _board(tmp_path, comments=[('worker', 'real 300', 300), ('worker', 'real 310', 310),
+                                    ('default', '  \n\t ', 320)])
+    lines = _later_lines(_prompt(db))
+    assert len(lines) == 2, lines
+    assert 'real 300' in lines[0] and 'real 310' in lines[1], lines
+    assert core.rank_later_comments([{'at': 1, 'author': 'a', 'body': ' \n '}]) == []
