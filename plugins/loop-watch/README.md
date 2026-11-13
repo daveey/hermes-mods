@@ -171,8 +171,21 @@ real records on both sides of a safe service restart.
 ## Opt-in tracemalloc heap census
 
 Also **off by default**, and meant for one diagnostic process lifetime only: tracing adds memory
-(roughly 50-100 bytes per live block) and CPU to every allocation. Give the ordinary launcher
-`HERMES_LOOP_WATCH_HEAP_CENSUS=<frames>` (an integer 1-32; anything else is off) before its next
+(roughly 50-100 bytes per live block) and CPU to every allocation. One arming needs all of:
+
+| Key | Meaning |
+|---|---|
+| `HERMES_LOOP_WATCH_HEAP_CENSUS=<frames>` | integer 1-32; anything else is off |
+| `HERMES_LOOP_WATCH_HEAP_CENSUS_UNTIL=<epoch seconds>` | wall-clock end of the arming window. Absent, non-numeric, in the past or more than 24 h away = **off**. Tracing also stops at this time. Set it with `$(($(date +%s) + 7200))` |
+| `HERMES_LOOP_WATCH_HEAP_CENSUS_KINDS` (optional) | comma list of process kinds that may arm: `gateway` (`hermes gateway run`), `serve`, `dashboard`, `other`. Default `gateway` only: a `hermes serve`, dashboard or CLI process never arms unless named here (naming `serve` alone excludes the gateway) |
+
+and the process must be the first of its Hermes home to arm for that UNTIL value: arming creates
+`<HERMES_HOME>/loop-watch-heap/armed-<until>` exclusively, so a restart (or a second process of the
+home) inside the window does not arm again. To arm once more, set a new UNTIL. A process that sees the
+frames key but does not arm logs one WARNING `heap census skipped in pid …: <reason>` and traces
+nothing; a key forgotten in a persistent `.env` is therefore inert once its window has passed.
+
+Give the ordinary launcher those keys before its next
 natural start. When loop-watch registers, it calls `tracemalloc.start(<frames>)` (unless tracing is
 already on) and arms the same private one-shot trigger as the cache census, under
 `<HERMES_HOME>/loop-watch-heap/<pid>-<random-generation>/`, with the command `heap-census-v1\n`
@@ -195,23 +208,31 @@ stops tracing (if it started it), releasing the per-block overhead. A failing sn
 `status: unknown` with the exception type. Remove the env var after the diagnostic run.
 
 **TTL.** If no request is consumed within `HERMES_LOOP_WATCH_HEAP_CENSUS_TTL_S` seconds (default
-21600 = 6 h; unset, non-numeric, non-finite or <= 0 means the default), the census thread stops
+21600 = 6 h; unset, non-numeric, non-finite or <= 0 means the default) or by the wall-clock UNTIL,
+whichever is first, the census thread stops
 tracing (only if loop-watch started it; tracing that was already on is left alone), writes
-`result.json` with `{"schema": 1, "kind": "heap_census", "status": "expired", "ttl_s", "frames",
-"tracing_left_on"}` and no scan, and exits. The one request opportunity is then spent; a later
-`request` file is never consumed. Send the request well inside the TTL (a 1 h warm-up fits the
+`result.json` with `{"schema": 1, "kind": "heap_census", "status": "expired", "ttl_s", "until",
+"frames", "tracing_left_on"}` and no scan, and exits. The one request opportunity is then spent; a later
+`request` file is never consumed. Send the request well inside the window (a 1 h warm-up fits the
 default); raise the TTL in the same launcher env for a longer warm-up. When the census arms, loop-watch
-logs one WARNING to agent.log naming `HERMES_LOOP_WATCH_HEAP_CENSUS=<frames>`, the pid and the TTL,
-and another when it expires, so a forgotten opt-in is visible instead of only slow.
+logs one WARNING to agent.log naming `HERMES_LOOP_WATCH_HEAP_CENSUS=<frames>`, the pid, the process
+kind, UNTIL and the TTL, and another when it expires, so a forgotten opt-in is visible instead of only
+slow. The TTL is counted on the monotonic clock, which stops while a Mac sleeps; UNTIL is the wall-clock
+bound. A process that armed on a loop-watch older than the TTL (before 2026-11-13) has no expiry at
+all and traces until it exits: restart it.
 
 **Keep it out of shared `.env` files.** hermes-cred-relay copies `.env` keys to every gateway. A
 `HERMES_LOOP_WATCH_HEAP_CENSUS` set in one host's diagnostic `.env` once reached two other gateways,
 and every process started there traced for its whole life (allocation-heavy paths 5-20x
 slower, Desktop polls of minutes). The relay's `env_deny` therefore holds `^HERMES_LOOP_WATCH_`; keep
-it there, and set this key on the launcher of the one process you are diagnosing. The TTL is the
-second guard.
+it there, and set this key on the launcher of the one process you are diagnosing. The UNTIL window,
+the gateway-only default, the one claim per home and the TTL are the further guards: a home `.env` is
+read by every gateway, serve and CLI process of that home, on every restart.
 
 `tests_heap.py` covers env parsing, default-off, attribution of a held allocation to its line, value
-privacy, the one-shot trigger and output cap, the TTL (expiry stops tracing with a fake clock, a
-request before the TTL still reports, pre-existing tracing is never stopped), and that the cache census
-defaults are unchanged.
+privacy, the one-shot trigger and output cap, the arming rules (an absent, stale or too-distant UNTIL
+does not arm; a restarted process with the same env does not arm; serve, dashboard and CLI processes do
+not arm unless named; an unwritable claim does not arm; the same through `register()` in real child
+processes), the TTL (expiry calls `tracemalloc.stop` exactly once at the TTL with a fake clock, the
+wall-clock UNTIL stops tracing when the monotonic clock stands still, a request before the TTL still
+reports, pre-existing tracing is never stopped), and that the cache census defaults are unchanged.

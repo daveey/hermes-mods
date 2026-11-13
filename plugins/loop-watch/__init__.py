@@ -87,7 +87,8 @@ def register(ctx) -> None:
             census = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(census)
         census.start(home)
-    # Default-off tracemalloc heap census (HERMES_LOOP_WATCH_HEAP_CENSUS=<frames>): diagnostic runs only.
+    # Default-off tracemalloc heap census: diagnostic runs only. The frames key alone never arms; heap.start
+    # also needs a future HERMES_LOOP_WATCH_HEAP_CENSUS_UNTIL, a named process kind and the home's one claim.
     if os.environ.get("HERMES_LOOP_WATCH_HEAP_CENSUS"):
         try:
             try:
