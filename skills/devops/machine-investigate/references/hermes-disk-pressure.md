@@ -20,6 +20,21 @@ Read when a Hermes host (not a Mac) is low on disk, including the "Low disk · /
 5. **Find live writers** by sampling `/proc/<pid>/io` `write_bytes` twice, 20 s apart. Directory mtimes alone
    don't show which process is writing.
 
+## Worker nodes (worker-N)
+
+- Reclaim is the `hermes-worker-disk-pressure` systemd timer (`~/bin/worker-disk-pressure`, code in
+  `~/.hermes/repos/hermes-state/hosts/hermes-workers/`). It only reclaims below `--warn-gib` (default 30) and
+  otherwise keeps done-card workspaces for the 7-day retention. Map `kanban/workspaces/<tid>` to status with
+  `~/.hermes/kanban.db`, `kanban/boards/*/kanban.db` AND `kanban/sync-shadow/*.db` (hub-board rows live only in
+  the shadows; without them most dirs look row-less).
+- **Never run `worker-disk-pressure` (or anything that calls core `remove_archived`) from a Kanban worker
+  shell.** The worker's descendants carry `HERMES_DELEGATED_CHILD_CONTEXT`, so every detach fails with
+  `error:PermissionError` AFTER the archive is built: nothing is freed, and each tree leaves a complete archive
+  with a stale `detach-*.json` intent (custody then refuses it `upload:recovery_intent`). If that happened:
+  confirm each intent's `original` exists and its `detached` path does not, then move those archive dirs out of
+  `~/.hermes/archive/scratch/<board>/` (recursive rm is blocked headless; moving into a task-named
+  `cache/scratch` dir lets the 24 h prune drop them). Don't bypass the guard via `systemd-run`.
+
 ## Producers the existing GC misses
 
 - **Test-run homes in `cache/scratch`** (for example `coach-collection-*`, ~400 MB each). A conftest that uses a
