@@ -586,3 +586,103 @@ def test_nudge_counts_puts_unjudged_outcomes_under_unjudged(tmp_path):
     (tmp_path / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     c = sh.nudge_counts(tmp_path, now=now)["report_only"]
     assert c.get("unjudged") == 1 and c["still_failing"] == 0 and c["filed"] == 0
+
+
+# ── coach-1b2ea7d9a7: the re-check judge raised (quota out) and the outcome said only "outcome check failed" ────────
+# 11-12 08:19 PT, MacBook: a report_only nudge's outcome came back 0.47 s after delivery as judged=true, evidence
+# "outcome check failed" (Nov 9: inside a SubscriptionQuotaUnavailable window). nudge_outcome dropped the exception
+# type, and signals filed every such record as a broken re-check. Judge unavailability is now its own class, never
+# filed (like reply_skipped); a real crash keeps a typed class and fingerprint.
+
+class SubscriptionQuotaUnavailable(Exception):
+    pass
+
+
+def _quota_judge(system, prompt):
+    raise SubscriptionQuotaUnavailable("anthropic subscription quota exhausted until 09:00")
+
+
+def test_judge_raising_quota_error_names_the_type_and_is_judge_unavailable():
+    """(a) the judge raised: evidence names the type, judge_error, error=<Type>, class judge_unavailable."""
+    res = rc.nudge_outcome("report_only", U_REPLY, "what's next?", [], _quota_judge)
+    assert res["resolved"] is None and res["judged"] is True
+    assert res["evidence"].startswith("judge unavailable: SubscriptionQuotaUnavailable: anthropic subscription"), res
+    assert res.get("judge_error") is True and res.get("error") == "SubscriptionQuotaUnavailable"
+    assert res.get("trace") and len(res["trace"]) <= 3
+    assert sg.unjudged_outcome({"resolved": None, **res}) == "judge_unavailable"
+
+
+def test_judge_unavailable_outcome_files_nothing_and_counts_on_its_own(tmp_path):
+    """(a) collect_coach files nothing for a judge-unavailable outcome (no agent, no coach defect, no late filing);
+    it logs nudge_outcome_judge_unavailable; nudge_counts shows it under judge_unavailable, outside `filed`."""
+    res = rc.nudge_outcome("report_only", U_REPLY, "what's next?", [], _quota_judge)
+    out = _uout(res["evidence"], judged=True, judge_error=True, error=res["error"])
+    got, later, logged = _collect(tmp_path, [U_NUDGE, out])
+    assert got == [] and later == [], got
+    u = [r for r in logged if r.get("event") == "nudge_outcome_judge_unavailable"]
+    assert len(u) == 1 and u[0]["nudge_id"] == "n_614e" and u[0]["error"] == "SubscriptionQuotaUnavailable"
+    rows = [{**U_NUDGE, "ts": NOW - 300}, {**out, "ts": NOW - 290}]
+    (tmp_path / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    c = sh.nudge_counts(tmp_path, now=NOW)["report_only"]
+    assert c.get("judge_unavailable") == 1 and not c.get("unjudged") and c["filed"] == 0
+
+
+def test_crash_after_the_judge_is_check_failed_with_its_type_and_own_fingerprint(tmp_path, monkeypatch):
+    """(b) a KeyError raised by the re-check code (not the judge) -> 'outcome check failed: KeyError at <file:line>',
+    class check_failed:KeyError, one coach defect with a fingerprint distinct from the legacy check_failed."""
+    def boom(reply, ask, log, judge, **kw):
+        judge("s", "p")
+        return {}["missing"]
+    monkeypatch.setattr(rc, "check", boom)
+    res = rc.nudge_outcome("report_only", U_REPLY, "x", [], lambda s, p: '{"report_only": 0.1}')
+    assert res["evidence"].startswith("outcome check failed: KeyError at "), res
+    assert "test_nudge_outcome.py:" in res["evidence"] and not res.get("judge_error")
+    assert res.get("error") == "KeyError"
+    got, _, _ = _collect(tmp_path, [U_NUDGE, _uout(res["evidence"], judged=True, error="KeyError")])
+    assert [s["component"] for s in got] == ["coach"], got
+    assert got[0]["fp"] == sg.fp("coach", "outcome_unjudged", "report_only", "check_failed:KeyError")
+    assert got[0]["fp"] != sg.fp("coach", "outcome_unjudged", "report_only", "check_failed")
+
+
+def test_legacy_bare_outcome_check_failed_keeps_class_check_failed():
+    """(c) records written before the fix keep their class (and so their open card's fingerprint)."""
+    assert sg.unjudged_outcome({"resolved": None, "evidence": "outcome check failed"}) == "check_failed"
+
+
+def test_live_hooks_quota_out_recheck_logs_typed_outcome_and_error_event(tmp_path, monkeypatch):
+    """Entry path: the live pre_verify hook with a re-check judge that raises a quota error logs the typed outcome
+    (judge_error, error) plus a nudge_outcome_error event with the traceback tail, and the collector files nothing."""
+    z = {k: 0 for k in rc.RULES}
+    mod = load("coach_init_nudge_outcome_quota", ROOT / "__init__.py")
+    c = mod._load("core")
+    rcm = mod._load("reply_check")
+    calls = []
+
+    def judge(s, p):
+        calls.append(p)
+        if len(calls) == 1:
+            return json.dumps({**z, "confirm": 0.9, "evidence": "asks permission to run the tests"})
+        raise SubscriptionQuotaUnavailable("quota out")
+    monkeypatch.setattr(rcm, "aux_judge", judge)
+    monkeypatch.setenv("COACH_SYSTEM_ONE", "off")
+    monkeypatch.setenv("COACH_STALLED_GOAL", "0")
+    monkeypatch.setenv("COACH_REPLY_RULES", "confirm")
+    root = tmp_path / "coach"
+    _, hooks = mod.build(store=c.Store(root=root), checkout=None)
+    hooks["pre_llm_call"](session_id="s_q", user_message="fix the flaky test", platform="desktop")
+    out = hooks["pre_verify"](session_id="s_q", platform="desktop", attempt=0,
+                              final_response="I found the race. Want me to apply the fix and run the tests?")
+    assert out and out["action"] == "continue"
+    hooks["pre_verify"](session_id="s_q", platform="desktop", attempt=1,
+                        final_response="Applied the fix; tests pass. Should I also open a PR?")
+    assert len(calls) == 2
+    rows = [json.loads(l) for l in (root / "log.jsonl").read_text().splitlines()]
+    outs = [r for r in rows if r["event"] == "reply_nudge_outcome"]
+    assert len(outs) == 1 and outs[0]["resolved"] is None, outs
+    assert outs[0]["evidence"].startswith("judge unavailable: SubscriptionQuotaUnavailable")
+    assert outs[0]["judge_error"] is True and outs[0]["error"] == "SubscriptionQuotaUnavailable"
+    errs = [r for r in rows if r["event"] == "nudge_outcome_error"]
+    assert len(errs) == 1 and errs[0]["error"] == "SubscriptionQuotaUnavailable" and errs[0]["judge_error"] is True
+    assert errs[0]["trace"] and errs[0]["session_id"] == "s_q"
+    h = _home(tmp_path / "h", rows)
+    assert _nudges(sg.collect_coach(h, {}, time.time())) == []

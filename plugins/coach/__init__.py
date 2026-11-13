@@ -1259,10 +1259,17 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                          **({"asks": res["asks"]} if "asks" in res else {}),
                          **({"src": res["src"]} if "src" in res else {}),
                          **({"unconfirmed": True} if res.get("unconfirmed") else {}),
+                         # coach-1b2ea7d9a7: a re-check that raised says why (judge outage vs crash)
+                         **({"error": res["error"]} if res.get("error") else {}),
+                         **({"judge_error": True} if res.get("judge_error") else {}),
                          # agent-521fd3b5d4: signals.resume_lost_outcome files a failure judged on a resumed turn
                          # with no rehydrated tool log as a coach defect, not the agent's
                          **coach.resume_info(session_id),
                          **({} if attempt else {"via": "recheck"}))
+            if res.get("error"):
+                store.log({"event": "nudge_outcome_error", "session_id": session_id, "rule": rule, **_ids(n),
+                           "error": res["error"], "judge_error": bool(res.get("judge_error")),
+                           "evidence": res["evidence"], "trace": res.get("trace") or []})
             if n.get("lead") and rc.answer_dropped(n["lead"], final_response):
                 # agent-e868df5c84: the nudge took the draft's direct answer out of the reply the user sees
                 store.log({"event": "reply_nudge_answer_dropped", "session_id": session_id, "rule": rule,
