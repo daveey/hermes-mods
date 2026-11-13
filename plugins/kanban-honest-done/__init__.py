@@ -22,14 +22,20 @@ E. (any session, not only workers) ``kanban_create`` whose title/body names an o
 
 The refusal says what to do instead.
 
+R. (worker, never a refusal) a ``kanban_complete`` whose summary claims delivery but whose metadata has no
+   ``completion_receipt`` gets a hint appended to its tool result (``transform_tool_result``) and a
+   ``receipt-hint`` log line: legacy completions stay valid (self-heal agent-f82d813de9).
+
 C. In the Desktop backend it registers ``needs_attention`` with core's ``kanban_session_activity.register_done_check``
    (fork core): a session whose recent done card admits dropped work with no follow-up card paints amber, not green.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 try:
@@ -218,6 +224,54 @@ def _pre_llm_call(session_id: str = "", canonical_user_content: Any = None, **_:
     return None
 
 
+# R: a completion that claims delivery without metadata.completion_receipt gets a hint, never a refusal (legacy
+# stays valid). Without a receipt chat-closeout can only relay prose handoffs, which is how finished asks were
+# relisted as open (self-heal agent-f82d813de9: 0 of 1378 hub completions carried one). The log line is the metric.
+_DELIVERY_RE = re.compile(
+    r"\b(deliver(?:ed|s)?|ship(?:ped|s)?|land(?:ed|s)|merg(?:ed|es)|deploy(?:ed|s)|fix(?:ed|es)|publish(?:ed|es)|"
+    r"post(?:ed|s)|sent|implement(?:ed|s)|install(?:ed|s)|enabl(?:ed|es)|added|creat(?:ed|es)|wrote|built|"
+    r"resolv(?:ed|es)|repair(?:ed|s)|migrat(?:ed|es))\b", re.I)
+_NOT_DELIVERY_RE = re.compile(r"^\s*(not a defect|duplicate|investigat|no change|nothing to)", re.I)
+
+
+def receipt_hint(tool_name: str, args: Any, result: Any, env=None) -> Optional[str]:
+    """The tool result with the receipt hint appended, or None to leave it unchanged."""
+    env = os.environ if env is None else env
+    own = env.get("HERMES_KANBAN_TASK")
+    if not own or _strip(str(tool_name or "")) not in COMPLETE_TOOLS or not isinstance(result, str):
+        return None
+    args = args if isinstance(args, dict) else {}
+    if str(args.get("task_id") or own) != own:
+        return None
+    metadata = args.get("metadata")
+    if isinstance(metadata, dict) and "completion_receipt" in metadata:
+        return None
+    summary = str(args.get("summary") or args.get("result") or "")
+    if not _DELIVERY_RE.search(summary) or _NOT_DELIVERY_RE.search(summary):
+        return None
+    try:
+        ok = json.loads(result).get("ok") is True
+    except (ValueError, AttributeError):
+        return None
+    logger.info("kanban-honest-done: receipt-hint %s ok=%s (delivery claim without completion_receipt)", own, ok)
+    when = ("When you retry, add" if not ok else
+            "This completion was not refused (legacy handoffs stay valid), but next time add")
+    return (result + f"\n[kanban-honest-done] {when} metadata.completion_receipt (v1; shape and example in the "
+            "kanban_complete metadata schema): one item per delivered scope with its disposition, evidence refs "
+            "with observed_at and verification, and remaining work. Chat close-outs relay it instead of re-reading "
+            "the summary, so finished asks are not relisted as open.")
+
+
+def _transform_tool_result(tool_name: str = "", args: Any = None, result: Any = None, **_: Any) -> Optional[str]:
+    try:
+        if not _in_worker():
+            return None
+        return receipt_hint(tool_name, args, result)
+    except Exception:
+        logger.debug("kanban-honest-done receipt hint failed", exc_info=True)
+        return None
+
+
 def _register_done_check() -> bool:
     """C: tell core's sidebar activity which done cards need attention (fork core only; older cores lack it)."""
     try:
@@ -235,4 +289,5 @@ def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_hook("post_tool_call", _post_tool_call)
     ctx.register_hook("pre_llm_call", _pre_llm_call)
+    ctx.register_hook("transform_tool_result", _transform_tool_result)
     _register_done_check()

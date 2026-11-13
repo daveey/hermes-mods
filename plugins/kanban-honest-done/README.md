@@ -27,6 +27,13 @@ text. Those are classifier tests, not actual subprocess/writer or live deploymen
 proof. Dynamic Python/shell values remain subject to the canonical writer, not this
 static classifier.
 
+**Hint, not refusal (R).** A worker's own `kanban_complete` whose summary claims delivery
+(shipped, merged, fixed, deployed, ...) with no `metadata.completion_receipt` gets a hint
+appended to its tool result, after the call ran: on a refused call it says to add the
+receipt on the retry. It never blocks; legacy completions stay valid. Each hint logs
+`kanban-honest-done: receipt-hint <task> ok=<bool>`, the count of receipt-less delivery
+claims (self-heal agent-f82d813de9). `tests/test_receipt_hint.py`.
+
 ## What it does
 
 Inside a dispatcher-spawned worker (`HERMES_KANBAN_TASK` set), a `pre_tool_call` hook refuses (E and F: any session):
