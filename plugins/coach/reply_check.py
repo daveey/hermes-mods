@@ -3943,7 +3943,7 @@ NEW_CLAIM_RULES = ("merge_forecast", "pr_state_claim")
 
 def outcome_error(exc: BaseException, judge_error: bool, judged: bool) -> dict:
     """coach-1b2ea7d9a7: the outcome record for a re-check that raised, typed so the collector can tell a judge
-    outage from a crash. judge_error (the exception came out of the judge/second-opinion model call itself, e.g.
+    outage from a crash. judge_error (the exception came out of the screen judge's model call itself, e.g.
     SubscriptionQuotaUnavailable): evidence "judge unavailable: <Type>: <msg>", never filed (signals.unjudged_outcome
     class judge_unavailable, like reply_skipped). Otherwise the re-check code crashed: "outcome check failed: <Type> at
     <file:line>: <msg>", filed as coach defect class check_failed:<Type>. Both carry error=<Type> and `trace`, the last
@@ -4033,11 +4033,9 @@ def _rule_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
             seen["scored"] = event
 
     def second() -> Optional[tuple]:
-        try:
-            seen["c2"] = confirm() if confirm is not None else None
-        except Exception as exc:  # the second-opinion model call: same class as the screen judge
-            seen["judge_exc"] = exc
-            raise
+        # A raising second opinion (quota out) never reaches the except below: check() treats any confirm()
+        # exception as "no second opinion" (screen_fallback), so it lands as the unconfirmed outcome, never filed.
+        seen["c2"] = confirm() if confirm is not None else None
         return seen["c2"]
     try:
         hit = check(reply, user_ask, tool_log, judge, threshold=threshold, only=[rule], thresholds=thresholds,

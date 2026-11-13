@@ -193,7 +193,8 @@ def test_hub_split_fix_and_verify_still_pass_admission(store, gate):
 
 
 # ── the remote brief: every gateway step goes through hub-read / hub-admin ──────────────────────────────────────
-def test_hub_investigation_brief_records_on_the_gateway(store):
+def test_hub_investigation_brief_records_on_the_gateway(store, monkeypatch):
+    monkeypatch.setenv("COACH_SELFHEAL_ONE_CARD", "0")  # the split investigation (one_card_per_defect off)
     body = fields(investigation_argv())["body"]
     assert sh.REMOTE_NOTE in body and "Pinned to the gateway that filed it" not in body
     for kind in ("duplicate", "not_defect", "proposed"):
@@ -202,6 +203,21 @@ def test_hub_investigation_brief_records_on_the_gateway(store):
     stage = f".hermes/coach/selfheal/{FP}/proposal.md"
     assert f"base64 -d > {stage}" in body and f"head -n 3 {stage}" in body
     assert "write the proposal to `proposal.md` here" in body
+
+
+def test_hub_one_card_brief_records_fixed_on_the_gateway(store, gate):
+    """One card per defect on the hub: a pool worker, every lane event through hub-admin, result staged there."""
+    argv = investigation_argv()
+    f = fields(argv)
+    body = f["body"]
+    assert f["runs_on"] == ",".join(sh.POOL_LABELS) and sh.REMOTE_NOTE in body
+    for kind in ("duplicate", "not_defect", "fixed"):
+        assert f"hub-admin '{sh.SELF_EVENT} {kind} {FP}" in body, kind
+    assert "event proposed" not in body  # no proposal step: the lane files no fix card for it
+    assert sh.SELF_EVENT not in body.replace(f"hub-admin '{sh.SELF_EVENT}", "")
+    assert f"{sh.VERIFY_REMOTE_DIR}/{FP}.md" in body and f"--result {sh.VERIFY_REMOTE_DIR}/{FP}.md" in body
+    out = gate.decide(argv)
+    assert out.get("where") != "refuse" and gate.calls == []
 
 
 def test_other_gateways_and_named_boards_keep_the_home_pin(store, board_identity):

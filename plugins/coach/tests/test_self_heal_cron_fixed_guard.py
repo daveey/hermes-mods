@@ -62,6 +62,7 @@ def write_job(home: Path, streak: int, threshold: int = 3):
 def lane(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("COACH_SELFHEAL_ONE_CARD", "0")  # a split lane: investigation, then the fix card records fixed
     store = core.Store(tmp_path / "coach")
     host = sh.host_name()
     fp = signals.fp("cron", host, "default", "bsky-notify")

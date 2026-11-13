@@ -1834,6 +1834,19 @@ USD_DAY = 200.0
 MAX_RUNNING = 3
 INVESTIGATION_SLOTS_WHILE_FIXES_WAIT = 1  # fix-first: the rest of MAX_RUNNING goes to waiting fix cards
 FIX_TITLE = "self-heal fix:"
+# One card per defect (t_01a1d69064f6064c): a new defect's `selfheal:<fp>` card runs triage -> fix -> live verify and
+# records the same `event fixed` receipt the VERIFY child wrote, so the lane no longer files `self-heal fix:` /
+# `self-heal verify:` cards for it (336 of 678 default-board cards in the 24 h to 2026-11-13 20:00Z were self-heal,
+# three per defect). Lanes filed before (no `one_card` in their lane entry) keep the split until they finish.
+# Off switch: `one_card_per_defect: false` in selfheal-config.json or COACH_SELFHEAL_ONE_CARD=0.
+DEFECT_BUDGET = FIX_BUDGET  # the one card does the fix's work; triage and verify ride inside it
+DAILY_CARD_CAP = 40  # self-heal-created cards per board per UTC day (cfg daily_card_cap, env COACH_SELFHEAL_DAILY_CAP)
+DIGEST_KEY = "selfheal-digest:"  # + YYYY-MM-DD: the day's over-cap digest card; never counted against the cap
+DIGEST_BUDGET = 2
+DIGEST_RUNTIME = 1800
+DIGEST_STATE = "selfheal-digest.json"  # <coach>/: {day, boards: {board: {card, fps}}}: one comment per fp per day
+DEDUP_COMMENT_S = 3600  # a repeat occurrence on an open owner comments again after this long (or from a new session)
+FP_LINE = "fingerprint: {fp}"  # every self-heal card body carries this line: the dedupe's body match
 SNOOZE_DAYS = 14
 NOT_DEFECT_DAYS = 7
 SAME_QUOTE_MIN_CHARS = 120  # a quote this long, shared by other sessions, is one complaint (agent-ea7ff00170)
@@ -1882,6 +1895,8 @@ VERIFY_SKILLS = ("five-whys", "hermes-mods-repo")
 # EVIDENCE_OPEN/CLOSE (same strings as core's kanban_placement) come from placement_evidence.py: the placement scan
 # skips a complete fenced block. Reasons a self-heal card stays on the gateway that filed it:
 PIN_INVESTIGATION = "it reads this gateway's own logs, state files and coach store, which a worker node does not have"
+PIN_DEFECT = ("it reads this gateway's own logs, state files and coach store, verifies the fix live on it and records "
+              "the result in its coach lane")
 PIN_FIX = "it records its result in this gateway's coach lane and verifies live on it"
 PIN_VERIFY = "its live check and lane event need this gateway's coach store and logs"
 PIN_BACKPORT = "it patches a checkout that exists only on the gateway that raised the error"
@@ -2067,6 +2082,32 @@ def lane_config() -> dict:
     return cfg
 
 
+def one_card(cfg: Optional[dict] = None) -> bool:
+    """New defects get ONE card (triage -> fix -> live verify) instead of investigation + fix + verify cards:
+    `one_card_per_defect` in selfheal-config.json, env COACH_SELFHEAL_ONE_CARD=0/1 overrides; default on."""
+    env = os.environ.get("COACH_SELFHEAL_ONE_CARD", "").strip().lower()
+    if env:
+        return env not in ("0", "false", "off", "no")
+    cfg = lane_config() if cfg is None else cfg
+    return bool(cfg.get("one_card_per_defect", True))
+
+
+def daily_card_cap(cfg: Optional[dict] = None) -> int:
+    """Cards the lane may create per board per UTC day (`daily_card_cap` in selfheal-config.json, env
+    COACH_SELFHEAL_DAILY_CAP overrides; default DAILY_CARD_CAP). A value that is not a whole number >= 0 is ignored."""
+    cfg = lane_config() if cfg is None else cfg
+    for raw in (os.environ.get("COACH_SELFHEAL_DAILY_CAP", "").strip(), cfg.get("daily_card_cap")):
+        if raw is None or raw == "" or isinstance(raw, bool):
+            continue
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if n >= 0 and str(n) == str(raw).strip():
+            return n
+    return DAILY_CARD_CAP
+
+
 def hub_ssh_argv(cfg: dict) -> list:
     """ssh argv prefix to the hub. Pins the key (`hub_ssh_key` in the config, default ~/.ssh/id_ed25519 when it
     exists) with IdentitiesOnly: a launchd job's default identities differ from the shell's (no agent, other keys
@@ -2234,8 +2275,9 @@ def investigation_brief(d: dict, previous: Optional[dict] = None, cfg: Optional[
     return remote_body(text)
 
 
-def _investigation_brief(d: dict, previous: Optional[dict] = None, cfg: Optional[dict] = None) -> str:
-    fp = d["fingerprint"]
+def _defect_evidence(d: dict, previous: Optional[dict] = None, one: bool = False) -> tuple:
+    """(checklist title, checks, extra checks, fenced evidence, recurrence note) shared by both card briefs. ``one``:
+    the one-card brief (no proposal: the recurrence note goes in the root-cause comment and the plan)."""
     comp = d.get("component") or "other"
     when = _pt(d.get("at") or time.time())
     sid = d.get("session_id") or ""
@@ -2243,18 +2285,20 @@ def _investigation_brief(d: dict, previous: Optional[dict] = None, cfg: Optional
     extra = "" if comp == "agent" else "\n" + CHECKLIST["agent"][1]
     rec = ""
     if previous:
+        where = "your root-cause comment's first line" if one else "the proposal's first line"
+        plan = "your fix" if one else "the Plan"
         rec = (f"\n## Recurrence\nThis fingerprint was fixed before by card {previous.get('fix_card') or '?'} "
                f"({_pt(previous.get('fixed_at') or 0)}). The previous fix {previous.get('fix_card') or ''} didn't "
-               "hold. Say so in the proposal's first line, find why the earlier fix and its test didn't catch the "
-               "return (five-whys step 5), and the Plan MUST add a detection-level guard (test, assertion, alert or "
+               f"hold. Say so in {where}, find why the earlier fix and its test didn't catch the "
+               f"return (five-whys step 5), and {plan} MUST add a detection-level guard (test, assertion, alert or "
                "gate) that fails if it comes back.\n")
         held = [h for h in (previous.get("held") or []) if h.get("at")]
         if held:
             rec += ("\nHeld inside the rollout window (seen soon after the fix was pushed, so possibly a host still "
                     "on old code; filed now because it kept happening or came after the window):\n" +
                     "".join(f"- {_pt(h['at'])} on {h.get('host') or '?'} ({h.get('source') or '?'})\n" for h in held))
-    proposal = f"~/.hermes/coach/selfheal/{fp}/proposal.md"
-    evidence = fence_evidence(f"""- Symptom: {d.get('symptom') or '?'}
+    evidence = fence_evidence(f"""{fp_line(d['fingerprint'])}
+- Symptom: {d.get('symptom') or '?'}
 - Component: {comp} · detector: {d.get('source') or '?'} ({d.get('kind') or '?'}, p={d.get('p_defect', '?')})
 - When: {when} · host: {d.get('host') or '?'} · session: {('@session:' + (d.get('profile') or 'default') + '/' + sid) if sid else 'none (no chat, e.g. a cron run)'}
 - Quote: "{(d.get('quote') or '').strip()[:500]}"
@@ -2263,6 +2307,13 @@ def _investigation_brief(d: dict, previous: Optional[dict] = None, cfg: Optional
   str(d.get('stop_cause')) + (' — ' + str(d.get('stop_evidence'))[:600] if d.get('stop_evidence') else
   ' (no update receipt, mods-reload, gateway exit or sleep line in the window)'))
  if d.get('stop_cause') else ''}""")
+    return title, checks, extra, evidence, rec
+
+
+def _investigation_brief(d: dict, previous: Optional[dict] = None, cfg: Optional[dict] = None) -> str:
+    fp = d["fingerprint"]
+    title, checks, extra, evidence, rec = _defect_evidence(d, previous)
+    proposal = f"~/.hermes/coach/selfheal/{fp}/proposal.md"
     return f"""Self-heal investigation for defect `{fp}`. Nothing here needs a human; David's standing approval of this
 lane covers the investigation AND the fix. You do NOT ship the fix yourself: you write the proposal, and the lane's
 next pass auto-approves it and starts the fix card. Post NOTHING to the Inbox (David only wants finished fixes there).
@@ -2511,6 +2562,122 @@ Post nothing to the Inbox. Budget for this card <= ${INVESTIGATION_BUDGET}.
    `hub-admin 'cmp {stage} {coach}/selfheal-results/{fp}.md && grep selfheal_fixed {coach}/log.jsonl | tail -n 1'`.
 7. Complete the card with the live proof and that readback in the summary.
 """
+
+
+def fp_line(fp: str) -> str:
+    return FP_LINE.format(fp=fp)
+
+
+def with_fp_line(body: str, fp: str) -> str:
+    """``body`` carrying the card's `fingerprint: <fp>` line (once): the filing dedupe matches open owners by it. The
+    line goes inside the body's first placement evidence fence (a new fence when it has none), so core's placement
+    scan never reads `cron-<hash>` as a need and the body keeps one evidence block."""
+    line = fp_line(fp)
+    body = body or ""
+    if re.search(r"(?m)^" + re.escape(line) + r"[ \t]*$", body):
+        return body
+    i = body.find(EVIDENCE_OPEN)
+    j = body.find(EVIDENCE_CLOSE, i + len(EVIDENCE_OPEN)) if i >= 0 else -1
+    if j >= 0:
+        k = i + len(EVIDENCE_OPEN)
+        return body[:k] + "\n" + line + body[k:]
+    return body.rstrip("\n") + f"\n\n{fence_evidence(line)}\n"
+
+
+def defect_brief(d: dict, previous: Optional[dict] = None, cfg: Optional[dict] = None, remote: bool = False) -> str:
+    """The ONE card of a defect (``one_card``): triage, fix, ship and live verify, ending with the lane receipt
+    (`event fixed --result`) the VERIFY child used to record. Keeps the split's proof rules on this card: a commit is
+    not proof, the live check needs the natural event or a real-path A/B repro (NATURAL_EVENT_RULE), and a retry
+    reads an existing receipt first. ``remote`` (the hub's lane): a pool worker; every gateway step runs through
+    `hub-admin`, and the result file is staged on the gateway before the event reads it."""
+    fp = d["fingerprint"]
+    title, checks, extra, evidence, rec = _defect_evidence(d, previous, one=True)
+    bb = (d.get("component") == "bb")
+    ship = ("Ship it through the bb-self-fix procedure (PR, merge, deploy) under David's standing approval."
+            if bb else
+            "Ship it under David's standing merge/deploy approval: hermes-mods commit + push (pre-commit hook, never "
+            "--no-verify), settings through shared-config.json, state through its scratch-clone flow (hermes-mods-repo "
+            "skill). A core change goes through a `hermes-core-wt` worktree and `hermes-core-wt ship` with its "
+            "independent exact-head review; from this card use `--no-ci-wait` and `kanban_continue` while CI runs.")
+    if remote:
+        coach = '"$HOME/.hermes/coach"'
+        stage = f"{VERIFY_REMOTE_DIR}/{fp}.md"
+        receipt = retry_receipt_rule(fp, "<coach>", f":\n   `hub-admin 'grep selfheal_fixed {coach}/log.jsonl | grep {fp} | "
+                                                    f"tail -n 1; grep -o {fp} {coach}/selfheal_lane.json'`")
+        deployed = (f"`hub-admin 'git -C <checkout> merge-base --is-ancestor <sha> HEAD'` (exit 0) for the live checkout "
+                    "that runs it (`~/code/hermes-mods` for a hermes-mods change; the core checkout for core)")
+        record = (f"""   Write `result.md` here (what changed with commits, the red/green test output, your live proof, the undo
+   command), stage it on the gateway and record it there:
+   `hub-admin "mkdir -p {VERIFY_REMOTE_DIR} && echo $(base64 -w0 result.md) | base64 -d > {stage}"` (double quotes:
+   the `$(...)` expands here), then
+   `hub-admin '{SELF_EVENT} fixed {fp} --note "<every fix sha, space-separated>" --result {stage}'`.
+   Read both back: `hub-admin 'cmp {stage} {coach}/selfheal-results/{fp}.md && grep selfheal_fixed {coach}/log.jsonl | tail -n 1'`.""")
+        where = ("Every step that reads or changes the gateway (its logs, state, the live check, the lane `event`) "
+                 "runs there through `hub-admin '<command>'`; repo work (clone, test, push) is fine here.")
+
+        def ev(args: str) -> str:
+            return f"`hub-admin '{SELF_EVENT} {args}'`"
+    else:
+        receipt = retry_receipt_rule(fp, "<coach>")
+        deployed = ("`git -C <checkout> merge-base --is-ancestor <sha> HEAD` for the live checkout that runs it "
+                    "(a hermes-mods change deploys within 10 min, core through hermes-sync)")
+        record = (f"""   Write `result.md` (what changed with commits, the red/green test output, your live proof, the undo
+   command) and run `{SELF_EVENT} fixed {fp} --note "<every fix sha, space-separated>" --result result.md`.""")
+        where = "You run on the gateway that filed it, because the live check and the lane record need its state."
+
+        def ev(args: str) -> str:
+            return f"`{SELF_EVENT} {args}`"
+    text = f"""Self-heal for defect `{fp}`: ONE card from triage to a live-verified fix. Nothing here needs a human;
+David's standing approval of this lane covers the investigation, the fix and its deploy. The lane files no separate
+fix or verify card for this defect: this card does all of it and records the result. Post NOTHING to the Inbox.
+Budget for this card <= ${DEFECT_BUDGET}.
+{home_pin_note(PIN_DEFECT)}
+{where}
+
+## Evidence (from the detector)
+{evidence}
+{rec}
+## Do this
+{receipt}
+1. Triage. Reproduce or confirm it LIVE, not from the transcript alone. Scope it from the user's own words and the
+   session's open work (its cards, background processes, earlier turns), not only the detector's symptom: the trigger
+   can point at a different event than the one that hurt him. Checklist for {title}:
+{checks}{extra}
+   Other hosts: the coach digests in ~/code/hermes-coach-data/<host>/ (git pull first) carry every session's user
+   turns, tool counts and last reply. A host's state.db / kanban.db / logs are only readable ON that host.
+2. Root cause. Name 2-3 candidate roots and run the one check that tells them apart. The root is the writer of the
+   wrong state (code path, env, config, skill rule), not the surface that displayed it. Write the five-whys chain
+   from evidence (five-whys skill): one causal step per why, each with a file:line, log line, db row or quote;
+   label guesses `(hypothesis)`; branch "why it happened" and "why nothing caught it". Post it as a comment here.
+3. Stop early when it is not this card's to fix:
+   - A real defect already owned by another card is a duplicate, NOT not_defect: record
+     {ev(f'duplicate {fp} --owner <owner-card> --note "<evidence>"')} and complete this card as a duplicate.
+     A countermeasure you recommend is a `kanban_create` card whose id is in --note (the event refuses one without).
+   - Not a real defect (expected behaviour, the user's own setting, the outside world with nothing to guard), or
+     already fixed by an earlier commit? Only after you checked the user's complaint itself: run
+     {ev(f'not_defect {fp} --note "<why, or: already fixed by <sha>>"')} and complete with a result that
+     starts with "not a defect:".
+4. Fix. Write the regression test FIRST and show it FAILING on the current code (paste the output in a comment).
+   Make the fix at the root, plus a detection guard (test, assertion, alert or gate) that fails if it comes back.
+   Show the same test PASSING, plus the module's existing tests.
+5. {ship}
+   {SELFHEAL_KEY_RULE}
+6. Verify live; a completed push is not proof that this symptom is fixed. Confirm each fix sha is deployed where it
+   runs: {deployed}. Not deployed after 30 min? kanban_schedule a re-check; never record fixed on undeployed code.
+   Then check on the real path (the surface/command/session type where it happened) and capture the proof. A live
+   probe that makes a detector fire on purpose starts its first prompt with `[selfheal-probe]`: the lane then logs
+   `selfheal_skip why=probe` and files nothing; never delete selfheal_pending rows by hand. The check fails? Comment
+   the evidence and keep fixing, or kanban_block naming what still fails; do not record fixed.
+{NATURAL_EVENT_RULE}
+7. Record the result QUIETLY (the Inbox is for decisions only: do NOT run `hermes inbox post`). Put EVERY commit
+   sha of the fix in the note (core and hermes-mods): a later occurrence checks whether the checkout that raised it
+   contains one, and files a backport for a stale pinned runtime instead of "the fix didn't hold".
+{record}
+   That stores it under <coach>/selfheal-results/{fp}.md and logs selfheal_fixed.
+8. Complete the card with the live proof in the summary. If something irreversible or external blocks the fix,
+   kanban_block with the exact ask instead.
+"""
+    return remote_body(text) if remote else text
 
 
 def fix_brief(fp: str, st: dict) -> str:
@@ -3588,12 +3755,17 @@ def card_args(d: dict, key: str, previous: Optional[dict] = None, cfg: Optional[
     r = route(d, cfg)
     sym = incident_title(d.get("symptom"))
     remote = remote_lane(r["board"])  # the hub's lane: a pool worker investigates, never a refused machine:hub pin
-    return {"title": f"self-heal: {sym}" + (" (came back)" if previous else ""),
-            "body": investigation_brief(d, previous, cfg, remote=remote) + (f"\n\n{different_error}\n" if different_error else ""),
-            "idempotency_key": key, "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
-            "max_runtime": INVESTIGATION_RUNTIME, "skills": r["skills"], "board": r["board"],
-            "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES),
-            "home_pin": not remote, "runs_on": list(POOL_LABELS) if remote else []}
+    tail = f"\n\n{different_error}\n" if different_error else ""
+    common = {"title": f"self-heal: {sym}" + (" (came back)" if previous else ""), "idempotency_key": key,
+              "board": r["board"], "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES),
+              "home_pin": not remote, "runs_on": list(POOL_LABELS) if remote else []}
+    if one_card(cfg):  # the defect's ONE card: it writes and ships code, so the fix card's model, runtime and skills
+        return {**common, "body": with_fp_line(defect_brief(d, previous, cfg, remote=remote) + tail, d["fingerprint"]),
+                "model": MODEL, "provider": PROVIDER, "max_runtime": FIX_RUNTIME,
+                "skills": list(BB_SKILLS) if r["bb"] else list(FIX_SKILLS), "one_card": True}
+    return {**common, "body": with_fp_line(investigation_brief(d, previous, cfg, remote=remote) + tail, d["fingerprint"]),
+            "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER, "max_runtime": INVESTIGATION_RUNTIME,
+            "skills": r["skills"]}
 
 
 def kanban_argv(args: dict, hermes: str = "hermes") -> list:
@@ -4925,6 +5097,285 @@ def _open_card_comment(d: dict, st: dict, store, runner=None) -> dict:
             "why": "occurrence added to the open card" if rc == 0 else "occurrence comment failed"}
 
 
+def board_db_path(board: Optional[str], home: Optional[Path] = None) -> Optional[Path]:
+    """The target board's kanban.db where `hermes kanban [--board b] create` lands it (:func:`_kanban_root`;
+    default board: `<root>/kanban.db`). ``home`` overrides the root (tests)."""
+    return _kanban_board_path(board or "default", Path(home) if home is not None else _kanban_root())
+
+
+def _owner_key_match(key: str, fp: str) -> bool:
+    base = f"selfheal:{fp}"
+    return key == base or key.startswith(base + ":")
+
+
+_DEPLOY_KIND_RE = re.compile(r"^selfheal:[^:]+:(backport|undeployed):")
+DEDUP_MAX_PER_DAY = 12  # occurrence comments per owner per UTC day; more only log selfheal_dedup_held
+DEDUP_STATE = "selfheal-dedup.json"  # <coach>/: {fp: {owner, at, day, n, sessions}}; never the lane (unfiled fps)
+
+
+def open_owner(fp: str, board: Optional[str], exclude=(), home: Optional[Path] = None) -> Optional[dict]:
+    """The OPEN card (status not done/archived) on the target board that owns ``fp``: idempotency key `selfheal:<fp>`
+    with any suffix (`:r2`, `:fix`, `:verify`), or a body carrying the line `fingerprint: <fp>`. Oldest first.
+    -> {id, status, key, title, via: key|body} | None. A board without a DB has no owner; an unreadable one raises
+    sqlite3.Error (the caller logs it and files normally: the daily cap still bounds that)."""
+    path = board_db_path(board, home)
+    if path is None or not path.exists():
+        return None
+    con = _ro_state(path)
+    try:
+        cols = {c[1] for c in con.execute("PRAGMA table_info(tasks)")}
+        if "idempotency_key" not in cols:
+            return None
+        body = "body" in cols
+        base = f"selfheal:{fp}"
+        where = "idempotency_key = ? OR substr(idempotency_key, 1, ?) = ?"
+        params: list = [base, len(base) + 1, base + ":"]
+        if body:
+            where += " OR instr(body, ?) > 0"
+            params.append(fp_line(fp))
+        order = "created_at, id" if "created_at" in cols else "id"
+        rows = con.execute(f"SELECT id, status, idempotency_key, title, {'body' if body else 'NULL'} FROM tasks "
+                           f"WHERE status NOT IN ('done', 'archived') AND ({where}) ORDER BY {order}",
+                           params).fetchall()
+    finally:
+        con.close()
+    line = re.compile(r"(?m)^" + re.escape(fp_line(fp)) + r"[ \t]*$")
+    for tid, status, key, title, text in rows:
+        if tid in set(exclude or ()):
+            continue
+        if _DEPLOY_KIND_RE.search(str(key or "")):
+            continue  # a backport/deploy check owns one host's missing fix, not the defect: a recurrence must file
+        via = "key" if _owner_key_match(str(key or ""), fp) else "body" if line.search(text or "") else None
+        if via:
+            return {"id": tid, "status": status, "key": key, "title": title, "via": via}
+    return None
+
+
+def cards_created_today(board: Optional[str], now: float, home: Optional[Path] = None) -> int:
+    """Cards created_by self-heal on the target board since 00:00Z of ``now``'s UTC day, the day's digest card
+    excluded. A board without a DB has none; an unreadable one raises sqlite3.Error."""
+    path = board_db_path(board, home)
+    if path is None or not path.exists():
+        return 0
+    con = _ro_state(path)
+    try:
+        cols = {c[1] for c in con.execute("PRAGMA table_info(tasks)")}
+        if not {"created_by", "created_at"} <= cols:
+            return 0
+        key = "coalesce(idempotency_key, '')" if "idempotency_key" in cols else "''"
+        return int(con.execute(f"SELECT count(*) FROM tasks WHERE created_by = ? AND created_at >= ? "
+                               f"AND typeof(created_at) IN ('integer', 'real') "
+                               f"AND substr({key}, 1, ?) != ?",
+                               (CREATED_BY, int(now) // 86400 * 86400, len(DIGEST_KEY), DIGEST_KEY)).fetchone()[0])
+    finally:
+        con.close()
+
+
+def _kanban_board_argv(board: Optional[str]) -> list:
+    return ["hermes", "kanban"] + (["--board", board] if board else [])
+
+
+def _occurrence_text(d: dict, now: float, limit: int = 600) -> str:
+    sid = d.get("session_id") or ""
+    at = _detected_at(d)
+    ev = str(d.get("quote") or d.get("evidence") or d.get("details") or "").strip()
+    return (f"- fingerprint: {d['fingerprint']} · component {d.get('component') or '?'} · detector "
+            f"{d.get('source') or '?'}\n"
+            f"- when: {_iso(at if at is not None else now)} · host {d.get('host') or '?'}\n"
+            f"- session: {('@session:' + (d.get('profile') or 'default') + '/' + sid) if sid else 'none'}\n"
+            f"- symptom: {str(d.get('symptom') or '?')[:300]}\n"
+            f"- evidence: {ev[:limit] if ev else '(none; the lane log has the detection: selfheal_detect ' + d['fingerprint'] + ')'}")
+
+
+def _dedupe_open_owner(d: dict, fp: str, board: Optional[str], store, runner, now: float) -> Optional[dict]:
+    """Filing dedupe: an open owner of ``fp`` on the target board takes this occurrence as a comment, and nothing is
+    filed (`selfheal_dedup_commented`). The same owner is commented again only from a new session or after
+    DEDUP_COMMENT_S (`selfheal_dedup_held` otherwise), so a detector that re-fires every pass cannot flood it.
+    A hand re-file's own card (`filed_by`) is never its owner. -> the skip result, or None to file."""
+    try:
+        owner = open_owner(fp, board, exclude=[d.get("filed_by")] if d.get("filed_by") else ())
+    except Exception as exc:  # health: allow BLE001 -- a failed lookup must not stop filing; the daily cap still holds
+        store.log({"event": "selfheal_dedup_error", "fingerprint": fp, "board": board, "error": str(exc)[:200]})
+        return None
+    if not owner:
+        return None
+    memo_all = _json_state(store, DEDUP_STATE)
+    memo = memo_all.get(fp) if (memo_all.get(fp) or {}).get("owner") == owner["id"] else {}
+    memo = memo or {}
+    sid = d.get("session_id") or ""
+    day = _utc_day(now)
+    seen = list(memo.get("sessions") or [])
+    n_today = int(memo.get("n") or 0) if memo.get("day") == day else 0
+    fresh = (not memo or (sid and sid not in seen) or now - float(memo.get("at") or 0) >= DEDUP_COMMENT_S)
+    res = {"action": "skip", "why": f"open owner {owner['id']} ({owner['via']} match)", "card": owner["id"],
+           "dedup": True}
+    rec = {"fingerprint": fp, "card": owner["id"], "via": owner["via"], "owner_status": owner["status"],
+           "board": board, "session_id": sid or None, "source": d.get("source")}
+    if not fresh or n_today >= DEDUP_MAX_PER_DAY:
+        store.log({"event": "selfheal_dedup_held", **rec,
+                   "why": "same owner and session within the hour" if not fresh else
+                   f"{n_today} occurrence comments on this owner today"})
+        return {**res, "commented": False}
+    body = (f"Self-heal: another occurrence of the defect this card owns. The lane filed no new card for it.\n"
+            f"{_occurrence_text(d, now)}")
+    try:
+        rc, out, err = _run(_kanban_board_argv(board) + ["comment", owner["id"], body], runner)
+    except Exception as exc:  # health: allow BLE001 -- the occurrence is still not filed: the owner holds the defect
+        rc, out, err = 1, "", str(exc)
+    if rc == 0:
+        memo_all[fp] = {"owner": owner["id"], "at": now, "day": day, "n": n_today + 1,
+                        "sessions": (seen + ([sid] if sid and sid not in seen else []))[-20:]}
+        memo_all = {k: v for k, v in memo_all.items() if now - float((v or {}).get("at") or 0) < 7 * 86400}
+        _save_json_state(store, DEDUP_STATE, memo_all)
+    store.log({"event": "selfheal_dedup_commented", **rec, "ok": rc == 0,
+               **({"error": (err or out).strip()[-200:]} if rc else {})})
+    return {**res, "commented": rc == 0}
+
+
+def _json_state(store, name: str) -> dict:
+    try:
+        data = json.loads((Path(store.root) / name).read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_json_state(store, name: str, state: dict) -> None:
+    path = Path(store.root) / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state))
+    os.replace(tmp, path)
+
+
+def _digest_state(store) -> dict:
+    return _json_state(store, DIGEST_STATE)
+
+
+def _save_digest_state(store, state: dict) -> None:
+    _save_json_state(store, DIGEST_STATE, state)
+
+
+def digest_brief(day: str, cap: int, wake: str) -> str:
+    return f"""Self-heal daily digest for {day} (UTC). The self-heal lane reached its daily card cap ({cap} cards created
+by self-heal on this board today) and filed no card for each defect commented below. Each one stays queued and
+refiles on its own after 00:00Z (the open-owner dedupe and the next day's cap still apply), so nothing here needs a
+fix from you. Post nothing to the Inbox. Budget for this card <= ${DIGEST_BUDGET}.
+
+When this card runs:
+1. Before {wake}: `kanban_schedule` it with reason `SCHEDULED_UNTIL={wake}` and `clock_only=true`, then stop.
+2. After that: count the comments and complete with the summary
+   "<n> self-heal defects over the cap on {day}: <fingerprints>". Do not file or fix anything from this card.
+"""
+
+
+def _card_ended(board: Optional[str], tid: str) -> bool:
+    """True when ``tid`` is done/archived on the board's DB; unknown (no DB, unreadable, absent) is False."""
+    try:
+        path = board_db_path(board)
+        if path is None or not path.exists():
+            return False
+        con = _ro_state(path)
+        try:
+            row = con.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+        finally:
+            con.close()
+    except Exception:  # health: allow BLE001 -- unknown keeps the cached digest
+        return False
+    return bool(row) and row[0] in ("done", "archived")
+
+
+def _get_digest(store, board: Optional[str], now: float, cap: int, runner) -> tuple:
+    """The day's digest card, created once per UTC day and board (idempotency key `selfheal-digest:<day>`), parked
+    until the next midnight. One closed by hand mid-day is replaced by `selfheal-digest:<day>:<n>` (the key alone
+    would hand the closed card back). -> (card id | None, error | None)."""
+    day = _utc_day(now)
+    state = _digest_state(store)
+    slot = ((state.get("boards") or {}) if state.get("day") == day else {}).get(board or "default") or {}
+    gen = int(slot.get("gen") or 1)
+    if slot.get("card"):
+        if not _card_ended(board, slot["card"]):
+            return slot["card"], None
+        gen += 1
+    wake = _next_utc_midnight(now)
+    tid, out, err, rc, args = None, "", "", 1, {}
+    for _ in range(3):  # a key that hands back a closed card (state file lost) moves to the next generation
+        key = f"{DIGEST_KEY}{day}" + (f":{gen}" if gen > 1 else "")
+        args = {"title": f"self-heal digest {day}: defects over the daily cap", "body": digest_brief(day, cap, wake),
+                "idempotency_key": key, "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
+                "max_runtime": DIGEST_RUNTIME, "skills": [], "board": board, "assignee": "default",
+                "created_by": CREATED_BY, "requires": [], "home_pin": False, "runs_on": []}  # portable: reads nothing
+        try:
+            rc, out, err = _run_card(args, runner)
+        except Exception as exc:  # health: allow BLE001 -- reported; the defect stays queued either way
+            rc, out, err = 1, "", f"{type(exc).__name__}: {exc}"
+        tid = _task_id(out) if rc == 0 else None
+        if not tid or not _card_ended(board, tid):
+            break
+        gen, tid = gen + 1, None
+    if not tid:
+        return None, (err or out).strip()[-300:] or f"kanban create exited {rc} with no open digest card"
+    try:  # not dispatchable until the day is over; its brief re-parks it if a worker claims it first
+        src, sout, serr = _run(_kanban_board_argv(board) + ["schedule", tid, f"SCHEDULED_UNTIL={wake} self-heal digest "
+                                                    f"collects over-cap defects until the UTC day ends",
+                                                    "--clock-only"], runner)
+        if src:
+            store.log({"event": "selfheal_digest_schedule_error", "card": tid, "rc": src,
+                       "error": (serr or sout).strip()[-200:]})
+    except Exception as exc:  # health: allow BLE001 -- the brief parks it itself
+        store.log({"event": "selfheal_digest_schedule_error", "card": tid, "error": str(exc)[:200]})
+    boards = dict(state.get("boards") or {}) if state.get("day") == day else {}
+    boards[board or "default"] = {"card": tid, "fps": [], "gen": gen}
+    _save_digest_state(store, {"day": day, "boards": boards})
+    store.log({"event": "selfheal_digest_filed", "card": tid, "utc_day": day, "board": board,
+               "key": args["idempotency_key"]})
+    return tid, None
+
+
+def _over_cap(d: dict, fp: str, board: Optional[str], store, runner, now: float, cfg: Optional[dict],
+              kind: str = "defect") -> Optional[dict]:
+    """Daily card cap: at or over `daily_card_cap` self-heal cards created on ``board`` today, no new card. The
+    defect goes to the day's digest card as one comment (once per fingerprint per day) and logs `selfheal_over_cap`.
+    kind "defect" queues it in selfheal_pending until the next 00:00Z (-> deferred); other kinds (backport, undeployed)
+    return skip, and their next occurrence retries. -> None under the cap."""
+    cap = daily_card_cap(cfg)
+    try:
+        n = cards_created_today(board, now)
+    except Exception as exc:  # health: allow BLE001 -- an unknown count is not zero: refuse, like an unreadable budget
+        why = f"daily card count unreadable: {str(exc)[:200]}"
+        store.log({"event": "selfheal_cap_unavailable", "fingerprint": fp, "board": board, "why": why})
+        return {"action": "error", "why": why}
+    if n < cap:
+        return None
+    card, error = _get_digest(store, board, now, cap, runner)
+    commented = False
+    if card:
+        state = _digest_state(store)
+        slot = state.setdefault("boards", {}).setdefault(board or "default", {"card": card, "fps": []})
+        if fp in (slot.get("fps") or []):
+            commented = None  # already on today's digest
+        else:
+            body = f"Over the daily cap ({n} >= {cap}), not filed ({kind}):\n{_occurrence_text(d, now)}"
+            try:
+                rc, out, err = _run(_kanban_board_argv(board) + ["comment", card, body], runner)
+            except Exception as exc:  # health: allow BLE001 -- logged below
+                rc, out, err = 1, "", str(exc)
+            commented = rc == 0
+            if commented:
+                slot["fps"] = (slot.get("fps") or []) + [fp]
+                _save_digest_state(store, state)
+            else:
+                error = (err or out).strip()[-200:] or "comment failed"
+    store.log({"event": "selfheal_over_cap", "fingerprint": fp, "kind": kind, "board": board, "count": n, "cap": cap,
+               "digest": card, "commented": commented, "session_id": d.get("session_id"),
+               "symptom": str(d.get("symptom") or "")[:200], **({"error": error} if error else {})})
+    why = f"daily card cap: {n} self-heal cards today >= {cap}; on digest {card or '(not filed)'}"
+    if kind != "defect":
+        return {"action": "skip", "why": why, "over_cap": True, "digest": card}
+    return _defer_investigation(d, {"action": "deferred", "retry_at": _next_utc_midnight(now), "why": why,
+                                    "over_cap": True, "digest": card, "stop_pass": False}, store)
+
+
 def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: Optional[float] = None,
                 cfg: Optional[dict] = None, budget_fn: Optional[Callable] = None,
                 owner_fn: Optional[Callable] = None, sig_owner_fn: Optional[Callable] = None) -> dict:
@@ -5076,7 +5527,8 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     args = card_args(d, dec["key"], dec.get("previous"), cfg, dec.get("different_error", ""))
     if m == "live" and hub and args.get("board") and not board_present(args["board"]):
         return _defer_missing_board(d, args["board"], store, now)
-    b = (budget_fn or budget)(args.get("board"), now)
+    b = (budget_fn(args.get("board"), now) if budget_fn else  # the one card reserves the fix card's budget
+         budget(args.get("board"), now, new_card_usd=DEFECT_BUDGET if args.get("one_card") else INVESTIGATION_BUDGET))
     sched = None
     if not b["ok_usd"]:
         sched = (_next_utc_midnight(now), f"self-heal lane budget: {b['why'] or 'cap reached'}")
@@ -5089,6 +5541,9 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
                "budget_available": b.get("available", True)}
         store.log(rec)
         return {"action": "would_file", **rec}
+    deduped = _dedupe_open_owner(d, fp, args.get("board"), store, runner, now)
+    if deduped:
+        return deduped
     unavailable = _budget_unavailable(b, fp, store)
     if unavailable:
         return unavailable
@@ -5098,6 +5553,9 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     stale = _stale_admission(d, store, fp)  # after the caps: a deferred row is re-judged once, when it would file
     if stale:
         return stale
+    capped = _over_cap(d, fp, args.get("board"), store, runner, now, cfg)
+    if capped:
+        return capped
     known, gen = known_cards(st), dec["gen"]
     tid, out, err = None, "", ""
     for _ in range(5):  # an idempotency key that hands back an earlier card (any non-archived status) -> next gen
@@ -5126,7 +5584,7 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
               fix_card=None if not prev else st.get("fix_card"), gen=gen,
               cards=sorted(known | {tid}), proposed_at=None, family=root_family(d), held=[],
               complaint_owner=None, complaint_previous=None, source=d.get("source"),
-              **_complaint_identity(d))
+              one_card=bool(args.get("one_card")), **_complaint_identity(d))
     if prev:
         kw["recurrences"] = int(st.get("recurrences") or 0) + 1
     elif dec["why"] == "refile":
@@ -5134,7 +5592,7 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     lane.update(fp, **kw)
     store.log({"event": "selfheal_filed", "fingerprint": fp, "card": tid, "component": d.get("component"),
                "board": args.get("board"), "recurrence": bool(prev), "scheduled": sched[0] if sched else None,
-               "source": d.get("source")})
+               "source": d.get("source"), "one_card": bool(args.get("one_card"))})
     if prev:
         store.log({"event": "selfheal_recurrence", "fingerprint": fp, "card": tid,
                    "previous": prev.get("fix_card"), "component": d.get("component")})
@@ -5206,7 +5664,7 @@ def _file_backport(d: dict, fp: str, st: dict, dec: dict, store, m: Optional[str
         return {"action": "skip", "why": why}
     r = route(d, cfg)
     args = {"title": f"backport {dec['sha'][:11]} to {dec['checkout']}"[:200],
-            "body": backport_brief(d, fp, st, dec), "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
+            "body": with_fp_line(backport_brief(d, fp, st, dec), fp), "idempotency_key": key, "model": MODEL, "provider": PROVIDER,
             "max_runtime": FIX_RUNTIME, "skills": list(FIX_SKILLS), "board": r["board"], "assignee": "default",
             "created_by": CREATED_BY}
     if m != "live" or not is_hub(cfg):
@@ -5217,6 +5675,9 @@ def _file_backport(d: dict, fp: str, st: dict, dec: dict, store, m: Optional[str
         why = f"backport deferred: {b.get('why') or 'self-heal budget/concurrency'}; the next occurrence retries"
         store.log({**rec, "deferred": why})
         return {"action": "skip", "why": why}
+    capped = _over_cap(d, fp, args.get("board"), store, runner, now, cfg, kind="backport")
+    if capped:
+        return capped
     rc, out, err = _run_card(args, runner)
     tid = _task_id(out) if rc == 0 else None
     if not tid:
@@ -5271,7 +5732,7 @@ def _file_undeployed(d: dict, fp: str, st: dict, dec: dict, store, m: Optional[s
         return {"action": "skip", "why": why, "not_deployed": True}
     r = route(d, cfg)
     args = pool_args({"title": f"host {dec['label']} hasn't synced fix {dec['sha'][:11]}"[:200],
-            "body": undeployed_brief(d, fp, st, dec), "idempotency_key": key, "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
+            "body": with_fp_line(undeployed_brief(d, fp, st, dec), fp), "idempotency_key": key, "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
             "max_runtime": INVESTIGATION_RUNTIME, "skills": ["hermes-mods-repo"], "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES), "home_pin": True})
     if m != "live" or not is_hub(cfg):
@@ -5282,6 +5743,9 @@ def _file_undeployed(d: dict, fp: str, st: dict, dec: dict, store, m: Optional[s
         why = f"undeployed card deferred: {b.get('why') or 'self-heal budget/concurrency'}; the next occurrence retries"
         store.log({**rec, "deferred": why})
         return {"action": "skip", "why": why, "not_deployed": True}
+    capped = _over_cap(d, fp, args.get("board"), store, runner, now, cfg, kind="undeployed")
+    if capped:
+        return {**capped, "not_deployed": True}
     rc, out, err = _run_card(args, runner)
     tid = _task_id(out) if rc == 0 else None
     if not tid:
@@ -5313,6 +5777,15 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
     st = lane.get(fp)
     if not FP_RE.match(fp or ""):
         return {"action": "error", "why": f"not a fingerprint: {fp!r}"}
+    if st.get("one_card"):
+        # One card per defect: its own card fixes and verifies it. A stray `event proposed` (or a proposal.md) never
+        # opens a fix card; the lane goes back to `filed` on that card, which records `event fixed` itself.
+        if st.get("status") == "proposed":
+            lane.update(fp, status="filed", proposed_at=None)
+        store.log({"event": "selfheal_fix_skipped", "fingerprint": fp, "card": st.get("card"), "why": "one_card",
+                   "trigger": trigger})
+        return {"action": "skip", "why": f"one card per defect: {st.get('card') or '?'} fixes and verifies it",
+                "card": st.get("card")}
     if st.get("fix_card") and st.get("status") in ("approved", "fixed"):
         r = route({"component": st.get("component")})
         if split_fix(st, r["board"]) and st.get("status") == "approved" and not st.get("verify_card") \
@@ -5338,7 +5811,7 @@ def _file_fix(fp: str, store=None, runner=None, now: Optional[float] = None, bud
         return adopted
     # Incident text (even the "cron" component) is evidence, not an execution need; titles never carry it raw.
     args = {"title": f"{FIX_TITLE} {'defect ' + fp.rsplit('-', 1)[-1] if split else incident_title(st.get('symptom') or fp)}",
-            "body": portable_fix_brief(fp, st) if split else fix_brief(fp, st),
+            "body": with_fp_line(portable_fix_brief(fp, st) if split else fix_brief(fp, st), fp),
             "idempotency_key": key, "model": MODEL, "provider": PROVIDER, "max_runtime": FIX_RUNTIME,
             "skills": (list(BB_SKILLS) if r["bb"] else list(FIX_SKILLS)), "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY,
@@ -5501,7 +5974,7 @@ def _file_verify(fp: str, st: dict, fix_card: str, r: dict, store, runner, now: 
     lane = LaneState(store.root)
     remote = remote_verify()
     args = {"title": f"{VERIFY_TITLE} {incident_title(st.get('symptom') or fp)}",
-            "body": verify_brief(fp, st, fix_card, remote=remote),
+            "body": with_fp_line(verify_brief(fp, st, fix_card, remote=remote), fp),
             "idempotency_key": verify_key(fp, generation(st) or 1), "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
             "max_runtime": VERIFY_RUNTIME, "skills": list(VERIFY_SKILLS), "board": r["board"],
             "assignee": "default", "created_by": CREATED_BY, "requires": list(SELFHEAL_REQUIRES),
@@ -6202,6 +6675,12 @@ def _recover_completion_receipt(fp: str, store, runner, now: float) -> Optional[
         if denied:
             _log_deferral_once(store, fp, denied, b, now, stage="receipt")
             return None
+        # An adopted owner (a duplicate) still earns its exact-symptom receipt check, one-card lanes too; that card
+        # counts toward the daily cap like every self-heal card, and over the cap it waits (lane stays approved).
+        d = {"fingerprint": fp, "symptom": st.get("symptom"), "component": st.get("component"),
+             "session_id": st.get("session_id"), "source": st.get("source"), "quote": f"owner {st.get('fix_card')}"}
+        if _over_cap(d, fp, r["board"], store, runner, now, None, kind="receipt"):
+            return None
         return _file_verify(fp, st, st["fix_card"], r, store, runner, now)
 
 
@@ -6420,7 +6899,7 @@ def _reconcile_fp(lane, store, fp: str, st: dict, runner, now: float, via: str =
         p_mtime = proposal.stat().st_mtime if status == "filed" and ks == "done" else 0.0
     except OSError:
         p_mtime = 0.0
-    if p_mtime and p_mtime >= (st.get("filed_at") or 0):
+    if p_mtime and p_mtime >= (st.get("filed_at") or 0) and not st.get("one_card"):
         # The investigation finished and wrote this generation's proposal, but its `event proposed` never reached
         # this lane (plugin-129c2f2518: an exported scratch HERMES_HOME sent it to a temp lane that reported
         # success). The proposal is the evidence: record it as proposed so sync() files the fix card.
