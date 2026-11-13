@@ -331,7 +331,6 @@ def test_the_census_does_not_count_itself():
     out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=120)
     assert out.returncode == 0, out.stderr
     first, second = json.loads(out.stdout)
-    assert r.scan.__code__.co_cellvars == ()  # a cell of scan's frame would be in gc.get_objects()
     for report in (first, second):
         rows = _rows(report)
         assert rows['__main__.big'][0] > 20 * MB
@@ -339,6 +338,7 @@ def test_the_census_does_not_count_itself():
         assert rows.get('<unowned cell>', (0, 0))[0] < 50_000
         assert report['bytes'] < rows['__main__.big'][0] + 12 * MB  # the interpreter and its stdlib imports
     assert abs(second['bytes'] - first['bytes']) < MB
+    assert r.scan.__code__.co_cellvars == ()  # a cell of scan's frame would be in gc.get_objects()
 
 
 def test_the_scan_leaves_nothing_behind():
@@ -462,6 +462,45 @@ def test_an_invalid_or_stale_arm_file_does_not_arm(tmp_path, clean, caplog, spec
         assert r.start(tmp_path, argv=GATEWAY) is None
     assert 'roots census not armed' in caplog.text and not hasattr(sys, r.SENTINEL)
     assert [p.name for p in (tmp_path / r.SUBDIR).iterdir()] == [r.ARM]
+
+
+def test_foreign_owned_private_arm_is_refused(tmp_path, monkeypatch):
+    path = _arm_file(tmp_path, {'until': time.time() + 600})
+    assert r.read_arm(tmp_path)[0] > 0  # same bytes/mode accepted for the actual owner
+    # Model another user's file without privileged chown or patching global fstat.
+    monkeypatch.setattr(r, 'os', types.SimpleNamespace(
+        open=os.open, close=os.close, read=os.read, fstat=os.fstat, path=os.path,
+        O_RDONLY=os.O_RDONLY, O_NOFOLLOW=os.O_NOFOLLOW, O_NONBLOCK=os.O_NONBLOCK,
+        getuid=lambda: path.stat().st_uid + 1))
+    end, reason = r.read_arm(tmp_path)
+    assert end == 0.0 and 'of this user' in reason
+
+
+def test_constructor_failure_releases_claim_for_retry(tmp_path, clean):
+    _arm_file(tmp_path, {'until': time.time() + 600})
+
+    def refuse(*args, **kwargs):
+        raise OSError('request directory unavailable')
+
+    assert r.start(tmp_path, argv=GATEWAY, probe_factory=refuse) is None
+    thread = r.start(tmp_path, argv=GATEWAY, recheck_s=0.0, sleep=lambda s: time.sleep(0.01))
+    try:
+        assert thread is not None  # retry actually registers, not merely a missing sentinel
+    finally:
+        (tmp_path / r.SUBDIR / r.ARM).unlink()
+        if thread is not None:
+            thread.join(10)
+            assert not thread.is_alive()
+
+
+def test_long_owner_labels_are_bounded_and_coalesced():
+    w = r._Walk(lambda: 0, 60)
+    prefix = 'x' * 160
+    first = w.label(prefix + 'private-suffix-one')
+    second = w.label(prefix + 'private-suffix-two')
+    assert w.labels[first] == prefix
+    assert first == second
+    assert 'private-suffix' not in json.dumps(w.labels)
 
 
 def test_read_arm_never_raises(tmp_path):
