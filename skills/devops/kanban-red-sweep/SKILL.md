@@ -96,8 +96,6 @@ Reserve a human block for real money above standing envelopes; permissions or cr
 
 Prevent acceptance-change surprises at card creation instead (slug `acceptance-waiver-owner-decision`): a card with a numeric gate states each threshold and preregisters, before execution and with independent review of the plan, one `IF FAIL <check>: <next step>` line per gate (re-measure once on fresh seeds, report FAIL and stop, file the decision card with options). A branch decides the next step; it never waives or passes the check. The worker then reports `metadata.acceptance_results` honestly (`fail` + the `branch` it followed) and the kanban-honest-done plugin's Gate G refuses a waived or guessed pass. When no branch fits, the honest outcome is a needs_input block naming the changed limit ("waives check 4", "lowers the 25% target"); that ask is legitimate, not avoidable.
 
-For recurrence evidence, inspect the private red-sweep log for slug `owner-recommendation-not-applied`; keep personal incident details in the private worker skill rather than copying them into this public repository.
-
 ## 3. Act
 
 - Unblock: `kanban_unblock` (or `hermes kanban unblock <id>` for triage/scheduled), always after a comment that says what changed.
@@ -176,7 +174,8 @@ For recurrence evidence, inspect the private red-sweep log for slug `owner-recom
   `hermes kanban [--board B] notify-subscribe <id> --platform tui --chat-id <this session id> --delivery-mode notify+wake`.
   The sync loop's chat-link reconcile turns that `tui` subscription into a `shepherd` row in `task_chat_links`
   within about a minute. Check `released=0`. A raw `INSERT INTO task_chat_links` is released again by the next
-  reconcile, so don't write that table directly.
+  reconcile, so don't write that table directly. Remote gateways refuse this chat's id (`not a chat in this
+  profile's state.db`): name their waiting cards in the report instead.
 - Mac probes that a worker reports "no agent route" for (mini/MacBook check_compat, git ancestry, sqlite reads) often
   run directly with `tailnet_exec` from the user's interactive chat. A host outside `tailnet.auto_hosts` returns an
   approval request instead; name it in the report.
@@ -199,7 +198,8 @@ For recurrence evidence, inspect the private red-sweep log for slug `owner-recom
   or complete). Then withdraw every For-you request this chat published for the same question
   (`action_request {"withdraw": ...}`), so nothing stale stays in the queue.
   A skipped question gets the safest narrow default, stated in the comment.
-- Don't re-publish unanswered questions as `session_outcome`/For-you tiles: they duplicate the form.
+- Don't re-publish unanswered questions as `session_outcome`/For-you tiles: they duplicate the form. Relaying asks
+  in a reply (form withdrawn by an update) is once only: each later `::user-step` restating them mints new requests.
 - Physical or sign-in steps are not questions. Before listing one, check it's still true (e.g. open the page in the
   signed-in browser); then list it with its device and what "done" looks like.
 
@@ -242,8 +242,9 @@ and the final response.
 - "No red cards" from the hub's sqlite is not "no red chats". The sidebar paints a chat red from
   `sessions.outcome_json` kind `decision` (hub `state.db`), fed by blocked cards on any gateway (the MacBook board
   alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards. `red_cards.py list`
-  covers both; remote cards are commented and unblocked on their own host (`tailnet_exec ... hermes kanban
-  comment/unblock`), `cross_task` only reads and comments.
+  covers both; remote cards are commented and unblocked on their own host, `cross_task` only reads and comments.
+  Macs: `tailnet_exec` with the tailnet host (`mbp`, `mini`), not the gateway name. Workers:
+  `~/.hermes/bin/hub-worker-exec worker-N -- bash -lc "hermes kanban comment <id> '...' && hermes kanban unblock <id>"`.
 - A chat still painted red after its cards finished: run `hermes sessions outcome <id> --refresh` on its gateway. It
   re-derives the outcome from live cards, so a decision about a done card becomes `done`. Never edit `state.db`.
 - Chat-level asks (`us_*` extracted user-steps, For-you requests) can only be withdrawn by the chat that owns them;
