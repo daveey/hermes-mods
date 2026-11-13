@@ -30,6 +30,10 @@ def home(tmp_path, monkeypatch):
     plug._last_sweep[0] = 0.0
     monkeypatch.setattr(plug, "SWEEP_EVERY_S", 10 ** 9)  # tests flush explicitly
     plug._last_sweep[0] = 10 ** 12
+    # load coach's regexes (several large modules, cached per process) now: the first pre_llm_call would otherwise
+    # import them after a test captured `t`, and on a busy host the stamped user time lands > 1 s past t + GRACE_S
+    core._keyword_fn()
+    core._coach_synthetic_res()
     return h
 
 
