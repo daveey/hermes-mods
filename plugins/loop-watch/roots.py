@@ -66,7 +66,7 @@ TOP = 100
 DEADLINE_S = 60.0
 NAME_DEPTH = 2  # instance attribute levels that get their own row under a module global
 MAX_ATTRS = 64  # an instance with more attributes than this is data-shaped: no per-attribute rows
-MAX_LABELS = 20000
+MAX_LABELS = 100000
 BIG_CONTAINER = 100000  # the deadline is also checked before walking into a container this large
 SPLIT_INSTANCES = 8  # a class with at most this many unreached instances gets a row per attribute
 LABEL_MAX = 160
@@ -194,6 +194,7 @@ class _Walk:
         self.labels, self.sizes, self.counts, self.index = [], [], [], {}
         self.clock, self.deadline = clock, deadline
         self.truncated = False
+        self.labels_truncated = False
         self.phases = []
 
     def late(self):
@@ -244,6 +245,7 @@ class _Walk:
         found = self.index.get(name)
         if found is None:
             if len(self.labels) >= MAX_LABELS:
+                self.labels_truncated = True
                 name = "<other owners>"
                 found = self.index.get(name)
                 if found is not None:
@@ -518,7 +520,8 @@ def scan(*, clock=time.monotonic, top=TOP, deadline_s=DEADLINE_S, modules=None):
     del everything, frontier
     chunk = obj = None
     order = sorted(range(len(w.labels)), key=w.sizes.__getitem__, reverse=True)[:top]
-    return dict(schema=1, kind="roots_census", status="ok", truncated=w.truncated, bytes=total,
+    return dict(schema=1, kind="roots_census", status="ok", truncated=w.truncated,
+                labels_truncated=w.labels_truncated, bytes=total,
                 module_bytes=w.phases[0], frame_bytes=w.phases[1], code_bytes=w.phases[2],
                 instance_bytes=w.phases[3], unowned_bytes=w.phases[4], objects=sum(w.counts),
                 gc_objects=gc_objects, roots=roots, owners=len(w.labels), bitmap_bytes=len(w.pages) * 8192,
