@@ -6,6 +6,11 @@ changed file is in an allowed path (docs); a ``require_check`` guard blocks it u
 check-run is ``success``, and holds every `gh pr merge` to the same rule (admin credentials can bypass
 branch protection without --admin), as well as REST ``PUT .../pulls/<n>/merge`` (gh api, curl, Python HTTP); GraphQL
 merge mutations on a guarded repo and ``gh pr merge --auto`` on a require_check branch are refused. ``PUSH_GUARD=off`` in the command skips this local hook, not server protection.
+
+On every host (no push-guards.json needed) it also refuses a hand cancel of a GitHub Actions run (`gh run cancel`,
+`gh api .../actions/runs/<id>/(force-)cancel`, curl or Python HTTP to it) and names github-ci-wait
+``scripts/ci_run_cancel.py --expect-attempt N``, which re-reads the run's attempt before cancelling.
+``CI_CANCEL_GUARD=off`` skips that check.
 """
 
 from __future__ import annotations
@@ -101,8 +106,14 @@ def classify(tool_name: str, args: Any) -> Optional[str]:
     args = args if isinstance(args, dict) else {}
     if tool_name in SHELL_TOOLS:
         cmd = " ; ".join(str(args.get(k) or "") for k in ("command", "input", "data"))
+        what = guard.check_run_cancel(cmd)
+        if what:
+            return guard.cancel_message(what)
         return guard.check_shell(cmd, _cwd(args))
     if tool_name in PY_TOOLS:
+        what = guard.check_python_run_cancel(str(args.get("code") or ""))
+        if what:
+            return guard.cancel_message(what)
         return guard.check_python(str(args.get("code") or ""), _cwd(args))
     if tool_name in {"tool_call", "mcp__tool_call"}:
         for call in args.get("calls") or []:

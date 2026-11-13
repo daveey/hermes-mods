@@ -59,13 +59,14 @@ workflow's concurrency group. Cancelled runs do this when an `if: always()` gate
 ("All required checks pass", timing report, aggregate) still waits for a busy runner, and a main group
 without cancel-in-progress serializes runs the same way. Read the workflow's `concurrency:` block before
 proposing "add cancel-in-progress": it is usually already there. Release the latch by force-cancelling
-(`gh api -X POST repos/O/R/actions/runs/<id>/force-cancel`) ONLY runs that meet all of these:
+(github-ci-wait `scripts/ci_run_cancel.py --run-id <id> --gh-repo O/R --expect-attempt 1 --force`; push-guard refuses a
+bare `gh run cancel`/`…/force-cancel`) ONLY runs that meet all of these:
 - the head is superseded (no longer the current PR head or main HEAD);
 - the run has at least one job, and every open job is a gate or report job;
 - `run_attempt` is 1 (a rerun may be a deliberate operator action; find its owner first).
 
-For a main run you are timing, record created / first-job / last-real-job times before cancelling. `gh run cancel`
-only *requests* cancellation: read back `completed/cancelled` before you count the run as cleared. The lasting fix
+For a main run you are timing, record created / first-job / last-real-job times before cancelling. A cancel
+only *requests* cancellation (`ci_run_cancel.py` exit 4 = not settled yet): read back `completed/cancelled` before you count the run as cleared. The lasting fix
 is to give gate jobs `if: ${{ !cancelled() }}` and run them on a light runner label. PR runs use the PR's own
 workflow file, so open PRs keep the old behavior until they rebase.
 
