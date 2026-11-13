@@ -109,9 +109,14 @@ def test_real_backend_restart_is_backend_down_not_mini_saturation(tmp_path, caps
     assert sum(out["awake_explained_by_path"].values()) == 24
 
 
-def test_real_backend_restart_files_no_conn_card_and_no_victim_path_card(tmp_path, capsys):
+def test_real_backend_restart_files_no_conn_card_and_no_victim_path_card(tmp_path, capsys, monkeypatch):
     install(tmp_path, FIXTURE.read_text())
     board = Board()
+    # At the default threshold this window files nothing: 22 of its 31 lines are fail-fast echoes
+    # (test_backend_timeout_fail_fast.py). With the threshold at its 9 real timeouts the incident card still says so.
+    report(tmp_path, capsys, board=board)
+    assert keys(board) == []
+    monkeypatch.setenv("COACH_BACKEND_TIMEOUTS_THRESHOLD", "9")
     report(tmp_path, capsys, board=board)
     assert keys(board) == ["backend-timeouts:laptop:2026-11-13"], keys(board)  # the incident card only
     (argv, body), = board.creates()

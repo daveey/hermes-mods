@@ -1493,6 +1493,12 @@ every timeout still in the logs. Tests: `tests/test_backend_timeouts.py` (40 lin
 repeat the same day comments instead of duplicating, lost state, next day, rotated logs, histogram; also passes
 under Python 3.9).
 
+Down-gate fail-fast lines do not count toward the threshold (2026-11-13 20:31Z: a core update restarted one remote
+backend; 9 real timeouts plus 22 `... is down (Timed out connecting ..., Ns ago); ... Failing fast instead of waiting
+for a timeout.` lines read as 31, over the threshold of 30). Such a line quotes the conn's last error and no request
+waited. It stays in the raw and awake counts and in `backend_down`; `fail_fast` reports how many there were, and
+`over_threshold` is judged without them. Tests: `tests/test_backend_timeout_fail_fast.py` (the real log slice).
+
 Link/connection saturation (2026-11-13: one saturated hub ssh tunnel filed three per-path cards, kanban/board,
 kanban/boards and hub-sync/status, for one cause): awake timeouts are bucketed per `conn=` in 2-second buckets. A
 conn that is significant (>= 20% of the awake count or >= the threshold) with >= half of its timeouts in >= 2 shared

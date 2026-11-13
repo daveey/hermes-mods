@@ -12,6 +12,9 @@ probe failure) proves the request started before that wake: wall time >= the mon
 latest possible start is stamp + 1 s - N, and a sleep interval ending after it means the request lived through sleep
 (e.g. 2026-11-01 18:36:09: 40 60s-timeouts 30 s after a lid wake, all issued while the lid was shut).
 Failed/unsupported power probes suppress nothing.
+A down-gate `... is down (Timed out connecting ..., Ns ago); ... Failing fast instead of waiting for a timeout.` line
+quotes the conn's last error and no request waited: it stays in the raw and awake counts and is reported under
+`fail_fast`, but the threshold is judged on awake_count minus those lines.
 
     backend_timeouts.py [--dry-run] [--json] [--hours] [--threshold N] [--window MIN] [--home PATH] [--host NAME]
 
@@ -73,6 +76,12 @@ except ImportError:  # run as a script, or loaded by path: take the sibling file
     home_route = _pe.home_route
 
 NEEDLE = "Timed out connecting to Hermes backend"
+# The Desktop's down gate answers a request at once while a conn is treated as down: `... is down (<last error>, Ns
+# ago); ... Failing fast instead of waiting for a timeout.` It quotes the conn's last error, so it carries NEEDLE when
+# that error was a timeout, yet no request waited. Such a line stays in the raw and awake counts (and in
+# backend_down), but it does not count toward the incident threshold: it is an echo of one earlier timeout
+# (2026-11-13 20:31Z: 22 echoes of 2 gate-trial timeouts took a 9-timeout window to 31, over the threshold of 30).
+FAIL_FAST = "Failing fast instead of waiting for a timeout"
 STAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[,.]\d{3} (?:([+-]\d{2}:\d{2}) )?")
 API_RE = re.compile(r"\[hermes:api (?:[A-Z]+ )?(\S+?)\]")
 PATH_RE = re.compile(r"(/api/[^\s\]\)'\"?,:]+)")
@@ -215,7 +224,7 @@ def resolve_link_events(events: list, since: Optional[datetime] = None) -> tuple
     return out, unmapped
 
 
-def iter_timeouts(files: list, *, strict=False, evidence=None, events=None):
+def iter_timeouts(files: list, *, strict=False, evidence=None, events=None, fail_fast=None):
     """Yield (datetime, route, conn, lookback_s) per log entry naming the timeout. Stack/continuation lines without a stamp count only
     if their entry's stamped line did not already (one entry = one timeout). With `events` (a list), link-state
     lines (:func:`link_event`) are appended to it from the same pass."""
@@ -253,6 +262,8 @@ def iter_timeouts(files: list, *, strict=False, evidence=None, events=None):
                 m = CONN_RE.search(line)
                 a = AFTER_RE.search(line)
                 lookback = (int(a.group(1)) / 1000.0 + int(a.group(2) or 0)) if a else 0.0
+                if fail_fast is not None and FAIL_FAST in line:  # still yielded; the caller sees the list grow
+                    fail_fast.append(last_ts)
                 yield last_ts, route_of(line), (m.group(1) if m else "?"), lookback
 
 
@@ -334,6 +345,11 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
     awake_since_wake: Counter = Counter()
     awake: list = []  # (ts, route, conn) of awake timeouts, classified after the pass
     link_events: list = []
+    echoes: list = []  # grows by one just before a down-gate fail-fast entry is yielded
+    seen_echoes = 0
+    ff_path: Counter = Counter()
+    ff_conn: Counter = Counter()
+    ff_awake = 0
     wake_ends = sorted(hi for _, hi in intervals)
     sleep_count = 0
     spanning_count = 0
@@ -344,7 +360,8 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
         raise ValueError('no Desktop logs found; bounded count unproven')
     evidence = {}
     for ts, route, conn, lookback in iter_timeouts(files, strict=bool(now.tzinfo), evidence=evidence,
-                                                   events=link_events):
+                                                   events=link_events, fail_fast=echoes):
+        is_echo, seen_echoes = len(echoes) > seen_echoes, len(echoes)
         if now.tzinfo and ts.tzinfo is None:
             # Any legal datetime UTC offset is strictly within +/-24 hours.
             # Exclude only when ALL possible instants are outside this window;
@@ -366,6 +383,10 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
                 awake_by_conn[conn] += 1
                 awake_since_wake[wake_bucket(ts, wake_ends)] += 1
                 awake.append((ts, route, conn))
+                ff_awake += is_echo
+            if is_echo:
+                ff_path[route] += 1
+                ff_conn[conn] += 1
             first = ts if first is None or ts < first else first
             last = ts if last is None or ts > last else last
     coverage_start = evidence.get('coverage_start')
@@ -378,6 +399,8 @@ def scan(home: Path, now: datetime, window_min: int, intervals=()) -> dict:
             "by_path": dict(by_path.most_common()), "by_conn": dict(by_conn.most_common()),
 
             "sleep_count": sleep_count, "sleep_spanning_count": spanning_count, "awake_count": sum(awake_by_path.values()),
+            "fail_fast": {"count": sum(ff_path.values()), "awake_count": ff_awake,
+                          "by_conn": dict(ff_conn.most_common()), "by_path": dict(ff_path.most_common())},
             "awake_by_path": dict(awake_by_path.most_common()),
             "awake_by_conn": dict(awake_by_conn.most_common()),
             "awake_since_wake": dict(awake_since_wake.most_common()),
@@ -643,6 +666,8 @@ Of these, {rep.get("awake_count", rep["count"])} occurred while awake and
 {rep.get("sleep_count", 0)} during positively observed sleep/darkwake intervals (of which {rep.get("sleep_spanning_count", 0)} landed
 after a wake but were issued before it).
 The threshold applies only to awake timeouts; raw count remains unchanged.
+{(rep.get("fail_fast") or {}).get("awake_count", 0)} of the awake lines are down-gate "Failing fast" lines that quote an earlier timeout (no request
+waited; by conn {(rep.get("fail_fast") or {}).get("by_conn") or "(none)"}): they stay in the counts but not in the threshold.
 Awake timeouts by backend connection: {rep.get("awake_by_conn") or "(none)"}; by time since last observed wake:
 {rep.get("awake_since_wake") or "(none)"}.
 {(chr(10) + sat + chr(10)) if sat else ""}
@@ -1155,7 +1180,7 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] =
     res = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "host": host, "home": str(home),
            "dry_run": a.dry_run, "threshold": threshold, "window_min": window, **rep,
            "power": power_report, "clock": clock,
-           "over_threshold": rep["awake_count"] >= threshold, "saturated_conns": saturated_conns(rep, threshold),
+           "over_threshold": rep["awake_count"] - rep["fail_fast"]["awake_count"] >= threshold, "saturated_conns": saturated_conns(rep, threshold),
            "cards": []}
     # Most of the window is a client-side stall: one uplink card; the generic incident (and its conn/path owners)
     # only when what remains unexplained is over the threshold by itself.
