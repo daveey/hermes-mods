@@ -360,3 +360,9 @@ def test_review_number_decoding():
     assert g._review_number("PRR_kwDOVDjH788AAAABX0maWQ") == "5893626457"
     assert g._review_number("MDE3OlB1bGxSZXF1ZXN0UmV2aWV3MQ==") == "MDE3OlB1bGxSZXF1ZXN0UmV2aWV3MQ=="
     assert g._review_number(None) == "None"
+
+
+def test_refusal_quotes_identifiers_intact(monkeypatch):
+    # Live #1613 quoted "testhubreadexamples.py": markdown stripping must not eat underscores.
+    why = state_check(monkeypatch, state_pr([review("Nit (non-blocking). In `test_hub_read_examples.py` line 99.")]))
+    assert why and "test_hub_read_examples.py" in why

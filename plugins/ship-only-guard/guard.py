@@ -100,7 +100,7 @@ _BOT_LOGINS = {"github-actions", "dependabot", "renovate", "copilot", "copilot-p
 def _review_point(body):
     """The first line of a review body that raises a non-blocking point, or ''."""
     for line in str(body or "").splitlines():
-        flat = re.sub(r"[*_`#>]", "", line)
+        flat = re.sub(r"[*`#>]", "", line)  # keep _: identifiers in the quoted line stay intact
         for m in _POINT.finditer(flat):
             clause = re.split(r"[.;:!?]", flat[:m.start()])[-1]
             if _NEGATION.search(clause) or _NONE_AFTER.match(flat[m.end():]):
