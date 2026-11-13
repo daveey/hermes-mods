@@ -144,3 +144,43 @@ def test_non_ai_cost_estimate_blocks_are_not_held():
         assert h.credit_ask("kanban_block", {"reason": r}) is None, r
     for r in ("Please add about $250 of Anthropic credit, then unblock.", "Add $250 of credit, then unblock."):
         assert h.credit_ask("kanban_block", {"reason": r}), r
+
+
+# An explicit credit word is strong money wording, so only the CI/infra billing context (agent-2c90bd7aa7) keeps these
+# from being held. Mirrors coach test_credit_ask: CI_COST_WORDING is reached only by the NON_LLM_BILLING_RE wording line,
+# CI_BILL_TARGETS only by the runner(s) target in _OTHER, BUILD_MACHINE_CREDIT by either.
+CI_COST_WORDING = ("Please add $50 of credit so Blacksmith can keep running the macOS jobs, then unblock.",
+                   "Please add $50 of credit so we can pay for more runner minutes, then unblock.",
+                   "Please buy $40 of credit for CI time on the nightly build, then unblock.",
+                   "Please add $30 of credit for macOS hours, then unblock.")
+CI_BILL_TARGETS = ("Please add $50 of credit for runners billing, then unblock.",
+                   "Please add $50 of credit to the runner account, then unblock.")
+BUILD_MACHINE_CREDIT = ("Please add $50 of credit for the build machines, then unblock.",
+                        "Please add $50 of credit for Blacksmith runner minutes so the macOS jobs can run.")
+AI_CREDIT_NEXT_TO_CI = ("Please add $50 of Anthropic credit for the Blacksmith runner minutes, then unblock.",
+                        "Please add $50 of OpenAI API credit; the runners billing is separate.",
+                        "Please add $50 of Anthropic credit so the CI time eval can finish.")
+
+
+def test_credit_for_ci_cost_wording_blocks_are_not_held():
+    h = fresh()
+    for r in CI_COST_WORDING:
+        assert h.credit_ask("kanban_block", {"reason": r}) is None, r
+
+
+def test_credit_for_runners_billing_blocks_are_not_held():
+    h = fresh()
+    for r in CI_BILL_TARGETS:
+        assert h.credit_ask("kanban_block", {"reason": r}) is None, r
+
+
+def test_credit_for_build_machines_blocks_are_not_held():
+    h = fresh()
+    for r in BUILD_MACHINE_CREDIT:
+        assert h.credit_ask("kanban_block", {"reason": r}) is None, r
+
+
+def test_ai_credit_next_to_ci_wording_blocks_are_still_held():
+    h = fresh()
+    for r in AI_CREDIT_NEXT_TO_CI:
+        assert h.credit_ask("kanban_block", {"reason": r}), r
