@@ -39,13 +39,19 @@ THRESHOLD = 2
 EVENT = "create_overlap"
 
 
-# Cards made to be thrown away: live-proof / scratch / synthetic probes archive themselves as cleanup, not as duplicates.
-SCRATCH_TITLE = re.compile(r"\bscratch\b|\blive[- ](?:proof|check)\b|\bsynthetic\b|\bwaiter\b|^\[[\w-]*-live\]", re.I)
+# Cards made to be thrown away: live-proof / scratch / synthetic probes and test fixtures archive themselves as
+# cleanup, not as duplicates.
+SCRATCH_TITLE = re.compile(r"\bscratch\b|\blive[- ](?:proof|check)\b|\bsynthetic\b|\bwaiter\b|^\[[\w-]*-live\]"
+                           r"|\bfixtures?\b|\bnot real work\b", re.I)
+# An override whose reason says the matched card was already archived (replica lag: the gateway's copy still showed
+# it open) or names the new card a probe/fixture target let no duplicate through, whatever later archived it.
+GONE_MATCH_REASON = re.compile(r"\b(?:already|was|were|is|been)\s+archived\b|\bprobe target\b|\bfixture\b", re.I)
 
 
-def is_cleanup_archive(title: str, source_status: Optional[str]) -> bool:
+def is_cleanup_archive(title: str, source_status: Optional[str], reason: Optional[str] = None) -> bool:
     """True when the archive is routine cleanup rather than a coordinator closing a duplicate."""
-    return source_status == "done" or bool(SCRATCH_TITLE.search(title or ""))
+    return (source_status == "done" or bool(SCRATCH_TITLE.search(title or ""))
+            or bool(GONE_MATCH_REASON.search(reason or "")))
 
 
 def hermes_home(home: Optional[str] = None) -> Path:
@@ -102,7 +108,7 @@ def scan(home: Optional[str] = None, days: float = 7, now: Optional[float] = Non
                     src = json.loads(arch[0] or "{}").get("source_status") if arch else None
                 except (sqlite3.Error, ValueError):
                     src = None
-                if is_cleanup_archive(title, src):
+                if is_cleanup_archive(title, src, p.get("reason")):
                     continue
                 found.append({"board": board, "id": tid, "title": title, "at": at, "reason": p.get("reason"),
                               "overrode": [m.get("id") for m in p.get("matches") or []]})

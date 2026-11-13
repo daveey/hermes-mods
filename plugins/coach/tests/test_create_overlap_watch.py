@@ -78,3 +78,28 @@ def test_cleanup_archives_are_not_duplicates(tmp_path):
     db.commit()
     db.close()
     assert [f["id"] for f in cw.scan(str(tmp_path), now=NOW)] == ["d1"]  # only the ready-card archive is a duplicate
+
+
+def test_fixtures_and_overrides_of_already_archived_matches_are_not_duplicates(tmp_path):
+    """The week that filed t_01a1d37e58c39663: of 3 archived overrides only the superseded measurement card was a
+    duplicate. A test fixture and a card whose override reason says the match was already archived are not."""
+    cases = {
+        "dup": ("Hub live CPU + prompt ACK measurement after PR1125 deploy (hub-local)",
+                "t_old lives on worker-2, has sat unclaimed 59 min, and the hub can neither edit nor reach it"),
+        "fix": ("fixture: hub-owned comment target for t_x live test (not real work)",
+                "t_y was archived (wrong gateway); this one must be hub-owned"),
+        "gone": ("State suite: scripts/run-state-suite-local runs tests/run_ci.py on a pool worker",
+                 "that worker-6 scratch is already archived (replica lag); this is the hub-side probe target"),
+        "gone2": ("Rebuild the index", "the matched card has been archived since; recreating it here"),
+    }
+    _board(tmp_path / "kanban.db", [(tid, "archived", "override", 1) for tid in cases])
+    db = sqlite3.connect(tmp_path / "kanban.db")
+    for tid, (title, reason) in cases.items():
+        db.execute("UPDATE tasks SET title=? WHERE id=?", (title, tid))
+        db.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='create_overlap'",
+                   (json.dumps({"outcome": "override", "reason": reason, "matches": [{"id": "t_m"}]}), tid))
+        db.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                   (tid, "archived", json.dumps({"source_status": "todo"}), int(NOW)))
+    db.commit()
+    db.close()
+    assert [f["id"] for f in cw.scan(str(tmp_path), now=NOW)] == ["dup"]
