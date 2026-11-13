@@ -1110,7 +1110,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                     return {"action": "continue", "message": msg}
                 if "unverified" not in cfg["rules"]:  # added only for the review: fall back to the next real rule
                     v = hit["verdict"]
-                    rest = [r for r in cfg["rules"] if r in rc.prefilter(final_response)
+                    rest = [r for r in cfg["rules"] if r in rc.prefilter(final_response, log_lines)
                             and not (sub and r in rc.SUBAGENT_EXEMPT_RULES)
                             and v.get(r, 0) >= rc.rule_threshold(r, v, cfg.get("thresholds") or {}, cfg["threshold"])
                             and r != "unwatched" and not (r == "report_only" and rc.report_only_guard(ask, final_response, log_lines))]
@@ -1124,7 +1124,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 guard = rc.report_only_guard(ask, final_response, log_lines)
                 _el = rc.budget_elapsed()
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
-                           "candidates": rc.prefilter(final_response), "ask_len": len(ask or ""),
+                           "candidates": rc.prefilter(final_response, log_lines), "ask_len": len(ask or ""),
                            **({"elapsed_s": _el} if _el is not None else {}),
                            **({"guard": guard} if guard else {}), **({"subagent": True} if sub else {}),
                            **({"park": _park} if guard == "lifecycle_park" and (_park := rc.run_end_tool(log_lines))

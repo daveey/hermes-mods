@@ -113,6 +113,45 @@ def recommend_stall(reply: str) -> Optional[str]:
     if not (RECOMMEND_CONTRAST_RE.search(sentence) or HELD_BACK_RE.search(tail)):
         return None
     return " ".join(sentence.split()).strip(" *_")[:200]
+
+
+# agent-f0722b8b79: after an approval the agent asked "which name?" as a decide tile whose choices were "Go now: <a>" /
+# "Go now: <b>" / "Hold" and recommended <a> in its reply; 2 hours passed. Two or more go choices mean the run is
+# settled and only a detail is open. The ask is a tool call (agent_rules.decide_go_line writes the turn-log line) or a
+# list of go options in the reply; neither has the question wording CONFIRM_RE needs.
+_GO_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)]|\(?[a-z]\))\s+[*_`]*(.+?)[*_`]*\s*$")
+
+
+def go_variant_ask(tool_log: Optional[list]) -> Optional[str]:
+    """The newest `<- decide go_variants=...` line in this turn's tool log, else None."""
+    mark = "<- decide go_variants="
+    for line in reversed(list(tool_log or [])):
+        s = (line or "").strip()
+        if s.startswith(mark):
+            return s
+    return None
+
+
+def reply_go_variants(reply: str) -> Optional[str]:
+    """`go options: "<a>" | "<b>"` when the reply's tail lists two or more go options on their own lines, else None."""
+    try:
+        ar = _cache.load_sibling(_HERE, "agent_rules")
+    except Exception:
+        return None
+    go = []
+    for line in (reply or "")[-1500:].splitlines():
+        m = _GO_LIST_ITEM_RE.match(line)
+        if m and len(m.group(1)) <= 160 and ar.go_option(m.group(1)):
+            go.append(m.group(1).strip())
+    return ("go options: " + " | ".join(json.dumps(g) for g in go[:4])) if len(go) >= 2 else None
+
+
+CONFIRM_GO_VARIANTS_NUDGE = (
+    "[coach] This turn asks the user to pick between two or more \"go\" options ({evidence}). The run is settled and "
+    "only a detail is open, so the ask stalls approved work. Pick the option the user's words or your own "
+    "recommendation name, note the pick and how to undo it (on the card when there is one), proceed this turn, and "
+    "mention the alternative in one line. Ask only when the options differ in money, permissions, another person or "
+    "something that can't be undone; then say which, in one sentence.")
 _FINISH = (r"(?:finish(?:es|ed)?|complete[sd]?|land(?:s|ed)?|(?:is|are) done|come[s]? back|end[s]?|pass(?:es)?|"
            r"go(?:es)? green)")
 WAIT_RE = re.compile(
@@ -2426,14 +2465,15 @@ def drop_na_tickoffs(reply: str) -> str:
     return TICK_LINE_RE.sub(line, reply or "")
 
 
-def prefilter(reply: str) -> list[str]:
-    """Which rules this reply is a candidate for (cheap, recall-oriented)."""
+def prefilter(reply: str, tool_log: Optional[list] = None) -> list[str]:
+    """Which rules this reply is a candidate for (cheap, recall-oriented). `tool_log`: this turn's tool log, for asks
+    made as a tool call rather than in the reply's wording (go_variant_ask)."""
     r = reply or ""
     tail = r[-700:]
     out = []
     if HANDOFF_RE.search(r):
         out.append("handoff")
-    if CONFIRM_RE.search(tail) or recommend_stall(r):
+    if CONFIRM_RE.search(tail) or recommend_stall(r) or go_variant_ask(tool_log) or reply_go_variants(r):
         out.append("confirm")
     if DONE_RE.search(r[:600]) or DONE_RE.search(tail):
         out.append("unverified")
@@ -2647,6 +2687,13 @@ probabilities (0-1):
   ("what do you recommend?", "should we?", "plan first"); when the only thing held back is new scope beyond the
   user's direction or a step that spends money, changes permissions, is irreversible or external-facing, and the
   message says so; and for a neutral status report that recommends nothing.
+  The ask can also be a decision tile or an option list: a tool-log line `<- decide go_variants=N: "<a>" | "<b>"`
+  (or the message listing two or more "Go now: ..." / "Approve: ..." options) asks the user to pick between go
+  variants. The run is then settled and only a detail (a name, a target, an order) is open: a needless confirm,
+  score it 0.8+, especially when the message or the user's words already point to one option. Score it LOW when
+  the line carries why_not_default= or the message names a real difference in money, permissions, another person
+  or something that can't be undone, or when the line ends in `refused` and the message picks an option and
+  proceeds.
 - unverified: the message claims the work is done/fixed/working/deployed, but the turn's tool log shows no check
   that exercises the user's actual path (running the real command/app/URL/test the user cares about and seeing the
   right result). Building, type-checking, or testing something adjacent does not count. Saying explicitly that it
@@ -3766,14 +3813,19 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "status_only", "p": 1.0, "evidence": ev, "reason": "status_only",
                     "verdict": {"status_only": 1.0, "evidence": ev},
                     "nudge": STATUS_ONLY_NUDGE.format(evidence=ev[:200])}
-    cands = [r for r in prefilter(reply) if not only or r in only]
+    cands = [r for r in prefilter(reply, tool_log) if not only or r in only]
+    # agent-f0722b8b79: an ask whose choices are two or more go options (a decide tile or a listed set): the run is
+    # settled, so it is a confirm candidate whatever the reply's wording, and the screen can't drop it.
+    go_ask = ("confirm" in cands and not CONFIRM_RE.search((reply or "")[-700:])
+              and (go_variant_ask(tool_log) or reply_go_variants(reply))) or None
     # agent-56e18d89f2: a confirm candidate that is only a held-back recommendation (no "Want me to ...?"). Dropped when
     # the user limited the turn to analysis/a plan or asked for the recommendation itself.
     rec_only = None
     if "confirm" in cands and not CONFIRM_RE.search((reply or "")[-700:]):
         rec_only = recommend_stall(reply)
         if rec_only and (scope_limited(user_ask) or ASKED_OPINION_RE.search(scope_text(user_ask)[-3000:])):
-            cands.remove("confirm")
+            if not go_ask:
+                cands.remove("confirm")
             rec_only = None
     if relay_repeat and "report_only" not in cands and (not only or "report_only" in only):
         cands.append("report_only")
@@ -3803,7 +3855,7 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
         # the confirm screen asks "does it END BY ASKING permission": a statement-shaped stall has no question, so its
         # screen score says nothing and the judge decides
         kept = [r for r in cands if r not in sp or sp[r] >= screen_below or (forced and r == "report_only")
-                or (rec_only and r == "confirm")]
+                or (rec_only and r == "confirm") or (go_ask and r == "confirm")]
         if not shadow:
             if not kept:
                 if log:
@@ -3883,6 +3935,10 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
         return {"rule": best, "p": v[best], "evidence": v["evidence"], "verdict": v, "variant": "recommend",
                 "reason": "recommend_stall",
                 "nudge": keep_answer(CONFIRM_RECOMMEND_NUDGE.format(evidence=v["evidence"] or rec_only), reply)}
+    if best == "confirm" and go_ask:
+        return {"rule": best, "p": v[best], "evidence": v["evidence"], "verdict": v, "variant": "go_variants",
+                "reason": "go_variants",
+                "nudge": keep_answer(CONFIRM_GO_VARIANTS_NUDGE.format(evidence=v["evidence"] or go_ask[:200]), reply)}
     return {"rule": best, "p": v[best], "evidence": v["evidence"], "verdict": v,
             **({"variant": "card_closed"} if closed and not down else {}),
             "nudge": nudge_for(best, v["evidence"], kanban_down=down, card_closed=closed, platform=platform,

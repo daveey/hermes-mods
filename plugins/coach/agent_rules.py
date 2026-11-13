@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import json
 import os
 import re
+import sys
 import time
 import threading
 import uuid
@@ -3481,6 +3483,68 @@ def wait_result_line(tool: str, args: Any, result: Any) -> Optional[str]:
     return f"   <- OK {body}"[:OK_LINE_MAX]
 
 
+# agent-f0722b8b79: an approved run stalled 2 hours on a decide tile whose choices were "Go now: <a>" / "Go now: <b>" /
+# "Hold". Two or more go choices mean the run is settled and only a detail is open. The ask is a tool call, so the
+# reply's wording never showed it: this line puts it in the turn log, and reply_check.go_variant_ask makes `confirm`
+# a candidate from it. Go labels come from user-steps' own go_option(), the one the approval path uses.
+GO_VARIANTS_LINE = "   <- decide go_variants="
+_US_DIR = Path(__file__).resolve().parent.parent / "user-steps"
+
+
+def go_option(label: str) -> bool:
+    """user-steps' go_option(label); False when user-steps is not installed beside coach."""
+    try:
+        cache = sys.modules.get("_coach_module_cache")
+        if cache is None:
+            spec = importlib.util.spec_from_file_location("_coach_module_cache",
+                                                          Path(__file__).resolve().parent / "module_cache.py")
+            assert spec and spec.loader
+            cache = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cache)
+            cache = sys.modules.setdefault("_coach_module_cache", cache)
+        return bool(cache.load_sibling(_US_DIR, "core").go_option(label))
+    except Exception:
+        return False
+
+
+def go_labels(choices: Any) -> list:
+    """The go labels among a decide item's choices (dicts with a label, or bare strings)."""
+    out = []
+    for c in choices if isinstance(choices, list) else []:
+        label = c.get("label") if isinstance(c, dict) else c
+        if isinstance(label, str) and label.strip() and go_option(" ".join(label.split())):
+            out.append(" ".join(label.split()))
+    return out
+
+
+def decide_go_line(tool: str, args: Any, result: Any = None, refused: bool = False) -> Optional[str]:
+    """`   <- decide go_variants=<n>: "<a>" | "<b>"[ why_not_default=...][ refused]` for a session_outcome decide (direct
+    or via tool_call) with an item of two or more go choices, else None."""
+    a = args if isinstance(args, dict) else {}
+    name = (tool or "").rsplit("__", 1)[-1]
+    calls = ([(name, a)] if name != "tool_call" else
+             [(str((c or {}).get("name") or "").rsplit("__", 1)[-1], (c or {}).get("arguments"))
+              for c in a.get("calls") or [] if isinstance(c, dict)])
+    for n, ca in calls:
+        if n != "session_outcome" or not isinstance(ca, dict) or ca.get("kind") != "decide":
+            continue
+        for it in ca.get("items") or []:
+            if not isinstance(it, dict):
+                continue
+            go = go_labels(it.get("choices"))
+            if len(go) < 2:
+                continue
+            body = f"{GO_VARIANTS_LINE}{len(go)}: " + " | ".join(json.dumps(g) for g in go[:4])
+            why = " ".join(str(it.get("why_not_default") or "").split())
+            if why:
+                body += f" why_not_default={json.dumps(why[:160])}"
+            d = _as_dict(result)
+            if refused or (isinstance(d, dict) and d.get("ok") is False):
+                body += " refused"
+            return body[:OK_LINE_MAX + 200]
+    return None
+
+
 def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = None,
                       saved: Any = ()) -> Optional[str]:
     """The `   <- OK ...` line for a successful owner read, else None. Callers skip failed calls. `saved`: files an
@@ -4028,6 +4092,13 @@ class AgentCoach:
         if mut:
             s["turn_log"].append(mut)
             s.setdefault("turn_rich", deque(maxlen=60)).append(mut)
+        try:  # a decide tile of go variants: reply_check.go_variant_ask (agent-f0722b8b79)
+            go_line = decide_go_line(tool, args, result, refused=failed(tool, result, status))
+        except Exception:
+            go_line = None
+        if go_line:
+            s["turn_log"].append(go_line)
+            s.setdefault("turn_rich", deque(maxlen=60)).append(go_line)
         if is_kanban_call(tool, args):  # sticky across turns until the next Kanban call answers
             s["kanban_db_down"] = bool(failed(tool, result, status) and KANBAN_DB_DOWN.search(str(result)))
 
