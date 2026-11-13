@@ -591,6 +591,33 @@ def recommendation_without_request(span: str, block: str = "") -> bool:
     return bool(_RECOMMENDATION.search(context) and not grounded)
 
 
+def publication_step(step: dict, current: Optional[dict], now: float) -> dict:
+    """Project canonical retirement onto a ledger step without writing either store."""
+    projected = dict(step)
+    if current is not None:
+        if current['state'] == 'withdrawn':
+            # Withdrawal is not an answer/decline: a later ask may be published afresh.
+            if projected.get('status') == 'open':
+                projected.update(status='resolved', resolution=f'{NO_LONGER_NEEDED}.',
+                                 resolved_by='canonical', resolved_at=now)
+            projected['withdrawn'] = True
+        elif current['state'] in ('superseded', 'resolved', 'cancelled'):
+            projected.update(status='resolved', resolution='canonical request retired',
+                             resolved_by='canonical', resolved_at=now)
+    return projected
+
+
+def retired_action(prior: list[dict]) -> bool:
+    """An exact prior action was settled (not merely withdrawn): hold the entire reply."""
+    return any(s.get('status') == 'resolved' and not s.get('withdrawn') for s in prior)
+
+
+def publication_budget(steps: list[dict], now: float) -> int:
+    """Remaining new tiles, including recent steps that have since been resolved."""
+    recent = sum(1 for s in steps if now - s.get('created', 0) < 3600)
+    return min(MAX_NEW_PER_REPLY, max(0, MAX_NEW_PER_HOUR - recent))
+
+
 def action_identity(step: dict) -> tuple:
     """Exact validated source fields, not a topic/account key or reopen proof.
 
@@ -1379,15 +1406,7 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
             for step in d["steps"]:
                 if action_store is not None and step.get('requestId') and step.get('session') == session_id:
                     current = action_store.get(action_owner, step['requestId'])
-                    if current['state'] == 'withdrawn':
-                        # Retired without a decision: a later re-ask is a fresh ask, never a held repeat.
-                        if step.get('status') == 'open':
-                            step.update(status='resolved', resolution=f'{NO_LONGER_NEEDED}.',
-                                        resolved_by='canonical', resolved_at=now)
-                        step['withdrawn'] = True
-                    elif current['state'] in ('superseded', 'resolved', 'cancelled'):
-                        step.update(status='resolved', resolution='canonical request retired',
-                                    resolved_by='canonical', resolved_at=now)
+                    step.update(publication_step(step, current, now))
                 if step.get("id") in res["resolved"] and step.get("status") == "open" and not step.get("requestId"):
                     step.update(status="resolved", resolution="answered in chat", resolved_by="model",
                                 resolved_at=now)
@@ -1395,16 +1414,14 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
             matches = [(s, [old for old in d["steps"] if action_identity(old) == action_identity(s)])
                        for s in res["steps"]]
             # A withdrawn ask was never answered or declined, so asking it again is not a repeat.
-            suppressed = [s for s, old in matches
-                          if any(x.get("status") == "resolved" and not x.get("withdrawn") for x in old)]
+            suppressed = [s for s, old in matches if retired_action(old)]
             held = False
             if suppressed:
                 # Evidence does not delimit dependent instructions in other blocks.
                 # Hold the whole draft rather than leave an orphaned approval ask.
                 retired.extend(suppressed)
                 text, held = HELD_REPLY, True
-            recent = sum(1 for s in d["steps"] if now - s.get("created", 0) < 3600)
-            budget = min(MAX_NEW_PER_REPLY, max(0, MAX_NEW_PER_HOUR - recent))
+            budget = publication_budget(d["steps"], now)
             asks = open_asks(action_store, action_owner, d["steps"]) if action_store is not None else []
             # The prompt's bounded ELSEWHERE list is advisory, not a publication guard.
             # Recheck all other-session titles after extraction; suppression only, never
@@ -1849,7 +1866,6 @@ def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optiona
     Exact provenance only, never title, word or menu similarity on its own:
     - the model marked this exact sentence as a repeat of an open id (request id or extracted step id) and the
       sentence or its paragraph corroborates it (``repeat_corroborated``);
-    - the evidence sentence (a specific one) is the sentence an open extracted ask came from in an EARLIER reply;
     - the request was published or revised by the producer tool in this very turn (``turn_requests``,
       server-recorded) and the candidate restates its title, or is the approve/change/decline menu of the only
       such approval (or its sentence was already read as that approval in this reply).
@@ -1873,11 +1889,6 @@ def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optiona
                     and repeat_corroborated(candidate.get('verbatim_span'),
                                             _paragraph(reply, candidate.get('verbatim_span')), tile_texts(ids[r['id']])):
                 return ids[r['id']]
-    # One sentence can carry two different asks: the same-sentence rule is for LATER replies only.
-    hit = pick([a for a in asks if long_span and a['step'] is not None and not a.get('fresh')
-                and span == ask_key(a['step'].get('verbatim_span'))])
-    if hit:
-        return hit
     mine = [a for a in asks if a['id'] in turn]
     hit = pick([a for a in mine if (len(text) >= _ASK_KEY_MIN and text == ask_key(a['title']))
                 or (long_span and span == ask_key(a['title']))])

@@ -452,8 +452,6 @@ open, undecided request of the same session only with exact provenance:
 - the extractor listed that exact sentence under `repeats` for the open id (request id
   or extracted step id; the prompt lists producer-published requests as open steps),
   and the reply corroborates it (below);
-- the evidence sentence (30+ characters, 5+ words) is the sentence an open ask was
-  extracted from in an EARLIER reply;
 - the request was published or revised by the `action_request` tool in this very turn
   (server-recorded `turn_requests`; reset when the next turn starts), and the ask
   restates its title or is the approve/change/decline menu of the only such approval;
@@ -468,6 +466,33 @@ an earlier turn holds the reply and the nudge asks the agent to revise THAT requ
 its requestId (which is turn provenance). `restates_open_ask` keeps the old heuristics
 for the duplicate detectors only (`chat.py`, `stale_watch.py`); their cards tell the
 agent to withdraw only when the source proves a re-ask.
+
+**A restatement is refused before it is shown, never merged.** Identity stays
+provenance only, so a reminder ("Two macOS CI choices still need you.", "The only thing
+waiting on you is the macOS CI pick.") or a restated question in a later reply would
+mint a second tile beside the open one (live chat ..f07c32, 11:54 and 13:17). Rules
+that matched such sentences by title, lettered menu or scope were tried and dropped
+(PR #93): every round of independent review found asks for another subject folded
+onto the open tile, which silently loses a decision. Instead the pre-send gate
+(`publication_buffer`, `open_ask_hold`) holds a final reply ONCE per turn when the
+session has an open request and the reply yields an ask that nothing above maps and
+that the transform would mint (its span is in a prose block; no identical open ledger
+step; not an other-session title in a relay turn; not held by a reply-draft card;
+no retired exact action holding the entire reply; and room in the per-reply/hourly
+publication budget). Canonical retirement is projected read-only as in `process_reply`.
+The nudge, headed
+`[user-steps: open request check]`, names each open request (requestId and title)
+and quotes the new asks. It tells the agent to delete a sentence that only restates or
+points at an open request, to revise an open request through `action_request`, or to
+send the reply again if it is a different decision. The re-sent reply is never held
+again by this check; it publishes subject to the usual publication policies and rate
+limits. The gate only judges; nothing is published from a held draft. A publish hold (an
+approval with no plan) takes precedence. With an open ledger step the gate extracts
+even when the reply has no ask-like wording, as `process_reply` does. A text inside an
+agent-written `::user-step` marker is an attribute, not prose: it mints nothing and is
+not held. Tests: `tests/test_one_open_ask.py` (live 11:54 and 13:17 replies held,
+then one tile; every review probe M/R/F/K/N/MN stays two tiles at publication and is
+held pre-send).
 
 `action_request`: a new request revises an open, undecided, card-free request of the
 session in place only when it cites that request's own extracted step: an exact
