@@ -218,6 +218,8 @@ Countermeasures:
 
 ### 8. Check Done means (below), fix at most 2 rounds, then report what still fails
 
+For a chain going into a new card's body, check the draft before `kanban_create`: a worker claims the card within minutes, so a fix round after filing needs a body edit plus a steer its live run actually receives.
+
 ## Done means
 - [ ] For CPU-starvation reproduction, did you enumerate descendants through every task/thread child list and apply the SIGSTOP/SIGCONT duty cycle to detached canonical test workers as well as their launcher, rather than only the launcher process group?
 - [ ] For a fixture-teardown race, did the test join the producer thread before asserting cleanup or restoring mocks, rather than treating file publication as completion (it can precede pending-row deletion)?
