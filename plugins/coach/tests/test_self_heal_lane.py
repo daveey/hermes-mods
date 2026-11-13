@@ -1647,7 +1647,11 @@ def test_replay_kanban_disk_io_then_corrupt_signal_adopts_the_first_lane(store):
     (e,) = [x for x in ev(store, "selfheal_adopted_owner") if x.get("via") == "family"]
     assert e["card"] == owner and e["family"] == "kanban-db-view"
     st = sh.LaneState(store.root).get(second["fingerprint"])
-    assert st["status"] == "approved" and st["fix_card"] == owner
+    # The owner lane is still investigating: its card is no fix, so the adopter waits on that lane's fix card
+    # (test_self_heal_follow_owner.py) instead of taking the investigation as fix_card.
+    assert st["status"] == "approved" and not st.get("fix_card")
+    owner_fp = next(fp for fp, e in sh.LaneState(store.root).read().items() if e.get("card") == owner)
+    assert st["follow_owner"] == owner_fp and st["follow_card"] == owner
 
 
 def test_unreliable_view_error_joins_an_open_corrupt_lane(store):

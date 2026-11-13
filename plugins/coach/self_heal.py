@@ -4403,6 +4403,62 @@ def recovery_holder_card(db: str, home: Path, dbs: list) -> Optional[dict]:
     return {"id": card, "title": "", "status": "running", "created_at": None, "board": board, "via": "recovery_lock"}
 
 
+def _investigation_owner(lanes: dict, card: Optional[str], fp: str) -> Optional[str]:
+    """The other lane whose investigation card (`card`, never its `fix_card`) is ``card``, else None. Adopting such
+    a card must wait for that lane's fix card: an investigation's completion is a proposal, nothing to verify."""
+    if not card:
+        return None
+    for ofp, e in sorted(lanes.items()):
+        if ofp != fp and e.get("card") == card and e.get("fix_card") != card and not e.get("complaint_owner"):
+            return ofp
+    return None
+
+
+FOLLOW_WAIT = ("filed", "proposed")  # the owner's investigation is open or its fix card is not filed yet
+
+
+def _follow_owner_fix(lane, store, fp: str, st: dict, lanes: dict, now: float) -> Optional[str]:
+    """reconcile() for a lane that adopted another lane's investigation card. Migrates a legacy adoption (fix_card
+    = that investigation, no verify yet) into `follow_owner`; once the owner has a fix card, takes it as fix_card
+    (so the receipt verify names the fix); when the owner ends without one, goes stale. -> what changed, or None."""
+    if not st.get("follow_owner"):
+        card = st.get("fix_card")
+        if st.get("status") != "approved" or not card or st.get("verify_card"):
+            return None
+        ofp = _investigation_owner(lanes, card, fp)
+        if not ofp:
+            return None
+        if not lane.transition(fp, {"status": "approved", "fix_card": card, "verify_card": None},
+                               fix_card=None, follow_owner=ofp, follow_card=card,
+                               follow_via=st.get("adopt_via") or "unknown"):
+            return None
+        store.log({"event": "selfheal_follow_owner", "fingerprint": fp, "owner_fingerprint": ofp, "card": card,
+                   "why": "fix_card was the owner's investigation card", "migrated": True})
+        st = lane.get(fp)
+    ofp = st["follow_owner"]
+    if st.get("status") != "approved" or st.get("fix_card"):
+        return None
+    o = lanes.get(ofp) or {}
+    held = {"status": "approved", "fix_card": None, "follow_owner": ofp}
+    if o.get("fix_card") and o.get("status") in ("approved", "fixed"):
+        fix = o["fix_card"]
+        if not lane.transition(fp, held, fix_card=fix, follow_owner=None, adopt_card=fix,
+                               adopt_via=st.get("follow_via") or "unknown",
+                               board=o.get("board") or st.get("board"), cards=sorted(known_cards(st) | {fix})):
+            return None
+        store.log({"event": "selfheal_follow_owner_fix", "fingerprint": fp, "owner_fingerprint": ofp,
+                   "card": fix, "investigation": st.get("follow_card"), "owner_status": o.get("status")})
+        return f"following {ofp}: fix card {fix}"
+    if o.get("status") in FOLLOW_WAIT:
+        return None
+    if not lane.transition(fp, held, status="stale", closed_at=now, follow_owner=None):
+        return None
+    store.log({"event": "selfheal_stale", "fingerprint": fp, "card": st.get("follow_card"), "was": "approved",
+               "why": f"followed owner {ofp} ended {o.get('status') or 'missing'} without a fix card",
+               "component": st.get("component")})
+    return f"stale (owner {ofp} {o.get('status') or 'missing'}, no fix card)"
+
+
 def _adopt_signature_card(d: dict, fp: str, store, now: float,
                           sig_owner_fn: Optional[Callable] = None) -> Optional[dict]:
     """No session owner (e.g. a background signal with no session): adopt an open card that already names the same
@@ -4428,13 +4484,19 @@ def _adopt_signature_card(d: dict, fp: str, store, now: float,
     if not cards:
         return None
     c = cards[0]
-    lane.update(fp, status="approved", fix_card=c["id"], approved_at=now, component=d.get("component"),
-                symptom=d.get("symptom"), session_id=d.get("session_id"), board=c.get("board"),
-                filed_day=_utc_day(now), cards=sorted(known_cards(st) | {c["id"]}), **_complaint_identity(d))
+    # The open card may be another lane's INVESTIGATION (its `card`), not a fix: then there is nothing to verify
+    # when it ends. Follow that lane's fix card instead (agent-0f69b9e1b0 adopted agent-6ba9ac9880's investigation
+    # t_01a1d5a7cd1406c0 as its fix_card, and a verify with nothing to verify was filed when it completed).
+    ofp = _investigation_owner(lane.read(), c["id"], fp)
+    lane.update(fp, status="approved", fix_card=None if ofp else c["id"], approved_at=now,
+                component=d.get("component"), symptom=d.get("symptom"), session_id=d.get("session_id"),
+                board=c.get("board"), filed_day=_utc_day(now), cards=sorted(known_cards(st) | {c["id"]}),
+                **({"follow_owner": ofp, "follow_card": c["id"], "follow_via": "signature"} if ofp else {}),
+                **_complaint_identity(d))
     store.log({"event": "selfheal_adopted_owner", "via": "signature", "fingerprint": fp, "card": c["id"],
                "status": c.get("status"), "board": c.get("board"), "session_id": d.get("session_id"),
                "signature": {k: v for k, v in sig.items() if k != "symptom"},
-               "candidates": [x["id"] for x in cards]})
+               "candidates": [x["id"] for x in cards], **({"follow_owner": ofp} if ofp else {})})
     return {"action": "skip", "why": f"adopted owner card {c['id']} by error signature", "card": c["id"],
             "adopted": True, "via": "signature"}
 
@@ -4706,9 +4768,12 @@ def _adopt_family_lane(d: dict, fp: str, store, now: float) -> Optional[dict]:
         return None
     _, ofp, card, board = sorted(owners)[0]
     st = lane.get(fp)
-    lane.update(fp, status="approved", fix_card=card, approved_at=now, component=d.get("component"),
+    inv = _investigation_owner(lane.read(), card, fp)  # the owner has no fix card yet: wait for it, see signature
+    lane.update(fp, status="approved", fix_card=None if inv else card, approved_at=now, component=d.get("component"),
                 symptom=d.get("symptom"), session_id=d.get("session_id"), board=board, family=fam,
-                family_owner=ofp, filed_day=_utc_day(now), cards=sorted(known_cards(st) | {card}), **_complaint_identity(d))
+                family_owner=ofp, filed_day=_utc_day(now), cards=sorted(known_cards(st) | {card}),
+                **({"follow_owner": inv, "follow_card": card, "follow_via": "family"} if inv else {}),
+                **_complaint_identity(d))
     store.log({"event": "selfheal_adopted_owner", "via": "family", "family": fam, "fingerprint": fp, "card": card,
                "owner_fingerprint": ofp, "board": board, "session_id": d.get("session_id"),
                "candidates": [o[2] for o in sorted(owners)]})
@@ -4826,6 +4891,7 @@ def _open_card_comment(d: dict, st: dict, store, runner=None) -> dict:
     `proposed` (the investigation finished, its fix card not filed yet; <= one 5-minute sync) still targets the done
     investigation card, which links the fix card once sync files it: an accepted gap, the occurrence stays on record."""
     card = (st.get("card") if st.get("status") in ("filed", "proposed") else st.get("fix_card")) or st.get("card")
+    card = card or st.get("follow_card")  # waiting on another lane's investigation: that card holds the evidence
     if not card:
         return {"action": "skip", "why": "no open card"}
     own = lane_owner(card, st.get("board"), runner)
@@ -6047,6 +6113,15 @@ def reconcile(store=None, runner=None, now: Optional[float] = None) -> list:
     now = now or time.time()
     lane = LaneState(store.root)
     done = []
+    lanes = lane.read()
+    for fp, st in lanes.items():  # before the receipt path: a followed investigation is never a fix to verify
+        try:
+            what = _follow_owner_fix(lane, store, fp, st, lanes, now)
+        except Exception as exc:  # health: allow BLE001 -- one lane's follow must not stop the pass
+            store.log({"event": "selfheal_follow_owner_error", "fingerprint": fp, "error": str(exc)[:200]})
+            what = None
+        if what:
+            done.append((fp, what))
     lanes = lane.read()
     legacy = {fp for fp, st in lanes.items() if _adoption_unmarked(st)}
     recs = _adoption_log_records(store, legacy) if legacy else {}
