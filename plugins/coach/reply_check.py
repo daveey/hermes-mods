@@ -1509,7 +1509,9 @@ def skipped_live(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
 # Backtest (worker-6, 14 days, tool log ignored): "the installer only deploys when ...", "Z lands after our write",
 # "will deploy-check it" and "I'll merge into the branch" describe mechanisms or git steps, not a PR's merge time, so
 # present-tense "lands" needs a time/condition word, deploy/ship are not forecasts here, and "merge into" is excluded.
-_MF_WHEN = r"(?:once|as\s+soon\s+as|by|at|around|within|tonight|today|tomorrow|in\s+(?:about\s+)?(?:an?|\d+|a\s+few)\b)"
+# "in a/an/N/a few" needs a time unit: "two merges in a row" is no forecast (agent-372c9408b8).
+_MF_WHEN = (r"(?:once|as\s+soon\s+as|by|at|around|within|tonight|today|tomorrow|in\s+(?:about\s+)?(?:an?|\d+|a\s+few)"
+            r"\s+(?:(?:more|couple(?:\s+of)?)\s+)?(?:min(?:ute)?s?|hours?|hrs?|days?|weeks?|bit|moment)\b)")
 _MF_FORECAST_RE = re.compile(
     r"\bmerges\s+(?:(?:when|after)\b|" + _MF_WHEN + r")|\blands\s+" + _MF_WHEN
     + r"|\b(?:will|(?:I|it|we|that|this|they)[\u2019']ll|should|is\s+(?:expected|going|due)\s+to|is\s+set\s+to)\s+"
@@ -1996,6 +1998,13 @@ def restart_scope_claim_nudge(evidence: str, skew: Optional[tuple]) -> str:
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
          "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock", "claimed_mutation",
          "restart_scope_claim")
+# Every rule is classified by whether its check reads the user turn (agent-372c9408b8). A reply-only rule judges the
+# reply (and tool log or board) alone, so many holds under one user-turn opening say nothing about the rule firing on
+# a template: close-out turns are where chats report PR state. signals.template_holds skips these rules.
+# tests/test_signals.py fails CI for a rule in neither set, or a "reply-only" check that takes the ask.
+REPLY_ONLY_RULES = frozenset({"denied_ask", "credit_ask", "laptop_job", "skipped_live", "merge_forecast",
+                              "pr_state_claim", "future_clock", "claimed_mutation", "restart_scope_claim"})
+USER_TURN_RULES = frozenset({"handoff", "confirm", "unverified", "unwatched", "report_only", "status_only"})
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
                  "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock", "claimed_mutation",
                  "restart_scope_claim")

@@ -1840,6 +1840,11 @@ _ASKED_RE = re.compile(r'^asked "(.*?)"; ')
 # reply_check.NOTICE_CONTEXT, 58f6f810): a notice opening there is the rule working, not firing on a template
 # (agent-efb7407bb5). status_only skips notices (83e86f83), so a notice opening there is still a real bug.
 NOTICE_JUDGING_RULES = {"report_only"}
+# Rules whose check never reads the user turn (reply_check.REPLY_ONLY_RULES): a shared opening cannot make them misfire,
+# and close-out turns are where real PR forecasts cluster (agent-372c9408b8). Static copy for a broken reply_check;
+# tests keep it equal to the live set.
+_REPLY_ONLY_FALLBACK = frozenset({"denied_ask", "credit_ask", "laptop_job", "skipped_live", "merge_forecast",
+                                  "pr_state_claim", "future_clock", "claimed_mutation", "restart_scope_claim"})
 _RELAY_HEAD = "[message from another hermes session"
 _rc_mod = None
 
@@ -1853,6 +1858,13 @@ def _reply_check():
         spec.loader.exec_module(mod)
         _rc_mod = mod
     return _rc_mod
+
+
+def _reply_only_rules() -> frozenset:
+    try:
+        return frozenset(_reply_check().REPLY_ONLY_RULES)
+    except Exception:  # noqa: BLE001 - a broken sibling must not stop the collector
+        return _REPLY_ONLY_FALLBACK
 
 
 def _notice_head(head: str) -> bool:
@@ -1912,8 +1924,11 @@ def template_holds(cur: dict, nudges: List[dict], now: float, host: str = "") ->
     groups: Dict[Tuple[str, str], List[dict]] = {}
     for e in evs:
         groups.setdefault((e["rule"], e["head"].lower()), []).append(e)
+    reply_only = _reply_only_rules()
     for (rule, _), mine in groups.items():
         head = mine[-1]["head"]
+        if rule in reply_only:
+            continue  # the rule never reads the user turn: a shared opening is not it firing on a template
         if rule in NOTICE_JUDGING_RULES and _notice_head(head):
             continue  # the rule judges notices on purpose: a notice opening is not a misfire
         chats = sorted({e["sid"] for e in mine if e["sid"]})

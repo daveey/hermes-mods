@@ -92,3 +92,15 @@ def test_rule_lists_stay_in_step():
     assert "merge_forecast" in rc.RULES and "merge_forecast" in rc.BACKTEST_RULES
     src = (HERE / "signals.py").read_text() + (HERE / "self_heal.py").read_text()
     assert src.count('"merge_forecast"') >= 2
+
+
+# agent-372c9408b8: `in (a|an|N|a few)` needs a time unit after it, so "merges in a row" is no forecast.
+def test_merges_in_a_row_is_not_a_forecast():
+    assert rc.merge_forecast("The last two merges in a row both install quickly. PR #1 is fine.", NO_CHECK_LOG) is None
+
+
+def test_in_a_time_unit_and_once_still_forecast():
+    assert rc.merge_forecast("PR #1 merges in an hour.", NO_CHECK_LOG)
+    assert rc.merge_forecast("PR #1 merges in 20 minutes.", NO_CHECK_LOG)
+    assert rc.merge_forecast("PR #1 lands in a few days.", NO_CHECK_LOG)
+    assert rc.merge_forecast("PR #1 lands once CI passes.", NO_CHECK_LOG)

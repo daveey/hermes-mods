@@ -2427,6 +2427,48 @@ def test_status_only_distinct_closeout_prompts_still_file_one_card(tmp_path):
     assert len(got) == 1 and "3 holds" in got[0]["details"] and "2 chats" in got[0]["details"]
 
 
+# ── reply-only rules on a close-out opening (agent-372c9408b8) ───────────────────────────────────────────────
+# The hub filed "merge_forecast held 4 replies whose user turn has the same opening text \"[Kanban close-out] The
+# Kanban notice abo\" in 4 chats". merge_forecast(reply, tool_log) never reads the user turn: close-out turns are where
+# chats report PR state, so real forecasts cluster there. A shared opening says nothing about such a rule.
+
+CLOSEOUT_HEAD = "[Kanban close-out] The Kanban notice abo"
+
+
+def test_merge_forecast_holds_on_a_closeout_opening_file_nothing(tmp_path):
+    rows = [{**_tpl_nudge(i, f"s{i % 2}", head=CLOSEOUT_HEAD, rule="merge_forecast"), "ask_len": 900 + i,
+             "ask_fp": f"fp{i % 3:08d}"} for i in range(4)]
+    assert _templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW)) == []
+
+
+def test_status_only_holds_on_the_same_closeout_opening_still_file(tmp_path):
+    rows = [{**_tpl_nudge(i, f"s{i % 2}", head=CLOSEOUT_HEAD), "ask_len": 900 + i, "ask_fp": f"fp{i % 3:08d}"}
+            for i in range(4)]
+    assert len(_templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW))) == 1
+
+
+def test_reply_only_rules_fall_back_to_the_static_copy_when_reply_check_fails(tmp_path, monkeypatch):
+    def boom():
+        raise ImportError("reply_check broken")
+    monkeypatch.setattr(sg, "_reply_check", boom)
+    assert "merge_forecast" in sg._reply_only_rules()
+    rows = [{**_tpl_nudge(i, f"s{i % 2}", head="please look at the PR from yesterday", rule="pr_state_claim"),
+             "ask_len": 900 + i, "ask_fp": f"fp{i:08d}"} for i in range(3)]
+    assert _templates(sg.collect_coach(_coach_home(tmp_path, rows), {}, NOW)) == []
+
+
+def test_every_reply_rule_is_classified_by_whether_it_reads_the_user_turn():
+    """Detection guard: a new reply_check rule must say whether it reads the user turn, or CI fails."""
+    import inspect
+    rc = sg._reply_check()
+    assert set(rc.REPLY_ONLY_RULES) | set(rc.USER_TURN_RULES) == set(rc.RULES)
+    assert not set(rc.REPLY_ONLY_RULES) & set(rc.USER_TURN_RULES)
+    assert sg._REPLY_ONLY_FALLBACK == frozenset(rc.REPLY_ONLY_RULES)
+    for rule in rc.REPLY_ONLY_RULES:
+        params = set(inspect.signature(getattr(rc, {"denied_ask": "denies_ask"}.get(rule, rule))).parameters)
+        assert not ({"user_ask", "ask"} & params), f"{rule} reads the user turn: it is not reply-only"
+
+
 # ── resumed Kanban worker prompt (agent-105768f616) ───────────────────────────────────────────────────────────
 # Core's restart resume (gateway/session_kanban_resume.py RESUME_NOTE) puts "## Resumed after gateway restart" BEFORE
 # the "# Kanban task <id>:" header. report_only held 7 such worker turns in 7 chats on the hub and the template
