@@ -97,13 +97,15 @@ def test_real_restart_is_cold_start_not_local_link_saturation(tmp_path, capsys):
     assert out["awake_by_conn"] == {"mac-mini": 37, "local": 10, "?": 1}  # the raw count is unchanged
     assert out["over_threshold"] is True
     assert out["saturated_conns"] == []
-    assert "local" not in out["awake_conn_bursts"] and "?" not in out["awake_conn_bursts"]
+    assert out["awake_conn_bursts"]["local"]["count"] == 10
+    assert out["awake_conn_bursts"]["?"]["count"] == 1
     assert out["backend_cold_start"] == {
         "count": 11, "by_conn": {"local": 10, "?": 1},
         "by_path": {BOARDS: 4, HUB_SYNC: 2, BOARD: 2, "/api/plugins/hub-sync/tasks": 1, "[fleet-roster]": 1,
                     "/api/plugins/hub-sync/sessions": 1},
         "readies": ["2026-11-13 21:58:49+00:00"]}
-    assert sum(out["awake_explained_by_path"].values()) == 11
+    assert sum(out["awake_explained_by_path"].values()) == 0
+    assert bt.residual_count(out) == 48
 
 
 def test_real_restart_files_no_conn_card_and_the_incident_card_says_cold_start(tmp_path, capsys):
@@ -125,7 +127,7 @@ def test_local_timeouts_past_the_cold_start_window_are_not_cold_start(tmp_path, 
                                  timeout(late, BOARD), timeout(late, BOARDS)] + lone_remote()) + "\n")
     out = report(tmp_path, capsys, dry=True)
     assert out["backend_cold_start"]["count"] == 1 and out["backend_cold_start"]["by_path"] == {BOARD: 1}
-    assert out["awake_conn_bursts"]["local"]["count"] == 2
+    assert out["awake_conn_bursts"]["local"]["count"] == 3
 
 
 def test_local_timeouts_before_ready_are_not_cold_start(tmp_path, capsys):
@@ -156,3 +158,39 @@ def test_local_bursts_with_no_ready_line_are_never_link_saturation(tmp_path, cap
     assert out["saturated_conns"] == []
     assert not [k for k in keys(board) if ":conn:" in k], keys(board)
     assert "backend-timeouts:laptop:2026-11-13" in keys(board)  # the incident card owns them
+
+
+def test_unknown_remote_entries_do_not_inherit_fleet_local_evidence(tmp_path, capsys):
+    t = READY + timedelta(seconds=5)
+    lines = [ready(READY),
+             f"{stamp(t)} [hermes] [fleet-roster] local: Timed out connecting to Hermes backend after 8000ms",
+             f"{stamp(t)} [hermes] [fleet-roster] remote-one: Timed out connecting to Hermes backend after 8000ms",
+             timeout(t, BOARD, "?"), timeout(t, BOARDS).replace(" conn=local", ""),
+             timeout(t, HUB_SYNC, "primary")]
+    install(tmp_path, "\n".join(lines) + "\n")
+    out = report(tmp_path, capsys, dry=True)
+    assert out["awake_by_conn"] == {"?": 4, "primary": 1}
+    assert out["backend_cold_start"]["count"] == 2
+    assert out["backend_cold_start"]["by_path"] == {"[fleet-roster]": 1, HUB_SYNC: 1}
+    assert bt.residual_count(out) == 5
+    assert out["awake_explained_by_path"] == {}
+    prose = bt._stall_md(out)
+    assert "Startup correlation only" in prose
+    assert "does not prove the API was not mounted" in prose
+    assert "that these failures are fixed" in prose
+
+
+def test_cold_failures_keep_incident_and_path_owners_with_dominant_uplink(tmp_path, capsys):
+    early = END - timedelta(minutes=22)
+    lines = (burst(early, "remote-one", seconds=15) + burst(early, "remote-two", seconds=15)
+             + [ready(READY)] + burst(READY + timedelta(seconds=2), seconds=12)
+             + [timeout(READY + timedelta(seconds=5), BOARD)] * 30)
+    install(tmp_path, "\n".join(lines) + "\n")
+    board = Board()
+    out = report(tmp_path, capsys, board=board)
+    assert out["uplink_stall"] is True
+    assert out["backend_cold_start"]["count"] == 78
+    assert bt.residual_count(out) == 78
+    assert "backend-timeouts:laptop:2026-11-13" in keys(board)
+    assert BOARD in bt.significant_paths(out, out["threshold"])
+    assert not [k for k in keys(board) if ":conn:local" in k]
