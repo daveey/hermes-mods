@@ -1235,6 +1235,44 @@ def board_section(reply: str, tool_log: Optional[list], board: Optional[list] = 
             + "\n".join(lines) + "\n\n")
 
 
+# A [chat-closeout] prompt prints comments posted on a card after its frozen handoff ("later on this card (after its
+# handoff): <UTC> <author>: <text>"), re-read from the board for this turn. The judges' request excerpt keeps only the
+# head and tail of a long notice, so the David-recorded decision those lines carry fell in the cut and a correct
+# "closed by decision" reply scored report_only (self-heal agent-93112d1e96). They get their own section, as a card read.
+CLOSEOUT_LATER_MARK = "later on this card (after its handoff):"
+CLOSEOUT_LATER_MAX = 4096
+_CLOSEOUT_HEAD_RE = re.compile(r"^\s*\[chat-closeout\]", re.I)
+
+
+def closeout_later_lines(user_ask: str) -> list[str]:
+    """The "later on this card" lines of the turn's own [chat-closeout] prompt (bounded), else []. Only the anchored
+    close-out envelope counts: a human message quoting the phrase is a bare claim, not a board read."""
+    ask = user_ask or ""
+    if not _CLOSEOUT_HEAD_RE.match(ask):
+        return []
+    out, used, card = [], 0, ""
+    for ln in ask.splitlines():
+        s = ln.strip()
+        if s.startswith("- ") and re.match(r"- \S+ \[", s):
+            card = s.split()[1]
+        elif s.startswith(CLOSEOUT_LATER_MARK):
+            line = f"{card}: {s}" if card else s
+            if used + len(line) > CLOSEOUT_LATER_MAX:
+                break
+            out.append(line)
+            used += len(line)
+    return out
+
+
+def closeout_section(user_ask: str) -> str:
+    lines = closeout_later_lines(user_ask)
+    if not lines:
+        return ""
+    return ("CARD COMMENTS THE CLOSE-OUT RE-READ (Hermes's own board read for this [chat-closeout] turn: comments posted "
+            "on each card after its handoff; counts as a card read recording them, so a user decision here is a "
+            "recorded decision):\n" + "\n".join(lines) + "\n\n")
+
+
 # status_only: the user asks why it's waiting / what's going on / to finish it, and the turn only reopened, unblocked,
 # commented on or looked at cards (defect agent-38a817308d: four "reopened the card / verified ready" replies while the
 # rollout card sat unstarted for 4 days). Deterministic, before the judge: the report_only owner-check exemption
@@ -3076,7 +3114,8 @@ probabilities (0-1):
   job or wait that is scheduled or parked on purpose (a timed wake, retention, soak or release window) and is
   working as designed: a legitimate wait is not a problem; or the open item is one the user
   chose to defer, rescope or skip, the message names that decision, and the tool log (this turn or
-  the previous turn) shows where it is recorded (a card read or comment carrying the decision): honoring the
+  the previous turn) shows where it is recorded (a card read or comment carrying the decision, or a line
+  under CARD COMMENTS THE CLOSE-OUT RE-READ, which is Hermes's own board read of that card): honoring the
   user's own decision is not a leftover. Only the user's own recorded decision counts: an agent's own choice to wait,
   a schedule, or a bare claim that the user deferred it (nothing in either tool log) does not, and a latest request
   asking the agent to finish it overrides an earlier deferral.
@@ -3130,7 +3169,7 @@ Return ONLY one JSON object:
 
 - A Done-means tick-off line's `still failing: <what>` clause is an unresolved problem; its `n/a: <item> — <why>` clause (a checklist line that doesn't apply to this change, with the reason) is not, unless the reason admits a step that does apply was skipped or left undone.
 - problem: true if the reply mentions a defect, failure, bug, blocker, stale/wrong state, or something not working or not done that is STILL UNRESOLVED when the reply ends ("not fixed", "still broken", "remaining work", "X is outdated", "Y failed", "waiting on CI"). false if no unresolved problem is mentioned. A card, job or wait that is scheduled or parked on purpose (a timed wake, retention, soak or release window) and working as designed is not a problem by itself.
-- agent_fixable: when problem is true: could an agent with the access above plausibly fix it or start fixing it itself (true), or does it genuinely need the user (password, physical action, a decision only he can make, money) or an outside party (false)? null when problem is false. An item the user chose to defer, rescope or skip is false when the reply names that decision and a tool log shown (this turn or the previous turn) records it (a card read or comment carrying the decision); acting on it would override the user. Only the user's own recorded decision counts: an agent's own choice to wait, a schedule, or a bare claim that the user deferred it (nothing in either tool log) does not, and the latest request asking the agent to finish it overrides an earlier deferral.
+- agent_fixable: when problem is true: could an agent with the access above plausibly fix it or start fixing it itself (true), or does it genuinely need the user (password, physical action, a decision only he can make, money) or an outside party (false)? null when problem is false. An item the user chose to defer, rescope or skip is false when the reply names that decision and a tool log shown (this turn or the previous turn) records it (a card read or comment carrying the decision, or a line under CARD COMMENTS THE CLOSE-OUT RE-READ, which is Hermes's own board read of that card); acting on it would override the user. Only the user's own recorded decision counts: an agent's own choice to wait, a schedule, or a bare claim that the user deferred it (nothing in either tool log) does not, and the latest request asking the agent to finish it overrides an earlier deferral.
 - outcome (pick the best fit for the unresolved problem the reply is mainly about):
   "fixed": the agent itself fixed or changed the thing during this turn (edited code/config, ran the command that resolves it), even if final verification is pending.
   "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR). A Kanban worker that checkpointed its own card with kanban_continue this turn has started the leftovers that checkpoint carries to the card's next run. """ + STALLED_OWNER + """ Such a card (failed start attempts, parked on quota or "No eligible deep routes", "starts by itself" after a reset) is "report_only", not "started", unless the agent did the work this turn or re-placed it on a gateway that can run it. A Kanban worker's own kanban_block(kind=dependency) behind such a card is not a started fix either. """ + UNLINKED_WAIT + """
@@ -3340,7 +3379,8 @@ def confirm_prompt(user_ask: str, rich_log: list[str], reply: str, prev_turn: Op
     request = (ask[:950] + "\n[handoff middle omitted]\n" + ask[-500:]) if notice and len(ask) > 1500 else request_excerpt(ask)
     context = f"{NOTICE_CONTEXT}\n\n" if notice else ""
     return (f"{context}USER'S REQUEST (latest):\n{request}\n\nTOOL LOG THIS TURN (oldest first, real arguments, "
-            f"truncated):\n{log}\n\n{board_section(reply, rich_log, board, user_ask)}{prev_turn_section(prev_turn, rich_log)}"
+            f"truncated):\n{log}\n\n{closeout_section(ask)}{board_section(reply, rich_log, board, user_ask)}"
+            f"{prev_turn_section(prev_turn, rich_log)}"
             f"AGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
 
 
@@ -3558,7 +3598,8 @@ def judge_prompt(user_ask: str, tool_log: list[str], reply: str, prev_turn: Opti
                  board: Optional[list] = None) -> str:
     log = render_tool_log(tool_log, 5000)
     return (f"USER'S REQUEST (latest):\n{request_excerpt(user_ask)}\n\nTOOL LOG THIS TURN (oldest first, truncated):\n"
-            f"{log}\n\n{board_section(reply, tool_log, board, user_ask)}{prev_turn_section(prev_turn, tool_log)}"
+            f"{log}\n\n{closeout_section(user_ask)}{board_section(reply, tool_log, board, user_ask)}"
+            f"{prev_turn_section(prev_turn, tool_log)}"
             f"AGENT'S FINAL MESSAGE:\n{(reply or '')[:4000]}")
 
 
