@@ -1,8 +1,9 @@
 """Event-loop stall watcher: names what held the loop when an HTTP backend stops answering.
 
 A daemon thread posts a no-op onto the watched asyncio loop every ``period_s``. If the loop has
-not run it within ``stall_s``, the thread samples every thread's Python stack every ``sample_s``
-until the loop catches up. Then it writes ONE report: stall length, the loop thread's stacks
+not run it within ``stall_s``, the thread samples every thread's Python stack (frame metadata only)
+every ``sample_s`` or slower, until the loop catches up; its own cost is bounded (``SAMPLE_BUDGET``
+share of stall time, ``MAX_SAMPLES`` per stall, ``SAMPLED_STALLS_PER_WINDOW``). Then it writes ONE report: stall length, the loop thread's stacks
 (what the loop was doing instead of serving), and the other threads seen running Python during
 the stall (a thread holding the GIL in a long C call starves the loop without appearing on its
 stack). The watcher's own oversleep (``watch_lag_s``) tells GIL starvation from a busy loop: a
@@ -19,8 +20,8 @@ import os
 import sys
 import threading
 import time
-import traceback
-from collections import Counter
+from collections import Counter, deque
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -39,6 +40,18 @@ PERIOD_S = 0.25
 SAMPLE_S = 0.1
 STACK_DEPTH = 14
 TOP_N = 5
+# Stall-time cost bounds. The sampler runs while the process is already stalled, and every sample needs
+# the GIL the loop thread needs. On hermes-hub (2026-11-12/13) the old sampler formatted every thread's
+# full stack with traceback.extract_stack each 0.1 s: one linecache.checkcache os.stat per frame file per
+# thread, each a GIL release/re-acquire, so one sample took ~0.45 s of watcher wall time (median sample
+# spacing 0.55 s over 681 stalls of one backend) and the watcher took ~26% of GIL time; Desktop probes timed
+# out until it was switched off. Now: raw frame metadata only (no source/stat I/O), formatting after the
+# stall ends, the watcher's share of stall wall time capped, a per-stall sample cap and a stall rate limit.
+SAMPLE_BUDGET = 0.05  # max fraction of stall wall time the watcher spends sampling (measured per pass)
+MAX_SAMPLES = 40  # per stall; a longer stall is still timed, just not sampled further
+MAX_THREADS_PER_SAMPLE = 256  # other threads examined per sample
+SAMPLED_STALLS_PER_WINDOW = 30  # stalls sampled per RATE_WINDOW_S; later ones are timed only
+RATE_WINDOW_S = 600.0
 # Frames of a thread that is idle (waiting on a lock, a socket, a queue, sleep). Skipped when
 # listing "other threads running Python" so the report shows only threads that did work.
 _IDLE_FUNCS = {"wait", "_wait_for_tstate_lock", "select", "poll", "sleep", "get", "acquire", "accept",
@@ -46,13 +59,29 @@ _IDLE_FUNCS = {"wait", "_wait_for_tstate_lock", "select", "poll", "sleep", "get"
                "wait_for", "control", "epoll", "kqueue", "result", "_recv_bytes", "readinto"}
 
 
-def _fmt_stack(frame, depth: int = STACK_DEPTH) -> tuple:
+def _raw_stack(frame, depth: int = STACK_DEPTH) -> tuple:
+    """Innermost ``depth`` frames as (filename, lineno, funcname), outer-to-inner.
+
+    Frame metadata only: traceback.extract_stack also runs linecache.checkcache (an os.stat per file,
+    each one a GIL release and re-acquire) and reads source lines, which is what made stall sampling slow."""
     out = []
-    for fs in traceback.extract_stack(frame)[-depth:]:
-        out.append("%s:%d %s" % (_short(fs.filename), fs.lineno, fs.name))
+    while frame is not None and len(out) < depth:
+        code = frame.f_code
+        out.append((code.co_filename, frame.f_lineno, code.co_name))
+        frame = frame.f_back
+    out.reverse()
     return tuple(out)
 
 
+def _fmt_raw(raw: tuple) -> tuple:
+    return tuple("%s:%d %s" % (_short(fn), line or 0, name) for fn, line, name in raw)
+
+
+def _fmt_stack(frame, depth: int = STACK_DEPTH) -> tuple:
+    return _fmt_raw(_raw_stack(frame, depth))
+
+
+@lru_cache(maxsize=4096)
 def _short(path: str) -> str:
     for marker in ("/hermes-agent/", "/site-packages/", "/plugins/", "/lib/python"):
         i = path.rfind(marker)
@@ -72,10 +101,18 @@ class LoopWatch:
     def __init__(self, loop: asyncio.AbstractEventLoop, loop_thread_id: int, *,
                  sink: Callable[[dict], None], stall_s: float = STALL_S, period_s: float = PERIOD_S,
                  sample_s: float = SAMPLE_S, clock: Callable[[], float] = time.monotonic,
-                 frames: Callable[[], dict] = sys._current_frames) -> None:
+                 frames: Callable[[], dict] = sys._current_frames, budget: float = SAMPLE_BUDGET,
+                 max_samples: int = MAX_SAMPLES, max_threads: int = MAX_THREADS_PER_SAMPLE,
+                 stalls_per_window: int = SAMPLED_STALLS_PER_WINDOW, window_s: float = RATE_WINDOW_S,
+                 wait: Optional[Callable[[threading.Event, float], bool]] = None) -> None:
         self.loop, self.loop_tid, self.sink = loop, loop_thread_id, sink
         self.stall_s, self.period_s, self.sample_s = stall_s, period_s, sample_s
         self.clock, self.frames = clock, frames
+        self.budget = min(1.0, max(1e-3, float(budget)))
+        self.max_samples, self.max_threads = int(max_samples), int(max_threads)
+        self.stalls_per_window, self.window_s = int(stalls_per_window), float(window_s)
+        self.wait = wait or (lambda ev, t: ev.wait(t))
+        self._sampled_at: deque = deque()  # clock() of recently sampled stalls (rate limit)
         self.stop = threading.Event()
         self.reports = 0
         self.on_tick: Optional[Callable[[], None]] = None
@@ -83,8 +120,39 @@ class LoopWatch:
     def _names(self) -> dict:
         return {t.ident: t.name for t in threading.enumerate()}
 
+    def _rate_ok(self, now: float) -> bool:
+        while self._sampled_at and now - self._sampled_at[0] > self.window_s:
+            self._sampled_at.popleft()
+        if len(self._sampled_at) >= self.stalls_per_window:
+            return False
+        self._sampled_at.append(now)
+        return True
+
+    def _sample(self, me: int, loop_stacks: Counter, busy: Counter) -> None:
+        """One pass: raw frame metadata into the counters. No formatting, no I/O."""
+        frames = self.frames()
+        f = frames.get(self.loop_tid)
+        if f is not None:
+            loop_stacks[_raw_stack(f)] += 1
+        seen = 0
+        for tid, fr in frames.items():
+            if tid == me or tid == self.loop_tid:
+                continue
+            seen += 1
+            if seen > self.max_threads:
+                break
+            # Idle threads (most of a big backend's pools) cost one attribute read, not a stack walk.
+            if fr is None or fr.f_code.co_name in _IDLE_FUNCS:
+                continue
+            busy[(tid, _raw_stack(fr, 6))] += 1
+
     def check_once(self) -> Optional[dict]:
-        """Post one probe; on a stall, sample until the loop runs it and return the report."""
+        """Post one probe; on a stall, sample (within the cost bounds) until the loop runs it.
+
+        Cost bounds while the process is stalled: each pass's own duration sets the wait before the next
+        (watcher share <= ``budget`` of stall wall time after the first pass), at most ``max_samples`` passes
+        per stall, at most ``stalls_per_window`` sampled stalls per ``window_s``. Formatting runs after the
+        loop has caught up; ``stall_s`` is measured when it did, so it excludes the watcher's own report work."""
         ran = threading.Event()
         posted_wall, posted = time.time(), self.clock()
         try:
@@ -92,39 +160,50 @@ class LoopWatch:
         except RuntimeError:  # loop closed
             self.stop.set()
             return None
-        if ran.wait(self.stall_s):
+        if self.wait(ran, self.stall_s):
             return None
         me = threading.get_ident()
         loop_stacks: Counter = Counter()
         busy: Counter = Counter()
-        names = self._names()
-        samples, watch_lag = 0, 0.0
+        sampling = "full" if self._rate_ok(self.clock()) else "rate_limited"
+        samples, watch_lag, cost = 0, 0.0, 0.0
+        wait_s = self.sample_s
+        done = False
         while True:
-            t0 = self.clock()
-            done = ran.wait(self.sample_s)
-            watch_lag = max(watch_lag, self.clock() - t0 - self.sample_s)
-            frames = self.frames()
-            samples += 1
-            f = frames.get(self.loop_tid)
-            if f is not None:
-                loop_stacks[_fmt_stack(f)] += 1
-            for tid, fr in frames.items():
-                if tid in (me, self.loop_tid):
-                    continue
-                st = _fmt_stack(fr, 6)
-                if not _idle(st):
-                    busy[(names.get(tid) or str(tid), st)] += 1
+            if sampling == "full" and samples < self.max_samples:
+                c0 = self.clock()
+                self._sample(me, loop_stacks, busy)
+                c = max(0.0, self.clock() - c0)
+                cost += c
+                samples += 1
+                wait_s = max(self.sample_s, c * (1.0 - self.budget) / self.budget)
+            elif sampling == "full":
+                sampling = "capped"
+                wait_s = max(self.sample_s, self.period_s)
+            elif sampling == "rate_limited":
+                wait_s = max(self.sample_s, self.period_s)
             if done or self.stop.is_set():
                 break
+            t0 = self.clock()
+            done = self.wait(ran, wait_s)
+            watch_lag = max(watch_lag, self.clock() - t0 - wait_s)
+            if done:
+                break
         stall = self.clock() - posted
+        names = self._names()
+        busy_named: Counter = Counter()
+        for (tid, raw), n in busy.items():
+            busy_named[(names.get(tid) or str(tid), _fmt_raw(raw))] += n
         return {
             "posted": time.strftime("%H:%M:%S", time.localtime(posted_wall)) + ".%03d" % (int(posted_wall * 1000) % 1000),
             "stall_s": round(stall, 3),
             "samples": samples,
+            "sampling": sampling,  # full | capped (max_samples reached) | rate_limited (timed only)
+            "watcher_cost_s": round(cost, 3),  # wall time of the watcher's own sample passes in this stall
             "watch_lag_s": round(max(0.0, watch_lag), 3),
             "pid": os.getpid(),
-            "loop_stacks": [{"n": n, "stack": list(st)} for st, n in loop_stacks.most_common(TOP_N)],
-            "busy_threads": [{"n": n, "thread": name, "stack": list(st)} for (name, st), n in busy.most_common(TOP_N)],
+            "loop_stacks": [{"n": n, "stack": list(_fmt_raw(st))} for st, n in loop_stacks.most_common(TOP_N)],
+            "busy_threads": [{"n": n, "thread": name, "stack": list(st)} for (name, st), n in busy_named.most_common(TOP_N)],
         }
 
     def run(self) -> None:
@@ -258,8 +337,10 @@ def default_sink(path: Path) -> Callable[[dict], None]:
             return
         top = rep["loop_stacks"][0]["stack"][-1] if rep["loop_stacks"] else "?"
         hog = rep["busy_threads"][0] if rep["busy_threads"] else None
-        log.warning("loop-watch: event loop stalled %.2fs (posted %s, watch_lag %.2fs) loop top=%s busiest=%s",
-                    rep["stall_s"], rep["posted"], rep["watch_lag_s"], top,
+        log.warning("loop-watch: event loop stalled %.2fs (posted %s, watch_lag %.2fs, %d samples %s, watcher %.3fs)"
+                    " loop top=%s busiest=%s",
+                    rep["stall_s"], rep["posted"], rep["watch_lag_s"], rep.get("samples", 0),
+                    rep.get("sampling", "full"), rep.get("watcher_cost_s", 0.0), top,
                     ("%s %s" % (hog["thread"], hog["stack"][-1])) if hog else "-")
         _append(path, rep)
     return sink
