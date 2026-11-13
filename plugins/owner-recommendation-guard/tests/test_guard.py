@@ -142,6 +142,39 @@ def test_rule_error_fails_open(guard, tmp_path, monkeypatch):
     monkeypatch.delitem(sys.modules, guard._RULE_KEY, raising=False)
 
 
+def test_independent_session_gets_new_hold(guard):
+    args = {"task_id": "t_same", "human_request": FX.MACOS_LANE}
+    assert guard.pre_tool_call("kanban_block", args, "s1")["action"] == "block"
+    assert guard.pre_tool_call("kanban_block", args, "s1")["action"] == "block"
+    assert guard.pre_tool_call("kanban_block", args, "s1") is None
+    result = guard.pre_tool_call("kanban_block", args, "s2")
+    assert result and result["action"] == "block"
+
+
+def test_zero_hook_ask_gate_does_not_suppress_guard(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("OWNER_RECOMMENDATION_GUARD_IGNORE_ASK_GATE", raising=False)
+    fresh = _load("owner_recommendation_guard_zero_hooks")
+    pkg, plugins = type(sys)("hermes_cli"), type(sys)("hermes_cli.plugins")
+    plugins.get_plugin_manager = lambda: SimpleNamespace(list_plugins=lambda: [
+        {"name": "ask-gate", "enabled": True, "error": None, "hooks": 0},
+    ])
+    pkg.plugins = plugins
+    monkeypatch.setitem(sys.modules, "hermes_cli", pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
+    result = _block(fresh, FX.MACOS_LANE)
+    assert result and result["action"] == "block"
+
+
+def test_real_registered_hook_holds(guard):
+    hooks = {}
+    guard.register(SimpleNamespace(register_hook=lambda name, fn: hooks.__setitem__(name, fn)))
+    assert "pre_tool_call" in hooks
+    result = hooks["pre_tool_call"]("kanban_block", {"human_request": FX.MACOS_LANE}, "s1")
+    assert result and result["action"] == "block"
+
+
 def test_shares_ask_gate_rule_file(guard):
     assert guard._RULE_PATH == HERE.parent / "ask-gate" / "owner_recommendation.py"
     assert guard._RULE_PATH.is_file()
