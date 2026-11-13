@@ -96,7 +96,23 @@ review of that head (names it, says "review") and approves; a reply first line
 phrases include request changes, cannot/unable to/would approve, no approval, needs
 changes and withheld. No verdict, a review
 of an earlier head only, or a later request-changes refuses. A state PR with no
-review at all (#2413) is refused. Missing/malformed/offline,
+review at all (#2413) is refused.
+
+**Patch-identical update-branch carry.** When the head has no verdict at all,
+the newest exact-head approval of an earlier head H0 (a review on that commit,
+or a comment naming its full sha the same way; the newest 2 distinct approved
+shas are tried) counts for the head H when all hold, read through gh only:
+(a) `gh api repos/OWNER/REPO/compare/H0...H` is `ahead` with `behind_by` 0, and
+every commit on H's first-parent line back to H0 (at most 3; parents from that
+compare, else `gh api repos/OWNER/REPO/git/commits/<sha>`) is a merge whose
+second parent is on `state` (`compare/<parent>...state` ahead or identical);
+(b) `git patch-id --stable` of the PR diffs `compare/state...H0` and
+`compare/state...H` (diff media type, each merge-base..sha) is the same single
+id; (c) no non-bot blocking verdict on any head (or a verdict with no readable
+time) came at or after that approval. Any failed or odd read refuses with the
+reason; a blocking verdict on H itself is never overridden. Base drift is
+checked separately and still applies. Why: #1812, #1837 and #2438 were refused
+although `gh pr update-branch` left their patch-id unchanged. Missing/malformed/offline,
 main/other base, changed head, pending/failed/skipped/neutral checks, a possibly
 truncated rollup, unreadable reviews/comments, an unanswered review point and a
 missing exact-head approval fail closed. This is not a blanket non-main exemption.
@@ -145,7 +161,8 @@ each, 8-second timeout; a failed lookup only drops that attribution), and the
 base commits (content commits first, the first 8) and asks for
 `gh api -X PUT repos/OWNER/REPO/pulls/N/update-branch -f expected_head_sha=<head>`,
 green CI on the new head and a rerun; the exact-head approval check then applies
-to the new head. A missing/malformed `baseRefOid`, a missing, empty or 100-entry
+to the new head (an approval of the pre-update head carries when the patch-id is
+unchanged, above). A missing/malformed `baseRefOid`, a missing, empty or 100-entry
 (possibly capped) `files` list, a failed or unparsable compare, missing
 `total_commits`/`commits`/`files`, 250+ commits, 300+ files, or a base that is
 not an ancestor of `state` fail closed. Why: #2491's CI tested base 3a55357793;

@@ -268,9 +268,13 @@ def state_check(monkeypatch, data, argv=STATE_CMD):
         return SimpleNamespace(returncode=0, stdout=json.dumps(data))
     monkeypatch.setattr(g.subprocess, "run", run)
     why = g.check_argv(argv, repos={"example/protected"}, env={"GH_REPO": "example/protected"})
-    assert 1 <= len(calls) <= 2 and "reviews" in calls[0][-1].split(",") and "comments" in calls[0][-1].split(",")
-    # A second call is only ever the base-drift compare of the PR's baseRefOid against state.
-    assert calls[1:] in ([], [["gh", "api", f"repos/example/protected/compare/{data['baseRefOid']}...state"]])
+    assert len(calls) >= 1 and "reviews" in calls[0][-1].split(",") and "comments" in calls[0][-1].split(",")
+    # Later calls are gh api reads only: the patch-identical carry probes of an earlier approved head
+    # (tests_carry.py), then at most the base-drift compare of the PR's baseRefOid against state.
+    drift = ["gh", "api", f"repos/example/protected/compare/{data['baseRefOid']}...state"]
+    assert all(c[:2] == ["gh", "api"] and "-X" not in c for c in calls[1:])
+    assert calls[1:].count(drift) <= 1 and (drift not in calls or calls[-1] == drift)
+    assert all("/compare/" in c[-1] for c in calls[1:])
     return why
 
 

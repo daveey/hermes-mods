@@ -232,40 +232,59 @@ def _body_verdict(body, first_line_ok=True):
     return "block" if bad else None
 
 
-def _approval_refusal(number, data):
-    """Refusal text unless the latest non-bot verdict on the exact head approves; else None.
+def _review_verdict(r):
+    state = r.get("state")
+    return ("approve" if state == "APPROVED" else "block" if state == "CHANGES_REQUESTED"
+            else _body_verdict(r.get("body")))
 
-    Evidence is a review whose commit is the head (state APPROVED/CHANGES_REQUESTED, a VERDICT line, or a
-    first line that approves), or a PR comment naming the head (its first 10+ hex) with a VERDICT line.
-    It proves an approval record exists, not that its author was independent (every agent posts as one
-    account): independence stays the landing owner's duty.
-    Why: #2413 merged 16 min after its head was pushed with no review or verdict at all; 19 state PRs merged
-    2026-11-13 had no exact-head approval record and this preflight admitted every one."""
-    head = str(data.get("headRefOid") or "")
+
+def _comment_verdict(body, sha):
+    """A PR comment's verdict on head `sha`: it names the sha (first 10+ hex) and carries a VERDICT line, or
+    its first line is a review of that sha (names it, says review, is no reply) that approves or blocks."""
+    if not sha or not re.search(rf"(?<![0-9a-f]){sha[:10]}", body):
+        return None
+    verdict = _body_verdict(body, first_line_ok=False)
+    if verdict is None:
+        first = next((_flat(line) for line in body.splitlines() if line.strip()), "")
+        if (re.search(rf"(?<![0-9a-f]){sha[:10]}", first) and _REVIEW_NOUN.search(first)
+                and not _REPLY_LINE.search(first)):
+            verdict = _body_verdict(first)
+    return verdict
+
+
+def _head_verdicts(data, head):
+    """[(time, verdict)] of non-bot reviews on commit `head` and non-bot comments naming it."""
     verdicts = []
     for r in data.get("reviews") or []:
         if _is_bot(r.get("author"), r.get("authorAssociation")):
             continue
         if not isinstance(r.get("commit"), dict) or r["commit"].get("oid") != head:
             continue
-        state = r.get("state")
-        verdict = ("approve" if state == "APPROVED" else "block" if state == "CHANGES_REQUESTED"
-                   else _body_verdict(r.get("body")))
+        verdict = _review_verdict(r)
         if verdict:
             verdicts.append((_when(r.get("submittedAt")), verdict))
     for c in data.get("comments") or []:
-        body = str(c.get("body") or "")
-        if _is_bot(c.get("author"), c.get("authorAssociation")) or not re.search(
-                rf"(?<![0-9a-f]){head[:10]}", body):
+        if _is_bot(c.get("author"), c.get("authorAssociation")):
             continue
-        verdict = _body_verdict(body, first_line_ok=False)
-        if verdict is None:
-            first = next((_flat(line) for line in body.splitlines() if line.strip()), "")
-            if (re.search(rf"(?<![0-9a-f]){head[:10]}", first) and _REVIEW_NOUN.search(first)
-                    and not _REPLY_LINE.search(first)):
-                verdict = _body_verdict(first)
+        verdict = _comment_verdict(str(c.get("body") or ""), head)
         if verdict:
             verdicts.append((_when(c.get("createdAt")), verdict))
+    return verdicts
+
+
+def _approval_refusal(number, data, repo=None, cwd=None, env=None):
+    """Refusal text unless the latest non-bot verdict on the exact head approves; else None.
+
+    Evidence is a review whose commit is the head (state APPROVED/CHANGES_REQUESTED, a VERDICT line, or a
+    first line that approves), or a PR comment naming the head (its first 10+ hex) with a VERDICT line.
+    It proves an approval record exists, not that its author was independent (every agent posts as one
+    account): independence stays the landing owner's duty.
+    With no verdict on the head at all and a `repo`, an exact-head approval of an earlier head carries when
+    the new head only merged the base into it and the PR's patch is unchanged (`_carried_approval`).
+    Why: #2413 merged 16 min after its head was pushed with no review or verdict at all; 19 state PRs merged
+    2026-11-13 had no exact-head approval record and this preflight admitted every one."""
+    head = str(data.get("headRefOid") or "")
+    verdicts = _head_verdicts(data, head)
     if any(t is None for t, _ in verdicts):
         return (f"[ship-only-guard] Refused state merge of PR #{number}: a review/verdict on head {head[:10]} has "
                 "no readable time, so the latest exact-head verdict cannot be read. Rerun the same merge "
@@ -273,13 +292,191 @@ def _approval_refusal(number, data):
     verdicts.sort()
     if verdicts and verdicts[-1][1] == "approve":
         return None
+    carried = ""
+    if not verdicts and repo is not None:
+        ok, carried = _carried_approval(head, data, repo, cwd, env or {})
+        if ok:
+            return None
     why = ("its latest exact-head verdict requests changes" if verdicts
            else "it has no approval of its exact head (no review on that commit and no comment naming it "
-                "with a VERDICT line)")
+                "with a VERDICT line)" + (f"; {carried}" if carried else ""))
     return (f"[ship-only-guard] Refused state merge of PR #{number}: {why}. A state PR lands only after an "
             f"independent exact-head review of {head}: file a review card for that sha (its reviewer posts a "
             "review on that commit whose first line says approve, or `VERDICT: APPROVE`), fix any requested "
-            "changes, then rerun the same merge command. A review of an earlier head does not count.")
+            "changes, then rerun the same merge command. A review of an earlier head counts only when the "
+            "head since then only merged the base and the PR's patch-id is unchanged.")
+
+
+# Patch-identical update-branch carry (t_01a1d666f7d34164). `gh pr update-branch` (or `git merge origin/state`)
+# moves the head without changing the PR's own patch: #1812 (bc33e1eb82 -> 21cbd60ac5), #1837
+# (20bf041a47 -> d49e9bcfa5) and #2438 (1fd079c68f -> b1e5d5ef46) kept their stable patch-id, yet the
+# exact-head gate refused all three. The base-drift gate (`_base_drift_refusal`) still applies separately.
+_CARRY_MERGES = 3            # base merges on the PR's first-parent line between the approved head and the head
+_CARRY_CANDIDATES = 2        # distinct earlier approved heads tried, newest approval first
+_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+class _Unreadable(Exception):
+    pass
+
+
+def _earlier_approval(data, head, exclude=()):
+    """(time, sha) of the newest non-bot approval of a head other than `head` (and not in `exclude`), else
+    None; and whether a blocking verdict on any head (or a verdict with no readable time) came at or after it."""
+    approvals, blocks = [], []
+    for r in data.get("reviews") or []:
+        if _is_bot(r.get("author"), r.get("authorAssociation")):
+            continue
+        verdict, at = _review_verdict(r), _when(r.get("submittedAt"))
+        oid = r.get("commit", {}).get("oid") if isinstance(r.get("commit"), dict) else None
+        if verdict == "block" or (verdict and at is None):
+            blocks.append(at)
+        elif verdict == "approve" and isinstance(oid, str) and _SHA.fullmatch(oid) and oid != head:
+            approvals.append((at, oid))
+    for c in data.get("comments") or []:
+        if _is_bot(c.get("author"), c.get("authorAssociation")):
+            continue
+        body, at = str(c.get("body") or ""), _when(c.get("createdAt"))
+        # Any blocking comment verdict counts against the carry, whatever head it names (or none).
+        first = next((_flat(line) for line in body.splitlines() if line.strip()), "")
+        if _body_verdict(body, first_line_ok=False) == "block" or (
+                _REVIEW_NOUN.search(first) and not _REPLY_LINE.search(first) and _body_verdict(first) == "block"):
+            blocks.append(at)
+            continue
+        for sha in dict.fromkeys(re.findall(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])", body)):
+            verdict = _comment_verdict(body, sha)
+            if sha != head and verdict == "approve":
+                if at is None:
+                    blocks.append(None)
+                else:
+                    approvals.append((at, sha))
+            elif verdict == "block":
+                blocks.append(at)
+    approvals = [a for a in approvals if a[1] not in exclude]
+    if not approvals:
+        return None, False
+    newest = max(approvals)
+    return newest, any(t is None or t >= newest[0] for t in blocks)
+
+
+def _earlier_approvals(data, head):
+    """Distinct earlier approved heads, newest approval first, at most _CARRY_CANDIDATES, each with
+    whether a block came at or after it. A comment naming two shas (head and base) yields both."""
+    out, seen = [], set()
+    while len(out) < _CARRY_CANDIDATES:
+        newest, blocked = _earlier_approval(data, head, seen)
+        if newest is None:
+            break
+        out.append((newest, blocked))
+        seen.add(newest[1])
+    return out
+
+
+def _gh_text(path, cwd, env, accept=None):
+    probe_env = dict(env)
+    probe_env["GH_PROMPT_DISABLED"] = "1"
+    argv = ["gh", "api", *(["-H", f"Accept: {accept}"] if accept else []), path]
+    try:
+        p = subprocess.run(argv, cwd=_probe_cwd(cwd), env=probe_env, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise _Unreadable(f"`gh api {path}` could not run ({type(e).__name__})")
+    if p.returncode != 0:
+        raise _Unreadable(f"`gh api {path}` exited {p.returncode}")
+    return str(p.stdout or "")
+
+
+def _gh_json(path, cwd, env) -> dict:
+    try:
+        out = json.loads(_gh_text(path, cwd, env))
+    except (ValueError, TypeError):
+        raise _Unreadable(f"`gh api {path}` returned unreadable JSON")
+    if not isinstance(out, dict):
+        raise _Unreadable(f"`gh api {path}` returned no JSON object")
+    return out
+
+
+def _patch_id(diff, cwd):
+    """`git patch-id --stable` of a diff text (no repository needed); _Unreadable when empty or ambiguous."""
+    if not diff.strip():
+        raise _Unreadable("a PR diff is empty")
+    try:
+        p = subprocess.run(["git", "patch-id", "--stable"], input=diff, cwd=_probe_cwd(cwd),
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise _Unreadable(f"`git patch-id` could not run ({type(e).__name__})")
+    lines = [line.split() for line in str(p.stdout or "").splitlines() if line.strip()]
+    if p.returncode != 0 or len(lines) != 1 or not _SHA.fullmatch(lines[0][0]):
+        raise _Unreadable("`git patch-id --stable` gave no single id")
+    return lines[0][0]
+
+
+def _carried_approval(head, data, repo, cwd, env):
+    """(True, H0) when an approval of an earlier head H0 counts for `head`, else (False, why-or-'').
+
+    All must hold, read only through gh (any failed or odd read refuses):
+    (a) H0 is an ancestor of the head (`compare/H0...head` is ahead, behind 0) and every commit on the head's
+        first-parent line back to H0 is a merge (at most _CARRY_MERGES) whose second parent is on `state`
+        (`compare/<parent>...state` ahead or identical): the head only merged the base in;
+    (b) `git patch-id --stable` of the PR diff `compare/state...H0` equals the one of `compare/state...head`
+        (each is merge-base..sha, the PR's own patch);
+    (c) no non-bot blocking verdict, on any head, at or after that approval.
+    The newest _CARRY_CANDIDATES distinct approved heads are tried in turn (a comment naming the head and a
+    base sha yields both); the first one's refusal reason is reported."""
+    first = ""
+    for (_, h0), blocked in _earlier_approvals(data, head):
+        ok, why = _carry_one(head, h0, blocked, repo, cwd, env)
+        if ok:
+            return True, h0
+        first = first or why
+    return False, first
+
+
+def _carry_one(head, h0, blocked, repo, cwd, env):
+    lead = f"the approval of earlier head {h0[:10]} does not carry to it"
+    if blocked:
+        return False, f"{lead}: a blocking verdict came at or after that approval"
+    if not _SHA.fullmatch(head):
+        return False, f"{lead}: the head sha is unreadable"
+    try:
+        cmp = _gh_json(f"repos/{repo}/compare/{h0}...{head}", cwd, env)
+        if cmp.get("status") != "ahead" or cmp.get("behind_by") != 0:
+            return False, (f"{lead}: {h0[:10]} is not an ancestor of the head (compare status "
+                           f"{cmp.get('status')!r}; a rebase or force-push changed the PR)")
+        known = {}
+        listed = cmp.get("commits")
+        for c in listed if isinstance(listed, list) else []:
+            if isinstance(c, dict) and isinstance(c.get("sha"), str) and isinstance(c.get("parents"), list):
+                known[c["sha"]] = [p.get("sha") if isinstance(p, dict) else None for p in c["parents"]]
+        cur, bases = head, []
+        while cur != h0:
+            if len(bases) >= _CARRY_MERGES:
+                return False, (f"{lead}: more than {_CARRY_MERGES} commits sit on the PR's first-parent line "
+                               f"after {h0[:10]}")
+            parents = known.get(cur)
+            if parents is None:
+                got = _gh_json(f"repos/{repo}/git/commits/{cur}", cwd, env).get("parents")
+                parents = [p.get("sha") if isinstance(p, dict) else None for p in got] if isinstance(
+                    got, list) else []
+            if not parents or not all(isinstance(p, str) and _SHA.fullmatch(p) for p in parents):
+                raise _Unreadable(f"the parents of {cur[:10]} are unreadable")
+            if len(parents) != 2:
+                return False, (f"{lead}: {cur[:10]} after it is not a merge of the base (a non-merge commit "
+                               "changes the PR)")
+            bases.append(str(parents[1]))
+            cur = str(parents[0])
+        for parent in dict.fromkeys(bases):
+            on = _gh_json(f"repos/{repo}/compare/{parent}...state", cwd, env)
+            if on.get("status") not in ("ahead", "identical") or on.get("behind_by") != 0:
+                return False, (f"{lead}: merge parent {parent[:10]} is not on state (the head merged "
+                               "something other than the base)")
+        diff = "application/vnd.github.diff"
+        old = _patch_id(_gh_text(f"repos/{repo}/compare/state...{h0}", cwd, env, accept=diff), cwd)
+        new = _patch_id(_gh_text(f"repos/{repo}/compare/state...{head}", cwd, env, accept=diff), cwd)
+    except _Unreadable as e:
+        return False, f"{lead}: {e}, so patch identity cannot be shown"
+    if old != new:
+        return False, f"{lead}: the PR's patch changed (patch-id {old[:12]} -> {new[:12]})"
+    return True, h0
 
 
 # Base drift under the PR's CI (t_01a1d6201140c966). The PR's recorded baseRefOid is at or before the base its
@@ -452,8 +649,8 @@ def _base_drift_refusal(number, repo, data, cwd, env):
             + f"Base commits since {base[:10]}: {named}. "
             f"Run `gh api -X PUT repos/{repo}/pulls/{number}/update-branch -f expected_head_sha={head}`, wait "
             "for green CI on the new head, then rerun the merge with --match-head-commit <new head>. The guard "
-            "re-checks exact-head approval on the new head: confirm `git patch-id --stable` of the PR diff is "
-            "unchanged and get the review confirmed for that sha.")
+            "re-checks exact-head approval on the new head; an approval of the old head carries when the new "
+            "head only merged state and the PR's `git patch-id --stable` is unchanged.")
 
 
 def _attribute_hits(repo, names, window, subject, cwd, env):
@@ -586,7 +783,7 @@ def _state_merge(words, repo, cwd, env):
         if bad:
             return failed(f"{len(bad)} of {len(checks)} checks not green: " + ", ".join(bad[:8])
                           + (f", +{len(bad) - 8} more" if len(bad) > 8 else ""))
-        return (_review_reply_refusal(number, data) or _approval_refusal(number, data)
+        return (_review_reply_refusal(number, data) or _approval_refusal(number, data, repo, cwd, env)
                 or _base_drift_refusal(number, repo, data, cwd, env) or True)
     except (ValueError, TypeError) as e:
         return failed(f"`gh pr view {number}` returned an unexpected shape ({type(e).__name__})")
