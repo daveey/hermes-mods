@@ -25,6 +25,7 @@ def relay(tmp_path, monkeypatch):
     monkeypatch.setattr(sm.rf, "root", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "no-hub"))  # never the real hermes-hub replica
     monkeypatch.setattr(sm, "_sender_info", lambda sid: {"session_id": sid or ""})
+    monkeypatch.setattr(sm.bt, "enabled", lambda: False)  # the courier path, whatever this host's config says
     stop = threading.Event()
 
     def courier():
@@ -90,6 +91,7 @@ def test_bounded_read_timeout_withdraws_unclaimed_request(tmp_path, monkeypatch)
         (tmp_path / sub).mkdir()
     monkeypatch.setattr(sm.rf, "root", lambda: tmp_path)
     monkeypatch.setattr(sm, "_sender_info", lambda sid: {})
+    monkeypatch.setattr(sm.bt, "enabled", lambda: False)
     now = [100.0]
     monkeypatch.setattr(sm.time, "time", lambda: now[0])
     monkeypatch.setattr(sm.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))

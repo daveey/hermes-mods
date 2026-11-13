@@ -8,6 +8,7 @@ and posts the result to ``POST /api/plugins/session-mentions/result``. The tool 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
@@ -202,7 +203,9 @@ TASK_SCHEMA = {
         "`relays_user_message: true`: the card then counts it as a human answer (once per user message).\n"
         "Reading or commenting does not tie the task to this session; `hermes-hub adopt-task` does that when "
         "this session really owns the work.\n"
-        "Requires the Hermes Desktop app to be running (it relays the request)."
+        "Gateways no connected Desktop reaches (Board worker nodes `worker-N`) go through the hermes-hub courier: "
+        "comments are queued to the owning gateway (`transport: hub_courier`), reads come from the replica.\n"
+        "Otherwise requires the Hermes Desktop app to be running (it relays the request)."
     ),
     "parameters": {
         "type": "object",
@@ -243,6 +246,9 @@ def handle_task(args: dict, session_id: str | None = None, *, timeout_seconds: f
     if bt.enabled():
         return json.dumps(bt.handle(args))
     args.pop("relayed_human", None)  # only the origin's own proof below may set it, never the model
+    hub = _hub_route(action, args, session_id)
+    if hub is not None:
+        return hub
     if action == "comment" and rh.requested(args):
         # kanban-d1b921f32e: this gateway holds the chat's transcript, so it proves the relay here.
         relayed, refusal = rh.stamp(str(args["target"]), session_id, base=rf.root(),
@@ -265,6 +271,153 @@ def handle_task(args: dict, session_id: str | None = None, *, timeout_seconds: f
                                "error": f"relays_user_message refused by the card's gateway: {refused}. "
                                         "Post it without the flag if it is not the user's reply."})
     return out
+
+# --- gateways no Desktop courier reaches (Board worker nodes `worker-N`): the hermes-hub courier (agent-e4fd46c7a7)
+
+log = logging.getLogger(__name__)
+HUB_CLI_TIMEOUT = 60.0
+HUB_HINT = ("Reach it with the hermes-hub courier: `hermes-hub request <gateway> tasks <profile>/<board>/<task_id> "
+            "comment --arg text=<message>` (reads: `hermes-hub tasks --gw <gateway> --json`).")
+
+
+def _route_claimable(route: str, base) -> bool | None:
+    """True when a live Desktop courier may claim ``route`` (its device/aliases or reach list has it, or a legacy
+    courier with no reach list), False when live couriers exist and none can, None when no courier is live
+    (a Desktop may be starting: keep the old pickup wait)."""
+    couriers = rf.live_couriers(base)
+    if not couriers:
+        return None
+    for c in couriers:
+        reach = rf.names(c.get("reach") or ())
+        if not reach or route in reach or route in rf.names(c.get("aliases") or ()) or route == rf.norm_name(c.get("device")):
+            return True
+    return False
+
+
+def _hub_state_db():
+    from pathlib import Path
+    return Path(os.environ.get("HERMES_HUB_STATE") or Path.home() / ".local/state/hermes-hub") / "hub.db"
+
+
+def _hub_gateways() -> set:
+    """Gateway ids the hermes-hub replica knows (what `hermes-hub request` resolves); empty without a replica."""
+    path = _hub_state_db()
+    if not path.is_file():
+        return set()
+    try:
+        con = rf._ro_connect(path)
+        try:
+            return {rf.norm_name(r[0]) for r in con.execute("SELECT DISTINCT gw FROM replica") if r[0]}
+        finally:
+            con.close()
+    except Exception:
+        return set()
+
+
+def _hub_cli() -> str | None:
+    import shutil
+    from pathlib import Path
+    found = shutil.which("hermes-hub")
+    if found:
+        return found
+    fallback = Path.home() / ".local/bin/hermes-hub"
+    return str(fallback) if fallback.is_file() else None
+
+
+def _hub_run(argv: list, session_id: str | None = None):
+    import subprocess
+    env = dict(os.environ)
+    if session_id:
+        # hermes-hub stamps an agent's comment (writer_kind=agent) from its own environment: the gateway process
+        # running this tool may lack the markers, so the call names them.
+        env["HERMES_AGENT"] = "1"
+        env["HERMES_SESSION_ID"] = str(session_id)
+    else:
+        env.setdefault("HERMES_AGENT", "1")
+    return subprocess.run([_hub_cli() or "hermes-hub"] + argv, capture_output=True, text=True, timeout=HUB_CLI_TIMEOUT, env=env)
+
+
+def _hub_tasks(gw: str) -> list:
+    proc = _hub_run(["tasks", "--gw", gw, "--all", "--json"])
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "").strip()[:500] or f"exit {proc.returncode}")
+    rows = json.loads(proc.stdout or "[]")
+    return rows if isinstance(rows, list) else []
+
+
+def _task_ref(target) -> tuple[str, str]:
+    """(board, task id) from `@task:<board>@<gw>/<id>` or `<gw>:<id>`; board '' when the ref has none."""
+    text = str(target or "").strip().strip("`\"'")
+    while text.startswith("@task:"):
+        text = text[len("@task:"):].strip("`\"'")
+    if "/" in text:
+        head, tid = text.split("/", 1)
+        return head.split("@", 1)[0], tid.strip()
+    if ":" in text:
+        return "", text.split(":", 1)[1].strip()
+    return "", text
+
+
+def _hub_route(action: str, args: dict, session_id: str | None) -> str | None:
+    """Serve a request no live Desktop courier can claim. None = leave it to the Desktop relay."""
+    route = rf.route_of_target(args.get("target")) if args.get("target") else rf.norm_name(args.get("gateway"))
+    if not route or route in rf.LOCAL_ALIASES or route == rf.gateway_name():
+        return None
+    base = rf.root()
+    if _route_claimable(route, base) is not False:
+        return None
+    if route not in _hub_gateways() or not _hub_cli():
+        reach = sorted({n for c in rf.live_couriers(base) for n in rf.names(c.get("reach") or ())})
+        log.warning("cross_task: unroutable route=%s", route)
+        return _err(f"No Desktop courier reaches `{route}` (live reach lists: {', '.join(reach) or 'none'}) and the "
+                    f"hermes-hub replica on this gateway does not know it. " + HUB_HINT)
+    try:
+        if action == "comment":
+            if rh.requested(args):
+                return _err("relays_user_message is not carried by the hermes-hub courier that reaches "
+                            f"`{route}`; post the comment without the flag, or relay it from a chat on that gateway.")
+            board, tid = _task_ref(args.get("target"))
+            profile = "default"
+            try:
+                row = next((r for r in _hub_tasks(route) if r.get("id") == tid), None)
+            except Exception:
+                row = None
+            if row:
+                profile = str(row.get("owner_profile") or profile)
+                board = str(row.get("board") or board)
+            key = f"{profile}/{board or 'default'}/{tid}"
+            proc = _hub_run(["request", route, "tasks", key, "comment", "--arg", f"text={args['message']}"], session_id)
+            rid = (proc.stdout or "").strip().splitlines()[-1:] or [""]
+            if proc.returncode not in (0, 3):
+                log.warning("cross_task: unroutable route=%s (hermes-hub request exit %s)", route, proc.returncode)
+                return _err(f"hermes-hub request to `{route}` failed: {(proc.stderr or proc.stdout).strip()[:500]}")
+            out = {"ok": True, "transport": "hub_courier", "gateway": route, "key": key, "request_id": rid[0]}
+            if proc.returncode == 3:
+                out["queued"] = "hub unreachable; queued locally and sent on the next hermes-hub sync"
+            out["note"] = f"Delivered by the owning gateway's courier; `hermes-hub requests` shows {rid[0]}'s outcome."
+            return json.dumps(out)
+        rows = _hub_tasks(route)
+        meta = {"ok": True, "source": "replica", "transport": "hub_replica", "gateway": route,
+                "freshness": "hermes-hub replica copy; it may lag the owning gateway."}
+        if action == "read":
+            _board, tid = _task_ref(args.get("target"))
+            row = next((r for r in rows if r.get("id") == tid), None)
+            if row is None:
+                return _err(f"Task {tid} is not in the hermes-hub replica for `{route}`.")
+            return json.dumps({**meta, "task": {**row, "source": "replica", "owner": route}})
+        query = str(args.get("query") or "").casefold()
+        statuses = set(rf.names(args.get("status") or ""))
+        try:
+            limit = max(1, min(200, int(args.get("limit") or 20)))
+        except (TypeError, ValueError):
+            limit = 20
+        keep = [r for r in rows if (not statuses or rf.norm_name(r.get("status")) in statuses)
+                and query in f"{r.get('id', '')} {r.get('title', '')}".casefold()]
+        return json.dumps({**meta, "tasks": keep[:limit]})
+    except Exception as exc:
+        log.warning("cross_task: unroutable route=%s (%s)", route, exc)
+        return _err(f"hermes-hub courier for `{route}` failed: {exc}. " + HUB_HINT)
+
 
 def _devices_note(base) -> str:
     try:
@@ -319,8 +472,10 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
             except OSError:
                 pass
             if route:
+                log.warning("cross_task: unroutable route=%s (no Desktop pickup)", route)
                 return _err(f"No connected Hermes Desktop that can reach `{route}` picked up the request "
-                            f"(only a Desktop that knows that gateway/Mac claims it). " + _devices_note(base))
+                            f"(only a Desktop that knows that gateway/Mac claims it). " + _devices_note(base)
+                            + (" " + HUB_HINT if action.startswith("task_") else ""))
             return _err("The Hermes Desktop app did not pick up the request — it must be running with the "
                         "session-mentions plugin enabled to reach other gateways.")
         time.sleep(0.5)
