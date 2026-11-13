@@ -47,3 +47,22 @@ switch_model, interruptible_*_api_call, perform_api_call) are untouched. `agent/
 turn-worker submit path still runs the turn under `copy_context().run`, so the request-local
 `account_usage_dispatch` ContextVar keeps propagating. No new credential/route fence. selection.py
 unchanged, so recovery_wrapper and fast-rate-limit-fallback/account-usage-compatibility.json need no refresh.
+
+## Re-audit: head 65e64a2bbbe0 (card t_01a1d3ca393bceef)
+
+Merge base = fork main da52aff8f4c0; main `run_agent.py` is now 2723695bbcbe (kept).
+Drifted: `run_agent.py` -> 9a84dd7a5863 (added; older-head digests kept). `check_compat.py --core <head>`
+reports no other drift.
+
+`git diff origin/main...65e64a2bbbe0 -- run_agent.py` (+34/-7) is the same background-review custody
+change audited at 06d1730d9469 (`_spawn_background_review_now` reserves a `local_work_agent` token and
+calls `__class__._spawn_background_review_run`; the review thread releases after its requeue; HX012
+comment). The seams selection.py relies on (client factories, recover_with_credential_pool,
+_failed_credential_identity, switch_model, interruptible_*_api_call, perform_api_call) are untouched; no
+diff line names any of them or credential_pool. Visible in the PR diff now: `run_conversation` is a
+`local_work_agent.scope` wrapper around `_run_conversation_scoped`, and the gateway turn worker submits
+via `submit_tracked(executor, ctx.run, ...)` with `ctx = contextvars.copy_context()` (`run_in_pool`
+also runs under `ctx.run`), so the request-local `account_usage_dispatch` ContextVar still propagates.
+Neither plugin wraps run_conversation or the turn-worker submit. No new credential/route fence.
+selection.py unchanged, so recovery_wrapper and fast-rate-limit-fallback/account-usage-compatibility.json
+need no refresh.
