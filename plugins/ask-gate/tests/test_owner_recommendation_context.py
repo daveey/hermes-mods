@@ -56,6 +56,9 @@ def test_complete_risk_denial_is_not_a_limit(gate, denial, field):
 
 @pytest.mark.parametrize("why", [
     '"No credentials or other people involved."',
+    'The note says "Scheduling only. No credentials or other people involved. Keep it local."',
+    "The note says ‘Scheduling only. No credentials involved. Keep it local.’",
+    "The note says `Scheduling only. No credentials involved. Keep it local.`",
     "No credentials involved unless we rotate the key.",
     "No credentials involved, but other people are.",
     "No credentials involved. Rotate the API key.",
