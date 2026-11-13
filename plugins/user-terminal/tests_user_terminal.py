@@ -372,11 +372,15 @@ def test_status_only_for_the_origin_gateway(remote, monkeypatch, tmp_path):
 # Round trip: remote tool -> outbox -> fake Desktop courier (real claim rule) -> Mac-side local path -> result.
 class FakeCourier(threading.Thread):
     """Plays a Mac's Desktop courier: claims with relay_files' real rule, runs the request through the
-    user-terminal Mac routes' functions (start_relayed / relayed_status) and posts the result."""
+    user-terminal Mac routes' functions (start_relayed / relayed_status) and posts the result.
+    legacy=True plays a courier from before request ids were passed to the Mac; start_delay holds the start
+    answer back (a Mac whose answer arrives after the gateway stopped waiting)."""
 
-    def __init__(self, base: Path, device: str, gateway_key: str = "nous-1", aliases=()):
+    def __init__(self, base: Path, device: str, gateway_key: str = "nous-1", aliases=(), legacy=False,
+                 start_delay=0.0):
         super().__init__(daemon=True)
         self.base, self.device, self.gw, self.aliases = base, device, gateway_key, list(aliases) or [device]
+        self.legacy, self.start_delay = legacy, start_delay
         self.stop, self.claimed = threading.Event(), []
 
     def run(self):
@@ -389,7 +393,10 @@ class FakeCourier(threading.Thread):
                 else:
                     origin = {"gateway": self.gw, "profile": req["sender"].get("profile"),
                               "session_id": req["sender"].get("session_id"), "title": req["sender"].get("title")}
+                    if not self.legacy:
+                        origin["request_id"] = req["id"]
                     res = ut.start_relayed(a["command"], a.get("reason"), a.get("cwd"), origin)
+                    time.sleep(self.start_delay)
                 rf.write_result(req["id"], {**res, "device": self.device}, self.base)
             time.sleep(0.1)
 
@@ -442,6 +449,170 @@ def test_round_trip_pending_then_resume_with_job_id(remote, monkeypatch, tmp_pat
     finally:
         c.stop.set()
     assert again["ok"] and again["status"] == "ran" and again["job_id"] == first["job_id"]
+
+
+# t_01a1d40fc0dda5c3: a relayed job outlives a Desktop restart / courier reconnect, and a lost job_id or record
+# never reads as "unknown job_id" (= "never ran"), which invites resending a Terraform apply.
+def _go_offline(base: Path, courier: "FakeCourier", device: str = "macbook") -> None:
+    courier.stop.set()
+    courier.join(2)
+    old = time.time() - 120
+    os.utime(base / "couriers" / f"{device}.json", (old, old))
+
+
+def _mac_jobs(mac: Path) -> list:
+    return sorted(p for p in mac.iterdir() if p.is_dir())
+
+
+def test_reconnect_running_job_polls_pending_then_real_result(remote, monkeypatch, tmp_path):
+    base, mac = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DEVICE", "macbook")
+    monkeypatch.setattr(ut, "POLL_S", 1)
+    monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    c = FakeCourier(base, "macbook")
+    _beat(base, "macbook")
+    c.start()
+    first = json.loads(ut.handle_remote({"command": "terraform apply", "cwd": str(tmp_path), "wait_s": 1}, "s1"))
+    assert first["ok"] and first["status"] == "pending", first
+    job = mac / first["job_id"]
+    (job / "status.json").write_text(json.dumps({"status": "running"}))
+    _go_offline(base, c)  # the Mac's Desktop quits for an update: no courier, the window keeps running
+    t = time.time()
+    away = json.loads(ut.handle_remote({"job_id": first["job_id"], "wait_s": 600}, "s1"))
+    assert time.time() - t < 2 and away["ok"] and away["status"] == "pending", away
+    assert away["courier"] == "offline" and "Do not resend" in away["note"] and "unknown" not in json.dumps(away)
+    (job / "status.json").write_text(json.dumps({"status": "ran", "exit_code": 0, "output": "Apply complete"}))
+    back = FakeCourier(base, "macbook")  # the restarted Desktop's courier: new process, nothing in memory
+    _beat(base, "macbook")
+    back.start()
+    try:
+        done = json.loads(ut.handle_remote({"job_id": first["job_id"], "wait_s": 5}, "s1"))
+    finally:
+        back.stop.set()
+    assert done["ok"] and done["status"] == "ran" and done["exit_code"] == 0 and done["job_id"] == first["job_id"]
+    assert _mac_jobs(mac) == [job]
+
+
+def test_courier_gone_mid_poll_reads_pending_not_an_error(remote, monkeypatch, tmp_path):
+    base, mac = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setattr(ut, "POLL_S", 1)
+    monkeypatch.setattr(ut, "PICKUP_S", 0.6)
+    monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    c = FakeCourier(base, "macbook")
+    _beat(base, "macbook")
+    c.start()
+    first = json.loads(ut.handle_remote({"command": "true", "cwd": str(tmp_path), "wait_s": 1}, "s1"))
+    c.stop.set()  # heartbeat still fresh, but nobody claims the next status poll
+    c.join(2)
+    out = json.loads(ut.handle_remote({"job_id": first["job_id"], "wait_s": 5}, "s1"))
+    assert out["ok"] and out["status"] == "pending" and out["courier"] == "offline", out
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_lost_job_id_is_found_by_its_request_id(remote, monkeypatch, tmp_path, legacy):
+    """The 2026-11-13 incident: the start answered with job 20261112-230727-c18e35, a core-update pause stamped
+    over the tool result, and the agent polled with the courier request id. Now that id finds the job: through
+    the gateway's ledger, and (new couriers) through the Mac's own request index even without the ledger."""
+    base, mac = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setattr(ut, "POLL_S", 1)
+    monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    c = FakeCourier(base, "macbook", legacy=legacy)
+    _beat(base, "macbook")
+    c.start()
+    via_mac: dict = {}
+    try:
+        first = json.loads(ut.handle_remote({"command": "make apply", "cwd": str(tmp_path), "wait_s": 1}, "s1"))
+        rid = c.claimed[0]["id"]
+        (mac / first["job_id"] / "status.json").write_text(json.dumps({"status": "ran", "exit_code": 0}))
+        via_ledger = json.loads(ut.handle_remote({"job_id": rid, "wait_s": 5}, "s1"))
+        if not legacy:
+            import shutil
+
+            shutil.rmtree(ut.ledger_dir(base))
+            via_mac = json.loads(ut.handle_remote({"job_id": rid, "wait_s": 5}, "s1"))
+    finally:
+        c.stop.set()
+    assert via_ledger["status"] == "ran" and via_ledger["job_id"] == first["job_id"], via_ledger
+    if not legacy:
+        assert via_mac["status"] == "ran" and via_mac["job_id"] == first["job_id"], via_mac
+
+
+def test_record_really_lost_says_result_lost_not_unknown_job_id(remote, monkeypatch, tmp_path):
+    base, mac = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setattr(ut, "POLL_S", 1)
+    c = FakeCourier(base, "macbook")
+    _beat(base, "macbook")
+    c.start()
+    try:
+        out = json.loads(ut.handle_remote({"job_id": "684589fa119b473585210034b1f63b93", "wait_s": 5}, "s1"))
+    finally:
+        c.stop.set()
+    assert out["ok"] is False and out["status"] == "result_lost" and out["error"].startswith("result lost:"), out
+    assert "may have run" in out["error"] and "Do not resend" in out["error"] and "side effect" in out["error"]
+    assert "unknown job_id" not in out["error"]
+
+
+def test_unanswered_start_is_never_sent_twice(remote, monkeypatch, tmp_path):
+    """The start's answer never reaches the gateway (Desktop quit, tool call cancelled): sending the same
+    command again from that session polls the first request instead of opening a second window."""
+    base, mac = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setattr(ut, "POLL_S", 1)
+    monkeypatch.setattr(ut, "START_RESULT_S", 0.5)
+    monkeypatch.setattr(ut, "PICKUP_S", 0.5)  # claimed at once; the answer comes 3 s later, after the wait
+    monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    c = FakeCourier(base, "macbook", start_delay=3)
+    _beat(base, "macbook")
+    c.start()
+    try:
+        first = json.loads(ut.handle_remote({"command": "terraform apply", "cwd": str(tmp_path), "wait_s": 1}, "s1"))
+        assert first["ok"] is False and first["code"] == "no_answer" and "Do not resend" in first["note"], first
+        time.sleep(3)  # the Mac's answer lands after the gateway stopped waiting: an orphaned result
+        again = json.loads(ut.handle_remote({"command": "terraform apply", "cwd": str(tmp_path), "wait_s": 1}, "s1"))
+    finally:
+        c.stop.set()
+    assert again["not_resent"] and again["duplicate_of"] == first["job_id"] and "Not sent again" in again["note"]
+    assert again["job_id"] != first["job_id"]  # resolved to the Mac's own job id through its request index
+    assert len(_mac_jobs(mac)) == 1 and sum(1 for r in c.claimed if not r["args"].get("job_id")) == 1
+
+
+def test_same_command_runs_again_once_its_result_was_read(remote, monkeypatch, tmp_path):
+    base, mac = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setattr(ut, "POLL_S", 1)
+    monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    c = FakeCourier(base, "macbook")
+    _beat(base, "macbook")
+    c.start()
+    try:
+        first = json.loads(ut.handle_remote({"command": "true", "cwd": str(tmp_path), "wait_s": 1}, "s1"))
+        dup = json.loads(ut.handle_remote({"command": "true", "cwd": str(tmp_path), "wait_s": 1}, "s1"))
+        assert dup["not_resent"] and dup["job_id"] == first["job_id"] and dup["status"] == "pending"
+        (mac / first["job_id"] / "status.json").write_text(json.dumps({"status": "ran", "exit_code": 0}))
+        read = json.loads(ut.handle_remote({"job_id": first["job_id"], "wait_s": 5}, "s1"))
+        assert read["status"] == "ran"
+        other = json.loads(ut.handle_remote({"command": "true", "cwd": str(tmp_path), "wait_s": 1}, "s2"))
+        rerun = json.loads(ut.handle_remote({"command": "true", "cwd": str(tmp_path), "wait_s": 1}, "s1"))
+    finally:
+        c.stop.set()
+    assert not other.get("not_resent") and not rerun.get("not_resent")  # another session; a read result
+    assert len(_mac_jobs(mac)) == 3
+
+
+def test_mac_start_is_idempotent_per_request_and_gateway(remote, monkeypatch, tmp_path):
+    monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    rid = "684589fa119b473585210034b1f63b93"
+    one = ut.start_relayed("true", "", str(tmp_path), {**ORIGIN, "request_id": rid})
+    two = ut.start_relayed("true", "", str(tmp_path), {**ORIGIN, "request_id": rid})
+    assert two["job_id"] == one["job_id"] and two["duplicate_request"] and len(_mac_jobs(remote[1])) == 1
+    assert ut.relayed_status(rid, "nous-1", 0)["job_id"] == one["job_id"]
+    other = ut.relayed_status(rid, "hermes-hub", 0)  # another gateway never reads it, by either id
+    assert other["ok"] is False and other["code"] == "job_not_found"
+    assert ut.relayed_status("not-a-request-id", "nous-1", 0)["code"] == "job_not_found"
 
 
 def test_register_picks_remote_handler_without_a_screen(monkeypatch):

@@ -28,7 +28,7 @@ test('start: runs on THIS Mac\'s backend, origin gateway named by the courier, n
     return { ok: true, job_id: 'j1', status: 'waiting_for_user', terminal: 'iTerm' }
   })
   const res = await m.performRequest(
-    { action: 'user_terminal', route: 'macbook', args: { command: 'echo ok', reason: 'why', cwd: '' }, sender: { ...sender, gateway: 'forged' } },
+    { id: '684589fa119b473585210034b1f63b93', action: 'user_terminal', route: 'macbook', args: { command: 'echo ok', reason: 'why', cwd: '' }, sender: { ...sender, gateway: 'forged' } },
     'cloud-1',
     conns
   )
@@ -39,7 +39,8 @@ test('start: runs on THIS Mac\'s backend, origin gateway named by the courier, n
   assert.equal(calls[0].connectionId, 'local')
   assert.equal(calls[0].path, '/api/plugins/user-terminal/start')
   assert.equal(calls[0].method, 'POST')
-  assert.deepEqual(calls[0].body.origin, { gateway: 'nous-1', gateway_label: 'nous-1', profile: 'alpha', session_id: sender.session_id, title: 'Revoke token' })
+  // request_id lets the gateway find the job again by its own request id if the job_id answer is lost
+  assert.deepEqual(calls[0].body.origin, { gateway: 'nous-1', gateway_label: 'nous-1', profile: 'alpha', session_id: sender.session_id, title: 'Revoke token', request_id: '684589fa119b473585210034b1f63b93' })
   assert.equal(calls[0].body.command, 'echo ok')
 })
 

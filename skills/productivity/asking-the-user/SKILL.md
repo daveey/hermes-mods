@@ -89,7 +89,18 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   still overwrite evidence when two chats share output paths. If that happened, hash the retained coherent logs
   and count them as one proof, not two independent runs; do not rerun merely to recreate overwritten evidence.
 - `run_in_user_terminal` returning `ok:false` with "`<device>` claimed the request but sent no answer in time" is still
-  pending, not failed: call it again with only that `job_id` (and a wait); never resend the command, which would run it twice.
+  pending, not failed: call it again with only the `job_id` it returned (the request id) and a wait; never resend
+  the command, which would run it twice.
+- Never resend a relayed command whose outcome you have not read, whatever the reason the result is missing: a
+  tool result replaced by `[interrupted by Hermes update ...: re-run if still needed]`, a `no answer in time`, a
+  `courier: offline` pending, a compaction that dropped the job_id, or a `result lost:` reply. The window on the
+  Mac keeps running through Desktop restarts and courier reconnects. Recover in this order: call again with the
+  job_id (a courier request id from `session_mentions/claimed/` works too); calling again with the identical
+  command from the same session is safe, because the gateway polls the earlier start (`not_resent: true`)
+  instead of sending it; on `result lost:` verify by the command's side effect (the Terraform state, the merged
+  PR, the file) and report that. Only after verifying it did not run, send it again. Why: on 2026-11-13 a
+  Terraform apply's real result was stamped over by an update pause and the poll by request id read
+  "unknown job_id", which looked like "never ran" while the apply was finishing (t_01a1d40fc0dda5c3).
 - `run_in_user_terminal` refusing with "`<mac>` has no Hermes Desktop connected to this gateway right now (live
   Desktops: ...)" means that Mac is asleep or offline (confirm: `tailnet_exec` to it times out). Don't re-call it
   each turn: file one blocked `physical` card ("wake the Mac with Hermes Desktop running") whose `resolved_check`

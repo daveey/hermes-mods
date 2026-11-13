@@ -2623,6 +2623,14 @@ def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
         return {"ok": False, "error": "command is required"}
     if not isinstance(origin, dict) or not str(origin.get("gateway") or "").strip():
         return {"ok": False, "error": "a relayed job must name its origin gateway"}
+    origin = dict(origin)
+    rid = _request_id(origin.get("request_id"))
+    origin.pop("request_id", None)
+    if rid:
+        origin["request_id"] = rid
+        prior = find_relayed_by_request(rid, str(origin.get("gateway") or ""))
+        if prior is not None:  # the same courier request again (a retried POST): never a second window
+            return {**wait_for(prior, 0), "ok": True, "job_id": prior.name, "duplicate_request": True}
     cwd = os.path.expanduser(str(cwd or "").strip() or "~")
     if not os.path.isdir(cwd):
         return {"ok": False, "error": f"cwd does not exist on the Mac: {cwd}"}
@@ -2644,11 +2652,43 @@ def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
     return out
 
 
+_REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _request_id(raw: Any) -> str:
+    """A courier request id (uuid4 hex, the gateway's outbox file name), else ""."""
+    rid = str(raw or "").strip().lower()
+    return rid if _REQUEST_ID.match(rid) else ""
+
+
+def find_relayed_by_request(request_id: str, gateway: str) -> Path | None:
+    """The relayed job a courier request created (meta origin.request_id), for that origin gateway only.
+
+    A gateway that lost the job_id of a start it sent (its tool call was cancelled after the Mac answered)
+    still knows the request id, so a poll by that id finds the job and its real result (t_01a1d40fc0dda5c3)."""
+    rid = _request_id(request_id)
+    if not rid or not gateway:
+        return None
+    d = jobs_dir(create=False)
+    for job in sorted(d.iterdir(), reverse=True) if d.is_dir() else ():
+        try:
+            origin = json.loads((job / "meta.json").read_text()).get("origin") or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(origin, dict) and origin.get("request_id") == rid and origin.get("gateway") == gateway:
+            return job
+    return None
+
+
 def relayed_status(job_id: str, gateway: str, wait_s: float) -> dict:
-    """Wait on a relayed job. Only the gateway that started it may read it (output can be private)."""
+    """Wait on a relayed job, by its job_id or by the courier request id that started it. Only the gateway that
+    started it may read it (output can be private)."""
     job = jobs_dir() / Path(str(job_id or "")).name
     if not job_id or not job.is_dir() or not gateway or job_origin_gateway(job) != gateway:
-        return {"ok": False, "error": f"unknown job_id {job_id}"}
+        job = find_relayed_by_request(str(job_id or ""), gateway)
+    if job is None:
+        return {"ok": False, "code": "job_not_found",
+                "error": f"no job {job_id} on this Mac for gateway {gateway or '(none)'}"}
     return wait_for(job, max(0.0, min(float(wait_s or 0), 25.0)), reconcile=True)
 
 
@@ -2808,11 +2848,11 @@ def _sender(session_id: str | None) -> dict:
 
 
 def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: float,
-               yieldable: bool = False) -> dict:
+               yieldable: bool = False, rid: str | None = None) -> dict:
     """One request to the Mac's courier. Errors (never a hang) when nobody claims it within PICKUP_S.
     yieldable (status polls only, never the start request whose answer carries the new job_id): a chat
     message returns {"ok": True, "status": "pending", "yielded": True} at once."""
-    rid = uuid.uuid4().hex
+    rid = rid or uuid.uuid4().hex
     outbox, result = base / "outbox" / f"{rid}.json", base / "results" / f"{rid}.json"
     req = {"id": rid, "action": "user_terminal", "route": device, "args": args, "sender": sender,
            "created_at": time.time(), "ttl": PICKUP_S + 5}
@@ -2832,9 +2872,10 @@ def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: f
             return data if isinstance(data, dict) else {"ok": False, "error": "courier posted no result"}
         if outbox.exists() and time.time() > pickup:
             outbox.unlink(missing_ok=True)
-            return {"ok": False, "error": (f"The Hermes Desktop on `{device}` did not pick up the request (it may "
-                                           f"be quitting, asleep, or running an older session-mentions plugin). "
-                                           f"Tell the owner; do not hand them the command.")}
+            return {"ok": False, "code": "not_picked_up",
+                    "error": (f"The Hermes Desktop on `{device}` did not pick up the request (it may "
+                              f"be quitting, asleep, or running an older session-mentions plugin). "
+                              f"Tell the owner; do not hand them the command.")}
         if _interrupted():
             return {"ok": False, "error": "interrupted"}
         if yieldable and _yield_requested():  # a chat message: hand control back; the Mac's job keeps waiting
@@ -2842,7 +2883,123 @@ def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: f
                 outbox.unlink(missing_ok=True)  # unclaimed status poll: nobody needs its answer now
             return {"ok": True, "status": "pending", "yielded": True}
         time.sleep(0.3)
-    return {"ok": False, "error": f"`{device}` claimed the request but sent no answer in time"}
+    return {"ok": False, "code": "no_answer", "error": f"`{device}` claimed the request but sent no answer in time"}
+
+
+# ---------------------------------------------------------------- the gateway's ledger of relayed starts
+# One file per start request (<request id>.json) under <gateway root>/cache/user-terminal-relayed: the request
+# id, the Mac's job_id once it answers, the sending session and a hash of command + cwd. Written before the
+# request goes out, so a cancelled tool call (a core-update pause stamps its own text over the result, which
+# dropped job 20261112-230727-c18e35 on 2026-11-13: t_01a1d40fc0dda5c3) never loses track of a command that may
+# be running. A start of the same command from the same session while an earlier one is still open polls that
+# one instead of opening a second window; an entry closes once a final status (or a lost record) is seen.
+LEDGER_KEEP_S = 7 * 86400
+OPEN_STATES = ("sent", "started")
+
+
+def ledger_dir(base: Path) -> Path:
+    return base.parent / "cache" / "user-terminal-relayed"
+
+
+def command_key(command: str, cwd: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(f"{command.strip()}\0{cwd.strip()}".encode()).hexdigest()
+
+
+def ledger_put(base: Path, entry: dict) -> None:
+    try:
+        d = ledger_dir(base)
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{_request_id(entry.get('request_id')) or 'unknown'}.json"
+        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+        tmp.write_text(json.dumps(entry))
+        os.replace(tmp, path)
+    except OSError:
+        log.warning("user_terminal: could not record relayed request %s", entry.get("request_id"), exc_info=True)
+
+
+def ledger_entries(base: Path) -> list[dict]:
+    d = ledger_dir(base)
+    out = []
+    for path in d.glob("*.json") if d.is_dir() else ():
+        try:
+            entry = json.loads(path.read_text())
+            if time.time() - float(entry.get("created") or 0) > LEDGER_KEEP_S:
+                path.unlink(missing_ok=True)
+                continue
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        if isinstance(entry, dict):
+            out.append(entry)
+    return sorted(out, key=lambda e: float(e.get("created") or 0), reverse=True)
+
+
+def ledger_lookup(base: Path, ident: str) -> dict | None:
+    """The entry whose request id or Mac job_id is ``ident``."""
+    ident = str(ident or "").strip()
+    if not ident:
+        return None
+    return next((e for e in ledger_entries(base) if ident in (e.get("request_id"), e.get("job_id"))), None)
+
+
+def ledger_open_duplicate(base: Path, session_id: str, key: str) -> dict | None:
+    return next((e for e in ledger_entries(base) if e.get("state") in OPEN_STATES and e.get("key") == key
+                 and (e.get("session_id") or "") == session_id), None)
+
+
+def ledger_close(base: Path, entry: dict, state: str, status: str | None = None) -> None:
+    entry.update(state=state, closed=time.time(), **({"status": status} if status else {}))
+    ledger_put(base, entry)
+
+
+# A start the Mac answered without creating a job, or that nobody claimed: nothing ran there.
+_NOT_STARTED = re.compile(r"^(refused|cwd does not exist|command is required|a relayed job must)", re.I)
+
+
+def start_failed(base: Path, entry: dict, res: dict, device: str) -> dict:
+    """The start request's answer when it carries no job_id. A request the Mac may have acted on (claimed but no
+    answer, interrupted, an unreachable backend after sending) stays open in the ledger: resending it is refused
+    and the answer says how to find its outcome."""
+    out = {**res, "ok": False, "device": device}
+    error = str(res.get("error") or "")
+    if res.get("code") == "not_picked_up" or res.get("status") == "failed" or _NOT_STARTED.match(error):
+        ledger_close(base, entry, "final", "not_started")
+        return out
+    rid = entry["request_id"]
+    out["job_id"] = rid
+    out["note"] = (f"`{device}` may have started this command (request {rid}) and its answer did not come back. "
+                   f"Do not resend it. Call run_in_user_terminal with job_id {rid} to read its outcome; calling "
+                   f"again with the same command from this session does the same.")
+    return out
+
+
+def lost_on_mac(res: dict) -> bool:
+    error = str(res.get("error") or "")
+    return not res.get("ok") and (res.get("code") == "job_not_found" or error.startswith("unknown job_id"))
+
+
+def result_lost(job_id: str, device: str) -> dict:
+    return {"ok": False, "status": "result_lost", "code": "result_lost", "job_id": job_id, "device": device,
+            "error": (f"result lost: `{device}` has no record of job {job_id} for this gateway, so its outcome "
+                      f"cannot be read. The command may have run. Do not resend it; verify by its side effect "
+                      f"(the change it was meant to make) and report what you find. Only if you verified it did "
+                      f"not run, send it again as a new call with the command.")}
+
+
+def courier_offline(job_id: str, device: str) -> dict:
+    return {"ok": True, "status": "pending", "courier": "offline", "job_id": job_id, "device": device,
+            "note": (f"`{device}` has no Hermes Desktop connected to this gateway right now (restarting, updating "
+                     f"or asleep). The job's record and its window live on the Mac and keep going without it. Call "
+                     f"run_in_user_terminal with this job_id again later to read the result. Do not resend the "
+                     f"command.")}
+
+
+def duplicate_note(entry: dict, job_id: str) -> str:
+    sent = time.strftime("%H:%M:%SZ", time.gmtime(float(entry.get("created") or 0)))
+    return (f"Not sent again: this session already sent the same command at {sent} (request "
+            f"{entry.get('request_id')}, job {job_id}), and its outcome had not been read. This is that job's "
+            f"state. To run it again after reading this result, call again with the command.")
 
 
 def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
@@ -2860,24 +3017,48 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
             return _err("command is required (or job_id to resume waiting)")
         base = _root()
         device, err = pick_courier(base)
-        if err:
+        if err and not job_id:
             return _err(err)
+        if err:  # a resume while the Mac's Desktop is away (restarting, asleep): the job lives on the Mac
+            return json.dumps(courier_offline(job_id, configured_device() or "the owner's Mac"))
         sender = _sender(session_id)
         deadline = time.time() + wait_s
-        if not job_id:
-            res = relay_once(base, device, {"command": command, "reason": str(args.get("reason") or ""),
-                                            "cwd": str(args.get("cwd") or "")}, sender, START_RESULT_S)
-            if not res.get("ok") or not res.get("job_id"):
-                return json.dumps({**res, "ok": False, "device": device})
-            job_id, terminal = str(res["job_id"]), res.get("terminal")
+        entry: dict | None = None
+        duplicate: dict | None = None
+        terminal = None
+        if job_id:
+            entry = ledger_lookup(base, job_id)
+            if entry and entry.get("job_id"):
+                job_id = str(entry["job_id"])  # a request id the agent dug up resolves to the Mac's job
         else:
-            terminal = None
+            cwd = str(args.get("cwd") or "")
+            key = command_key(command, cwd)
+            duplicate = ledger_open_duplicate(base, sender.get("session_id") or "", key)
+            if duplicate:  # the same command from this session is still out there: poll it, never resend
+                entry = duplicate
+                job_id = str(duplicate.get("job_id") or duplicate.get("request_id"))
+            else:
+                rid = uuid.uuid4().hex
+                entry = {"request_id": rid, "job_id": None, "device": device, "session_id": sender.get("session_id") or "",
+                         "key": key, "created": time.time(), "state": "sent", "command": command[:200]}
+                ledger_put(base, entry)  # before sending: an interrupt after this point never loses the request
+                res = relay_once(base, device, {"command": command, "reason": str(args.get("reason") or ""),
+                                                "cwd": cwd}, sender, START_RESULT_S, rid=rid)
+                if res.get("job_id"):
+                    entry.update(job_id=str(res["job_id"]), state="started")
+                    ledger_put(base, entry)
+                if not res.get("ok") or not res.get("job_id"):
+                    return json.dumps(start_failed(base, entry, res, device))
+                job_id, terminal = str(res["job_id"]), res.get("terminal")
         res: dict = {}
         yielded = False
         while True:
             left = deadline - time.time()
             res = relay_once(base, device, {"job_id": job_id, "wait_s": int(max(0, min(POLL_S, left)))}, sender,
                              POLL_S + 30, yieldable=True)
+            if not res.get("ok") and res.get("code") == "not_picked_up":  # the Desktop went away mid-wait
+                res = courier_offline(job_id, device)
+                break
             yielded = bool(res.pop("yielded", False))
             if yielded or not res.get("ok") or res.get("status") in FINAL or time.time() >= deadline:
                 break
@@ -2886,9 +3067,31 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
             if _yield_requested():
                 yielded = True
                 break
-        res = {**res, "job_id": job_id, "device": device}
+        res = {**res, "job_id": res.get("job_id") or job_id, "device": device}
+        entry = entry or ledger_lookup(base, res["job_id"])
+        if lost_on_mac(res):
+            if entry:
+                ledger_close(base, entry, "lost")
+            return json.dumps(result_lost(job_id, device))
+        if entry and res.get("job_id") and entry.get("job_id") != res["job_id"]:
+            entry.update(job_id=res["job_id"], state="started")
+            ledger_put(base, entry)
+        if entry and res.get("status") in FINAL:
+            ledger_close(base, entry, "final", res.get("status"))
         if terminal:
             res["terminal"] = terminal
+        if duplicate:
+            res["not_resent"] = True
+            res["duplicate_of"] = duplicate.get("request_id")
+            note = duplicate_note(duplicate, res["job_id"])
+            if res.get("courier") == "offline":
+                note += " " + res["note"]
+            elif res.get("status") not in FINAL:
+                note += " Call run_in_user_terminal with this job_id to keep waiting."
+            res["note"] = note
+            return json.dumps(res)
+        if res.get("courier") == "offline":
+            return json.dumps(res)
         if yielded and res.get("ok") and res.get("status") not in FINAL:
             res["yielded"] = True
             res["note"] = YIELD_NOTE + f" (The window is on `{device}`.)"

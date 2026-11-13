@@ -1385,7 +1385,8 @@ export async function performUserTerminal(req, origin, conns) {
         command: String(args.command || ''),
         reason: String(args.reason || ''),
         cwd: String(args.cwd || ''),
-        origin: { gateway, gateway_label: gw?.label || '', profile: sender.profile || 'default', session_id: sender.session_id || '', title: sender.title || '' }
+        // request_id: the gateway's own request id, so it can find this job again if it lost the job_id.
+        origin: { gateway, gateway_label: gw?.label || '', profile: sender.profile || 'default', session_id: sender.session_id || '', title: sender.title || '', request_id: String(req?.id || '') }
       },
       timeoutMs: 40_000
     })

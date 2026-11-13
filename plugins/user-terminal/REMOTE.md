@@ -35,6 +35,19 @@ Invariants (each has a test in `tests_user_terminal.py` or `../session-mentions/
    under `COURIER_FRESH_S` (20 s). A failure in the Desktop's gateway-ticket step comes before the request is sent,
    so it is retried for up to 25 s. A failure after sending (`Timed out connecting…` on `start`) is never retried,
    so nothing can run twice. The result POST back to the gateway is retried, because it is keyed by request id.
+6. A relayed command is never sent twice and its outcome is never reported as "unknown"
+   (`test_reconnect_running_job_polls_pending_then_real_result`, `test_unanswered_start_is_never_sent_twice`,
+   `test_record_really_lost_says_result_lost_not_unknown_job_id`, `test_lost_job_id_is_found_by_its_request_id`):
+   - The gateway records every start in `<root>/cache/user-terminal-relayed/<request id>.json` before sending it
+     (request id, the Mac's job_id once it answers, session, hash of command + cwd).
+   - The courier passes its request id to the Mac (`origin.request_id`), so the Mac's `/status` finds a job by
+     job_id or by request id, and a retried `/start` of the same request returns the existing job.
+   - A resume while the Mac's Desktop is away (restarting, updating, asleep), or a status poll nobody claims,
+     returns `ok: true, status: pending, courier: offline`: the job and its window live on the Mac.
+   - The same command (same cwd) from the same session while an earlier start is still open (its final status
+     was never read) polls that start (`not_resent: true`) instead of opening a second window.
+   - A poll for a job the Mac has no record of says `result lost: … The command may have run. Do not resend
+     it; verify by its side effect`, never `unknown job_id`.
 
 - Owned-prompt withdrawal is not relayed: `action: withdraw` on a screenless gateway returns an error (never a
   silent resume). The Mac's job-local watchdog still withdraws a relayed job after `user_terminal.max_wait_minutes`
@@ -97,4 +110,27 @@ Countermeasures:
   test_window_shows_origin_and_neutralises_escapes, test_no_courier_errors_immediately.
 - detection: the bot's SOUL/instructions carry the "owner-only or Mac-only commands go through
   run_in_user_terminal, never 'run this yourself'" rule.
+```
+
+### Why the relayed job record looked lost (2026-11-13, t_01a1d40fc0dda5c3)
+
+```
+Problem: hub session 20261111_200009_edbe39 polled a relayed Terraform apply with job_id 684589fa… and got
+  "unknown job_id"; the real result (ran, exit 0, 07:57:50Z) never came back, and the reply read as "never ran".
+Why 1: 684589fa… was the courier request id (session_mentions/claimed/<id>.json), not a Mac job id
+  (YYYYmmdd-HHMMSS-xxxxxx). The Mac's job 20261112-230727-c18e35 (origin hub-ec2, that session) existed the whole
+  time; relayed_status only matched job dir names.
+Why 2: the agent no longer had the real job_id. The tool had returned {"error": "interrupted",
+  "job_id": "20261112-230727-c18e35"} at 07:08:32Z (hub agent.log), but the transcript holds
+  "[interrupted by Hermes update at 07:08:31Z: re-run if still needed]".
+Why 3: core's mid-tool update cancel (agent/update_pause_cancel.committed) stamps that text over every
+  cancelled call's real result; only a terminal job handed to the background keeps its own.
+Root (happened): a tool result's resume handle is discarded by the update-pause cancel, and nothing on the
+  gateway kept the request -> job mapping, so the only id left was the courier request id.
+Root (not caught): "unknown job_id" is the same text for "never existed" and "record exists, wrong id", and no
+  test covered a cancelled or reconnecting relay.
+Not the cause: the Desktop restart (quit 23:09 local, back 23:45; the job dir and its detached watchdog
+  survived) or the courier reconnect; the hub never stores job records.
+Countermeasures: invariant 6 above (ledger, request-id lookup, offline = pending, no resend, "result lost");
+  core: keep a cancelled call's own result next to the stamp (follow-up card from t_01a1d40fc0dda5c3).
 ```
