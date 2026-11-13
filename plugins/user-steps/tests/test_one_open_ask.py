@@ -950,3 +950,66 @@ def test_menu_identity_needs_the_same_subject():
     assert core.same_lettered_menu(dict(STEP_64AE), ask)
     assert not core.same_lettered_menu({**STEP_64AE, 'text': 'Pick babybear CI option A, B, or C'}, ask)
     assert core._subject('Pick macOS CI option A, B, or C (B recommended)') == {'macos', 'ci'}
+
+
+# ---- re-review of PR #93 (card t_01a1d6b234acd4ac): the subject anchor must read the evidence, not only the text --
+
+_R2_T1 = 'hermes-mods macOS CI: A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini runner (free)?'
+_R2_T2 = ('babybear macOS CI, a separate budget line: A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini '
+          'runner (free)?')
+
+
+@pytest.mark.parametrize('text,t1,t2', [
+    pytest.param('Pick the macOS CI runner',
+                 'For hermes-mods, which macOS CI runner do you want? A: Blacksmith macOS runner (~$120/mo), B: '
+                 'self-hosted mini runner (free).',
+                 'For babybear, which macOS CI runner do you want? A: Blacksmith macOS runner (~$120/mo), B: '
+                 'self-hosted mini runner (free).', id='p1-repo-named-only-in-the-evidence'),
+    pytest.param('Pick the macOS runner', _R2_T1, _R2_T2, id='p1b-r2-evidence-generic-text'),
+    pytest.param('Pick the macOS CI runner',
+                 'For hermes-mods:\nWhich one? A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini runner (free).',
+                 # (an identical evidence sentence is main's same-sentence rule, so the second one is worded apart)
+                 'For babybear:\nWhich one do you want? A: Blacksmith macOS runner (~$120/mo), B: self-hosted mini '
+                 'runner (free).', id='p1c-repo-named-before-a-bare-menu-sentence'),
+])
+def test_the_same_generic_step_text_for_two_repos_named_in_the_evidence_is_a_new_ask(tmp_path, text, t1, t2):
+    span2 = t2.split('\n')[-1]
+    store = _two_replies(tmp_path, t1, {'text': text, 'kind': 'choose', 'options': _RUNNER_MENU,
+                                        'verbatim_span': t1.split('\n')[-1]},
+                         t2, {'text': text, 'kind': 'choose', 'options': _RUNNER_MENU, 'verbatim_span': span2})
+    assert len(live(store)) == 2, [r['title'] for r in live(store)]
+
+
+def test_a_reminder_that_names_only_the_open_asks_words_reuses_it(tmp_path):
+    # Positive twin: the same reply as p1, restated for hermes-mods, is the open tile.
+    t1 = ('For hermes-mods, which macOS CI runner do you want? A: Blacksmith macOS runner (~$120/mo), B: self-hosted '
+          'mini runner (free).')
+    t2 = 'The hermes-mods macOS CI runner pick still needs you.'
+    store = _two_replies(tmp_path, t1, {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': _RUNNER_MENU,
+                                        'verbatim_span': t1},
+                         t2, {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': _RUNNER_MENU,
+                              'verbatim_span': t2})
+    assert len(live(store)) == 1
+
+
+def test_evidence_names_only_open_reads_the_sentence_then_the_lead():
+    ask = {'id': 'r1', 'kind': 'choice', 'title': 'Pick macOS CI option', 'labels': [], 'scope': 'hermes-mods macOS CI',
+           'step': {'id': 'us_r1', 'text': 'Pick the macOS CI runner', 'options': list(_RUNNER_MENU),
+                    'verbatim_span': 'x'}}
+    step = {'text': 'Pick the macOS CI runner', 'kind': 'choose', 'options': list(_RUNNER_MENU)}
+    assert core._evidence_names_only_open({**step, 'verbatim_span': 'Two macOS CI choices still need you.'}, ask)
+    assert not core._evidence_names_only_open({**step, 'verbatim_span': 'The babybear macOS CI pick still needs you.'},
+                                              ask)
+    bare = 'Which one? A: Blacksmith macOS runner, B: self-hosted mini runner.'
+    assert core._evidence_names_only_open({**step, 'verbatim_span': bare}, ask, 'For hermes-mods:\n' + bare)
+    assert not core._evidence_names_only_open({**step, 'verbatim_span': bare}, ask, 'For babybear:\n' + bare)
+
+
+def test_a_card_ask_quoted_by_two_open_scopes_maps_onto_neither():
+    # Scope identity needs exactly one open request, like menu identity.
+    text = f'The tests-os card still asks: {TESTS_OS_ASK}'
+    asks = [{'id': rid, 'kind': 'choice', 'title': 'Pick macOS test CI', 'labels': [], 'step': None,
+             'scope': NEEDS_YOU_1108} for rid in ('r1', 'r2')]
+    cand = {**STEP_60B8, 'verbatim_span': text}
+    assert core.same_open_ask(cand, asks[:1], reply=text)['id'] == 'r1'
+    assert core.same_open_ask(cand, asks, reply=text) is None

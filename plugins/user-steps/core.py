@@ -1901,11 +1901,13 @@ def _same_label(a: set, b: set) -> bool:
     return len(shared) >= _LABEL_SHARED_MIN and len(shared) / min(len(a), len(b)) >= _LABEL_MATCH
 
 
-def same_lettered_menu(candidate: dict, ask: dict) -> bool:
+def same_lettered_menu(candidate: dict, ask: dict, reply: str = "") -> bool:
     """(i) A choose step whose lettered menu is the open choice's own: the same letters, each label sharing at least
     two of its specific words (``_lettered_menu`` / ``_same_label``). Generic menus (yes/no, approve/decline, labels
     that differ only in a one-word target) never match. The open side is its extracted step's options, else the
-    request's choice labels. ``same_open_ask`` also requires that exactly one open choice matches."""
+    request's choice labels. The step's text must name the open ask's subject, and its evidence may name nothing
+    the open ask never mentions (``_evidence_names_only_open``). ``same_open_ask`` also requires that exactly one
+    open choice matches."""
     if candidate.get('kind') != 'choose' or ask.get('kind') != 'choice':
         return False
     mine = _lettered_menu(candidate.get('options'))
@@ -1917,7 +1919,50 @@ def same_lettered_menu(candidate: dict, ask: dict) -> bool:
     # A menu says nothing about the subject (the same runner menu for two repos, "go ahead today / hold off" for
     # two projects): the step's subject must also be the open ask's own, word for word.
     subject = _subject(candidate.get('text'))
-    return bool(subject) and subject in (_subject(step.get('text')), _subject(ask.get('title')))
+    if not (subject and subject in (_subject(step.get('text')), _subject(ask.get('title')))):
+        return False
+    # The step text is the extractor's summary: two repos named only in the evidence can get one generic text
+    # ("Pick the macOS CI runner" for hermes-mods and for babybear). The evidence itself must name nothing new.
+    return _evidence_names_only_open(candidate, ask, reply)
+
+
+# Reminder and question words that name no subject ("Two macOS CI choices still need you." -> {macos, ci}).
+# "separate", "different", "another" are deliberately absent: they announce a new subject.
+_EVIDENCE_STOP = _SUBJECT_STOP | frozenset("""need needs needed still waiting waits left remain remains remaining
+    pending open two three four both each every more question questions decision decisions ask asks asked want
+    wants like prefer would could can will shall may might please here there tell let know thing things same
+    again reminder note there's it's that's i'd i'm you're we're has have had been being was were are am""".split())
+
+
+def _naming_words(text, drop: set) -> set:
+    """Words of ``text`` that could name a subject: no stop words, no menu-label words (``drop``), plural-folded."""
+    return {_fold(w) for w in _label_words(str(text or "")) if len(w) > 1 and w not in _EVIDENCE_STOP} - drop
+
+
+def _fold(w: str) -> str:
+    return w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
+
+
+def _evidence_names_only_open(candidate: dict, ask: dict, reply: str = "") -> bool:
+    """Every naming word of the step's evidence sentence is in the open ask's title, step text, evidence, labels or
+    frozen scope. A sentence that names nothing of its own (\"Which one? A: ..., B: ...\") is read with the text
+    before it in its paragraph (\"For babybear: ...\")."""
+    step = ask.get('step') if isinstance(ask.get('step'), dict) else {}
+    labels = [str(o or "") for o in list(candidate.get('options') or ()) + list(step.get('options') or ())
+              + list(ask.get('labels') or ())]
+    drop = {_fold(w) for o in labels for w in _label_words(_LETTERED.sub(r"\2", o))}
+    known = _naming_words(" ".join(str(x or "") for x in (
+        ask.get('title'), ask.get('scope'), step.get('text'), step.get('verbatim_span'))), set())
+    span = str(candidate.get('verbatim_span') or "")
+    names = _naming_words(span, drop)
+    if not names and reply:
+        nspan = _norm(span)
+        for para in re.split(r"\n\s*\n", reply):
+            text = _norm(para)
+            if nspan and nspan in text:
+                names = _naming_words(text[:text.find(nspan)], drop)
+                break
+    return names <= known
 
 
 def _subject(text) -> frozenset:
@@ -2011,9 +2056,11 @@ def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optiona
         return hit
     # Same decision in a LATER reply: the open tile's own lettered menu, or an ask its frozen scope already carries.
     earlier = [a for a in asks if not a.get('fresh')]
-    menus = [a for a in earlier if same_lettered_menu(candidate, a)]
-    hit = (menus[0] if len(menus) == 1 else None) or \
-        pick([a for a in earlier if inside_open_scope(candidate, a, reply)])
+    # Either rule maps only onto exactly one open ask: two equal menus or two scopes quoting the same card ask are
+    # two requests, and picking one would be a guess.
+    menus = [a for a in earlier if same_lettered_menu(candidate, a, reply)]
+    scopes = [a for a in earlier if inside_open_scope(candidate, a, reply)]
+    hit = (menus[0] if len(menus) == 1 else None) or (scopes[0] if len(scopes) == 1 else None)
     if hit:
         return hit
     mine = [a for a in asks if a['id'] in turn]

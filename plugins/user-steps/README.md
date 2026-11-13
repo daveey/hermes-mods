@@ -460,12 +460,18 @@ open, undecided request of the same session only with exact provenance:
   specific words with the open label (`same_lettered_menu`: "A: lane + jobs to Blacksmith
   (~$770/mo)" is "A: lane plus jobs (~$770/mo)"), and the step text's subject words (no
   verbs of choosing, letters or function words: "Pick macOS CI option A, B, or C" ->
-  {macos, ci}) equal the open step's text or title. Specific means not generic (yes/no,
+  {macos, ci}) equal the open step's text or title. The step text is the extractor's
+  summary, so the evidence is checked too: every naming word of the evidence sentence
+  (no reminder or question words such as "two", "still", "need", no menu-label words)
+  must appear in the open ask's title, step text, evidence or frozen scope; a sentence
+  that names nothing of its own ("Which one? A: …, B: …") is read with the paragraph
+  text before it (`_evidence_names_only_open`). Specific means not generic (yes/no,
   approve/decline, keep/change and function words are dropped) and not shared with
   another label of the same menu, so "A: yes / B: no" or "PR lane on the mini / on the
   hub" against "on worker-6 / worker-7" never match. A menu alone names no subject: the
   same runner or "go ahead today / hold off" menu for two repos or projects stays two
-  tiles;
+  tiles, even when the extractor gives both the same generic text ("Pick the macOS CI
+  runner") and only the evidence names the repo;
 - in a LATER reply, the step's paragraph quotes (`"…"`, 40+ characters) a card ask that
   the frozen scope markdown of an open request of the same kind quotes too, the quote
   carries its own specific lettered menu ("A) PR lane on the mini, B) scheduled
@@ -474,7 +480,8 @@ open, undecided request of the same session only with exact provenance:
   the quote), or the quote carries every label of the step's menu and the evidence
   sentence asks nothing of its own (`inside_open_scope`). Quoted boilerplate ("If you
   approve, …; if you decline, nothing changes.") carries no menu and never counts, nor
-  does a bare scope sentence. Live chat ..f07c32: a bare "Two macOS CI choices still
+  does a bare scope sentence. Both rules map only when exactly one open request
+  matches (two scopes quoting one card ask, or two equal menus, map onto neither). Live chat ..f07c32: a bare "Two macOS CI choices still
   need you." and the restated second question each minted a tile beside the open
   request that held both picks;
 - the request was published or revised by the `action_request` tool in this very turn
