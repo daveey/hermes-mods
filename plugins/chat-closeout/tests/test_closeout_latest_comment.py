@@ -76,3 +76,53 @@ def test_replica_fill_fails_open(tmp_path, monkeypatch):
     key = 'hub/default/default/t_7e2ee45c'
     cards = {key: _remote()}
     assert plugin._with_latest_comments({'batch': [key]}, cards)[key].get('last_comment') is None
+
+
+# ---- the real prompts: pre_llm_call and the wake tick fill the latest comment (mutants C5-C7 of 2910162d) -------
+KEY = 'hub/default/default/t_7e2ee45c'
+
+
+def _hub(tmp_path, monkeypatch, comments):
+    hub = _replica(tmp_path / 'hub.db', [
+        ('hub', 'default/default/t_7e2ee45c', {'id': 't_7e2ee45c', 'status': 'archived', 'last_comments': comments})])
+    monkeypatch.setattr(plugin, 'hub_db_path', lambda: hub)
+    led = core.Ledger(tmp_path / 'ledger.db')
+    monkeypatch.setattr(plugin, 'ledger', lambda: led)
+    led.write('chat', batch=[KEY], open=[])
+    return led
+
+
+def test_pre_llm_call_brief_shows_the_latest_comment_of_a_remote_card(tmp_path, monkeypatch):
+    _hub(tmp_path, monkeypatch, [{'author': 'hub:gw:macbook', 'body': DECISION, 'at': 1794441600}])
+    monkeypatch.setattr(plugin, '_eligible', lambda *a, **k: True)
+    monkeypatch.setattr(plugin, 'open_card_ids', lambda _: [])
+    monkeypatch.setattr(plugin, 'session_proof', lambda *a: False)  # never read the host's real transcripts
+    cards = {KEY: _remote()}
+    monkeypatch.setattr(plugin, 'read_cards', lambda _: cards)
+    out = plugin.pre_llm_call(session_id='chat')
+    assert out and 'latest comment [' in out['context'] and 'Close scoped' in out['context'], out
+    assert 'last_comment' not in cards[KEY]  # the inventory row read stays unmodified
+
+
+def test_wake_tick_brief_shows_the_latest_comment_of_a_remote_card(tmp_path, monkeypatch):
+    _hub(tmp_path, monkeypatch, [{'author': 'hub:gw:macbook', 'body': DECISION, 'at': 1794441600}])
+    monkeypatch.setattr(plugin, '_lineage', lambda sid: [sid])
+    monkeypatch.setattr(plugin, '_session_source', lambda sid: 'desktop')
+    assert plugin.ensure_upgraded(lambda ids: {}) is True
+    prompts = []
+
+    def wake(sid, prompt, **k):
+        prompts.append(prompt)
+        return 'started'
+    cards = {KEY: _remote()}
+    assert plugin.wake_tick(now=1000, wake=wake, unseen={}, last_user=lambda _: 0, read=lambda _: cards,
+                            proof=lambda *a: False)
+    assert len(prompts) == 1 and 'latest comment [' in prompts[0] and 'Close scoped' in prompts[0], prompts
+
+
+def test_blank_newest_comment_does_not_hide_the_earlier_real_one(tmp_path, monkeypatch):
+    _hub(tmp_path, monkeypatch, [{'author': 'hub:gw:macbook', 'body': DECISION, 'at': 1794441600},
+                                 {'author': 'default', 'body': '  \n ', 'at': 1794441700}])
+    out = plugin._with_latest_comments({'batch': [KEY]}, {KEY: _remote()})
+    assert out[KEY]['last_comment']['body'] == DECISION, out[KEY]
+    assert 'Close scoped' in core.closeout_prompt({'batch': [KEY]}, out, now=1794500000)
