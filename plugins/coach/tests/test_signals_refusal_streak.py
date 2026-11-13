@@ -162,4 +162,6 @@ def test_core_fold_headers_are_automated_deliveries():
     spec.loader.exec_module(rs)
     assert rs.automated("[IMPORTANT: 3 Kanban task updates arrived while this session was busy. Each card …]")
     assert rs.automated("[IMPORTANT: 2 background process results arrived while this session was busy. Treat …]")
+    assert rs.automated("[IMPORTANT: 2 background processes completed for this session.\nTreat these results …")
+    assert rs.automated("[IMPORTANT: 2 background subagent delegations completed for this session. Treat …]")
     assert not rs.automated('[IMPORTANT: The user launched this CLI session with the "x" skill preloaded.] why?')

@@ -400,6 +400,76 @@ def test_every_core_envelope_constant_is_classified():
     assert not unclassified, f'classify in reply_check.CORE_JOB_RE or NOT_NOTICES: {unclassified}'
 
 
+# Core f-strings that only wrap a caller-built message ("[IMPORTANT: {message}]"): the rendered "[IMPORTANT: 3]"
+# says nothing; the messages they wrap are classified from core's own wording in CORE_WRAPPED_MESSAGES below.
+PASSTHROUGH_ENVELOPES = {"[IMPORTANT: 3]"}
+# tools/process_registry.py's watch_disabled / overflow `message` texts, which those wrappers deliver.
+CORE_WRAPPED_MESSAGES = (
+    "[IMPORTANT: Watch patterns disabled for process proc_1a2b — too many matches]",
+    "[IMPORTANT: Watch-pattern notifications resumed. 3 suppressed]",
+    "[IMPORTANT: Watch-pattern overflow: >3 notifications in 3s]",
+)
+
+
+def _core_envelope_fstrings():
+    """Every f-string anywhere under core's gateway/, tools/, tui_gateway/ whose leading literal opens like a
+    user-role envelope, each {value} rendered as 3: {'<path>:<line>': text}. Module constants are only half the
+    surface: core builds its batch headers inside functions (agent-93c4a84a5c follow-up, t_01a1d5420d118335)."""
+    import ast
+    root = _core_root()
+    out = {}
+    for d in ENVELOPE_DIRS:
+        for path in sorted((root / d).rglob('*.py')):
+            try:
+                tree = ast.parse(path.read_text())
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.JoinedStr) and node.values and isinstance(node.values[0], ast.Constant)
+                        and str(node.values[0].value).lstrip().startswith(ENVELOPE_OPENINGS)):
+                    continue
+                out[f'{path.relative_to(root)}:{node.lineno}'] = ''.join(
+                    str(v.value) if isinstance(v, ast.Constant) else '3' for v in node.values)
+    return out
+
+
+def _classified(text):
+    return rc.notice_turn(text) or any(text.startswith(p) for p in rc.NOT_NOTICES)
+
+
+def test_every_core_envelope_fstring_is_classified():
+    """Detection guard for envelopes built in functions: each must be a notice (full text and 40-char template head)
+    or listed in NOT_NOTICES; a pure pass-through wrapper is checked through the messages it delivers."""
+    found = _core_envelope_fstrings()
+    assert any(k.startswith('tools/process_registry_notifications.py:') for k in found), sorted(found)
+    unclassified = []
+    for k, text in found.items():
+        if text in PASSTHROUGH_ENVELOPES:
+            continue
+        if not _classified(text):
+            unclassified.append((k, text[:70]))
+        elif rc.notice_turn(text) and not rc.notice_turn(' '.join(text.split())[:40]):
+            unclassified.append((k + ' (40-char head)', text[:40]))
+    assert not unclassified, f'classify in reply_check.CORE_JOB_RE or NOT_NOTICES: {unclassified}'
+    for msg in CORE_WRAPPED_MESSAGES:
+        assert rc.notice_turn(msg) and rc.notice_turn(msg[:40]), msg
+
+
+def test_core_batch_completion_headers_are_notices():
+    """t_01a1d5420d118335: core's coalesced completion headers held replies as report_only on the 40-char head."""
+    for full in ("[IMPORTANT: 2 background processes completed for this session.",  # gateway/run_notifications.py
+                 "[IMPORTANT: 2 background processes completed. Treat these results as one batch and give one "
+                 "consolidated response; preserve failures and actionable results.]",  # tools/process_registry_notif…
+                 "[IMPORTANT: 2 background subagent delegations completed for this session. Treat these results"):
+        for ask in (full, full[:40], full + '\n\n[IMPORTANT: Background process proc_1a2b exited]'):
+            assert rc.notice_turn(ask) and rc.automation_prompt(ask), ask[:60]
+    assert rc.notice_turn('[IMPORTANT: 2 background processes compl')
+    assert rc.notice_turn('[IMPORTANT: 12 background processes com')
+    assert not rc.notice_turn('[IMPORTANT: The user launched this CLI session with the "five-whys" skill')
+    assert not rc.notice_turn('[IMPORTANT: 2 background processes? why are they still running')
+    assert not rc.notice_turn('Why did [IMPORTANT: 2 background processes completed] show up?')
+
+
 # ── resume preambles (agent-6b76c58161) ──────────────────────────────────────────────────────────────────────
 # Core wraps a resumed turn's real request in a "[System note: …]" preamble. The coach's template detector keys on
 # the ask's opening, so it must see the request, not the preamble. Built from core's own builders: a new or reworded

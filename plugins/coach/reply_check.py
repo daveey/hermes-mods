@@ -2907,9 +2907,29 @@ CROSS_SESSION_RE = re.escape(CROSS_SESSION_HEADER) + r"(?:\s|\])"
 # the 40-char template head ("…updates arrive", "…results"), so only "arrived" or a truncation of it at the very end
 # counts (agent-93c4a84a5c: report_only holds on a folded Kanban wake were filed as a template misfire).
 # test_every_core_envelope_constant_is_classified scans core for every such module-level envelope constant.
+#
+# Core's coalesced completion headers, built in f-strings inside functions (gateway/run_notifications.py
+# "[IMPORTANT: N background processes completed for this session." / "… background subagent delegations completed …",
+# tools/process_registry_notifications.py "[IMPORTANT: N background processes completed. Treat …"), core's MCP reload
+# note (gateway/run_turn.py) and the watch_disabled/overflow messages its "[IMPORTANT: {message}]" wrappers deliver
+# (tools/process_registry.py). The 40-char head cuts the batch header mid-word ("…processes compl"), so the tail
+# is the whole phrase or a cut of it at the very end (t_01a1d5420d118335: report_only holds on a batch notice).
+# test_every_core_envelope_fstring_is_classified scans core's f-strings for every such envelope.
+
+
+def _full_or_cut(phrase: str) -> str:
+    """`phrase` as a whole word run, or any leading cut of it that ends the text (a 40-char template head)."""
+    cuts = "|".join(re.escape(phrase[:i]) for i in range(len(phrase) - 1, 0, -1))
+    return rf"(?:{re.escape(phrase)}\b|(?:{cuts})?$)"
+
+
 CORE_JOB_RE = (r"\[ASYNC DELEGATION (?:BATCH COMPLETE|COMPLETE|TASK FAILED) — "
                r"|\[IMPORTANT: \d+ (?:Kanban task updates|background process results)"
                r"(?: arrived\b|\s?(?:a|ar|arr|arri|arriv|arrive)?$)"
+               r"|\[IMPORTANT: \d+ background(?:" + _full_or_cut(" processes completed") + "|"
+               + _full_or_cut(" subagent delegations completed") + ")"
+               r"|\[IMPORTANT: MCP servers have been" + _full_or_cut(" reloaded") +
+               r"|\[IMPORTANT: Watch(?:-pattern | patterns )"
                r"|\[IMPORTANT: Background process \S+(?:\s|$)"
                r"|\[Background process \S+ heartbeat\b"
                r"|\[System note: background job results")
@@ -2929,6 +2949,8 @@ NOT_NOTICES = {
     "[Your active task list": "todo list re-injected after compaction, not a new ask",
     "[Planning state preserved": "planning state re-injected after compaction, not a new ask",
     "[OUT-OF-BAND": "David's own mid-turn steering message: judged as a live human ask",
+    '[IMPORTANT: The "': "skill auto-load preamble (gateway/run_turn_prepare.py) before David's own words, like the CLI "
+                         "skill preload: the turn stays his ask",
     "Cronjob Response:": "cron output delivered to a messaging platform, never a chat's user turn reply_check judges",
 }
 
