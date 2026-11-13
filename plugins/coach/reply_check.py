@@ -3941,6 +3941,27 @@ STRONG_REPORT_ONLY_SRC = ("confirm", "closed_owner", "unverified_owner")
 NEW_CLAIM_RULES = ("merge_forecast", "pr_state_claim")
 
 
+def outcome_error(exc: BaseException, judge_error: bool, judged: bool) -> dict:
+    """coach-1b2ea7d9a7: the outcome record for a re-check that raised, typed so the collector can tell a judge
+    outage from a crash. judge_error (the exception came out of the judge/second-opinion model call itself, e.g.
+    SubscriptionQuotaUnavailable): evidence "judge unavailable: <Type>: <msg>", never filed (signals.unjudged_outcome
+    class judge_unavailable, like reply_skipped). Otherwise the re-check code crashed: "outcome check failed: <Type> at
+    <file:line>: <msg>", filed as coach defect class check_failed:<Type>. Both carry error=<Type> and `trace`, the last
+    3 traceback frames ("file:line in func"), which the caller logs as a nudge_outcome_error event."""
+    import traceback
+    name = type(exc).__name__
+    msg = " ".join(str(exc).split())[:200]
+    frames = traceback.extract_tb(exc.__traceback__)[-3:]
+    trace = [f"{os.path.basename(f.filename)}:{f.lineno} in {f.name}" for f in frames]
+    if judge_error:
+        ev = f"judge unavailable: {name}" + (f": {msg}" if msg else "")
+    else:
+        at = f" at {os.path.basename(frames[-1].filename)}:{frames[-1].lineno}" if frames else ""
+        ev = f"outcome check failed: {name}{at}" + (f": {msg}" if msg else "")
+    return {"p": None, "resolved": None, "evidence": ev, "judged": judged, "error": name, "trace": trace,
+            **({"judge_error": True} if judge_error else {})}
+
+
 def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
                   threshold: float = 0.8, thresholds: Optional[dict] = None,
                   wake: Optional[Callable[[], list]] = None, kanban_down: Optional[bool] = None,
@@ -3999,7 +4020,11 @@ def _rule_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
 
     def judge(system: str, prompt: str) -> str:
         seen["called"] = True
-        raw = llm(system, prompt)
+        try:
+            raw = llm(system, prompt)
+        except Exception as exc:  # coach-1b2ea7d9a7: a judge outage (quota out) is not a broken re-check
+            seen["judge_exc"] = exc
+            raise
         seen["v"] = parse_verdict(raw)
         return raw
 
@@ -4008,7 +4033,11 @@ def _rule_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
             seen["scored"] = event
 
     def second() -> Optional[tuple]:
-        seen["c2"] = confirm() if confirm is not None else None
+        try:
+            seen["c2"] = confirm() if confirm is not None else None
+        except Exception as exc:  # the second-opinion model call: same class as the screen judge
+            seen["judge_exc"] = exc
+            raise
         return seen["c2"]
     try:
         hit = check(reply, user_ask, tool_log, judge, threshold=threshold, only=[rule], thresholds=thresholds,
@@ -4016,8 +4045,8 @@ def _rule_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
                     confirm=second if confirm is not None else None, confirm_floor=confirm_floor,
                     human_confirm_floor=human_confirm_floor, report_only_fallback=report_only_fallback, audit=audit,
                     deny_quoted=True)
-    except Exception:
-        return {"p": None, "resolved": None, "evidence": "outcome check failed", "judged": seen["called"]}
+    except Exception as exc:
+        return outcome_error(exc, judge_error=exc is seen.get("judge_exc"), judged=seen["called"])
     sc = seen["scored"] or {}
     src = {}
     if rule == "report_only":
