@@ -391,8 +391,14 @@ _WAKE_PENDING_RE = re.compile(r"task=(?:[\w,]*?)(t_[0-9a-zA-Z_]+)\b[^|]*?\bwake=
 
 def owner_wake_pending(reply: str, tool_log: Optional[list] = None, user_ask: str = "") -> list[str]:
     """Card ids the reply (or, when it names none, the user's ask) names whose owner line in `tool_log` shows a
-    pending timed wake. Empty when none."""
+    pending timed wake. Empty when none.
+    agent-93c5dbebae (round 2): also the cards the coach resolved for "the fix card" (tail_card_ids: the notice
+    card's open dependents, a board read's ids), since that reply names neither the owner nor does its ask."""
     named = set(NAMED_CARD_RE.findall(reply or "")) or set(NAMED_CARD_RE.findall(user_ask or ""))
+    try:
+        named |= set(tail_card_ids(reply, tool_log, user_ask)[0])
+    except Exception:
+        pass
     out: list[str] = []
     for line in tool_log or []:
         s = (line or "").lstrip()
@@ -606,7 +612,10 @@ def turn_card_ids(tool_log: Optional[list]) -> list[str]:
 # `<- OK` line). Every owner lookup above keys on a `t_…` id, so the judges got owner_source=none and held a true
 # reply twice at p 0.9. A reply ending that names PRs and no card id now resolves them to cards (last fallback).
 PR_REF_RE = re.compile(r"(?:\bPRs?\s*#?\s*|(?<![\w#/&])#|/pull/)(\d{2,6})\b", re.I)
-_BOARD_READ_RE = re.compile(r"kanban\.db\b|sync-shadow/")
+# agent-93c5dbebae (round 2): also `'kan' + 'ban.db'`, board table names, and a CARDS line marked `(board read)`
+# (agent_rules.card_read_line: a result printing a card's board row).
+_BOARD_READ_RE = re.compile(r"kanban\.db\b|sync-shadow/|ban\.db\b|\btask_(?:events|links|runs|comments)\b"
+                            r"|\(board read\)")
 
 
 def _pr_text_re(n: str):
@@ -781,6 +790,40 @@ def owner_pr_telemetry(reply: str, tool_log: Optional[list] = None) -> dict:
     return {"owner_pr_ids": prs, "owner_pr_resolved": len(pr_owner_card_ids(tail, tool_log))}
 
 
+def open_child_card_ids(parents: list) -> list[str]:
+    """Open (not done/archived) cards that depend on any of `parents` (task_links children), on this host's boards
+    and replicas, newest first, at most NAMED_CARD_MAX. [] on any read failure (fail-open, read-only)."""
+    out: list[str] = []
+    parents = [p for p in dict.fromkeys(parents or []) if NAMED_CARD_RE.fullmatch(str(p))]
+    if not parents:
+        return out
+    try:
+        ar = _cache.load_sibling(_HERE, "agent_rules")
+        paths = list(ar.board_dbs()) + list(ar.shadow_dbs())
+    except Exception:
+        return out
+    marks = ",".join("?" * len(parents))
+    for path in paths:
+        try:
+            conn = ar._board_connect(path)
+            try:
+                rows = conn.execute(
+                    "select l.child_id from task_links l join tasks t on t.id=l.child_id where l.parent_id in "
+                    f"({marks}) and t.status not in ('done','archived') order by t.created_at desc limit ?",
+                    (*parents, NAMED_CARD_MAX)).fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            continue
+        for (cid,) in rows:
+            cid = str(cid)
+            if cid not in out and cid not in parents:
+                out.append(cid)
+        if len(out) >= NAMED_CARD_MAX:
+            break
+    return out[:NAMED_CARD_MAX]
+
+
 def tail_card_ids(reply: str, tool_log: Optional[list] = None, user_ask: str = "") -> tuple[list[str], bool]:
     """(ids, fallback): the unquoted card ids the reply's ending names, in order (callers cap at NAMED_CARD_MAX).
     When it names none: the cards `user_ask` names (agent-b22d5f6bb5), else, when it refers to "the card", the cards
@@ -801,7 +844,13 @@ def tail_card_ids(reply: str, tool_log: Optional[list] = None, user_ask: str = "
         # the turn-touched and PR-resolved cards, after the ask's.
         ref = bool(CARD_REF_RE.search(reply_tail))
         if ref or tail_pr_ids(reply_tail):
-            for cid in (turn_card_ids(tool_log) if ref else []) + pr_owner_card_ids(reply_tail, tool_log):
+            ask_ids = list(ids)
+            # agent-93c5dbebae (round 2): "the fix card" after a done notice for its review card. The owner waited
+            # on that card, so the board's own dependency graph names it: the open task_links children, ranked
+            # before the turn-touched and PR-resolved guesses so the NAMED_CARD_MAX cap never drops them.
+            extra = open_child_card_ids(ask_ids)
+            extra += (turn_card_ids(tool_log) if ref else []) + pr_owner_card_ids(reply_tail, tool_log)
+            for cid in extra:
                 if cid not in ids:
                     ids.append(cid)
         return ids[:NAMED_CARD_MAX], True

@@ -2635,23 +2635,38 @@ CARD_READ_MAX = 8
 _CARD_READ_ID_RE = re.compile(r"\bt_[0-9a-f]{8,}\b")
 _CARD_READ_DB_RE = re.compile(r"kanban\.db\b|sync-shadow/")
 _CARD_READ_RESULT_SCAN = 20000
+# agent-93c5dbebae (round 2): the owner read was a heredoc python script spelling the db `'kan' + 'ban.db'`, so no
+# `kanban.db` appeared anywhere and the read counted as none. A board read is also recognised by the db's tail
+# (`ban.db`), a board table name in the argument, or a result printing a card's row (`t_… ('scheduled', 700, None)`);
+# its CARDS line then ends `(board read)` (reply_check._BOARD_READ_RE).
+BOARD_READ_MARK = "board read"
+_CARD_READ_BOARD_ARG_RE = re.compile(r"ban\.db\b|\btask_(?:events|links|runs|comments)\b")
+_CARD_READ_BOARD_ROW_RE = re.compile(
+    r"\bt_[0-9a-f]{8,}\b['\"]?[\s,:|=]{0,3}[(\[]?\s*['\"]?(?:triage|todo|ready|running|scheduled|blocked|review|"
+    r"done|archived)['\"]?\s*[,)\]]")
 
 
 def card_read_line(arg: str, result: Any = None, ok: bool = True, cap: int = TURN_LOG_ARG_CAP) -> Optional[str]:
-    """The `   <- CARDS read: ...` line for a call whose full `arg` reads a board db or names card ids, when the
-    `->` line's first `cap` chars do not already show every id and db it names; None otherwise."""
+    """The `   <- CARDS read: ...` line for a call whose full `arg` reads a board db or names card ids (or whose result
+    prints a card's board row), when the `->` line's first `cap` chars do not already show every id and db it names;
+    None otherwise."""
     if not isinstance(arg, str):
         return None
     dbs = list(dict.fromkeys(m.group(0) for m in _CARD_READ_DB_RE.finditer(arg)))
     ids = list(dict.fromkeys(_CARD_READ_ID_RE.findall(arg)))
-    if not dbs and not ids:
-        return None
+    text = ""
     if ok and result is not None:
         try:
             text = result if isinstance(result, str) else json.dumps(result, default=str)
         except Exception:
             text = str(result)
-        ids += [c for c in dict.fromkeys(_CARD_READ_ID_RE.findall(text[:_CARD_READ_RESULT_SCAN])) if c not in ids]
+        text = text[:_CARD_READ_RESULT_SCAN]
+    if not dbs and (_CARD_READ_BOARD_ARG_RE.search(arg) or _CARD_READ_BOARD_ROW_RE.search(text)):
+        dbs.append(BOARD_READ_MARK)
+    if not dbs and not ids:
+        return None
+    if text:
+        ids += [c for c in dict.fromkeys(_CARD_READ_ID_RE.findall(text)) if c not in ids]
     shown = arg[:cap]
     if not ids or (all(c in shown for c in ids) and all(d in shown for d in dbs)):
         return None
