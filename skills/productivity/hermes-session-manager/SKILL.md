@@ -103,8 +103,10 @@ say what's running, never what needs the user.
   worker capability, or a check that really is hub-local. Then push the capability fix or split out the hub-only
   part. "It needs the hub" is a claim you must back with evidence. A `scheduled` card whose awaited review or parent just finished can be
   `kanban_unblock`ed at once instead of waiting out its wake interval. Before saying when a `scheduled` card
-  wakes, read its `wake_episode_started` event's `cmd` (its `wake_check`): `SCHEDULED_UNTIL` is only the backstop
-  when a check on the producer wakes it sooner. Report "wakes when <producer> finishes" and name that producer's
+  wakes, read the `status:` wake line of `hermes kanban show` (`wakes when `<cmd>` passes …, backstop T`; `--json`
+  `.wakes`, the kanban_show tool's `wakes`/`Wakes:`). Core builds before that line exists: read the `wake check:`
+  field. Quote the backstop time only when no check is armed: a check on the producer wakes it sooner. Report
+  "wakes when <producer> finishes" and name that producer's
   live heartbeat; don't quote the backstop time as the next step or add a redundant link that changes nothing.
 - For a completion sweep ("get all sessions green"), inspect each remaining deliverable and why it stopped,
   then resolve authorized asks and resume concrete work. If a recipient only relays the instruction back,
