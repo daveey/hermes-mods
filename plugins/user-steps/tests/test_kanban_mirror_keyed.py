@@ -148,6 +148,26 @@ def test_a_deferred_pass_is_not_memoized(keyed, monkeypatch):
     assert not runs(k)
 
 
+def test_rejected_publication_is_retried_with_unchanged_inputs(keyed, monkeypatch):
+    k = keyed
+    real = k.mirror._publish
+
+    def reject(*args):
+        raise core.ActionError("publication conflict", 409)
+
+    before = k.mirror._key(OWNER, True)
+    monkeypatch.setattr(k.mirror, "_publish", reject)
+    assert runs(k)
+    assert k.store.requests(OWNER) == []
+    assert k.mirror._key(OWNER, True) == before
+
+    monkeypatch.setattr(k.mirror, "_publish", real)
+    assert runs(k)  # removing the failure changes no keyed input
+    assert len(k.store.requests(OWNER)) == 1
+    settle(k)
+    assert not runs(k)
+
+
 def test_receipt_on_a_bound_card_that_left_blocked_moves_the_key(keyed):
     k = keyed
     settle(k)
