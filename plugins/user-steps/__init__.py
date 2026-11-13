@@ -474,10 +474,11 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
              if r['kind'] == 'approval' and r['state'] == 'open' and r['scope']['complete'] and not r.get('resolution')
              and {'approve', 'revise', 'decline'} <= {c['effect'] for c in r['choices']}}
     mapped: dict = {}
+    relayed = {r.get('id') for r in res.get('repeats') or () if isinstance(r, dict)} & {e['id'] for e in card_asks}
 
     def maps(step):
         """('card', entry) / ('open', ask) when provenance maps the step (as process_reply would), else None."""
-        card = core.card_ask_for(step, card_asks, res.get('repeats') or (), final_response)
+        card = core.card_ask_for(step, card_asks, res.get('repeats') or (), final_response, relayed=relayed)
         if card is not None:
             return 'card', card
         draft = core.reply_draft_holds(session_id, step.get('kind'), step.get('text'), step.get('verbatim_span'))
