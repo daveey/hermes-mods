@@ -201,14 +201,25 @@ def test_refused_owner_wake_is_relayed_to_the_process_holding_the_chat(tmp_path)
     _owner_tick(wlog, lambda *a, **k: pytest.fail('premise already woke'), relay_refused=True, now=5000)
 
 
-def test_busy_relay_is_retried_next_pass_and_expires_with_its_claim(tmp_path):
+def test_busy_relay_is_dropped_and_its_claims_released_so_the_next_host_pass_re_decides(tmp_path):
+    """N1: a busy relayed wake is not replayed for up to CLAIM_TTL_S with a possibly stale premise. It is dropped
+    and its claims released (as ``tick``'s own busy path does), so the next host pass re-checks ``due(card)``."""
     wlog = owner_wake.WakeLog(tmp_path / 'owner-wake.db')
     _owner_tick(wlog, lambda *a, **k: 'refused', relay_refused=True)
     assert [o['result'] for o in owner_wake.take_relays(live={'chat'}, wake=lambda *a, **k: 'busy', log=wlog,
                                                          now=1030)] == ['busy']
-    assert owner_wake.take_relays(live={'chat'}, wake=lambda *a, **k: 'busy', log=wlog, now=1060)
-    assert owner_wake.take_relays(live={'chat'}, wake=lambda *a, **k: pytest.fail('expired'), log=wlog,
-                                  now=1000 + owner_wake.CLAIM_TTL_S + 1) == []
+    assert wlog.relays_for({'chat'}, 1031) == []
+    assert not wlog.fired('default/t_p', 'p1', 1031)
+    # the card unparked meanwhile: the next host pass wakes nobody
+    owner_wake.tick(cards=[], wake=lambda *a, **k: pytest.fail('card no longer due'), log=wlog,
+                    chat_info=lambda sid: {'source': 'desktop'}, supervise=lambda *a: pytest.fail('no route'),
+                    last_user=lambda sid: 0, now=1060, relay_refused=True)
+    assert owner_wake.take_relays(live={'chat'}, wake=lambda *a, **k: pytest.fail('dropped'), log=wlog,
+                                  now=1061) == []
+    # still parked: the host pass re-decides and wakes again at once (not after CLAIM_TTL_S)
+    calls = []
+    _owner_tick(wlog, lambda *a, **k: calls.append(a[0]) or 'refused', relay_refused=True, now=1090)
+    assert calls == ['chat']
 
 
 def test_without_the_lease_a_refused_owner_wake_posts_nothing(tmp_path):
@@ -222,6 +233,100 @@ def test_residual_pass_takes_owner_relays_for_its_live_chats(tmp_path, monkeypat
     _owner_tick(w.wlog, lambda *a, **k: 'refused', relay_refused=True, now=__import__('time').time())
     w.run_as('serve', held=False)
     assert w.started() == [('serve', 'chat')]
+
+
+# ---- lease handoff (N2): the new holder does not wait out what the old holder recorded for its own chats -------
+def test_new_holder_retries_its_live_chat_over_the_old_holders_refusal(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, live={'gateway': {'warm'}, 'serve': set()})
+    settled(w, 'warm')
+    assert w.run_as('serve', held=True) == 'host'  # serve held the lease; the chat is live in the gateway
+    assert w.log == [('serve', 'warm', 'refused')]
+    assert w.run_as('gateway', held=True) == 'host'  # lease handed to the gateway
+    assert w.started() == [('gateway', 'warm')]
+    w.run_as('gateway', held=True)
+    assert w.started() == [('gateway', 'warm')]  # once
+
+
+def test_new_holder_still_backs_off_its_own_refusal(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, live={'serve': {'warm'}, 'gateway': {'warm'}})
+    settled(w, 'warm')
+    w.run_as('gateway', held=True)  # refused: serve also holds it
+    w.run_as('gateway', held=True)
+    assert w.log == [('gateway', 'warm', 'refused')]
+
+
+def test_new_holder_takes_relays_the_old_holder_posted_for_its_live_chats(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, live={'gateway': {'chat'}, 'serve': set()})
+    _owner_tick(w.wlog, lambda *a, **k: 'refused', relay_refused=True, now=__import__('time').time())  # old holder
+    assert w.run_as('gateway', held=True) == 'host'
+    assert w.started() == [('gateway', 'chat')]
+    assert w.wlog.relays_for({'chat'}, __import__('time').time()) == []
+
+
+# ---- reload (N3): the previous module's lease is released, not left to core's watchdog -------------------------
+def _fresh_module(name):
+    s = importlib.util.spec_from_file_location(name, ROOT / '__init__.py')
+    m = importlib.util.module_from_spec(s)
+    m.__package__ = ''
+    s.loader.exec_module(m)
+    return m
+
+
+class FakeCtx:
+    def __init__(self):
+        self.unloads = []
+
+    def register_hook(self, *a, **k):
+        pass
+
+    def on_unload(self, cb):
+        self.unloads.append(cb)
+
+
+def _real_lease(tmp_path, monkeypatch):
+    hll = pytest.importorskip('hermes_cli.host_loop_lease')
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.delenv(hll.KILL_SWITCH_ENV, raising=False)
+    return hll
+
+
+def test_plugin_unload_releases_the_lease_so_the_reloaded_module_holds_it_at_once(tmp_path, monkeypatch):
+    _real_lease(tmp_path, monkeypatch)
+    monkeypatch.setenv('HERMES_KANBAN_TASK', 't_fixture')  # no waker thread
+    old, new = _fresh_module('closeout_reload_old'), _fresh_module('closeout_reload_new')
+    try:
+        assert old._host_lease().held()
+        ctx = FakeCtx()
+        old.register(ctx)
+        assert not new._host_lease().held()  # the old module's fd still holds the flock
+        for cb in ctx.unloads:
+            cb()
+        assert new._host_lease().held()
+    finally:
+        for m in (old, new):
+            if m._state.get('lease') is not None:
+                m._state['lease'].release()
+
+
+def test_stopped_waker_thread_releases_its_modules_lease(tmp_path, monkeypatch):
+    """A reload that only stops the old waker (``_stop_stale_threads``) also frees that module's lease."""
+    _real_lease(tmp_path, monkeypatch)
+    monkeypatch.setenv('CHAT_CLOSEOUT_FIRST_S', '3600')
+    old, new = _fresh_module('closeout_thread_old'), _fresh_module('closeout_thread_new')
+    try:
+        assert old._host_lease().held()
+        old.start_thread()
+        t_old = old._state['thread']
+        new.start_thread()  # stops the old module's thread
+        t_old.join(5)
+        assert not t_old.is_alive()
+        assert new._host_lease().held()
+    finally:
+        for m in (old, new):
+            if m._state.get('stop') is not None:
+                m._state['stop'].set()
+            if m._state.get('lease') is not None:
+                m._state['lease'].release()
 
 
 # ---- wiring -----------------------------------------------------------------------------------------------------
