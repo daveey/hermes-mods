@@ -1876,8 +1876,11 @@ def skipped_live(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
 # "in a/an/N/a few" needs a time unit: "two merges in a row" is no forecast (agent-372c9408b8).
 _MF_WHEN = (r"(?:once|as\s+soon\s+as|by|at|around|within|tonight|today|tomorrow|in\s+(?:about\s+)?(?:an?|\d+|a\s+few)"
             r"\s+(?:(?:more|couple(?:\s+of)?)\s+)?(?:min(?:ute)?s?|hours?|hrs?|days?|weeks?|bit|moment)\b)")
+# An adverb may sit between the verb and its condition: "merges right after PR #1806" (agent-aece75acd4). Not
+# "only": the backtest's "ship merges only after CI is green on that exact head" describes the gate, not a PR.
+_MF_ADV = r"(?:(?:right|just|soon|immediately|straight|directly)\s+)?"
 _MF_FORECAST_RE = re.compile(
-    r"\bmerges\s+(?:(?:when|after)\b|" + _MF_WHEN + r")|\blands\s+" + _MF_WHEN
+    r"\bmerges\s+" + _MF_ADV + r"(?:(?:when|after)\b|" + _MF_WHEN + r")|\blands\s+" + _MF_ADV + _MF_WHEN
     + r"|\b(?:will|(?:I|it|we|that|this|they)[\u2019']ll|should|is\s+(?:expected|going|due)\s+to|is\s+set\s+to)\s+"
     r"(?:auto-?)?(?:merge|land|be\s+(?:auto-?)?(?:merged|landed))\b(?![-\w])(?!\s+(?:[\w/.-]+\s+){0,2}into\b)",
     re.I)
@@ -1926,11 +1929,23 @@ _PSC_CLAIM_RE = re.compile(
     r"|\b(?:it|PR|PRs|request|that|this|which)" + _APOS + r"?s?\s+not\s+(?:yet\s+)?(?:merged|landed)\b"
     r"|\bstill\s+(?:open|unmerged|un-merged|pending\s+merge|in\s+review|waiting\s+(?:on|for)\s+(?:review|checks|CI|merge))\b"
     r"|\b(?:is|are)\s+(?:still\s+)?unmerged\b"
-    r"|\b(?:awaiting|waiting\s+to)\s+(?:merge|be\s+merged|land)\b",
+    r"|\b(?:awaiting|waiting\s+to)\s+(?:merge|be\s+merged|land)\b"
+    # Positive present state (agent-aece75acd4: "That one is approved, its checks pass" about a PR merged 2.5 h
+    # earlier; agent-fd934117b4: "#1187 is approved and waiting for its macOS check" after it merged). A check
+    # claim needs a PR-ish owner ("its/required/all 12 checks", "CI"): "the ancestry check passes" is no PR state.
+    r"|\b(?:is|are|has\s+been|have\s+been)\s+(?:now\s+|already\s+)?approved\b"
+    r"|\b(?:(?:its|their|required|all|every|both|\d+|[\w#]+" + _APOS + r"s)\s+(?:(?:\d+|required|PR|CI|GitHub)\s+){0,2}"
+    r"checks?"
+    r"|(?:required\s+)?CI(?:\s+checks?)?)"
+    r"\s+(?:all\s+)?(?:pass(?:es)?|(?:is|are)\s+(?:(?:all|now)\s+)?(?:green|passing))\b"
+    r"|\b(?:queued|lined\s+up)\s+to\s+(?:merge|land)\b|\bin\s+the\s+merge\s+queue\b"
+    r"|\bwaiting\s+(?:on|for)\s+(?:its|their|the)\s+(?:[\w.+/-]+\s+){0,3}(?:checks?|jobs?|CI|builds?)\b",
     re.I)
 _PSC_IT_RE = re.compile(r"^\W*(?:it|it" + _APOS + r"s|that|this)\b", re.I)
 # The claim sits inside a condition or reported speech: "if PR 42 isn't merged yet", "the log said it isn't merged".
-_PSC_HEDGE_RE = re.compile(r"\b(?:if|whether|unless|until|once|when|in\s+case|said|says|told|showed|shows|reported|"
+_PSC_HEDGE_RE = re.compile(r"\b(?:if|whether|unless|until|once|when|after|before|as\s+soon\s+as|in\s+case|said|says|"
+                           r"suppose|imagine|requires?|needs?\s+to\s+see|has\s+to\s+see|have\s+to\s+see|must\s+see|"
+                           r"confirm|told|showed|shows|reported|"
                            r"claimed|thought|assumed|wrote|was\s+going\s+off)\b[^.;:!?]{0,60}$", re.I)
 _PSC_READ_RE = re.compile(
     _MF_CHECK_RE.pattern + r"|\bgh\s+pr\s+(?:list|merge|create|ready)\b|\bhermes-core-wt\s+(?:ship|land|lane)\b",
@@ -1945,7 +1960,8 @@ PR_STATE_CLAIM_NUDGE = (
 
 
 def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
-    """The sentence claiming a PR's present (unmerged/open) state when this turn read no PR state, else None (code
+    """The sentence claiming a PR's present state (unmerged/open, or approved/checks green/queued) when this turn
+    read no PR state, else None (code
     spans, quotes, `>` lines, questions, conditions, reported speech and replies naming pr_state_claim are ignored)."""
     text = _CODE_QUOTE.sub(" ", reply or "")
     text = _QUOTED_RE.sub(" ", text)
@@ -3922,7 +3938,45 @@ def handoff_outcome(reply: str, user_ask: str, tool_log: list[str], llm: Callabl
 STRONG_REPORT_ONLY_SRC = ("confirm", "closed_owner", "unverified_owner")
 
 
+NEW_CLAIM_RULES = ("merge_forecast", "pr_state_claim")
+
+
 def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
+                  threshold: float = 0.8, thresholds: Optional[dict] = None,
+                  wake: Optional[Callable[[], list]] = None, kanban_down: Optional[bool] = None,
+                  human_asks: Optional[Callable[[], list]] = None, prev_turn: Optional[dict] = None,
+                  confirm: Optional[Callable[[], Optional[tuple]]] = None, confirm_floor: float = CONFIRM_FLOOR,
+                  human_confirm_floor: Optional[float] = None,
+                  report_only_fallback: str = REPORT_ONLY_FALLBACK,
+                  extra_rules: Optional[tuple] = None) -> dict:
+    """_rule_outcome (the nudged rule re-run on the revision), then the deterministic PR rules (`extra_rules`,
+    default NEW_CLAIM_RULES, minus the nudged rule) on the same revision and tool log. A revision that answers the
+    nudge but adds a stale PR claim ("merges right after PR #1806. That one is approved": agent-aece75acd4) is a
+    failed outcome: resolved=False, the claim's sentence as evidence, and new_claim={"rule", "evidence"}. No second
+    nudge and no model call: both rules are regex checks."""
+    res = _rule_outcome(rule, reply, user_ask, tool_log, llm, threshold=threshold, thresholds=thresholds, wake=wake,
+                        kanban_down=kanban_down, human_asks=human_asks, prev_turn=prev_turn, confirm=confirm,
+                        confirm_floor=confirm_floor, human_confirm_floor=human_confirm_floor,
+                        report_only_fallback=report_only_fallback)
+    fns = {"merge_forecast": merge_forecast, "pr_state_claim": pr_state_claim}
+    for r in (NEW_CLAIM_RULES if extra_rules is None else extra_rules):
+        if r == rule or r not in fns:
+            continue
+        try:
+            ev = fns[r](reply, tool_log)
+        except Exception:
+            ev = None
+        if ev:
+            res = dict(res)
+            res["new_claim"] = {"rule": r, "evidence": ev[:300]}
+            if res.get("resolved") is not False:
+                res.update(resolved=False, evidence=f"{r}: {ev[:280]}", p=1.0)
+                res.pop("unconfirmed", None)
+            break
+    return res
+
+
+def _rule_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, str], str],
                   threshold: float = 0.8, thresholds: Optional[dict] = None,
                   wake: Optional[Callable[[], list]] = None, kanban_down: Optional[bool] = None,
                   human_asks: Optional[Callable[[], list]] = None, prev_turn: Optional[dict] = None,

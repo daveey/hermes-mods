@@ -1199,7 +1199,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
     def _nudge_outcome(session_id, final_response, attempt=1, platform=""):
         """The continuation's check after this turn's reply_check nudge (any rule; attempt >= 1, or attempt 0 on a
         different reply after a mid-turn compaction): re-run that rule once on the revised reply and the turn's tool
-        log (same screen judge, thresholds and, for report_only, the same strong-model second opinion and daily cap as
+        log, plus the deterministic PR rules (merge_forecast, pr_state_claim) when enabled: a revision that adds a
+        stale PR claim fails the outcome and logs reply_nudge_outcome_new_claim (agent-aece75acd4) (same screen judge,
+        thresholds and, for report_only, the same strong-model second opinion and daily cap as
         the nudge: agent-e5b6dcf428), log a reply_nudge_outcome, never nudge again. Fail-open, but a nudge taken
         off the loop state always gets its outcome record. Self-heal files the outcome (signals.collect_coach), not
         the nudge (agent-e278947864, agent-3ba1979f34)."""
@@ -1236,7 +1238,15 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                                    confirm=_report_only_confirm(rc, session_id, ask, final_response, prev,
                                                                 ref=nid_ref, via="outcome"),
                                    confirm_floor=rc.CONFIRM_FLOOR, human_confirm_floor=rc.human_confirm_floor(plat),
-                                   report_only_fallback=cfg.get("report_only_fallback", rc.REPORT_ONLY_FALLBACK))
+                                   report_only_fallback=cfg.get("report_only_fallback", rc.REPORT_ONLY_FALLBACK),
+                                   extra_rules=tuple(r for r in rc.NEW_CLAIM_RULES
+                                                     if r in (cfg.get("rules") or rc.NEW_CLAIM_RULES)))
+            if res.get("new_claim"):
+                # agent-aece75acd4: the revision added a stale PR claim the nudged rule never looks at
+                store.log({"event": "reply_nudge_outcome_new_claim", "session_id": session_id, "rule": rule,
+                           **_ids(n), "claim_rule": res["new_claim"]["rule"],
+                           "evidence": res["new_claim"]["evidence"], "reply": (final_response or "")[:300],
+                           **({"platform": plat} if plat else {})})
             try:
                 out_ids = (rc.evidence_ids(final_response, res.get("evidence") or "", tool_log=log_lines,
                                           user_ask=ask)
