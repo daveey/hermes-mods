@@ -64,6 +64,7 @@ A `py-spy dump` is one instant: enough to see what a hung process waits on, but 
 that isn't the hot path. To attribute CPU to code, record instead:
 `sudo -n py-spy record --nonblocking --pid <pid> --duration 15 --rate 40 --format raw -o <f>` (each line is
 `frame;frame;… count`), then rank functions by their inclusive share of samples (count each function once per stack).
+To measure time a thread spends blocked on a lock or event, add `--idle`: without it py-spy drops sleeping threads' samples, so lock waits never show up.
 Use the profile to locate code, not to convert sample counts directly into CPU utilization: thread filtering,
 missed samples and nonblocking reads affect that estimate. Cross-check against the step 3 CPU-time delta.
 `<f>` may be owned by root after `sudo`; inspect ownership and use `sudo -n` to read/delete it if needed.
