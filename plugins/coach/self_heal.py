@@ -4575,13 +4575,51 @@ def corruption_incident(d: dict, now: float) -> Optional[dict]:
             "hour": int(d.get("at") or now) // 3600}
 
 
+def _this_gateway_names() -> set:
+    """Names a '<gateway>:<board>' lane board may give this host: the digest host (coach-data dir = host_name()) and
+    the Board gateway name when the board is synced. Lowercased; an unreadable Board identity adds nothing."""
+    names = {host_name().lower()}
+    try:
+        gw = _placement_evidence.home_machine()
+    except Exception:
+        gw = None
+    if gw:
+        names.add(str(gw).lower())
+    return names
+
+
+def lane_kanban_argv(board: Optional[str]) -> tuple:
+    """`hermes kanban [--board <slug>]` for a lane's board, for a comment on (or a show of) its card.
+    -> (argv, None), or (None, why) when the card is on another gateway, whose board this host's CLI cannot reach.
+    A digest-sourced lane holds '<gateway>:<board>' (hermes-hub:default), which the CLI refuses as a slug (exit 2):
+    this host's own gateway uses the board part; another gateway's card is skipped with the reason logged, never
+    commented on locally (the local board does not hold it). Reads that can use the hub replica go via card_lookup."""
+    base = ["hermes", "kanban"]
+    if not board:
+        return base, None
+    board = str(board)
+    if ":" not in board:
+        return base + ["--board", board], None
+    gw, _, slug = board.partition(":")
+    if gw.lower() not in _this_gateway_names():
+        return None, f"card is on gateway {gw}, which this host's kanban CLI cannot reach"
+    return base + (["--board", slug] if slug else []), None
+
+
+def _comment_skipped(event: str, d: dict, st: dict, card: str, why: str, store) -> None:
+    store.log({"event": event, "fingerprint": d["fingerprint"], "card": card, "ok": None, "skipped": why,
+               "board": st.get("board")})
+
+
 def _corruption_comment(d: dict, st: dict, store, runner=None) -> dict:
     card = (st.get("card") if st.get("status") in ("filed", "proposed") else st.get("fix_card"))
     card = card or st.get("fix_card") or st.get("card")
     if not card:
         return {"action": "skip", "why": "incident suppressed"}
-    board = st.get("board")
-    argv = ["hermes", "kanban"] + (["--board", board] if board else [])
+    argv, remote = lane_kanban_argv(st.get("board"))
+    if argv is None:
+        _comment_skipped("selfheal_incident_comment", d, st, card, remote, store)
+        return {"action": "skip", "card": card, "why": f"incident comment skipped: {remote}"}
     body = (f"SQLite corruption occurrence ({d['incident']['db']}, host {d['incident']['host']}): "
             f"{d.get('symptom') or ''}\n{str(d.get('details') or '')[-1500:]}")
     rc, out, err = _run(argv + ["comment", card, body], runner)
@@ -4598,7 +4636,10 @@ def _open_card_comment(d: dict, st: dict, store, runner=None) -> dict:
     card = (st.get("card") if st.get("status") in ("filed", "proposed") else st.get("fix_card")) or st.get("card")
     if not card:
         return {"action": "skip", "why": "no open card"}
-    argv = ["hermes", "kanban"] + (["--board", st["board"]] if st.get("board") else [])
+    argv, remote = lane_kanban_argv(st.get("board"))
+    if argv is None:
+        _comment_skipped("selfheal_occurrence_comment", d, st, card, remote, store)
+        return {"action": "skip", "card": card, "why": f"occurrence comment skipped: {remote}"}
     body = (f"Occurrence on {d.get('host') or '?'}: {d.get('symptom') or ''}\n"
             f"{str(d.get('details') or '')[-1500:]}")
     rc, out, err = _run(argv + ["comment", card, body], runner)
@@ -5943,7 +5984,13 @@ def sweep_inbox_steps(store=None, runner=None) -> list:
         card = st.get("card") if status == "filed" else st.get("fix_card") if status == "approved" else None
         if not card or st.get("inbox_step_noted") == card:
             continue
-        argv = ["hermes", "kanban"] + (["--board", st["board"]] if st.get("board") else [])
+        argv, remote = lane_kanban_argv(st.get("board"))
+        if argv is None:
+            if st.get("inbox_step_skipped") != card:  # logged once per card, not on every sync
+                lane.update(fp, inbox_step_skipped=card)
+                store.log({"event": "selfheal_inbox_step_noted", "fingerprint": fp, "card": card, "ok": None,
+                           "skipped": remote, "board": st.get("board")})
+            continue
         try:
             rc, out, _ = _run(argv + ["show", card, "--json"], runner)
             task = json.loads(out)["task"] if rc == 0 else None
