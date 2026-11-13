@@ -15,6 +15,6 @@ not, the gateway logs once per wall episode and reason:
 | `no-session` | lookup ran with no routing session | core bug: file a card |
 
 A Desktop chat's own provider URL (`https://chatgpt.com/backend-api/codex` for openai-codex) is not
-`endpoint`: it overrides nothing (`overrides_endpoint`). Core fix on fork branch
-`selfheal/t_01a1d5fbc022d996` (commit cf740b99ee). Repeated `Model resolution failed ... Subscription
+`endpoint`: it overrides nothing (`overrides_endpoint`). Core fix 78c49a510ba on main;
+check `git -C ~/.hermes/hermes-agent merge-base --is-ancestor 78c49a510ba HEAD`. Repeated `Model resolution failed ... Subscription
 quota unavailable` with no such WARNING means the installed core predates that fix.
