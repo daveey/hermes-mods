@@ -314,10 +314,18 @@ def _shell_segments(text):
     if segment: yield segment
 
 
+def _abbreviates(word, options):
+    # argparse may accept an unambiguous prefix of a long option; treat any
+    # prefix of a target-selecting option as that option (conservative).
+    return word.startswith("--") and len(word) > 2 and any(o.startswith(word) for o in options)
+
+
 def _resource_values(svc, op, argv):
     if (svc, op) != ("ssm", "sendcommand"):
         return None
-    if any(t.split("=", 1)[0] in {"--cli-input-json", "--cli-input-yaml", "--targets"} for t in argv):
+    if any(_abbreviates(t.split("=", 1)[0], ("--cli-input-json", "--cli-input-yaml", "--targets")) for t in argv):
+        return None
+    if any(t.split("=", 1)[0] != "--instance-ids" and _abbreviates(t.split("=", 1)[0], ("--instance-ids",)) for t in argv):
         return None
     values = []
     for i, token in enumerate(argv):
@@ -329,7 +337,8 @@ def _resource_values(svc, op, argv):
                 values.append(value)
     # Only explicit instance ids can prove a different SSM instance. All other
     # syntax (including output substitution, lists, files and variables) is unknown.
-    return values if values and all(re.fullmatch(r"i-[0-9a-f]+", v) for v in values) else None
+    # A literal alphanumeric id is passed verbatim to AWS; compared case-insensitively.
+    return [v.lower() for v in values] if values and all(re.fullmatch(r"i-[0-9A-Za-z]+", v) for v in values) else None
 
 
 _AWS_WRAPPERS = {"env", "sudo", "doas", "command", "exec", "nohup", "nice", "ionice", "timeout", "stdbuf", "setsid",
@@ -898,9 +907,10 @@ def _py_invocations(code, depth=0):
             for service in services:
                 resources = None
                 value = next((k.value for k in node.keywords if k.arg == "InstanceIds"), None)
-                if service == "ssm" and name == "send_command" and isinstance(value, (ast.List, ast.Tuple)):
+                if service == "ssm" and name == "send_command" and isinstance(value, (ast.List, ast.Tuple)) \
+                        and not any(k.arg is None or k.arg == "Targets" for k in node.keywords):
                     values = [_literal(v) for v in value.elts]
-                    if values and all(v and re.fullmatch(r"i-[0-9a-f]+", v) for v in values): resources = values
+                    if values and all(v and re.fullmatch(r"i-[0-9A-Za-z]+", v) for v in values): resources = [v.lower() for v in values]
                 out.append((service.lower(), _norm(name), resources))
         if isinstance(node.func, ast.Attribute) and node.func.attr == "resource" and re.search(r"\bboto3\b|\bbotocore\b", code):
             # boto3 resource objects call operations through generated
@@ -1394,13 +1404,15 @@ _CD_ROOT = re.compile(r'''(?:^|[;&|(){}\s])(?:cd|pushd)(?:\s+-[LPe@]+)*(?:\s*(?:
 
 
 def _ancestor_paths():
-    roots = []
-    try:
-        roots.append(resolve_root())
-    except Exception:
-        pass
+    # An explicit ledger root (classify(root=...)) is the protected root; the
+    # account root is resolved only when none was given (production hooks).
     extra = getattr(_PY_STATE, 'ledger_root', None)
-    if extra: roots.append(Path(extra))
+    roots = [Path(extra)] if extra else []
+    if not roots:
+        try:
+            roots.append(resolve_root())
+        except Exception:
+            pass
     return {str(p) for root in roots for p in (root, *root.parents)}
 
 
@@ -3069,7 +3081,7 @@ def _resource_match(kind, text, row, cache=None):
     calls = cache[kind, text]
     matching = [resources for s, o, resources in calls
                 if row["action"] == "UNKNOWN" or _action_matches(row["action"], [(s, o)], row.get("action_kind"))]
-    return any(resources is None or _rid(row["resource"]) in resources for resources in matching)
+    return any(resources is None or _rid(row["resource"]).lower() in resources for resources in matching)
 
 
 def classify(tool_name, args, now=None, *, root=None, **native_ids):
