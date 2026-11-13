@@ -11,18 +11,27 @@ exact-head review. Two callers use this one implementation:
 Results are ``clear``, ``overlap`` (with the matching PRs) or ``unknown``. A failed, rate-limited, over-budget or
 incompletely paginated lookup is ``unknown``, never ``clear``: the publisher holds on it and retries next pass. Reads
 are bounded (request count, page caps, wall-clock deadline) and cached: the open-PR list for ``LIST_TTL`` seconds,
-each PR's files by its head sha. Stdlib only; the repository, base branch and token come from the caller.
+each PR's files by its head sha. Stdlib only; the repository and base branch come from the caller.
+
+Transports. The in-process hook reads through the host's ``gh`` (``gh_fetch``: one ``gh api --include`` per request),
+never with a raw token over urllib: on Board workers ``gh`` is worker-gh and on the Macs gh-shim, which vend per call
+and record every REST request in the github_quota ledger. A urllib call from the agent process carried the inherited
+user token unmetered (gh-conntrace ``hermes-hook-_pr`` rows, card t_01a1d3e6f40a8e39). The publisher CLI keeps
+``http_fetch`` with the token its caller hands it (the hub passes an App installation token, its own bucket).
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -72,6 +81,66 @@ def http_fetch(url: str, token: str, timeout: float):
         raise Unknown(f"GitHub lookup failed ({type(exc).__name__})") from None
 
 
+def _split_response(raw: bytes):
+    """(status or None, {lower-case header: value}, body) of ``gh api --include`` output."""
+    text = raw.decode("utf-8", "replace")
+    m = re.match(r"\s*HTTP/\S+\s+(\d{3})\b", text)
+    if not m:
+        return None, {}, text
+    sep = re.search(r"\r?\n\r?\n", text)
+    head, body = (text[:sep.start()], text[sep.end():]) if sep else (text, "")
+    headers = {}
+    for line in head.splitlines()[1:]:
+        name, colon, value = line.partition(":")
+        if colon:
+            headers[name.strip().lower()] = value.strip()
+    return int(m.group(1)), headers, body
+
+
+def gh_fetch(url: str, token: str, timeout: float):
+    """Metered transport: one ``gh api --include`` GET per request. (decoded JSON, next-page URL or None).
+
+    ``token`` is ignored: gh authenticates itself (worker-gh/gh-shim vend per call and write the quota ledger row;
+    a plain gh uses its own login). Raises Unknown on any failure: gh missing, timeout, non-zero exit (75 = the
+    quota guard refused the call at its reserve), HTTP >= 400 or a body that is not JSON."""
+    gh = shutil.which(os.environ.get("PR_OVERLAP_GH") or "gh")
+    if not gh:
+        raise Unknown("gh CLI not found (pr_overlap reads GitHub only through the metered gh)")
+    path = url[len(API) + 1:] if url.startswith(API + "/") else url
+    env = dict(os.environ, GH_PROMPT_DISABLED="1", GH_PAGER="", NO_COLOR="1", GH_NO_UPDATE_NOTIFIER="1")
+    cmd = [gh, "api", "--include", "-H", "Accept: application/vnd.github+json",
+           "-H", "X-GitHub-Api-Version: 2022-11-28", path]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=env)
+    except OSError as exc:
+        raise Unknown(f"gh could not start ({type(exc).__name__})") from None
+    try:
+        out, _err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.terminate()   # SIGTERM lets a quota supervisor stop its own child group
+        try:
+            proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+        raise Unknown("GitHub lookup failed (timeout)") from None
+    status, headers, body = _split_response(out)
+    where = path.split("?")[0]
+    if status is not None and status >= 400:
+        raise Unknown(f"GitHub HTTP {status} for {where}")
+    if proc.returncode != 0:
+        why = " (quota guard refused)" if proc.returncode == 75 else ""
+        raise Unknown(f"gh api exit {proc.returncode}{why} for {where}")
+    if status is None:
+        raise Unknown("unexpected gh api output")
+    try:
+        data = json.loads(body)
+    except ValueError:
+        raise Unknown("GitHub lookup failed (bad JSON)") from None
+    return data, _next_link(headers.get("link", ""))
+
+
 def default_token() -> str:
     tok = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
     if tok:
@@ -83,14 +152,21 @@ def default_token() -> str:
         return ""
 
 
+FILE_WORKERS = 4   # concurrent per-PR file reads: a metered gh call costs ~1.5 s of vend + supervisor start
+
+
 class Checker:
     def __init__(self, fetch: Callable = http_fetch, token: Optional[str] = None, cache_dir: Path = CACHE_DIR,
                  deadline: float = 20.0, clock: Callable[[], float] = time.monotonic,
-                 wall: Callable[[], float] = time.time, list_ttl: float = LIST_TTL):
+                 wall: Callable[[], float] = time.time, list_ttl: float = LIST_TTL, workers: int = FILE_WORKERS):
         self.fetch, self.cache_dir, self.clock, self.wall, self.list_ttl = fetch, Path(cache_dir), clock, wall, list_ttl
-        self._token = token
+        # gh_fetch authenticates through gh itself: never resolve (or hand it) a raw token.
+        self._token = "" if fetch is gh_fetch and token is None else token
         self.deadline = clock() + deadline
         self.requests = 0
+        self.workers = max(1, workers)
+        self._lock = threading.Lock()
+        self._failed: Optional[str] = None
 
     @property
     def token(self) -> str:
@@ -99,18 +175,22 @@ class Checker:
         return self._token
 
     def _get(self, url: str):
-        left = self.deadline - self.clock()
-        if left <= 0:
-            raise Unknown("lookup deadline exceeded")
-        if self.requests >= MAX_REQUESTS:
-            raise Unknown("lookup request budget exceeded")
-        self.requests += 1
+        with self._lock:
+            if self._failed:
+                raise Unknown(self._failed)   # one failure ends the lookup: no further requests
+            left = self.deadline - self.clock()
+            if left <= 0:
+                raise Unknown("lookup deadline exceeded")
+            if self.requests >= MAX_REQUESTS:
+                raise Unknown("lookup request budget exceeded")
+            self.requests += 1
         try:
             return self.fetch(url, self.token, min(REQUEST_TIMEOUT, left))
-        except Unknown:
-            raise
-        except Exception as exc:  # any other fetch failure is still not "clear"
-            raise Unknown(str(exc) or type(exc).__name__) from None
+        except Exception as exc:  # any fetch failure is still not "clear"
+            reason = str(exc) or type(exc).__name__
+            with self._lock:
+                self._failed = self._failed or reason
+            raise Unknown(reason) from None
 
     def _pages(self, url: str, cap: int) -> list:
         items, page = [], 0
@@ -152,30 +232,46 @@ class Checker:
         entry = lists.get(base)
         if not entry or self.wall() - float(entry.get("at", 0)) > self.list_ttl:
             raw = self._pages(f"{API}/repos/{slug}/pulls?state=open&base={base}&per_page=100", MAX_LIST_PAGES)
+            # Files are read from the PR's canonical base repo: a renamed/moved repo answers its old slug with a 301,
+            # which doubles every request (each redirect is a metered request of its own).
             entry = {"at": self.wall(), "prs": [
                 {"number": p.get("number"), "sha": (p.get("head") or {}).get("sha", ""),
+                 "repo": (((p.get("base") or {}).get("repo") or {}).get("full_name") or slug),
                  "url": p.get("html_url", ""), "title": p.get("title", "")} for p in raw if isinstance(p, dict)]}
             lists[base] = entry
         files_cache = cache.setdefault("files", {})
-        live = {f"{p['number']}@{p['sha']}" for p in entry["prs"]}
-        out = []
+        key = lambda pr: f"{pr['number']}@{pr['sha']}"   # noqa: E731
+        live = {key(p) for p in entry["prs"]}
+        missing = [pr for pr in entry["prs"] if key(pr) not in files_cache]
+        errors = []
         try:
-            for pr in entry["prs"]:
-                key = f"{pr['number']}@{pr['sha']}"
-                if key not in files_cache:
-                    rows = self._pages(f"{API}/repos/{slug}/pulls/{pr['number']}/files?per_page=100", MAX_FILE_PAGES)
-                    if len(rows) >= 100 * MAX_FILE_PAGES:
-                        raise Unknown(f"PR #{pr['number']} file list truncated by GitHub")
-                    names = []
-                    for r in rows:
-                        names += [r.get(k) for k in ("filename", "previous_filename") if r.get(k)]
-                    files_cache[key] = names
-                out.append(dict(pr, files=set(files_cache[key])))
+            if missing:
+                with ThreadPoolExecutor(max_workers=min(self.workers, len(missing))) as pool:
+                    futures = {pool.submit(self._pr_files, slug, pr): pr for pr in missing}
+                    for fut in as_completed(futures):
+                        try:
+                            files_cache[key(futures[fut])] = fut.result()
+                        except Unknown as exc:
+                            errors.append(exc)
+            if errors:
+                raise errors[0]
         finally:
-            for key in [k for k in files_cache if k not in live]:
-                del files_cache[key]   # closed or re-pushed PRs drop out
-            self._save(slug, cache)
-        return out
+            for k in [k for k in files_cache if k not in live]:
+                del files_cache[k]   # closed or re-pushed PRs drop out
+            self._save(slug, cache)   # finished file lists are kept even when the lookup ends unknown
+        return [dict(pr, files=set(files_cache[key(pr)])) for pr in entry["prs"]]
+
+    def _pr_files(self, slug: str, pr: dict) -> list:
+        repo = pr.get("repo") if isinstance(pr.get("repo"), str) and repo_slug(
+            f"https://github.com/{pr.get('repo')}") == pr.get("repo") else slug
+        rows = self._pages(f"{API}/repos/{repo}/pulls/{pr['number']}/files?per_page=100", MAX_FILE_PAGES)
+        if len(rows) >= 100 * MAX_FILE_PAGES:
+            raise Unknown(f"PR #{pr['number']} file list truncated by GitHub")
+        names = []
+        for r in rows:
+            if isinstance(r, dict):
+                names += [r.get(k) for k in ("filename", "previous_filename") if r.get(k)]
+        return names
 
     def check(self, slug: str, base: str, paths: Iterable[str], prefixes: Iterable[str] = ()) -> dict:
         """{"status": clear|overlap|unknown, "matches": [{path, number, url, title}], "reason": str}."""

@@ -78,7 +78,11 @@ there and the updater skipped every pass for 1h25m. Tests: `tests_core_root.py`.
   incomplete lookup (HTTP error, rate limit, 8 s deadline, truncated pagination) allows the edit, and the skills
   publisher (state `hosts/hermes-hub/skills-sync/skills_sync.sh`, the same `pr_overlap.py check` CLI) holds it
   uncommitted instead and retries. Reads are cached in `~/.hermes/cache/pr-overlap/` (PR list 120 s, files per head
-  sha). Token: `GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth token`. Escape hatch for a user-approved edit:
+  sha; files are read from each PR's canonical base repo, so a moved repo's 301 does not double them). Transport:
+  the hook reads only through the host's `gh` (`gh api --include`, one call per request, up to 4 file reads at a
+  time), never with a raw token over urllib, so a metering `gh` wrapper (a GitHub quota ledger) sees every read;
+  `PR_OVERLAP_GH` overrides the binary, and gh missing or refusing (e.g. a quota guard's exit 75) is unknown. The CLI
+  keeps urllib with the caller's token (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth token`). Escape hatch for a user-approved edit:
   `SKILL_PR_OVERLAP_GUARD=0`. Tests: `tests_pr_overlap.py`. Its successful documentation writes are
   published by the post-call observer described below; failures never turn a successful tool result into an error.
 - Claude Code: `claude_hook.py` is a PreToolUse hook for `Bash` and `Write|Edit|MultiEdit|NotebookEdit`.

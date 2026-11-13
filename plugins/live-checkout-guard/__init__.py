@@ -168,7 +168,9 @@ def _skill_finder():
 
 
 def _overlap_checker(mod):
-    return mod.Checker(deadline=8.0)   # bounded: the hook delays the tool call
+    # Bounded: the hook delays the tool call. Metered: reads go through the host's gh (quota ledger), never a raw
+    # token over urllib from the agent process.
+    return mod.Checker(fetch=mod.gh_fetch, deadline=8.0)
 
 
 def _skill_overlap(tool_name: str, args: Any) -> Optional[str]:
