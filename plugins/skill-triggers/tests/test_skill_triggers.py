@@ -275,3 +275,53 @@ def test_non_object_results_keep_prose_append():
         st._fired.clear()
         out = run("kanban_create", {"title": "x"}, raw)
         assert out.startswith(raw) and st.MARK in out[len(raw):]
+
+
+# Defect agent-44bc7b02a4: one `py-spy dump` snapshot was reported as a CPU diagnosis. The dump result now carries
+# machine-investigate's rule (one dump is one instant; attribute CPU with `py-spy record`).
+@pytest.fixture
+def mi_home(env):
+    d = env / "skills" / "devops" / "machine-investigate"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text((REPO / "skills" / "devops" / "machine-investigate" / "SKILL.md").read_text())
+    return env
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("terminal", {"command": "sudo -n py-spy dump --nonblocking --pid 123"}),
+    ("terminal", {"command": "py-spy dump --pid 4242 | head -50"}),
+    ("terminal", {"command": "sample 4242 5 -file /tmp/s.txt"}),
+    ("terminal", {"command": "sudo -n sample 4242 5"}),
+    ("execute_code", {"code": "terminal('sudo -n py-spy dump --nonblocking --pid 99')"}),
+])
+def test_py_spy_dump_row(mi_home, tool, args):
+    out = run(tool, args)
+    assert out and st.MARK in out and "machine-investigate" in out
+    assert "A `py-spy dump` is one instant" in out and "py-spy record --nonblocking" in out
+    assert out.count("A `py-spy dump` is one instant") == 1
+    assert run(tool, args) is None  # once per session
+
+
+@pytest.mark.parametrize("cmd", [
+    "sudo -n py-spy record --nonblocking --pid 1 --duration 15 -o f",
+    "py-spy top --pid 1",
+    "python3 -c 'import random; print(random.sample(range(9), 5))'",
+    "shuf --sample 100 x",
+    "ls samples 3",
+])
+def test_py_spy_dump_row_negatives(mi_home, cmd):
+    assert run("terminal", {"command": cmd}) is None
+
+
+def test_py_spy_dump_row_skill_already_viewed(mi_home):
+    run("skill_view", {"name": "machine-investigate"}, "skill text")
+    assert run("terminal", {"command": "sudo -n py-spy dump --nonblocking --pid 123"}) is None
+
+
+def test_py_spy_dump_row_shipped_section_resolves():
+    rows = {r["id"]: r for r in st.load_rows(user_path=P / "nonexistent.yaml")}
+    r = rows["py-spy-dump-cpu"]
+    assert r["skill"] == "machine-investigate" and r["tools"] == ["terminal", "execute_code"]
+    text = (REPO / "skills" / "devops" / "machine-investigate" / "SKILL.md").read_text()
+    for sec in r["sections"]:
+        assert "one instant" in st.extract_section(text, sec)
