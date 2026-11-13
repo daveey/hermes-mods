@@ -554,13 +554,13 @@ def test_ln_destination_in_live_blocked(env):
 # ---- leading cd / $VAR paths: resolve before refusing (card t_01a1a13103e73bf3) -----------------------
 
 def test_cd_out_first_then_relative_write_allowed(env, monkeypatch):
-    """(1) cwd inside the live checkout, but the command cd's out first: later relative paths are outside."""
+    """Only success-gated writes may rely on cd leaving the live checkout."""
     out = env.other / "x"
     out.mkdir()
-    assert not term(f"cd {out}; echo > f", env.live)
-    assert not term(f"cd {out}; cat > reply.txt <<'E'\nhi\nE", env.live)
+    assert blocked(term(f"cd {out}; echo > f", env.live))
+    assert not term(f"cd {out} && cat > reply.txt <<'E'\nhi\nE", env.live)
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(out))
-    assert not term("cd $HERMES_KANBAN_WORKSPACE; cat > reply.txt <<'E'\nhi\nE", env.live)
+    assert not term("cd $HERMES_KANBAN_WORKSPACE && cat > reply.txt <<'E'\nhi\nE", env.live)
     assert not term("cd ${HERMES_KANBAN_WORKSPACE} && echo > f", env.live)
 
 
@@ -576,7 +576,7 @@ def test_tmpdir_var_paths_allowed_when_outside(env, monkeypatch):
 def test_unknown_var_path_is_not_proven_inside(env, monkeypatch):
     monkeypatch.delenv("LCG_NOPE", raising=False)
     assert not term("rm -rf $LCG_NOPE/foo", env.live)
-    assert not term("cd $LCG_NOPE; echo > f", env.live)
+    assert blocked(term("cd $LCG_NOPE; echo > f", env.live))
 
 
 def test_relative_write_with_cwd_inside_still_refused(env):
@@ -607,7 +607,7 @@ def test_literal_case4_default_root(monkeypatch, tmp_path):
 def test_unknown_cwd_ln_and_git_not_crashing(env, monkeypatch):
     monkeypatch.delenv("LCG_NOPE", raising=False)
     assert not term("ln -s /x $LCG_NOPE/y", env.live)
-    assert not term("cd $LCG_NOPE && ln -s /x y && git stash", env.live)
+    assert blocked(term("cd $LCG_NOPE && ln -s /x y && git stash", env.live))
     assert blocked(term(f"cd $LCG_NOPE; cd {env.live}; echo > f", env.other))
 
 
