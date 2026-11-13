@@ -253,6 +253,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             coach.check_widget_send(session_id, tool_name, args)
             coach.check_plan_first(session_id, tool_name, args)
             coach.check_empty_wait(session_id, tool_name, args, result)
+            coach.check_cleanup_sweeper(session_id, tool_name, args, result)
             hint = coach.take(session_id) if isinstance(result, str) else None
             return rules.attach_hint(result, hint) if hint else None
         except Exception as exc:

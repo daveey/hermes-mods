@@ -138,6 +138,8 @@ Never stop at these. Each is a symptom that needs another why:
 - "not a bug" or "expected behavior": then why was it filed as a failure, and why will it be filed again?
 - "bad data" or "misconfigured": why was that data or config accepted?
 - "it was already like that": why didn't anything notice?
+- a sweeper that deletes the symptom (a cron, timer or cronjob that archives, deletes or kills leftovers): why does
+  the producer leak? Read the producer's session or card when no file shows it, fix it there, and remove the job.
 
 ### 5. Check for recurrence
 

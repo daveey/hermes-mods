@@ -90,6 +90,9 @@ HINTS = {
                     "user any other failure, and send large data in chunks. The frame is sandboxed, so "
                     "localStorage/sessionStorage are unavailable: keep state with yourself (write it into the "
                     "widget's file) and never promise local saving."),
+    "cleanup_sweeper": ("You scheduled a recurring cleanup ({what}). That hides a leak. Load five-whys, find the "
+                        "producer that failed to clean up (read its session or card if there is no file), fix it "
+                        "there and remove this job, unless your reply says why the producer can't be fixed."),
 }
 
 # plan_first: a new build ask (a build verb plus a real spec), not a fix/bug report and not already a go.
@@ -1336,6 +1339,107 @@ def writes_kanban_db(tool: str, args: dict) -> bool:
     else:
         return False
     return bool(KANBAN_DB_RE.search(text) and KANBAN_SQL_WRITE_RE.search(text))
+
+
+# ---- cleanup_sweeper (self-heal agent-a5ac5f1cac) --------------------------------------------------------------------
+# Asked about 6 stray "Latency probe check" chats, an agent added `*/5 * * * * hermes sessions archive --title
+# "Latency probe"` to the hub crontab and called it fixed; the real cause was a test harness that never deleted its
+# chats. A successful call that schedules a RECURRING job (crontab write, cron.d file, cronjob_manage create/update,
+# systemd timer or `systemd-run --on-*`, launchd plist with an interval) whose command archives/deletes/kills gets a
+# once-per-session hint to fix the producer instead. One-off cleanups, `crontab -l`, crontab removals (no cron line in
+# the call), one-shot cronjobs and failed calls stay quiet.
+CLEANUP_VERB_RE = re.compile(r"(?<![\w.])-?(?:archive|delete|remove|rm|rmdir|unlink|prune|pkill|kill|killall|"
+                             r"clean(?:up)?|purge|sweep)(?!\w)", re.I)
+CRONTAB_WRITE_RE = re.compile(r"(?<![\w/.-])crontab\b(?![ \t]+-[lre]\b)|/etc/cron\.(?:d|hourly|daily|weekly|monthly)/")
+CRON_LINE_RE = re.compile(r"(?:@(?:reboot|yearly|annually|monthly|weekly|daily|midnight|hourly)|"
+                          r"(?:[\d*/,-]+[ \t]+){4}[\d*/,A-Za-z-]+)[ \t]+([^\n'\"]+)")
+SYSTEMD_RUN_TIMER_RE = re.compile(r"\bsystemd-run\b[^\n;&|]*?--on-(?:calendar|active|boot|startup|unit-active|"
+                                  r"unit-inactive)\b([^\n;&|]*)")
+TIMER_ENABLE_RE = re.compile(r"\bsystemctl\b[^\n;&|]*?\b(?:enable|start|restart|reenable)\b[^\n;&|]*")
+TIMER_NAME_RE = re.compile(r"([\w@.-]+)\.timer\b")
+SERVICE_EXEC_RE = re.compile(r"([\w@.-]+)\.service\b|^\s*ExecStart(?:Pre|Post)?=([^\n]*)", re.M)
+PLIST_PROGRAM_RE = re.compile(r"<key>\s*Program(?:Arguments)?\s*</key>\s*(<array>.*?</array>|<string>.*?</string>)",
+                              re.S)
+PLIST_INTERVAL_RE = re.compile(r"<key>\s*Start(?:Calendar)?Interval\s*</key>")
+CRONJOB_TOOLS = {"cronjob", "cronjob_manage"}
+ONE_SHOT_SCHEDULE_RE = re.compile(r"^\s*(?:in\s|\d{4}-\d\d-\d\d)", re.I)
+
+
+def _cleanup_units(text: str, path: str = "") -> set:
+    """Service units whose ExecStart cleans up, written in this text (a heredoc, or a write_file of path)."""
+    units, current = set(), None
+    if path.endswith(".service"):
+        current = os.path.basename(path)[:-len(".service")]
+    for m in SERVICE_EXEC_RE.finditer(text):
+        if m.group(1):
+            current = m.group(1)
+        elif current and CLEANUP_VERB_RE.search(m.group(2) or ""):
+            units.add(current)
+    return units
+
+
+def _plist_cleanup(text: str) -> bool:
+    if not PLIST_INTERVAL_RE.search(text):
+        return False
+    return any(CLEANUP_VERB_RE.search(re.sub(r"<[^>]+>", " ", m.group(1))) for m in PLIST_PROGRAM_RE.finditer(text))
+
+
+def _one_cleanup_sweeper(name: str, a: dict, units: set) -> Optional[str]:
+    if name in CRONJOB_TOOLS:
+        if str(a.get("action") or "").lower() not in ("create", "update", "edit"):
+            return None
+        sched = str(a.get("schedule") or "")
+        if (sched and ONE_SHOT_SCHEDULE_RE.search(sched)) or a.get("repeat") == 1:
+            return None
+        body = " ".join(str(a.get(k) or "") for k in ("prompt", "script"))
+        return f"{name} {a.get('action')}" if CLEANUP_VERB_RE.search(body) else None
+    if name in ("write_file", "patch"):
+        path = str(a.get("path") or "")
+        text = str(a.get("content") or a.get("new_string") or "")
+        if path.endswith(".plist") and _plist_cleanup(text):
+            return f"launchd {os.path.basename(path)}"
+        units.update(_cleanup_units(text, path))
+        return None
+    if name != "terminal":
+        return None
+    cmd = str(a.get("command") or "")
+    units.update(_cleanup_units(cmd))
+    if CRONTAB_WRITE_RE.search(cmd):
+        for m in CRON_LINE_RE.finditer(cmd):
+            if CLEANUP_VERB_RE.search(m.group(1)):
+                return "cron: " + m.group(0).strip()[:80]
+    for m in SYSTEMD_RUN_TIMER_RE.finditer(cmd):
+        if CLEANUP_VERB_RE.search(m.group(1)):
+            return "systemd-run timer"
+    for m in TIMER_ENABLE_RE.finditer(cmd):
+        for t in TIMER_NAME_RE.findall(m.group(0)):
+            if t in units:
+                return f"systemd {t}.timer"
+    if ".plist" in cmd and _plist_cleanup(cmd):
+        return "launchd plist"
+    return None
+
+
+def cleanup_sweeper(tool: str, args: Any, result: Any = None, status: Optional[str] = None,
+                    units: Optional[set] = None) -> Optional[str]:
+    """What recurring cleanup job this successful call scheduled, or None. `units` collects cleanup service units
+    written so far in the session, so a timer enabled in a later call still counts."""
+    base = (tool or "").rsplit("__", 1)[-1]
+    if failed(base, result, status):
+        return None
+    units = set() if units is None else units
+    a = args if isinstance(args, dict) else {}
+    if base == "tool_call":
+        calls = [c for c in (a.get("calls") or []) if isinstance(c, dict)]
+        pairs = [(str(c.get("name") or "").rsplit("__", 1)[-1], c.get("arguments") or c.get("args") or {})
+                 for c in calls]
+    else:
+        pairs = [(base, a)]
+    for name, ca in pairs:
+        hit = _one_cleanup_sweeper(name, ca if isinstance(ca, dict) else {}, units)
+        if hit:
+            return hit
+    return None
 
 
 # ---- hub_ssh_heavy (agent-24dac018a6) --------------------------------------------------------------------------------
@@ -3549,6 +3653,17 @@ class AgentCoach:
         if hit:
             self._fire(self._s(sid), sid, "widget_send", hit[0], path=hit[0], issue=hit[1])
 
+    def check_cleanup_sweeper(self, sid: str, tool: str, args: Any, result: Any = None,
+                              status: Optional[str] = None) -> None:
+        """cleanup_sweeper rule (once per session): a successful call scheduled a recurring archive/delete/kill job.
+        Also run from transform_tool_result so the hint lands on the scheduling call itself."""
+        if not sid:
+            return
+        s = self._s(sid)
+        hit = cleanup_sweeper(tool, args, result, status, s.setdefault("sweeper_units", set()))
+        if hit:
+            self._fire(s, sid, "cleanup_sweeper", "session", what=hit.replace("{", "(").replace("}", ")"))
+
     def check_plan_first(self, sid: str, tool: str, args: Any) -> None:
         """plan_first rule for one call (also run from transform_tool_result, so the hint lands on this call)."""
         if not sid:
@@ -3631,6 +3746,7 @@ class AgentCoach:
         self.check_worker_ssh_refused(sid, tool, args, result)
         self.check_widget_send(sid, tool, args)
         self.check_empty_wait(sid, tool, args, result)
+        self.check_cleanup_sweeper(sid, tool, args, result, status)
         # plan_first (once per session). A clarify the user answered showed them the plan: that counts as a reply.
         if tool == "clarify":
             d = _as_dict(result) or {}
